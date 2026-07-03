@@ -22,7 +22,7 @@ pub fn parse(input: &str) -> Result<Query> {
     let mut fts_terms: Vec<String> = Vec::new();
     let mut scopes: Vec<Scope> = Vec::new();
 
-    for token in tokenize(input) {
+    for token in tokenize(input)? {
         if let Some(rest) = token.strip_prefix('~') {
             let term = unquote(rest);
             if term.is_empty() {
@@ -79,7 +79,10 @@ pub fn parse(input: &str) -> Result<Query> {
 }
 
 /// Split `input` into tokens on whitespace, keeping `"…"`-quoted spans together.
-fn tokenize(input: &str) -> Vec<String> {
+///
+/// # Errors
+/// Returns a validation error if a `"` is opened but never closed.
+fn tokenize(input: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
@@ -97,10 +100,13 @@ fn tokenize(input: &str) -> Vec<String> {
             c => current.push(c),
         }
     }
+    if in_quote {
+        return Err(bad(input, "unterminated `\"` quote"));
+    }
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens
+    Ok(tokens)
 }
 
 /// Parse `tag:` payload `facet<op>value`.
@@ -249,5 +255,11 @@ mod tests {
             let err = parse(bad).unwrap_err();
             assert!(err.to_string().contains(bad) || err.to_string().contains("invalid query"));
         }
+    }
+
+    #[test]
+    fn unterminated_quote_is_rejected() {
+        let err = parse("hello \"unclosed phrase").unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
     }
 }
