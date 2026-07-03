@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use jkb_core::blob;
 use jkb_types::{EdgeType, Error as TypeError};
 
 use super::{SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
@@ -100,7 +101,7 @@ impl ParseState {
         let content = self.text_run.join("\n");
         self.text_run.clear();
         let local_id = uniquify(
-            format!("text-{}", &hash_hex(content.as_bytes())[..8]),
+            format!("text-{}", &blob::hash_bytes(content.as_bytes())[..8]),
             &mut self.used_ids,
         );
         let mut item = SyncItem::new(local_id, "text", content);
@@ -519,7 +520,7 @@ fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
     } else {
         trimmed.to_owned()
     };
-    let short = &hash_hex(title.as_bytes())[..6];
+    let short = &blob::hash_bytes(title.as_bytes())[..6];
     let candidate = format!("{base}-{short}");
     let mut id = candidate.clone();
     let mut n = 2;
@@ -544,11 +545,6 @@ fn uniquify(base: String, used: &mut HashSet<String>) -> String {
         }
         n += 1;
     }
-}
-
-/// blake3 of `bytes` as lowercase hex.
-fn hash_hex(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
 }
 
 /// A validation error for the `tasks` format (routes to quarantine in the engine).
