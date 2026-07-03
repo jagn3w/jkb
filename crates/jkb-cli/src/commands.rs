@@ -49,19 +49,36 @@ fn base_dir() -> Result<PathBuf> {
     Ok(home.join(".claude"))
 }
 
-/// Write `set` into `dir`, naming each file `{prefix}{stem}.{ext}`. Returns the installed
-/// file names.
-fn write_set(dir: &Path, prefix: &str, ext: &str, set: &[(&str, &str)]) -> Result<Vec<String>> {
+/// Write `set` into `dir`, naming each file `{prefix}{stem}.{ext}`. Prints each write when
+/// `verbose` (an explicit `install`); stays silent for the auto-install path.
+fn write_set(dir: &Path, prefix: &str, ext: &str, set: &[(&str, &str)], verbose: bool) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let mut names = Vec::new();
     for (stem, body) in set {
-        let name = format!("{prefix}{stem}.{ext}");
-        let path = dir.join(&name);
+        let path = dir.join(format!("{prefix}{stem}.{ext}"));
         std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-        println!("wrote {}", path.display());
-        names.push(name);
+        if verbose {
+            println!("wrote {}", path.display());
+        }
     }
-    Ok(names)
+    Ok(())
+}
+
+/// Path of the stamp recording which bundled-asset version has been reconciled into the
+/// config dir, so auto-install only acts when the shipped bundle actually changes.
+fn stamp_path(base: &Path) -> PathBuf {
+    base.join(".jkb-assets")
+}
+
+/// A stable fingerprint of the bundled asset set (names + contents); changes whenever the
+/// binary ships different commands or workflows.
+fn fingerprint() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for entry in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
+        entry.0.hash(&mut h);
+        entry.1.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
 }
 
 /// Remove `set` from `dir` (files named `{prefix}{stem}.{ext}`), reporting each.
@@ -84,8 +101,9 @@ fn remove_set(dir: &Path, prefix: &str, ext: &str, set: &[(&str, &str)]) -> Resu
 /// Returns an error if `HOME` is unset or an asset can't be written.
 pub fn install() -> Result<()> {
     let base = base_dir()?;
-    write_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS)?;
-    write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS)?;
+    write_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS, true)?;
+    write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS, true)?;
+    std::fs::write(stamp_path(&base), fingerprint()).context("writing asset stamp")?;
     println!(
         "installed {} command(s) and {} workflow(s).",
         BUNDLED_COMMANDS.len(),
@@ -111,6 +129,44 @@ pub fn uninstall() -> Result<()> {
     let base = base_dir()?;
     remove_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS)?;
     remove_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS)?;
+    if base.exists() {
+        // Mark the current bundle reconciled so auto-install won't re-add these until the
+        // binary ships a different set.
+        std::fs::write(stamp_path(&base), fingerprint()).context("writing asset stamp")?;
+        println!(
+            "removed. Auto-install won't re-add them until the next `jkb` upgrade; set \
+             JKB_NO_AUTO_COMMANDS=1 to disable auto-install entirely."
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort: keep the bundled assets present and current in the user's Claude Code
+/// config dir, so they're available without an explicit `jkb commands install`. No-ops
+/// (and never propagates an error to the caller) when `JKB_NO_AUTO_COMMANDS` is set, when
+/// the config dir doesn't exist (Claude Code not in use — never created here), or when the
+/// shipped bundle is already reconciled. Silent on success, so it is safe to call before
+/// any command including `jkb mcp` (whose stdout is the MCP protocol).
+pub fn ensure_installed() {
+    if std::env::var_os("JKB_NO_AUTO_COMMANDS").is_some() {
+        return;
+    }
+    let _ = try_ensure();
+}
+
+fn try_ensure() -> Result<()> {
+    let base = base_dir()?;
+    if !base.exists() {
+        return Ok(());
+    }
+    let stamp = stamp_path(&base);
+    let want = fingerprint();
+    if std::fs::read_to_string(&stamp).ok().as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    write_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS, false)?;
+    write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS, false)?;
+    std::fs::write(&stamp, want).context("writing asset stamp")?;
     Ok(())
 }
 
