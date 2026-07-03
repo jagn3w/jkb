@@ -3,7 +3,9 @@
 //! `depends_on` edges must stay acyclic (design D5); [`link`] rejects any edge
 //! that would close a cycle, checked with a reachability CTE.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
+
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use jkb_types::{EdgeId, EdgeType, Error as TypeError, ItemId};
@@ -114,6 +116,41 @@ pub fn edges_from(conn: &Connection, src: ItemId, edge_type: EdgeType) -> Result
     let mut out = Vec::new();
     for row in rows {
         out.push(ItemId::new(row?));
+    }
+    Ok(out)
+}
+
+/// The direct `edge_type` targets of every source in `srcs`, keyed by source id, in one
+/// query. Batches [`edges_from`] so callers reconciling many items (e.g. file sync) avoid
+/// one round-trip per source. Sources with no such edges are absent from the map.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn edges_from_many(
+    conn: &Connection,
+    srcs: &[ItemId],
+    edge_type: EdgeType,
+) -> Result<HashMap<ItemId, Vec<ItemId>>> {
+    let mut out: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+    if srcs.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; srcs.len()].join(", ");
+    let sql = format!(
+        "SELECT src_item_id, dst_item_id FROM edges
+         WHERE type = ? AND src_item_id IN ({placeholders})
+         ORDER BY src_item_id, dst_item_id"
+    );
+    let mut params: Vec<SqlValue> = Vec::with_capacity(srcs.len() + 1);
+    params.push(SqlValue::Text(edge_type.as_str().to_owned()));
+    params.extend(srcs.iter().map(|id| SqlValue::Integer(id.get())));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
+        Ok((ItemId::new(r.get::<_, i64>(0)?), ItemId::new(r.get::<_, i64>(1)?)))
+    })?;
+    for row in rows {
+        let (src, dst) = row?;
+        out.entry(src).or_default().push(dst);
     }
     Ok(out)
 }
