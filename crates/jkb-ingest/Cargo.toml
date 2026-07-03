@@ -1,0 +1,26 @@
+[package]
+name = "jkb-ingest"
+description = "Staged, idempotent ingestion pipeline (fetch/parse/chunk/embed) and source adapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3 = "1.8.5"
+headless_chrome = "1.0.22"
+jkb-core = { version = "0.1.0", path = "../jkb-core" }
+jkb-index = { version = "0.1.0", path = "../jkb-index" }
+jkb-types = { version = "0.1.0", path = "../jkb-types" }
+pdf-extract = "0.12.0"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+rusqlite = { workspace = true }
+scraper = "0.27.0"
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile = "3.27.0"

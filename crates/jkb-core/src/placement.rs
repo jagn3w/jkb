@@ -1,0 +1,226 @@
+//! Placement repository: the many-to-many link between items and namespaces.
+//!
+//! An item may be placed under many namespaces (design D3) — e.g. a task under
+//! both its `tasks/…` home and a `repos/…` mirror.
+
+use rusqlite::{params, Connection};
+use serde_json::json;
+
+use jkb_types::{ItemId, NamespaceId, PlacementRole};
+
+use crate::store::WriteMeta;
+use crate::{changelog, Result};
+
+/// Place `item` under `namespace` with the given `role` and `position`. Idempotent
+/// on `(item, namespace, role)`: re-placing updates the position.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn place(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    namespace: NamespaceId,
+    role: PlacementRole,
+    position: i64,
+) -> Result<()> {
+    let rowid: i64 = conn
+        .prepare_cached(
+            "INSERT INTO placements (item_id, namespace_id, role, position)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(item_id, namespace_id, role) DO UPDATE SET position = excluded.position
+             RETURNING rowid",
+        )?
+        .query_row(
+            params![item.get(), namespace.get(), role.as_str(), position],
+            |row| row.get(0),
+        )?;
+    let after = json!({
+        "item_id": item.get(),
+        "namespace_id": namespace.get(),
+        "role": role.as_str(),
+        "position": position,
+    });
+    changelog::append(
+        conn,
+        meta,
+        "insert",
+        "placements",
+        &rowid.to_string(),
+        None,
+        Some(&after),
+    )?;
+    Ok(())
+}
+
+/// Make `namespace` the item's **sole** primary placement at `position`: any existing
+/// primary under a *different* namespace is removed (each recorded in the changelog)
+/// before the new primary is placed. Used by file sync when an item moves between
+/// sections, so an item never ends up with two primary homes.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn set_primary(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    namespace: NamespaceId,
+    position: i64,
+) -> Result<()> {
+    let stale: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT rowid, namespace_id FROM placements
+             WHERE item_id = ?1 AND role = 'primary' AND namespace_id != ?2",
+        )?;
+        let rows = stmt.query_map([item.get(), namespace.get()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (rowid, old_ns) in stale {
+        conn.prepare_cached("DELETE FROM placements WHERE rowid = ?1")?
+            .execute([rowid])?;
+        changelog::append(
+            conn,
+            meta,
+            "delete",
+            "placements",
+            &rowid.to_string(),
+            Some(&json!({ "item_id": item.get(), "namespace_id": old_ns, "role": "primary" })),
+            None,
+        )?;
+    }
+    place(
+        conn,
+        meta,
+        item,
+        namespace,
+        PlacementRole::Primary,
+        position,
+    )
+}
+
+/// The items directly placed under `namespace`, optionally filtered by `role`,
+/// ordered by position.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn items_in(
+    conn: &Connection,
+    namespace: NamespaceId,
+    role: Option<PlacementRole>,
+) -> Result<Vec<ItemId>> {
+    let mut out = Vec::new();
+    if let Some(role) = role {
+        let mut stmt = conn.prepare_cached(
+            "SELECT item_id FROM placements
+             WHERE namespace_id = ?1 AND role = ?2 ORDER BY position, item_id",
+        )?;
+        let rows = stmt.query_map(params![namespace.get(), role.as_str()], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        for row in rows {
+            out.push(ItemId::new(row?));
+        }
+    } else {
+        let mut stmt = conn.prepare_cached(
+            "SELECT item_id FROM placements WHERE namespace_id = ?1 ORDER BY position, item_id",
+        )?;
+        let rows = stmt.query_map([namespace.get()], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            out.push(ItemId::new(row?));
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{items_in, place};
+    use crate::item::{upsert, NewItem};
+    use crate::{ns, Db};
+    use jkb_types::PlacementRole;
+
+    #[test]
+    fn one_item_resolves_under_multiple_namespaces() {
+        let db = Db::open_in_memory().unwrap();
+        let (task_id, home, mirror) = db
+            .write_txn("t", |conn, meta| {
+                let home = ns::ensure(conn, "tasks/inbox")?;
+                let mirror = ns::ensure(conn, "repos/monorepo/backend")?;
+                let task_id = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "task:1".to_owned(),
+                        kind: "task".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                place(conn, meta, task_id, home, PlacementRole::Primary, 0)?;
+                place(conn, meta, task_id, mirror, PlacementRole::Reference, 0)?;
+                Ok((task_id, home, mirror))
+            })
+            .unwrap();
+
+        let in_home = db.read(move |conn| items_in(conn, home, None)).unwrap();
+        let in_mirror = db.read(move |conn| items_in(conn, mirror, None)).unwrap();
+        assert_eq!(in_home, vec![task_id]);
+        assert_eq!(in_mirror, vec![task_id]);
+    }
+
+    #[test]
+    fn set_primary_moves_the_sole_primary_and_audits() {
+        use super::set_primary;
+        let db = Db::open_in_memory().unwrap();
+        let (item, a, b) = db
+            .write_txn("t", |conn, meta| {
+                let a = ns::ensure(conn, "docs/a")?;
+                let b = ns::ensure(conn, "docs/b")?;
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "i".to_owned(),
+                        kind: "task".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                set_primary(conn, meta, item, a, 0)?;
+                Ok((item, a, b))
+            })
+            .unwrap();
+        assert_eq!(
+            db.read(move |conn| items_in(conn, a, None)).unwrap(),
+            vec![item]
+        );
+
+        // Re-home to b: the primary under a is removed, leaving exactly one primary.
+        db.write_txn("t", move |conn, meta| set_primary(conn, meta, item, b, 0))
+            .unwrap();
+        assert!(db
+            .read(move |conn| items_in(conn, a, None))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.read(move |conn| items_in(conn, b, None)).unwrap(),
+            vec![item]
+        );
+
+        // The removal was recorded in the changelog (audit convention).
+        let deletes: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM changelog WHERE entity_type = 'placements' AND op = 'delete'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(deletes, 1);
+    }
+}

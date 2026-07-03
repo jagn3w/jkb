@@ -1,0 +1,53 @@
+# cargo-deny configuration: supply-chain hygiene (advisories, licenses, sources).
+# Run with `cargo deny check` (install once: `cargo install cargo-deny`).
+
+[advisories]
+version = 2
+# Fail on any security advisory for a dependency. Add specific IDs to `ignore`
+# only with a written justification.
+ignore = [
+    # `ttf-parser` is unmaintained (not a vulnerability). It is a transitive dep of
+    # `pdf-extract` (via `lopdf`) used only for PDF text extraction; there is no
+    # actively-maintained drop-in and no known exploit. Revisit if `pdf-extract`
+    # gains a replacement or a real CVE is filed against `ttf-parser`.
+    "RUSTSEC-2026-0192",
+]
+
+[licenses]
+version = 2
+# Allow only permissive licenses compatible with jkb's own MIT/Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    # `webpki-roots` (Mozilla's CA bundle, pulled in transitively by `headless_chrome`)
+    # ships under CDLA-Permissive-2.0, a permissive data license. Safe to allow.
+    "CDLA-Permissive-2.0",
+]
+
+# Scoped exception: `auto_generate_cdp` is GPL-3.0 but is a **build-dependency only**
+# of `headless_chrome` — a codegen tool that generates the Chrome DevTools Protocol
+# bindings at compile time. It is not linked into or distributed in the `jkb` binary
+# (what ships is the generated code, embedded in the MIT-licensed `headless_chrome`),
+# so GPL copyleft does not reach jkb. Accepted here explicitly rather than hidden.
+# (If URL ingestion is later feature-gated off by default, this dep — and this
+# exception — drop out of the default build entirely.)
+[[licenses.exceptions]]
+name = "auto_generate_cdp"
+allow = ["GPL-3.0-or-later"]
+
+[bans]
+# Warn (not fail) when two versions of the same crate are pulled in; tighten later.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
