@@ -3,7 +3,9 @@
 //! A facet (e.g. `read_year`, `topic`, `size`) is declared once; applications
 //! attach a value to an item and may carry per-application properties.
 
-use rusqlite::{params, Connection};
+use std::collections::HashMap;
+
+use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde_json::json;
 
 use jkb_types::ItemId;
@@ -104,6 +106,41 @@ pub fn applications(conn: &Connection, item: ItemId) -> Result<Vec<(String, Stri
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The `(facet, value)` applications for every item in `items`, keyed by item id,
+/// in one query. Batches [`applications`] so callers reconciling many items (e.g. file
+/// sync) avoid one round-trip per item. Items with no tags are absent from the map.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn applications_for(
+    conn: &Connection,
+    items: &[ItemId],
+) -> Result<HashMap<ItemId, Vec<(String, String)>>> {
+    let mut out: HashMap<ItemId, Vec<(String, String)>> = HashMap::new();
+    if items.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; items.len()].join(", ");
+    let sql = format!(
+        "SELECT item_id, facet, value FROM tag_applications
+         WHERE item_id IN ({placeholders}) ORDER BY item_id, facet, value"
+    );
+    let params: Vec<Value> = items.iter().map(|id| Value::Integer(id.get())).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
+        Ok((
+            ItemId::new(r.get::<_, i64>(0)?),
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, facet, value) = row?;
+        out.entry(id).or_default().push((facet, value));
     }
     Ok(out)
 }
