@@ -6,6 +6,7 @@
 //! Read/task/query commands default their namespace scope to the mount covering the
 //! current directory (design D19), overridable with `--global`.
 
+mod commands;
 mod output;
 mod service;
 
@@ -120,6 +121,11 @@ enum Command {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Install jkb's bundled Claude Code slash commands (`/jkb-…`) for this machine.
+    Commands {
+        #[command(subcommand)]
+        cmd: CommandsCmd,
+    },
     /// Task DAG: quick-add and the ready frontier.
     Task {
         #[command(subcommand)]
@@ -187,6 +193,16 @@ enum ServiceCmd {
     Install,
     /// Remove the installed service unit.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum CommandsCmd {
+    /// Write the bundled slash commands into the Claude Code commands directory.
+    Install,
+    /// Remove the bundled slash commands.
+    Uninstall,
+    /// List the bundled commands and their install location (a dry run).
+    List,
 }
 
 #[derive(Subcommand)]
@@ -309,6 +325,11 @@ fn run(cli: Cli) -> Result<()> {
             ServiceCmd::Print => service::print(&db_path),
             ServiceCmd::Install => service::install(&db_path),
             ServiceCmd::Uninstall => service::uninstall(&db_path),
+        },
+        Command::Commands { cmd } => match cmd {
+            CommandsCmd::Install => commands::install(),
+            CommandsCmd::Uninstall => commands::uninstall(),
+            CommandsCmd::List => commands::list(),
         },
         Command::Task { cmd } => cmd_task(&db, cmd, global, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
