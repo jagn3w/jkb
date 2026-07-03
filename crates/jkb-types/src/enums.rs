@@ -71,6 +71,8 @@ pub enum ConflictPolicy {
 ///
 /// Note: `blocked` is intentionally absent — it is *derived* from `depends_on`
 /// edges (design D19), never stored, so there is a single source of truth.
+/// `needs_review` is a real, settable status that unblocks dependents without being
+/// `done` (see [`TaskStatus::unblocks_dependents`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -78,6 +80,9 @@ pub enum TaskStatus {
     Open,
     /// Actively being worked.
     InProgress,
+    /// Implementation finished but awaiting operator approval. Unblocks dependents like
+    /// a terminal status, but is **not** `done` until an operator approves it.
+    NeedsReview,
     /// Completed.
     Done,
     /// Abandoned.
@@ -103,16 +108,27 @@ impl TaskStatus {
         match self {
             Self::Open => "open",
             Self::InProgress => "in_progress",
+            Self::NeedsReview => "needs_review",
             Self::Done => "done",
             Self::Cancelled => "cancelled",
         }
     }
 
     /// Whether this is a terminal status (`done`/`cancelled`): no further work is
-    /// expected, and such tasks are excluded from the ready frontier (design D19).
+    /// expected. `needs_review` is deliberately **not** terminal — the work still needs
+    /// operator approval before it is `done`.
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Cancelled)
+    }
+
+    /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents
+    /// (and keeps the task itself out of the ready frontier). True for the terminal
+    /// statuses *and* `needs_review`: the work is finished enough for dependents to
+    /// proceed, even though `needs_review` is not yet `done`.
+    #[must_use]
+    pub fn unblocks_dependents(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled | Self::NeedsReview)
     }
 
     /// Parse a *manually settable* status string into a [`TaskStatus`].
@@ -126,6 +142,7 @@ impl TaskStatus {
         match s {
             "open" => Some(Self::Open),
             "in_progress" => Some(Self::InProgress),
+            "needs_review" => Some(Self::NeedsReview),
             "done" => Some(Self::Done),
             "cancelled" => Some(Self::Cancelled),
             _ => None,
@@ -225,6 +242,7 @@ mod tests {
         for status in [
             TaskStatus::Open,
             TaskStatus::InProgress,
+            TaskStatus::NeedsReview,
             TaskStatus::Done,
             TaskStatus::Cancelled,
         ] {
@@ -241,14 +259,29 @@ mod tests {
         assert!(TaskStatus::Cancelled.is_terminal());
         assert!(!TaskStatus::Open.is_terminal());
         assert!(!TaskStatus::InProgress.is_terminal());
+        // `needs_review` unblocks dependents but is NOT terminal (not yet done).
+        assert!(!TaskStatus::NeedsReview.is_terminal());
 
         assert_eq!(TaskStatus::from_manual_str("open"), Some(TaskStatus::Open));
         assert_eq!(
             TaskStatus::from_manual_str("in_progress"),
             Some(TaskStatus::InProgress)
         );
+        assert_eq!(
+            TaskStatus::from_manual_str("needs_review"),
+            Some(TaskStatus::NeedsReview)
+        );
         // `blocked` is derived, never manually settable.
         assert_eq!(TaskStatus::from_manual_str("blocked"), None);
         assert_eq!(TaskStatus::from_manual_str("nope"), None);
+    }
+
+    #[test]
+    fn needs_review_unblocks_without_being_terminal() {
+        assert!(TaskStatus::Done.unblocks_dependents());
+        assert!(TaskStatus::Cancelled.unblocks_dependents());
+        assert!(TaskStatus::NeedsReview.unblocks_dependents());
+        assert!(!TaskStatus::Open.unblocks_dependents());
+        assert!(!TaskStatus::InProgress.unblocks_dependents());
     }
 }

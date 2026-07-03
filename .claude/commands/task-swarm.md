@@ -100,15 +100,17 @@ budget is low). The workflow runs in the background and notifies on completion.
 
 ## 7. Report + hand-off
 
-When the workflow finishes, relay its result: which task uids **merged**, which it
-**gave up** on (retry-capped), and how many rounds it ran. Then tell the user how to
-finish:
+When the workflow finishes, relay its result: which task uids are **awaiting_review**,
+which it **gave up** on (retry-capped), and how many rounds it ran. Each integrated task
+was set to **`needs_review`** in jkb (file-backed tasks got a `- [?]` checkbox + sync) — so
+its dependents were free to proceed, but nothing is marked `done`. Then tell the user how
+to finish:
 
 - Review the integrated result: `git -C .swarm/integration log --oneline "$BASE".."swarm/$BASE"`
-  and run the test suite there.
-- When satisfied, merge it into your branch: `git switch "$BASE" && git merge "swarm/$BASE"`.
+  and run the test suite there. Review each `needs_review` task (`jkb query --global 'kind:task status:needs_review'`).
+- **Approve** the tasks you accept by flipping their `- [?]` to `- [x]` in the source file
+  and running `jkb sync` (or, for managed tasks, `task_update` via MCP). Anything you reject
+  stays `needs_review` for another pass.
+- When satisfied, merge into your branch: `git switch "$BASE" && git merge "swarm/$BASE"`.
 - Clean up: `git worktree remove .swarm/integration` and prune the per-task worktrees/branches
   (`git worktree prune`; `git branch -D` the merged `swarm-task/*` branches).
-
-Note any tasks the swarm marked done in jkb (file-backed tasks had their checkboxes flipped
-and were synced) versus managed tasks that need `task_update` via MCP to close.

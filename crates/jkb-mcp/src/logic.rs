@@ -95,7 +95,8 @@ pub struct TaskCreateArgs {
 pub struct TaskUpdateArgs {
     /// The task's stable uid.
     pub uid: String,
-    /// New status (`open`/`in_progress`/`done`/`cancelled`; `blocked` is rejected).
+    /// New status (`open`/`in_progress`/`needs_review`/`done`/`cancelled`; `blocked` is
+    /// rejected).
     #[serde(default)]
     pub status: Option<String>,
     /// New priority (use `null`/omit to leave unchanged).
