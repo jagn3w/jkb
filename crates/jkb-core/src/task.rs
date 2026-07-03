@@ -403,7 +403,7 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
     let mut qa = QuickAdd::default();
     let mut title_words: Vec<String> = Vec::new();
 
-    for token in tokenize(input) {
+    for token in tokenize(input)? {
         if let Some(v) = token.strip_prefix("!p") {
             qa.priority = Some(
                 v.parse::<i64>()
@@ -445,7 +445,10 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
 }
 
 /// Split `input` into tokens on whitespace, keeping `"…"`-quoted spans together.
-fn tokenize(input: &str) -> Vec<String> {
+///
+/// # Errors
+/// Returns a validation error if a `"` is opened but never closed.
+fn tokenize(input: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
@@ -463,10 +466,13 @@ fn tokenize(input: &str) -> Vec<String> {
             c => current.push(c),
         }
     }
+    if in_quote {
+        return Err(bad(input, "unterminated `\"` quote"));
+    }
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens
+    Ok(tokens)
 }
 
 /// Strip a single pair of surrounding double quotes, if present.
@@ -520,6 +526,12 @@ mod tests {
         assert!(parse_quick_add("!px review").is_err());
         assert!(parse_quick_add("#nofacet review").is_err());
         assert!(parse_quick_add("!p1 @2026-01-01").is_err()); // no title
+    }
+
+    #[test]
+    fn quick_add_rejects_unterminated_quote() {
+        let err = parse_quick_add("fix bug \"quoted title").unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
     }
 
     #[test]
