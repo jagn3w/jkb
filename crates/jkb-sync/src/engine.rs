@@ -824,7 +824,11 @@ fn reconcile_edges(
         let mut current = edge::edges_from_many(conn, &srcs, kind)?;
         for &src in &srcs {
             let want = desired.get(&src).cloned().unwrap_or_default();
-            let have: HashSet<ItemId> = current.remove(&src).unwrap_or_default().into_iter().collect();
+            let have: HashSet<ItemId> = current
+                .remove(&src)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             for &dst in want.difference(&have) {
                 edge::link(conn, meta, src, dst, kind, None)?;
             }

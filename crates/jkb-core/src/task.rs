@@ -19,6 +19,7 @@ use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, PlacementRole, TaskStatus};
 
+use crate::dsl::{has_unterminated_quote, tokenize, unquote};
 use crate::query::{Query, Scope, TagPred};
 use crate::store::WriteMeta;
 use crate::{binding, changelog, edge, item, ns, placement, tag, Error, Result};
@@ -403,7 +404,10 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
     let mut qa = QuickAdd::default();
     let mut title_words: Vec<String> = Vec::new();
 
-    for token in tokenize(input)? {
+    if has_unterminated_quote(input) {
+        return Err(bad(input, "unterminated `\"` quote"));
+    }
+    for token in tokenize(input) {
         if let Some(v) = token.strip_prefix("!p") {
             qa.priority = Some(
                 v.parse::<i64>()
@@ -442,44 +446,6 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
         return Err(bad(input, "a task needs a title"));
     }
     Ok(qa)
-}
-
-/// Split `input` into tokens on whitespace, keeping `"…"`-quoted spans together.
-///
-/// # Errors
-/// Returns a validation error if a `"` is opened but never closed.
-fn tokenize(input: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in input.chars() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                current.push(c);
-            }
-            c if c.is_whitespace() && !in_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if in_quote {
-        return Err(bad(input, "unterminated `\"` quote"));
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    Ok(tokens)
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s)
 }
 
 /// Build an actionable parse error naming the offending token.

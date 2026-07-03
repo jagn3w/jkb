@@ -13,6 +13,7 @@ mod store;
 
 pub mod binding;
 pub mod blob;
+pub mod dsl;
 pub mod edge;
 pub mod item;
 pub mod mount;
