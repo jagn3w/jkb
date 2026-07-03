@@ -278,6 +278,13 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
+    // (best-effort, silent). Skipped for explicit `jkb commands …` so it never fights the
+    // user's own install/uninstall.
+    if !matches!(cli.command, Command::Commands { .. }) {
+        commands::ensure_installed();
+    }
+
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     let db = open_db(&db_path)?;
     let json = cli.json;
