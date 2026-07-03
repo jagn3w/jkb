@@ -809,6 +809,7 @@ fn reconcile_edges(
     doc: &SyncDoc,
     resolved: &HashMap<String, ItemId>,
 ) -> Result<()> {
+    let srcs: Vec<ItemId> = resolved.values().copied().collect();
     for kind in [EdgeType::ParentOf, EdgeType::DependsOn] {
         // desired src -> set(dst) from the doc, mapped to item ids.
         let mut desired: HashMap<ItemId, HashSet<ItemId>> = HashMap::new();
@@ -819,9 +820,11 @@ fn reconcile_edges(
                 }
             }
         }
-        for &src in resolved.values() {
+        // Current edges for all sources in one query, indexed by source.
+        let mut current = edge::edges_from_many(conn, &srcs, kind)?;
+        for &src in &srcs {
             let want = desired.get(&src).cloned().unwrap_or_default();
-            let have: HashSet<ItemId> = edge::edges_from(conn, src, kind)?.into_iter().collect();
+            let have: HashSet<ItemId> = current.remove(&src).unwrap_or_default().into_iter().collect();
             for &dst in want.difference(&have) {
                 edge::link(conn, meta, src, dst, kind, None)?;
             }
@@ -878,30 +881,34 @@ fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) ->
         }
     }
 
+    // Batch the per-item lookups into one query each, keyed by item id, so this is a
+    // constant number of round-trips instead of ~4N for N items.
+    let ids: Vec<ItemId> = resolved.iter().map(|(_, id)| *id).collect();
+    let mut tags = tag::applications_for(conn, &ids)?;
+    let mut mirrors = mirror_paths_for(conn, &ids, &file_ns_path)?;
+    let parents = edge::edges_from_many(conn, &ids, EdgeType::ParentOf)?;
+    let deps = edge::edges_from_many(conn, &ids, EdgeType::DependsOn)?;
+
     for (local_id, id) in &resolved {
         let Some(mut item) = load_item(conn, local_id, *id, &file_ns_path)? else {
             continue;
         };
-        item.tags = tag::applications(conn, *id)?;
-        item.mirrors = mirror_paths(conn, *id, &file_ns_path)?;
+        item.tags = tags.remove(id).unwrap_or_default();
+        item.mirrors = mirrors.remove(id).unwrap_or_default();
         doc.items.push(item);
 
-        for child in edge::edges_from(conn, *id, EdgeType::ParentOf)? {
-            if let Some(dst) = id_to_local.get(&child.get()) {
-                doc.edges.push(crate::serializers::SyncEdge {
-                    src: local_id.clone(),
-                    dst: dst.clone(),
-                    edge_type: EdgeType::ParentOf,
-                });
-            }
-        }
-        for dep in edge::edges_from(conn, *id, EdgeType::DependsOn)? {
-            if let Some(dst) = id_to_local.get(&dep.get()) {
-                doc.edges.push(crate::serializers::SyncEdge {
-                    src: local_id.clone(),
-                    dst: dst.clone(),
-                    edge_type: EdgeType::DependsOn,
-                });
+        for (edge_type, targets) in [
+            (EdgeType::ParentOf, parents.get(id)),
+            (EdgeType::DependsOn, deps.get(id)),
+        ] {
+            for dst_id in targets.into_iter().flatten() {
+                if let Some(dst) = id_to_local.get(&dst_id.get()) {
+                    doc.edges.push(crate::serializers::SyncEdge {
+                        src: local_id.clone(),
+                        dst: dst.clone(),
+                        edge_type,
+                    });
+                }
             }
         }
     }
@@ -961,23 +968,41 @@ fn load_item(
     Ok(Some(item))
 }
 
-/// The reference-placement namespace paths of `id` outside its file namespace subtree,
-/// as `+ns` mirrors, sorted for a stable round-trip.
-fn mirror_paths(conn: &Connection, id: ItemId, file_ns_path: &str) -> Result<Vec<String>> {
+/// The reference-placement namespace paths of the given items outside their file
+/// namespace subtree, as `+ns` mirrors, keyed by item id in one query. Each item's
+/// paths stay ordered (`ORDER BY item_id, n.path`) for a stable round-trip. Items
+/// with no mirrors are absent from the map.
+fn mirror_paths_for(
+    conn: &Connection,
+    ids: &[ItemId],
+    file_ns_path: &str,
+) -> Result<HashMap<ItemId, Vec<String>>> {
+    let mut out: HashMap<ItemId, Vec<String>> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
     let subtree_like = format!("{file_ns_path}/%");
-    let mut stmt = conn.prepare_cached(
-        "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-         WHERE p.item_id = ?1 AND p.role = 'reference'
-           AND n.path != ?2 AND n.path NOT LIKE ?3
-         ORDER BY n.path",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![id.get(), file_ns_path, subtree_like],
-        |r| r.get::<_, String>(0),
-    )?;
-    let mut out = Vec::new();
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT p.item_id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ?
+           AND p.item_id IN ({placeholders})
+         ORDER BY p.item_id, n.path"
+    );
+    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
+    params.push(rusqlite::types::Value::Text(file_ns_path.to_owned()));
+    params.push(rusqlite::types::Value::Text(subtree_like));
+    params.extend(
+        ids.iter()
+            .map(|id| rusqlite::types::Value::Integer(id.get())),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+    })?;
     for row in rows {
-        out.push(row?);
+        let (id, path) = row?;
+        out.entry(id).or_default().push(path);
     }
     Ok(out)
 }
