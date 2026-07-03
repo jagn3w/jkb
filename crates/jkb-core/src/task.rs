@@ -19,6 +19,7 @@ use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, PlacementRole, TaskStatus};
 
+use crate::dsl::{tokenize, unquote};
 use crate::query::{Query, Scope, TagPred};
 use crate::store::WriteMeta;
 use crate::{binding, changelog, edge, item, ns, placement, tag, Error, Result};
@@ -442,38 +443,6 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
         return Err(bad(input, "a task needs a title"));
     }
     Ok(qa)
-}
-
-/// Split `input` into tokens on whitespace, keeping `"…"`-quoted spans together.
-fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in input.chars() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                current.push(c);
-            }
-            c if c.is_whitespace() && !in_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s)
 }
 
 /// Build an actionable parse error naming the offending token.
