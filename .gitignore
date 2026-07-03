@@ -3,6 +3,8 @@
 .claude/*
 !.claude/commands/
 !.claude/workflows/
+!.claude/hooks/
+!.claude/settings.json
 openspec/
 .codereviews/
 .backlog/
