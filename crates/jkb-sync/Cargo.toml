@@ -10,7 +10,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
 globset = "0.4"
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
 jkb-types = { version = "0.1.0", path = "../jkb-types" }
