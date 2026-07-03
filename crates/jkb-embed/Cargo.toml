@@ -1,0 +1,22 @@
+[package]
+name = "jkb-embed"
+description = "Pluggable text embeddings behind trait Embedder (ollama default, fastembed feature)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fastembed = { version = "5.17.2", optional = true }
+jkb-types = { version = "0.1.0", path = "../jkb-types" }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+fastembed = ["dep:fastembed"]
+
+[dev-dependencies]
+serde_json.workspace = true

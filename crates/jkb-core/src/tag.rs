@@ -1,0 +1,247 @@
+//! Tag repository: namespaced facets applied to items.
+//!
+//! A facet (e.g. `read_year`, `topic`, `size`) is declared once; applications
+//! attach a value to an item and may carry per-application properties.
+
+use rusqlite::{params, Connection};
+use serde_json::json;
+
+use jkb_types::ItemId;
+
+use crate::store::WriteMeta;
+use crate::{changelog, Result};
+
+/// Declare a facet with a value kind (idempotent).
+///
+/// # Errors
+/// Returns an error if the statement fails.
+pub fn define_facet(conn: &Connection, facet: &str, value_kind: &str) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO tag_defs (facet, value_kind) VALUES (?1, ?2)
+         ON CONFLICT(facet) DO NOTHING",
+    )?
+    .execute(params![facet, value_kind])?;
+    Ok(())
+}
+
+/// Apply `facet = value` to `item` (auto-declaring the facet as `string` if new).
+/// Idempotent on `(item, facet, value)`.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn apply(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    facet: &str,
+    value: &str,
+) -> Result<()> {
+    define_facet(conn, facet, "string")?;
+    let rowid: i64 = conn
+        .prepare_cached(
+            "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id, facet, value) DO UPDATE SET value = value
+             RETURNING rowid",
+        )?
+        .query_row(params![item.get(), facet, value], |row| row.get(0))?;
+    let after = json!({ "item_id": item.get(), "facet": facet, "value": value });
+    changelog::append(
+        conn,
+        meta,
+        "insert",
+        "tag_applications",
+        &rowid.to_string(),
+        None,
+        Some(&after),
+    )?;
+    Ok(())
+}
+
+/// Remove the application `facet = value` from `item` (idempotent — removing an
+/// absent application is a no-op). Paired with [`apply`] so file sync can reconcile a
+/// task's tag set to exactly what the file declares.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn remove(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    facet: &str,
+    value: &str,
+) -> Result<()> {
+    let removed = conn
+        .prepare_cached(
+            "DELETE FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+        )?
+        .execute(params![item.get(), facet, value])?;
+    if removed > 0 {
+        changelog::append(
+            conn,
+            meta,
+            "delete",
+            "tag_applications",
+            &item.get().to_string(),
+            Some(&json!({ "item_id": item.get(), "facet": facet, "value": value })),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// The `(facet, value)` applications on `item`, ordered. Lets sync diff a task's
+/// current tags against the file's declared set.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn applications(conn: &Connection, item: ItemId) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT facet, value FROM tag_applications WHERE item_id = ?1 ORDER BY facet, value",
+    )?;
+    let rows = stmt.query_map([item.get()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The items tagged with `facet = value`.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn items_with(conn: &Connection, facet: &str, value: &str) -> Result<Vec<ItemId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT item_id FROM tag_applications WHERE facet = ?1 AND value = ?2 ORDER BY item_id",
+    )?;
+    let rows = stmt.query_map(params![facet, value], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(ItemId::new(row?));
+    }
+    Ok(out)
+}
+
+/// Rename a facet across its definition and every application. Returns the number
+/// of applications updated.
+///
+/// # Errors
+/// Returns an error if a statement fails (e.g. the new facet collides with an
+/// existing application on the same item and value).
+pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -> Result<usize> {
+    let updated = conn
+        .prepare_cached("UPDATE tag_applications SET facet = ?1 WHERE facet = ?2")?
+        .execute(params![new, old])?;
+    conn.prepare_cached("UPDATE tag_defs SET facet = ?1 WHERE facet = ?2")?
+        .execute(params![new, old])?;
+    changelog::append(
+        conn,
+        meta,
+        "update",
+        "tag_defs",
+        old,
+        Some(&json!({ "facet": old })),
+        Some(&json!({ "facet": new })),
+    )?;
+    Ok(updated)
+}
+
+/// List declared facets as `(facet, value_kind)`, ordered by facet.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn facets(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached("SELECT facet, value_kind FROM tag_defs ORDER BY facet")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply, facets, items_with, rename_facet};
+    use crate::item::{upsert, NewItem};
+    use crate::Db;
+
+    #[test]
+    fn tagged_items_are_found_by_facet_and_value() {
+        let db = Db::open_in_memory().unwrap();
+        let sicp = db
+            .write_txn("t", |conn, meta| {
+                let sicp = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "book:sicp".to_owned(),
+                        kind: "document".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                apply(conn, meta, sicp, "read_year", "2025")?;
+                apply(conn, meta, sicp, "read_year", "2025")?; // idempotent
+                Ok(sicp)
+            })
+            .unwrap();
+
+        let hits = db
+            .read(|conn| items_with(conn, "read_year", "2025"))
+            .unwrap();
+        assert_eq!(hits, vec![sicp]);
+
+        let misses = db
+            .read(|conn| items_with(conn, "read_year", "2024"))
+            .unwrap();
+        assert!(misses.is_empty());
+    }
+
+    #[test]
+    fn renaming_a_facet_moves_applications_and_defs() {
+        let db = Db::open_in_memory().unwrap();
+        let item = db
+            .write_txn("t", |conn, meta| {
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "book".to_owned(),
+                        kind: "document".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                apply(conn, meta, item, "year_read", "2025")?;
+                Ok(item)
+            })
+            .unwrap();
+
+        let updated = db
+            .write_txn("t", |conn, meta| {
+                rename_facet(conn, meta, "year_read", "read_year")
+            })
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        assert_eq!(
+            db.read(move |conn| items_with(conn, "read_year", "2025"))
+                .unwrap(),
+            vec![item]
+        );
+        assert!(db
+            .read(|conn| items_with(conn, "year_read", "2025"))
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .read(facets)
+            .unwrap()
+            .iter()
+            .any(|(facet, _)| facet == "read_year"));
+    }
+}

@@ -1,0 +1,47 @@
+# Workspace root. jkb is a Cargo *workspace*: many small crates that share one
+# build, one lockfile, and one set of lints. Members live under `crates/`.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Fields every member inherits via `<field>.workspace = true`, so version/edition
+# are defined once here instead of in nine places.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["John Agnew <john.v.agnew@gmail.com>"]
+
+# Lints applied workspace-wide. Each crate opts in with `[lints] workspace = true`.
+# `unsafe_code = "deny"` is the whole-project no-unsafe guarantee (design D16). It was
+# `forbid` through Section 5; Section 6 relaxed it to `deny` because registering the
+# `sqlite-vec` extension needs exactly one FFI call with no safe wrapper. `deny` still
+# fails the build on any unsafe, but (unlike `forbid`) permits a narrow, commented
+# `#[allow(unsafe_code)]` — used only in `jkb-index`'s isolated vector module (per D9,
+# all `sqlite-vec` code lives in one module). Every other crate remains unsafe-free.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# `pedantic` is an opinionated extra clippy group. `priority = -1` lets us allow
+# individual pedantic lints later without disabling the whole group.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Shared dependency versions live here as we add them, so every crate uses the
+# same version of a given dependency. (Populated per section as we implement.)
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+# Pinned once here so every crate shares ONE `libsqlite3-sys` (bundled). Desyncing
+# the version across crates reintroduces the `links = "sqlite3"` conflict, so all
+# SQLite-touching crates use `rusqlite = { workspace = true }`. Kept at 0.39 to match
+# refinery 0.9.2's libsqlite3-sys (jkb-core).
+rusqlite = { version = "0.39", features = ["bundled"] }
+# HTTP client. jkb-embed talks to the local ollama server; jkb-ingest reuses it
+# for URL fetching. Kept TLS-free here (embed only hits http://localhost); crates
+# that need https opt into a TLS feature (see tasks.md 7.3).
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json"] }
+# dev-only
+serde_json = "1"
+proptest = "1"

@@ -1,0 +1,34 @@
+[package]
+name = "jkb-cli"
+description = "The jkb command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The crate is `jkb-cli` but the installed binary is `jkb`.
+[[bin]]
+name = "jkb"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive"] }
+ctrlc = "3.5.2"
+jkb-core = { version = "0.1.0", path = "../jkb-core" }
+jkb-embed = { version = "0.1.0", path = "../jkb-embed" }
+jkb-index = { version = "0.1.0", path = "../jkb-index" }
+jkb-ingest = { version = "0.1.0", path = "../jkb-ingest" }
+jkb-mcp = { version = "0.1.0", path = "../jkb-mcp" }
+jkb-search = { version = "0.1.0", path = "../jkb-search" }
+jkb-sync = { version = "0.1.0", path = "../jkb-sync" }
+jkb-types = { version = "0.1.0", path = "../jkb-types" }
+serde_json.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"

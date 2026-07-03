@@ -1,0 +1,13 @@
+.claude/
+openspec/
+.codereviews/
+.backlog/
+
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# jkb local databases and backups (tests use temp dirs; never commit a live DB)
+*.db
+*.db-wal
+*.db-shm
