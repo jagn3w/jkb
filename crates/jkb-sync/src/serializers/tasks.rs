@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use jkb_core::dsl::{tokenize, unquote};
 use jkb_types::{EdgeType, Error as TypeError};
 
 use super::{SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
@@ -416,38 +417,6 @@ fn is_uri_safe(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Split on whitespace, keeping `"…"`-quoted spans together (mirrors `jkb_core::task`).
-fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in input.chars() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                current.push(c);
-            }
-            c if c.is_whitespace() && !in_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s)
 }
 
 /// Parse a header line `#{1,6} text`, returning `(level, text)`. Only lines starting

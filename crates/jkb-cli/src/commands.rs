@@ -51,7 +51,13 @@ fn base_dir() -> Result<PathBuf> {
 
 /// Write `set` into `dir`, naming each file `{prefix}{stem}.{ext}`. Prints each write when
 /// `verbose` (an explicit `install`); stays silent for the auto-install path.
-fn write_set(dir: &Path, prefix: &str, ext: &str, set: &[(&str, &str)], verbose: bool) -> Result<()> {
+fn write_set(
+    dir: &Path,
+    prefix: &str,
+    ext: &str,
+    set: &[(&str, &str)],
+    verbose: bool,
+) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     for (stem, body) in set {
         let path = dir.join(format!("{prefix}{stem}.{ext}"));
@@ -101,7 +107,13 @@ fn remove_set(dir: &Path, prefix: &str, ext: &str, set: &[(&str, &str)]) -> Resu
 /// Returns an error if `HOME` is unset or an asset can't be written.
 pub fn install() -> Result<()> {
     let base = base_dir()?;
-    write_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS, true)?;
+    write_set(
+        &base.join("commands"),
+        CMD_PREFIX,
+        "md",
+        BUNDLED_COMMANDS,
+        true,
+    )?;
     write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS, true)?;
     std::fs::write(stamp_path(&base), fingerprint()).context("writing asset stamp")?;
     println!(
@@ -164,7 +176,13 @@ fn try_ensure() -> Result<()> {
     if std::fs::read_to_string(&stamp).ok().as_deref() == Some(want.as_str()) {
         return Ok(());
     }
-    write_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS, false)?;
+    write_set(
+        &base.join("commands"),
+        CMD_PREFIX,
+        "md",
+        BUNDLED_COMMANDS,
+        false,
+    )?;
     write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS, false)?;
     std::fs::write(&stamp, want).context("writing asset stamp")?;
     Ok(())
