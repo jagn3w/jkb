@@ -470,10 +470,36 @@ fn header(line: &str) -> Option<(usize, &str)> {
     }
 }
 
-/// Parse a task line, returning `(indent_spaces, status, rest_after_checkbox)`.
+/// Tab stop width used to expand a leading `\t` into a visual column count when
+/// measuring task indentation (see `task_line`).
+const TAB_WIDTH: usize = 4;
+
+/// Visual indentation width of a run of leading whitespace: a space is one
+/// column, a tab advances to the next `TAB_WIDTH` stop. Used only for *relative*
+/// nesting comparison, so the exact width is immaterial as long as deeper
+/// (more-indented) lines yield strictly larger widths.
+fn indent_width(ws: &str) -> usize {
+    let mut col = 0;
+    for c in ws.chars() {
+        if c == '\t' {
+            col = (col / TAB_WIDTH + 1) * TAB_WIDTH;
+        } else {
+            col += 1;
+        }
+    }
+    col
+}
+
+/// Parse a task line, returning `(indent_width, status, rest_after_checkbox)`.
+///
+/// `indent_width` is a visual column count (see `indent_width`) used only for the
+/// *relative* nesting comparison in `on_task`; tabs count as indentation so a
+/// Tab-nested subtask (`"\t- [ ] child"`) still parents under a preceding
+/// less-indented task instead of collapsing to depth 0.
 fn task_line(line: &str) -> Option<(usize, &'static str, &str)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    let trimmed = &line[indent..];
+    let ws_bytes = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent = indent_width(&line[..ws_bytes]);
+    let trimmed = &line[ws_bytes..];
     let after = trimmed.strip_prefix("- [")?;
     let mark = after.chars().next()?;
     let status = match mark {
@@ -686,5 +712,20 @@ Some description.
             .unwrap();
         assert!(doc.items.iter().all(|i| i.kind == "text"));
         assert!(TasksSerializer.quarantine_on_parse_error());
+    }
+
+    #[test]
+    fn tab_indented_subtask_nests_under_parent() {
+        // A subtask nested with a Tab (not spaces) must still parent under the
+        // preceding less-indented task instead of collapsing to depth 0.
+        let doc = TasksSerializer
+            .parse(b"- [ ] parent ^p\n\t- [ ] child ^c\n")
+            .unwrap();
+        let child = doc.items.iter().find(|i| i.local_id == "c").unwrap();
+        assert_eq!(child.parent.as_deref(), Some("p"));
+        assert!(doc
+            .edges
+            .iter()
+            .any(|e| e.src == "p" && e.dst == "c" && e.edge_type == jkb_types::EdgeType::ParentOf));
     }
 }
