@@ -66,6 +66,11 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
         }
     }
     st.flush_text();
+    if let Some(missing) = dangling_dependency(&st.doc) {
+        return Err(bad(&format!(
+            "task dependency `needs:^{missing}` names an id that is not defined in this file"
+        )));
+    }
     if has_dependency_cycle(&st.doc) {
         return Err(bad("task dependencies (`needs:^…`) form a cycle"));
     }
@@ -186,6 +191,21 @@ impl ParseState {
         }
         Ok(())
     }
+}
+
+/// The `dst` of the first `depends_on` edge whose target is not defined in the file, if
+/// any. A `needs:^id` whose `^id` names no task (a typo, or the target line was deleted)
+/// would otherwise be silently dropped by the engine's `reconcile_edges` (which skips any
+/// edge endpoint that doesn't resolve to an item id), losing the user-declared dependency
+/// permanently and invisibly. Surfacing it as a parse error routes the file to quarantine
+/// so the mistake is flagged instead of swallowed.
+fn dangling_dependency(doc: &SyncDoc) -> Option<String> {
+    let defined: HashSet<&str> = doc.items.iter().map(|i| i.local_id.as_str()).collect();
+    doc.edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::DependsOn)
+        .find(|e| !defined.contains(e.dst.as_str()))
+        .map(|e| e.dst.clone())
 }
 
 /// Whether the `depends_on` edges among the file's tasks contain a cycle. Detecting it
@@ -569,6 +589,7 @@ Some description.
   - [x] Write the harness ^write-harness
 ## 2. Frontend
 - [~] Ship the button ^ship
+- [ ] Set up CI ^setup
 ";
 
     #[test]
@@ -580,7 +601,7 @@ Some description.
         assert_eq!(doc.sections[1].path, "2-frontend");
 
         let tasks: Vec<_> = doc.items.iter().filter(|i| i.kind == "task").collect();
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         let fix = &tasks[0];
         assert_eq!(fix.content, "Fix the flaky test");
         assert_eq!(fix.local_id, "fix-flaky");
@@ -677,6 +698,24 @@ Some description.
         assert!(TasksSerializer
             .parse(b"- [ ] a needs:^b ^a\n- [ ] b needs:^a ^b\n")
             .is_err());
+    }
+
+    #[test]
+    fn dangling_needs_id_errors() {
+        // `needs:^missing` names an id no task in the file defines. Rather than silently
+        // drop the dependency (the engine's reconcile_edges would skip the unresolved
+        // endpoint), parsing errors so the file is quarantined for the user to fix.
+        let err = TasksSerializer
+            .parse(b"- [ ] a needs:^ghost ^a\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ghost"),
+            "error should name the missing id: {err}"
+        );
+        // A dependency on a real id still parses cleanly.
+        assert!(TasksSerializer
+            .parse(b"- [ ] a needs:^b ^a\n- [ ] b ^b\n")
+            .is_ok());
     }
 
     #[test]
