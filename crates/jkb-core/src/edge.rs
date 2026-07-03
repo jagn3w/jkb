@@ -146,7 +146,10 @@ pub fn edges_from_many(
     params.extend(srcs.iter().map(|id| SqlValue::Integer(id.get())));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
-        Ok((ItemId::new(r.get::<_, i64>(0)?), ItemId::new(r.get::<_, i64>(1)?)))
+        Ok((
+            ItemId::new(r.get::<_, i64>(0)?),
+            ItemId::new(r.get::<_, i64>(1)?),
+        ))
     })?;
     for row in rows {
         let (src, dst) = row?;
