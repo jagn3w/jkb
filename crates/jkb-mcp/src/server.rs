@@ -156,7 +156,7 @@ impl JkbServer {
 
     /// Update a task's status/priority/due (audited).
     #[tool(
-        description = "Update a task by uid: status (open/in_progress/done/cancelled; blocked is rejected), priority, or due."
+        description = "Update a task by uid: status (open/in_progress/needs_review/done/cancelled; blocked is rejected), priority, or due."
     )]
     async fn task_update(
         &self,

@@ -283,6 +283,7 @@ fn render_task(
     let checkbox = match item.status.as_deref() {
         Some("done") => 'x',
         Some("in_progress") => '~',
+        Some("needs_review") => '?',
         Some("cancelled") => '-',
         _ => ' ',
     };
@@ -479,6 +480,7 @@ fn task_line(line: &str) -> Option<(usize, &'static str, &str)> {
         ' ' => "open",
         'x' | 'X' => "done",
         '~' => "in_progress",
+        '?' => "needs_review",
         '-' => "cancelled",
         _ => return None,
     };
@@ -641,6 +643,15 @@ Some description.
         let task = &doc.items[0];
         assert!(task.local_id.starts_with("no-id-here-"));
         assert_eq!(task.status.as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn needs_review_checkbox_round_trips() {
+        let s = TasksSerializer;
+        let doc = s.parse(b"- [?] awaiting approval ^rev\n").unwrap();
+        assert_eq!(doc.items[0].status.as_deref(), Some("needs_review"));
+        let text = String::from_utf8(s.render(&doc).unwrap()).unwrap();
+        assert!(text.contains("- [?] awaiting approval ^rev"));
     }
 
     #[test]

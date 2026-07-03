@@ -63,7 +63,8 @@ pub struct SyncItem {
     pub section: Option<String>,
     /// Order within the owning section (tasks and text items interleave).
     pub position: i64,
-    /// Task status (`open`/`in_progress`/`done`/`cancelled`); `None` for non-tasks.
+    /// Task status (`open`/`in_progress`/`needs_review`/`done`/`cancelled`); `None` for
+    /// non-tasks.
     pub status: Option<String>,
     /// Task priority (`!pN`); `None` if unset.
     pub priority: Option<i64>,

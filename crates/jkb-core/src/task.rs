@@ -222,7 +222,8 @@ pub fn set_status(
 ///
 /// # Errors
 /// Returns a validation error if `status` is not a settable status
-/// (`open`/`in_progress`/`done`/`cancelled`), or the errors of [`set_status`].
+/// (`open`/`in_progress`/`needs_review`/`done`/`cancelled`), or the errors of
+/// [`set_status`].
 pub fn set_status_str(
     conn: &Connection,
     meta: &WriteMeta,
@@ -231,8 +232,8 @@ pub fn set_status_str(
 ) -> Result<()> {
     let parsed = TaskStatus::from_manual_str(status).ok_or_else(|| {
         Error::Types(TypeError::Validation(format!(
-            "cannot set status `{status}`: settable statuses are open, in_progress, done, \
-             cancelled (blocked is derived from depends_on edges, not set)"
+            "cannot set status `{status}`: settable statuses are open, in_progress, \
+             needs_review, done, cancelled (blocked is derived from depends_on edges, not set)"
         )))
     })?;
     set_status(conn, meta, task, parsed)
@@ -299,11 +300,12 @@ pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&s
     Ok(())
 }
 
-/// Whether `task` is **blocked**: it has a `depends_on` edge to a task that is not
-/// yet terminal (`done` *or* `cancelled`). This is the derived state that stands in
-/// for a stored `blocked` status (design D19); it mirrors the anti-join in
-/// [`crate::query`]'s `is:ready`. A cancelled dependency will never complete, so it
-/// unblocks rather than blocks its dependents.
+/// Whether `task` is **blocked**: it has a `depends_on` edge to a task that is not yet
+/// settled — i.e. not `done`/`cancelled`/`needs_review` (see
+/// `TaskStatus::unblocks_dependents`). This is the derived state that stands in for a
+/// stored `blocked` status (design D19); it mirrors the anti-join in [`crate::query`]'s
+/// `is:ready`. A cancelled dependency will never complete and a `needs_review` one is
+/// finished enough to proceed on, so both unblock rather than block their dependents.
 ///
 /// # Errors
 /// Returns an error if the query fails.
@@ -313,6 +315,7 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
             "SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
              WHERE e.src_item_id = ?1 AND e.type = 'depends_on'
                AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
+               AND d.status IS NOT 'needs_review'
              LIMIT 1",
         )?
         .query_row([task.get()], |row| row.get(0))
@@ -637,6 +640,34 @@ mod tests {
         // (terminal) is not itself ready.
         db.write_txn("t", move |conn, meta| {
             set_status_str(conn, meta, b, "cancelled")
+        })
+        .unwrap();
+        assert!(!db.read(move |conn| is_blocked(conn, a)).unwrap());
+        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        assert_eq!(uids(&frontier), vec!["task:a".to_owned()]);
+    }
+
+    #[test]
+    fn needs_review_dependency_unblocks_but_is_not_itself_ready() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = db
+            .write_txn("t", |conn, meta| {
+                let b = create(conn, meta, &NewTask::new("task:b", "b"))?;
+                let mut a_spec = NewTask::new("task:a", "a");
+                a_spec.depends_on = vec!["task:b".to_owned()];
+                let a = create(conn, meta, &a_spec)?;
+                Ok((a, b))
+            })
+            .unwrap();
+
+        // While b is open, a is blocked.
+        assert!(db.read(move |conn| is_blocked(conn, a)).unwrap());
+
+        // Move b to needs_review: its work is done pending approval, so a unblocks and
+        // becomes ready — but b, awaiting review, is NOT itself in the frontier (and is
+        // not terminal/done).
+        db.write_txn("t", move |conn, meta| {
+            set_status_str(conn, meta, b, "needs_review")
         })
         .unwrap();
         assert!(!db.read(move |conn| is_blocked(conn, a)).unwrap());

@@ -166,15 +166,20 @@ impl Query {
             }
         }
         if self.ready {
-            // A task is ready if it is non-terminal and every `depends_on` target is
-            // itself terminal (`done` *or* `cancelled`): a cancelled dependency will
-            // never complete, so it unblocks rather than blocks its dependents.
+            // A task is ready if it is itself unsettled and every `depends_on` target is
+            // settled. The settled set is `done`/`cancelled`/`needs_review` (see
+            // `TaskStatus::unblocks_dependents`): a cancelled dependency will never
+            // complete, and a `needs_review` one is finished enough to proceed on, so both
+            // unblock rather than block their dependents. `IS NOT` keeps NULL-status rows
+            // (non-tasks) treated as unsettled, matching the pre-`needs_review` behaviour.
             clauses.push(
                 "i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
+                   AND i.status IS NOT 'needs_review'
                  AND NOT EXISTS (
                      SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
                      WHERE e.src_item_id = i.id AND e.type = 'depends_on'
                        AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
+                       AND d.status IS NOT 'needs_review'
                  )"
                 .to_owned(),
             );
