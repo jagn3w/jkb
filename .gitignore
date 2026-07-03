@@ -1,4 +1,8 @@
-.claude/
+# Ignore local Claude config, but commit the bundled slash commands + workflows so they
+# ship across machines (and the jkb binary can embed them at build time).
+.claude/*
+!.claude/commands/
+!.claude/workflows/
 openspec/
 .codereviews/
 .backlog/
@@ -11,3 +15,6 @@ openspec/
 *.db
 *.db-wal
 *.db-shm
+
+# /task-swarm integration + per-task git worktrees
+.swarm/
