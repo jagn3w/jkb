@@ -16,7 +16,9 @@ export const meta = {
 // (integration branch + its worktree) is done by the command BEFORE launch; this
 // script only orchestrates agents.
 // ---------------------------------------------------------------------------
-const cfg = args || {}
+// `args` may arrive as a JSON-encoded string (depending on how the launcher
+// serializes it); parse defensively so cfg is always an object.
+const cfg = (typeof args === 'string' ? JSON.parse(args) : args) || {}
 const JKB = cfg.jkb || 'jkb' // how to invoke the jkb binary
 const DB = cfg.db ? ` --db ${cfg.db}` : '' // optional --db flag
 const SCOPE = cfg.scope || '' // a jkb DSL scope, e.g. "ns:codereviews/**"
