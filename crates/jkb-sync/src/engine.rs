@@ -1003,6 +1003,10 @@ struct Sig {
     priority: Option<i64>,
     due: Option<String>,
     section: Option<String>,
+    /// The item's parent `local_id` (its `parent_of` incoming edge). Part of the
+    /// signature so a re-parenting/indentation change on either side is detected —
+    /// without it a nesting edit has an identical `Sig` and is silently reverted.
+    parent: Option<String>,
     tags: Vec<(String, String)>,
     mirrors: Vec<String>,
     deps: Vec<String>,
@@ -1011,12 +1015,17 @@ struct Sig {
 /// Signatures of every item in `doc`, keyed by `local_id`.
 fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
     let mut deps: HashMap<&str, Vec<String>> = HashMap::new();
-    for e in doc
-        .edges
-        .iter()
-        .filter(|e| e.edge_type == EdgeType::DependsOn)
-    {
-        deps.entry(&e.src).or_default().push(e.dst.clone());
+    // `parent_of` edges run parent(src) -> child(dst); key the child's parent by dst so
+    // a re-parenting shows up in the child's signature (the edge's authoritative form).
+    let mut parent_of: HashMap<&str, String> = HashMap::new();
+    for e in &doc.edges {
+        match e.edge_type {
+            EdgeType::DependsOn => deps.entry(&e.src).or_default().push(e.dst.clone()),
+            EdgeType::ParentOf => {
+                parent_of.insert(&e.dst, e.src.clone());
+            }
+            _ => {}
+        }
     }
     doc.items
         .iter()
@@ -1035,6 +1044,7 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
                     priority: i.priority,
                     due: i.due.clone(),
                     section: i.section.clone(),
+                    parent: parent_of.get(i.local_id.as_str()).cloned(),
                     tags,
                     mirrors,
                     deps: d,
@@ -1085,24 +1095,44 @@ fn three_way(base: &SyncDoc, disk: &SyncDoc, kb: &SyncDoc) -> ThreeWay {
     ids.sort();
     ids.dedup();
 
-    let mut present: HashSet<String> = HashSet::new();
-    for id in ids {
-        let side = if changed_disk.contains(&id) {
+    let chosen_side = |id: &str| -> &SyncDoc {
+        if changed_disk.contains(id) {
             disk
-        } else if changed_kb.contains(&id) {
+        } else if changed_kb.contains(id) {
             kb
         } else {
             base
-        };
-        if let Some(item) = side.items.iter().find(|i| i.local_id == id) {
+        }
+    };
+
+    let mut present: HashSet<String> = HashSet::new();
+    for id in &ids {
+        let side = chosen_side(id);
+        if let Some(item) = side.items.iter().find(|i| &i.local_id == id) {
             merged.items.push(item.clone());
             present.insert(id.clone());
-            for e in side.edges.iter().filter(|e| e.src == id) {
+        }
+    }
+
+    // Emit each edge from its *owner's* chosen side, so a per-item edit picks up its own
+    // edges: `depends_on` is owned by its `src` (the dependent), `parent_of` by its `dst`
+    // (the child — its indentation). Taking every edge by `src` alone drops a re-parented
+    // child's incoming edge when only the child changed (its parent item stays on `base`).
+    for id in &ids {
+        let side = chosen_side(id);
+        for e in &side.edges {
+            let owner = match e.edge_type {
+                EdgeType::ParentOf => &e.dst,
+                _ => &e.src,
+            };
+            if owner == id {
                 merged.edges.push(e.clone());
             }
         }
     }
-    merged.edges.retain(|e| present.contains(&e.dst));
+    merged
+        .edges
+        .retain(|e| present.contains(&e.src) && present.contains(&e.dst));
     ThreeWay::Merged(merged)
 }
 
