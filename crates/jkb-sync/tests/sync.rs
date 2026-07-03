@@ -700,3 +700,79 @@ fn malformed_file_is_quarantined_then_recovers() {
     assert!(report.count(Outcome::Imported) + report.count(Outcome::Merged) >= 1);
     assert_eq!(journal(&db, &uri).unwrap().0, "ok");
 }
+
+/// Whether a `parent_of` edge runs from `parent_uri` to `child_uri`.
+fn has_parent_edge(db: &Db, parent_uri: &str, child_uri: &str) -> bool {
+    let parent_uri = parent_uri.to_owned();
+    let child_uri = child_uri.to_owned();
+    db.read(move |conn| {
+        let (Some(parent), Some(child)) = (
+            binding::item_for_uri(conn, &parent_uri)?,
+            binding::item_for_uri(conn, &child_uri)?,
+        ) else {
+            return Ok(false);
+        };
+        Ok(
+            jkb_core::edge::edges_from(conn, parent, jkb_types::EdgeType::ParentOf)?
+                .contains(&child),
+        )
+    })
+    .unwrap()
+}
+
+#[test]
+fn disk_reindent_survives_a_three_way_merge() {
+    // Regression: a re-parenting (indentation) edit on disk is a `parent_of` change, which
+    // the merge signature must capture — otherwise a both-sides-changed merge silently
+    // reverts it (the child's `Sig` looks identical and the edge is taken from `base`).
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // Initially `fix` is a top-level sibling of `setup`, not its child.
+    assert!(!has_parent_edge(
+        &db,
+        &format!("{uri}#setup"),
+        &format!("{uri}#fix")
+    ));
+
+    // Disk re-indents `fix` under `setup` (a pure `parent_of` change). Independently, the
+    // KB edits a *different* task (`ship`) so the reconcile takes the both-changed →
+    // three-way merge path rather than a plain import.
+    kb_set_status(&db, &format!("{uri}#ship"), "in_progress");
+    fs::write(
+        &file,
+        "<!-- notes -->\n## Backend\n- [ ] Set up CI ^setup\n  - [ ] Fix flaky test !p1 needs:^setup ^fix\n## Frontend\n- [x] Ship button ^ship\n",
+    )
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Merged),
+        1,
+        "expected a three-way merge"
+    );
+
+    // The re-parenting landed in the KB…
+    assert!(
+        has_parent_edge(&db, &format!("{uri}#setup"), &format!("{uri}#fix")),
+        "disk re-indent was dropped by the merge"
+    );
+    // …the disjoint KB edit survived…
+    assert_eq!(
+        status_of(&db, &format!("{uri}#ship")).as_deref(),
+        Some("in_progress")
+    );
+    // …and the file was not reverted to the flat base — the child stays indented.
+    assert!(
+        fs::read_to_string(&file)
+            .unwrap()
+            .contains("  - [ ] Fix flaky test"),
+        "file lost its indentation"
+    );
+}
