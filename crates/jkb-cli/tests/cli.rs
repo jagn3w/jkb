@@ -247,6 +247,232 @@ fn doctor_reports_integrity_and_version() {
     assert!(backup.exists());
 }
 
+/// Add a task via the CLI and return its minted uid (`--json` emits `{uid}`).
+fn add_task(db: &Path, text: &str) -> String {
+    let out = jkb(db)
+        .args(["--json", "task", "add", text])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["uid"].as_str().unwrap().to_string()
+}
+
+/// Read one task's `status` via `task show --json`.
+fn task_status(db: &Path, uid: &str) -> String {
+    let out = jkb(db)
+        .args(["--json", "task", "show", uid])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["status"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn task_set_status_priority_due_roundtrips_and_is_undoable() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "editable task");
+
+    jkb(&db)
+        .args([
+            "task", "set", &uid, "--status", "in_progress", "--priority", "2", "--due",
+            "2026-08-01",
+        ])
+        .assert()
+        .success();
+    assert_eq!(task_status(&db, &uid), "in_progress");
+
+    // The last mutation (set due) is undoable like any other write.
+    jkb(&db).args(["undo"]).assert().success();
+}
+
+#[test]
+fn task_set_blocked_status_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "a task");
+    jkb(&db)
+        .args(["task", "set", &uid, "--status", "blocked"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_depend_excludes_from_frontier_and_refuses_cycles() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let a = add_task(&db, "task a");
+    let b = add_task(&db, "task b");
+
+    // a depends_on b → a drops out of the ready frontier, b remains.
+    jkb(&db).args(["task", "depend", &a, &b]).assert().success();
+    let out = jkb(&db)
+        .args(["--global", "--json", "task", "next"])
+        .output()
+        .unwrap();
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uids: Vec<&str> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["uid"].as_str().unwrap())
+        .collect();
+    assert!(uids.contains(&b.as_str()));
+    assert!(!uids.contains(&a.as_str()));
+
+    // b depends_on a would close a cycle a→b→a: refused by the cycle guard.
+    jkb(&db).args(["task", "depend", &b, &a]).assert().failure();
+
+    // Detaching the dependency returns a to the frontier.
+    jkb(&db)
+        .args(["task", "undepend", &a, &b])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["--global", "task", "next"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task a"));
+}
+
+#[test]
+fn task_tag_add_and_remove_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "taggable");
+
+    jkb(&db)
+        .args(["task", "tag", "add", &uid, "size=small"])
+        .assert()
+        .success();
+    // Filtering the frontier by the tag finds it.
+    jkb(&db)
+        .args(["--global", "task", "next", "#size=small"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("taggable"));
+
+    jkb(&db)
+        .args(["task", "tag", "rm", &uid, "size=small"])
+        .assert()
+        .success();
+    // A malformed tag is rejected.
+    jkb(&db)
+        .args(["task", "tag", "add", &uid, "nofacet"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn task_place_and_bind_are_orthogonal() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "placeable");
+
+    // A reference mirror under a repo namespace makes the task visible when scoped there.
+    jkb(&db)
+        .args(["task", "place", &uid, "repos/app/backend"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "next", "ns:repos/app/**"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("placeable"));
+
+    // Binding is the other axis: switch to a synced file uri, then back to managed.
+    jkb(&db)
+        .args(["task", "bind", &uid, "--sync", "file:///tmp/placeable.md"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &uid, "--managed"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn task_claim_flips_status_and_excludes_from_frontier() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "claimable");
+
+    // Claim with an explicit owner: the task becomes in_progress and leaves the frontier.
+    jkb(&db)
+        .args(["task", "claim", &uid, "--owner", "host:1234"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in_progress"));
+    assert_eq!(task_status(&db, &uid), "in_progress");
+    jkb(&db)
+        .args(["--global", "task", "next"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claimable").not());
+
+    // Release returns it to the frontier (status stays in_progress, claim cleared).
+    jkb(&db)
+        .args(["task", "release", &uid, "--owner", "host:1234"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["--global", "task", "next"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claimable"));
+}
+
+#[test]
+fn doctor_reclaims_orphaned_claims_but_keeps_live_ones() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let dead = add_task(&db, "dead owner task");
+    let live = add_task(&db, "live owner task");
+
+    // `dead` is claimed by a non-existent pid; `live` by this test process (alive during
+    // the doctor run). host:<pid> is the liveness-checkable owner id format.
+    let live_owner = format!("host:{}", std::process::id());
+    jkb(&db)
+        .args(["task", "claim", &dead, "--owner", "host:4294967290"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "claim", &live, "--owner", &live_owner])
+        .assert()
+        .success();
+
+    // A bare doctor run reports the orphaned claim (dead owner) and touches nothing.
+    jkb(&db)
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("orphaned").and(predicate::str::contains("dead owner")));
+
+    // `--fix` clears the orphaned claim; the live owner's claim is retained.
+    jkb(&db)
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared 1 orphaned claim"));
+
+    // The reclaimed task returns to the frontier; the live-owned one stays out.
+    let out = jkb(&db)
+        .args(["--global", "--json", "task", "next"])
+        .output()
+        .unwrap();
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uids: Vec<&str> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["uid"].as_str().unwrap())
+        .collect();
+    assert!(uids.contains(&dead.as_str()));
+    assert!(!uids.contains(&live.as_str()));
+}
+
 #[test]
 fn service_print_emits_a_unit_referencing_the_watcher() {
     let dir = TempDir::new().unwrap();

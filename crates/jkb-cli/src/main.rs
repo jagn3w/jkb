@@ -8,6 +8,7 @@
 
 mod commands;
 mod output;
+mod owner;
 mod service;
 
 use std::path::{Path, PathBuf};
@@ -19,11 +20,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use jkb_core::query::{Query, Scope};
-use jkb_core::{mount, ns, tag, task, undo, view, Db};
+use jkb_core::{binding, claim, edge, mount, ns, placement, tag, task, undo, view, Db};
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_ingest::Pipeline;
 use jkb_search::{Route, Searcher};
-use jkb_types::{ConflictPolicy, Embedder, ItemId, SyncMode};
+use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, PlacementRole, SyncMode};
 
 /// A local-first, agent-native knowledge base.
 #[derive(Parser)]
@@ -148,6 +149,9 @@ enum Command {
         /// Also write a checkpointed backup to this path.
         #[arg(long)]
         backup: Option<PathBuf>,
+        /// Apply repairs: clear claims whose owner process no longer exists.
+        #[arg(long)]
+        fix: bool,
     },
     /// Run the MCP server (Section 13, not yet available).
     Mcp,
@@ -187,6 +191,95 @@ enum TaskCmd {
     Show {
         /// The task uid (the `task:` prefix is optional).
         uid: String,
+    },
+    /// Edit a task's metadata: any of `--status` / `--priority` / `--due`.
+    Set {
+        /// The task uid (the `task:` prefix is optional).
+        uid: String,
+        /// New status (`open`/`in_progress`/`needs_review`/`done`/`cancelled`;
+        /// `blocked` is derived and rejected).
+        #[arg(long)]
+        status: Option<String>,
+        /// New priority (lower is more important).
+        #[arg(long)]
+        priority: Option<i64>,
+        /// New ISO due date, e.g. `2026-07-15`.
+        #[arg(long)]
+        due: Option<String>,
+    },
+    /// Add or remove a `facet=value` tag on a task.
+    Tag {
+        #[command(subcommand)]
+        cmd: TaskTagCmd,
+    },
+    /// Add a `depends_on` edge (cycle-guarded): `<uid>` now depends on `<dep>`.
+    Depend {
+        /// The dependent task uid.
+        uid: String,
+        /// The dependency task uid it should wait on.
+        dep: String,
+    },
+    /// Remove a `depends_on` edge from `<uid>` to `<dep>`.
+    Undepend {
+        /// The dependent task uid.
+        uid: String,
+        /// The dependency task uid to detach.
+        dep: String,
+    },
+    /// Place a task under a namespace: a reference mirror, or its primary `--home`.
+    Place {
+        /// The task uid.
+        uid: String,
+        /// The namespace path to place it under.
+        ns: String,
+        /// Make this the task's sole primary home (default: a reference mirror).
+        #[arg(long)]
+        home: bool,
+    },
+    /// Bind a task to storage: `--managed` (no file) or `--sync <uri>` (a file mount).
+    Bind {
+        /// The task uid.
+        uid: String,
+        /// Bind as `managed:` — not written to any repo.
+        #[arg(long, conflicts_with = "sync")]
+        managed: bool,
+        /// Bind to a synced `file://` uri.
+        #[arg(long)]
+        sync: Option<String>,
+    },
+    /// Claim a task for an owner (defaults to this process), atomically starting it.
+    Claim {
+        /// The task uid.
+        uid: String,
+        /// The liveness-checkable owner id (default: this process's `host:pid`).
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Release a task's claim held by an owner (defaults to this process).
+    Release {
+        /// The task uid.
+        uid: String,
+        /// The owner id whose claim to release (default: this process's `host:pid`).
+        #[arg(long)]
+        owner: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskTagCmd {
+    /// Apply `facet=value` to a task.
+    Add {
+        /// The task uid.
+        uid: String,
+        /// The tag as `facet=value`.
+        facet_value: String,
+    },
+    /// Remove `facet=value` from a task.
+    Rm {
+        /// The task uid.
+        uid: String,
+        /// The tag as `facet=value`.
+        facet_value: String,
     },
 }
 
@@ -347,7 +440,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index => cmd_index(&db),
-        Command::Doctor { backup } => cmd_doctor(&db, &db_path, backup.as_deref()),
+        Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
     }
 }
@@ -705,27 +798,189 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             output::print_items(&items, json);
         }
         TaskCmd::Show { uid } => {
-            // Accept either the full `task:<slug>` uid or the bare slug.
-            let candidates = if uid.contains(':') {
-                vec![uid.clone()]
-            } else {
-                vec![format!("task:{uid}"), uid.clone()]
-            };
-            let id = db.read(move |conn| {
-                for cand in &candidates {
-                    if let Some(id) = jkb_core::item::id_for_uid(conn, cand)? {
-                        return Ok(Some(id));
-                    }
-                }
-                Ok(None)
-            })?;
-            let Some(id) = id else {
-                anyhow::bail!("no item with uid {uid}");
-            };
+            let id = resolve_task_uid(db, &uid)?;
             output::print_item_full(db, id, json)?;
+        }
+        other => cmd_task_mutate(db, other, json)?,
+    }
+    Ok(())
+}
+
+/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/
+/// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
+/// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
+fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
+        TaskCmd::Set {
+            uid,
+            status,
+            priority,
+            due,
+        } => {
+            if status.is_none() && priority.is_none() && due.is_none() {
+                anyhow::bail!("nothing to set: pass at least one of --status/--priority/--due");
+            }
+            let id = resolve_task_uid(db, &uid)?;
+            db.write_txn("cli", move |conn, meta| {
+                if let Some(s) = &status {
+                    task::set_status_str(conn, meta, id, s)?;
+                }
+                if let Some(p) = priority {
+                    task::set_priority(conn, meta, id, Some(p))?;
+                }
+                if let Some(d) = &due {
+                    task::set_due(conn, meta, id, Some(d))?;
+                }
+                Ok(())
+            })?;
+            report(json, &uid, "updated");
+        }
+        TaskCmd::Tag { cmd } => {
+            let (uid, facet_value, adding) = match cmd {
+                TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, true),
+                TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, false),
+            };
+            let (facet, value) = facet_value
+                .split_once('=')
+                .context("tag must be `facet=value`, e.g. `size=small`")?;
+            let (facet, value) = (facet.to_owned(), value.to_owned());
+            let id = resolve_task_uid(db, &uid)?;
+            db.write_txn("cli", move |conn, meta| {
+                if adding {
+                    tag::apply(conn, meta, id, &facet, &value)
+                } else {
+                    tag::remove(conn, meta, id, &facet, &value)
+                }
+            })?;
+            report(json, &uid, if adding { "tagged" } else { "untagged" });
+        }
+        TaskCmd::Depend { uid, dep } => {
+            let id = resolve_task_uid(db, &uid)?;
+            let dep_uid = canonical_task_uid(&dep);
+            db.write_txn("cli", move |conn, meta| {
+                task::add_dependency(conn, meta, id, &dep_uid)
+            })?;
+            report(json, &uid, "depends_on set");
+        }
+        TaskCmd::Undepend { uid, dep } => {
+            let id = resolve_task_uid(db, &uid)?;
+            let dep_id = resolve_task_uid(db, &dep)?;
+            db.write_txn("cli", move |conn, meta| {
+                edge::unlink(conn, meta, id, dep_id, EdgeType::DependsOn)
+            })?;
+            report(json, &uid, "depends_on removed");
+        }
+        TaskCmd::Place { uid, ns, home } => {
+            let id = resolve_task_uid(db, &uid)?;
+            let ns_path = ns.clone();
+            db.write_txn("cli", move |conn, meta| {
+                let ns_id = jkb_core::ns::ensure(conn, &ns_path)?;
+                if home {
+                    placement::set_primary(conn, meta, id, ns_id, 0)
+                } else {
+                    placement::place(conn, meta, id, ns_id, PlacementRole::Reference, 0)
+                }
+            })?;
+            report(json, &uid, "placed");
+        }
+        TaskCmd::Bind { uid, managed, sync } => {
+            let (uri, mode) = match (managed, sync) {
+                (_, Some(uri)) => (uri, Some(SyncMode::Bidirectional)),
+                (true, None) => (task::MANAGED_BINDING.to_owned(), None),
+                (false, None) => {
+                    anyhow::bail!("pass --managed or --sync <uri>");
+                }
+            };
+            let id = resolve_task_uid(db, &uid)?;
+            db.write_txn("cli", move |conn, meta| {
+                binding::set(conn, meta, id, &uri, mode, None)
+            })?;
+            report(json, &uid, "bound");
+        }
+        TaskCmd::Claim { uid, owner } => cmd_task_claim(db, &uid, owner, true, json)?,
+        TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
+        // The read subcommands are dispatched by `cmd_task` and never reach here.
+        TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+/// `task claim` / `task release` (design D27.3): CAS-acquire or clear a task's claim
+/// through the 17.2 core seams, so the coordinator never touches SQL. `owner` defaults
+/// to this process's liveness-checkable `host:pid` id. `claim` also flips the task to
+/// `in_progress`.
+fn cmd_task_claim(
+    db: &Db,
+    uid: &str,
+    owner: Option<String>,
+    acquire: bool,
+    json: bool,
+) -> Result<()> {
+    let owner = owner.unwrap_or_else(owner::self_owner);
+    let id = resolve_task_uid(db, uid)?;
+    let owner2 = owner.clone();
+    let ok = db.write_txn("cli", move |conn, meta| {
+        if acquire {
+            claim::claim(conn, meta, id, &owner2)
+        } else {
+            claim::release(conn, meta, id, &owner2)
+        }
+    })?;
+    let key = if acquire { "acquired" } else { "released" };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"uid": uid, "owner": owner, key: ok})
+        );
+    } else {
+        match (acquire, ok) {
+            (true, true) => println!("claimed {uid} for {owner} (now in_progress)"),
+            (true, false) => println!("{uid} is already claimed by another live owner"),
+            (false, true) => println!("released {uid} (was held by {owner})"),
+            (false, false) => println!("{uid} was not claimed by {owner}"),
         }
     }
     Ok(())
+}
+
+/// Print a short human/JSON confirmation for a task mutation.
+fn report(json: bool, uid: &str, action: &str) {
+    if json {
+        println!("{}", serde_json::json!({"uid": uid, "action": action}));
+    } else {
+        println!("{action}: {uid}");
+    }
+}
+
+/// Canonicalize a task uid: leave a `:`-bearing uid alone, else prefix `task:`.
+fn canonical_task_uid(uid: &str) -> String {
+    if uid.contains(':') {
+        uid.to_owned()
+    } else {
+        format!("task:{uid}")
+    }
+}
+
+/// Resolve a task reference (full `task:<slug>` uid or bare slug) to its item id.
+///
+/// # Errors
+/// Errors if no item matches either the given uid or `task:<uid>`.
+fn resolve_task_uid(db: &Db, uid: &str) -> Result<ItemId> {
+    // Accept either the full `task:<slug>` uid or the bare slug.
+    let candidates = if uid.contains(':') {
+        vec![uid.to_owned()]
+    } else {
+        vec![format!("task:{uid}"), uid.to_owned()]
+    };
+    let id = db.read(move |conn| {
+        for cand in &candidates {
+            if let Some(id) = jkb_core::item::id_for_uid(conn, cand)? {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    })?;
+    id.ok_or_else(|| anyhow::anyhow!("no item with uid {uid}"))
 }
 
 fn cmd_view(db: &Db, cmd: ViewCmd, json: bool) -> Result<()> {
@@ -787,7 +1042,7 @@ fn cmd_index(db: &Db) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>) -> Result<()> {
+fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Result<()> {
     // Embedder health.
     let embed_status = match embedder().and_then(|e| e.health_check().map_err(Into::into)) {
         Ok(()) => "ok".to_owned(),
@@ -825,6 +1080,42 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>) -> Result<()> {
         for s in &flagged {
             let detail = s.parse_error.as_deref().unwrap_or("both sides changed");
             println!("  {} [{}]: {detail}", s.uri, s.status);
+        }
+    }
+
+    // Stale task claims: owner-existence reclaim (design D27.2). For each claimed task
+    // probe whether the recorded owner still exists (`kill -0`); a claim whose owner is
+    // gone is orphaned (no time-based staleness — a paused-but-alive owner is retained).
+    // A bare run reports; `--fix` clears orphaned claims so their tasks return to the
+    // ready frontier.
+    let held = db.read(claim::claimed)?;
+    let orphaned: Vec<_> = held.iter().filter(|c| !owner::is_alive(&c.owner)).collect();
+    if held.is_empty() {
+        println!("task claims: none held");
+    } else if orphaned.is_empty() {
+        println!("task claims: {} held, all owners alive", held.len());
+    } else {
+        println!(
+            "task claims: {} orphaned (owner gone) of {} held",
+            orphaned.len(),
+            held.len()
+        );
+        for c in &orphaned {
+            println!("  {} claimed by dead owner {}", c.uid, c.owner);
+        }
+        if fix {
+            // Reclaim clears every claim whose owner is NOT in the verified-alive set.
+            let live_owners: Vec<String> = held
+                .iter()
+                .map(|c| c.owner.clone())
+                .filter(|o| owner::is_alive(o))
+                .collect();
+            let cleared = db.write_txn("cli", move |conn, meta| {
+                claim::reclaim_dead(conn, meta, &live_owners)
+            })?;
+            println!("  cleared {} orphaned claim(s)", cleared.len());
+        } else {
+            println!("  run `jkb doctor --fix` to clear them");
         }
     }
 
