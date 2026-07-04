@@ -263,6 +263,14 @@ enum TaskCmd {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Reclaim claims whose owner process is gone (the deterministic crash-recovery
+    /// scan). Keeps claims whose pid is alive plus any `--keep` owners — so a live
+    /// coordinator passes its own owner to never reclaim its own in-flight work.
+    Reclaim {
+        /// Owner id(s) to always preserve (repeatable), e.g. this run's own owner.
+        #[arg(long)]
+        keep: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -899,8 +907,27 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         }
         TaskCmd::Claim { uid, owner } => cmd_task_claim(db, &uid, owner, true, json)?,
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
+        TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read subcommands are dispatched by `cmd_task` and never reach here.
         TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+/// `task reclaim` (design D27.1/D27.6.6b): the deterministic owner-existence scan,
+/// exposed so the coordinator can run it SQL-free. Clears claims whose owner pid is
+/// gone, preserving `keep` owners (the live run passes its own owner so it never
+/// reclaims its own in-flight work).
+fn cmd_task_reclaim(db: &Db, keep: &[String], json: bool) -> Result<()> {
+    let (held, cleared) = reclaim_orphaned(db, keep)?;
+    if json {
+        let uids: Vec<&str> = cleared.iter().map(|c| c.uid.as_str()).collect();
+        println!("{}", serde_json::json!({"held": held, "reclaimed": uids}));
+    } else {
+        println!("reclaimed {} of {held} claim(s)", cleared.len());
+        for c in &cleared {
+            println!("  {} (dead owner {})", c.uid, c.owner);
+        }
     }
     Ok(())
 }
@@ -950,6 +977,27 @@ fn report(json: bool, uid: &str, action: &str) {
     } else {
         println!("{action}: {uid}");
     }
+}
+
+/// The owner-existence reclaim (design D27.1/D27.2): clear every claim whose owner
+/// process no longer exists, keeping claims whose pid is alive plus any `keep` owners.
+/// Returns `(total_held, cleared_claims)`. Used by `task reclaim` and `doctor --fix`.
+///
+/// # Errors
+/// Errors if a database read/write fails.
+fn reclaim_orphaned(db: &Db, keep: &[String]) -> Result<(usize, Vec<claim::ClaimInfo>)> {
+    let held = db.read(claim::claimed)?;
+    // The verified-alive set: every held owner whose pid is alive, plus explicit keeps.
+    let mut live: Vec<String> = held
+        .iter()
+        .map(|c| c.owner.clone())
+        .filter(|o| owner::is_alive(o))
+        .collect();
+    live.extend(keep.iter().cloned());
+    let cleared = db.write_txn("cli", move |conn, meta| {
+        claim::reclaim_dead(conn, meta, &live)
+    })?;
+    Ok((held.len(), cleared))
 }
 
 /// Canonicalize a task uid: leave a `:`-bearing uid alone, else prefix `task:`.
@@ -1105,14 +1153,7 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         }
         if fix {
             // Reclaim clears every claim whose owner is NOT in the verified-alive set.
-            let live_owners: Vec<String> = held
-                .iter()
-                .map(|c| c.owner.clone())
-                .filter(|o| owner::is_alive(o))
-                .collect();
-            let cleared = db.write_txn("cli", move |conn, meta| {
-                claim::reclaim_dead(conn, meta, &live_owners)
-            })?;
+            let (_, cleared) = reclaim_orphaned(db, &[])?;
             println!("  cleared {} orphaned claim(s)", cleared.len());
         } else {
             println!("  run `jkb doctor --fix` to clear them");

@@ -277,7 +277,14 @@ fn task_set_status_priority_due_roundtrips_and_is_undoable() {
 
     jkb(&db)
         .args([
-            "task", "set", &uid, "--status", "in_progress", "--priority", "2", "--due",
+            "task",
+            "set",
+            &uid,
+            "--status",
+            "in_progress",
+            "--priority",
+            "2",
+            "--due",
             "2026-08-01",
         ])
         .assert()
@@ -471,6 +478,46 @@ fn doctor_reclaims_orphaned_claims_but_keeps_live_ones() {
         .collect();
     assert!(uids.contains(&dead.as_str()));
     assert!(!uids.contains(&live.as_str()));
+}
+
+#[test]
+fn task_reclaim_keeps_named_owner_and_clears_dead_ones() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let dead = add_task(&db, "dead owner task");
+    let kept = add_task(&db, "kept owner task");
+
+    // `dead` is owned by a non-existent pid; `kept` by a string owner we will --keep
+    // (its pid is unparseable/dead, so only --keep preserves it).
+    jkb(&db)
+        .args(["task", "claim", &dead, "--owner", "host:4294967290"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "claim", &kept, "--owner", "swarm-run-xyz"])
+        .assert()
+        .success();
+
+    jkb(&db)
+        .args(["task", "reclaim", "--keep", "swarm-run-xyz"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reclaimed 1 of 2"));
+
+    // The kept owner's task stays out of the frontier; the dead one returns.
+    let out = jkb(&db)
+        .args(["--global", "--json", "task", "next"])
+        .output()
+        .unwrap();
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uids: Vec<&str> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["uid"].as_str().unwrap())
+        .collect();
+    assert!(uids.contains(&dead.as_str()));
+    assert!(!uids.contains(&kept.as_str()));
 }
 
 #[test]
