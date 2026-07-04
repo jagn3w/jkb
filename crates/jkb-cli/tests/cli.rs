@@ -75,6 +75,51 @@ fn task_next_json_is_an_array() {
 }
 
 #[test]
+fn task_show_prints_the_full_untruncated_body() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // A body deliberately longer than the 80-char listing snippet.
+    let body = "this task body is deliberately much longer than the eighty character \
+                snippet that listings show so we can prove show returns the whole thing";
+    let out = jkb(&db)
+        .args(["--json", "task", "add", body])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = v["uid"].as_str().unwrap().to_string();
+
+    // Human form shows the full body (the tail past the 80-char snippet).
+    jkb(&db)
+        .args(["task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "prove show returns the whole thing",
+        ));
+
+    // JSON form carries the full content, not a snippet.
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", &uid])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let sj: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(sj["content"].as_str().unwrap(), body);
+
+    // The bare slug (without the `task:` prefix) also resolves.
+    let slug = uid.strip_prefix("task:").unwrap();
+    jkb(&db).args(["task", "show", slug]).assert().success();
+
+    // An unknown uid errors.
+    jkb(&db)
+        .args(["task", "show", "task:does-not-exist-0000"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn view_save_list_and_run() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

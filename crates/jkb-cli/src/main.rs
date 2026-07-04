@@ -183,6 +183,11 @@ enum TaskCmd {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Show a single task in full: metadata and untruncated content.
+    Show {
+        /// The task uid (the `task:` prefix is optional).
+        uid: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -698,6 +703,26 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
             let items = output::fetch_items(db, &ids)?;
             output::print_items(&items, json);
+        }
+        TaskCmd::Show { uid } => {
+            // Accept either the full `task:<slug>` uid or the bare slug.
+            let candidates = if uid.contains(':') {
+                vec![uid.clone()]
+            } else {
+                vec![format!("task:{uid}"), uid.clone()]
+            };
+            let id = db.read(move |conn| {
+                for cand in &candidates {
+                    if let Some(id) = jkb_core::item::id_for_uid(conn, cand)? {
+                        return Ok(Some(id));
+                    }
+                }
+                Ok(None)
+            })?;
+            let Some(id) = id else {
+                anyhow::bail!("no item with uid {uid}");
+            };
+            output::print_item_full(db, id, json)?;
         }
     }
     Ok(())
