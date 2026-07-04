@@ -10,6 +10,7 @@
 use jkb_types::Error as TypeError;
 
 use super::{CmpOp, DueValue, Query, Scope, TagPred};
+use crate::dsl::{has_unterminated_quote, tokenize, unquote};
 use crate::Result;
 
 /// Parse a DSL string into a [`Query`].
@@ -22,6 +23,9 @@ pub fn parse(input: &str) -> Result<Query> {
     let mut fts_terms: Vec<String> = Vec::new();
     let mut scopes: Vec<Scope> = Vec::new();
 
+    if has_unterminated_quote(input) {
+        return Err(bad(input, "unterminated `\"` quote"));
+    }
     for token in tokenize(input) {
         if let Some(rest) = token.strip_prefix('~') {
             let term = unquote(rest);
@@ -78,31 +82,6 @@ pub fn parse(input: &str) -> Result<Query> {
     Ok(query)
 }
 
-/// Split `input` into tokens on whitespace, keeping `"…"`-quoted spans together.
-fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in input.chars() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                current.push(c);
-            }
-            c if c.is_whitespace() && !in_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
 /// Parse `tag:` payload `facet<op>value`.
 fn parse_tag(payload: &str, token: &str) -> Result<TagPred> {
     let op_idx = payload
@@ -156,13 +135,6 @@ fn leading_op(s: &str) -> Option<(CmpOp, &str)> {
         }
     }
     None
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s)
 }
 
 /// Require a non-empty value for `field`, else an actionable error.
@@ -249,5 +221,11 @@ mod tests {
             let err = parse(bad).unwrap_err();
             assert!(err.to_string().contains(bad) || err.to_string().contains("invalid query"));
         }
+    }
+
+    #[test]
+    fn unterminated_quote_is_rejected() {
+        let err = parse("hello \"unclosed phrase").unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
     }
 }
