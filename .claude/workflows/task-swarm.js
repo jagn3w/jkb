@@ -252,11 +252,11 @@ Return ok=true (detail = any that failed). Change no code.`
 }
 
 function reclaimPrompt() {
-  return `Mechanical crash-recovery step (design D27.6.6b) — in the main copy at ${REPO}, run:
+  return `Mechanical startup crash-recovery step (design D27.6.6b) — in the main copy at ${REPO}, run ONCE:
 
 ${JKB}${DB} task reclaim --keep '${OWNER}'
 
-This clears claims left by CRASHED PRIOR runs (owner pid gone) while preserving THIS run's own claims (owner '${OWNER}' is kept). Return ok=true with the reclaimed count from the output. Change no code, touch no git.`
+This clears claims left by CRASHED PRIOR runs (owner pid gone) before the first frontier read, while preserving THIS run's own claims (owner '${OWNER}' is kept). The ONGOING ~60s reclaim is handled by the /task-swarm command's sidecar, not here. Return ok=true with the reclaimed count. Change no code, touch no git.`
 }
 
 // ---------------------------------------------------------------------------
@@ -410,10 +410,13 @@ function startGroup(group) {
 // A SCHEDULER pass over the CURRENT ready frontier → new work-groups (never cross-round).
 async function schedule() {
   round++
-  // Crash-recovery scan (D27.6.6b): clear claims left by dead PRIOR runs, keeping our own.
-  // In workflow JS there is no wall clock, so this runs once per scheduling pass — the
-  // faithful approximation of the ~60s timer (a scan interval, not a claim lifetime).
-  await agent(reclaimPrompt(), { label: `reclaim#${round}`, phase: 'Schedule', schema: ACK, model: 'haiku' })
+  // Startup crash-recovery scan (D27.6.6b), first pass only: clear claims left by dead
+  // PRIOR runs before the first frontier read, keeping our own owner. The ONGOING ~60s
+  // periodic reclaim is a true wall-clock timer owned by the /task-swarm command's sidecar
+  // process (workflow JS has no clock/background timer), so we do NOT repeat it each pass.
+  if (round === 1) {
+    await agent(reclaimPrompt(), { label: 'reclaim#startup', phase: 'Schedule', schema: ACK, model: 'haiku' })
+  }
   const s = await agent(schedulerPrompt(round), { label: `schedule#${round}`, phase: 'Schedule', schema: SCHEDULE })
   return s || { groups: [], remaining: 0 }
 }

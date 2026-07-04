@@ -91,8 +91,28 @@ Ephemeral per-group `swarm-task/*` branches are **local-only** — they never en
 (the merge queue rebase/fast-forwards, so no merge commits or branch-name artifacts) and
 **must not be pushed**; prune them after landing.
 
-Compute a liveness-checkable **run owner** for the claim model (D27.1) —
-`OWNER="$(hostname):$$"` (a `host:pid` id); pass it as `owner` below.
+### Run owner + the 60s reclaimer sidecar (the claim liveness authority)
+
+The periodic owner-existence reclaim (D27.1/D27.6.6b) is a **true wall-clock timer**, which
+the workflow JS engine can't provide (no clock, no background timer). So run it **here**, as
+a detached sidecar the command owns for the swarm's lifetime — this is the coordinator's
+liveness authority for *crashed prior runs*, independent of the workflow's scheduling cadence:
+
+```sh
+HOST="$(hostname)"
+RUN_OWNER_FILE="$(mktemp)"                 # the sidecar reads the run owner from here
+# Sidecar: every ~60s clear claims whose owner PROCESS is gone (crashed prior runs),
+# always --keep-ing THIS run's owner so it never touches our own in-flight claims.
+( while :; do sleep 60; jkb task reclaim --keep "$(cat "$RUN_OWNER_FILE")" >/dev/null 2>&1; done ) &
+RECLAIMER_PID=$!                           # a real, live pid for the whole run
+OWNER="$HOST:$RECLAIMER_PID"               # host:pid — liveness-checkable via `kill -0`
+printf '%s' "$OWNER" > "$RUN_OWNER_FILE"
+```
+
+Launch this with the Bash tool's **`run_in_background: true`** so it detaches and keeps
+running across turns. `OWNER = host:<sidecar pid>` is a genuinely alive process for the run,
+so an external `jkb doctor --fix` never mistakes this live run for a crashed one. Pass `OWNER`
+as `owner` below; the workflow's implementers claim with it and the sidecar keeps it.
 
 ## 6. Launch the workflow
 
@@ -130,6 +150,12 @@ budget is low, then drains in-flight work). The workflow runs in the background 
 notifies on completion.
 
 ## 7. Report + hand-off
+
+**Stop the reclaimer sidecar first** — it's no longer needed once the swarm is done:
+
+```sh
+kill "$RECLAIMER_PID" 2>/dev/null; rm -f "$RUN_OWNER_FILE"
+```
 
 When the workflow finishes, relay its result: which task uids **completed** (landed on the
 feature branch and marked `done`), which it **gave up** on (retry-capped), how many groups
