@@ -77,7 +77,12 @@ Locate the installed workflow script (first that exists): `"$CLAUDE_CONFIG_DIR/w
 `"$HOME/.claude/workflows/task-swarm.js"`, or `./.claude/workflows/task-swarm.js`.
 
 Call the **Workflow** tool with `scriptPath` = that path (or `name: "task-swarm"` if your
-setup resolves saved workflows), and `args`:
+setup resolves saved workflows), and `args`.
+
+> **Gotcha:** pass `args` as an **actual JSON object**, not a JSON-encoded string. The
+> script does `const cfg = args || {}` and reads `cfg.integration` etc.; a stringified
+> value makes `cfg` a string, so every field is `undefined` and the script throws
+> `task-swarm requires args.integration and args.integrationWorktree` on launch.
 
 ```json
 {
@@ -100,17 +105,16 @@ budget is low). The workflow runs in the background and notifies on completion.
 
 ## 7. Report + hand-off
 
-When the workflow finishes, relay its result: which task uids are **awaiting_review**,
+When the workflow finishes, relay its result: which task uids **completed**,
 which it **gave up** on (retry-capped), and how many rounds it ran. Each integrated task
-was set to **`needs_review`** in jkb (file-backed tasks got a `- [?]` checkbox + sync) — so
-its dependents were free to proceed, but nothing is marked `done`. Then tell the user how
-to finish:
+was marked **`done`** in jkb (file-backed tasks got a `- [x]` checkbox + sync) once it
+landed on the coordinating branch — which also unblocked its dependents. (A dedicated
+reviewer-agent handoff using `needs_review` is planned separately; today the swarm marks
+done on merge.) Then tell the user how to finish:
 
 - Review the integrated result: `git -C .swarm/integration log --oneline "$BASE".."swarm/$BASE"`
-  and run the test suite there. Review each `needs_review` task (`jkb query --global 'kind:task status:needs_review'`).
-- **Approve** the tasks you accept by flipping their `- [?]` to `- [x]` in the source file
-  and running `jkb sync` (or, for managed tasks, `task_update` via MCP). Anything you reject
-  stays `needs_review` for another pass.
+  and run the test suite there. The completed tasks are already `done`
+  (`jkb query --global 'kind:task status:done'`); revert any you reject.
 - When satisfied, merge into your branch: `git switch "$BASE" && git merge "swarm/$BASE"`.
 - Clean up: `git worktree remove .swarm/integration` and prune the per-task worktrees/branches
   (`git worktree prune`; `git branch -D` the merged `swarm-task/*` branches).
