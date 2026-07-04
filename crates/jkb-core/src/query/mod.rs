@@ -172,8 +172,14 @@ impl Query {
             // complete, and a `needs_review` one is finished enough to proceed on, so both
             // unblock rather than block their dependents. `IS NOT` keeps NULL-status rows
             // (non-tasks) treated as unsettled, matching the pre-`needs_review` behaviour.
+            //
+            // A live claim (any non-null `claimant_id`) also excludes a task from the
+            // frontier (design D27.1): work already in flight must not be handed out
+            // twice. This is a plain column predicate — no anti-join. The owner-existence
+            // reclaim NULLs a dead owner's `claimant_id`, which drops the task back in.
             clauses.push(
-                "i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
+                "i.claimant_id IS NULL
+                 AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
                    AND i.status IS NOT 'needs_review'
                  AND NOT EXISTS (
                      SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
