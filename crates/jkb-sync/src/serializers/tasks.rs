@@ -18,6 +18,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use jkb_core::blob;
+use jkb_core::dsl::{tokenize, unquote};
 use jkb_types::{EdgeType, Error as TypeError};
 
 use super::{SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
@@ -66,6 +68,11 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
         }
     }
     st.flush_text();
+    if let Some(missing) = dangling_dependency(&st.doc) {
+        return Err(bad(&format!(
+            "task dependency `needs:^{missing}` names an id that is not defined in this file"
+        )));
+    }
     if has_dependency_cycle(&st.doc) {
         return Err(bad("task dependencies (`needs:^…`) form a cycle"));
     }
@@ -100,7 +107,7 @@ impl ParseState {
         let content = self.text_run.join("\n");
         self.text_run.clear();
         let local_id = uniquify(
-            format!("text-{}", &hash_hex(content.as_bytes())[..8]),
+            format!("text-{}", &blob::hash_bytes(content.as_bytes())[..8]),
             &mut self.used_ids,
         );
         let mut item = SyncItem::new(local_id, "text", content);
@@ -186,6 +193,21 @@ impl ParseState {
         }
         Ok(())
     }
+}
+
+/// The `dst` of the first `depends_on` edge whose target is not defined in the file, if
+/// any. A `needs:^id` whose `^id` names no task (a typo, or the target line was deleted)
+/// would otherwise be silently dropped by the engine's `reconcile_edges` (which skips any
+/// edge endpoint that doesn't resolve to an item id), losing the user-declared dependency
+/// permanently and invisibly. Surfacing it as a parse error routes the file to quarantine
+/// so the mistake is flagged instead of swallowed.
+fn dangling_dependency(doc: &SyncDoc) -> Option<String> {
+    let defined: HashSet<&str> = doc.items.iter().map(|i| i.local_id.as_str()).collect();
+    doc.edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::DependsOn)
+        .find(|e| !defined.contains(e.dst.as_str()))
+        .map(|e| e.dst.clone())
 }
 
 /// Whether the `depends_on` edges among the file's tasks contain a cycle. Detecting it
@@ -418,38 +440,6 @@ fn is_uri_safe(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Split on whitespace, keeping `"…"`-quoted spans together (mirrors `jkb_core::task`).
-fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in input.chars() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                current.push(c);
-            }
-            c if c.is_whitespace() && !in_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s)
-}
-
 /// Parse a header line `#{1,6} text`, returning `(level, text)`. Only lines starting
 /// with `#` at column 0 followed by a space count (so `#facet=x` inside a task or a
 /// `#comment` mid-line is never mistaken for a header).
@@ -470,10 +460,36 @@ fn header(line: &str) -> Option<(usize, &str)> {
     }
 }
 
-/// Parse a task line, returning `(indent_spaces, status, rest_after_checkbox)`.
+/// Tab stop width used to expand a leading `\t` into a visual column count when
+/// measuring task indentation (see `task_line`).
+const TAB_WIDTH: usize = 4;
+
+/// Visual indentation width of a run of leading whitespace: a space is one
+/// column, a tab advances to the next `TAB_WIDTH` stop. Used only for *relative*
+/// nesting comparison, so the exact width is immaterial as long as deeper
+/// (more-indented) lines yield strictly larger widths.
+fn indent_width(ws: &str) -> usize {
+    let mut col = 0;
+    for c in ws.chars() {
+        if c == '\t' {
+            col = (col / TAB_WIDTH + 1) * TAB_WIDTH;
+        } else {
+            col += 1;
+        }
+    }
+    col
+}
+
+/// Parse a task line, returning `(indent_width, status, rest_after_checkbox)`.
+///
+/// `indent_width` is a visual column count (see `indent_width`) used only for the
+/// *relative* nesting comparison in `on_task`; tabs count as indentation so a
+/// Tab-nested subtask (`"\t- [ ] child"`) still parents under a preceding
+/// less-indented task instead of collapsing to depth 0.
 fn task_line(line: &str) -> Option<(usize, &'static str, &str)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    let trimmed = &line[indent..];
+    let ws_bytes = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent = indent_width(&line[..ws_bytes]);
+    let trimmed = &line[ws_bytes..];
     let after = trimmed.strip_prefix("- [")?;
     let mark = after.chars().next()?;
     let status = match mark {
@@ -519,7 +535,7 @@ fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
     } else {
         trimmed.to_owned()
     };
-    let short = &hash_hex(title.as_bytes())[..6];
+    let short = &blob::hash_bytes(title.as_bytes())[..6];
     let candidate = format!("{base}-{short}");
     let mut id = candidate.clone();
     let mut n = 2;
@@ -546,11 +562,6 @@ fn uniquify(base: String, used: &mut HashSet<String>) -> String {
     }
 }
 
-/// blake3 of `bytes` as lowercase hex.
-fn hash_hex(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
-}
-
 /// A validation error for the `tasks` format (routes to quarantine in the engine).
 fn bad(msg: &str) -> Error {
     Error::Types(TypeError::Validation(format!("tasks file: {msg}")))
@@ -569,6 +580,7 @@ Some description.
   - [x] Write the harness ^write-harness
 ## 2. Frontend
 - [~] Ship the button ^ship
+- [ ] Set up CI ^setup
 ";
 
     #[test]
@@ -580,7 +592,7 @@ Some description.
         assert_eq!(doc.sections[1].path, "2-frontend");
 
         let tasks: Vec<_> = doc.items.iter().filter(|i| i.kind == "task").collect();
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         let fix = &tasks[0];
         assert_eq!(fix.content, "Fix the flaky test");
         assert_eq!(fix.local_id, "fix-flaky");
@@ -680,11 +692,44 @@ Some description.
     }
 
     #[test]
+    fn dangling_needs_id_errors() {
+        // `needs:^missing` names an id no task in the file defines. Rather than silently
+        // drop the dependency (the engine's reconcile_edges would skip the unresolved
+        // endpoint), parsing errors so the file is quarantined for the user to fix.
+        let err = TasksSerializer
+            .parse(b"- [ ] a needs:^ghost ^a\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ghost"),
+            "error should name the missing id: {err}"
+        );
+        // A dependency on a real id still parses cleanly.
+        assert!(TasksSerializer
+            .parse(b"- [ ] a needs:^b ^a\n- [ ] b ^b\n")
+            .is_ok());
+    }
+
+    #[test]
     fn prose_never_fails_to_parse() {
         let doc = TasksSerializer
             .parse(b"just some prose\nwith #hashes and !bangs that aren't tasks\n")
             .unwrap();
         assert!(doc.items.iter().all(|i| i.kind == "text"));
         assert!(TasksSerializer.quarantine_on_parse_error());
+    }
+
+    #[test]
+    fn tab_indented_subtask_nests_under_parent() {
+        // A subtask nested with a Tab (not spaces) must still parent under the
+        // preceding less-indented task instead of collapsing to depth 0.
+        let doc = TasksSerializer
+            .parse(b"- [ ] parent ^p\n\t- [ ] child ^c\n")
+            .unwrap();
+        let child = doc.items.iter().find(|i| i.local_id == "c").unwrap();
+        assert_eq!(child.parent.as_deref(), Some("p"));
+        assert!(doc
+            .edges
+            .iter()
+            .any(|e| e.src == "p" && e.dst == "c" && e.edge_type == jkb_types::EdgeType::ParentOf));
     }
 }
