@@ -96,7 +96,7 @@ function schedulerPrompt(round) {
   return `You are the SCHEDULER for a task swarm (round ${round}). Determine the current READY frontier of jkb tasks and how many tasks remain.
 
 1. Ready frontier: ${readyCmd}. \`task next\` returns only unblocked, non-terminal tasks ordered by priority then due — these are safe to start now.
-2. Remaining count: run \`${JKB}${DB} query${GLOBAL} --json 'kind:task ${TASKS ? '' : SCOPE}' --limit 1000\` and count the items whose "status" is NOT "done", NOT "cancelled", and NOT "needs_review" — a needs_review task is finished pending operator approval, so it is NOT remaining work. (There is no is:open filter — count from the returned status field.) If scoping by explicit uids, count those uids whose status is still one of those remaining values instead.
+2. Remaining count: run \`${JKB}${DB} query${GLOBAL} --json 'kind:task ${TASKS ? '' : SCOPE}' --limit 1000\` and count the items whose "status" is NOT "done", NOT "cancelled", and NOT "needs_review" — the swarm marks a task done once it merges into the coordinating branch, so done tasks are NOT remaining work (needs_review is also excluded, reserved for a future reviewer handoff). (There is no is:open filter — count from the returned status field.) If scoping by explicit uids, count those uids whose status is still one of those remaining values instead.
 3. For each ready task capture its "uid", "id", "title" (the snippet is fine), "priority", "namespace", and — if its uid starts with file:// — the absolute file path before the '#', as "source_file" (else null).
 
 Return the structured frontier. Do not modify anything.`
@@ -137,12 +137,14 @@ Return merged=true only if the branch is merged AND the integration branch build
 }
 
 function completePrompt(task) {
-  return `A swarm task is fully merged into the integration branch. Mark it NEEDS REVIEW in jkb — this unblocks its dependents so the swarm can proceed, while recording that it is NOT done until the operator approves it. Work in the MAIN copy at ${REPO}, not the integration worktree.
+  return `A swarm task is fully merged into the integration (coordinating) branch. Mark it DONE in jkb — landing on the coordinating branch is what completes it, and done also unblocks its dependents so the swarm can proceed. Work in the MAIN copy at ${REPO}, not the integration worktree.
+
+(A dedicated reviewer-agent handoff using the needs_review status is planned separately; this step marks done on merge.)
 
 TASK uid ${task.uid}${task.source_file ? `, source file ${task.source_file}` : ''}.
 
-- If the uid starts with file:// (source_file is set): set its checkbox to "- [?]" (the needs_review marker) on the line ending in \`^${task.uid.split('#').pop()}\` in ${task.source_file}, then run \`${JKB}${DB} sync\` so the KB status becomes needs_review.
-- If it's a managed task (no source file): the jkb CLI has no status setter; set status "needs_review" via the MCP task_update tool if available, else report it needs manual approval. Do not fabricate a change.
+- If the uid starts with file:// (source_file is set): set its checkbox to "- [x]" (the done marker) on the line ending in \`^${task.uid.split('#').pop()}\` in ${task.source_file}, then run \`${JKB}${DB} sync\` so the KB status becomes done.
+- If it's a managed task (no source file): the jkb CLI has no status setter; set status "done" via the MCP task_update tool if available, else report it needs manual completion. Do not fabricate a change.
 
 Return a one-line confirmation of what you did.`
 }
@@ -239,8 +241,8 @@ while (round < ROUND_CAP) {
       done.add(b.uid)
       merged.push(b.uid)
       designHint.delete(b.uid)
-      await agent(completePrompt(b.task), { label: `review:${b.uid}`, phase: 'Resolve' })
-      log(`merged ${b.uid} → needs_review`)
+      await agent(completePrompt(b.task), { label: `complete:${b.uid}`, phase: 'Resolve' })
+      log(`merged ${b.uid} → done`)
     } else {
       bump(b.uid)
       const flag = (r && r.flag) || 'needs_impl'
@@ -254,8 +256,7 @@ return {
   scope: scopeExpr,
   integration_branch: INTEGRATION,
   rounds: round,
-  // Merged into the integration branch and set to needs_review in jkb — awaiting your
-  // approval to become done.
-  awaiting_review: merged,
+  // Merged into the integration (coordinating) branch and marked done in jkb.
+  completed: merged,
   gave_up: gaveUp,
 }
