@@ -302,11 +302,12 @@ pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&s
 }
 
 /// Whether `task` is **blocked**: it has a `depends_on` edge to a task that is not yet
-/// settled — i.e. not `done`/`cancelled`/`needs_review` (see
+/// settled — i.e. not terminal (`done`/`cancelled`; see
 /// `TaskStatus::unblocks_dependents`). This is the derived state that stands in for a
 /// stored `blocked` status (design D19); it mirrors the anti-join in [`crate::query`]'s
-/// `is:ready`. A cancelled dependency will never complete and a `needs_review` one is
-/// finished enough to proceed on, so both unblock rather than block their dependents.
+/// `is:ready`. A cancelled dependency will never complete, so it unblocks; a
+/// `needs_review` dependency is not yet landed and may bounce back, so it blocks
+/// (design D27.7).
 ///
 /// # Errors
 /// Returns an error if the query fails.
@@ -316,7 +317,6 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
             "SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
              WHERE e.src_item_id = ?1 AND e.type = 'depends_on'
                AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
-               AND d.status IS NOT 'needs_review'
              LIMIT 1",
         )?
         .query_row([task.get()], |row| row.get(0))
@@ -626,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_review_dependency_unblocks_but_is_not_itself_ready() {
+    fn needs_review_dependency_still_blocks_its_dependents() {
         let db = Db::open_in_memory().unwrap();
         let (a, b) = db
             .write_txn("t", |conn, meta| {
@@ -641,13 +641,20 @@ mod tests {
         // While b is open, a is blocked.
         assert!(db.read(move |conn| is_blocked(conn, a)).unwrap());
 
-        // Move b to needs_review: its work is done pending approval, so a unblocks and
-        // becomes ready — but b, awaiting review, is NOT itself in the frontier (and is
-        // not terminal/done).
+        // Move b to needs_review (a reviewer is reviewing): its work is NOT yet landed on
+        // the feature branch and may bounce back, so a stays blocked (design D27.7). b
+        // itself, being non-terminal and unclaimed, is in the frontier — but a is not.
         db.write_txn("t", move |conn, meta| {
             set_status_str(conn, meta, b, "needs_review")
         })
         .unwrap();
+        assert!(db.read(move |conn| is_blocked(conn, a)).unwrap());
+        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        assert_eq!(uids(&frontier), vec!["task:b".to_owned()]);
+
+        // Only once b lands (`done`) does a unblock.
+        db.write_txn("t", move |conn, meta| set_status_str(conn, meta, b, "done"))
+            .unwrap();
         assert!(!db.read(move |conn| is_blocked(conn, a)).unwrap());
         let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
         assert_eq!(uids(&frontier), vec!["task:a".to_owned()]);
