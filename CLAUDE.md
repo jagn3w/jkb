@@ -94,8 +94,13 @@ implementation checklist and the **source of truth for what's done**.
   remote *bindings* (`https://`/`git://`), and an optional MCP `sync_status` tool. Live
   smokes needing external resources — `jkb search` vector/hybrid (ollama) and `jkb ingest
   <url>` (Chrome) — remain `#[ignore]` tests.
-- **162 tests** green (53 core + 15 embed + 13 types + 8 index + 17 ingest + 7 search
-  + 25 sync + 18 cli + 6 mcp; +2 `#[ignore]`: live-ollama, live-URL); `clippy -D warnings` clean
+- **Section 17 (fleet hardening, D27) is COMPLETE and green** — the agent-claim model
+  (`jkb-core/src/claim.rs`, migration `V005`), the full CLI mutate surface + `doctor`/`task`
+  reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
+  unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
+  See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
+- **203 tests** green (68 core + 15 embed + 14 types + 8 index + 23 ingest + 7 search
+  + 29 sync + 33 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama, live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
   `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
@@ -124,6 +129,13 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   `unwrap`/`expect` outside tests.
 - **IDs are newtypes** so `ItemId`/`NamespaceId` can't be crossed.
 - **SQL is always parameterized.** Never string-interpolate values.
+- **No raw `sqlite3` against a jkb db** (mirrors the no-raw-cargo rule). The `jkb`
+  CLI covers every read/write an agent needs — reads (`task show`/`next`, `query`,
+  `search`), edits (`task set`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/
+  `release`/`reclaim`), `undo`, `doctor --fix` — each routed through the audited
+  writer-actor + changelog + undo. A PreToolUse hook (`.claude/hooks/block-raw-sqlite.sh`,
+  fail-open) denies `sqlite3` targeting `jkb.db`/`$JKB_DB`/`~/.jkb/…`. Scripts under
+  `./scripts/` may read the DB directly (the sanctioned path).
 - **Writes go through the single writer-actor**; core is synchronous, async only
   at the edges (ollama HTTP, file-watching, MCP).
 - **Indexes are derived** — anything in an index must be rebuildable from the VFS.
@@ -379,3 +391,43 @@ design). What's intentionally left (each noted at its origin in `tasks.md`):
   offline suite can't cover.
 - **PDF OCR (v2).** Scanned/image-only PDFs extract near-zero text (the pipeline
   warns); OCR is out of scope for v1.
+
+## Section 17 — fleet hardening (D27, DONE, for reference)
+
+The robustness pass on the agent swarm that drives jkb task execution (design
+`openspec/changes/jkb-fleet-hardening/`). Four axes, all landed:
+
+- **Agent-claim model (D27.1, `jkb-core/src/claim.rs`, migration `V005`).** A claim is
+  a **property of the task** — two nullable `items` columns (`claimant_id`, `claimed_at`),
+  **not** a side table, never encoded in `status`. `claim(item, owner)` is a **CAS** that
+  succeeds only if free or same-owner and **atomically sets `status='in_progress'`** (no
+  claimed-but-`open` window). `release` clears the claim (leaves `status`). `reclaim_dead(
+  live_owners)` NULLs **only** claims whose owner ∉ the verified-alive set, writing **only**
+  claim columns — so it never clashes with a status transition and a live run never reclaims
+  its own work. **Liveness is by owner-existence, never age**: no TTL, no heartbeat — a
+  paused-but-alive agent keeps its claim. All three are **changelogged** (op
+  `claim`/`release`/`reclaim`), not undoable (undo inverts only inserts). `ready` gained the
+  plain predicate `AND claimant_id IS NULL`.
+- **CLI mutate surface + reclaim (D27.2/D27.3, `jkb-cli`).** `task
+  show`/`set`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/`release`/`reclaim` cover
+  every read/write over existing audited core seams; owner ids are `host:pid`
+  (`owner.rs`, `kill -0` liveness probe). `doctor` reports orphaned claims (owner gone);
+  `doctor --fix` and `task reclaim --keep <owner>` run the owner-existence reclaim.
+- **Four-state lifecycle (D27.7).** `open → in_progress → needs_review → done` reusing the
+  existing `TaskStatus` (no new variant). **`needs_review` no longer unblocks dependents** —
+  `unblocks_dependents()` is now just the terminal set `{done, cancelled}` (a task under
+  review may bounce back). `needs_review` means "a reviewer is reviewing" (transient).
+- **Status is KB-local, never in git.** Task status, task ids, and the fact a swarm ran
+  are personal bookkeeping — commits are ordinary professional messages (no `swarm:` prefix,
+  no uid, no trailer), history is linear (the merge queue rebase/fast-forwards, no merge
+  commits), and the integration branch is nameable as an ordinary feature branch.
+
+The **swarm pipeline** (agent-tooling, not a crate: `.claude/workflows/task-swarm.js`,
+`scripts/merge-queue.sh`, `.claude/commands/task-swarm.md`): **SCHEDULER** clusters
+overlapping ready tasks into work-groups (≤~4) → one **IMPLEMENTER** per group (all its
+tasks on one clean branch, stays with the group) → a **fresh REVIEWER** per pass (checks
+the whole group, seeded with the prior handoff) → a **deterministic merge queue** (no
+RESOLVER agent; `merge-queue.sh` rebase/fast-forwards, runs the gate, marks the group
+`done` on green, ejects on conflict/red). Pipelined (no per-round barrier), the merge
+queue the one serial stage; the coordinator loop claims each group before dispatch,
+releases on settle, and runs `task reclaim --keep <owner>` each pass as the crash net.

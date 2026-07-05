@@ -81,8 +81,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         // Bumped with each migration: V001 init, V002 fts, V003 embeddings_meta version,
-        // V004 sync journal.
-        assert_eq!(user_version, 4);
+        // V004 sync journal, V005 task claims.
+        assert_eq!(user_version, 5);
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 4);
+        assert_eq!(user_version, 5);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

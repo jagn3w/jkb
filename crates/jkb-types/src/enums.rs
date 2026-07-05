@@ -71,8 +71,10 @@ pub enum ConflictPolicy {
 ///
 /// Note: `blocked` is intentionally absent — it is *derived* from `depends_on`
 /// edges (design D19), never stored, so there is a single source of truth.
-/// `needs_review` is a real, settable status that unblocks dependents without being
-/// `done` (see [`TaskStatus::unblocks_dependents`]).
+/// `needs_review` is a real, settable status meaning "a reviewer is reviewing the
+/// branch" — transient, and it does **not** unblock dependents (design D27.7): a task
+/// under review is not yet landed and may bounce back (see
+/// [`TaskStatus::unblocks_dependents`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -80,8 +82,9 @@ pub enum TaskStatus {
     Open,
     /// Actively being worked.
     InProgress,
-    /// Implementation finished but awaiting operator approval. Unblocks dependents like
-    /// a terminal status, but is **not** `done` until an operator approves it.
+    /// A reviewer is reviewing the branch (design D27.5) — transient and re-enterable.
+    /// It does **not** unblock dependents and is **not** `done`: the work is not yet on
+    /// the feature branch and may bounce back to the implementer.
     NeedsReview,
     /// Completed.
     Done,
@@ -122,13 +125,15 @@ impl TaskStatus {
         matches!(self, Self::Done | Self::Cancelled)
     }
 
-    /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents
-    /// (and keeps the task itself out of the ready frontier). True for the terminal
-    /// statuses *and* `needs_review`: the work is finished enough for dependents to
-    /// proceed, even though `needs_review` is not yet `done`.
+    /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents.
+    /// True for exactly the **terminal** statuses (`done`/`cancelled`) — the terminal
+    /// set (design D27.7). A `needs_review` dependency deliberately does **not** unblock:
+    /// its work is not yet landed on the feature branch and may bounce back, so a
+    /// dependent must not start against it. Dependents unblock only once the dependency
+    /// reaches `done` (its work is landed) or `cancelled` (it will never complete).
     #[must_use]
     pub fn unblocks_dependents(self) -> bool {
-        matches!(self, Self::Done | Self::Cancelled | Self::NeedsReview)
+        matches!(self, Self::Done | Self::Cancelled)
     }
 
     /// Parse a *manually settable* status string into a [`TaskStatus`].
@@ -259,7 +264,7 @@ mod tests {
         assert!(TaskStatus::Cancelled.is_terminal());
         assert!(!TaskStatus::Open.is_terminal());
         assert!(!TaskStatus::InProgress.is_terminal());
-        // `needs_review` unblocks dependents but is NOT terminal (not yet done).
+        // `needs_review` is transient (a reviewer is reviewing) and NOT terminal.
         assert!(!TaskStatus::NeedsReview.is_terminal());
 
         assert_eq!(TaskStatus::from_manual_str("open"), Some(TaskStatus::Open));
@@ -277,10 +282,12 @@ mod tests {
     }
 
     #[test]
-    fn needs_review_unblocks_without_being_terminal() {
+    fn only_terminal_statuses_unblock_dependents() {
+        // The terminal set unblocks (design D27.7).
         assert!(TaskStatus::Done.unblocks_dependents());
         assert!(TaskStatus::Cancelled.unblocks_dependents());
-        assert!(TaskStatus::NeedsReview.unblocks_dependents());
+        // `needs_review` no longer unblocks — a task under review may still bounce back.
+        assert!(!TaskStatus::NeedsReview.unblocks_dependents());
         assert!(!TaskStatus::Open.unblocks_dependents());
         assert!(!TaskStatus::InProgress.unblocks_dependents());
     }

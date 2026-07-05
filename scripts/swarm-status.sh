@@ -2,9 +2,11 @@
 # Status for a task-swarm run (the /task-swarm coordinator). Two views:
 #
 #   ./scripts/swarm-status.sh [run_id|wf_dir]
-#       RUN view (default): per-task implement/resolve outcomes, rounds, agents,
-#       the swarm/* integration-branch commits, and jkb task-status counts.
-#       With no arg it picks the newest workflow run under ~/.claude.
+#       RUN view (default): SCHEDULER passes + group counts, IMPLEMENTER/REVIEWER
+#       outcomes, merge-queue landed/eject counts, the integration branch commits
+#       (base recovered from the merge detail), and jkb task-status counts (the
+#       needs_review vs done breakdown shows in-review work). With no arg it picks
+#       the newest workflow run under ~/.claude.
 #
 #   ./scripts/swarm-status.sh --file <tasks.md> [--db <db>]
 #       FILE view: for one code-review tasks.md, each task's disk checkbox marker
@@ -27,9 +29,12 @@ file_view() {
     [ -f "$file" ] || { echo "no such file: $file" >&2; exit 1; }
     [ -f "$db" ]   || { echo "no such db: $db" >&2; exit 1; }
 
-    local abs uri
+    local abs uri uri_sql
     abs=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
     uri="file://$abs"
+    # Escape single quotes for safe embedding in a SQL string literal (a path with an
+    # apostrophe would otherwise close the literal early and break the query).
+    uri_sql=${uri//\'/\'\'}
     echo "file: $abs"
     echo "db:   $db"
     echo
@@ -40,7 +45,7 @@ file_view() {
                 substr(base_blob_hash,1,12)  AS base_hash,
                 substr(quarantine_blob_hash,1,12) AS quar_hash,
                 parse_error, updated_at
-         FROM sync_state WHERE uri = '$uri';" 2>&1 \
+         FROM sync_state WHERE uri = '$uri_sql';" 2>&1 \
       || echo "(no sync_state row — file not yet synced)"
     echo
 
@@ -48,19 +53,35 @@ file_view() {
     kb=$(sqlite3 -separator $'\t' "$db" \
         "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
          FROM bindings b JOIN items i ON i.id = b.item_id
-         WHERE b.uri LIKE '$uri#%' AND i.kind = 'task';" 2>&1 || true)
+         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" 2>&1 || true)
 
     echo "=== tasks (disk marker | kb status) ==="
     printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"
     printf '%-4s  %-13s  %s\n' "----" "---------" "----"
-    grep -nE '^[[:space:]]*- \[.\].*\^[A-Za-z0-9-]+[[:space:]]*$' "$file" | while IFS= read -r line; do
-        local marker frag title kbstatus
-        marker=$(printf '%s' "$line" | sed -E 's/^[0-9]+:[[:space:]]*- \[(.)\].*/\1/')
-        frag=$(printf '%s' "$line"   | sed -E 's/.*\^([A-Za-z0-9-]+)[[:space:]]*$/\1/')
-        title=$(printf '%s' "$line"  | sed -E 's/^[0-9]+:[[:space:]]*- \[.\] //; s/ \^[A-Za-z0-9-]+[[:space:]]*$//; s/ —.*$//')
-        kbstatus=$(printf '%s\n' "$kb" | awk -F'\t' -v f="$frag" '$1==f{print $2; found=1} END{if(!found)print "(unbound)"}')
-        printf '[%s]   %-13s  %.60s\n' "$marker" "$kbstatus" "$title"
-    done
+    # One awk pass: preload the KB frag→status map once, then look up each checkbox line
+    # against it (an associative lookup, not a re-scan of $kb per line — avoids O(T²)).
+    grep -nE '^[[:space:]]*- \[.\].*\^[A-Za-z0-9-]+[[:space:]]*$' "$file" \
+      | KB="$kb" awk '
+        BEGIN {
+            n = split(ENVIRON["KB"], klines, "\n")
+            for (i = 1; i <= n; i++) {
+                p = index(klines[i], "\t")
+                if (p > 0) st[substr(klines[i], 1, p - 1)] = substr(klines[i], p + 1)
+            }
+        }
+        {
+            line = $0
+            sub(/^[0-9]+:/, "", line)                              # drop grep -n prefix
+            if (!match(line, /- \[.\]/)) next
+            marker = substr(line, RSTART + 3, 1)                   # char inside [ ]
+            frag = line; sub(/^.*\^/, "", frag); sub(/[[:space:]]*$/, "", frag)
+            title = line
+            sub(/^[[:space:]]*- \[.\][[:space:]]*/, "", title)     # strip checkbox
+            sub(/[[:space:]]*\^[A-Za-z0-9-]+[[:space:]]*$/, "", title)
+            sub(/ —.*$/, "", title)                                # drop trailing " — note"
+            kbstatus = (frag in st) ? st[frag] : "(unbound)"
+            printf "[%s]   %-13s  %.60s\n", marker, kbstatus, title
+        }'
     echo
     echo "legend: [ ] todo  [x] done  [~] partial  [-] cancelled  [?] needs_review"
 }
@@ -93,53 +114,57 @@ run_view() {
     echo "dir: $run_dir"
     echo
 
-    JOURNAL="$run_dir/journal.jsonl" SCOPE_OUT="$run_dir/.swarm-scope" python3 - <<'PY'
-import json, os
+    JOURNAL="$run_dir/journal.jsonl" SCOPE_OUT="$run_dir/.swarm-scope" BASE_OUT="$run_dir/.swarm-base" python3 - <<'PY'
+import json, os, re
 rows = [json.loads(l) for l in open(os.environ["JOURNAL"]) if l.strip()]
-sched, impl, resolve, started = [], {}, {}, 0
+# New swarm shape (D27): SCHEDULER groups → IMPLEMENTER → REVIEWER → merge queue.
+sched, impls, reviews, merges, started = [], [], [], [], 0
 for e in rows:
     if e.get("type") == "started":
         started += 1; continue
     if e.get("type") != "result":
         continue
-    r = e.get("result") or {}
+    r = e.get("result")
     if not isinstance(r, dict):
         continue
-    if "ready" in r:
-        sched.append(r); continue
-    uid = r.get("uid")
-    if not uid:
-        continue
-    if r.get("branch"):
-        impl[uid] = r
-    elif "merged" in r:
-        resolve[uid] = r
-label = lambda u: u.split("#")[-1] if "#" in u else u.rsplit("/", 1)[-1]
-order, seen, namespaces = [], set(), []
+    if "groups" in r:          sched.append(r)
+    elif "outcome" in r:       impls.append(r)         # IMPL {outcome, branch, summary}
+    elif "verdict" in r:       reviews.append(r)       # REVIEW {verdict, notes, handoff}
+    elif "landed" in r:        merges.append(r)        # MERGE {landed, detail}
+
+namespaces, base = [], None
 for s in sched:
-    for t in s.get("ready", []):
-        if t["uid"] not in seen:
-            seen.add(t["uid"]); order.append(t["uid"])
-        if t.get("namespace"):
-            namespaces.append(t["namespace"])
-print(f"rounds scheduled: {len(sched)}   agents started: {started}")
+    for g in s.get("groups", []):
+        for t in g.get("tasks", []):
+            if t.get("namespace"):
+                namespaces.append(t["namespace"])
+n_groups = sum(len(s.get("groups", [])) for s in sched)
+n_impl_ok = sum(1 for r in impls if r.get("outcome") == "ready")
+n_approve = sum(1 for r in reviews if r.get("verdict") == "approve")
+n_reqchg  = sum(1 for r in reviews if r.get("verdict") == "request_changes")
+n_land = sum(1 for r in merges if r.get("landed"))
+n_eject = sum(1 for r in merges if not r.get("landed"))
+
+print(f"scheduler passes: {len(sched)}   agents started: {started}")
 if sched:
     last = sched[-1]
-    print(f"last scheduler: ready={len(last.get('ready',[]))} remaining={last.get('remaining')}")
-n_merged  = sum(1 for r in resolve.values() if r.get("merged"))
-n_flagged = sum(1 for r in resolve.values() if not r.get("merged"))
-print(f"implemented: {len(impl)}/{len(order)}   merged: {n_merged}   resolver-flagged: {n_flagged}")
-print()
-hdr = f"{'task':40} {'impl':6} {'resolve':10}"
-print(hdr); print("-" * len(hdr))
-for u in order:
-    i = "ok" if u in impl else "-"
-    if u in resolve:
-        rr = resolve[u]
-        rs = "merged" if rr.get("merged") else (rr.get("flag") or rr.get("outcome") or "flagged")
-    else:
-        rs = "-"
-    print(f"{label(u)[:40]:40} {i:6} {rs:10}")
+    print(f"last pass: groups={len(last.get('groups',[]))} remaining={last.get('remaining')}")
+print(f"groups scheduled: {n_groups}   implemented(ok): {n_impl_ok}")
+print(f"reviews: approve={n_approve} request_changes={n_reqchg}")
+print(f"merge queue: landed={n_land} eject={n_eject}")
+if merges:
+    print()
+    hdr = f"{'merge outcome':14} {'detail':60}"
+    print(hdr); print("-" * len(hdr))
+    for m in merges:
+        out = "landed" if m.get("landed") else "eject"
+        print(f"{out:14} {str(m.get('detail',''))[:60]:60}")
+        # Parse the base branch from a "landed: <branch> -> <base> in …" line.
+        mm = re.search(r'->\s*(\S+)', str(m.get("detail","")))
+        if mm and not base:
+            base = mm.group(1)
+if base:
+    open(os.environ["BASE_OUT"], "w").write(base)
 if namespaces:
     segs = [n.split("/") for n in namespaces]
     common = []
@@ -153,16 +178,17 @@ if namespaces:
 PY
 
     echo
-    echo "=== integration branch(es) ==="
-    local found=""
-    while read -r br; do
-        [ -z "$br" ] && continue
-        found=1
-        local base="${br#swarm/}"
-        echo "-- $br (vs $base) --"
-        git -C "$REPO" log --oneline "$base".."$br" 2>/dev/null || echo "  (base '$base' not found)"
-    done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads/swarm/ 2>/dev/null)
-    [ -z "$found" ] && echo "(no swarm/* branches)"
+    echo "=== integration branch ==="
+    # The integration/feature branch is an ordinary branch name (no swarm/* artifact,
+    # D27.7). Recover its base from the merge-queue detail lines when available.
+    local base_file="$run_dir/.swarm-base"
+    if [ -f "$base_file" ]; then
+        local base; base="$(cat "$base_file")"; rm -f "$base_file"
+        echo "base branch (from merge detail): $base"
+        git -C "$REPO" log --oneline -15 "$base" 2>/dev/null || echo "  (branch '$base' not found locally)"
+    else
+        echo "(no landed merges recorded yet — integration branch name is in the coordinator's memory, not git)"
+    fi
 
     local scope_file="$run_dir/.swarm-scope"
     if [ -f "$scope_file" ] && command -v jkb >/dev/null 2>&1; then
