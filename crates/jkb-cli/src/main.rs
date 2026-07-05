@@ -919,7 +919,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
 /// gone, preserving `keep` owners (the live run passes its own owner so it never
 /// reclaims its own in-flight work).
 fn cmd_task_reclaim(db: &Db, keep: &[String], json: bool) -> Result<()> {
-    let (held, cleared) = reclaim_orphaned(db, keep)?;
+    let (held, cleared) = reclaim_orphaned(db, keep, true)?;
     if json {
         let uids: Vec<&str> = cleared.iter().map(|c| c.uid.as_str()).collect();
         println!("{}", serde_json::json!({"held": held, "reclaimed": uids}));
@@ -981,23 +981,44 @@ fn report(json: bool, uid: &str, action: &str) {
 
 /// The owner-existence reclaim (design D27.1/D27.2): clear every claim whose owner
 /// process no longer exists, keeping claims whose pid is alive plus any `keep` owners.
-/// Returns `(total_held, cleared_claims)`. Used by `task reclaim` and `doctor --fix`.
+/// Returns `(total_held, cleared_or_orphaned_claims)`. Used by `task reclaim`,
+/// `doctor` (report), and `doctor --fix`.
+///
+/// When `fix` is false this is **report-only**: it returns the held claims that *would*
+/// be reclaimed (a stale-snapshot read is fine — nothing is written). When `fix` is true
+/// the reclaim runs **inside the write transaction** (via [`claim::reclaim_dead`]) so
+/// liveness is re-evaluated against the current claim set, closing the race where a claim
+/// acquired concurrently by a live owner could be reclaimed from a snapshot.
 ///
 /// # Errors
 /// Errors if a database read/write fails.
-fn reclaim_orphaned(db: &Db, keep: &[String]) -> Result<(usize, Vec<claim::ClaimInfo>)> {
+fn reclaim_orphaned(db: &Db, keep: &[String], fix: bool) -> Result<(usize, Vec<claim::ClaimInfo>)> {
     let held = db.read(claim::claimed)?;
-    // The verified-alive set: every held owner whose pid is alive, plus explicit keeps.
-    let mut live: Vec<String> = held
-        .iter()
-        .map(|c| c.owner.clone())
-        .filter(|o| owner::is_alive(o))
-        .collect();
-    live.extend(keep.iter().cloned());
+    let total = held.len();
+    if !fix {
+        return Ok((total, orphaned_claims(held, keep)));
+    }
+    let keep = keep.to_vec();
     let cleared = db.write_txn("cli", move |conn, meta| {
-        claim::reclaim_dead(conn, meta, &live)
+        claim::reclaim_dead(conn, meta, &keep, owner::is_alive)
     })?;
-    Ok((held.len(), cleared))
+    Ok((total, cleared))
+}
+
+/// The held claims whose owner process no longer exists (owners in `keep` are alive by
+/// fiat and never probed). Probes each **distinct** owner at most once via
+/// [`owner::is_alive`] — the single source of the liveness rule, shared with the
+/// txn-internal probe in [`claim::reclaim_dead`]. Report-only: it never writes.
+fn orphaned_claims(held: Vec<claim::ClaimInfo>, keep: &[String]) -> Vec<claim::ClaimInfo> {
+    let mut alive: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    held.into_iter()
+        .filter(|c| {
+            let live = *alive
+                .entry(c.owner.clone())
+                .or_insert_with(|| keep.iter().any(|o| o == &c.owner) || owner::is_alive(&c.owner));
+            !live
+        })
+        .collect()
 }
 
 /// Canonicalize a task uid: leave a `:`-bearing uid alone, else prefix `task:`.
@@ -1136,24 +1157,25 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
     // gone is orphaned (no time-based staleness — a paused-but-alive owner is retained).
     // A bare run reports; `--fix` clears orphaned claims so their tasks return to the
     // ready frontier.
-    let held = db.read(claim::claimed)?;
-    let orphaned: Vec<_> = held.iter().filter(|c| !owner::is_alive(&c.owner)).collect();
-    if held.is_empty() {
+    // One `reclaim_orphaned(.., false)` computes the report (shared with `task reclaim`,
+    // no rule duplication). On `--fix` the reclaim re-probes inside the write txn — that
+    // repeat is deliberate: the race-free clear must evaluate liveness against the current
+    // claim set, not the report's snapshot.
+    let (held_count, orphaned) = reclaim_orphaned(db, &[], false)?;
+    if held_count == 0 {
         println!("task claims: none held");
     } else if orphaned.is_empty() {
-        println!("task claims: {} held, all owners alive", held.len());
+        println!("task claims: {held_count} held, all owners alive");
     } else {
         println!(
-            "task claims: {} orphaned (owner gone) of {} held",
+            "task claims: {} orphaned (owner gone) of {held_count} held",
             orphaned.len(),
-            held.len()
         );
         for c in &orphaned {
             println!("  {} claimed by dead owner {}", c.uid, c.owner);
         }
         if fix {
-            // Reclaim clears every claim whose owner is NOT in the verified-alive set.
-            let (_, cleared) = reclaim_orphaned(db, &[])?;
+            let (_, cleared) = reclaim_orphaned(db, &[], true)?;
             println!("  cleared {} orphaned claim(s)", cleared.len());
         } else {
             println!("  run `jkb doctor --fix` to clear them");

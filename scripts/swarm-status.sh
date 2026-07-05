@@ -29,9 +29,12 @@ file_view() {
     [ -f "$file" ] || { echo "no such file: $file" >&2; exit 1; }
     [ -f "$db" ]   || { echo "no such db: $db" >&2; exit 1; }
 
-    local abs uri
+    local abs uri uri_sql
     abs=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
     uri="file://$abs"
+    # Escape single quotes for safe embedding in a SQL string literal (a path with an
+    # apostrophe would otherwise close the literal early and break the query).
+    uri_sql=${uri//\'/\'\'}
     echo "file: $abs"
     echo "db:   $db"
     echo
@@ -42,7 +45,7 @@ file_view() {
                 substr(base_blob_hash,1,12)  AS base_hash,
                 substr(quarantine_blob_hash,1,12) AS quar_hash,
                 parse_error, updated_at
-         FROM sync_state WHERE uri = '$uri';" 2>&1 \
+         FROM sync_state WHERE uri = '$uri_sql';" 2>&1 \
       || echo "(no sync_state row — file not yet synced)"
     echo
 
@@ -50,19 +53,35 @@ file_view() {
     kb=$(sqlite3 -separator $'\t' "$db" \
         "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
          FROM bindings b JOIN items i ON i.id = b.item_id
-         WHERE b.uri LIKE '$uri#%' AND i.kind = 'task';" 2>&1 || true)
+         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" 2>&1 || true)
 
     echo "=== tasks (disk marker | kb status) ==="
     printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"
     printf '%-4s  %-13s  %s\n' "----" "---------" "----"
-    grep -nE '^[[:space:]]*- \[.\].*\^[A-Za-z0-9-]+[[:space:]]*$' "$file" | while IFS= read -r line; do
-        local marker frag title kbstatus
-        marker=$(printf '%s' "$line" | sed -E 's/^[0-9]+:[[:space:]]*- \[(.)\].*/\1/')
-        frag=$(printf '%s' "$line"   | sed -E 's/.*\^([A-Za-z0-9-]+)[[:space:]]*$/\1/')
-        title=$(printf '%s' "$line"  | sed -E 's/^[0-9]+:[[:space:]]*- \[.\] //; s/ \^[A-Za-z0-9-]+[[:space:]]*$//; s/ —.*$//')
-        kbstatus=$(printf '%s\n' "$kb" | awk -F'\t' -v f="$frag" '$1==f{print $2; found=1} END{if(!found)print "(unbound)"}')
-        printf '[%s]   %-13s  %.60s\n' "$marker" "$kbstatus" "$title"
-    done
+    # One awk pass: preload the KB frag→status map once, then look up each checkbox line
+    # against it (an associative lookup, not a re-scan of $kb per line — avoids O(T²)).
+    grep -nE '^[[:space:]]*- \[.\].*\^[A-Za-z0-9-]+[[:space:]]*$' "$file" \
+      | KB="$kb" awk '
+        BEGIN {
+            n = split(ENVIRON["KB"], klines, "\n")
+            for (i = 1; i <= n; i++) {
+                p = index(klines[i], "\t")
+                if (p > 0) st[substr(klines[i], 1, p - 1)] = substr(klines[i], p + 1)
+            }
+        }
+        {
+            line = $0
+            sub(/^[0-9]+:/, "", line)                              # drop grep -n prefix
+            if (!match(line, /- \[.\]/)) next
+            marker = substr(line, RSTART + 3, 1)                   # char inside [ ]
+            frag = line; sub(/^.*\^/, "", frag); sub(/[[:space:]]*$/, "", frag)
+            title = line
+            sub(/^[[:space:]]*- \[.\][[:space:]]*/, "", title)     # strip checkbox
+            sub(/[[:space:]]*\^[A-Za-z0-9-]+[[:space:]]*$/, "", title)
+            sub(/ —.*$/, "", title)                                # drop trailing " — note"
+            kbstatus = (frag in st) ? st[frag] : "(unbound)"
+            printf "[%s]   %-13s  %.60s\n", marker, kbstatus, title
+        }'
     echo
     echo "legend: [ ] todo  [x] done  [~] partial  [-] cancelled  [?] needs_review"
 }

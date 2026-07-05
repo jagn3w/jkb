@@ -500,7 +500,17 @@ fn task_line(line: &str) -> Option<(usize, &'static str, &str)> {
         '-' => "cancelled",
         _ => return None,
     };
-    let rest = after.get(1..)?.strip_prefix("] ")?;
+    // After the marker we require a literal `]`, then either end-of-line (a titleless
+    // placeholder `- [ ]`) or a single space/tab separator before the title. Accepting
+    // both an empty remainder and a tab keeps a hand-edited `- [ ]` / `- [ ]\ttitle`
+    // parsed as a task instead of silently falling through to verbatim prose (lost from
+    // the DAG). `- [x]foo` (no separator) is still not a task line.
+    let body = after.get(1..)?.strip_prefix(']')?;
+    let rest = match body.chars().next() {
+        None => "",
+        Some(' ' | '\t') => &body[1..],
+        Some(_) => return None,
+    };
     Some((indent, status, rest))
 }
 
@@ -731,5 +741,26 @@ Some description.
             .edges
             .iter()
             .any(|e| e.src == "p" && e.dst == "c" && e.edge_type == jkb_types::EdgeType::ParentOf));
+    }
+
+    #[test]
+    fn empty_and_tab_separated_checkboxes_parse_as_tasks() {
+        // `- [ ]` (no trailing space) and `- [x]\ttitle` (tab after the bracket) must be
+        // parsed as tasks, not demoted to verbatim prose (which would drop them from the
+        // DAG). `- [x]foo` (no separator) stays prose.
+        let doc = TasksSerializer
+            .parse(b"- [ ]\n- [x]\tdone one ^d\n- [~]bad\n")
+            .unwrap();
+        let tasks: Vec<_> = doc.items.iter().filter(|i| i.kind == "task").collect();
+        assert_eq!(tasks.len(), 2, "two checkbox lines are tasks");
+        assert_eq!(tasks[0].status.as_deref(), Some("open"));
+        assert!(tasks[0].content.is_empty());
+        assert_eq!(tasks[1].status.as_deref(), Some("done"));
+        assert_eq!(tasks[1].content, "done one");
+        // `- [~]bad` (no separator) is not a task; it survives as text prose.
+        assert!(doc
+            .items
+            .iter()
+            .any(|i| i.kind == "text" && i.content.contains("[~]bad")));
     }
 }
