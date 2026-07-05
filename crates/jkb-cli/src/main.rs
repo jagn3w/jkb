@@ -956,6 +956,19 @@ fn cmd_task_edit(
         text.join(" ")
     };
     let id = resolve_task_uid(db, uid)?;
+    // A file-backed task is a single line in its source file: the tasks serializer renders
+    // the item's `content` verbatim as the checkbox line (`render_task`). Multi-line content
+    // — always the case for `--append`, and for any replacement containing a newline — would
+    // split that line on sync, detaching the trailing `^id` and losing the task's identity.
+    // Refuse it and point at the source-file flow the design gate already prescribes.
+    let file_backed = uid.starts_with("file://");
+    if file_backed && (append || new_text.contains('\n')) {
+        anyhow::bail!(
+            "`{uid}` is a file-backed task; its source line is single-line, so `--append` \
+             or multi-line content would corrupt it on sync. Edit the source file directly \
+             (add indented notes beneath its `^id` line), then run `jkb sync`."
+        );
+    }
     db.write_txn("cli", move |conn, meta| {
         let content = if append {
             match item::get_content(conn, id)? {
@@ -968,7 +981,7 @@ fn cmd_task_edit(
         item::set_content(conn, meta, id, &content, None)
     })?;
     report(json, uid, if append { "appended" } else { "edited" });
-    if uid.starts_with("file://") && !json {
+    if file_backed && !json {
         eprintln!(
             "note: this is a file-backed task; run `jkb sync` to propagate the edit to its file."
         );
