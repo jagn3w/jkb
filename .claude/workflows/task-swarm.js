@@ -29,6 +29,10 @@ const JKB = cfg.jkb || 'jkb' // how to invoke the jkb binary
 const DB = cfg.db ? ` --db ${cfg.db}` : '' // optional --db flag
 const SCOPE = cfg.scope || '' // a jkb DSL scope, e.g. "ns:codereviews/**"
 const TASKS = Array.isArray(cfg.tasks) ? cfg.tasks : null // or explicit task uids
+// Design gate (D28): in scope mode the swarm only touches tasks whose design has been
+// approved (tag `design=approved`, set by /design-pass). `cfg.designGate:false` disables
+// it. Explicit-uid mode (TASKS) is a deliberate hand-pick and always bypasses the gate.
+const DESIGN_GATE = cfg.designGate === false || TASKS ? '' : 'tag:design=approved'
 const GLOBAL = cfg.global === false ? '' : ' --global' // ignore ambient cwd scoping
 const REPO = cfg.repo || '.' // the main working copy (where task files live)
 const INTEGRATION = cfg.integration // integration/feature branch name (required)
@@ -48,7 +52,12 @@ if (!INTEGRATION || !INTEGRATION_WT) {
   )
 }
 
-const scopeExpr = TASKS ? `tasks [${TASKS.join(', ')}]` : SCOPE || '(ambient scope)'
+// The scope terms handed to `task next`/`query`, with the design gate ANDed in (scope
+// mode only). Both empty → an empty DSL string (whole ambient/global frontier, gated).
+const GATED_SCOPE = [SCOPE, DESIGN_GATE].filter(Boolean).join(' ')
+const scopeExpr = TASKS
+  ? `tasks [${TASKS.join(', ')}]`
+  : GATED_SCOPE || '(ambient scope)'
 const shortUid = (uid) => (uid.includes('#') ? uid.split('#').pop() : uid.split('/').pop())
 // A task's file-backed requirement id (the trailing `^id`), or null for a managed task.
 const fragOf = (uid) => (uid.startsWith('file://') ? uid.split('#').pop() : null)
@@ -130,11 +139,14 @@ const ACK = {
 function schedulerPrompt(round) {
   const readyCmd = TASKS
     ? `list only the still-ready ones among these uids: ${TASKS.join(', ')} (a task is ready only if unblocked AND unclaimed)`
-    : `run \`${JKB}${DB} task next${GLOBAL} --json '${SCOPE}' --limit 100\``
+    : `run \`${JKB}${DB} task next${GLOBAL} --json '${GATED_SCOPE}' --limit 100\``
+  const gateNote = DESIGN_GATE
+    ? ` The scope carries \`${DESIGN_GATE}\` — the design gate (D28): only design-approved tasks are swarmable, so un-triaged tasks are correctly invisible here.`
+    : ''
   return `You are the SCHEDULER for a task swarm (pass ${round}), the head of each round (design D27.8). Read the current READY frontier and cluster overlapping tasks into WORK-GROUPS.
 
-1. Ready frontier: ${readyCmd}. \`task next\` returns only unblocked, non-terminal, UNCLAIMED tasks (claimed = already in flight, excluded) ordered by priority then due — safe to start now.
-2. Remaining count: run \`${JKB}${DB} query${GLOBAL} --json 'kind:task ${TASKS ? '' : SCOPE}' --limit 1000\` and count items whose "status" is NOT "done" and NOT "cancelled" (those are terminal; everything else — open/in_progress/needs_review — is still remaining work). If scoping by explicit uids, count only those uids.
+1. Ready frontier: ${readyCmd}. \`task next\` returns only unblocked, non-terminal, UNCLAIMED tasks (claimed = already in flight, excluded) ordered by priority then due — safe to start now.${gateNote}
+2. Remaining count: run \`${JKB}${DB} query${GLOBAL} --json 'kind:task ${TASKS ? '' : GATED_SCOPE}' --limit 1000\` and count items whose "status" is NOT "done" and NOT "cancelled" (those are terminal; everything else — open/in_progress/needs_review — is still remaining work). If scoping by explicit uids, count only those uids.
 3. For each ready task capture "uid", "id", "title", "priority", "namespace", and — if the uid starts with file:// — the absolute file path before '#' as "source_file" (else null).
 4. PRECOMPUTE OVERLAP SIGNALS, then CLUSTER (this judgement is why you are an agent):
    a. For each ready task, read its body (\`${JKB}${DB} task show <uid> --json\`; for file-backed tasks the real requirement is the line ending in \`^<frag>\` in its source_file) and extract the concrete files/paths/symbols/crate it will touch. This extraction is the deterministic signal.
@@ -161,9 +173,10 @@ ${reviewHint ? `\nFEEDBACK to address this pass (from the reviewer or a merge-qu
 
 Steps:
 1. ${priorBranch ? `Reuse your branch ${priorBranch} (create it off ${INTEGRATION} if it's gone), and rebase it onto the current ${INTEGRATION} tip.` : `Branch off the latest integrated state: \`git switch -c ${branchName} ${INTEGRATION}\` (pick a short unique name if that one exists).`}
-2. Implement EVERY task in the group fully, following the repo's CLAUDE.md conventions. Make the real change. Stay within the group's scope — implement all of these tasks and NOTHING beyond their union (no drift, no unrelated edits).
-3. Verify with the repo's own scripts/tests (e.g. ./scripts/fix.sh, ./scripts/test.sh, ./scripts/clippy.sh, or the project's equivalent). Do not weaken tests to pass.
-4. Commit with a NORMAL, PROFESSIONAL commit message describing the change on its own terms — NO "swarm:" prefix, NO task uid, NO trailer, no reference to the swarm (this branch lands in a shared codebase). You MAY squash to one clean commit. Committing is REQUIRED — the worktree may be cleaned up, but the branch/commit persist for the reviewer and merge queue.
+2. READ THE APPROVED DESIGN FIRST (D28). Each task here is design-approved — the decided approach was worked out with the user and recorded, NOT left for you to invent. For each task: (a) read its body for an inline "Design:" note (\`${JKB}${DB} task show <uid> --json\` for managed tasks; for a file-backed task, the "Design:" block indented beneath its \`^${'<frag>'}\` line in the source file); (b) also grep the repo's design docs for a decision that governs it: \`grep -rl '<task-uid>' openspec/**/design.md openspec/design-notes.md 2>/dev/null\` and read the decision block that names it. FOLLOW the recorded decision exactly — do not re-litigate settled choices or substitute your own architecture. If a task has NO recorded design anywhere (no inline note, no governing doc block) and its approach is genuinely non-obvious, return "failed" with reason "missing design for <uid>" rather than guessing (it should not have been gated through).
+3. Implement EVERY task in the group fully, following the repo's CLAUDE.md conventions. Make the real change. Stay within the group's scope — implement all of these tasks and NOTHING beyond their union (no drift, no unrelated edits).
+4. Verify with the repo's own scripts/tests (e.g. ./scripts/fix.sh, ./scripts/test.sh, ./scripts/clippy.sh, or the project's equivalent). Do not weaken tests to pass.
+5. Commit with a NORMAL, PROFESSIONAL commit message describing the change on its own terms — NO "swarm:" prefix, NO task uid, NO trailer, no reference to the swarm (this branch lands in a shared codebase). You MAY squash to one clean commit. Committing is REQUIRED — the worktree may be cleaned up, but the branch/commit persist for the reviewer and merge queue.
 
 Return outcome "ready" with your branch name if all group tasks are implemented, committed, and tests pass; else "failed" with the reason. Only return "ready" if you actually committed a branch.`
 }

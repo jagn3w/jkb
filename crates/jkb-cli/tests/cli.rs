@@ -198,6 +198,84 @@ fn mount_and_sync_imports_files() {
 }
 
 #[test]
+fn task_edit_refuses_newline_edits_on_file_backed_tasks() {
+    // A file-backed task is a single source line; `--append` (or multi-line content)
+    // would split it on sync and detach its `^id`. The CLI must refuse such edits.
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = TempDir::new().unwrap();
+    std::fs::write(
+        repo.path().join("tasks.md"),
+        "## Inbox\n\n- [ ] fix the parser bug\n",
+    )
+    .unwrap();
+
+    jkb(&db)
+        .args([
+            "mount",
+            "work",
+            repo.path().to_str().unwrap(),
+            "--serializer",
+            "tasks",
+            "--include",
+            "**/tasks.md",
+        ])
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "work"]).assert().success();
+
+    // The file-backed uid is the only `file://…` string in the JSON frontier.
+    let out = jkb(&db)
+        .args(["--global", "task", "next", "--json", "ns:work/**"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let start = stdout.find("file://").expect("a file-backed task uid");
+    let uid = &stdout[start..start + stdout[start..].find('"').unwrap()];
+    assert!(uid.contains("tasks.md#"), "unexpected uid: {uid}");
+
+    // `--append` is refused with a message pointing at the source-file flow.
+    jkb(&db)
+        .args(["task", "edit", uid, "--append", "Design: use trait X"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("file-backed"))
+        .stderr(predicate::str::contains("run `jkb sync`"));
+
+    // A multi-line replacement is refused too (content carrying a newline).
+    jkb(&db)
+        .args(["task", "edit", uid, "line one\nline two"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("file-backed"));
+
+    // A single-line replacement round-trips and is allowed.
+    jkb(&db)
+        .args(["task", "edit", uid, "renamed", "title"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("edited"));
+
+    // The guard is specific to file-backed tasks: a managed task still appends fine.
+    jkb(&db)
+        .args(["task", "add", "managed task"])
+        .assert()
+        .success();
+    let managed = jkb(&db)
+        .args(["--global", "task", "next", "--json", "ns:tasks/**"])
+        .output()
+        .unwrap();
+    let mstdout = String::from_utf8(managed.stdout).unwrap();
+    let mstart = mstdout.find("task:").expect("a managed task uid");
+    let muid = &mstdout[mstart..mstart + mstdout[mstart..].find('"').unwrap()];
+    jkb(&db)
+        .args(["task", "edit", muid, "--append", "Design: settled"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended"));
+}
+
+#[test]
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

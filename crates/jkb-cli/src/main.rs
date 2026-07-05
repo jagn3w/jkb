@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use jkb_core::query::{Query, Scope};
-use jkb_core::{binding, claim, edge, mount, ns, placement, tag, task, undo, view, Db};
+use jkb_core::{binding, claim, edge, item, mount, ns, placement, tag, task, undo, view, Db};
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_ingest::Pipeline;
 use jkb_search::{Route, Searcher};
@@ -206,6 +206,21 @@ enum TaskCmd {
         /// New ISO due date, e.g. `2026-07-15`.
         #[arg(long)]
         due: Option<String>,
+    },
+    /// Edit a task's body text: replace it, or `--append` to it. Content comes from
+    /// the trailing args, or from stdin with `--stdin` (handy for multi-line notes).
+    Edit {
+        /// The task uid (the `task:` prefix is optional).
+        uid: String,
+        /// The new content (omit and pass `--stdin` to read it from stdin).
+        #[arg(num_args = 0..)]
+        text: Vec<String>,
+        /// Read the new content from stdin instead of the trailing args.
+        #[arg(long)]
+        stdin: bool,
+        /// Append to the existing content (blank-line separated) instead of replacing.
+        #[arg(long)]
+        append: bool,
     },
     /// Add or remove a `facet=value` tag on a task.
     Tag {
@@ -843,6 +858,12 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             })?;
             report(json, &uid, "updated");
         }
+        TaskCmd::Edit {
+            uid,
+            text,
+            stdin,
+            append,
+        } => cmd_task_edit(db, &uid, &text, stdin, append, json)?,
         TaskCmd::Tag { cmd } => {
             let (uid, facet_value, adding) = match cmd {
                 TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, true),
@@ -910,6 +931,60 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read subcommands are dispatched by `cmd_task` and never reach here.
         TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+/// `task edit`: replace (or `--append` to) a task's body text through the audited
+/// `item::set_content` seam. Content comes from `text` or, with `stdin`, from stdin.
+fn cmd_task_edit(
+    db: &Db,
+    uid: &str,
+    text: &[String],
+    stdin: bool,
+    append: bool,
+    json: bool,
+) -> Result<()> {
+    let new_text = if stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("reading task content from stdin")?;
+        buf.trim_end().to_owned()
+    } else if text.is_empty() {
+        anyhow::bail!("provide new content as arguments, or pass --stdin");
+    } else {
+        text.join(" ")
+    };
+    let id = resolve_task_uid(db, uid)?;
+    // A file-backed task is a single line in its source file: the tasks serializer renders
+    // the item's `content` verbatim as the checkbox line (`render_task`). Multi-line content
+    // — always the case for `--append`, and for any replacement containing a newline — would
+    // split that line on sync, detaching the trailing `^id` and losing the task's identity.
+    // Refuse it and point at the source-file flow the design gate already prescribes.
+    let file_backed = uid.starts_with("file://");
+    if file_backed && (append || new_text.contains('\n')) {
+        anyhow::bail!(
+            "`{uid}` is a file-backed task; its source line is single-line, so `--append` \
+             or multi-line content would corrupt it on sync. Edit the source file directly \
+             (add indented notes beneath its `^id` line), then run `jkb sync`."
+        );
+    }
+    db.write_txn("cli", move |conn, meta| {
+        let content = if append {
+            match item::get_content(conn, id)? {
+                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{new_text}"),
+                _ => new_text,
+            }
+        } else {
+            new_text
+        };
+        item::set_content(conn, meta, id, &content, None)
+    })?;
+    report(json, uid, if append { "appended" } else { "edited" });
+    if file_backed && !json {
+        eprintln!(
+            "note: this is a file-backed task; run `jkb sync` to propagate the edit to its file."
+        );
     }
     Ok(())
 }
