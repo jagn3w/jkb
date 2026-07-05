@@ -32,9 +32,19 @@ steps in order and **do not spawn anything until after the cost preview and conf
 - If `$ARGUMENTS` is empty, stop and ask for a jkb path or task uids.
 - `--dry-run` present → do steps 2–3 only (preview, spawn nothing).
 - `--branch <name>` present → use `<name>` as the integration/feature branch (see step 5).
+- `--no-design-gate` present → set `GATE=""` (skip the design gate; see below). Otherwise
+  `GATE="tag:design=approved"`.
 - Otherwise interpret the non-flag argument as either:
   - a **namespace/path** (no spaces, no `#`) → scope `SCOPE="ns:<path>/**"`, or
   - one or more **task uids** (contain `:` or `#`, or a space-separated list) → collect them as `TASKS`.
+
+**Design gate (D28).** In **scope mode** the swarm only touches tasks whose design has been
+approved — tag `design=approved`, set by `/design-pass`. This keeps implementers from
+inventing architecture on undecided work (they run headless and can't ask you). So the
+scout and the workflow AND `GATE` into the scope. Un-triaged tasks are deliberately
+invisible to the swarm. Two bypasses: `--no-design-gate` (emergency), and **explicit-uid
+mode** (`TASKS`) — naming exact uids is a deliberate hand-pick, so the gate never applies
+there (but see the warning in step 3).
 
 ## 2. Preflight
 
@@ -46,12 +56,19 @@ steps in order and **do not spawn anything until after the cost preview and conf
 
 ## 3. Scout + cost preview (the guardrail)
 
-Fetch the frontier without changing anything:
+Fetch the frontier without changing anything (`<SCOPE> <GATE>` = the scope terms plus the
+design gate, e.g. `ns:foo/** tag:design=approved`; drop `<GATE>` when `--no-design-gate`):
 
 ```sh
-jkb task next --global --json '<SCOPE>' --limit 100      # ready (unblocked, unclaimed) tasks
-jkb query    --global --json 'kind:task <SCOPE>' --limit 1000   # all tasks in scope
+jkb task next --global --json '<SCOPE> <GATE>' --limit 100      # ready + design-approved
+jkb query    --global --json 'kind:task <SCOPE> <GATE>' --limit 1000   # all approved tasks in scope
 ```
+
+Also run the **ungated** ready query once (`jkb task next --global --json '<SCOPE>'`) so you
+can report how many ready tasks are held back by the gate — if that count is high, tell the
+user to run `/design-pass <path>` first. In **explicit-uid mode** the gate is bypassed; check
+each named uid for `design=approved` (`jkb task show <uid> --json`) and warn about any that
+lack it before proceeding (they'll be built with un-approved designs).
 
 (For a uid list, filter these to the given uids.) From the results, print:
 - the **ready** task count and titles, and the **total non-terminal** count (status not
@@ -140,11 +157,16 @@ setup resolves saved workflows), and `args`.
   "owner": "<OWNER, e.g. host:pid>",
   "retryCap": 3,
   "roundCap": 40,
-  "groupCap": 4
+  "groupCap": 4,
+  "designGate": true
 }
 ```
 
-Include only `scope` **or** `tasks` (whichever you resolved; omit the other). If the user
+Include only `scope` **or** `tasks` (whichever you resolved; omit the other). Set
+`"designGate": false` **only** when the user passed `--no-design-gate`; otherwise leave it
+`true` so the workflow re-applies `tag:design=approved` on every scheduler pass (the gate
+must live in the workflow too — new tasks can appear between passes). In explicit-uid mode
+`designGate` is ignored (the workflow bypasses the gate for `tasks`). If the user
 set a token budget, the workflow honors it (it stops feeding new groups when the remaining
 budget is low, then drains in-flight work). The workflow runs in the background and
 notifies on completion.

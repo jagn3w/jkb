@@ -131,7 +131,7 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 - **SQL is always parameterized.** Never string-interpolate values.
 - **No raw `sqlite3` against a jkb db** (mirrors the no-raw-cargo rule). The `jkb`
   CLI covers every read/write an agent needs — reads (`task show`/`next`, `query`,
-  `search`), edits (`task set`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/
+  `search`), edits (`task set`/`edit`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/
   `release`/`reclaim`), `undo`, `doctor --fix` — each routed through the audited
   writer-actor + changelog + undo. A PreToolUse hook (`.claude/hooks/block-raw-sqlite.sh`,
   fail-open) denies `sqlite3` targeting `jkb.db`/`$JKB_DB`/`~/.jkb/…`. Scripts under
@@ -409,7 +409,7 @@ The robustness pass on the agent swarm that drives jkb task execution (design
   `claim`/`release`/`reclaim`), not undoable (undo inverts only inserts). `ready` gained the
   plain predicate `AND claimant_id IS NULL`.
 - **CLI mutate surface + reclaim (D27.2/D27.3, `jkb-cli`).** `task
-  show`/`set`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/`release`/`reclaim` cover
+  show`/`set`/`edit`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/`release`/`reclaim` cover
   every read/write over existing audited core seams; owner ids are `host:pid`
   (`owner.rs`, `kill -0` liveness probe). `doctor` reports orphaned claims (owner gone);
   `doctor --fix` and `task reclaim --keep <owner>` run the owner-existence reclaim.
@@ -431,3 +431,25 @@ RESOLVER agent; `merge-queue.sh` rebase/fast-forwards, runs the gate, marks the 
 `done` on green, ejects on conflict/red). Pipelined (no per-round barrier), the merge
 queue the one serial stage; the coordinator loop claims each group before dispatch,
 releases on settle, and runs `task reclaim --keep <owner>` each pass as the crash net.
+
+## Design gate (D28) — human design, swarm implementation
+
+The swarm implementers run headless (Workflow sub-agents) and **cannot ask the user** about
+undecided design. So design is separated from implementation by a tag gate (full write-up:
+`openspec/design-notes.md`, D28):
+
+- A task is swarm-eligible only when tagged **`design=approved`**. `/task-swarm` (scout +
+  every SCHEDULER pass) ANDs `tag:design=approved` into its `task next`/`query` selection in
+  scope mode, so un-triaged tasks are invisible to the swarm. Bypasses: `--no-design-gate`
+  and explicit-uid mode.
+- **`/design-pass <path>`** is the interactive counterpart: it walks open, un-triaged tasks,
+  settles each design *with the user* (via `AskUserQuestion`), records it, and only then runs
+  `jkb task tag add <uid> design=approved`.
+- Decisions are recorded in a design doc keyed by `Governs: <uid>` (the implementer greps it
+  by uid) plus an inline `Design:` note stamped into the task body (`jkb task edit --append`
+  for managed tasks; the source-file line for file-backed ones); trivial tasks skip the doc
+  and are fast-tracked to the tag. The IMPLEMENTER reads the approved design first and
+  follows it rather than re-deciding.
+- **Gate DSL gotcha:** use `tag:design=approved` (the query DSL). The `#facet=value` form is
+  quick-add-only, and `task next` silently drops non-`tag:`/`ns:` terms — so `#design=approved`
+  in a `task next` scope is ignored (parsed as dropped free text).
