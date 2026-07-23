@@ -71,17 +71,24 @@ impl NewTask {
         }
     }
 
-    /// Lift a parsed [`QuickAdd`] into a create spec, applying the default home and
-    /// `managed:` binding. `uid` is supplied by the caller (the CLI derives one).
+    /// Lift a parsed [`QuickAdd`] into a create spec (design D26.1). The **first**
+    /// `+<ns>` placement becomes the Primary `home`; any further placements stay
+    /// `mirrors` (Reference). [`DEFAULT_HOME`] is used as the home only when no placement
+    /// was given. Binding defaults to [`MANAGED_BINDING`]. `uid` is supplied by the caller
+    /// (the CLI derives one).
     #[must_use]
     pub fn from_quick_add(uid: impl Into<String>, qa: QuickAdd) -> Self {
+        let (home, mirrors) = match qa.placements.split_first() {
+            Some((first, rest)) => (first.clone(), rest.to_vec()),
+            None => (DEFAULT_HOME.to_owned(), Vec::new()),
+        };
         Self {
             uid: uid.into(),
             title: qa.title,
             priority: qa.priority,
             due: qa.due,
-            home: DEFAULT_HOME.to_owned(),
-            mirrors: qa.placements,
+            home,
+            mirrors,
             tags: qa.tags,
             depends_on: qa.depends_on,
             binding: MANAGED_BINDING.to_owned(),
@@ -498,6 +505,59 @@ mod tests {
     fn quick_add_rejects_unterminated_quote() {
         let err = parse_quick_add("fix bug \"quoted title").unwrap_err();
         assert!(err.to_string().contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn from_quick_add_homes_first_placement_rest_mirror() {
+        // No placement → the default inbox is the home, no mirrors (design D26.1).
+        let t = NewTask::from_quick_add("task:a", parse_quick_add("capture this").unwrap());
+        assert_eq!(t.home, super::DEFAULT_HOME);
+        assert!(t.mirrors.is_empty());
+
+        // `+a` alone → home `a`, no forced inbox mirror.
+        let t = NewTask::from_quick_add("task:b", parse_quick_add("do it +a").unwrap());
+        assert_eq!(t.home, "a");
+        assert!(t.mirrors.is_empty());
+
+        // `+a +b` → home `a`, mirror `b`.
+        let t = NewTask::from_quick_add("task:c", parse_quick_add("do it +a +b").unwrap());
+        assert_eq!(t.home, "a");
+        assert_eq!(t.mirrors, vec!["b".to_owned()]);
+    }
+
+    #[test]
+    fn create_places_home_primary_and_mirrors_reference() {
+        let db = Db::open_in_memory().unwrap();
+        let qa = parse_quick_add("do it +proj/x +repos/y").unwrap();
+        let id = db
+            .write_txn("t", move |conn, meta| {
+                create(conn, meta, &NewTask::from_quick_add("task:h", qa))
+            })
+            .unwrap();
+
+        let roles = db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT n.path, p.role FROM placements p
+                     JOIN namespaces n ON n.id = p.namespace_id
+                     WHERE p.item_id = ?1 ORDER BY n.path",
+                )?;
+                let rows = stmt
+                    .query_map([id.get()], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+
+        assert_eq!(
+            roles,
+            vec![
+                ("proj/x".to_owned(), "primary".to_owned()),
+                ("repos/y".to_owned(), "reference".to_owned()),
+            ]
+        );
     }
 
     #[test]
