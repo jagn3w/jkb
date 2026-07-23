@@ -10,7 +10,7 @@
 use jkb_types::Error as TypeError;
 
 use super::{CmpOp, DueValue, Query, Scope, TagPred};
-use crate::dsl::{has_unterminated_quote, tokenize, unquote};
+use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
 use crate::Result;
 
 /// Parse a DSL string into a [`Query`].
@@ -26,13 +26,13 @@ pub fn parse(input: &str) -> Result<Query> {
     if has_unterminated_quote(input) {
         return Err(bad(input, "unterminated `\"` quote"));
     }
-    for token in tokenize(input) {
+    for token in tokenize_escaped(input) {
         if let Some(rest) = token.strip_prefix('~') {
-            let term = unquote(rest);
+            let term = unquote_unescape(rest);
             if term.is_empty() {
                 return Err(bad(&token, "expected a term after `~`, e.g. `~\"topic\"`"));
             }
-            query.vector = Some(term.to_owned());
+            query.vector = Some(term);
         } else if let Some(v) = token.strip_prefix("kind:") {
             query.kind = Some(non_empty(v, &token, "kind")?.to_owned());
         } else if let Some(v) = token.strip_prefix("status:") {
@@ -67,7 +67,7 @@ pub fn parse(input: &str) -> Result<Query> {
             };
             query.due = Some((op, due));
         } else {
-            fts_terms.push(unquote(&token).to_owned());
+            fts_terms.push(unquote_unescape(&token));
         }
     }
 
