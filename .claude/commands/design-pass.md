@@ -63,22 +63,39 @@ is unavailable to decide, leave the task un-tagged and move on.
 
 ## 3. Record + approve each task
 
-**a. (non-trivial) Write the decision to a design doc.** Append a decision block to the
-running design log `openspec/design-notes.md` (create it if absent), or — if the task
-belongs to an existing openspec change — to that change's `design.md`. Number decisions
-`D<N>` continuing the repo's existing sequence (the last one is D28 for this gate; check
-with `grep -rho 'D[0-9]\+' openspec | sort -t D -k2 -n | tail -1`). Format so an implementer
-can grep it by uid:
+**a. (non-trivial) Record the decision.** Two homes, by size and scope:
+
+- **Small & standalone → the task itself.** If the design is short and uncomplicated and the
+  task doesn't belong to a larger group of related work, just stamp the decision inline on the
+  task (step 3b) and **skip the change folder** — the inline `Design:` note is the record.
+- **Substantial or multi-task → an openspec change folder.** Otherwise design lives in
+  `openspec/changes/<change-name>/`, **one folder per group of related tasks** (mirroring
+  `jkb-v1-foundation`, `jkb-v2-file-sync`, `jkb-fleet-hardening`, `jkb-task-homing`). Do **not**
+  use a running `design-notes.md` log.
+  - If the task belongs to an **existing** change, add the decision to that change's `design.md`.
+  - Otherwise **create a new change folder** with the standard scaffolding: `.openspec.yaml`
+    (`schema: spec-driven` + `created:`), `proposal.md` (Why / What Changes / Capabilities /
+    Impact), `design.md` (the decisions), `tasks.md` (implementation checklist with `^anchor`
+    ids), and `specs/<capability>/spec.md` (ADDED/MODIFIED Requirements, each with a WHEN/THEN
+    scenario). Group unrelated tasks into **separate** folders. Don't `jkb sync` a new change's
+    `tasks.md` if that would duplicate the existing origin task(s) — openspec isn't a live
+    watched mount, so sync is explicit.
+
+Each change **owns one `D<N>` number** with sub-decisions `D<N>.1`, `D<N>.2` (like D26.x,
+D27.x). Continue the repo's global sequence — find the current max with
+`grep -rho 'D[0-9]\+' openspec CLAUDE.md | sort -t D -k2 -n | tail -1`. Format each block so an
+implementer can grep it by uid:
 
 ```
-## D<N>: <short title>
+## D<N>.<M>: <short title>
 Governs: <task-uid>[, <task-uid> ...]
 Decision: <the decided approach, concretely — the shape/name/strategy the user chose>
 Rationale: <why this over the alternatives considered>
 ```
 
 The `Governs: <uid>` line is load-bearing: the swarm implementer greps design docs for the
-task uid to find its decision. List every task uid the decision covers.
+task uid to find its decision. List every task uid the decision covers. (For the small &
+standalone case, the same `Governs:`/`Decision:` content goes in the inline note instead.)
 
 **b. (non-trivial) Stamp the design into the task body too.** So the implementer sees the
 decision on the task itself, not only via a doc grep:
@@ -86,7 +103,7 @@ decision on the task itself, not only via a doc grep:
 - **Managed task** (`task:` uid): append the design note to its body via the CLI:
 
   ```sh
-  jkb task edit <uid> --append "Design: <one-paragraph decided approach>. See D<N> in openspec/design-notes.md."
+  jkb task edit <uid> --append "Design: <one-paragraph decided approach>. See D<N>.<M> in openspec/changes/<name>/design.md."   # omit the 'See …' clause for the small & standalone case
   ```
 
   (Use `--stdin --append` for a multi-line note: `printf '...' | jkb task edit <uid> --stdin --append`.)
@@ -97,7 +114,7 @@ decision on the task itself, not only via a doc grep:
 
   ```
   - [ ] <title> ^<frag>
-    Design: <one-paragraph decided approach>. See D<N> in openspec/design-notes.md.
+    Design: <one-paragraph decided approach>. See D<N>.<M> in openspec/changes/<name>/design.md.
   ```
 
   (You could also `jkb task edit` a file-backed task, but editing the file keeps disk and KB
