@@ -19,7 +19,7 @@ use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, PlacementRole, TaskStatus};
 
-use crate::dsl::{has_unterminated_quote, tokenize, unquote};
+use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
 use crate::query::{Query, Scope, TagPred};
 use crate::store::WriteMeta;
 use crate::{binding, changelog, edge, item, ns, placement, tag, Error, Result};
@@ -407,7 +407,7 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
     if has_unterminated_quote(input) {
         return Err(bad(input, "unterminated `\"` quote"));
     }
-    for token in tokenize(input) {
+    for token in tokenize_escaped(input) {
         if let Some(v) = token.strip_prefix("!p") {
             qa.priority = Some(
                 v.parse::<i64>()
@@ -437,7 +437,7 @@ pub fn parse_quick_add(input: &str) -> Result<QuickAdd> {
             }
             qa.depends_on.push(v.to_owned());
         } else {
-            title_words.push(unquote(&token).to_owned());
+            title_words.push(unquote_unescape(&token));
         }
     }
 

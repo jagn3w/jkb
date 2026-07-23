@@ -29,6 +29,11 @@ pub enum Error {
     /// The background writer thread has stopped, so the request cannot be served.
     #[error("database writer has stopped")]
     WriterClosed,
+
+    /// A schema migration left the database with dangling foreign-key references
+    /// (detected by the post-migration `foreign_key_check`).
+    #[error("migration left {0} foreign-key violation(s); database integrity check failed")]
+    ForeignKeyViolation(usize),
 }
 
 /// Convenience alias: `Result<T>` is `Result<T, jkb_core::Error>`.
