@@ -100,6 +100,48 @@ pub fn set_primary(
     )
 }
 
+/// Remove any **reference** (mirror) placement of `item` under `namespace`, recording each
+/// removal in the changelog. The primary home is left untouched — re-home with
+/// [`set_primary`] instead. Idempotent: removing a mirror that isn't there is a no-op.
+/// Returns the number of placements removed. This is the inverse of [`place`] with
+/// [`PlacementRole::Reference`].
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn unplace(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    namespace: NamespaceId,
+) -> Result<usize> {
+    let rowids: Vec<i64> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT rowid FROM placements
+             WHERE item_id = ?1 AND namespace_id = ?2 AND role = 'reference'",
+        )?;
+        let rows = stmt.query_map([item.get(), namespace.get()], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for rowid in &rowids {
+        conn.prepare_cached("DELETE FROM placements WHERE rowid = ?1")?
+            .execute([rowid])?;
+        changelog::append(
+            conn,
+            meta,
+            "delete",
+            "placements",
+            &rowid.to_string(),
+            Some(&json!({
+                "item_id": item.get(),
+                "namespace_id": namespace.get(),
+                "role": "reference",
+            })),
+            None,
+        )?;
+    }
+    Ok(rowids.len())
+}
+
 /// The items directly placed under `namespace`, optionally filtered by `role`,
 /// ordered by position.
 ///
@@ -222,5 +264,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(deletes, 1);
+    }
+
+    #[test]
+    fn unplace_removes_only_the_reference_mirror() {
+        use super::{set_primary, unplace};
+        let db = Db::open_in_memory().unwrap();
+        let (item, home, mirror) = db
+            .write_txn("t", |conn, meta| {
+                let home = ns::ensure(conn, "tasks/jkb/.backlog")?;
+                let mirror = ns::ensure(conn, ".backlog")?;
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "i".to_owned(),
+                        kind: "task".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                set_primary(conn, meta, item, home, 0)?;
+                place(conn, meta, item, mirror, PlacementRole::Reference, 0)?;
+                Ok((item, home, mirror))
+            })
+            .unwrap();
+
+        // Removing the mirror leaves the primary home intact.
+        let removed = db
+            .write_txn("t", move |conn, meta| unplace(conn, meta, item, mirror))
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(db
+            .read(move |conn| items_in(conn, mirror, None))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.read(move |conn| items_in(conn, home, None)).unwrap(),
+            vec![item]
+        );
+
+        // Idempotent, and it never touches a primary placement.
+        let again = db
+            .write_txn("t", move |conn, meta| unplace(conn, meta, item, home))
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(
+            db.read(move |conn| items_in(conn, home, None)).unwrap(),
+            vec![item]
+        );
     }
 }

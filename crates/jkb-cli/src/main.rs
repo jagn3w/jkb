@@ -179,6 +179,16 @@ enum TaskCmd {
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
+        /// Home the task in the ambient repo's backlog (`tasks/<repo>/.backlog`)
+        /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
+        #[arg(long)]
+        backlog: bool,
+        /// Force a synced file binding into the home's `tasks` mount (errors if none).
+        #[arg(long, conflicts_with = "managed")]
+        sync: bool,
+        /// Force a `managed:` (KB-only) binding, overriding mount inference.
+        #[arg(long)]
+        managed: bool,
     },
     /// List the ready frontier (optionally scoped/filtered by DSL terms).
     Next {
@@ -250,6 +260,13 @@ enum TaskCmd {
         /// Make this the task's sole primary home (default: a reference mirror).
         #[arg(long)]
         home: bool,
+    },
+    /// Remove a task's reference (mirror) placement under a namespace (inverse of `place`).
+    Unplace {
+        /// The task uid.
+        uid: String,
+        /// The namespace path whose mirror to remove.
+        ns: String,
     },
     /// Bind a task to storage: `--managed` (no file) or `--sync <uri>` (a file mount).
     Bind {
@@ -511,6 +528,49 @@ fn apply_ambient(query: &mut Query, db: &Db, global: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The ambient repo key: the full namespace path of the `file://` mount covering the
+/// current directory (design D26.2), or `None` outside any mount. Tasks home under
+/// `tasks/<repo>/…` using this key. Unlike [`ambient`], `--global` does not apply — homing
+/// always reflects where the task was captured.
+fn ambient_repo(db: &Db) -> Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
+}
+
+/// Default an unscoped task query to the ambient repo's task tree (`tasks/<repo>/**`) when
+/// inside a repo, else the global `tasks/**` tree (design D26, open-question 4). `--global`
+/// forces the global tree.
+fn apply_ambient_tasks(query: &mut Query, db: &Db, global: bool) -> Result<()> {
+    if query.scope == Scope::All {
+        let base = if global {
+            "tasks".to_owned()
+        } else {
+            match ambient_repo(db)? {
+                Some(repo) => format!("tasks/{repo}"),
+                None => "tasks".to_owned(),
+            }
+        };
+        query.scope = Scope::Subtree(base);
+    }
+    Ok(())
+}
+
+/// Confirm a global `tasks/.backlog` fallback when `--backlog` is used outside any repo
+/// (design D26.4). Returns `true` only on interactive assent; when stdin is not a TTY
+/// (non-interactive/headless) it returns `false` so the caller errors instead of silently
+/// creating a global backlog task.
+fn confirm_global_backlog() -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    print!("Not inside a mounted repo. Home this task at the global `tasks/.backlog`? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 // ---- commands -------------------------------------------------------------
@@ -796,21 +856,79 @@ fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
 
 fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Add { text } => {
+        TaskCmd::Add {
+            text,
+            backlog,
+            sync,
+            managed,
+        } => {
             let input = text.join(" ");
             let qa = task::parse_quick_add(&input)?;
+            let had_explicit_placement = !qa.placements.is_empty();
             let uid = task_uid(&qa.title);
-            let spec = task::NewTask::from_quick_add(uid.clone(), qa);
+            let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
+
+            // Homing (design D26). An explicit `+<ns>` already set `spec.home` (first
+            // placement) via `from_quick_add`; otherwise derive it from `--backlog` and
+            // the ambient repo.
+            if had_explicit_placement {
+                if backlog {
+                    anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
+                }
+            } else if backlog {
+                match ambient_repo(db)? {
+                    Some(repo) => spec.home = format!("tasks/{repo}/.backlog"),
+                    None if confirm_global_backlog()? => spec.home = String::from("tasks/.backlog"),
+                    None => anyhow::bail!(
+                        "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
+                    ),
+                }
+            } else if let Some(repo) = ambient_repo(db)? {
+                // Inside a repo with no target: home at the per-repo inbox, mirrored into
+                // the global inbox so it stays a complete capture view (D26.3).
+                spec.home = format!("tasks/{repo}/inbox");
+                spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
+            }
+            // else: outside a repo with no target → home stays `tasks/inbox` (DEFAULT_HOME).
+
+            // Binding (design D26.5), orthogonal to homing: `--managed` forces KB-only;
+            // otherwise infer a synced file binding when the home is under a `tasks` mount,
+            // else `managed:`. `--sync` requires such a mount.
+            let synced_file = if managed {
+                None
+            } else {
+                jkb_sync::tasks_mount_file(db, &spec.home)?
+            };
+            match &synced_file {
+                Some(bare) => {
+                    let local_id = uid.strip_prefix("task:").unwrap_or(&uid);
+                    spec.binding = format!("{bare}#{local_id}");
+                }
+                None if sync => anyhow::bail!(
+                    "--sync: no `tasks`-serializer file mount covers the home `{}`",
+                    spec.home
+                ),
+                None => {} // spec.binding stays `managed:` (from_quick_add default)
+            }
+
+            let home = spec.home.clone();
             let id = db.write_txn("cli", move |conn, meta| task::create(conn, meta, &spec))?;
             if json {
-                println!("{}", serde_json::json!({"id": id.get(), "uid": uid}));
+                println!(
+                    "{}",
+                    serde_json::json!({"id": id.get(), "uid": uid, "home": home,
+                        "binding": synced_file.as_deref().unwrap_or("managed:")})
+                );
             } else {
-                println!("added task {uid} (item {id})");
+                println!("added task {uid} (item {id}) at {home}");
+                if synced_file.is_some() {
+                    println!("  synced binding — run `jkb sync` to write it to the file");
+                }
             }
         }
         TaskCmd::Next { terms, limit } => {
             let mut query = jkb_core::query::parse(&terms.join(" "))?;
-            apply_ambient(&mut query, db, global)?;
+            apply_ambient_tasks(&mut query, db, global)?;
             let (scope, tags) = (query.scope.clone(), query.tags.clone());
             let mut rows = db.read(move |conn| task::ready(conn, scope, &tags))?;
             if let Some(limit) = limit {
@@ -829,7 +947,26 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/
+/// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
+/// missing namespace or absent mirror is a no-op that reports `0` removed.
+fn cmd_task_unplace(db: &Db, uid: &str, ns: &str, json: bool) -> Result<()> {
+    let id = resolve_task_uid(db, uid)?;
+    let ns_path = ns.to_owned();
+    let removed = db.write_txn("cli", move |conn, meta| {
+        match jkb_core::ns::get(conn, &ns_path)? {
+            Some(ns_id) => placement::unplace(conn, meta, id, ns_id),
+            None => Ok(0),
+        }
+    })?;
+    if json {
+        println!("{}", serde_json::json!({ "uid": uid, "removed": removed }));
+    } else {
+        println!("unplaced {uid} from {ns} ({removed} mirror(s) removed)");
+    }
+    Ok(())
+}
+
+/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/`unplace`/
 /// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
 /// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
 fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
@@ -912,6 +1049,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             })?;
             report(json, &uid, "placed");
         }
+        TaskCmd::Unplace { uid, ns } => cmd_task_unplace(db, &uid, &ns, json)?,
         TaskCmd::Bind { uid, managed, sync } => {
             let (uri, mode) = match (managed, sync) {
                 (_, Some(uri)) => (uri, Some(SyncMode::Bidirectional)),
