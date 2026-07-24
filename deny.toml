@@ -11,6 +11,11 @@ ignore = [
     # actively-maintained drop-in and no known exploit. Revisit if `pdf-extract`
     # gains a replacement or a real CVE is filed against `ttf-parser`.
     "RUSTSEC-2026-0192",
+    # `paste` is unmaintained (not a vulnerability). It is a transitive proc-macro dep of
+    # the `fastembed` feature only (via `tokenizers`/`macro_rules_attribute` and
+    # `rav1e`/`image`); there is no maintained drop-in and no known exploit. Revisit when
+    # those upstreams migrate off `paste`.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
@@ -31,6 +36,10 @@ allow = [
     # `webpki-roots` (Mozilla's CA bundle, pulled in transitively by `headless_chrome`)
     # ships under CDLA-Permissive-2.0, a permissive data license. Safe to allow.
     "CDLA-Permissive-2.0",
+    # `libfuzzer-sys` (a fuzzing harness pulled by `rav1e` → `image` → `fastembed` only
+    # under `--all-features`) is dual MIT/Apache-2.0 AND NCSA. NCSA (University of
+    # Illinois/NCSA Open Source License) is a permissive, OSI-approved BSD-style license.
+    "NCSA",
 ]
 
 # Scoped exception: `auto_generate_cdp` is GPL-3.0 but is a **build-dependency only**

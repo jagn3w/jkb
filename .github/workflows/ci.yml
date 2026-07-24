@@ -1,0 +1,59 @@
+# Continuous integration — mirrors ./scripts/check.sh on every push and pull request so
+# both humans and the task-swarm merge queue get a trustworthy green signal (design D30).
+# The toolchain is pinned by rust-toolchain.toml (1.96.1); the two live-smoke tests (ollama,
+# Chrome) stay #[ignore]d because CI has neither. cargo-deny honours deny.toml, which ignores
+# RUSTSEC-2026-0192 (the unmaintained ttf-parser transitive dep, tracked separately).
+name: CI
+
+on: [push, pull_request]
+
+# Cancel superseded runs on the same ref so a rapid push sequence doesn't pile up.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml and installs the pinned channel; ensure the
+      # rustfmt/clippy components are present for the gates below.
+      - name: Install pinned toolchain + components
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: clippy (fastembed)
+        run: cargo clippy --all-targets --features fastembed -- -D warnings
+
+      - name: test
+        run: cargo test --all
+
+      - name: test (fastembed)
+        run: cargo test --all --features fastembed
+
+      # The action defaults to `cargo deny check --all-features`, so feature-gated deps
+      # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
