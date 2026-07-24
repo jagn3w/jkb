@@ -20,10 +20,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const tree = new JkbTreeProvider(client);
   const decorations = new JkbDecorationProvider();
 
-  const refreshAll = () => {
-    tree.refresh();
-    decorations.refresh();
-  };
+  // Refresh the tree only. Decorations follow automatically: each node's resource URI
+  // encodes its status/priority, so a changed node is a *new* URI (freshly decorated) and
+  // an unchanged node keeps its cached decoration — no colour flashing on refresh.
+  const refreshAll = () => tree.refresh();
 
   context.subscriptions.push(
     vscode.window.createTreeView("jkb.explorer", { treeDataProvider: tree }),
@@ -68,18 +68,46 @@ function databasePath(): string {
   return path.join(os.homedir(), ".jkb", "jkb.db");
 }
 
-/** Watch the jkb database (and its WAL) and refresh the tree on change, debounced. */
+/** Watch the jkb database and refresh the tree only on real writes, debounced. */
 function watchDatabase(onChange: () => void): vscode.Disposable {
   const db = databasePath();
   const dir = path.dirname(db);
   const base = path.basename(db);
+
+  // A cheap signature of the DB's *write* state: the main file's size+mtime plus the WAL's
+  // size. Reads in WAL mode only touch the `-shm` side-file (which fs.watch also reports),
+  // so gating on this signature ignores read-induced churn — including the extension's own
+  // `jkb` reads — and refreshes only on genuine writes. Without it, each read would trigger
+  // a refresh that spawns more reads: a flicker loop.
+  const signature = (): string => {
+    let sig = "";
+    for (const suffix of ["", "-wal"]) {
+      try {
+        const st = fs.statSync(`${db}${suffix}`);
+        sig += `${suffix}=${st.size}:${Math.round(st.mtimeMs)};`;
+      } catch {
+        // side-file may not exist yet
+      }
+    }
+    return sig;
+  };
+
+  let last = signature();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const check = (): void => {
+    const now = signature();
+    if (now !== last) {
+      last = now;
+      onChange();
+    }
+  };
+
   let watcher: fs.FSWatcher | undefined;
   try {
     watcher = fs.watch(dir, (_event, filename) => {
       if (!filename || !filename.startsWith(base)) return;
       if (timer) clearTimeout(timer);
-      timer = setTimeout(onChange, 400);
+      timer = setTimeout(check, 500);
     });
   } catch {
     // The directory may not exist yet; live refresh is best-effort.
