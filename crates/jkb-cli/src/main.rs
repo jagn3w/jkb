@@ -181,6 +181,20 @@ enum ItemCmd {
         #[arg(long, default_value_t = 800)]
         preview: usize,
     },
+    /// Replace (or `--append` to) any item's content.
+    Edit {
+        /// The item uid.
+        uid: String,
+        /// New content (omit and pass `--stdin` to read from stdin).
+        #[arg(num_args = 0..)]
+        text: Vec<String>,
+        /// Read the new content from stdin instead of the trailing args.
+        #[arg(long)]
+        stdin: bool,
+        /// Append to the existing content (blank-line separated) instead of replacing.
+        #[arg(long)]
+        append: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -511,6 +525,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ls { path, all } => cmd_ls(&db, path.as_deref(), all, json),
         Command::Item { cmd } => match cmd {
             ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
+            ItemCmd::Edit {
+                uid,
+                text,
+                stdin,
+                append,
+            } => cmd_item_edit(&db, &uid, &text, stdin, append, json),
         },
     }
 }
@@ -738,6 +758,7 @@ struct Child {
     label: String,
     has_children: bool,
     status: Option<String>,
+    priority: Option<i64>,
 }
 
 impl Child {
@@ -748,7 +769,23 @@ impl Child {
             "label": self.label,
             "has_children": self.has_children,
             "status": self.status,
+            "priority": self.priority,
         })
+    }
+
+    /// Ordering key: namespaces first, then tasks (most important — lowest priority
+    /// number — first), then other items; ties broken by label. Nulls sort last.
+    fn sort_key(&self) -> (u8, i64, String) {
+        let group = match self.kind.as_str() {
+            "namespace" => 0,
+            "task" => 1,
+            _ => 2,
+        };
+        (
+            group,
+            self.priority.unwrap_or(i64::MAX),
+            self.label.to_lowercase(),
+        )
     }
 }
 
@@ -796,6 +833,7 @@ fn list_children(
             label,
             has_children: has_sub || has_items,
             status: None,
+            priority: None,
         });
     }
 
@@ -805,8 +843,10 @@ fn list_children(
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
                 };
+                // Hide any terminal-status item (done/cancelled) unless `all` — like
+                // ignored files, revealed only on explicit toggle.
                 let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
-                if !all && meta.kind == "task" && terminal {
+                if !all && terminal {
                     continue;
                 }
                 out.push(Child {
@@ -815,10 +855,12 @@ fn list_children(
                     reference: meta.uid,
                     has_children: false,
                     status: meta.status,
+                    priority: meta.priority,
                 });
             }
         }
     }
+    out.sort_by_key(Child::sort_key);
     Ok(out)
 }
 
@@ -954,6 +996,54 @@ fn print_item_detail(
         println!("tags:      {}", t.join(", "));
     }
     println!("updated:   {}", meta.updated_at);
+}
+
+/// `item edit <uid>` — replace (or `--append` to) any item's content through the audited
+/// `item::set_content` seam (`content_hash` cleared, like `task edit`).
+fn cmd_item_edit(
+    db: &Db,
+    uid: &str,
+    text: &[String],
+    stdin: bool,
+    append: bool,
+    json: bool,
+) -> Result<()> {
+    let new_text = if stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("reading item content from stdin")?;
+        buf.trim_end().to_owned()
+    } else if text.is_empty() {
+        anyhow::bail!("provide new content as arguments, or pass --stdin");
+    } else {
+        text.join(" ")
+    };
+    let u = uid.to_owned();
+    let found = db.write_txn("cli", move |conn, meta| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(false);
+        };
+        let content = if append {
+            match item::get_content(conn, id)? {
+                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{new_text}"),
+                _ => new_text,
+            }
+        } else {
+            new_text
+        };
+        item::set_content(conn, meta, id, &content, None)?;
+        Ok(true)
+    })?;
+    if !found {
+        anyhow::bail!("no item with uid `{uid}`");
+    }
+    report(json, uid, if append { "appended" } else { "edited" });
+    if uid.starts_with("file://") && !json {
+        eprintln!(
+            "note: this is a file-backed item; run `jkb sync` to propagate the edit to its file."
+        );
+    }
+    Ok(())
 }
 
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {

@@ -970,3 +970,57 @@ fn item_show_bounds_the_preview() {
         .stdout(predicate::str::contains("\"content_chars\": 500"))
         .stdout(predicate::str::contains("\"preview_truncated\": true"));
 }
+
+#[test]
+fn item_edit_replaces_content() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["task", "add", "before edit"])
+        .output()
+        .unwrap();
+    let uid = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+
+    jkb(&db)
+        .args(["item", "edit", &uid, "after edit"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["item", "show", &uid, "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("after edit"))
+        .stdout(predicate::str::contains("before edit").not());
+}
+
+#[test]
+fn ls_sorts_namespaces_first_then_tasks_by_priority() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "low pri", "+proj", "!p3"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "high pri", "+proj", "!p1"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "child ns task", "+proj/sub"])
+        .assert()
+        .success();
+
+    // Order: namespace `sub` first, then the p1 task, then the p3 task.
+    let out = jkb(&db).args(["ls", "proj", "--json"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let sub = stdout.find("\"sub\"").unwrap();
+    let high = stdout.find("high pri").unwrap();
+    let low = stdout.find("low pri").unwrap();
+    assert!(sub < high, "namespace should sort before tasks");
+    assert!(high < low, "higher-priority task should sort first");
+}
