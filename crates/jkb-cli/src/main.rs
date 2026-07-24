@@ -183,6 +183,12 @@ enum TaskCmd {
         /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
         #[arg(long)]
         backlog: bool,
+        /// Force a synced file binding into the home's `tasks` mount (errors if none).
+        #[arg(long, conflicts_with = "managed")]
+        sync: bool,
+        /// Force a `managed:` (KB-only) binding, overriding mount inference.
+        #[arg(long)]
+        managed: bool,
     },
     /// List the ready frontier (optionally scoped/filtered by DSL terms).
     Next {
@@ -850,7 +856,12 @@ fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
 
 fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Add { text, backlog } => {
+        TaskCmd::Add {
+            text,
+            backlog,
+            sync,
+            managed,
+        } => {
             let input = text.join(" ");
             let qa = task::parse_quick_add(&input)?;
             let had_explicit_placement = !qa.placements.is_empty();
@@ -880,11 +891,39 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             }
             // else: outside a repo with no target → home stays `tasks/inbox` (DEFAULT_HOME).
 
+            // Binding (design D26.5), orthogonal to homing: `--managed` forces KB-only;
+            // otherwise infer a synced file binding when the home is under a `tasks` mount,
+            // else `managed:`. `--sync` requires such a mount.
+            let synced_file = if managed {
+                None
+            } else {
+                jkb_sync::tasks_mount_file(db, &spec.home)?
+            };
+            match &synced_file {
+                Some(bare) => {
+                    let local_id = uid.strip_prefix("task:").unwrap_or(&uid);
+                    spec.binding = format!("{bare}#{local_id}");
+                }
+                None if sync => anyhow::bail!(
+                    "--sync: no `tasks`-serializer file mount covers the home `{}`",
+                    spec.home
+                ),
+                None => {} // spec.binding stays `managed:` (from_quick_add default)
+            }
+
+            let home = spec.home.clone();
             let id = db.write_txn("cli", move |conn, meta| task::create(conn, meta, &spec))?;
             if json {
-                println!("{}", serde_json::json!({"id": id.get(), "uid": uid}));
+                println!(
+                    "{}",
+                    serde_json::json!({"id": id.get(), "uid": uid, "home": home,
+                        "binding": synced_file.as_deref().unwrap_or("managed:")})
+                );
             } else {
-                println!("added task {uid} (item {id})");
+                println!("added task {uid} (item {id}) at {home}");
+                if synced_file.is_some() {
+                    println!("  synced binding — run `jkb sync` to write it to the file");
+                }
             }
         }
         TaskCmd::Next { terms, limit } => {

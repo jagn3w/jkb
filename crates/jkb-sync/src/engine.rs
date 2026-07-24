@@ -181,6 +181,38 @@ pub fn backing_dir(db: &Db, mount_ns: &str) -> Result<PathBuf> {
     Ok(load_ctx(db, mount_ns)?.dir)
 }
 
+/// If `home_ns` — or an ancestor of it — is a `tasks`-serializer `file://` mount, return the
+/// bare binding uri of that mount's root tasks file (`file://<backing_dir>/tasks.md`). A task
+/// homed under such a mount can bind to `<that>#<local_id>` and round-trip via [`sync`]
+/// (design D26.5). Returns `None` when no `tasks` mount covers the home namespace, so the
+/// caller keeps the task `managed:`. The first mount encountered while walking up stops the
+/// search: a non-`tasks` mount covering the home yields `None` rather than crossing it.
+///
+/// # Errors
+/// Returns an error if a database read fails.
+pub fn tasks_mount_file(db: &Db, home_ns: &str) -> Result<Option<String>> {
+    let home = home_ns.to_owned();
+    let uri = db.read(move |conn| {
+        let mut cur = Some(home);
+        while let Some(path) = cur {
+            if let Some(ns_id) = ns::get(conn, &path)? {
+                if let Some(m) = mount::get(conn, ns_id)? {
+                    if m.serializer == "tasks" {
+                        if let Some(dir) = m.backing_uri.strip_prefix("file://") {
+                            let dir = dir.trim_end_matches('/');
+                            return Ok(Some(format!("file://{dir}/tasks.md")));
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+            cur = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+        }
+        Ok(None)
+    })?;
+    Ok(uri)
+}
+
 /// Load the mount configuration into an owned [`Ctx`].
 fn load_ctx(db: &Db, mount_ns: &str) -> Result<Ctx> {
     let path = mount_ns.to_owned();
@@ -329,8 +361,10 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
     let kb_has_items = !kb_doc.items.is_empty();
 
     let Some((disk_bytes, disk_doc)) = disk else {
-        // File missing: re-export from the KB if we can, else leave it.
-        if journal.is_some() && ctx.exports() && kb_has_items {
+        // File missing but the KB has items bound to it: export to create the file. This
+        // covers both a previously-synced file that was deleted on disk (journal present)
+        // and a KB-created binding not yet written (journal absent — e.g. `task add --sync`).
+        if ctx.exports() && kb_has_items {
             return finish_export(conn, meta, ctx, path, &bare_uri, &ser_name, &kb_bytes);
         }
         return Ok(Outcome::Skipped);

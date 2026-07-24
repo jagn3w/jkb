@@ -15,7 +15,9 @@ mod error;
 mod serializers;
 mod watch;
 
-pub use engine::{backing_dir, sync, sync_paths, FileResult, Outcome, SyncReport};
+pub use engine::{
+    backing_dir, sync, sync_paths, tasks_mount_file, FileResult, Outcome, SyncReport,
+};
 pub use error::{Error, Result};
 pub use serializers::{
     resolve, DocumentSerializer, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer,

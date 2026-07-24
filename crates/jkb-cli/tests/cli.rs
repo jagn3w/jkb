@@ -830,3 +830,63 @@ fn task_unplace_removes_mirror_but_keeps_the_home() {
         .success()
         .stdout(predicate::str::contains("unplace target"));
 }
+
+#[test]
+fn task_add_infers_synced_binding_under_a_tasks_mount() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let bk = dir.path().join("bk");
+    std::fs::create_dir(&bk).unwrap();
+    jkb(&db)
+        .args([
+            "mount",
+            "tasks/proj/.backlog",
+            bk.to_str().unwrap(),
+            "--serializer",
+            "tasks",
+        ])
+        .assert()
+        .success();
+
+    // Homed under the tasks mount → a synced file binding is inferred (D26.5).
+    jkb(&db)
+        .args(["task", "add", "synced task", "+tasks/proj/.backlog"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("synced binding"));
+
+    // Sync writes it to tasks.md; a second sync is a no-op (round-trips).
+    jkb(&db)
+        .args(["sync", "tasks/proj/.backlog"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 exported"));
+    let content = std::fs::read_to_string(bk.join("tasks.md")).unwrap();
+    assert!(content.contains("synced task"), "file: {content}");
+    assert!(content.contains("- [ ]"), "file: {content}");
+    jkb(&db)
+        .args(["sync", "tasks/proj/.backlog"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 up-to-date"));
+}
+
+#[test]
+fn task_add_stays_managed_without_a_tasks_mount_and_sync_errors() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // No tasks mount over the home → inference keeps it managed (no synced hint).
+    jkb(&db)
+        .args(["task", "add", "plain managed", "+proj/x"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("synced binding").not());
+
+    // --sync with no tasks mount over the home is an error.
+    jkb(&db)
+        .args(["task", "add", "needs sync", "+proj/x", "--sync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no `tasks`-serializer file mount"));
+}
