@@ -890,3 +890,137 @@ fn task_add_stays_managed_without_a_tasks_mount_and_sync_errors() {
         .failure()
         .stderr(predicate::str::contains("no `tasks`-serializer file mount"));
 }
+
+// ---- ls + item show (UI read surface, design D31) --------------------------
+
+#[test]
+fn ls_lists_children_and_hides_terminal_tasks() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "alpha task", "+proj/x"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "beta task", "+proj/x"])
+        .assert()
+        .success();
+
+    // Root: the `proj` namespace appears, flagged as having children.
+    jkb(&db)
+        .args(["ls", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ref\": \"proj\""))
+        .stdout(predicate::str::contains("\"has_children\": true"));
+
+    // Its child namespace `proj/x` holds the two tasks as leaves.
+    jkb(&db)
+        .args(["ls", "proj/x", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha task"))
+        .stdout(predicate::str::contains("beta task"))
+        .stdout(predicate::str::contains("\"kind\": \"task\""));
+
+    // A completed task is hidden by default, revealed with --all.
+    let out = jkb(&db)
+        .args(["task", "add", "gamma task", "+proj/y"])
+        .output()
+        .unwrap();
+    let uid = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+    jkb(&db)
+        .args(["task", "set", &uid, "--status", "done"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ls", "proj/y", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gamma task").not());
+    jkb(&db)
+        .args(["ls", "proj/y", "--all", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gamma task"));
+}
+
+#[test]
+fn item_show_bounds_the_preview() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let long = "x".repeat(500);
+    let out = jkb(&db).args(["task", "add", &long]).output().unwrap();
+    let uid = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+
+    jkb(&db)
+        .args(["item", "show", &uid, "--preview", "10", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"content_chars\": 500"))
+        .stdout(predicate::str::contains("\"preview_truncated\": true"));
+}
+
+#[test]
+fn item_edit_replaces_content() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["task", "add", "before edit"])
+        .output()
+        .unwrap();
+    let uid = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+
+    jkb(&db)
+        .args(["item", "edit", &uid, "after edit"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["item", "show", &uid, "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("after edit"))
+        .stdout(predicate::str::contains("before edit").not());
+}
+
+#[test]
+fn ls_sorts_namespaces_first_then_tasks_by_priority() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "low pri", "+proj", "!p3"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "high pri", "+proj", "!p1"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "child ns task", "+proj/sub"])
+        .assert()
+        .success();
+
+    // Order: namespace `sub` first, then the p1 task, then the p3 task.
+    let out = jkb(&db).args(["ls", "proj", "--json"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let sub = stdout.find("\"sub\"").unwrap();
+    let high = stdout.find("high pri").unwrap();
+    let low = stdout.find("low pri").unwrap();
+    assert!(sub < high, "namespace should sort before tasks");
+    assert!(high < low, "higher-priority task should sort first");
+}

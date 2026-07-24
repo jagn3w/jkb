@@ -1,0 +1,8 @@
+packages:
+  - core
+  - vscode
+
+# Allow esbuild's install script to fetch its platform binary. pnpm blocks dependency
+# build scripts by default; esbuild is the only one permitted here.
+onlyBuiltDependencies:
+  - esbuild

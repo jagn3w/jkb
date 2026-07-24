@@ -57,7 +57,15 @@ pub fn run(conn: &mut Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
-    conn.pragma_update(None, "user_version", version)?;
+    // Only stamp when it actually changed. `pragma_update` writes the database header — a
+    // WAL write in WAL mode — and `run` executes on *every* `Db::open`, so stamping
+    // unconditionally would make every read-only command (e.g. `jkb ls`) a writer. That
+    // churns the WAL and trips file-watchers on reads (it made the VS Code explorer's live
+    // refresh loop on its own queries). On a fully-migrated database this is now a no-op.
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current != version {
+        conn.pragma_update(None, "user_version", version)?;
+    }
     Ok(())
 }
 

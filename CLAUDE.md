@@ -459,3 +459,22 @@ undecided design. So design is separated from implementation by a tag gate (D28)
 - **Gate DSL gotcha:** use `tag:design=approved` (the query DSL). The `#facet=value` form is
   quick-add-only, and `task next` silently drops non-`tag:`/`ns:` terms — so `#design=approved`
   in a `task next` scope is ignored (parsed as dropped free text).
+
+## UI explorer (D31) — the `ui/` pnpm workspace
+
+A visual tree explorer over the VFS lives in `ui/` (a **pnpm** workspace — pnpm only, never
+npm). Design in `openspec/changes/jkb-ui-explorer/`. The load-bearing rule: **the UI is a
+client of the `jkb` CLI** (`jkb … --json`), never a bespoke backend — anything the UI does,
+the terminal can too. It drives two general CLI reads: `jkb ls [path]` (lazy tree children:
+sub-namespaces + items homed there, `has_children`, hides `done`/`cancelled` unless `--all`)
+and `jkb item show <uid>` (kind-aware details + a bounded preview, never the whole document).
+
+- `ui/core` (`@jkb/core`) — **portable TypeScript, no `vscode`/Node**: the `JkbClient`
+  transport interface, models, the node-kind registry, detail HTML rendering. A future web
+  app reuses it with an HTTP-backed client.
+- `ui/vscode` (`jkb-explorer`) — the VS Code adapter: `CliJkbClient` (spawns the CLI), a
+  `TreeDataProvider`, a Webview details host; bundled with esbuild. `cd ui && pnpm install &&
+  pnpm run build`, then F5 in `ui/vscode`.
+
+Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
+web-app package.

@@ -155,6 +155,46 @@ enum Command {
     },
     /// Run the MCP server (Section 13, not yet available).
     Mcp,
+    /// List the direct children of a namespace (sub-namespaces + items homed there) —
+    /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
+    Ls {
+        /// The namespace whose children to list (default: top-level namespaces).
+        path: Option<String>,
+        /// Include terminal (`done`/`cancelled`) tasks (hidden by default).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect items (generic, kind-aware).
+    Item {
+        #[command(subcommand)]
+        cmd: ItemCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ItemCmd {
+    /// Show one item's details + a bounded content preview (any kind).
+    Show {
+        /// The item uid.
+        uid: String,
+        /// Max preview characters (default 800; never the whole document).
+        #[arg(long, default_value_t = 800)]
+        preview: usize,
+    },
+    /// Replace (or `--append` to) any item's content.
+    Edit {
+        /// The item uid.
+        uid: String,
+        /// New content (omit and pass `--stdin` to read from stdin).
+        #[arg(num_args = 0..)]
+        text: Vec<String>,
+        /// Read the new content from stdin instead of the trailing args.
+        #[arg(long)]
+        stdin: bool,
+        /// Append to the existing content (blank-line separated) instead of replacing.
+        #[arg(long)]
+        append: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -482,6 +522,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Index => cmd_index(&db),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
+        Command::Ls { path, all } => cmd_ls(&db, path.as_deref(), all, json),
+        Command::Item { cmd } => match cmd {
+            ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
+            ItemCmd::Edit {
+                uid,
+                text,
+                stdin,
+                append,
+            } => cmd_item_edit(&db, &uid, &text, stdin, append, json),
+        },
     }
 }
 
@@ -697,6 +747,301 @@ fn cmd_search(
                 println!("    {marker} {}: {}", c.position, first_line(&c.content));
             }
         }
+    }
+    Ok(())
+}
+
+/// A direct child of a namespace in the tree: a sub-namespace, or an item homed there.
+struct Child {
+    kind: String,
+    reference: String,
+    label: String,
+    has_children: bool,
+    status: Option<String>,
+    priority: Option<i64>,
+}
+
+impl Child {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind,
+            "ref": self.reference,
+            "label": self.label,
+            "has_children": self.has_children,
+            "status": self.status,
+            "priority": self.priority,
+        })
+    }
+
+    /// Ordering key: namespaces first, then tasks (most important — lowest priority
+    /// number — first), then other items; ties broken by label. Nulls sort last.
+    fn sort_key(&self) -> (u8, i64, String) {
+        let group = match self.kind.as_str() {
+            "namespace" => 0,
+            "task" => 1,
+            _ => 2,
+        };
+        (
+            group,
+            self.priority.unwrap_or(i64::MAX),
+            self.label.to_lowercase(),
+        )
+    }
+}
+
+/// A short label for an item: its first non-empty content line (≤80 chars), else its uid.
+fn item_label(meta: &item::ItemMeta) -> String {
+    let line = meta
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.is_empty() {
+        return meta.uid.clone();
+    }
+    let mut s: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        s.push('…');
+    }
+    s
+}
+
+/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
+/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
+/// tasks are hidden unless `all`.
+fn list_children(
+    conn: &rusqlite::Connection,
+    path: Option<&str>,
+    all: bool,
+) -> jkb_core::Result<Vec<Child>> {
+    let mut out = Vec::new();
+
+    let ns_children = match path {
+        None => ns::roots(conn)?,
+        Some(p) => ns::children(conn, p)?,
+    };
+    for (ns_id, ns_path) in ns_children {
+        let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
+        let has_sub = !ns::children(conn, &ns_path)?.is_empty();
+        let has_items = !placement::items_in(conn, ns_id, Some(PlacementRole::Primary))?.is_empty();
+        out.push(Child {
+            kind: "namespace".to_owned(),
+            reference: ns_path,
+            label,
+            has_children: has_sub || has_items,
+            status: None,
+            priority: None,
+        });
+    }
+
+    if let Some(p) = path {
+        if let Some(ns_id) = ns::get(conn, p)? {
+            for item_id in placement::items_in(conn, ns_id, Some(PlacementRole::Primary))? {
+                let Some(meta) = item::get(conn, item_id)? else {
+                    continue;
+                };
+                // Hide any terminal-status item (done/cancelled) unless `all` — like
+                // ignored files, revealed only on explicit toggle.
+                let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
+                if !all && terminal {
+                    continue;
+                }
+                out.push(Child {
+                    label: item_label(&meta),
+                    kind: meta.kind,
+                    reference: meta.uid,
+                    has_children: false,
+                    status: meta.status,
+                    priority: meta.priority,
+                });
+            }
+        }
+    }
+    out.sort_by_key(Child::sort_key);
+    Ok(out)
+}
+
+/// `jkb ls [path]` — the direct children of a namespace, for lazy tree expansion.
+fn cmd_ls(db: &Db, path: Option<&str>, all: bool, json: bool) -> Result<()> {
+    let owned = path.map(str::to_owned);
+    let children = db.read(move |conn| list_children(conn, owned.as_deref(), all))?;
+    if json {
+        let v = serde_json::json!({
+            "path": path,
+            "children": children.iter().map(Child::to_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else if children.is_empty() {
+        println!("(empty)");
+    } else {
+        for c in &children {
+            let arrow = if c.has_children { "▸" } else { " " };
+            let status = c
+                .status
+                .as_deref()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            println!("{arrow} {:<10} {}{status}", c.kind, c.label);
+        }
+    }
+    Ok(())
+}
+
+/// The item's primary (home) namespace path, if placed.
+fn primary_ns(conn: &rusqlite::Connection, id: ItemId) -> jkb_core::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+             WHERE p.item_id = ?1 ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1",
+        )?
+        .query_row([id.get()], |r| r.get::<_, String>(0))
+        .optional()?)
+}
+
+/// `jkb item show <uid>` — generic, kind-aware item details + a bounded content preview.
+fn cmd_item_show(db: &Db, uid: &str, preview_max: usize, json: bool) -> Result<()> {
+    let u = uid.to_owned();
+    let found = db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(None);
+        };
+        let Some(meta) = item::get(conn, id)? else {
+            return Ok(None);
+        };
+        let binding = binding::get(conn, id)?.map(|b| b.uri);
+        let tags = tag::applications(conn, id)?;
+        let namespace = primary_ns(conn, id)?;
+        Ok(Some((meta, binding, tags, namespace)))
+    })?;
+    let Some((meta, binding, tags, namespace)) = found else {
+        anyhow::bail!("no item with uid `{uid}`");
+    };
+
+    let content_chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
+    let preview: String = meta
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(preview_max)
+        .collect();
+    let preview_truncated = content_chars > preview_max;
+
+    if json {
+        let v = serde_json::json!({
+            "uid": meta.uid,
+            "kind": meta.kind,
+            "status": meta.status,
+            "priority": meta.priority,
+            "due": meta.due,
+            "mime": meta.mime,
+            "binding": binding,
+            "namespace": namespace,
+            "content_chars": content_chars,
+            "content_hash": meta.content_hash,
+            "created_at": meta.created_at,
+            "updated_at": meta.updated_at,
+            "tags": tags
+                .iter()
+                .map(|(f, v)| serde_json::json!({"facet": f, "value": v}))
+                .collect::<Vec<_>>(),
+            "preview": preview,
+            "preview_truncated": preview_truncated,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
+        println!(
+            "content:   {content_chars} chars{}",
+            if preview_truncated {
+                " (preview truncated)"
+            } else {
+                ""
+            }
+        );
+        if !preview.is_empty() {
+            println!("\n{preview}");
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable header lines for `item show`.
+fn print_item_detail(
+    meta: &item::ItemMeta,
+    binding: Option<&str>,
+    namespace: Option<&str>,
+    tags: &[(String, String)],
+) {
+    println!("uid:       {}", meta.uid);
+    println!("kind:      {}", meta.kind);
+    if let Some(s) = &meta.status {
+        println!("status:    {s}");
+    }
+    if let Some(ns) = namespace {
+        println!("namespace: {ns}");
+    }
+    if let Some(m) = &meta.mime {
+        println!("mime:      {m}");
+    }
+    if let Some(b) = binding {
+        println!("binding:   {b}");
+    }
+    if !tags.is_empty() {
+        let t: Vec<String> = tags.iter().map(|(f, v)| format!("{f}={v}")).collect();
+        println!("tags:      {}", t.join(", "));
+    }
+    println!("updated:   {}", meta.updated_at);
+}
+
+/// `item edit <uid>` — replace (or `--append` to) any item's content through the audited
+/// `item::set_content` seam (`content_hash` cleared, like `task edit`).
+fn cmd_item_edit(
+    db: &Db,
+    uid: &str,
+    text: &[String],
+    stdin: bool,
+    append: bool,
+    json: bool,
+) -> Result<()> {
+    let new_text = if stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("reading item content from stdin")?;
+        buf.trim_end().to_owned()
+    } else if text.is_empty() {
+        anyhow::bail!("provide new content as arguments, or pass --stdin");
+    } else {
+        text.join(" ")
+    };
+    let u = uid.to_owned();
+    let found = db.write_txn("cli", move |conn, meta| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(false);
+        };
+        let content = if append {
+            match item::get_content(conn, id)? {
+                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{new_text}"),
+                _ => new_text,
+            }
+        } else {
+            new_text
+        };
+        item::set_content(conn, meta, id, &content, None)?;
+        Ok(true)
+    })?;
+    if !found {
+        anyhow::bail!("no item with uid `{uid}`");
+    }
+    report(json, uid, if append { "appended" } else { "edited" });
+    if uid.starts_with("file://") && !json {
+        eprintln!(
+            "note: this is a file-backed item; run `jkb sync` to propagate the edit to its file."
+        );
     }
     Ok(())
 }
