@@ -1,0 +1,64 @@
+{
+  "name": "jkb-explorer",
+  "displayName": "jkb Explorer",
+  "description": "Browse and edit your jkb knowledge base as a tree, backed entirely by the jkb CLI.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "jkb",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "jkb", "title": "jkb", "icon": "media/jkb.svg" }
+      ]
+    },
+    "views": {
+      "jkb": [
+        { "id": "jkb.explorer", "name": "Explorer" }
+      ]
+    },
+    "commands": [
+      { "command": "jkb.refresh", "title": "jkb: Refresh Explorer", "icon": "$(refresh)" },
+      { "command": "jkb.toggleTerminal", "title": "jkb: Show/Hide Completed Tasks", "icon": "$(eye)" },
+      { "command": "jkb.openDetails", "title": "jkb: Open Details" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "jkb.refresh", "when": "view == jkb.explorer", "group": "navigation" },
+        { "command": "jkb.toggleTerminal", "when": "view == jkb.explorer", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "jkb",
+      "properties": {
+        "jkb.cliPath": {
+          "type": "string",
+          "default": "jkb",
+          "description": "Path to the jkb binary (on PATH by default)."
+        },
+        "jkb.dbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the jkb database (blank uses $JKB_DB or ~/.jkb/jkb.db)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@jkb/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.3"
+  }
+}

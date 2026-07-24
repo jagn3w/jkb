@@ -1,0 +1,10 @@
+{
+  "name": "@jkb/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "jkb UI workspace: a portable core + host adapters (VS Code first, web later).",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck"
+  }
+}
