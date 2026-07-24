@@ -5,6 +5,6 @@
   "description": "jkb UI workspace: a portable core + host adapters (VS Code first, web later).",
   "scripts": {
     "build": "pnpm -r run build",
-    "typecheck": "pnpm -r run typecheck"
+    "typecheck": "pnpm --filter @jkb/core run build && pnpm -r run typecheck"
   }
 }

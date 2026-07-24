@@ -17,6 +17,8 @@ export interface TreeChild {
   readonly hasChildren: boolean;
   /** Task status, when the child is a task; otherwise absent. */
   readonly status?: string | null;
+  /** Task priority (lower = more important), when set; drives ranking + colour. */
+  readonly priority?: number | null;
 }
 
 /** A tag application on an item. */
@@ -78,7 +80,8 @@ export type MutationIntent =
   | { readonly type: "setTaskDue"; readonly uid: string; readonly due: string }
   | { readonly type: "setTaskTitle"; readonly uid: string; readonly title: string }
   | { readonly type: "addTaskTag"; readonly uid: string; readonly facet: string; readonly value: string }
-  | { readonly type: "renameNamespace"; readonly from: string; readonly to: string };
+  | { readonly type: "renameNamespace"; readonly from: string; readonly to: string }
+  | { readonly type: "setItemContent"; readonly uid: string; readonly content: string };
 
 /** All mutation intent discriminants — used by the registry to declare allowed edits. */
 export type MutationType = MutationIntent["type"];

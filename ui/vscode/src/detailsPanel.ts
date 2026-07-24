@@ -144,6 +144,9 @@ const WIRING = `
       const facet = value('tag-facet');
       const val = value('tag-value');
       if (facet && val) post([{ type: 'addTaskTag', uid, facet, value: val }]);
+    } else if (action === 'save-content') {
+      const content = value('content');
+      if (content) post([{ type: 'setItemContent', uid, content }]);
     }
   });
 `;

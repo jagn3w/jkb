@@ -18,4 +18,7 @@ export interface JkbClient {
 
   /** Apply one edit intent, mapped to an audited `jkb` command. */
   mutate(intent: MutationIntent): Promise<void>;
+
+  /** Items matching a query DSL string (e.g. `kind:task is:ready`). Backed by `jkb query`. */
+  search(query: string): Promise<readonly TreeChild[]>;
 }

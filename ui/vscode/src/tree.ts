@@ -4,6 +4,8 @@ import * as vscode from "vscode";
 
 import { kindInfo, type JkbClient, type NodeRef, type TreeChild } from "@jkb/core";
 
+import { nodeIcon, nodeUri } from "./decorations.js";
+
 export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
   private readonly emitter = new vscode.EventEmitter<TreeChild | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
@@ -30,7 +32,10 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
         ? vscode.TreeItemCollapsibleState.Collapsed
         : vscode.TreeItemCollapsibleState.None,
     );
-    item.iconPath = new vscode.ThemeIcon(kindInfo(kind).icon);
+    item.iconPath = nodeIcon(kind, kindInfo(kind).icon, child.status, child.priority);
+    // A synthetic resource URI drives the FileDecorationProvider (label colour + badge);
+    // the explicit label above still wins over the URI basename.
+    item.resourceUri = nodeUri(child);
     item.contextValue = kind;
     if (child.status) item.description = child.status;
     item.command = {

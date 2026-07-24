@@ -28,6 +28,16 @@ interface RawChild {
   label: string;
   has_children: boolean;
   status: string | null;
+  priority: number | null;
+}
+
+/** Raw `jkb query` result row. */
+interface RawQueryItem {
+  uid: string;
+  kind: string;
+  status: string | null;
+  priority: number | null;
+  snippet: string | null;
 }
 
 /** Raw `jkb item show` shape. */
@@ -95,6 +105,17 @@ export class CliJkbClient implements JkbClient {
     await this.run(intentToArgs(intent));
   }
 
+  async search(query: string): Promise<TreeChild[]> {
+    const rows = await this.json<RawQueryItem[]>(["query", query, "--global"]);
+    return rows.map((r) => ({
+      ref: { kind: "item", uid: r.uid, itemKind: r.kind },
+      label: r.snippet ?? r.uid,
+      hasChildren: false,
+      status: r.status,
+      priority: r.priority,
+    }));
+  }
+
   // ---- process plumbing ----
 
   private async json<T>(args: string[]): Promise<T> {
@@ -128,7 +149,13 @@ function toTreeChild(c: RawChild): TreeChild {
     c.kind === "namespace"
       ? { kind: "namespace", path: c.ref }
       : { kind: "item", uid: c.ref, itemKind: c.kind };
-  return { ref, label: c.label, hasChildren: c.has_children, status: c.status };
+  return {
+    ref,
+    label: c.label,
+    hasChildren: c.has_children,
+    status: c.status,
+    priority: c.priority,
+  };
 }
 
 /** Map an edit intent to an audited `jkb` command line. */
@@ -146,5 +173,7 @@ function intentToArgs(i: MutationIntent): string[] {
       return ["task", "tag", "add", i.uid, `${i.facet}=${i.value}`];
     case "renameNamespace":
       return ["ns", "mv", i.from, i.to];
+    case "setItemContent":
+      return ["item", "edit", i.uid, i.content];
   }
 }

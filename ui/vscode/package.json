@@ -23,12 +23,19 @@
     "commands": [
       { "command": "jkb.refresh", "title": "jkb: Refresh Explorer", "icon": "$(refresh)" },
       { "command": "jkb.toggleTerminal", "title": "jkb: Show/Hide Completed Tasks", "icon": "$(eye)" },
-      { "command": "jkb.openDetails", "title": "jkb: Open Details" }
+      { "command": "jkb.search", "title": "jkb: Search", "icon": "$(search)" },
+      { "command": "jkb.openDetails", "title": "jkb: Open Details" },
+      { "command": "jkb.workTask", "title": "jkb: Work this task with Claude", "icon": "$(sparkle)" }
     ],
     "menus": {
       "view/title": [
-        { "command": "jkb.refresh", "when": "view == jkb.explorer", "group": "navigation" },
-        { "command": "jkb.toggleTerminal", "when": "view == jkb.explorer", "group": "navigation" }
+        { "command": "jkb.search", "when": "view == jkb.explorer", "group": "navigation@1" },
+        { "command": "jkb.refresh", "when": "view == jkb.explorer", "group": "navigation@2" },
+        { "command": "jkb.toggleTerminal", "when": "view == jkb.explorer", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "inline" },
+        { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "jkb@1" }
       ]
     },
     "configuration": {

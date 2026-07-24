@@ -37,14 +37,21 @@ pnpm run typecheck    # typecheck both packages
 
 Settings: `jkb.cliPath` (default `jkb`) and `jkb.dbPath` (blank = `$JKB_DB` / `~/.jkb/jkb.db`).
 
-## First pass — what works
+## What works
 
-- Lazy tree of the VFS (namespaces + items homed under them); completed/cancelled tasks
-  hidden by default (toggle in the view title).
-- Type-specific details with a **bounded preview** (a large PDF/document shows metadata +
-  a snippet, never the whole thing).
-- Inline edits routed through the CLI: task status/priority/due/title, namespace
-  rename/move, add task tag.
+- **Lazy tree** of the VFS (namespaces + items homed under them). Sorted: namespaces
+  first, then tasks by priority (most important first), then other items. Completed /
+  cancelled items are hidden by default (toggle in the view title, like ignored files).
+- **Row colours + badges**: tasks coloured by importance (p1 red → p3 yellow, with a `p1`
+  badge), items by kind. The colour policy is portable (`@jkb/core`); the VS Code adapter
+  maps it to ThemeColors.
+- **Type-specific details** with a **bounded preview** (a large PDF/document shows metadata
+  + a snippet, never the whole thing).
+- **Inline edits** routed through the CLI: task status/priority/due/title, namespace
+  rename/move, add task tag, and **item/text body editing** (`jkb item edit`).
+- **Live refresh**: the tree updates when the database changes (CLI, swarm, sync).
+- **Search** (view-title): run a query DSL string and jump to a result's details.
+- **Work a task with Claude**: right-click a task → opens a terminal running `claude`
+  seeded with a prompt to do it.
 
-Deferred (the abstractions leave room): item/document body editing, drag re-placement,
-live watch-driven refresh, in-tree search, and the web-app package.
+Deferred (the abstractions leave room): drag re-placement/re-binding and the web-app package.

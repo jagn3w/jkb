@@ -13,7 +13,7 @@
 
 import type { ItemDetails, NamespaceDetails, NodeDetails } from "./model.js";
 import { TASK_STATUSES } from "./model.js";
-import { kindInfo } from "./registry.js";
+import { allowsEdit, kindInfo } from "./registry.js";
 
 /** Escape text for safe interpolation into HTML. */
 export function escapeHtml(s: string): string {
@@ -73,20 +73,39 @@ function renderItem(d: ItemDetails): string {
         .join("")}</div>`
     : "";
 
-  const edit = d.itemKind === "task" ? renderTaskEdit(d) : "";
-
-  const preview = d.preview
-    ? `<h3>Preview</h3><pre class="jkb-preview">${escapeHtml(d.preview)}${
-        d.previewTruncated ? "\n…" : ""
-      }</pre>`
-    : "";
+  // Task → its edit form (which includes the title/content). Content-editable non-task
+  // items with an untruncated preview → an editable content box. Everything else →
+  // a read-only preview.
+  let body: string;
+  if (d.itemKind === "task") {
+    body = renderTaskEdit(d);
+  } else if (allowsEdit(d.itemKind, "setItemContent") && !d.previewTruncated) {
+    body = renderContentEdit(d);
+  } else {
+    body = previewBlock(d);
+  }
 
   return `<div class="jkb-details" data-node-kind="${escapeHtml(d.itemKind)}" data-uid="${escapeHtml(d.uid)}">
     <h2>${escapeHtml(info.label)}</h2>
     ${meta}
     ${tags}
-    ${edit}
-    ${preview}
+    ${body}
+  </div>`;
+}
+
+function previewBlock(d: ItemDetails): string {
+  if (!d.preview) return "";
+  return `<h3>Preview</h3><pre class="jkb-preview">${escapeHtml(d.preview)}${
+    d.previewTruncated ? "\n…" : ""
+  }</pre>`;
+}
+
+function renderContentEdit(d: ItemDetails): string {
+  return `<div class="jkb-edit">
+    <label>Content
+      <textarea data-edit="content" rows="14">${escapeHtml(d.preview)}</textarea>
+    </label>
+    <button data-action="save-content">Save content</button>
   </div>`;
 }
 

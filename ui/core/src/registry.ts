@@ -26,9 +26,10 @@ const TASK_EDITS: readonly MutationType[] = [
 export const KIND_REGISTRY: Readonly<Record<string, KindInfo>> = {
   namespace: { icon: "folder", label: "Namespace", edits: ["renameNamespace"] },
   task: { icon: "checklist", label: "Task", edits: TASK_EDITS },
-  document: { icon: "file", label: "Document", edits: [] },
+  document: { icon: "file", label: "Document", edits: ["setItemContent"] },
   chunk: { icon: "symbol-string", label: "Chunk", edits: [] },
-  text: { icon: "note", label: "Text", edits: [] },
+  text: { icon: "note", label: "Text", edits: ["setItemContent"] },
+  note: { icon: "note", label: "Note", edits: ["setItemContent"] },
   view: { icon: "eye", label: "View", edits: [] },
 };
 
