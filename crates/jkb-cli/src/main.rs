@@ -179,6 +179,10 @@ enum TaskCmd {
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
+        /// Home the task in the ambient repo's backlog (`tasks/<repo>/.backlog`)
+        /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
+        #[arg(long)]
+        backlog: bool,
     },
     /// List the ready frontier (optionally scoped/filtered by DSL terms).
     Next {
@@ -513,6 +517,49 @@ fn apply_ambient(query: &mut Query, db: &Db, global: bool) -> Result<()> {
     Ok(())
 }
 
+/// The ambient repo key: the full namespace path of the `file://` mount covering the
+/// current directory (design D26.2), or `None` outside any mount. Tasks home under
+/// `tasks/<repo>/…` using this key. Unlike [`ambient`], `--global` does not apply — homing
+/// always reflects where the task was captured.
+fn ambient_repo(db: &Db) -> Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
+}
+
+/// Default an unscoped task query to the ambient repo's task tree (`tasks/<repo>/**`) when
+/// inside a repo, else the global `tasks/**` tree (design D26, open-question 4). `--global`
+/// forces the global tree.
+fn apply_ambient_tasks(query: &mut Query, db: &Db, global: bool) -> Result<()> {
+    if query.scope == Scope::All {
+        let base = if global {
+            "tasks".to_owned()
+        } else {
+            match ambient_repo(db)? {
+                Some(repo) => format!("tasks/{repo}"),
+                None => "tasks".to_owned(),
+            }
+        };
+        query.scope = Scope::Subtree(base);
+    }
+    Ok(())
+}
+
+/// Confirm a global `tasks/.backlog` fallback when `--backlog` is used outside any repo
+/// (design D26.4). Returns `true` only on interactive assent; when stdin is not a TTY
+/// (non-interactive/headless) it returns `false` so the caller errors instead of silently
+/// creating a global backlog task.
+fn confirm_global_backlog() -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    print!("Not inside a mounted repo. Home this task at the global `tasks/.backlog`? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
 // ---- commands -------------------------------------------------------------
 
 fn cmd_ingest(db: &Db, path: &str, ns: Option<&str>, global: bool, json: bool) -> Result<()> {
@@ -796,11 +843,36 @@ fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
 
 fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Add { text } => {
+        TaskCmd::Add { text, backlog } => {
             let input = text.join(" ");
             let qa = task::parse_quick_add(&input)?;
+            let had_explicit_placement = !qa.placements.is_empty();
             let uid = task_uid(&qa.title);
-            let spec = task::NewTask::from_quick_add(uid.clone(), qa);
+            let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
+
+            // Homing (design D26). An explicit `+<ns>` already set `spec.home` (first
+            // placement) via `from_quick_add`; otherwise derive it from `--backlog` and
+            // the ambient repo.
+            if had_explicit_placement {
+                if backlog {
+                    anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
+                }
+            } else if backlog {
+                match ambient_repo(db)? {
+                    Some(repo) => spec.home = format!("tasks/{repo}/.backlog"),
+                    None if confirm_global_backlog()? => spec.home = String::from("tasks/.backlog"),
+                    None => anyhow::bail!(
+                        "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
+                    ),
+                }
+            } else if let Some(repo) = ambient_repo(db)? {
+                // Inside a repo with no target: home at the per-repo inbox, mirrored into
+                // the global inbox so it stays a complete capture view (D26.3).
+                spec.home = format!("tasks/{repo}/inbox");
+                spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
+            }
+            // else: outside a repo with no target → home stays `tasks/inbox` (DEFAULT_HOME).
+
             let id = db.write_txn("cli", move |conn, meta| task::create(conn, meta, &spec))?;
             if json {
                 println!("{}", serde_json::json!({"id": id.get(), "uid": uid}));
@@ -810,7 +882,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         }
         TaskCmd::Next { terms, limit } => {
             let mut query = jkb_core::query::parse(&terms.join(" "))?;
-            apply_ambient(&mut query, db, global)?;
+            apply_ambient_tasks(&mut query, db, global)?;
             let (scope, tags) = (query.scope.clone(), query.tags.clone());
             let mut rows = db.read(move |conn| task::ready(conn, scope, &tags))?;
             if let Some(limit) = limit {

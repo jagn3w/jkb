@@ -649,3 +649,142 @@ fn index_on_empty_kb_has_nothing_to_embed() {
         .success()
         .stdout(predicate::str::contains("nothing to embed"));
 }
+
+// ---- task homing (design D26) ---------------------------------------------
+
+#[test]
+fn task_add_explicit_placement_sets_home() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    jkb(&db)
+        .args(["task", "add", "explicit home task", "+projects/alpha"])
+        .assert()
+        .success();
+
+    // The first `+<ns>` is the Primary home; there is no forced `tasks/inbox` placement.
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:projects/alpha"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("explicit home task"));
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:tasks/inbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("explicit home task").not());
+}
+
+#[test]
+fn task_add_backlog_outside_repo_errors() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // No ambient repo and stdin is not a TTY → the global fallback is declined → error.
+    jkb(&db)
+        .args(["task", "add", "orphan backlog", "--backlog"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--backlog needs an ambient repo"));
+}
+
+/// Mount `repo_dir` at namespace `ns` so tasks added from inside it home under `tasks/<ns>`.
+fn mount_repo(db: &Path, ns: &str, repo_dir: &Path) {
+    jkb(db)
+        .args(["mount", ns, repo_dir.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn task_add_in_repo_homes_per_repo_inbox_and_mirror() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().join("myrepo");
+    std::fs::create_dir(&repo).unwrap();
+    mount_repo(&db, "repos/proj", &repo);
+
+    jkb(&db)
+        .current_dir(&repo)
+        .args(["task", "add", "in repo task"])
+        .assert()
+        .success();
+
+    // Primary home at the per-repo inbox, and mirrored into the global inbox (D26.3).
+    jkb(&db)
+        .args([
+            "--global",
+            "query",
+            "kind:task",
+            "ns:tasks/repos/proj/inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in repo task"));
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:tasks/inbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in repo task"));
+}
+
+#[test]
+fn task_add_backlog_in_repo_homes_per_repo_backlog_no_mirror() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().join("myrepo");
+    std::fs::create_dir(&repo).unwrap();
+    mount_repo(&db, "repos/proj", &repo);
+
+    jkb(&db)
+        .current_dir(&repo)
+        .args(["task", "add", "repo backlog item", "--backlog"])
+        .assert()
+        .success();
+
+    jkb(&db)
+        .args([
+            "--global",
+            "query",
+            "kind:task",
+            "ns:tasks/repos/proj/.backlog",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repo backlog item"));
+    // A backlog is per-repo: not mirrored into the global inbox.
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:tasks/inbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repo backlog item").not());
+}
+
+#[test]
+fn task_next_scopes_to_the_repo_task_tree() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().join("myrepo");
+    std::fs::create_dir(&repo).unwrap();
+    mount_repo(&db, "repos/proj", &repo);
+
+    // A purely-global task and a repo-scoped task.
+    jkb(&db)
+        .args(["task", "add", "global only task"])
+        .assert()
+        .success();
+    jkb(&db)
+        .current_dir(&repo)
+        .args(["task", "add", "repo scoped task"])
+        .assert()
+        .success();
+
+    // `task next` from inside the repo defaults to `tasks/repos/proj/**`.
+    jkb(&db)
+        .current_dir(&repo)
+        .args(["task", "next"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repo scoped task"))
+        .stdout(predicate::str::contains("global only task").not());
+}
