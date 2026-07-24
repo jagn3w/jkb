@@ -46,9 +46,11 @@ jkb ingest https://example.com/article --ns web
 jkb search "distinctive phrase" --route hybrid --context 2
 jkb query "kind:task is:ready ns:tasks/**"
 
-# Tasks: quick-add DSL, then the ready frontier (ordered by priority then due)
+# Tasks: quick-add DSL (the first +<ns> is the task's home, the rest are mirrors),
+# then the ready frontier (ordered by priority then due)
 jkb task add "fix the flaky test" !p1 @2026-07-15 +repos/app #size=small
-jkb task next
+jkb task add "triage this later" --backlog   # home in the ambient repo's backlog
+jkb task next                                # ready tasks; scoped to the repo when inside one
 
 # Saved views (named queries)
 jkb view save my-day "kind:task is:ready due:today"
@@ -108,6 +110,9 @@ jkb is a Cargo workspace of small crates under `crates/`:
 ./scripts/test.sh      # tests (pass-through args, e.g. -p jkb-sync)
 ./scripts/clippy.sh    # clippy only
 ```
+
+GitHub Actions runs the same gate (`.github/workflows/ci.yml`, mirroring `check.sh` with
+`--all-features`) on every push and pull request.
 
 Conventions: no `unsafe` (workspace `unsafe_code = "deny"`, with one scoped exception
 for the sqlite-vec FFI registration in `jkb-index`), clippy `pedantic`, errors via
