@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run jkb Explorer (extension)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/ui/vscode"],
+      "outFiles": ["${workspaceFolder}/ui/vscode/dist/**/*.js"]
+    }
+  ]
+}

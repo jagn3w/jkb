@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build jkb extension",
+      "type": "shell",
+      "command": "pnpm run build",
+      "options": { "cwd": "${workspaceFolder}/ui" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "clear": true }
+    },
+    {
+      "label": "watch jkb extension",
+      "type": "shell",
+      "command": "pnpm --filter jkb-explorer run watch",
+      "options": { "cwd": "${workspaceFolder}/ui" },
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}
