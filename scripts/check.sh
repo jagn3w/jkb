@@ -14,7 +14,10 @@ cargo test --all
 
 echo "==> cargo-deny (advisories, licenses, sources)"
 if command -v cargo-deny >/dev/null 2>&1; then
-    cargo deny check
+    # --all-features so feature-gated deps (e.g. the `fastembed` graph) are audited too;
+    # this matches CI (the cargo-deny action defaults to --all-features). Without it a
+    # vuln behind an optional feature is invisible locally.
+    cargo deny --all-features check
 else
     echo "   (skipped: cargo-deny not installed — 'cargo install cargo-deny')"
 fi

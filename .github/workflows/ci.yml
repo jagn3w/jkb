@@ -53,5 +53,7 @@ jobs:
       - name: test (fastembed)
         run: cargo test --all --features fastembed
 
+      # The action defaults to `cargo deny check --all-features`, so feature-gated deps
+      # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
