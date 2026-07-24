@@ -1902,6 +1902,7 @@ dependencies = [
  "jkb-sync",
  "jkb-types",
  "predicates",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

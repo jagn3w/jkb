@@ -155,6 +155,32 @@ enum Command {
     },
     /// Run the MCP server (Section 13, not yet available).
     Mcp,
+    /// List the direct children of a namespace (sub-namespaces + items homed there) —
+    /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
+    Ls {
+        /// The namespace whose children to list (default: top-level namespaces).
+        path: Option<String>,
+        /// Include terminal (`done`/`cancelled`) tasks (hidden by default).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect items (generic, kind-aware).
+    Item {
+        #[command(subcommand)]
+        cmd: ItemCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ItemCmd {
+    /// Show one item's details + a bounded content preview (any kind).
+    Show {
+        /// The item uid.
+        uid: String,
+        /// Max preview characters (default 800; never the whole document).
+        #[arg(long, default_value_t = 800)]
+        preview: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -482,6 +508,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Index => cmd_index(&db),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
+        Command::Ls { path, all } => cmd_ls(&db, path.as_deref(), all, json),
+        Command::Item { cmd } => match cmd {
+            ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
+        },
     }
 }
 
@@ -699,6 +729,231 @@ fn cmd_search(
         }
     }
     Ok(())
+}
+
+/// A direct child of a namespace in the tree: a sub-namespace, or an item homed there.
+struct Child {
+    kind: String,
+    reference: String,
+    label: String,
+    has_children: bool,
+    status: Option<String>,
+}
+
+impl Child {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind,
+            "ref": self.reference,
+            "label": self.label,
+            "has_children": self.has_children,
+            "status": self.status,
+        })
+    }
+}
+
+/// A short label for an item: its first non-empty content line (≤80 chars), else its uid.
+fn item_label(meta: &item::ItemMeta) -> String {
+    let line = meta
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.is_empty() {
+        return meta.uid.clone();
+    }
+    let mut s: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        s.push('…');
+    }
+    s
+}
+
+/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
+/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
+/// tasks are hidden unless `all`.
+fn list_children(
+    conn: &rusqlite::Connection,
+    path: Option<&str>,
+    all: bool,
+) -> jkb_core::Result<Vec<Child>> {
+    let mut out = Vec::new();
+
+    let ns_children = match path {
+        None => ns::roots(conn)?,
+        Some(p) => ns::children(conn, p)?,
+    };
+    for (ns_id, ns_path) in ns_children {
+        let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
+        let has_sub = !ns::children(conn, &ns_path)?.is_empty();
+        let has_items = !placement::items_in(conn, ns_id, Some(PlacementRole::Primary))?.is_empty();
+        out.push(Child {
+            kind: "namespace".to_owned(),
+            reference: ns_path,
+            label,
+            has_children: has_sub || has_items,
+            status: None,
+        });
+    }
+
+    if let Some(p) = path {
+        if let Some(ns_id) = ns::get(conn, p)? {
+            for item_id in placement::items_in(conn, ns_id, Some(PlacementRole::Primary))? {
+                let Some(meta) = item::get(conn, item_id)? else {
+                    continue;
+                };
+                let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
+                if !all && meta.kind == "task" && terminal {
+                    continue;
+                }
+                out.push(Child {
+                    label: item_label(&meta),
+                    kind: meta.kind,
+                    reference: meta.uid,
+                    has_children: false,
+                    status: meta.status,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `jkb ls [path]` — the direct children of a namespace, for lazy tree expansion.
+fn cmd_ls(db: &Db, path: Option<&str>, all: bool, json: bool) -> Result<()> {
+    let owned = path.map(str::to_owned);
+    let children = db.read(move |conn| list_children(conn, owned.as_deref(), all))?;
+    if json {
+        let v = serde_json::json!({
+            "path": path,
+            "children": children.iter().map(Child::to_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else if children.is_empty() {
+        println!("(empty)");
+    } else {
+        for c in &children {
+            let arrow = if c.has_children { "▸" } else { " " };
+            let status = c
+                .status
+                .as_deref()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            println!("{arrow} {:<10} {}{status}", c.kind, c.label);
+        }
+    }
+    Ok(())
+}
+
+/// The item's primary (home) namespace path, if placed.
+fn primary_ns(conn: &rusqlite::Connection, id: ItemId) -> jkb_core::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+             WHERE p.item_id = ?1 ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1",
+        )?
+        .query_row([id.get()], |r| r.get::<_, String>(0))
+        .optional()?)
+}
+
+/// `jkb item show <uid>` — generic, kind-aware item details + a bounded content preview.
+fn cmd_item_show(db: &Db, uid: &str, preview_max: usize, json: bool) -> Result<()> {
+    let u = uid.to_owned();
+    let found = db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(None);
+        };
+        let Some(meta) = item::get(conn, id)? else {
+            return Ok(None);
+        };
+        let binding = binding::get(conn, id)?.map(|b| b.uri);
+        let tags = tag::applications(conn, id)?;
+        let namespace = primary_ns(conn, id)?;
+        Ok(Some((meta, binding, tags, namespace)))
+    })?;
+    let Some((meta, binding, tags, namespace)) = found else {
+        anyhow::bail!("no item with uid `{uid}`");
+    };
+
+    let content_chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
+    let preview: String = meta
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(preview_max)
+        .collect();
+    let preview_truncated = content_chars > preview_max;
+
+    if json {
+        let v = serde_json::json!({
+            "uid": meta.uid,
+            "kind": meta.kind,
+            "status": meta.status,
+            "priority": meta.priority,
+            "due": meta.due,
+            "mime": meta.mime,
+            "binding": binding,
+            "namespace": namespace,
+            "content_chars": content_chars,
+            "content_hash": meta.content_hash,
+            "created_at": meta.created_at,
+            "updated_at": meta.updated_at,
+            "tags": tags
+                .iter()
+                .map(|(f, v)| serde_json::json!({"facet": f, "value": v}))
+                .collect::<Vec<_>>(),
+            "preview": preview,
+            "preview_truncated": preview_truncated,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
+        println!(
+            "content:   {content_chars} chars{}",
+            if preview_truncated {
+                " (preview truncated)"
+            } else {
+                ""
+            }
+        );
+        if !preview.is_empty() {
+            println!("\n{preview}");
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable header lines for `item show`.
+fn print_item_detail(
+    meta: &item::ItemMeta,
+    binding: Option<&str>,
+    namespace: Option<&str>,
+    tags: &[(String, String)],
+) {
+    println!("uid:       {}", meta.uid);
+    println!("kind:      {}", meta.kind);
+    if let Some(s) = &meta.status {
+        println!("status:    {s}");
+    }
+    if let Some(ns) = namespace {
+        println!("namespace: {ns}");
+    }
+    if let Some(m) = &meta.mime {
+        println!("mime:      {m}");
+    }
+    if let Some(b) = binding {
+        println!("binding:   {b}");
+    }
+    if !tags.is_empty() {
+        let t: Vec<String> = tags.iter().map(|(f, v)| format!("{f}={v}")).collect();
+        println!("tags:      {}", t.join(", "));
+    }
+    println!("updated:   {}", meta.updated_at);
 }
 
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {

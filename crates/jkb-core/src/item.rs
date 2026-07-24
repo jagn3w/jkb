@@ -97,6 +97,62 @@ pub fn get_content(conn: &Connection, item: ItemId) -> Result<Option<String>> {
     Ok(content.flatten())
 }
 
+/// A full item row (metadata + content) for detail views (`jkb item show`).
+#[derive(Debug, Clone)]
+pub struct ItemMeta {
+    /// Row id.
+    pub id: ItemId,
+    /// Stable uid.
+    pub uid: String,
+    /// Item kind (`document`/`chunk`/`task`/`text`/`view`/…).
+    pub kind: String,
+    /// Text content, if any.
+    pub content: Option<String>,
+    /// Content hash (blake3 hex), if content-addressed.
+    pub content_hash: Option<String>,
+    /// MIME type, if known.
+    pub mime: Option<String>,
+    /// Task status, if a task.
+    pub status: Option<String>,
+    /// Priority, if set.
+    pub priority: Option<i64>,
+    /// Due date, if set.
+    pub due: Option<String>,
+    /// Creation timestamp (ISO).
+    pub created_at: String,
+    /// Last-update timestamp (ISO).
+    pub updated_at: String,
+}
+
+/// Fetch an item's full row by id, or `None` if it does not exist.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn get(conn: &Connection, item: ItemId) -> Result<Option<ItemMeta>> {
+    conn.prepare_cached(
+        "SELECT id, uid, kind, content, content_hash, mime, status, priority, due,
+                created_at, updated_at
+         FROM items WHERE id = ?1",
+    )?
+    .query_row([item.get()], |r| {
+        Ok(ItemMeta {
+            id: ItemId::new(r.get(0)?),
+            uid: r.get(1)?,
+            kind: r.get(2)?,
+            content: r.get(3)?,
+            content_hash: r.get(4)?,
+            mime: r.get(5)?,
+            status: r.get(6)?,
+            priority: r.get(7)?,
+            due: r.get(8)?,
+            created_at: r.get(9)?,
+            updated_at: r.get(10)?,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Replace an item's `content` (and `content_hash`), bumping `updated_at` and
 /// recording the change. Used by file sync when a bound file changes on disk; the
 /// FTS index follows automatically via the `V002` triggers.
