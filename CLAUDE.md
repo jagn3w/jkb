@@ -267,9 +267,14 @@ does **not** duplicate SQL — it builds a `Query { kind:task, ready:true, scope
 calls `Query::evaluate` (the one `is:ready` anti-join), then orders the ids by priority
 (asc, nulls last) then `date(due)`. `is_blocked` mirrors that anti-join for one task.
 Quick-add: `parse_quick_add` (quote-aware, mirrors `query/parse.rs`) →
-`NewTask::from_quick_add` with defaults `tasks/inbox` (`DEFAULT_HOME`) + `managed:`
-(`MANAGED_BINDING`). Ambient scope for `task next` is the CLI's job (§12): reuse
-`mount::ambient_namespace` (cwd→mirror ns) → `Scope`; `ready` already takes one.
+`NewTask::from_quick_add`. **Homing (D26, the `jkb-task-homing` change):** the first
+`+<ns>` placement is the Primary `home`, the rest are Reference `mirrors`; `tasks/inbox`
+(`DEFAULT_HOME`) is only the fallback when none is given. Binding defaults to `managed:`
+(`MANAGED_BINDING`). The CLI derives homes from the ambient repo (full mount ns): a plain
+`task add` inside a mounted repo → `tasks/<repo>/inbox` + a `tasks/inbox` mirror;
+`task add --backlog` → `tasks/<repo>/.backlog`. `task next`/unscoped task queries default
+to `tasks/<repo>/**` inside a repo, else the global `tasks/**`. `task unplace <uid> <ns>`
+removes a mirror. (The synced-file binding path and repo-root mounting remain follow-ups.)
 
 ## Section 11 — jkb-sync (DONE, for reference)
 
