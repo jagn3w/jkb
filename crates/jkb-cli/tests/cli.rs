@@ -788,3 +788,45 @@ fn task_next_scopes_to_the_repo_task_tree() {
         .stdout(predicate::str::contains("repo scoped task"))
         .stdout(predicate::str::contains("global only task").not());
 }
+
+#[test]
+fn task_unplace_removes_mirror_but_keeps_the_home() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // Add a task (homes at tasks/inbox) and mirror it under proj/mirror.
+    let out = jkb(&db)
+        .args(["task", "add", "unplace target"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // "added task <uid> (item N)"
+    let uid = stdout.split_whitespace().nth(2).unwrap().to_string();
+
+    jkb(&db)
+        .args(["task", "place", &uid, "proj/mirror"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:proj/mirror"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unplace target"));
+
+    // Unplace the mirror: it goes, the tasks/inbox home stays.
+    jkb(&db)
+        .args(["task", "unplace", &uid, "proj/mirror"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 mirror"));
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:proj/mirror"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unplace target").not());
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:tasks/inbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unplace target"));
+}

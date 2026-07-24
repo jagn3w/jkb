@@ -255,6 +255,13 @@ enum TaskCmd {
         #[arg(long)]
         home: bool,
     },
+    /// Remove a task's reference (mirror) placement under a namespace (inverse of `place`).
+    Unplace {
+        /// The task uid.
+        uid: String,
+        /// The namespace path whose mirror to remove.
+        ns: String,
+    },
     /// Bind a task to storage: `--managed` (no file) or `--sync <uri>` (a file mount).
     Bind {
         /// The task uid.
@@ -901,7 +908,26 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/
+/// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
+/// missing namespace or absent mirror is a no-op that reports `0` removed.
+fn cmd_task_unplace(db: &Db, uid: &str, ns: &str, json: bool) -> Result<()> {
+    let id = resolve_task_uid(db, uid)?;
+    let ns_path = ns.to_owned();
+    let removed = db.write_txn("cli", move |conn, meta| {
+        match jkb_core::ns::get(conn, &ns_path)? {
+            Some(ns_id) => placement::unplace(conn, meta, id, ns_id),
+            None => Ok(0),
+        }
+    })?;
+    if json {
+        println!("{}", serde_json::json!({ "uid": uid, "removed": removed }));
+    } else {
+        println!("unplaced {uid} from {ns} ({removed} mirror(s) removed)");
+    }
+    Ok(())
+}
+
+/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/`unplace`/
 /// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
 /// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
 fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
@@ -984,6 +1010,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             })?;
             report(json, &uid, "placed");
         }
+        TaskCmd::Unplace { uid, ns } => cmd_task_unplace(db, &uid, &ns, json)?,
         TaskCmd::Bind { uid, managed, sync } => {
             let (uri, mode) = match (managed, sync) {
                 (_, Some(uri)) => (uri, Some(SyncMode::Bidirectional)),
