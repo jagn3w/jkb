@@ -1078,3 +1078,38 @@ fn mount_ls_lists_mounts() {
         .success()
         .stdout(predicate::str::contains("\"namespace\": \"repos/x/docs\""));
 }
+
+#[test]
+fn ns_rm_refuses_nonempty_and_removes_empty() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["task", "add", "tmp task", "+proj/tmp"])
+        .output()
+        .unwrap();
+    let uid = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+
+    // Non-empty namespace is refused.
+    jkb(&db)
+        .args(["ns", "rm", "proj/tmp"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("placement"));
+
+    // Re-home the task elsewhere, emptying proj/tmp, then rm succeeds.
+    jkb(&db)
+        .args(["task", "place", &uid, "proj/other", "--home"])
+        .assert()
+        .success();
+    jkb(&db).args(["ns", "rm", "proj/tmp"]).assert().success();
+    jkb(&db)
+        .args(["ns", "ls", "proj"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tmp").not());
+}

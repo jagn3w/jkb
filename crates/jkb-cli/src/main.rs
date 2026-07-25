@@ -217,6 +217,8 @@ enum NsCmd {
     Ls { scope: Option<String> },
     /// Move a subtree to a new path.
     Mv { from: String, to: String },
+    /// Remove an empty namespace (no child namespaces or item placements).
+    Rm { path: String },
 }
 
 #[derive(Subcommand)]
@@ -1089,6 +1091,11 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
                 ns::move_subtree(conn, meta, &from2, &to2)
             })?;
             println!("moved {moved} namespace(s): {from} -> {to}");
+        }
+        NsCmd::Rm { path } => {
+            let p = path.clone();
+            db.write_txn("cli", move |conn, meta| ns::remove(conn, meta, &p))?;
+            report(json, &path, "removed namespace");
         }
     }
     Ok(())

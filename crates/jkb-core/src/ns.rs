@@ -249,6 +249,52 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
     Ok(rows.len())
 }
 
+/// Remove an **empty** namespace — no child namespaces and no item placements — recording
+/// the deletion in the changelog. Refuses a non-empty namespace so content is never
+/// silently orphaned. (A mount on the namespace is removed by cascade.)
+///
+/// # Errors
+/// Returns a validation error if the namespace does not exist or is not empty; otherwise a
+/// database error.
+pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
+    let normalized = normalize(path)?;
+    let Some(id) = get(conn, &normalized)? else {
+        return Err(
+            TypeError::Validation(format!("namespace '{normalized}' does not exist")).into(),
+        );
+    };
+    let children: i64 = conn
+        .prepare_cached("SELECT count(*) FROM namespaces WHERE parent_id = ?1")?
+        .query_row([id.get()], |r| r.get(0))?;
+    if children > 0 {
+        return Err(TypeError::Validation(format!(
+            "namespace '{normalized}' has {children} child namespace(s); remove or move them first"
+        ))
+        .into());
+    }
+    let placements: i64 = conn
+        .prepare_cached("SELECT count(*) FROM placements WHERE namespace_id = ?1")?
+        .query_row([id.get()], |r| r.get(0))?;
+    if placements > 0 {
+        return Err(TypeError::Validation(format!(
+            "namespace '{normalized}' holds {placements} item placement(s); move or unplace them first"
+        ))
+        .into());
+    }
+    conn.prepare_cached("DELETE FROM namespaces WHERE id = ?1")?
+        .execute([id.get()])?;
+    changelog::append(
+        conn,
+        meta,
+        "delete",
+        "namespaces",
+        &id.get().to_string(),
+        Some(&json!({ "path": normalized })),
+        None,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ensure, get_metadata, move_subtree, normalize, set_metadata, subtree};
