@@ -35,6 +35,10 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
 # --- 1. jkb binary -----------------------------------------------------------
+# Re-running this after `git pull` is the supported way to refresh the binary — the
+# jkb.db is global across branches/worktrees, so a newer branch's migration can lock
+# an older binary out; `--force` always reinstalls from the current checkout so you
+# never run a stale binary against a migrated DB.
 say "install jkb binary"
 # shellcheck disable=SC1090
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
@@ -55,14 +59,18 @@ fi
 echo "installed: $(command -v jkb) ($(jkb --version))"
 
 # --- 2. scaffold the KB ------------------------------------------------------
-# The DB and its migrations are created on first open. `_sys/` is created by the
-# migrations; these are the reserved semantic roots (design D32).
-if [ "$do_scaffold" -eq 1 ]; then
+# ONLY on a fresh machine: if a KB already exists we leave it completely untouched
+# (never mutate an existing knowledge base on setup — it may hold real data on a
+# shared/cloud-synced path). The DB + migrations are created on first open; `_sys/`
+# comes from the migrations, these are the reserved semantic roots (design D32).
+if [ "$do_scaffold" -eq 0 ]; then
+  warn "skipping KB scaffold (--no-scaffold)"
+elif [ -f "$db" ]; then
+  say "existing KB detected ($db) — left untouched"
+else
   say "scaffold KB namespaces ($db)"
   mkdir -p "$(dirname "$db")"
   jkb --db "$db" ns mk repos tasks media references memory
-else
-  warn "skipping KB scaffold (--no-scaffold)"
 fi
 
 # --- 3. VS Code extension ----------------------------------------------------
