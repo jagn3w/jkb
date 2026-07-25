@@ -69,8 +69,28 @@ Rules for the doc:
 - If the review found nothing, write a single section `## Summary` with
   `- [x] No findings — clean review !p3`.
 
-## 4. Report
+## 4. Mount the folder into the KB
+
+Mount the new review folder so its findings become managed tasks automatically. Each
+review gets its **own per-folder mount** — the `tasks` serializer maps `##` headers to
+namespaces under the mount, so one shared `.codereviews` mount would merge every review's
+`## High` into a single namespace. From the repo root, with `REVIEW_DIR` from step 1:
+
+```sh
+repo=$(basename "$(git rev-parse --show-toplevel)")
+folder=$(basename "$REVIEW_DIR")
+ns="repos/$repo/codereviews/$folder"
+jkb mount create "$ns" "$REVIEW_DIR" --serializer tasks
+jkb sync "$ns"
+```
+
+The findings home under `repos/<repo>/codereviews/<folder>/…` and auto-mirror to
+`tasks/<repo>/codereviews/…` (design D26/D32). A running `jkb sync --watch` won't see a
+just-created mount until it restarts, so the one-shot `jkb sync` above is what lands the
+findings immediately. `mount create` is idempotent, so re-running the review is safe.
+
+## 5. Report
 
 Print `REVIEW_DIR/tasks.md` and a one-line summary: `N findings (H high, M medium, L low)`.
-Mention the folder is under `.codereviews/` (git-ignored) and can be mounted with
-`jkb mount codereviews .codereviews --serializer tasks --include '**/tasks.md'`.
+Say the findings are now mounted at `repos/<repo>/codereviews/<folder>` (git-ignored on
+disk) and browsable in the KB under `tasks/<repo>/codereviews/…`.
