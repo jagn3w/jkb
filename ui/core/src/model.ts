@@ -15,6 +15,12 @@ export interface TreeChild {
   readonly label: string;
   /** Whether the node can be expanded (drives the lazy expand arrow). */
   readonly hasChildren: boolean;
+  /**
+   * For a namespace: how many visible item leaves live anywhere in its subtree (respecting
+   * the terminal-status toggle). Lets the host indicate which folders lead to real content.
+   * Absent for item leaves.
+   */
+  readonly leafCount?: number | null;
   /** Task status, when the child is a task; otherwise absent. */
   readonly status?: string | null;
   /** Task priority (lower = more important), when set; drives ranking + colour. */

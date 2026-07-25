@@ -37,7 +37,16 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
     // the explicit label above still wins over the URI basename.
     item.resourceUri = nodeUri(child);
     item.contextValue = kind;
-    if (child.status) item.description = child.status;
+    if (child.ref.kind === "namespace") {
+      // Indicate whether the folder's subtree leads to real content: show the count of
+      // visible leaves when there are any, and mark truly-empty branches so drilling in
+      // isn't a surprise. Respects the done/cancelled toggle (the count comes from `jkb ls`).
+      const n = child.leafCount ?? 0;
+      item.description = n > 0 ? String(n) : "empty";
+      item.tooltip = n > 0 ? `${n} task(s) in subtree` : "no tasks in subtree";
+    } else if (child.status) {
+      item.description = child.status;
+    }
     item.command = {
       command: "jkb.openDetails",
       title: "Open Details",

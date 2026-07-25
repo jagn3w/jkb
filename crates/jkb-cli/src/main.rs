@@ -784,6 +784,10 @@ struct Child {
     has_children: bool,
     status: Option<String>,
     priority: Option<i64>,
+    /// For namespaces: count of visible item leaves anywhere in the subtree (respecting the
+    /// terminal-status toggle). `None` for item children. Lets the pane flag which folders
+    /// lead to real content.
+    leaf_count: Option<i64>,
 }
 
 impl Child {
@@ -795,6 +799,7 @@ impl Child {
             "has_children": self.has_children,
             "status": self.status,
             "priority": self.priority,
+            "leaf_count": self.leaf_count,
         })
     }
 
@@ -851,7 +856,10 @@ fn list_children(
     for (ns_id, ns_path) in ns_children {
         let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
         let has_sub = !ns::children(conn, &ns_path)?.is_empty();
-        let has_items = !placement::items_in(conn, ns_id, Some(PlacementRole::Primary))?.is_empty();
+        // Any placement role, so `tasks/…` mirror namespaces (Reference placements) count
+        // as having children — the symbolic-link view of tasks homed elsewhere.
+        let has_items = !placement::items_in(conn, ns_id, None)?.is_empty();
+        let leaf_count = ns::subtree_leaf_count(conn, &ns_path, all)?;
         out.push(Child {
             kind: "namespace".to_owned(),
             reference: ns_path,
@@ -859,12 +867,15 @@ fn list_children(
             has_children: has_sub || has_items,
             status: None,
             priority: None,
+            leaf_count: Some(leaf_count),
         });
     }
 
     if let Some(p) = path {
         if let Some(ns_id) = ns::get(conn, p)? {
-            for item_id in placement::items_in(conn, ns_id, Some(PlacementRole::Primary))? {
+            // Any placement role: a `tasks/…` mirror surfaces the task even though its
+            // primary home is elsewhere (the symbolic-link view).
+            for item_id in placement::items_in(conn, ns_id, None)? {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
                 };
@@ -881,6 +892,7 @@ fn list_children(
                     has_children: false,
                     status: meta.status,
                     priority: meta.priority,
+                    leaf_count: None,
                 });
             }
         }

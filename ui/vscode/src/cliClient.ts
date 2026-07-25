@@ -27,6 +27,7 @@ interface RawChild {
   ref: string;
   label: string;
   has_children: boolean;
+  leaf_count: number | null;
   status: string | null;
   priority: number | null;
 }
@@ -153,6 +154,7 @@ function toTreeChild(c: RawChild): TreeChild {
     ref,
     label: c.label,
     hasChildren: c.has_children,
+    leafCount: c.leaf_count,
     status: c.status,
     priority: c.priority,
   };
