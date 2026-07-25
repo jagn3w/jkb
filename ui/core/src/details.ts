@@ -93,6 +93,14 @@ function renderItem(d: ItemDetails): string {
   </div>`;
 }
 
+// Rows to size a content textarea so short items stay compact and long ones are readable
+// without dominating the pane. Accounts for both explicit newlines and soft-wrapped long
+// lines (~80 cols), clamped to [3, 24]; the CSS caps height and lets it scroll past that.
+function contentRows(text: string): number {
+  const wrapped = text.split("\n").reduce((n, line) => n + Math.max(1, Math.ceil(line.length / 80)), 0);
+  return Math.min(24, Math.max(3, wrapped));
+}
+
 function previewBlock(d: ItemDetails): string {
   if (!d.preview) return "";
   return `<h3>Preview</h3><pre class="jkb-preview">${escapeHtml(d.preview)}${
@@ -103,7 +111,7 @@ function previewBlock(d: ItemDetails): string {
 function renderContentEdit(d: ItemDetails): string {
   return `<div class="jkb-edit">
     <label>Content
-      <textarea data-edit="content" rows="14">${escapeHtml(d.preview)}</textarea>
+      <textarea data-edit="content" rows="${contentRows(d.preview)}">${escapeHtml(d.preview)}</textarea>
     </label>
     <button data-action="save-content">Save content</button>
   </div>`;
@@ -114,11 +122,14 @@ function renderTaskEdit(d: ItemDetails): string {
   const options = TASK_STATUSES.map(
     (s) => `<option value="${s}"${s === status ? " selected" : ""}>${s}</option>`,
   ).join("");
-  // A task's content is its title; only offer title editing when the preview holds it all.
+  // A task's content is its title plus any body (notes/design). Show it in full in a
+  // field sized to the content (scrollable past ~24 rows). Editing + saving replaces the
+  // whole content via `task edit`. If the content was truncated (unusual for a task),
+  // fall back to a read-only preview so we never silently drop the tail.
   const titleField = d.previewTruncated
-    ? ""
-    : `<label>Title
-        <textarea data-edit="title" rows="2">${escapeHtml(d.preview)}</textarea>
+    ? previewBlock(d)
+    : `<label>Title / notes
+        <textarea data-edit="title" rows="${contentRows(d.preview)}">${escapeHtml(d.preview)}</textarea>
       </label>`;
   return `<div class="jkb-edit">
     <label>Status

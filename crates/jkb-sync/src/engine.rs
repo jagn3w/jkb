@@ -170,6 +170,21 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         })?;
         results.push(FileResult { path, outcome });
     }
+    // Any tasks just imported from `repos/<repo>/…/tasks.md` get a `tasks/…` mirror so
+    // `tasks/**` stays the complete task index. Only run when a file actually changed —
+    // a pure-no-op reconcile must not open a write txn, or the watcher would re-fire on
+    // its own commit and spin (the file-watch feedback loop).
+    let imported = results.iter().any(|r| {
+        matches!(
+            r.outcome,
+            Outcome::Created | Outcome::Imported | Outcome::Merged
+        )
+    });
+    if imported {
+        db.write_txn_with::<usize, Error, _>("sync", |conn, meta| {
+            Ok(task::ensure_all_mirrors(conn, meta)?)
+        })?;
+    }
     Ok(SyncReport { results })
 }
 
@@ -1021,9 +1036,13 @@ fn mirror_paths_for(
     }
     let subtree_like = format!("{file_ns_path}/%");
     let placeholders = vec!["?"; ids.len()].join(", ");
+    // `tasks/**` reference placements are the internal task index (auto-mirrored by
+    // `task::ensure_task_mirror`), not user-authored `+ns` mirrors — never serialize
+    // them back into the file, or they'd leak in as `+tasks/…` and break byte-stability.
     let sql = format!(
         "SELECT p.item_id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
          WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ?
+           AND n.path != 'tasks' AND n.path NOT LIKE 'tasks/%'
            AND p.item_id IN ({placeholders})
          ORDER BY p.item_id, n.path"
     );

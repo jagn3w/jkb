@@ -168,7 +168,77 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
     for dep_uid in &task.depends_on {
         add_dependency(conn, meta, item_id, dep_uid)?;
     }
+    ensure_task_mirror(conn, meta, item_id, &task.home)?;
     Ok(item_id)
+}
+
+/// The `tasks/` mirror namespace for a task homed at `home`, or `None` if `home` is already
+/// under `tasks/`. A leading `repos/` is stripped so `repos/jkb/openspec/x` mirrors at
+/// `tasks/jkb/openspec/x`, keeping all of a repo's tasks under `tasks/<repo>/**`.
+fn tasks_mirror_ns(home: &str) -> Option<String> {
+    if home == "tasks" || home.starts_with("tasks/") {
+        return None;
+    }
+    let rest = home.strip_prefix("repos/").unwrap_or(home);
+    Some(format!("tasks/{rest}"))
+}
+
+/// Ensure a task homed at `home` (its Primary namespace) has a `tasks/…` Reference mirror
+/// (a symbolic link) when `home` is outside `tasks/`, so `tasks/**` is the complete task
+/// index. Idempotent; returns whether a mirror was added.
+///
+/// # Errors
+/// Returns an error if a query or placement fails.
+pub fn ensure_task_mirror(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    home: &str,
+) -> Result<bool> {
+    let Some(mirror) = tasks_mirror_ns(home) else {
+        return Ok(false);
+    };
+    let ns_id = ns::ensure(conn, &mirror)?;
+    let exists = conn
+        .prepare_cached(
+            "SELECT 1 FROM placements WHERE item_id = ?1 AND namespace_id = ?2 LIMIT 1",
+        )?
+        .query_row(params![item.get(), ns_id.get()], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    if exists {
+        return Ok(false);
+    }
+    placement::place(conn, meta, item, ns_id, PlacementRole::Reference, 0)?;
+    Ok(true)
+}
+
+/// Ensure every task whose Primary home is outside `tasks/` has a `tasks/…` mirror. Backs
+/// the sync-time reconcile (file-backed tasks under `repos/<repo>/…`) and the one-shot
+/// `jkb task mirror`. Idempotent; returns the number of mirrors added.
+///
+/// # Errors
+/// Returns an error if a query or placement fails.
+pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
+    let tasks: Vec<(ItemId, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT i.id, n.path FROM items i
+             JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
+             JOIN namespaces n ON n.id = p.namespace_id
+             WHERE i.kind = 'task'",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut added = 0;
+    for (item, home) in tasks {
+        if ensure_task_mirror(conn, meta, item, &home)? {
+            added += 1;
+        }
+    }
+    Ok(added)
 }
 
 /// Add a `depends_on` edge from `task` to the task with uid `dep_uid`. The edge is
@@ -556,6 +626,8 @@ mod tests {
             vec![
                 ("proj/x".to_owned(), "primary".to_owned()),
                 ("repos/y".to_owned(), "reference".to_owned()),
+                // A task homed outside `tasks/` is auto-mirrored so `tasks/**` indexes it.
+                ("tasks/proj/x".to_owned(), "reference".to_owned()),
             ]
         );
     }
