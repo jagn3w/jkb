@@ -478,3 +478,22 @@ and `jkb item show <uid>` (kind-aware details + a bounded preview, never the who
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.
+
+## Namespace organization (D32) — a global, multi-repo layout
+
+jkb is one global DB across every repo/project. Namespaces follow a fixed, automatically-
+applied organization (design `openspec/changes/jkb-namespace-organization/`):
+
+- **`repos/<repo>/…`** — a repo's file-synced content (its `openspec/`, `codereviews/`,
+  source-derived docs). `<repo>` is the repo's namespace key; mirrors `tasks/<repo>` (D26).
+  `ns:repos/jkb/**` is *everything about jkb*, and repos never collide. Mount a repo dir at
+  `repos/<repo>/<subdir>`; ingest inside it inherits that root via ambient scoping.
+- **Semantic top-level roots** for cross-cutting/global knowledge, tied to no repo:
+  `media/` (ingested media/transcripts), `references/` (external docs/web), `memory/` (LLM
+  long-term memory — modelled in a later pass), plus `tasks/` (D26) and `_sys/`. Reserved
+  top-level roots: `repos tasks media references memory _sys`.
+
+The two axes are unchanged: these are *logical* namespaces; a subtree may be a `file://`
+mount or `managed:`. `jkb mount ls` lists mounts; `jkb ns rm` removes an empty namespace.
+The 2026-07-24 migration moved the old top-level `openspec`/`codereviews` mounts under
+`repos/jkb/…` and dropped a stray `<ns>`.
