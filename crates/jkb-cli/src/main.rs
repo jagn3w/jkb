@@ -61,6 +61,9 @@ enum Command {
         /// Maximum number of results.
         #[arg(long)]
         limit: Option<usize>,
+        /// Print only the number of matches (ignores `--limit`).
+        #[arg(long)]
+        count: bool,
     },
     /// Search (vector / fts / hybrid), optionally with neighbour context.
     Search {
@@ -470,7 +473,11 @@ fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
-        Command::Query { terms, limit } => cmd_query(&db, &terms.join(" "), limit, global, json),
+        Command::Query {
+            terms,
+            limit,
+            count,
+        } => cmd_query(&db, &terms.join(" "), limit, count, global, json),
         Command::Search {
             terms,
             route,
@@ -666,13 +673,31 @@ fn cmd_ingest(db: &Db, path: &str, ns: Option<&str>, global: bool, json: bool) -
     Ok(())
 }
 
-fn cmd_query(db: &Db, dsl: &str, limit: Option<usize>, global: bool, json: bool) -> Result<()> {
+fn cmd_query(
+    db: &Db,
+    dsl: &str,
+    limit: Option<usize>,
+    count: bool,
+    global: bool,
+    json: bool,
+) -> Result<()> {
     let mut query = jkb_core::query::parse(dsl)?;
     apply_ambient(&mut query, db, global)?;
-    if let Some(limit) = limit {
-        query.limit = Some(limit);
+    // `--count` reports the total; `--limit` only caps a listing.
+    if !count {
+        if let Some(limit) = limit {
+            query.limit = Some(limit);
+        }
     }
     let ids = db.read(move |conn| query.evaluate(conn))?;
+    if count {
+        if json {
+            println!("{}", serde_json::json!({ "count": ids.len() }));
+        } else {
+            println!("{}", ids.len());
+        }
+        return Ok(());
+    }
     let items = output::fetch_items(db, &ids)?;
     output::print_items(&items, json);
     Ok(())

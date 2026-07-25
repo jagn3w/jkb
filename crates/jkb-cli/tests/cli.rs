@@ -1024,3 +1024,28 @@ fn ls_sorts_namespaces_first_then_tasks_by_priority() {
     assert!(sub < high, "namespace should sort before tasks");
     assert!(high < low, "higher-priority task should sort first");
 }
+
+#[test]
+fn query_count_reports_the_number_of_matches() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "one", "+proj"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "two", "+proj"])
+        .assert()
+        .success();
+
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "--count"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "--count", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"count\":2"));
+}
