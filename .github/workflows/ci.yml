@@ -21,6 +21,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
+      # rav1e/image) and builds them twice (default + --features fastembed) plus a
+      # --all-features cargo-deny graph, which overflows the runner's ~14 GB free disk
+      # ("No space left on device"). Reclaim ~25 GB from preinstalled SDKs first.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/graalvm \
+            /usr/local/share/powershell || true
+          sudo apt-get clean || true
+          df -h /
+
       # rustup reads rust-toolchain.toml and installs the pinned channel; ensure the
       # rustfmt/clippy components are present for the gates below.
       - name: Install pinned toolchain + components
