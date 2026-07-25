@@ -1145,3 +1145,37 @@ fn task_mirror_symlinks_repo_tasks_under_tasks() {
         .success()
         .stdout(predicate::str::contains("0 tasks/ mirror"));
 }
+
+#[test]
+fn ns_mk_scaffolds_roots_and_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    // Create several roots at once (the setup-script scaffold).
+    jkb(&db)
+        .args([
+            "ns",
+            "mk",
+            "repos",
+            "tasks",
+            "media",
+            "references",
+            "memory",
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ns", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repos").and(predicate::str::contains("media")));
+    // Re-running is a no-op success (idempotent), including a nested path.
+    jkb(&db)
+        .args(["ns", "mk", "repos", "media/transcripts"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ns", "ls", "media"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("media/transcripts"));
+}
