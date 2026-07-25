@@ -13,8 +13,17 @@ and an **MCP server** lets agents (e.g. Claude) query and update the KB.
 
 ## Install & prerequisites
 
-Build the `jkb` binary with the toolchain pinned in `rust-toolchain.toml` (rustup
-installs it automatically):
+The one-shot installer sets everything up (and is safe to re-run after a `git pull`):
+
+```sh
+./scripts/setup.sh         # installs the jkb binary, scaffolds the KB roots,
+                           # installs the VS Code extension + file-sync watcher
+```
+
+It's idempotent and each step is best-effort — a missing optional tool (VS Code,
+pnpm) just warns and continues. Flags: `--no-extension`, `--no-service`,
+`--no-scaffold`, `--db <path>`. To build the binary alone, use the toolchain pinned
+in `rust-toolchain.toml` (rustup installs it automatically):
 
 ```sh
 cargo build --release      # produces target/release/jkb
@@ -34,13 +43,21 @@ Two capabilities need external programs; everything else is self-contained:
 The database lives at `$JKB_DB` or `~/.jkb/jkb.db` by default (override per-command
 with `--db <path>`); it is created on first use.
 
+## Namespaces
+
+jkb is one global KB across every repo and project, with a fixed top-level layout:
+`repos/<repo>/…` for a repo's own content, and semantic roots for cross-cutting
+knowledge — `media/`, `references/`, `memory/`, plus `tasks/` and `_sys/`. `jkb ns mk
+<path>…` creates namespaces (the scaffold step does this for the reserved roots);
+`jkb ns ls` browses them.
+
 ## Quick start
 
 ```sh
 # Ingest a local file, a PDF, or a JS-rendered web page
-jkb ingest notes.md --ns docs
-jkb ingest paper.pdf --ns papers
-jkb ingest https://example.com/article --ns web
+jkb ingest notes.md --ns references
+jkb ingest paper.pdf --ns references/papers
+jkb ingest https://example.com/article --ns references
 
 # Search (vector / fts / hybrid) with neighbour context, and structured query
 jkb search "distinctive phrase" --route hybrid --context 2
@@ -57,9 +74,9 @@ jkb view save my-day "kind:task is:ready due:today"
 jkb view run my-day
 
 # Bidirectional file sync: bind a namespace to a directory, then reconcile
-jkb mount create docs/repo ~/repos/app --include "**/*.md" --mode bidirectional
+jkb mount create repos/app ~/repos/app --include "**/*.md" --mode bidirectional
 jkb mount ls                       # list all mounts
-jkb sync docs/repo                 # one-shot (omit the namespace for all mounts)
+jkb sync repos/app                 # one-shot (omit the namespace for all mounts)
 jkb sync --watch                   # watch every mount until Ctrl-C
 jkb service install                # run the watcher at login (launchd / systemd)
 
@@ -87,9 +104,18 @@ undoable with `jkb undo`. Point an MCP client at it, e.g.:
 }
 ```
 
+## Visual explorer (VS Code)
+
+A tree explorer over the KB lives in [`ui/`](ui/README.md) — a lazy namespace tree with
+type-specific detail panes, inline editing, colour-coded rows, and a right-click "work
+this task with Claude". It is a **client of the `jkb` CLI** (`jkb … --json`), never a
+bespoke backend, so anything it does the terminal can too. `./scripts/setup.sh` builds and
+installs it; see [`ui/README.md`](ui/README.md) to run it from source.
+
 ## Workspace
 
-jkb is a Cargo workspace of small crates under `crates/`:
+jkb is a Cargo workspace of small crates under `crates/`, plus a **pnpm** workspace under
+[`ui/`](ui/README.md) (`@jkb/core` portable logic + the `jkb-explorer` VS Code adapter):
 
 | Crate | Role |
 |-------|------|
@@ -110,7 +136,11 @@ jkb is a Cargo workspace of small crates under `crates/`:
 ./scripts/check.sh     # fmt --check + clippy + tests + cargo-deny (CI gate)
 ./scripts/test.sh      # tests (pass-through args, e.g. -p jkb-sync)
 ./scripts/clippy.sh    # clippy only
+./scripts/setup.sh     # one-shot install (binary + KB scaffold + extension + watcher)
+./scripts/install-extension.sh   # rebuild + reinstall just the VS Code extension
 ```
+
+The `ui/` packages build with **pnpm only** (never npm): `cd ui && pnpm install && pnpm run build`.
 
 GitHub Actions runs the same gate (`.github/workflows/ci.yml`, mirroring `check.sh` with
 `--all-features`) on every push and pull request.

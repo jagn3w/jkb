@@ -216,6 +216,12 @@ enum MountCmd {
 enum NsCmd {
     /// List namespaces (children of `scope`, or top-level if omitted).
     Ls { scope: Option<String> },
+    /// Create one or more (nested) namespaces if absent. Idempotent — safe to re-run,
+    /// e.g. to scaffold the standard roots (`repos tasks media references memory`).
+    Mk {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+    },
     /// Move a subtree to a new path.
     Mv { from: String, to: String },
     /// Remove an empty namespace (no child namespaces or item placements).
@@ -1114,6 +1120,18 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
                 for (_, p) in paths {
                     println!("{p}");
                 }
+            }
+        }
+        NsCmd::Mk { paths } => {
+            let to_make = paths.clone();
+            db.write_txn("cli", move |conn, _meta| {
+                for p in &to_make {
+                    ns::ensure(conn, p)?;
+                }
+                Ok(())
+            })?;
+            for p in &paths {
+                report(json, p, "namespace ready");
             }
         }
         NsCmd::Mv { from, to } => {

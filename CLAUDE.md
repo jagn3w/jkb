@@ -105,6 +105,12 @@ implementation checklist and the **source of truth for what's done**.
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
   `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
   `inspect-dep.sh` (read a dep's extracted registry source).
+- **Fresh-machine setup:** `./scripts/setup.sh` is the one-shot, idempotent installer —
+  `cargo install`s the `jkb` binary, scaffolds the standard KB roots via `jkb ns mk repos
+  tasks media references memory`, builds+installs the VS Code extension (`install-extension.sh`),
+  and installs+activates the file-sync watcher service (launchd/systemd). Flags:
+  `--no-extension`/`--no-service`/`--no-scaffold`/`--db`. `jkb ns mk <path>…` creates namespaces
+  idempotently (the only way to make an empty namespace; others arise from placements/mounts).
 - Per-task status (with `[~]` partials and inline notes) is in
   `openspec/changes/jkb-v1-foundation/tasks.md` (v1) and
   `openspec/changes/jkb-v2-file-sync/tasks.md` (Section 15). Keep them updated as you go.
