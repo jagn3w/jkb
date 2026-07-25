@@ -57,7 +57,8 @@ jkb view save my-day "kind:task is:ready due:today"
 jkb view run my-day
 
 # Bidirectional file sync: bind a namespace to a directory, then reconcile
-jkb mount docs/repo ~/repos/app --include "**/*.md" --mode bidirectional
+jkb mount create docs/repo ~/repos/app --include "**/*.md" --mode bidirectional
+jkb mount ls                       # list all mounts
 jkb sync docs/repo                 # one-shot (omit the namespace for all mounts)
 jkb sync --watch                   # watch every mount until Ctrl-C
 jkb service install                # run the watcher at login (launchd / systemd)

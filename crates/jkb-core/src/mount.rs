@@ -120,6 +120,37 @@ pub fn all_paths(conn: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Every mount as `(namespace path, config)`, ordered by path — for `jkb mount ls`.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn all(conn: &Connection) -> Result<Vec<(String, Mount)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT n.path, m.backing_uri, m.sync_mode, m.serializer, m.include_glob,
+                m.exclude_glob, m.conflict_policy
+         FROM mounts m JOIN namespaces n ON n.id = m.namespace_id
+         ORDER BY n.path",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Mount {
+                backing_uri: r.get(1)?,
+                sync_mode: r.get(2)?,
+                serializer: r.get(3)?,
+                include_glob: r.get(4)?,
+                exclude_glob: r.get(5)?,
+                conflict_policy: r.get(6)?,
+            },
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Resolve the ambient namespace for a filesystem path: the mirror namespace of the
 /// most specific `file://` mount whose backing directory contains `fs_path` (design
 /// D-shared / task 8.5). Returns `None` if `fs_path` is under no mount.

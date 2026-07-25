@@ -90,27 +90,10 @@ enum Command {
         #[command(subcommand)]
         cmd: TagCmd,
     },
-    /// Bind a namespace subtree to a directory for file sync.
+    /// File-sync mounts: create one (bind a namespace to a directory) or list them.
     Mount {
-        /// Namespace to mount.
-        ns: String,
-        /// Backing directory.
-        dir: PathBuf,
-        /// Sync direction.
-        #[arg(long, value_enum, default_value_t = ModeArg::Bidirectional)]
-        mode: ModeArg,
-        /// File-format serializer.
-        #[arg(long, default_value = "document")]
-        serializer: String,
-        /// Include glob (e.g. `**/*.md`).
-        #[arg(long)]
-        include: Option<String>,
-        /// Exclude glob.
-        #[arg(long)]
-        exclude: Option<String>,
-        /// Conflict policy.
-        #[arg(long, value_enum, default_value_t = PolicyArg::Manual)]
-        policy: PolicyArg,
+        #[command(subcommand)]
+        cmd: MountCmd,
     },
     /// Reconcile a mount (one-shot, or `--watch`). With no namespace, all mounts.
     Sync {
@@ -198,6 +181,34 @@ enum ItemCmd {
         #[arg(long)]
         append: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum MountCmd {
+    /// Bind a namespace subtree to a directory for file sync.
+    Create {
+        /// Namespace to mount.
+        ns: String,
+        /// Backing directory.
+        dir: PathBuf,
+        /// Sync direction.
+        #[arg(long, value_enum, default_value_t = ModeArg::Bidirectional)]
+        mode: ModeArg,
+        /// File-format serializer.
+        #[arg(long, default_value = "document")]
+        serializer: String,
+        /// Include glob (e.g. `**/*.md`).
+        #[arg(long)]
+        include: Option<String>,
+        /// Exclude glob.
+        #[arg(long)]
+        exclude: Option<String>,
+        /// Conflict policy.
+        #[arg(long, value_enum, default_value_t = PolicyArg::Manual)]
+        policy: PolicyArg,
+    },
+    /// List all mounts (namespace → serializer → backing directory).
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -494,24 +505,7 @@ fn run(cli: Cli) -> Result<()> {
         ),
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
-        Command::Mount {
-            ns,
-            dir,
-            mode,
-            serializer,
-            include,
-            exclude,
-            policy,
-        } => cmd_mount(
-            &db,
-            &ns,
-            &dir,
-            mode.into(),
-            &serializer,
-            include.as_deref(),
-            exclude.as_deref(),
-            policy.into(),
-        ),
+        Command::Mount { cmd } => cmd_mount(&db, cmd, json),
         Command::Sync { ns, watch } => cmd_sync(&db, ns.as_deref(), watch),
         Command::Service { cmd } => match cmd {
             ServiceCmd::Print => service::print(&db_path),
@@ -1130,7 +1124,58 @@ fn cmd_tag(db: &Db, cmd: TagCmd, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_mount(
+fn cmd_mount(db: &Db, cmd: MountCmd, json: bool) -> Result<()> {
+    match cmd {
+        MountCmd::Create {
+            ns,
+            dir,
+            mode,
+            serializer,
+            include,
+            exclude,
+            policy,
+        } => cmd_mount_create(
+            db,
+            &ns,
+            &dir,
+            mode.into(),
+            &serializer,
+            include.as_deref(),
+            exclude.as_deref(),
+            policy.into(),
+        ),
+        MountCmd::Ls => cmd_mount_ls(db, json),
+    }
+}
+
+/// `mount ls` — list every mount as `namespace → serializer → backing directory`.
+fn cmd_mount_ls(db: &Db, json: bool) -> Result<()> {
+    let mounts = db.read(mount::all)?;
+    if json {
+        let v: Vec<_> = mounts
+            .iter()
+            .map(|(path, m)| {
+                serde_json::json!({
+                    "namespace": path,
+                    "serializer": m.serializer,
+                    "backing": m.backing_uri,
+                    "sync_mode": m.sync_mode,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else if mounts.is_empty() {
+        println!("(no mounts)");
+    } else {
+        for (path, m) in &mounts {
+            println!("{path}  [{}]  {}", m.serializer, m.backing_uri);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_mount_create(
     db: &Db,
     ns_path: &str,
     dir: &Path,

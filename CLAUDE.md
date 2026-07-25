@@ -353,8 +353,8 @@ per-file `bindings.serializer` override is now read (`engine::resolve_serializer
 scoping: `apply_ambient` rewrites an unscoped `Query` to the cwd mount's subtree via
 `mount::ambient_namespace` unless `--global`. Commands: `ingest` (local path, or an
 `http(s)://` URL rendered via headless browser), `query`, `search` (`--route`/`--limit`/`--context`), `ns ls|mv`
-(added `ns::roots` for top-level listing), `tag ls|rename`, `mount` (canonicalizes dir →
-`file://`), `sync [ns] [--watch]` (ns optional → all mounts; ctrl-c → shared stop flag),
+(added `ns::roots` for top-level listing), `tag ls|rename`, `mount create|ls` (`create`
+canonicalizes dir → `file://`; `ls` lists mounts), `sync [ns] [--watch]` (ns optional → all mounts; ctrl-c → shared stop flag),
 `service print|install|uninstall` (launchd/systemd unit for the watcher), `task add` (quick-add → slug+nanos
 uid) / `task next` (trailing DSL → scope+tags), `view save|ls|run`, `undo [txn]`,
 `doctor [--backup]`, `mcp` (stub → "Section 13" error). Embedder is the ollama default,
