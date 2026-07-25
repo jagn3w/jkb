@@ -175,6 +175,7 @@ fn mount_and_sync_imports_files() {
     jkb(&db)
         .args([
             "mount",
+            "create",
             "docs/repo",
             repo.path().to_str().unwrap(),
             "--include",
@@ -213,6 +214,7 @@ fn task_edit_refuses_newline_edits_on_file_backed_tasks() {
     jkb(&db)
         .args([
             "mount",
+            "create",
             "work",
             repo.path().to_str().unwrap(),
             "--serializer",
@@ -691,7 +693,7 @@ fn task_add_backlog_outside_repo_errors() {
 /// Mount `repo_dir` at namespace `ns` so tasks added from inside it home under `tasks/<ns>`.
 fn mount_repo(db: &Path, ns: &str, repo_dir: &Path) {
     jkb(db)
-        .args(["mount", ns, repo_dir.to_str().unwrap()])
+        .args(["mount", "create", ns, repo_dir.to_str().unwrap()])
         .assert()
         .success();
 }
@@ -840,6 +842,7 @@ fn task_add_infers_synced_binding_under_a_tasks_mount() {
     jkb(&db)
         .args([
             "mount",
+            "create",
             "tasks/proj/.backlog",
             bk.to_str().unwrap(),
             "--serializer",
@@ -1023,4 +1026,90 @@ fn ls_sorts_namespaces_first_then_tasks_by_priority() {
     let low = stdout.find("low pri").unwrap();
     assert!(sub < high, "namespace should sort before tasks");
     assert!(high < low, "higher-priority task should sort first");
+}
+
+#[test]
+fn query_count_reports_the_number_of_matches() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "one", "+proj"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "two", "+proj"])
+        .assert()
+        .success();
+
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "--count"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "--count", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"count\":2"));
+}
+
+#[test]
+fn mount_ls_lists_mounts() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = TempDir::new().unwrap();
+    jkb(&db)
+        .args([
+            "mount",
+            "create",
+            "repos/x/docs",
+            repo.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["mount", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repos/x/docs"));
+    jkb(&db)
+        .args(["mount", "ls", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"namespace\": \"repos/x/docs\""));
+}
+
+#[test]
+fn ns_rm_refuses_nonempty_and_removes_empty() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["task", "add", "tmp task", "+proj/tmp"])
+        .output()
+        .unwrap();
+    let uid = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+
+    // Non-empty namespace is refused.
+    jkb(&db)
+        .args(["ns", "rm", "proj/tmp"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("placement"));
+
+    // Re-home the task elsewhere, emptying proj/tmp, then rm succeeds.
+    jkb(&db)
+        .args(["task", "place", &uid, "proj/other", "--home"])
+        .assert()
+        .success();
+    jkb(&db).args(["ns", "rm", "proj/tmp"]).assert().success();
+    jkb(&db)
+        .args(["ns", "ls", "proj"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tmp").not());
 }

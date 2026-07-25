@@ -353,8 +353,8 @@ per-file `bindings.serializer` override is now read (`engine::resolve_serializer
 scoping: `apply_ambient` rewrites an unscoped `Query` to the cwd mount's subtree via
 `mount::ambient_namespace` unless `--global`. Commands: `ingest` (local path, or an
 `http(s)://` URL rendered via headless browser), `query`, `search` (`--route`/`--limit`/`--context`), `ns ls|mv`
-(added `ns::roots` for top-level listing), `tag ls|rename`, `mount` (canonicalizes dir →
-`file://`), `sync [ns] [--watch]` (ns optional → all mounts; ctrl-c → shared stop flag),
+(added `ns::roots` for top-level listing), `tag ls|rename`, `mount create|ls` (`create`
+canonicalizes dir → `file://`; `ls` lists mounts), `sync [ns] [--watch]` (ns optional → all mounts; ctrl-c → shared stop flag),
 `service print|install|uninstall` (launchd/systemd unit for the watcher), `task add` (quick-add → slug+nanos
 uid) / `task next` (trailing DSL → scope+tags), `view save|ls|run`, `undo [txn]`,
 `doctor [--backup]`, `mcp` (stub → "Section 13" error). Embedder is the ollama default,
@@ -478,3 +478,22 @@ and `jkb item show <uid>` (kind-aware details + a bounded preview, never the who
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.
+
+## Namespace organization (D32) — a global, multi-repo layout
+
+jkb is one global DB across every repo/project. Namespaces follow a fixed, automatically-
+applied organization (design `openspec/changes/jkb-namespace-organization/`):
+
+- **`repos/<repo>/…`** — a repo's file-synced content (its `openspec/`, `codereviews/`,
+  source-derived docs). `<repo>` is the repo's namespace key; mirrors `tasks/<repo>` (D26).
+  `ns:repos/jkb/**` is *everything about jkb*, and repos never collide. Mount a repo dir at
+  `repos/<repo>/<subdir>`; ingest inside it inherits that root via ambient scoping.
+- **Semantic top-level roots** for cross-cutting/global knowledge, tied to no repo:
+  `media/` (ingested media/transcripts), `references/` (external docs/web), `memory/` (LLM
+  long-term memory — modelled in a later pass), plus `tasks/` (D26) and `_sys/`. Reserved
+  top-level roots: `repos tasks media references memory _sys`.
+
+The two axes are unchanged: these are *logical* namespaces; a subtree may be a `file://`
+mount or `managed:`. `jkb mount ls` lists mounts; `jkb ns rm` removes an empty namespace.
+The 2026-07-24 migration moved the old top-level `openspec`/`codereviews` mounts under
+`repos/jkb/…` and dropped a stray `<ns>`.
