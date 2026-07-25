@@ -117,6 +117,36 @@ pub fn subtree(conn: &Connection, path: &str) -> Result<Vec<(NamespaceId, String
     Ok(out)
 }
 
+/// Count the distinct item leaves placed anywhere in the subtree rooted at `path`
+/// (the namespace itself or any descendant), so the tree can indicate whether a folder
+/// leads to real content. When `include_terminal` is false, `done`/`cancelled` tasks are
+/// excluded (mirroring the default `jkb ls` view); items with no status always count.
+///
+/// # Errors
+/// Returns an error if the path is invalid or the query fails.
+pub fn subtree_leaf_count(conn: &Connection, path: &str, include_terminal: bool) -> Result<i64> {
+    let normalized = normalize(path)?;
+    // The namespace hierarchy is a strict `parent_id` tree (a namespace's parent is always
+    // its path prefix), and mirrors are item→namespace placements, not namespace links — so
+    // no cycle is reachable here. The `depth < 256` bound is belt-and-suspenders: even if a
+    // cyclic `parent_id` were ever written, the CTE terminates instead of spinning.
+    let count: i64 = conn
+        .prepare_cached(
+            "WITH RECURSIVE sub(id, depth) AS (
+                 SELECT id, 0 FROM namespaces WHERE path = ?1
+                 UNION ALL
+                 SELECT n.id, sub.depth + 1 FROM namespaces n JOIN sub ON n.parent_id = sub.id
+                 WHERE sub.depth < 256
+             )
+             SELECT COUNT(DISTINCT p.item_id) FROM placements p
+             JOIN sub ON sub.id = p.namespace_id
+             JOIN items i ON i.id = p.item_id
+             WHERE ?2 OR i.status IS NULL OR i.status NOT IN ('done', 'cancelled')",
+        )?
+        .query_row(params![normalized, include_terminal], |row| row.get(0))?;
+    Ok(count)
+}
+
 /// The root namespaces (those with no parent), ordered by path. Backs `jkb ns ls`
 /// with no scope argument.
 ///
@@ -297,11 +327,61 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure, get_metadata, move_subtree, normalize, set_metadata, subtree};
+    use super::{
+        ensure, get_metadata, move_subtree, normalize, set_metadata, subtree, subtree_leaf_count,
+    };
     use crate::item::{upsert, NewItem};
     use crate::{placement, Db};
     use jkb_types::PlacementRole;
     use serde_json::json;
+
+    #[test]
+    fn subtree_leaf_count_spans_descendants_dedups_and_honours_terminal() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            let deep = ensure(conn, "tasks/jkb/openspec")?;
+            let leaf = ensure(conn, "tasks/jkb/openspec/changes")?;
+            let new = |uid: &str| NewItem {
+                uid: uid.to_owned(),
+                kind: "task".to_owned(),
+                content: None,
+                content_hash: None,
+                mime: None,
+            };
+            // `a` lives (via a mirror) under a descendant, and is *also* placed on an
+            // ancestor in the same subtree — it must be counted once, not twice.
+            let a = upsert(conn, meta, &new("task:a"))?;
+            placement::place(conn, meta, a, leaf, PlacementRole::Reference, 0)?;
+            placement::place(conn, meta, a, deep, PlacementRole::Reference, 0)?;
+            // `b` is a second, distinct leaf under the descendant.
+            let b = upsert(conn, meta, &new("task:b"))?;
+            placement::place(conn, meta, b, leaf, PlacementRole::Reference, 0)?;
+            // `c` is done — hidden unless terminal items are included.
+            let c = upsert(conn, meta, &new("task:c"))?;
+            placement::place(conn, meta, c, leaf, PlacementRole::Reference, 0)?;
+            conn.execute("UPDATE items SET status = 'done' WHERE id = ?1", [c.get()])?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Two visible distinct leaves (a counted once despite two placements; c excluded).
+        let visible = db
+            .read(|conn| subtree_leaf_count(conn, "tasks/jkb", false))
+            .unwrap();
+        assert_eq!(visible, 2);
+        // Including terminals reveals the done task.
+        let all = db
+            .read(|conn| subtree_leaf_count(conn, "tasks/jkb", true))
+            .unwrap();
+        assert_eq!(all, 3);
+        // A sibling branch with no placements has no leaves.
+        db.write_txn("t", |conn, _m| ensure(conn, "tasks/other"))
+            .unwrap();
+        let none = db
+            .read(|conn| subtree_leaf_count(conn, "tasks/other", true))
+            .unwrap();
+        assert_eq!(none, 0);
+    }
 
     #[test]
     fn normalize_rejects_bad_paths_and_keeps_case() {

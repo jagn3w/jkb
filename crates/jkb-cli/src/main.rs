@@ -159,13 +159,14 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ItemCmd {
-    /// Show one item's details + a bounded content preview (any kind).
+    /// Show one item's details + content. Text-like kinds (task/text/note/markdown) show
+    /// in full; heavy kinds (pdf/image) show a bounded preview. `--preview N` caps either.
     Show {
         /// The item uid.
         uid: String,
-        /// Max preview characters (default 800; never the whole document).
-        #[arg(long, default_value_t = 800)]
-        preview: usize,
+        /// Max preview characters. Default: unbounded for text-like kinds, 800 otherwise.
+        #[arg(long)]
+        preview: Option<usize>,
     },
     /// Replace (or `--append` to) any item's content.
     Edit {
@@ -359,6 +360,9 @@ enum TaskCmd {
         #[arg(long)]
         keep: Vec<String>,
     },
+    /// Ensure every task homed outside `tasks/` has a `tasks/…` mirror (symbolic link),
+    /// so `tasks/**` is the complete task index. Idempotent; sync does this automatically.
+    Mirror,
 }
 
 #[derive(Subcommand)]
@@ -780,6 +784,10 @@ struct Child {
     has_children: bool,
     status: Option<String>,
     priority: Option<i64>,
+    /// For namespaces: count of visible item leaves anywhere in the subtree (respecting the
+    /// terminal-status toggle). `None` for item children. Lets the pane flag which folders
+    /// lead to real content.
+    leaf_count: Option<i64>,
 }
 
 impl Child {
@@ -791,6 +799,7 @@ impl Child {
             "has_children": self.has_children,
             "status": self.status,
             "priority": self.priority,
+            "leaf_count": self.leaf_count,
         })
     }
 
@@ -847,7 +856,10 @@ fn list_children(
     for (ns_id, ns_path) in ns_children {
         let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
         let has_sub = !ns::children(conn, &ns_path)?.is_empty();
-        let has_items = !placement::items_in(conn, ns_id, Some(PlacementRole::Primary))?.is_empty();
+        // Any placement role, so `tasks/…` mirror namespaces (Reference placements) count
+        // as having children — the symbolic-link view of tasks homed elsewhere.
+        let has_items = !placement::items_in(conn, ns_id, None)?.is_empty();
+        let leaf_count = ns::subtree_leaf_count(conn, &ns_path, all)?;
         out.push(Child {
             kind: "namespace".to_owned(),
             reference: ns_path,
@@ -855,12 +867,15 @@ fn list_children(
             has_children: has_sub || has_items,
             status: None,
             priority: None,
+            leaf_count: Some(leaf_count),
         });
     }
 
     if let Some(p) = path {
         if let Some(ns_id) = ns::get(conn, p)? {
-            for item_id in placement::items_in(conn, ns_id, Some(PlacementRole::Primary))? {
+            // Any placement role: a `tasks/…` mirror surfaces the task even though its
+            // primary home is elsewhere (the symbolic-link view).
+            for item_id in placement::items_in(conn, ns_id, None)? {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
                 };
@@ -877,6 +892,7 @@ fn list_children(
                     has_children: false,
                     status: meta.status,
                     priority: meta.priority,
+                    leaf_count: None,
                 });
             }
         }
@@ -923,8 +939,16 @@ fn primary_ns(conn: &rusqlite::Connection, id: ItemId) -> jkb_core::Result<Optio
         .optional()?)
 }
 
-/// `jkb item show <uid>` — generic, kind-aware item details + a bounded content preview.
-fn cmd_item_show(db: &Db, uid: &str, preview_max: usize, json: bool) -> Result<()> {
+/// Whether an item's content is human-readable text worth showing in full (task notes,
+/// prose, markdown) versus a heavy blob (PDF/image) that should stay a bounded preview.
+fn is_text_like(kind: &str, mime: Option<&str>) -> bool {
+    matches!(kind, "task" | "text" | "note" | "view")
+        || mime.is_some_and(|m| m.starts_with("text/") || m.contains("markdown"))
+}
+
+/// `jkb item show <uid>` — generic, kind-aware item details + content. `preview_arg` caps
+/// the content; when `None`, text-like kinds render in full and heavy kinds cap at 800.
+fn cmd_item_show(db: &Db, uid: &str, preview_arg: Option<usize>, json: bool) -> Result<()> {
     let u = uid.to_owned();
     let found = db.read(move |conn| {
         let Some(id) = item::id_for_uid(conn, &u)? else {
@@ -942,6 +966,13 @@ fn cmd_item_show(db: &Db, uid: &str, preview_max: usize, json: bool) -> Result<(
         anyhow::bail!("no item with uid `{uid}`");
     };
 
+    let preview_max = preview_arg.unwrap_or_else(|| {
+        if is_text_like(&meta.kind, meta.mime.as_deref()) {
+            usize::MAX
+        } else {
+            800
+        }
+    });
     let content_chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
     let preview: String = meta
         .content
@@ -1276,6 +1307,102 @@ fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `--backlog`/`--sync`/`--managed` flags of `task add`, grouped so the helper
+/// signatures stay under the bool-argument lint.
+struct AddFlags {
+    backlog: bool,
+    sync: bool,
+    managed: bool,
+}
+
+/// Derive a task's home namespace from `--backlog` and the ambient repo (design D26),
+/// mutating `spec.home`/`spec.mirrors`. `had_explicit` is set when an explicit `+<ns>`
+/// already chose the home.
+fn resolve_task_home(
+    db: &Db,
+    spec: &mut task::NewTask,
+    flags: &AddFlags,
+    had_explicit: bool,
+) -> Result<()> {
+    if had_explicit {
+        if flags.backlog {
+            anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
+        }
+    } else if flags.backlog {
+        match ambient_repo(db)? {
+            Some(repo) => spec.home = format!("tasks/{repo}/.backlog"),
+            None if confirm_global_backlog()? => spec.home = String::from("tasks/.backlog"),
+            None => anyhow::bail!(
+                "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
+            ),
+        }
+    } else if let Some(repo) = ambient_repo(db)? {
+        // Inside a repo with no target: home at the per-repo inbox, mirrored into
+        // the global inbox so it stays a complete capture view (D26.3).
+        spec.home = format!("tasks/{repo}/inbox");
+        spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
+    }
+    // else: outside a repo with no target → home stays `tasks/inbox` (DEFAULT_HOME).
+    Ok(())
+}
+
+/// Derive a task's storage binding (design D26.5), setting `spec.binding` and returning
+/// the synced `file://` uri if one applies. `--managed` forces KB-only; `--sync` requires
+/// a covering `tasks` mount.
+fn resolve_task_binding(
+    db: &Db,
+    spec: &mut task::NewTask,
+    flags: &AddFlags,
+    uid: &str,
+) -> Result<Option<String>> {
+    let synced_file = if flags.managed {
+        None
+    } else {
+        jkb_sync::tasks_mount_file(db, &spec.home)?
+    };
+    match &synced_file {
+        Some(bare) => {
+            let local_id = uid.strip_prefix("task:").unwrap_or(uid);
+            spec.binding = format!("{bare}#{local_id}");
+        }
+        None if flags.sync => anyhow::bail!(
+            "--sync: no `tasks`-serializer file mount covers the home `{}`",
+            spec.home
+        ),
+        None => {} // spec.binding stays `managed:` (from_quick_add default)
+    }
+    Ok(synced_file)
+}
+
+/// Handle `task add`: parse the quick-add line, derive the home (design D26 homing) and
+/// the storage binding (D26.5), then create the task through the writer-actor.
+fn cmd_task_add(db: &Db, text: &[String], flags: &AddFlags, json: bool) -> Result<()> {
+    let input = text.join(" ");
+    let qa = task::parse_quick_add(&input)?;
+    let had_explicit_placement = !qa.placements.is_empty();
+    let uid = task_uid(&qa.title);
+    let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
+
+    resolve_task_home(db, &mut spec, flags, had_explicit_placement)?;
+    let synced_file = resolve_task_binding(db, &mut spec, flags, &uid)?;
+
+    let home = spec.home.clone();
+    let id = db.write_txn("cli", move |conn, meta| task::create(conn, meta, &spec))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"id": id.get(), "uid": uid, "home": home,
+                "binding": synced_file.as_deref().unwrap_or("managed:")})
+        );
+    } else {
+        println!("added task {uid} (item {id}) at {home}");
+        if synced_file.is_some() {
+            println!("  synced binding — run `jkb sync` to write it to the file");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::Add {
@@ -1283,71 +1410,16 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             backlog,
             sync,
             managed,
-        } => {
-            let input = text.join(" ");
-            let qa = task::parse_quick_add(&input)?;
-            let had_explicit_placement = !qa.placements.is_empty();
-            let uid = task_uid(&qa.title);
-            let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
-
-            // Homing (design D26). An explicit `+<ns>` already set `spec.home` (first
-            // placement) via `from_quick_add`; otherwise derive it from `--backlog` and
-            // the ambient repo.
-            if had_explicit_placement {
-                if backlog {
-                    anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
-                }
-            } else if backlog {
-                match ambient_repo(db)? {
-                    Some(repo) => spec.home = format!("tasks/{repo}/.backlog"),
-                    None if confirm_global_backlog()? => spec.home = String::from("tasks/.backlog"),
-                    None => anyhow::bail!(
-                        "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
-                    ),
-                }
-            } else if let Some(repo) = ambient_repo(db)? {
-                // Inside a repo with no target: home at the per-repo inbox, mirrored into
-                // the global inbox so it stays a complete capture view (D26.3).
-                spec.home = format!("tasks/{repo}/inbox");
-                spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
-            }
-            // else: outside a repo with no target → home stays `tasks/inbox` (DEFAULT_HOME).
-
-            // Binding (design D26.5), orthogonal to homing: `--managed` forces KB-only;
-            // otherwise infer a synced file binding when the home is under a `tasks` mount,
-            // else `managed:`. `--sync` requires such a mount.
-            let synced_file = if managed {
-                None
-            } else {
-                jkb_sync::tasks_mount_file(db, &spec.home)?
-            };
-            match &synced_file {
-                Some(bare) => {
-                    let local_id = uid.strip_prefix("task:").unwrap_or(&uid);
-                    spec.binding = format!("{bare}#{local_id}");
-                }
-                None if sync => anyhow::bail!(
-                    "--sync: no `tasks`-serializer file mount covers the home `{}`",
-                    spec.home
-                ),
-                None => {} // spec.binding stays `managed:` (from_quick_add default)
-            }
-
-            let home = spec.home.clone();
-            let id = db.write_txn("cli", move |conn, meta| task::create(conn, meta, &spec))?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"id": id.get(), "uid": uid, "home": home,
-                        "binding": synced_file.as_deref().unwrap_or("managed:")})
-                );
-            } else {
-                println!("added task {uid} (item {id}) at {home}");
-                if synced_file.is_some() {
-                    println!("  synced binding — run `jkb sync` to write it to the file");
-                }
-            }
-        }
+        } => cmd_task_add(
+            db,
+            &text,
+            &AddFlags {
+                backlog,
+                sync,
+                managed,
+            },
+            json,
+        )?,
         TaskCmd::Next { terms, limit } => {
             let mut query = jkb_core::query::parse(&terms.join(" "))?;
             apply_ambient_tasks(&mut query, db, global)?;
@@ -1364,6 +1436,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             let id = resolve_task_uid(db, &uid)?;
             output::print_item_full(db, id, json)?;
         }
+        TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
@@ -1388,6 +1461,19 @@ fn cmd_task_unplace(db: &Db, uid: &str, ns: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Ensure every task homed outside `tasks/` has a `tasks/…` mirror (the task index).
+/// Idempotent; `jkb sync` does this automatically, so this is a one-shot migration for
+/// tasks created before the mirror existed.
+fn cmd_task_mirror(db: &Db, json: bool) -> Result<()> {
+    let added = db.write_txn("cli", task::ensure_all_mirrors)?;
+    if json {
+        println!("{}", serde_json::json!({ "mirrors_added": added }));
+    } else {
+        println!("added {added} tasks/ mirror(s)");
+    }
+    Ok(())
+}
+
 /// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/`unplace`/
 /// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
 /// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
@@ -1398,25 +1484,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             status,
             priority,
             due,
-        } => {
-            if status.is_none() && priority.is_none() && due.is_none() {
-                anyhow::bail!("nothing to set: pass at least one of --status/--priority/--due");
-            }
-            let id = resolve_task_uid(db, &uid)?;
-            db.write_txn("cli", move |conn, meta| {
-                if let Some(s) = &status {
-                    task::set_status_str(conn, meta, id, s)?;
-                }
-                if let Some(p) = priority {
-                    task::set_priority(conn, meta, id, Some(p))?;
-                }
-                if let Some(d) = &due {
-                    task::set_due(conn, meta, id, Some(d))?;
-                }
-                Ok(())
-            })?;
-            report(json, &uid, "updated");
-        }
+        } => cmd_task_set(db, &uid, status, priority, due, json)?,
         TaskCmd::Edit {
             uid,
             text,
@@ -1490,8 +1558,39 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read subcommands are dispatched by `cmd_task` and never reach here.
-        TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } => unreachable!(),
+        TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Mirror => {
+            unreachable!()
+        }
     }
+    Ok(())
+}
+
+/// `task set`: update any of a task's `--status`/`--priority`/`--due` in one txn.
+fn cmd_task_set(
+    db: &Db,
+    uid: &str,
+    status: Option<String>,
+    priority: Option<i64>,
+    due: Option<String>,
+    json: bool,
+) -> Result<()> {
+    if status.is_none() && priority.is_none() && due.is_none() {
+        anyhow::bail!("nothing to set: pass at least one of --status/--priority/--due");
+    }
+    let id = resolve_task_uid(db, uid)?;
+    db.write_txn("cli", move |conn, meta| {
+        if let Some(s) = &status {
+            task::set_status_str(conn, meta, id, s)?;
+        }
+        if let Some(p) = priority {
+            task::set_priority(conn, meta, id, Some(p))?;
+        }
+        if let Some(d) = &due {
+            task::set_due(conn, meta, id, Some(d))?;
+        }
+        Ok(())
+    })?;
+    report(json, uid, "updated");
     Ok(())
 }
 

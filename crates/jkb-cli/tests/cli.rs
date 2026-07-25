@@ -1113,3 +1113,35 @@ fn ns_rm_refuses_nonempty_and_removes_empty() {
         .success()
         .stdout(predicate::str::contains("tmp").not());
 }
+
+#[test]
+fn task_mirror_symlinks_repo_tasks_under_tasks() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    // A task homed outside tasks/ (repo content) is auto-mirrored under tasks/ on create.
+    jkb(&db)
+        .args(["task", "add", "repo task", "+repos/jkb/openspec/x"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:tasks/jkb/openspec/x"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repo task"));
+    // Its real home stays under repos/.
+    jkb(&db)
+        .args(["--global", "query", "kind:task", "ns:repos/jkb/openspec/x"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repo task"));
+    // A tasks/-homed task isn't mirrored; `task mirror` finds nothing new.
+    jkb(&db)
+        .args(["task", "add", "inbox task", "+tasks/jkb/.backlog"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "mirror"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 tasks/ mirror"));
+}

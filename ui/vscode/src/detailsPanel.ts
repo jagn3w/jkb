@@ -107,6 +107,7 @@ const STYLE = `
     background: var(--vscode-input-background); color: var(--vscode-input-foreground);
     border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px; padding: 4px 6px; font-family: inherit;
   }
+  .jkb-edit textarea { resize: vertical; max-height: 60vh; line-height: 1.45; }
   .jkb-addtag { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
   button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; padding: 5px 12px; cursor: pointer; }
   button:hover { background: var(--vscode-button-hoverBackground); }
