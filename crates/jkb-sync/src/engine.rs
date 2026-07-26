@@ -802,7 +802,7 @@ fn update_item(
     }
     set_task_columns(conn, meta, id, it)?;
     reconcile_tags(conn, meta, id, &it.tags)?;
-    placement::set_primary(conn, meta, id, home, it.position)?;
+    task::set_primary_home(conn, meta, id, home, it.position)?;
     Ok(())
 }
 

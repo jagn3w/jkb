@@ -1571,7 +1571,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             db.write_txn("cli", move |conn, meta| {
                 let ns_id = jkb_core::ns::ensure(conn, &ns_path)?;
                 if home {
-                    placement::set_primary(conn, meta, id, ns_id, 0)
+                    task::set_primary_home(conn, meta, id, ns_id, 0)
                 } else {
                     placement::place(conn, meta, id, ns_id, PlacementRole::Reference, 0)
                 }
