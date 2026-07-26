@@ -400,6 +400,14 @@ fn classify(token: &str) -> Option<Modifier> {
 /// title. Never fails — malformed or mid-line sigils are treated as ordinary words,
 /// which is also consistent with [`render_task`] always emitting modifiers trailing.
 fn parse_task_tokens(rest: &str) -> TaskTokens {
+    // Peel the stable trailing `^id` anchor off the *raw* line first, before the
+    // quote-aware `tokenize`. An anchor is a whitespace-delimited `^`-word containing
+    // neither spaces nor quotes, so it is always recoverable this way — whereas
+    // `tokenize` would let an unterminated `"` earlier in the title (common in real
+    // prose) swallow the anchor into one long quoted token, hiding it from `classify`.
+    // Missing the anchor makes the parser think the line has none, mint a fresh id, and
+    // `render` append a *second* one — double-stamping the line on every sync.
+    let (rest, anchor) = split_trailing_anchor(rest);
     let tokens = tokenize(rest);
     let mut start = tokens.len();
     while start > 0 && classify(&tokens[start - 1]).is_some() {
@@ -430,7 +438,41 @@ fn parse_task_tokens(rest: &str) -> TaskTokens {
             None => {}
         }
     }
+    // A raw trailing anchor is authoritative over anything `classify` recovered.
+    if anchor.is_some() {
+        out.own_id = anchor;
+    }
     out
+}
+
+/// Peel every trailing `^<uri-safe>` anchor off the raw line, returning the remaining
+/// text and the **left-most** anchor found — the task's stable identity.
+///
+/// This runs before the quote-aware [`tokenize`] so an unterminated `"` in the title
+/// cannot hide the anchor (see [`parse_task_tokens`]). When a line already carries several
+/// trailing anchors — the residue of an earlier double-stamp — they collapse to the
+/// left-most: minting only ever *appends*, so the original hand-authored id is left-most and
+/// the extra minted duplicates are dropped, healing the line back to a single anchor.
+fn split_trailing_anchor(rest: &str) -> (&str, Option<String>) {
+    let mut head = rest.trim_end();
+    let mut anchor: Option<String> = None;
+    loop {
+        let (before, last) = match head.rsplit_once(char::is_whitespace) {
+            Some((b, l)) => (b, l),
+            None => ("", head),
+        };
+        match last.strip_prefix('^').filter(|id| is_uri_safe(id)) {
+            Some(id) => {
+                anchor = Some(id.to_owned());
+                head = before.trim_end();
+            }
+            None => break,
+        }
+    }
+    match anchor {
+        Some(id) => (head, Some(id)),
+        None => (rest, None),
+    }
 }
 
 /// Whether `s` is a uri-safe local id: non-empty lowercase letters, digits, and dashes.
@@ -741,6 +783,55 @@ Some description.
             .edges
             .iter()
             .any(|e| e.src == "p" && e.dst == "c" && e.edge_type == jkb_types::EdgeType::ParentOf));
+    }
+
+    #[test]
+    fn anchor_survives_an_unterminated_quote_in_the_title() {
+        // A title containing an unterminated `"` (here a raw `\"` inside backticks — exactly
+        // what a hand-written openspec tasks.md looks like) must NOT hide the trailing
+        // anchor. If it did, the parser would mint a fresh id and render would append a
+        // *second* anchor, double-stamping the line on every sync.
+        let line = "- [x] honour `\\\"` (a literal quote) and ^tokenize-honour-escape\n";
+        let s = TasksSerializer;
+        let doc = s.parse(line.as_bytes()).unwrap();
+        let task = doc.items.iter().find(|i| i.kind == "task").unwrap();
+        assert_eq!(task.local_id, "tokenize-honour-escape");
+        assert!(
+            !task.local_id.contains("honour-escape-"),
+            "identity must be the hand-authored anchor, not a freshly minted one"
+        );
+
+        // Render emits exactly one anchor, and re-parsing is a fixed point (no growth).
+        let rendered = String::from_utf8(s.render(&doc).unwrap()).unwrap();
+        assert_eq!(
+            rendered.matches('^').count(),
+            1,
+            "exactly one anchor: {rendered}"
+        );
+        assert!(rendered.contains("^tokenize-honour-escape"));
+        let rendered2 =
+            String::from_utf8(s.render(&s.parse(rendered.as_bytes()).unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            rendered, rendered2,
+            "double-stamp would grow the line each sync"
+        );
+    }
+
+    #[test]
+    fn multiple_trailing_anchors_heal_to_the_original() {
+        // A line already corrupted by an earlier double-stamp — the hand-authored anchor
+        // followed by two minted duplicates — collapses back to the left-most (original)
+        // one; minting only ever appends, so the original is left-most.
+        let s = TasksSerializer;
+        let doc = s
+            .parse(b"- [ ] title ^orig-anchor ^minted-5c5e31 ^minted-efd39a\n")
+            .unwrap();
+        let task = doc.items.iter().find(|i| i.kind == "task").unwrap();
+        assert_eq!(task.local_id, "orig-anchor");
+        assert_eq!(task.content, "title");
+        let rendered = String::from_utf8(s.render(&doc).unwrap()).unwrap();
+        assert_eq!(rendered.matches('^').count(), 1);
+        assert!(rendered.contains("- [ ] title ^orig-anchor"));
     }
 
     #[test]
