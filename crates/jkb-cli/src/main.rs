@@ -859,13 +859,16 @@ fn list_children(
         None => ns::roots(conn)?,
         Some(p) => ns::children(conn, p)?,
     };
+    // All children's subtree leaf counts in one grouped recursive query, rather than a
+    // separate descendant walk per child (an N+1 the tree hit on every expand).
+    let leaf_counts = ns::subtree_leaf_counts(conn, path, all)?;
     for (ns_id, ns_path) in ns_children {
         let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
         let has_sub = !ns::children(conn, &ns_path)?.is_empty();
         // Any placement role, so `tasks/…` mirror namespaces (Reference placements) count
         // as having children — the symbolic-link view of tasks homed elsewhere.
         let has_items = !placement::items_in(conn, ns_id, None)?.is_empty();
-        let leaf_count = ns::subtree_leaf_count(conn, &ns_path, all)?;
+        let leaf_count = leaf_counts.get(&ns_id).copied().unwrap_or(0);
         out.push(Child {
             kind: "namespace".to_owned(),
             reference: ns_path,
@@ -952,8 +955,19 @@ fn is_text_like(kind: &str, mime: Option<&str>) -> bool {
         || mime.is_some_and(|m| m.starts_with("text/") || m.contains("markdown"))
 }
 
+/// Default content cap (chars) for text-like kinds (task notes, prose, markdown, ingested
+/// text documents). Generous, but finite — the details pane shows a **bounded** preview,
+/// never the whole document, so a multi-MB ingested doc can't spike webview latency/memory
+/// (ui/README). Override with `--preview <n>` to read more.
+const TEXT_PREVIEW_MAX: usize = 100_000;
+
+/// Default content cap (chars) for heavy kinds (PDF/image blobs) — a short excerpt only.
+const HEAVY_PREVIEW_MAX: usize = 800;
+
 /// `jkb item show <uid>` — generic, kind-aware item details + content. `preview_arg` caps
-/// the content; when `None`, text-like kinds render in full and heavy kinds cap at 800.
+/// the content; when `None`, text-like kinds cap at [`TEXT_PREVIEW_MAX`] and heavy kinds at
+/// [`HEAVY_PREVIEW_MAX`]. A larger document is truncated (flagged `preview_truncated`);
+/// override with `--preview <n>`.
 fn cmd_item_show(db: &Db, uid: &str, preview_arg: Option<usize>, json: bool) -> Result<()> {
     let u = uid.to_owned();
     let found = db.read(move |conn| {
@@ -974,9 +988,9 @@ fn cmd_item_show(db: &Db, uid: &str, preview_arg: Option<usize>, json: bool) -> 
 
     let preview_max = preview_arg.unwrap_or_else(|| {
         if is_text_like(&meta.kind, meta.mime.as_deref()) {
-            usize::MAX
+            TEXT_PREVIEW_MAX
         } else {
-            800
+            HEAVY_PREVIEW_MAX
         }
     });
     let content_chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
@@ -1243,7 +1257,14 @@ fn cmd_mount_create(
 ) -> Result<()> {
     let abs = std::fs::canonicalize(dir)
         .with_context(|| format!("resolving mount directory {}", dir.display()))?;
-    let backing = format!("file://{}", abs.to_string_lossy());
+    // The backing path is stored verbatim in the `file://` uri and later resolved for sync,
+    // so a lossy conversion (U+FFFD for non-UTF-8 bytes) would silently point the mount at a
+    // different/nonexistent directory. Reject such paths outright rather than corrupting the
+    // mount.
+    let abs_str = abs.to_str().ok_or_else(|| {
+        anyhow::anyhow!("mount directory path is not valid UTF-8: {}", abs.display())
+    })?;
+    let backing = format!("file://{abs_str}");
     let (ns_path, serializer) = (ns_path.to_owned(), serializer.to_owned());
     let include = include.map(str::to_owned);
     let exclude = exclude.map(str::to_owned);
