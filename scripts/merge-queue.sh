@@ -27,17 +27,30 @@ git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branc
 
 PRE=$(git rev-parse HEAD)   # the base tip before this graft, for a clean rollback
 
-# 1. Rebase the branch's commits onto the CURRENT base tip.
-if ! git rebase "$BASE" "$BRANCH" >/tmp/merge-queue.log 2>&1; then
+# 1. Rebase the branch's commits onto the CURRENT base tip WITHOUT moving the branch ref.
+# `git rebase <base> <branch>` checks out <branch> first, which git REFUSES when <branch>
+# is checked out in the implementer's worktree ("fatal: '<branch>' is already used by
+# worktree at …") — a setup error the old code caught and misreported as a *content*
+# conflict, ejecting every group forever. Detaching HEAD at the branch commit does not
+# claim the branch ref, so it is allowed even when the branch is live elsewhere; we rebase
+# that detached HEAD, then fast-forward the base to the grafted result (linear, no merge
+# commit). Empty commits drop exactly as a normal rebase would.
+if ! git checkout --detach "$BRANCH" >/tmp/merge-queue.log 2>&1; then
+  git switch "$BASE" >/dev/null 2>&1
+  echo "eject: cannot detach at $BRANCH (see /tmp/merge-queue.log)"
+  exit 1
+fi
+if ! git rebase "$BASE" >/tmp/merge-queue.log 2>&1; then
   git rebase --abort >/dev/null 2>&1 || true
   git switch "$BASE" >/dev/null 2>&1
   echo "eject: rebase conflict onto $BASE"
   exit 1
 fi
+GRAFT=$(git rev-parse HEAD)   # the rebased commits (detached HEAD)
 
-# 2. Fast-forward the base to the rebased branch — linear graft, no merge commit.
+# 2. Fast-forward the base to the rebased result — linear graft, no merge commit.
 git switch "$BASE" >/dev/null 2>&1
-if ! git merge --ff-only "$BRANCH" >/tmp/merge-queue.log 2>&1; then
+if ! git merge --ff-only "$GRAFT" >/tmp/merge-queue.log 2>&1; then
   git reset --hard "$PRE" >/dev/null 2>&1
   echo "eject: fast-forward failed"
   exit 1
