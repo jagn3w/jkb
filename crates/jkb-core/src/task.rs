@@ -17,7 +17,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::json;
 
-use jkb_types::{EdgeType, Error as TypeError, ItemId, PlacementRole, TaskStatus};
+use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, TaskStatus};
 
 use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
 use crate::query::{Query, Scope, TagPred};
@@ -211,6 +211,59 @@ pub fn ensure_task_mirror(
     }
     placement::place(conn, meta, item, ns_id, PlacementRole::Reference, 0)?;
     Ok(true)
+}
+
+/// Re-home a task: make `namespace` its sole primary placement (via
+/// [`placement::set_primary`]) and reconcile the auto-managed `tasks/…` mirror so it tracks
+/// the new home. The stale mirror for the *previous* home ([`tasks_mirror_ns`]) is unplaced
+/// and a fresh mirror for the new home is ensured, so `tasks/**` never surfaces a task under
+/// a home it no longer has (design D26). Non-task items and moves within `tasks/` are
+/// re-homed without touching mirrors. Idempotent when the home is unchanged.
+///
+/// # Errors
+/// Returns an error if a query, placement, or changelog append fails.
+pub fn set_primary_home(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    namespace: NamespaceId,
+    position: i64,
+) -> Result<()> {
+    // Capture the pre-move primary home and kind before `set_primary` rewrites the placement.
+    let old_home: Option<String> = conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p
+             JOIN namespaces n ON n.id = p.namespace_id
+             WHERE p.item_id = ?1 AND p.role = 'primary' LIMIT 1",
+        )?
+        .query_row([item.get()], |r| r.get(0))
+        .optional()?;
+    let is_task: bool = conn
+        .prepare_cached("SELECT kind = 'task' FROM items WHERE id = ?1")?
+        .query_row([item.get()], |r| r.get(0))?;
+
+    placement::set_primary(conn, meta, item, namespace, position)?;
+
+    // Only tasks carry a `tasks/…` mirror; other kinds are simply re-homed.
+    if !is_task {
+        return Ok(());
+    }
+    let new_home: String = conn
+        .prepare_cached("SELECT path FROM namespaces WHERE id = ?1")?
+        .query_row([namespace.get()], |r| r.get(0))?;
+    let new_mirror = tasks_mirror_ns(&new_home);
+    // Drop the previous home's auto-mirror when it no longer matches the current home.
+    if let Some(old_home) = old_home {
+        if let Some(old_mirror) = tasks_mirror_ns(&old_home) {
+            if new_mirror.as_ref() != Some(&old_mirror) {
+                if let Some(ns_id) = ns::get(conn, &old_mirror)? {
+                    placement::unplace(conn, meta, item, ns_id)?;
+                }
+            }
+        }
+    }
+    ensure_task_mirror(conn, meta, item, &new_home)?;
+    Ok(())
 }
 
 /// Ensure every task whose Primary home is outside `tasks/` has a `tasks/…` mirror. Backs
@@ -535,11 +588,11 @@ fn bad(token: &str, expected: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_dependency, create, is_blocked, parse_quick_add, ready, set_due, set_priority,
-        set_status_str, NewTask, QuickAdd,
+        add_dependency, create, is_blocked, parse_quick_add, ready, set_due, set_primary_home,
+        set_priority, set_status_str, NewTask, QuickAdd,
     };
     use crate::query::Scope;
-    use crate::{binding, item, Db};
+    use crate::{binding, item, ns, Db};
     use jkb_types::TaskStatus;
 
     fn uids(rows: &[super::TaskRow]) -> Vec<String> {
@@ -628,6 +681,49 @@ mod tests {
                 ("repos/y".to_owned(), "reference".to_owned()),
                 // A task homed outside `tasks/` is auto-mirrored so `tasks/**` indexes it.
                 ("tasks/proj/x".to_owned(), "reference".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rehoming_a_task_moves_its_tasks_mirror() {
+        let db = Db::open_in_memory().unwrap();
+        let qa = parse_quick_add("do it +repos/jkb/a").unwrap();
+        let id = db
+            .write_txn("t", move |conn, meta| {
+                create(conn, meta, &NewTask::from_quick_add("task:h", qa))
+            })
+            .unwrap();
+
+        // Re-home to a different repo subtree; the stale `tasks/jkb/a` mirror must go.
+        db.write_txn("t", move |conn, meta| {
+            let dst = ns::ensure(conn, "repos/jkb/b")?;
+            set_primary_home(conn, meta, id, dst, 0)
+        })
+        .unwrap();
+
+        let roles = db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT n.path, p.role FROM placements p
+                     JOIN namespaces n ON n.id = p.namespace_id
+                     WHERE p.item_id = ?1 ORDER BY n.path",
+                )?;
+                let rows = stmt
+                    .query_map([id.get()], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+
+        assert_eq!(
+            roles,
+            vec![
+                ("repos/jkb/b".to_owned(), "primary".to_owned()),
+                // The mirror tracks the new home; the old `tasks/jkb/a` mirror is gone.
+                ("tasks/jkb/b".to_owned(), "reference".to_owned()),
             ]
         );
     }

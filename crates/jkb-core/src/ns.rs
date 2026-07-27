@@ -147,6 +147,74 @@ pub fn subtree_leaf_count(conn: &Connection, path: &str, include_terminal: bool)
     Ok(count)
 }
 
+/// Leaf counts (see [`subtree_leaf_count`]) for **every direct child** of `parent`
+/// (or every root namespace when `parent` is `None`), computed in a single grouped
+/// recursive query keyed by each child's own subtree. This replaces N independent
+/// descendant walks — one per child — when listing a wide namespace.
+///
+/// The returned map holds only children with a non-zero count; a child absent from
+/// the map has zero visible leaves. `include_terminal` matches [`subtree_leaf_count`].
+///
+/// # Errors
+/// Returns an error if the path is invalid or the query fails.
+pub fn subtree_leaf_counts(
+    conn: &Connection,
+    parent: Option<&str>,
+    include_terminal: bool,
+) -> Result<std::collections::HashMap<NamespaceId, i64>> {
+    // The recursive part is shared; only the anchor (direct children of `parent`, or the
+    // roots) differs. Each anchored child carries its own id as `root_id` down its subtree,
+    // so a single grouped COUNT(DISTINCT) yields per-child leaf totals. The `depth < 256`
+    // bound mirrors `subtree_leaf_count` — belt-and-suspenders against a cyclic `parent_id`.
+    const TAIL: &str = "
+             UNION ALL
+             SELECT sub.root_id, n.id, sub.depth + 1
+             FROM namespaces n JOIN sub ON n.parent_id = sub.id
+             WHERE sub.depth < 256
+         )
+         SELECT sub.root_id, COUNT(DISTINCT p.item_id)
+         FROM sub
+         JOIN placements p ON p.namespace_id = sub.id
+         JOIN items i ON i.id = p.item_id
+         WHERE (?1 OR i.status IS NULL OR i.status NOT IN ('done', 'cancelled'))
+         GROUP BY sub.root_id";
+    let mut out = std::collections::HashMap::new();
+    match parent {
+        None => {
+            let sql = format!(
+                "WITH RECURSIVE sub(root_id, id, depth) AS (
+                     SELECT id, id, 0 FROM namespaces WHERE parent_id IS NULL{TAIL}"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(params![include_terminal], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (id, count) = row?;
+                out.insert(NamespaceId::new(id), count);
+            }
+        }
+        Some(p) => {
+            let normalized = normalize(p)?;
+            let sql = format!(
+                "WITH RECURSIVE sub(root_id, id, depth) AS (
+                     SELECT c.id, c.id, 0 FROM namespaces c
+                     JOIN namespaces par ON c.parent_id = par.id
+                     WHERE par.path = ?2{TAIL}"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(params![include_terminal, normalized], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (id, count) = row?;
+                out.insert(NamespaceId::new(id), count);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The root namespaces (those with no parent), ordered by path. Backs `jkb ns ls`
 /// with no scope argument.
 ///
@@ -328,7 +396,8 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure, get_metadata, move_subtree, normalize, set_metadata, subtree, subtree_leaf_count,
+        children, ensure, get_metadata, move_subtree, normalize, roots, set_metadata, subtree,
+        subtree_leaf_count, subtree_leaf_counts,
     };
     use crate::item::{upsert, NewItem};
     use crate::{placement, Db};
@@ -381,6 +450,65 @@ mod tests {
             .read(|conn| subtree_leaf_count(conn, "tasks/other", true))
             .unwrap();
         assert_eq!(none, 0);
+    }
+
+    #[test]
+    fn subtree_leaf_counts_matches_per_child_and_covers_roots() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            let a_leaf = ensure(conn, "tasks/jkb/a/deep")?;
+            let b_leaf = ensure(conn, "tasks/other/b")?;
+            ensure(conn, "tasks/empty")?; // a child with no placements at all
+            let new = |uid: &str| NewItem {
+                uid: uid.to_owned(),
+                kind: "task".to_owned(),
+                content: None,
+                content_hash: None,
+                mime: None,
+            };
+            let x = upsert(conn, meta, &new("task:x"))?;
+            placement::place(conn, meta, x, a_leaf, PlacementRole::Reference, 0)?;
+            let y = upsert(conn, meta, &new("task:y"))?;
+            placement::place(conn, meta, y, b_leaf, PlacementRole::Reference, 0)?;
+            let z = upsert(conn, meta, &new("task:z"))?;
+            placement::place(conn, meta, z, b_leaf, PlacementRole::Reference, 0)?;
+            conn.execute("UPDATE items SET status = 'done' WHERE id = ?1", [z.get()])?;
+            Ok(())
+        })
+        .unwrap();
+
+        // The batched grouped query must agree with the per-child `subtree_leaf_count` for
+        // every direct child of `tasks`, for both the default and terminal-inclusive views.
+        for include_terminal in [false, true] {
+            let batched = db
+                .read(move |conn| subtree_leaf_counts(conn, Some("tasks"), include_terminal))
+                .unwrap();
+            let kids = db.read(|conn| children(conn, "tasks")).unwrap();
+            for (id, path) in kids {
+                let p = path.clone();
+                let expected = db
+                    .read(move |conn| subtree_leaf_count(conn, &p, include_terminal))
+                    .unwrap();
+                assert_eq!(batched.get(&id).copied().unwrap_or(0), expected, "{path}");
+            }
+        }
+
+        // The root-level variant (`parent = None`) counts each top-level namespace's subtree.
+        let root_counts = db
+            .read(|conn| subtree_leaf_counts(conn, None, true))
+            .unwrap();
+        let root_ids = db.read(roots).unwrap();
+        for (id, path) in root_ids {
+            let p = path.clone();
+            let expected = db
+                .read(move |conn| subtree_leaf_count(conn, &p, true))
+                .unwrap();
+            assert_eq!(
+                root_counts.get(&id).copied().unwrap_or(0),
+                expected,
+                "{path}"
+            );
+        }
     }
 
     #[test]
