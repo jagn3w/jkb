@@ -14,7 +14,6 @@ mod service;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -1419,7 +1418,7 @@ fn cmd_task_add(db: &Db, text: &[String], flags: &AddFlags, json: bool) -> Resul
     let input = text.join(" ");
     let qa = task::parse_quick_add(&input)?;
     let had_explicit_placement = !qa.placements.is_empty();
-    let uid = task_uid(&qa.title);
+    let uid = task::mint_uid(&qa.title);
     let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
 
     resolve_task_home(db, &mut spec, flags, had_explicit_placement)?;
@@ -1986,29 +1985,4 @@ fn output_line(item: &output::DisplayItem) -> String {
 fn first_line(content: &str) -> String {
     let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     line.trim().chars().take(100).collect()
-}
-
-/// A unique-ish task uid: a slug of the title plus a timestamp suffix.
-fn task_uid(title: &str) -> String {
-    let mut slug = String::new();
-    let mut dash = false;
-    for c in title.chars() {
-        if c.is_alphanumeric() {
-            slug.extend(c.to_lowercase());
-            dash = false;
-        } else if !dash && !slug.is_empty() {
-            slug.push('-');
-            dash = true;
-        }
-    }
-    let slug: String = slug.trim_matches('-').chars().take(32).collect();
-    let slug = if slug.is_empty() {
-        "task".to_owned()
-    } else {
-        slug
-    };
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("task:{slug}-{nanos:x}")
 }

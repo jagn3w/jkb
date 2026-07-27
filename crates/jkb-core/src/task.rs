@@ -29,6 +29,26 @@ pub const DEFAULT_HOME: &str = "tasks/inbox";
 /// The default binding for a new task: not written to any repo (design D19/D3).
 pub const MANAGED_BINDING: &str = "managed:";
 
+/// The longest slug prefix carried into a minted `task:` uid before the suffix.
+const UID_SLUG_MAX: usize = 32;
+
+/// Mint a unique-ish `task:<slug>-<nanos>` uid from a `title`. The slug is the shared
+/// [`crate::dsl::slug`] (unicode-aware, so the CLI, the MCP server, and file sync all
+/// derive the same slug from the same title), capped at [`UID_SLUG_MAX`] characters and
+/// falling back to `task` when the title has no alphanumerics; the suffix is a
+/// hex nanosecond timestamp for uniqueness across calls.
+///
+/// This is the single minting entry point — do not re-implement it at the CLI or MCP edge.
+#[must_use]
+pub fn mint_uid(title: &str) -> String {
+    let slug: String = crate::dsl::slug(title).chars().take(UID_SLUG_MAX).collect();
+    let slug = if slug.is_empty() { "task" } else { &slug };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("task:{slug}-{nanos:x}")
+}
+
 /// A specification for creating a task. Build it directly (fields are public) or via
 /// [`NewTask::new`] / [`NewTask::from_quick_add`] for sane defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,8 +608,8 @@ fn bad(token: &str, expected: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_dependency, create, is_blocked, parse_quick_add, ready, set_due, set_primary_home,
-        set_priority, set_status_str, NewTask, QuickAdd,
+        add_dependency, create, is_blocked, mint_uid, parse_quick_add, ready, set_due,
+        set_primary_home, set_priority, set_status_str, NewTask, QuickAdd,
     };
     use crate::query::Scope;
     use crate::{binding, item, ns, Db};
@@ -597,6 +617,16 @@ mod tests {
 
     fn uids(rows: &[super::TaskRow]) -> Vec<String> {
         rows.iter().map(|r| r.uid.clone()).collect()
+    }
+
+    #[test]
+    fn mint_uid_slugs_the_title_with_a_task_prefix() {
+        let uid = mint_uid("Fix the flaky test");
+        assert!(uid.starts_with("task:fix-the-flaky-test-"), "{uid}");
+        // The slug is the shared unicode-aware slug (matches the file-sync path).
+        assert!(mint_uid("Café résumé").starts_with("task:café-résumé-"));
+        // No alphanumerics → the `task` fallback, still unique via the suffix.
+        assert!(mint_uid("!!! ???").starts_with("task:task-"));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use jkb_core::blob;
-use jkb_core::dsl::{tokenize, unquote};
+use jkb_core::dsl::{slug, tokenize, unquote};
 use jkb_types::{EdgeType, Error as TypeError};
 
 use super::{SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
@@ -126,8 +126,8 @@ impl ParseState {
         }
         let parent = self.sec_stack.last().map(|(_, p)| p.clone());
         let base = match &parent {
-            Some(p) => format!("{p}/{}", slug(header_text)),
-            None => slug(header_text),
+            Some(p) => format!("{p}/{}", section_slug(header_text)),
+            None => section_slug(header_text),
         };
         let path = uniquify(base, &mut self.used_sections);
         self.sec_stack.push((level, path.clone()));
@@ -556,33 +556,25 @@ fn task_line(line: &str) -> Option<(usize, &'static str, &str)> {
     Some((indent, status, rest))
 }
 
-/// A lowercase `[a-z0-9-]` slug of `text` (runs of other characters collapse to `-`).
-fn slug(text: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for c in text.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
+/// A namespace-path segment from a `##` header: the shared [`slug`] with a `"section"`
+/// fallback when the header has no alphanumeric characters.
+fn section_slug(text: &str) -> String {
+    let s = slug(text);
+    if s.is_empty() {
         "section".to_owned()
     } else {
-        trimmed.to_owned()
+        s
     }
 }
 
 /// Mint a deterministic uri-safe id for a caret-less task, disambiguating collisions
-/// within the file with a numeric suffix. Pure — no RNG or clock.
+/// within the file with a numeric suffix. Pure — no RNG or clock. The base is the shared
+/// [`slug`] (so a task synced from a file and one added via the CLI derive the same slug
+/// from the same title), capped at 24 characters with a `"task"` fallback.
 fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
-    let mut base: String = slug(title).chars().take(24).collect();
+    let base: String = slug(title).chars().take(24).collect();
     let trimmed = base.trim_matches('-');
-    base = if trimmed.is_empty() {
+    let base = if trimmed.is_empty() {
         "task".to_owned()
     } else {
         trimmed.to_owned()
@@ -707,6 +699,21 @@ Some description.
         let task = &doc.items[0];
         assert!(task.local_id.starts_with("no-id-here-"));
         assert_eq!(task.status.as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn minted_id_slug_matches_the_shared_slugger() {
+        // The minted id's slug prefix is the shared `jkb_core::dsl::slug`, so a task
+        // synced from a file and one added via the CLI derive the same slug from the
+        // same title — including unicode, which the old ASCII-only slug dropped.
+        let doc = TasksSerializer
+            .parse("- [ ] Café résumé cleanup\n".as_bytes())
+            .unwrap();
+        assert!(
+            doc.items[0].local_id.starts_with("café-résumé-cleanup-"),
+            "{}",
+            doc.items[0].local_id
+        );
     }
 
     #[test]
