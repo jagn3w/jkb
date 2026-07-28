@@ -3,7 +3,9 @@
 //! Every item has at most one binding (the row's `item_id` is its rowid). The
 //! default is `managed:`; a `file://` binding participates in sync.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
+
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{ItemId, SyncMode};
@@ -68,6 +70,31 @@ pub fn item_for_uri(conn: &Connection, uri: &str) -> Result<Option<ItemId>> {
         .query_row([uri], |row| row.get(0))
         .optional()?;
     Ok(id.map(ItemId::new))
+}
+
+/// Batched reverse lookup: the `uri -> ItemId` map for every uri in `uris`, in a
+/// single query. Uris with no binding are simply absent from the map. This is the
+/// many-uri form of [`item_for_uri`], letting file sync resolve all of a file's
+/// bindings in one round-trip instead of N.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn items_for_uris(conn: &Connection, uris: &[String]) -> Result<HashMap<String, ItemId>> {
+    let mut out = HashMap::new();
+    if uris.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; uris.len()].join(", ");
+    let sql = format!("SELECT uri, item_id FROM bindings WHERE uri IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(uris.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, ItemId::new(row.get::<_, i64>(1)?)))
+    })?;
+    for row in rows {
+        let (uri, id) = row?;
+        out.insert(uri, id);
+    }
+    Ok(out)
 }
 
 /// The distinct `file://` binding uris of items placed under `ns_path` or any

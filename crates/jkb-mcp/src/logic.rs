@@ -254,7 +254,7 @@ pub fn task_create(db: &Db, args: &TaskCreateArgs) -> Result<Value> {
     if let Some(namespace) = &args.namespace {
         ns::normalize(namespace)?;
     }
-    let mut spec = task::NewTask::new(task_uid(&args.title), args.title.clone());
+    let mut spec = task::NewTask::new(task::mint_uid(&args.title), args.title.clone());
     spec.priority = args.priority;
     spec.due.clone_from(&args.due);
     if let Some(namespace) = &args.namespace {
@@ -359,32 +359,6 @@ fn items_json(db: &Db, ids: &[ItemId]) -> Result<Value> {
 fn snippet(content: &str) -> String {
     let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     line.trim().chars().take(120).collect()
-}
-
-/// A unique-ish task uid from the title (slug + monotonic-ish suffix). Uses a
-/// nanosecond timestamp for uniqueness across calls.
-fn task_uid(title: &str) -> String {
-    let mut slug = String::new();
-    let mut dash = false;
-    for c in title.chars() {
-        if c.is_alphanumeric() {
-            slug.extend(c.to_lowercase());
-            dash = false;
-        } else if !dash && !slug.is_empty() {
-            slug.push('-');
-            dash = true;
-        }
-    }
-    let slug: String = slug.trim_matches('-').chars().take(32).collect();
-    let slug = if slug.is_empty() {
-        "task".to_owned()
-    } else {
-        slug
-    };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("task:{slug}-{nanos:x}")
 }
 
 #[cfg(test)]

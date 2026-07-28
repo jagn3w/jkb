@@ -922,30 +922,36 @@ fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) ->
         }
     }
 
-    // Items: everything bound to this file. Build both directions of the id map.
+    // Items: everything bound to this file. Resolve every binding in one query, then
+    // build both directions of the id map (uris stay ordered for a stable round-trip).
     let uris = binding::synced_uris_for_file(conn, bare_uri)?;
+    let uri_ids = binding::items_for_uris(conn, &uris)?;
     let mut id_to_local: HashMap<i64, String> = HashMap::new();
     let mut resolved: Vec<(String, ItemId)> = Vec::new();
     for uri in &uris {
         let local_id = local_of(bare_uri, uri);
-        if let Some(id) = binding::item_for_uri(conn, uri)? {
+        if let Some(&id) = uri_ids.get(uri) {
             id_to_local.insert(id.get(), local_id.clone());
             resolved.push((local_id, id));
         }
     }
 
-    // Batch the per-item lookups into one query each, keyed by item id, so this is a
-    // constant number of round-trips instead of ~4N for N items.
+    // Batch every per-item lookup into one query each, keyed by item id, so this is a
+    // constant number of round-trips instead of O(N) point queries for N items.
     let ids: Vec<ItemId> = resolved.iter().map(|(_, id)| *id).collect();
     let mut tags = tag::applications_for(conn, &ids)?;
     let mut mirrors = mirror_paths_for(conn, &ids, &file_ns_path)?;
     let parents = edge::edges_from_many(conn, &ids, EdgeType::ParentOf)?;
     let deps = edge::edges_from_many(conn, &ids, EdgeType::DependsOn)?;
+    let mut item_rows = item_rows_for(conn, &ids)?;
+    let placements = primary_placements_for(conn, &ids)?;
 
     for (local_id, id) in &resolved {
-        let Some(mut item) = load_item(conn, local_id, *id, &file_ns_path)? else {
+        // Skip items with no row or no primary placement (mirrors the old `load_item`).
+        let (Some(row), Some(placement)) = (item_rows.remove(id), placements.get(id)) else {
             continue;
         };
+        let mut item = build_sync_item(local_id, &file_ns_path, row, placement);
         item.tags = tags.remove(id).unwrap_or_default();
         item.mirrors = mirrors.remove(id).unwrap_or_default();
         doc.items.push(item);
@@ -977,48 +983,94 @@ type ItemRow = (
     Option<String>,
 );
 
-/// Load one item's row + primary placement into a [`SyncItem`] (tags/mirrors/edges are
-/// filled by the caller). Returns `None` if the item has no primary placement.
-fn load_item(
-    conn: &Connection,
-    local_id: &str,
-    id: ItemId,
-    file_ns_path: &str,
-) -> Result<Option<SyncItem>> {
-    let row: Option<ItemRow> = conn
-        .prepare_cached("SELECT kind, content, status, priority, due FROM items WHERE id = ?1")?
-        .query_row([id.get()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
-        .optional()?;
-    let Some((kind, content, status, priority, due)) = row else {
-        return Ok(None);
-    };
+/// The `(kind, content, status, priority, due)` column rows of the given items, keyed
+/// by id, in one query. Items with no row are absent from the map. The batched form of
+/// the per-item `items` select the old `load_item` ran.
+fn item_rows_for(conn: &Connection, ids: &[ItemId]) -> Result<HashMap<ItemId, ItemRow>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT id, kind, content, status, priority, due FROM items WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(ids.iter().map(|id| id.get())),
+        |r| {
+            Ok((
+                ItemId::new(r.get(0)?),
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
+            ))
+        },
+    )?;
+    for row in rows {
+        let (id, item_row) = row?;
+        out.insert(id, item_row);
+    }
+    Ok(out)
+}
 
-    let placement: Option<(String, i64)> = conn
-        .prepare_cached(
-            "SELECT n.path, p.position FROM placements p
-             JOIN namespaces n ON n.id = p.namespace_id
-             WHERE p.item_id = ?1 AND p.role = 'primary' LIMIT 1",
-        )?
-        .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((ns_path, position)) = placement else {
-        return Ok(None);
-    };
+/// The primary-placement `(namespace path, position)` of the given items, keyed by id,
+/// in one query. Items with no primary placement are absent from the map. The batched
+/// form of the per-item primary-placement select the old `load_item` ran (an item has
+/// one primary placement by construction, so first-wins is deterministic).
+fn primary_placements_for(
+    conn: &Connection,
+    ids: &[ItemId],
+) -> Result<HashMap<ItemId, (String, i64)>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT p.item_id, n.path, p.position FROM placements p
+         JOIN namespaces n ON n.id = p.namespace_id
+         WHERE p.role = 'primary' AND p.item_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(ids.iter().map(|id| id.get())),
+        |r| {
+            Ok((
+                ItemId::new(r.get(0)?),
+                (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
+            ))
+        },
+    )?;
+    for row in rows {
+        let (id, placement) = row?;
+        out.entry(id).or_insert(placement);
+    }
+    Ok(out)
+}
+
+/// Shape a [`SyncItem`] from an item's already-batched row + primary placement
+/// (tags/mirrors/edges are filled by the caller). The pure inverse of the per-item
+/// mapping the old `load_item` did once the two rows were in hand.
+fn build_sync_item(
+    local_id: &str,
+    file_ns_path: &str,
+    row: ItemRow,
+    placement: &(String, i64),
+) -> SyncItem {
+    let (kind, content, status, priority, due) = row;
+    let (ns_path, position) = placement;
     let section = if ns_path == file_ns_path {
         None
     } else {
-        Some(relative(file_ns_path, &ns_path))
+        Some(relative(file_ns_path, ns_path))
     };
 
     let mut item = SyncItem::new(local_id.to_owned(), &kind, content.unwrap_or_default());
     item.section = section;
-    item.position = position;
+    item.position = *position;
     item.status = status;
     item.priority = priority;
     item.due = due;
-    Ok(Some(item))
+    item
 }
 
 /// The reference-placement namespace paths of the given items outside their file
@@ -1238,22 +1290,27 @@ fn load_base_doc(
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// The current `local_id -> ItemId` map for a file.
+/// The current `local_id -> ItemId` map for a file. Resolves every binding in one query.
 fn existing_by_local(conn: &Connection, bare_uri: &str) -> Result<HashMap<String, ItemId>> {
+    let uris = binding::synced_uris_for_file(conn, bare_uri)?;
+    let uri_ids = binding::items_for_uris(conn, &uris)?;
     let mut out = HashMap::new();
-    for uri in binding::synced_uris_for_file(conn, bare_uri)? {
-        if let Some(id) = binding::item_for_uri(conn, &uri)? {
-            out.insert(local_of(bare_uri, &uri), id);
+    for uri in &uris {
+        if let Some(&id) = uri_ids.get(uri) {
+            out.insert(local_of(bare_uri, uri), id);
         }
     }
     Ok(out)
 }
 
-/// The item ids currently bound to a file (for stamping on export).
+/// The item ids currently bound to a file (for stamping on export). Resolves every
+/// binding in one query; ids stay in the `synced_uris_for_file` order.
 fn current_bindings(conn: &Connection, bare_uri: &str) -> Result<Vec<ItemId>> {
+    let uris = binding::synced_uris_for_file(conn, bare_uri)?;
+    let uri_ids = binding::items_for_uris(conn, &uris)?;
     let mut out = Vec::new();
-    for uri in binding::synced_uris_for_file(conn, bare_uri)? {
-        if let Some(id) = binding::item_for_uri(conn, &uri)? {
+    for uri in &uris {
+        if let Some(&id) = uri_ids.get(uri) {
             out.push(id);
         }
     }

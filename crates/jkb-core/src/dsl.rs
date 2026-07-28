@@ -133,6 +133,31 @@ pub fn unquote_unescape(s: &str) -> String {
     unescape(inner)
 }
 
+/// A lowercase slug of `text`: runs of non-alphanumeric characters collapse to a single
+/// `-`, and leading/trailing dashes are trimmed. Unicode letters and digits are kept and
+/// lowercased ([`char::is_alphanumeric`], not the ASCII-only variant) so an accented title
+/// slugs the same on every path. Returns an **empty** string when `text` has no
+/// alphanumeric characters — callers supply their own fallback (e.g. `"task"`, `"section"`)
+/// and any length cap.
+///
+/// This is the single source of truth for slugging so a task minted via the CLI, the MCP
+/// server, or file sync derives the same slug from the same title.
+#[must_use]
+pub fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
 /// Resolve `\"`→`"` and `\\`→`\`; any other `\x` is kept verbatim (a literal backslash
 /// followed by `x`).
 fn unescape(s: &str) -> String {
@@ -178,6 +203,25 @@ mod tests {
         assert!(has_unterminated_quote(r#"hello "unclosed"#));
         assert!(!has_unterminated_quote(r#"hello "closed" world"#));
         assert!(!has_unterminated_quote("no quotes"));
+    }
+
+    #[test]
+    fn slug_collapses_and_trims() {
+        use super::slug;
+        assert_eq!(slug("Fix the flaky test"), "fix-the-flaky-test");
+        assert_eq!(slug("## 1. Backend & API"), "1-backend-api");
+        assert_eq!(slug("  --leading & trailing--  "), "leading-trailing");
+        // No alphanumerics → empty (callers supply their own fallback).
+        assert_eq!(slug("--- !!! ---"), "");
+    }
+
+    #[test]
+    fn slug_keeps_unicode_alphanumerics() {
+        use super::slug;
+        // Unicode letters/digits are lowercased and kept (not dropped as ASCII-only
+        // would), so the same title slugs identically on every path.
+        assert_eq!(slug("Café Résumé"), "café-résumé");
+        assert_eq!(slug("naïve Ångström"), "naïve-ångström");
     }
 
     #[test]
