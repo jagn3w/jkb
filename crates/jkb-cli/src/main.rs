@@ -189,7 +189,7 @@ enum Command {
         /// Include terminal (`done`/`cancelled`) items in the counts.
         #[arg(long)]
         all: bool,
-        /// Maximum depth to descend (default: unbounded).
+        /// Maximum depth to descend (default: 4; deeper folders show `…`). Raise for more.
         #[arg(long)]
         depth: Option<usize>,
     },
@@ -1272,6 +1272,15 @@ fn cmd_find(
     global: bool,
     json: bool,
 ) -> Result<()> {
+    // Refuse the one footgun: no filter, no path, no ambient scope, no limit would list the
+    // entire KB. Any filter / path / --limit (or being inside a mounted repo) makes it fine.
+    let unfiltered = kind.is_none() && tags.is_empty() && status.is_none() && path.is_none();
+    if unfiltered && limit.is_none() && ambient(db, global)?.is_none() {
+        anyhow::bail!(
+            "`find` with no filters would list the entire KB — add --kind/--tag/--status, a path, or --limit"
+        );
+    }
+
     let mut terms: Vec<String> = Vec::new();
     if let Some(k) = kind {
         terms.push(format!("kind:{k}"));
@@ -1372,7 +1381,13 @@ fn tree_to_json(node: &TreeNode) -> serde_json::Value {
     v
 }
 
-/// Render one tree level with box-drawing prefixes (`├─`/`└─`).
+/// Depth `jkb tree` descends by default before eliding deeper folders with `…` — deep
+/// enough to map any real subtree, shallow enough to bound the output and the per-namespace
+/// query fan-out (each level lists its children). `--depth` overrides.
+const DEFAULT_TREE_DEPTH: usize = 4;
+
+/// Render one tree level with box-drawing prefixes (`├─`/`└─`); a namespace elided by the
+/// depth cap (it has children we didn't descend into) gets a trailing `…`.
 fn print_tree(nodes: &[TreeNode], prefix: &str) {
     for (i, node) in nodes.iter().enumerate() {
         let last = i + 1 == nodes.len();
@@ -1393,7 +1408,18 @@ fn print_tree(nodes: &[TreeNode], prefix: &str) {
             .as_deref()
             .map(|s| format!(" [{s}]"))
             .unwrap_or_default();
-        println!("{prefix}{branch}{}{leaves}{status}", node.child.label);
+        let elided = if node.children.is_empty()
+            && node.child.has_children
+            && node.child.kind == "namespace"
+        {
+            " …"
+        } else {
+            ""
+        };
+        println!(
+            "{prefix}{branch}{}{leaves}{status}{elided}",
+            node.child.label
+        );
         print_tree(&node.children, &format!("{prefix}{cont}"));
     }
 }
@@ -1407,6 +1433,7 @@ fn cmd_tree(
     json: bool,
 ) -> Result<()> {
     let owned = path.map(str::to_owned);
+    let depth = Some(depth.unwrap_or(DEFAULT_TREE_DEPTH));
     let nodes = db.read(move |conn| tree_nodes(conn, owned.as_deref(), all, depth))?;
     if json {
         let v = serde_json::json!({

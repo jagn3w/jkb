@@ -1346,3 +1346,40 @@ fn tree_find_recent_stat_guide() {
         .success()
         .stdout(predicate::str::contains("agent quickstart"));
 }
+
+#[test]
+fn find_guards_unscoped_and_tree_bounds_depth() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    // A deep chain a/b/c/d/e/f so the default tree depth elides the bottom.
+    jkb(&db)
+        .args(["task", "add", "deep", "+a/b/c/d/e/f"])
+        .assert()
+        .success();
+
+    // Unfiltered, unscoped, global `find` refuses rather than dumping the whole KB.
+    jkb(&db)
+        .args(["--global", "find"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would list the entire KB"));
+    // Any filter makes it fine.
+    jkb(&db)
+        .args(["--global", "find", "--kind", "task"])
+        .assert()
+        .success();
+    // A path makes it fine.
+    jkb(&db).args(["--global", "find", "a"]).assert().success();
+
+    // Default-depth tree elides the deepest folder with `…`; --depth reveals it.
+    jkb(&db)
+        .args(["--global", "tree", "a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("…").and(predicate::str::contains("deep").not()));
+    jkb(&db)
+        .args(["--global", "tree", "a", "--depth", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deep"));
+}
