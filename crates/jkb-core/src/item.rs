@@ -110,11 +110,27 @@ pub struct GrepRow {
     pub content: String,
 }
 
+/// Escape `%`, `_`, and `\` for use inside a `LIKE … ESCAPE '\'` pattern, so a namespace
+/// path (which can contain `_`, e.g. the reserved `_sys` root) is matched literally rather
+/// than as wildcards.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Literal-substring content search (grep semantics), optionally scoped to the namespace
 /// subtree rooted at `scope` (the namespace itself or any descendant, matched via any
-/// placement). Matching is a plain substring test through `SQLite`'s `instr` — case-sensitive
-/// unless `ignore_case`, no regex or globbing — so results are predictable for humans and
-/// agents alike. Each matching item is returned once, ordered by uid.
+/// placement). Matching is a plain substring test — no regex or globbing. Case-sensitive by
+/// default; with `ignore_case` the fold is done in Rust (full Unicode via `to_lowercase`),
+/// **not** `SQLite`'s `lower` (which folds only ASCII), so accented text matches and the
+/// result agrees with a caller re-scanning the same content. Each matching item is returned
+/// once, ordered by uid.
 ///
 /// # Errors
 /// Returns an error if the query fails.
@@ -125,30 +141,28 @@ pub fn grep(
     ignore_case: bool,
 ) -> Result<Vec<GrepRow>> {
     use rusqlite::types::Value;
-    let needle = if ignore_case {
-        pattern.to_lowercase()
-    } else {
-        pattern.to_owned()
-    };
-    let haystack = if ignore_case {
-        "lower(i.content)"
-    } else {
-        "i.content"
-    };
-    let mut sql = format!(
-        "SELECT i.id, i.uid, i.kind, i.content FROM items i
-         WHERE i.content IS NOT NULL AND instr({haystack}, ?1) > 0"
+    let mut sql = String::from(
+        "SELECT i.id, i.uid, i.kind, i.content FROM items i WHERE i.content IS NOT NULL",
     );
-    let mut params: Vec<Value> = vec![Value::Text(needle)];
+    let mut params: Vec<Value> = Vec::new();
+    // Case-sensitive matching is a literal `instr` filter pushed into SQL (fast, exact).
+    // Case-insensitive is folded in Rust below — `SQLite`'s `lower` is ASCII-only, so an
+    // in-SQL `-i` filter would both miss non-ASCII and disagree with a Rust re-scan.
+    if !ignore_case {
+        sql.push_str(" AND instr(i.content, ?) > 0");
+        params.push(Value::Text(pattern.to_owned()));
+    }
     if let Some(s) = scope {
         sql.push_str(
             " AND EXISTS (SELECT 1 FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-                          WHERE p.item_id = i.id AND (n.path = ?2 OR n.path LIKE ?3))",
+                          WHERE p.item_id = i.id AND (n.path = ? OR n.path LIKE ? ESCAPE '\\'))",
         );
         params.push(Value::Text(s.to_owned()));
-        params.push(Value::Text(format!("{s}/%")));
+        params.push(Value::Text(format!("{}/%", like_escape(s))));
     }
     sql.push_str(" ORDER BY i.uid");
+
+    let needle = pattern.to_lowercase();
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
         Ok(GrepRow {
@@ -160,7 +174,13 @@ pub fn grep(
     })?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        let row = row?;
+        // For `-i`, keep only rows that actually contain the needle under a Unicode fold —
+        // the SQL query pre-filtered by scope only, not by text.
+        if ignore_case && !row.content.to_lowercase().contains(&needle) {
+            continue;
+        }
+        out.push(row);
     }
     Ok(out)
 }
@@ -325,6 +345,51 @@ mod tests {
             .read(|conn| grep(conn, "pipe", Some("proj/b"), true))
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn grep_ci_folds_unicode_and_scope_does_not_leak_across_siblings() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            // A non-ASCII case difference, and two sibling namespaces where one name is a
+            // LIKE prefix of the other under a wildcard (`_` matches any char).
+            for (uid, body, ns_path) in [
+                ("n:accent", "the RÉSUMÉ is ready", "_sys/z"),
+                ("n:bleed", "résumé elsewhere", "xsys/z"),
+            ] {
+                let at = ns::ensure(conn, ns_path)?;
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: uid.to_owned(),
+                        kind: "note".to_owned(),
+                        content: Some(body.to_owned()),
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                placement::place(conn, meta, item, at, PlacementRole::Primary, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Unicode-aware `-i`: lowercase "résumé" matches the uppercase "RÉSUMÉ".
+        let hits = db.read(|conn| grep(conn, "résumé", None, true)).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both accented items match under a Unicode fold"
+        );
+
+        // Scope `_sys` must NOT leak into `xsys` — `_` is escaped, not a LIKE wildcard.
+        let hits = db.read(|conn| grep(conn, "é", Some("_sys"), true)).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.uid.as_str()).collect::<Vec<_>>(),
+            ["n:accent"],
+            "the `_sys` scope must not match the sibling `xsys`"
+        );
     }
 
     #[test]
