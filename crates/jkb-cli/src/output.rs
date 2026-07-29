@@ -24,6 +24,8 @@ pub struct DisplayItem {
     pub snippet: Option<String>,
     /// The namespace the item is placed under (primary preferred).
     pub namespace: Option<String>,
+    /// Last-update timestamp (ISO), for `jkb recent` ordering.
+    pub updated: Option<String>,
 }
 
 impl DisplayItem {
@@ -37,6 +39,7 @@ impl DisplayItem {
             "due": self.due,
             "namespace": self.namespace,
             "snippet": self.snippet,
+            "updated": self.updated,
         })
     }
 
@@ -86,7 +89,7 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
         for id in &ids {
             let row = conn
                 .prepare_cached(
-                    "SELECT id, uid, kind, status, priority, due, content
+                    "SELECT id, uid, kind, status, priority, due, content, updated_at
                      FROM items WHERE id = ?1",
                 )?
                 .query_row([id], |r| {
@@ -98,10 +101,11 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
                         r.get::<_, Option<i64>>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
+                        r.get::<_, String>(7)?,
                     ))
                 })
                 .ok();
-            let Some((id, uid, kind, status, priority, due, content)) = row else {
+            let Some((id, uid, kind, status, priority, due, content, updated)) = row else {
                 continue;
             };
             let namespace = conn
@@ -121,6 +125,7 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
                 due,
                 snippet: content.as_deref().map(snippet),
                 namespace,
+                updated: Some(updated),
             });
         }
         Ok(out)

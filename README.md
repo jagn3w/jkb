@@ -88,6 +88,23 @@ jkb doctor --backup ~/jkb-backup.db
 # the cwd-based ambient namespace scope.
 ```
 
+## Familiar (Linux-style) verbs
+
+The KB is a virtual filesystem, so it answers to the commands you'd expect — handy at the
+terminal and for agents driving it (see [AGENTS.md](AGENTS.md), or run `jkb guide`):
+
+```sh
+jkb tree tasks/jkb            # a recursive map of a subtree, with per-folder counts
+jkb ls repos/jkb -l -R        # list children (-l long, -R recursive, -t by-time, -a all)
+jkb grep "TODO" repos/jkb     # literal-substring content search (exit 1 if none; -i/-l/-c)
+jkb find --kind task --tag design=approved tasks/**   # structured (typed) search
+jkb recent references         # the most-recently-updated items in a subtree
+jkb cat <uid>                 # an item's raw body to stdout;  jkb stat <uid> = metadata
+```
+
+`grep` is literal (exit-coded like real grep); `find`/`query` are structured; `search` is
+ranked vector/FTS retrieval — pick by whether you know the string, the fields, or neither.
+
 ## Using it from Claude (MCP)
 
 `jkb mcp` runs a stdio [MCP](https://modelcontextprotocol.io) server exposing read

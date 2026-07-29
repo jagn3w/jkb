@@ -1278,3 +1278,71 @@ fn cat_prints_raw_body() {
         .stdout(predicate::str::contains("cat me"));
     jkb(&db).args(["cat", "task:nope"]).assert().failure();
 }
+
+#[test]
+fn tree_find_recent_stat_guide() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "alpha task", "+proj/a"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "beta task", "+proj/b"])
+        .assert()
+        .success();
+
+    // tree: both leaf namespaces appear under the root.
+    jkb(&db)
+        .args(["--global", "tree", "proj"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("├─").and(predicate::str::contains("alpha task")));
+
+    // find: structured filter by kind (and it's the typed complement to grep).
+    jkb(&db)
+        .args(["--global", "find", "proj", "--kind", "task"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha task").and(predicate::str::contains("beta task")));
+    // find with a non-matching status yields nothing but still succeeds.
+    jkb(&db)
+        .args(["--global", "find", "proj", "--status", "done"])
+        .assert()
+        .success();
+
+    // recent: newest first — beta (added later) precedes alpha in the output.
+    let out = jkb(&db)
+        .args(["--global", "recent", "proj"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.find("beta task").unwrap() < text.find("alpha task").unwrap());
+
+    // stat: compact metadata, no body dump.
+    let uid = String::from_utf8(
+        jkb(&db)
+            .args(["grep", "beta", "proj", "-l"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    jkb(&db)
+        .args(["stat", uid.trim()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kind:").and(predicate::str::contains("proj/b")));
+
+    // guide: prints the cheat-sheet.
+    jkb(&db)
+        .args(["guide"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent quickstart"));
+}

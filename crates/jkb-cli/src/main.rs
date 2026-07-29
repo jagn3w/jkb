@@ -181,6 +181,54 @@ enum Command {
         /// The item uid.
         uid: String,
     },
+    /// Recursive namespace tree (like `tree`), with a leaf count per folder. One call maps
+    /// a whole subtree so an agent can orient before drilling in. Omit `path` for the roots.
+    Tree {
+        /// The namespace to root the tree at (default: top-level roots).
+        path: Option<String>,
+        /// Include terminal (`done`/`cancelled`) items in the counts.
+        #[arg(long)]
+        all: bool,
+        /// Maximum depth to descend (default: unbounded).
+        #[arg(long)]
+        depth: Option<usize>,
+    },
+    /// Structured item search by kind/tag/status over a namespace subtree — the typed
+    /// complement to `grep`'s text search. Sugar over the query DSL with familiar flags.
+    Find {
+        /// Namespace subtree to search (default: ambient scope, or all with --global).
+        path: Option<String>,
+        /// Restrict to a kind (e.g. `task`, `document`, `note`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Require a tag `facet=value` (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Restrict to a task status (e.g. `open`, `done`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// The most-recently-updated items in a subtree — what changed lately. Sugar for a
+    /// time-sorted listing so an agent can catch up quickly.
+    Recent {
+        /// Namespace subtree (default: ambient scope, or everything with --global).
+        path: Option<String>,
+        /// How many to show (default: 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Compact metadata for one item (kind, namespace, tags, sizes, timestamps) — the quick
+    /// `stat`, without the body. Use `jkb cat`/`item show` for content.
+    Stat {
+        /// The item uid.
+        uid: String,
+    },
+    /// Print a one-page cheat-sheet of the agent-facing command surface (verbs, flags,
+    /// exit-code and `--json` conventions). Start here when driving jkb from an agent.
+    Guide,
     /// Inspect items (generic, kind-aware).
     Item {
         #[command(subcommand)]
@@ -512,6 +560,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)] // a flat command dispatcher; one arm per subcommand
 fn run(cli: Cli) -> Result<()> {
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
     // (best-effort, silent). Skipped for explicit `jkb commands …` so it never fights the
@@ -602,6 +651,29 @@ fn run(cli: Cli) -> Result<()> {
             json,
         ),
         Command::Cat { uid } => cmd_cat(&db, &uid),
+        Command::Tree { path, all, depth } => cmd_tree(&db, path.as_deref(), all, depth, json),
+        Command::Find {
+            path,
+            kind,
+            tags,
+            status,
+            limit,
+        } => cmd_find(
+            &db,
+            path.as_deref(),
+            kind.as_deref(),
+            &tags,
+            status.as_deref(),
+            limit,
+            global,
+            json,
+        ),
+        Command::Recent { path, limit } => cmd_recent(&db, path.as_deref(), limit, global, json),
+        Command::Stat { uid } => cmd_stat(&db, &uid, json),
+        Command::Guide => {
+            cmd_guide();
+            Ok(())
+        }
         Command::Item { cmd } => match cmd {
             ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
             ItemCmd::Edit {
@@ -1184,6 +1256,213 @@ fn cmd_cat(db: &Db, uid: &str) -> Result<()> {
         Some(c) => print!("{}", c.unwrap_or_default()),
     }
     Ok(())
+}
+
+/// `jkb find [path] --kind --tag --status` — structured item search: familiar flags that
+/// compile to the query DSL (the typed complement to `grep`). Empty filters = list the
+/// scope (like `find .`); scope defaults to the ambient namespace.
+#[allow(clippy::too_many_arguments)]
+fn cmd_find(
+    db: &Db,
+    path: Option<&str>,
+    kind: Option<&str>,
+    tags: &[String],
+    status: Option<&str>,
+    limit: Option<usize>,
+    global: bool,
+    json: bool,
+) -> Result<()> {
+    let mut terms: Vec<String> = Vec::new();
+    if let Some(k) = kind {
+        terms.push(format!("kind:{k}"));
+    }
+    for t in tags {
+        terms.push(format!("tag:{t}"));
+    }
+    if let Some(s) = status {
+        terms.push(format!("status:{s}"));
+    }
+    if let Some(p) = path {
+        terms.push(format!("ns:{p}/**"));
+    }
+    cmd_query(db, &terms.join(" "), limit, false, global, json)
+}
+
+/// `jkb recent [path]` — the most-recently-updated items in a subtree, newest first.
+fn cmd_recent(db: &Db, path: Option<&str>, limit: usize, global: bool, json: bool) -> Result<()> {
+    let dsl = path.map(|p| format!("ns:{p}/**")).unwrap_or_default();
+    let mut query = jkb_core::query::parse(&dsl)?;
+    apply_ambient(&mut query, db, global)?;
+    let ids = db.read(move |conn| query.evaluate(conn))?;
+    let mut items = output::fetch_items(db, &ids)?;
+    // Newest first; missing timestamps (shouldn't happen) sort last.
+    items.sort_by(|a, b| b.updated.cmp(&a.updated));
+    items.truncate(limit);
+    output::print_items(&items, json);
+    Ok(())
+}
+
+/// `jkb stat <uid>` — compact metadata for one item (no body).
+fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
+    let u = uid.to_owned();
+    let found = db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(None);
+        };
+        let Some(meta) = item::get(conn, id)? else {
+            return Ok(None);
+        };
+        let binding = binding::get(conn, id)?.map(|b| b.uri);
+        let tags = tag::applications(conn, id)?;
+        let namespace = primary_ns(conn, id)?;
+        Ok(Some((meta, binding, tags, namespace)))
+    })?;
+    let Some((meta, binding, tags, namespace)) = found else {
+        anyhow::bail!("no item with uid `{uid}`");
+    };
+    let chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": meta.uid, "kind": meta.kind, "status": meta.status,
+                "priority": meta.priority, "due": meta.due, "mime": meta.mime,
+                "namespace": namespace, "binding": binding, "content_chars": chars,
+                "tags": tags.iter().map(|(f, v)| serde_json::json!({"facet": f, "value": v})).collect::<Vec<_>>(),
+                "created_at": meta.created_at, "updated_at": meta.updated_at,
+            })
+        );
+    } else {
+        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
+        println!("content:   {chars} chars");
+    }
+    Ok(())
+}
+
+/// One node in the `jkb tree` output: a listed child plus its recursively-listed children.
+struct TreeNode {
+    child: Child,
+    children: Vec<TreeNode>,
+}
+
+fn tree_nodes(
+    conn: &rusqlite::Connection,
+    path: Option<&str>,
+    all: bool,
+    depth_left: Option<usize>,
+) -> jkb_core::Result<Vec<TreeNode>> {
+    let mut out = Vec::new();
+    for child in list_children(conn, path, all)? {
+        let descend = child.kind == "namespace" && depth_left != Some(0);
+        let children = if descend {
+            tree_nodes(conn, Some(&child.reference), all, depth_left.map(|d| d - 1))?
+        } else {
+            Vec::new()
+        };
+        out.push(TreeNode { child, children });
+    }
+    Ok(out)
+}
+
+fn tree_to_json(node: &TreeNode) -> serde_json::Value {
+    let mut v = node.child.to_json();
+    if !node.children.is_empty() {
+        v["children"] = node.children.iter().map(tree_to_json).collect();
+    }
+    v
+}
+
+/// Render one tree level with box-drawing prefixes (`├─`/`└─`).
+fn print_tree(nodes: &[TreeNode], prefix: &str) {
+    for (i, node) in nodes.iter().enumerate() {
+        let last = i + 1 == nodes.len();
+        let (branch, cont) = if last {
+            ("└─ ", "   ")
+        } else {
+            ("├─ ", "│  ")
+        };
+        let leaves = node
+            .child
+            .leaf_count
+            .filter(|_| node.child.kind == "namespace")
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        let status = node
+            .child
+            .status
+            .as_deref()
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default();
+        println!("{prefix}{branch}{}{leaves}{status}", node.child.label);
+        print_tree(&node.children, &format!("{prefix}{cont}"));
+    }
+}
+
+/// `jkb tree [path]` — a recursive map of the namespace subtree with per-folder counts.
+fn cmd_tree(
+    db: &Db,
+    path: Option<&str>,
+    all: bool,
+    depth: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let owned = path.map(str::to_owned);
+    let nodes = db.read(move |conn| tree_nodes(conn, owned.as_deref(), all, depth))?;
+    if json {
+        let v = serde_json::json!({
+            "path": path,
+            "tree": nodes.iter().map(tree_to_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("{}", path.unwrap_or("."));
+        print_tree(&nodes, "");
+    }
+    Ok(())
+}
+
+/// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
+fn cmd_guide() {
+    print!(
+        r#"jkb — agent quickstart
+
+CONVENTIONS
+  --json      every read command emits machine-readable JSON; parse that, not the text.
+  --global    ignore the cwd-based ambient namespace scope (search/list everything).
+  exit codes  `grep` exits 1 when nothing matched (0 = found). Lookups of a missing uid
+              error (nonzero). Everything else is 0 on success.
+  namespaces  the KB is a virtual filesystem: `repos/<repo>/…`, `tasks/…`, `media/`,
+              `references/`, `memory/`. Items are "files"; typed edges + tags cross-cut.
+
+ORIENT (read-only)
+  jkb tree [path]              map a subtree (folders + per-folder counts), one call.
+  jkb ls [path] [-l -R -t -a]  list a namespace's children (long / recursive / by-time / all).
+  jkb recent [path]           most-recently-updated items — what changed lately.
+  jkb find [path] --kind K --tag f=v --status S   structured search (typed; → query DSL).
+  jkb grep <pat> [path] [-i -l -c]   literal-substring content search; exit 1 on no match.
+  jkb query "<DSL>"           full query DSL (kind: tag: status: ns: is:ready due<= …).
+  jkb search "<terms>" --route hybrid   ranked vector/FTS retrieval (needs the embedder).
+
+READ ONE ITEM
+  jkb cat <uid>               the raw body to stdout (pipe it, no metadata).
+  jkb stat <uid>              compact metadata (kind, namespace, tags, timestamps).
+  jkb item show <uid>         metadata + a (bounded) body preview.
+
+TASKS
+  jkb task add "text !p1 @2026-07-15 +ns #facet=value"   quick-add.
+  jkb task next [DSL]         the ready frontier (unblocked, by priority then due).
+  jkb task set <uid> --status done|open|in_progress|needs_review
+  jkb task show <uid>         the full task body.
+
+WRITE (all audited + undoable)
+  jkb item edit <uid> [--append] <text>   replace/append an item's content.
+  jkb task tag add <uid> facet=value      apply a tag.
+  jkb undo                                revert the last change.
+
+Tips: prefer `find`/`query` (structured) over `grep` when you know the kind/tag; add
+`--json` and parse; scope with a path or rely on the ambient cwd namespace.
+"#
+    );
 }
 
 /// The item's primary (home) namespace path, if placed.
