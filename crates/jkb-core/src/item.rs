@@ -5,6 +5,7 @@ use serde_json::json;
 
 use jkb_types::{Error as TypeError, ItemId};
 
+use crate::sql::like_escape;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -108,20 +109,6 @@ pub struct GrepRow {
     pub kind: String,
     /// The item's full text content (the match lives inside it).
     pub content: String,
-}
-
-/// Escape `%`, `_`, and `\` for use inside a `LIKE … ESCAPE '\'` pattern, so a namespace
-/// path (which can contain `_`, e.g. the reserved `_sys` root) is matched literally rather
-/// than as wildcards.
-fn like_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Literal-substring content search (grep semantics), optionally scoped to the namespace
