@@ -368,6 +368,15 @@ built lazily only where needed so read/task/query/sync/undo work fully offline; 
 captures (FTS-searchable) even when the embedder is down. Errors use `anyhow` at this
 edge. Tests: `tests/cli.rs` via `assert_cmd`, all offline.
 
+**Linux-style + agent-facing verbs** (ergonomic wrappers over the same reads; `output.rs`
+human+`--json`): `ls [path] [-l -R -t -a]` (children; `list_children`), `tree [path]`
+(recursive map + per-folder `ns::subtree_leaf_count`), `grep <pat> [path] [-i -l -c]`
+(literal substring via `SQLite` `instr`, new `item::grep`; **exits 1 on no match** — the
+only nonzero-on-empty command), `find [path] --kind/--tag/--status` (typed search → query
+DSL), `recent [path]` (updated-desc listing), `cat <uid>` (raw body) / `stat <uid>`
+(metadata, no body), and `guide` (the agent cheat-sheet, mirrored in root `AGENTS.md`).
+`grep` = literal, `find`/`query` = structured, `search` = ranked — pick by what you know.
+
 ## Section 13 — jkb-mcp (DONE, for reference)
 
 `crates/jkb-mcp` is the `rmcp` 2.0 stdio MCP server (design D17). Split in two:

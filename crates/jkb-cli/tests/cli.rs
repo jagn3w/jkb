@@ -1179,3 +1179,207 @@ fn ns_mk_scaffolds_roots_and_is_idempotent() {
         .success()
         .stdout(predicate::str::contains("media/transcripts"));
 }
+
+#[test]
+fn grep_is_literal_scoped_and_exit_coded() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "buy a 6-inch pipe", "+proj/hw"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "write the DESIGN doc", "+proj/docs"])
+        .assert()
+        .success();
+
+    // Literal match, scoped, exit 0, prints uid:line:text.
+    jkb(&db)
+        .args(["grep", "pipe", "proj"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(":1:buy a 6-inch pipe"));
+    // Case-sensitive by default: lowercase "design" misses the uppercase title.
+    jkb(&db).args(["grep", "design", "proj"]).assert().code(1);
+    // -i makes it match; -l prints only the uid (no `:line:` body).
+    jkb(&db)
+        .args(["grep", "-i", "design", "proj", "-l"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("task:write-the-design-doc")
+                .and(predicate::str::contains(":1:").not()),
+        );
+    // -c counts matching items.
+    jkb(&db)
+        .args(["grep", "-c", "pipe", "proj"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+    // No match anywhere → exit 1.
+    jkb(&db)
+        .args(["--global", "grep", "zzznope"])
+        .assert()
+        .code(1);
+    // A scope with no match → exit 1 (pipe is under proj/hw, not proj/docs).
+    jkb(&db)
+        .args(["grep", "pipe", "proj/docs"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn ls_long_and_recursive() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "alpha task", "+proj/a"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "beta task", "+proj/b"])
+        .assert()
+        .success();
+
+    // -l shows kind + location + label.
+    jkb(&db)
+        .args(["--global", "ls", "proj/a", "-l"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task").and(predicate::str::contains("alpha task")));
+    // -R flattens the subtree so both leaf tasks appear from the root.
+    jkb(&db)
+        .args(["--global", "ls", "proj", "-R"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha task").and(predicate::str::contains("beta task")));
+}
+
+#[test]
+fn cat_prints_raw_body() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "cat me", "+proj/x"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["grep", "cat me", "proj", "-l"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let uid = String::from_utf8(out).unwrap();
+    jkb(&db)
+        .args(["cat", uid.trim()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cat me"));
+    jkb(&db).args(["cat", "task:nope"]).assert().failure();
+}
+
+#[test]
+fn tree_find_recent_stat_guide() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "alpha task", "+proj/a"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "beta task", "+proj/b"])
+        .assert()
+        .success();
+
+    // tree: both leaf namespaces appear under the root.
+    jkb(&db)
+        .args(["--global", "tree", "proj"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("├─").and(predicate::str::contains("alpha task")));
+
+    // find: structured filter by kind (and it's the typed complement to grep).
+    jkb(&db)
+        .args(["--global", "find", "proj", "--kind", "task"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha task").and(predicate::str::contains("beta task")));
+    // find with a non-matching status yields nothing but still succeeds.
+    jkb(&db)
+        .args(["--global", "find", "proj", "--status", "done"])
+        .assert()
+        .success();
+
+    // recent: newest first — beta (added later) precedes alpha in the output.
+    let out = jkb(&db)
+        .args(["--global", "recent", "proj"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.find("beta task").unwrap() < text.find("alpha task").unwrap());
+
+    // stat: compact metadata, no body dump.
+    let uid = String::from_utf8(
+        jkb(&db)
+            .args(["grep", "beta", "proj", "-l"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    jkb(&db)
+        .args(["stat", uid.trim()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kind:").and(predicate::str::contains("proj/b")));
+
+    // guide: prints the cheat-sheet.
+    jkb(&db)
+        .args(["guide"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent quickstart"));
+}
+
+#[test]
+fn find_guards_unscoped_and_tree_bounds_depth() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    // A deep chain a/b/c/d/e/f so the default tree depth elides the bottom.
+    jkb(&db)
+        .args(["task", "add", "deep", "+a/b/c/d/e/f"])
+        .assert()
+        .success();
+
+    // Unfiltered, unscoped, global `find` refuses rather than dumping the whole KB.
+    jkb(&db)
+        .args(["--global", "find"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would list the entire KB"));
+    // Any filter makes it fine.
+    jkb(&db)
+        .args(["--global", "find", "--kind", "task"])
+        .assert()
+        .success();
+    // A path makes it fine.
+    jkb(&db).args(["--global", "find", "a"]).assert().success();
+
+    // Default-depth tree elides the deepest folder with `…`; --depth reveals it.
+    jkb(&db)
+        .args(["--global", "tree", "a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("…").and(predicate::str::contains("deep").not()));
+    jkb(&db)
+        .args(["--global", "tree", "a", "--depth", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deep"));
+}

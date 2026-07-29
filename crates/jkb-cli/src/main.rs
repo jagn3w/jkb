@@ -148,7 +148,87 @@ enum Command {
         /// Include terminal (`done`/`cancelled`) tasks (hidden by default).
         #[arg(long)]
         all: bool,
+        /// Long format: kind, status, and namespace/uid per row.
+        #[arg(short = 'l', long)]
+        long: bool,
+        /// Recurse into sub-namespaces (depth-first).
+        #[arg(short = 'R', long)]
+        recursive: bool,
+        /// Sort by most-recently-updated instead of by name.
+        #[arg(short = 't', long)]
+        time: bool,
     },
+    /// Literal-substring content search over a namespace subtree (grep semantics). Exit 0
+    /// if any item matched, 1 if none. `[path]` scopes the search (default: ambient/cwd).
+    Grep {
+        /// The substring to find (literal, not a regex).
+        pattern: String,
+        /// Namespace subtree to search (default: ambient scope, or everything with --global).
+        path: Option<String>,
+        /// Case-insensitive matching.
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// List only the matching items' uids, not the matching lines.
+        #[arg(short = 'l', long = "files-with-matches")]
+        names_only: bool,
+        /// Print only a count of matching items.
+        #[arg(short = 'c', long)]
+        count: bool,
+    },
+    /// Print an item's full content to stdout (like `cat`). A convenience over
+    /// `item show --preview` for piping a task/note/document body to a tool or an agent.
+    Cat {
+        /// The item uid.
+        uid: String,
+    },
+    /// Recursive namespace tree (like `tree`), with a leaf count per folder. One call maps
+    /// a whole subtree so an agent can orient before drilling in. Omit `path` for the roots.
+    Tree {
+        /// The namespace to root the tree at (default: top-level roots).
+        path: Option<String>,
+        /// Include terminal (`done`/`cancelled`) items in the counts.
+        #[arg(long)]
+        all: bool,
+        /// Maximum depth to descend (default: 4; deeper folders show `…`). Raise for more.
+        #[arg(long)]
+        depth: Option<usize>,
+    },
+    /// Structured item search by kind/tag/status over a namespace subtree — the typed
+    /// complement to `grep`'s text search. Sugar over the query DSL with familiar flags.
+    Find {
+        /// Namespace subtree to search (default: ambient scope, or all with --global).
+        path: Option<String>,
+        /// Restrict to a kind (e.g. `task`, `document`, `note`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Require a tag `facet=value` (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Restrict to a task status (e.g. `open`, `done`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// The most-recently-updated items in a subtree — what changed lately. Sugar for a
+    /// time-sorted listing so an agent can catch up quickly.
+    Recent {
+        /// Namespace subtree (default: ambient scope, or everything with --global).
+        path: Option<String>,
+        /// How many to show (default: 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Compact metadata for one item (kind, namespace, tags, sizes, timestamps) — the quick
+    /// `stat`, without the body. Use `jkb cat`/`item show` for content.
+    Stat {
+        /// The item uid.
+        uid: String,
+    },
+    /// Print a one-page cheat-sheet of the agent-facing command surface (verbs, flags,
+    /// exit-code and `--json` conventions). Start here when driving jkb from an agent.
+    Guide,
     /// Inspect items (generic, kind-aware).
     Item {
         #[command(subcommand)]
@@ -480,6 +560,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)] // a flat command dispatcher; one arm per subcommand
 fn run(cli: Cli) -> Result<()> {
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
     // (best-effort, silent). Skipped for explicit `jkb commands …` so it never fights the
@@ -534,7 +615,65 @@ fn run(cli: Cli) -> Result<()> {
         Command::Index => cmd_index(&db),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
-        Command::Ls { path, all } => cmd_ls(&db, path.as_deref(), all, json),
+        Command::Ls {
+            path,
+            all,
+            long,
+            recursive,
+            time,
+        } => cmd_ls(
+            &db,
+            path.as_deref(),
+            LsOpts {
+                all,
+                long,
+                recursive,
+                time,
+            },
+            json,
+        ),
+        Command::Grep {
+            pattern,
+            path,
+            ignore_case,
+            names_only,
+            count,
+        } => cmd_grep(
+            &db,
+            &pattern,
+            path.as_deref(),
+            GrepOpts {
+                ignore_case,
+                names_only,
+                count,
+            },
+            global,
+            json,
+        ),
+        Command::Cat { uid } => cmd_cat(&db, &uid),
+        Command::Tree { path, all, depth } => cmd_tree(&db, path.as_deref(), all, depth, json),
+        Command::Find {
+            path,
+            kind,
+            tags,
+            status,
+            limit,
+        } => cmd_find(
+            &db,
+            path.as_deref(),
+            kind.as_deref(),
+            &tags,
+            status.as_deref(),
+            limit,
+            global,
+            json,
+        ),
+        Command::Recent { path, limit } => cmd_recent(&db, path.as_deref(), limit, global, json),
+        Command::Stat { uid } => cmd_stat(&db, &uid, json),
+        Command::Guide => {
+            cmd_guide();
+            Ok(())
+        }
         Command::Item { cmd } => match cmd {
             ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
             ItemCmd::Edit {
@@ -793,6 +932,8 @@ struct Child {
     /// terminal-status toggle). `None` for item children. Lets the pane flag which folders
     /// lead to real content.
     leaf_count: Option<i64>,
+    /// The item's `updated_at` (for `ls -t`); `None` for namespaces.
+    updated: Option<String>,
 }
 
 impl Child {
@@ -805,6 +946,7 @@ impl Child {
             "status": self.status,
             "priority": self.priority,
             "leaf_count": self.leaf_count,
+            "updated": self.updated,
         })
     }
 
@@ -876,6 +1018,7 @@ fn list_children(
             status: None,
             priority: None,
             leaf_count: Some(leaf_count),
+            updated: None,
         });
     }
 
@@ -901,6 +1044,7 @@ fn list_children(
                     status: meta.status,
                     priority: meta.priority,
                     leaf_count: None,
+                    updated: Some(meta.updated_at.clone()),
                 });
             }
         }
@@ -909,30 +1053,443 @@ fn list_children(
     Ok(out)
 }
 
-/// `jkb ls [path]` — the direct children of a namespace, for lazy tree expansion.
-fn cmd_ls(db: &Db, path: Option<&str>, all: bool, json: bool) -> Result<()> {
+/// Flags for `jkb ls` (the ergonomic listing verb).
+#[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // a CLI flags bag, not state
+struct LsOpts {
+    all: bool,
+    long: bool,
+    recursive: bool,
+    time: bool,
+}
+
+/// `jkb ls [path]` — namespaces + items under a namespace (the lazy tree primitive plus
+/// familiar `-l`/`-R`/`-t` ergonomics). `-R` walks the subtree depth-first; without it,
+/// just the direct children.
+fn cmd_ls(db: &Db, path: Option<&str>, opts: LsOpts, json: bool) -> Result<()> {
     let owned = path.map(str::to_owned);
-    let children = db.read(move |conn| list_children(conn, owned.as_deref(), all))?;
+    let all = opts.all;
+    let recursive = opts.recursive;
+    // (namespace shown as the row's "parent", child) pairs — the parent gives `-l`/`-R`
+    // rows a stable location column even when descending.
+    let rows: Vec<(Option<String>, Child)> = db.read(move |conn| {
+        let mut acc = Vec::new();
+        collect_ls(conn, owned.as_deref(), all, recursive, &mut acc)?;
+        Ok(acc)
+    })?;
+
+    let mut rows = rows;
+    if opts.time {
+        // Most-recently-updated first; rows without an `updated` (namespaces) sort last.
+        rows.sort_by(|a, b| b.1.updated.cmp(&a.1.updated));
+    }
+
     if json {
-        let v = serde_json::json!({
-            "path": path,
-            "children": children.iter().map(Child::to_json).collect::<Vec<_>>(),
-        });
+        let children: Vec<_> = rows.iter().map(|(_, c)| c.to_json()).collect();
+        let v = serde_json::json!({ "path": path, "children": children });
         println!("{}", serde_json::to_string_pretty(&v)?);
-    } else if children.is_empty() {
+    } else if rows.is_empty() {
         println!("(empty)");
     } else {
-        for c in &children {
-            let arrow = if c.has_children { "▸" } else { " " };
-            let status = c
-                .status
-                .as_deref()
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default();
-            println!("{arrow} {:<10} {}{status}", c.kind, c.label);
+        for (parent, c) in &rows {
+            print_ls_row(parent.as_deref(), c, opts);
         }
     }
     Ok(())
+}
+
+/// Accumulate `ls` rows, optionally recursing into sub-namespaces depth-first. Each row is
+/// `(parent namespace path, child)`.
+fn collect_ls(
+    conn: &rusqlite::Connection,
+    path: Option<&str>,
+    all: bool,
+    recursive: bool,
+    acc: &mut Vec<(Option<String>, Child)>,
+) -> jkb_core::Result<()> {
+    let children = list_children(conn, path, all)?;
+    for c in children {
+        let is_ns = c.kind == "namespace";
+        let ns_path = c.reference.clone();
+        acc.push((path.map(str::to_owned), c));
+        if recursive && is_ns {
+            collect_ls(conn, Some(&ns_path), all, recursive, acc)?;
+        }
+    }
+    Ok(())
+}
+
+/// One human-readable `ls` row. `-l` adds kind/status and the location (namespace path for a
+/// sub-namespace, or `parent → uid` for an item); the default is the compact tree row.
+fn print_ls_row(parent: Option<&str>, c: &Child, opts: LsOpts) {
+    let status = c
+        .status
+        .as_deref()
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    if opts.long {
+        let loc = if c.kind == "namespace" {
+            c.reference.clone()
+        } else {
+            match parent {
+                Some(p) => format!("{p} → {}", c.reference),
+                None => c.reference.clone(),
+            }
+        };
+        let updated = c.updated.as_deref().unwrap_or("");
+        println!(
+            "{:<10} {:<12} {:<24} {}{status}",
+            c.kind, updated, loc, c.label
+        );
+    } else {
+        let arrow = if c.has_children { "▸" } else { " " };
+        // When recursing, prefix items with their namespace so the flattened list stays legible.
+        let loc = match (opts.recursive, parent, c.kind.as_str()) {
+            (true, Some(p), k) if k != "namespace" => format!("{p}/"),
+            _ => String::new(),
+        };
+        println!("{arrow} {:<10} {loc}{}{status}", c.kind, c.label);
+    }
+}
+
+/// Flags for `jkb grep`.
+#[derive(Clone, Copy)]
+struct GrepOpts {
+    ignore_case: bool,
+    names_only: bool,
+    count: bool,
+}
+
+/// `jkb grep <pattern> [path]` — literal-substring content search over a namespace subtree.
+/// Prints `uid:line` per matching line (or just uids with `-l`, or a count with `-c`), and
+/// **exits 1 when nothing matched** so it composes in scripts like real grep.
+fn cmd_grep(
+    db: &Db,
+    pattern: &str,
+    path: Option<&str>,
+    opts: GrepOpts,
+    global: bool,
+    json: bool,
+) -> Result<()> {
+    // Explicit path wins; otherwise scope to the ambient namespace (nothing = search all).
+    let scope = match path {
+        Some(p) => Some(p.to_owned()),
+        None => ambient(db, global)?,
+    };
+    let (pat, scope2) = (pattern.to_owned(), scope.clone());
+    let hits = db.read(move |conn| item::grep(conn, &pat, scope2.as_deref(), opts.ignore_case))?;
+
+    // Extract the matching lines per item (the SQL already confirmed a match exists).
+    let needle = if opts.ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_owned()
+    };
+    let matches_line = |line: &str| {
+        if opts.ignore_case {
+            line.to_lowercase().contains(&needle)
+        } else {
+            line.contains(&needle)
+        }
+    };
+
+    if opts.count {
+        let n = hits.len();
+        if json {
+            println!("{}", serde_json::json!({ "count": n }));
+        } else {
+            println!("{n}");
+        }
+        if n == 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if json {
+        let arr: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                let lines: Vec<_> = h
+                    .content
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, l)| matches_line(l))
+                    .map(|(i, l)| serde_json::json!({ "line": i + 1, "text": l }))
+                    .collect();
+                serde_json::json!({ "uid": h.uid, "kind": h.kind, "matches": lines })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else if opts.names_only {
+        for h in &hits {
+            println!("{}", h.uid);
+        }
+    } else {
+        for h in &hits {
+            for (i, line) in h.content.lines().enumerate() {
+                if matches_line(line) {
+                    println!("{}:{}:{}", h.uid, i + 1, line.trim_end());
+                }
+            }
+        }
+    }
+
+    if hits.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `jkb cat <uid>` — print an item's full content to stdout (no metadata, no truncation),
+/// so a task/note/document body pipes cleanly into another tool or an agent's context.
+fn cmd_cat(db: &Db, uid: &str) -> Result<()> {
+    let u = uid.to_owned();
+    let content = db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(None);
+        };
+        item::get_content(conn, id).map(Some)
+    })?;
+    match content {
+        None => anyhow::bail!("no item with uid `{uid}`"),
+        Some(c) => print!("{}", c.unwrap_or_default()),
+    }
+    Ok(())
+}
+
+/// `jkb find [path] --kind --tag --status` — structured item search: familiar flags that
+/// compile to the query DSL (the typed complement to `grep`). Empty filters = list the
+/// scope (like `find .`); scope defaults to the ambient namespace.
+#[allow(clippy::too_many_arguments)]
+fn cmd_find(
+    db: &Db,
+    path: Option<&str>,
+    kind: Option<&str>,
+    tags: &[String],
+    status: Option<&str>,
+    limit: Option<usize>,
+    global: bool,
+    json: bool,
+) -> Result<()> {
+    // Refuse the one footgun: no filter, no path, no ambient scope, no limit would list the
+    // entire KB. Any filter / path / --limit (or being inside a mounted repo) makes it fine.
+    let unfiltered = kind.is_none() && tags.is_empty() && status.is_none() && path.is_none();
+    if unfiltered && limit.is_none() && ambient(db, global)?.is_none() {
+        anyhow::bail!(
+            "`find` with no filters would list the entire KB — add --kind/--tag/--status, a path, or --limit"
+        );
+    }
+
+    let mut terms: Vec<String> = Vec::new();
+    if let Some(k) = kind {
+        terms.push(format!("kind:{k}"));
+    }
+    for t in tags {
+        terms.push(format!("tag:{t}"));
+    }
+    if let Some(s) = status {
+        terms.push(format!("status:{s}"));
+    }
+    if let Some(p) = path {
+        terms.push(format!("ns:{p}/**"));
+    }
+    cmd_query(db, &terms.join(" "), limit, false, global, json)
+}
+
+/// `jkb recent [path]` — the most-recently-updated items in a subtree, newest first.
+fn cmd_recent(db: &Db, path: Option<&str>, limit: usize, global: bool, json: bool) -> Result<()> {
+    let dsl = path.map(|p| format!("ns:{p}/**")).unwrap_or_default();
+    let mut query = jkb_core::query::parse(&dsl)?;
+    apply_ambient(&mut query, db, global)?;
+    let ids = db.read(move |conn| query.evaluate(conn))?;
+    let mut items = output::fetch_items(db, &ids)?;
+    // Newest first; missing timestamps (shouldn't happen) sort last.
+    items.sort_by(|a, b| b.updated.cmp(&a.updated));
+    items.truncate(limit);
+    output::print_items(&items, json);
+    Ok(())
+}
+
+/// `jkb stat <uid>` — compact metadata for one item (no body).
+fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
+    let u = uid.to_owned();
+    let found = db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &u)? else {
+            return Ok(None);
+        };
+        let Some(meta) = item::get(conn, id)? else {
+            return Ok(None);
+        };
+        let binding = binding::get(conn, id)?.map(|b| b.uri);
+        let tags = tag::applications(conn, id)?;
+        let namespace = primary_ns(conn, id)?;
+        Ok(Some((meta, binding, tags, namespace)))
+    })?;
+    let Some((meta, binding, tags, namespace)) = found else {
+        anyhow::bail!("no item with uid `{uid}`");
+    };
+    let chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": meta.uid, "kind": meta.kind, "status": meta.status,
+                "priority": meta.priority, "due": meta.due, "mime": meta.mime,
+                "namespace": namespace, "binding": binding, "content_chars": chars,
+                "tags": tags.iter().map(|(f, v)| serde_json::json!({"facet": f, "value": v})).collect::<Vec<_>>(),
+                "created_at": meta.created_at, "updated_at": meta.updated_at,
+            })
+        );
+    } else {
+        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
+        println!("content:   {chars} chars");
+    }
+    Ok(())
+}
+
+/// One node in the `jkb tree` output: a listed child plus its recursively-listed children.
+struct TreeNode {
+    child: Child,
+    children: Vec<TreeNode>,
+}
+
+fn tree_nodes(
+    conn: &rusqlite::Connection,
+    path: Option<&str>,
+    all: bool,
+    depth_left: Option<usize>,
+) -> jkb_core::Result<Vec<TreeNode>> {
+    let mut out = Vec::new();
+    for child in list_children(conn, path, all)? {
+        let descend = child.kind == "namespace" && depth_left != Some(0);
+        let children = if descend {
+            tree_nodes(conn, Some(&child.reference), all, depth_left.map(|d| d - 1))?
+        } else {
+            Vec::new()
+        };
+        out.push(TreeNode { child, children });
+    }
+    Ok(out)
+}
+
+fn tree_to_json(node: &TreeNode) -> serde_json::Value {
+    let mut v = node.child.to_json();
+    if !node.children.is_empty() {
+        v["children"] = node.children.iter().map(tree_to_json).collect();
+    }
+    v
+}
+
+/// Depth `jkb tree` descends by default before eliding deeper folders with `…` — deep
+/// enough to map any real subtree, shallow enough to bound the output and the per-namespace
+/// query fan-out (each level lists its children). `--depth` overrides.
+const DEFAULT_TREE_DEPTH: usize = 4;
+
+/// Render one tree level with box-drawing prefixes (`├─`/`└─`); a namespace elided by the
+/// depth cap (it has children we didn't descend into) gets a trailing `…`.
+fn print_tree(nodes: &[TreeNode], prefix: &str) {
+    for (i, node) in nodes.iter().enumerate() {
+        let last = i + 1 == nodes.len();
+        let (branch, cont) = if last {
+            ("└─ ", "   ")
+        } else {
+            ("├─ ", "│  ")
+        };
+        let leaves = node
+            .child
+            .leaf_count
+            .filter(|_| node.child.kind == "namespace")
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        let status = node
+            .child
+            .status
+            .as_deref()
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default();
+        let elided = if node.children.is_empty()
+            && node.child.has_children
+            && node.child.kind == "namespace"
+        {
+            " …"
+        } else {
+            ""
+        };
+        println!(
+            "{prefix}{branch}{}{leaves}{status}{elided}",
+            node.child.label
+        );
+        print_tree(&node.children, &format!("{prefix}{cont}"));
+    }
+}
+
+/// `jkb tree [path]` — a recursive map of the namespace subtree with per-folder counts.
+fn cmd_tree(
+    db: &Db,
+    path: Option<&str>,
+    all: bool,
+    depth: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let owned = path.map(str::to_owned);
+    let depth = Some(depth.unwrap_or(DEFAULT_TREE_DEPTH));
+    let nodes = db.read(move |conn| tree_nodes(conn, owned.as_deref(), all, depth))?;
+    if json {
+        let v = serde_json::json!({
+            "path": path,
+            "tree": nodes.iter().map(tree_to_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("{}", path.unwrap_or("."));
+        print_tree(&nodes, "");
+    }
+    Ok(())
+}
+
+/// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
+fn cmd_guide() {
+    print!(
+        r#"jkb — agent quickstart
+
+CONVENTIONS
+  --json      every read command emits machine-readable JSON; parse that, not the text.
+  --global    ignore the cwd-based ambient namespace scope (search/list everything).
+  exit codes  `grep` exits 1 when nothing matched (0 = found). Lookups of a missing uid
+              error (nonzero). Everything else is 0 on success.
+  namespaces  the KB is a virtual filesystem: `repos/<repo>/…`, `tasks/…`, `media/`,
+              `references/`, `memory/`. Items are "files"; typed edges + tags cross-cut.
+
+ORIENT (read-only)
+  jkb tree [path]              map a subtree (folders + per-folder counts), one call.
+  jkb ls [path] [-l -R -t -a]  list a namespace's children (long / recursive / by-time / all).
+  jkb recent [path]           most-recently-updated items — what changed lately.
+  jkb find [path] --kind K --tag f=v --status S   structured search (typed; → query DSL).
+  jkb grep <pat> [path] [-i -l -c]   literal-substring content search; exit 1 on no match.
+  jkb query "<DSL>"           full query DSL (kind: tag: status: ns: is:ready due<= …).
+  jkb search "<terms>" --route hybrid   ranked vector/FTS retrieval (needs the embedder).
+
+READ ONE ITEM
+  jkb cat <uid>               the raw body to stdout (pipe it, no metadata).
+  jkb stat <uid>              compact metadata (kind, namespace, tags, timestamps).
+  jkb item show <uid>         metadata + a (bounded) body preview.
+
+TASKS
+  jkb task add "text !p1 @2026-07-15 +ns #facet=value"   quick-add.
+  jkb task next [DSL]         the ready frontier (unblocked, by priority then due).
+  jkb task set <uid> --status done|open|in_progress|needs_review
+  jkb task show <uid>         the full task body.
+
+WRITE (all audited + undoable)
+  jkb item edit <uid> [--append] <text>   replace/append an item's content.
+  jkb task tag add <uid> facet=value      apply a tag.
+  jkb undo                                revert the last change.
+
+Tips: prefer `find`/`query` (structured) over `grep` when you know the kind/tag; add
+`--json` and parse; scope with a path or rely on the ambient cwd namespace.
+"#
+    );
 }
 
 /// The item's primary (home) namespace path, if placed.
