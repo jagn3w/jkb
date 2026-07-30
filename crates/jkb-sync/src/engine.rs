@@ -1086,14 +1086,16 @@ fn mirror_paths_for(
     if ids.is_empty() {
         return Ok(out);
     }
-    let subtree_like = format!("{file_ns_path}/%");
+    // Escape LIKE metacharacters in the path (namespace paths contain `_`), so the subtree
+    // exclusion is literal and doesn't spuriously match a sibling namespace.
+    let subtree_like = format!("{}/%", jkb_core::sql::like_escape(file_ns_path));
     let placeholders = vec!["?"; ids.len()].join(", ");
     // `tasks/**` reference placements are the internal task index (auto-mirrored by
     // `task::ensure_task_mirror`), not user-authored `+ns` mirrors — never serialize
     // them back into the file, or they'd leak in as `+tasks/…` and break byte-stability.
     let sql = format!(
         "SELECT p.item_id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ?
+         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ? ESCAPE '\\'
            AND n.path != 'tasks' AND n.path NOT LIKE 'tasks/%'
            AND p.item_id IN ({placeholders})
          ORDER BY p.item_id, n.path"

@@ -10,6 +10,7 @@ use serde_json::json;
 
 use jkb_types::{ItemId, SyncMode};
 
+use crate::sql::like_escape;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -105,12 +106,14 @@ pub fn items_for_uris(conn: &Connection, uris: &[String]) -> Result<HashMap<Stri
 /// # Errors
 /// Returns an error if the query fails.
 pub fn synced_uris_under(conn: &Connection, ns_path: &str) -> Result<Vec<String>> {
-    let like = format!("{ns_path}/%");
+    // Escape LIKE metacharacters in the path (`_sys`, `jkb-v1-foundation` all contain `_`),
+    // else the subtree prefix would match sibling namespaces.
+    let like = format!("{}/%", like_escape(ns_path));
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT b.uri FROM bindings b
          JOIN placements p ON p.item_id = b.item_id
          JOIN namespaces n ON n.id = p.namespace_id
-         WHERE b.uri LIKE 'file://%' AND (n.path = ?1 OR n.path LIKE ?2)",
+         WHERE b.uri LIKE 'file://%' AND (n.path = ?1 OR n.path LIKE ?2 ESCAPE '\\')",
     )?;
     let rows = stmt.query_map(params![ns_path, like], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
@@ -129,9 +132,12 @@ pub fn synced_uris_under(conn: &Connection, ns_path: &str) -> Result<Vec<String>
 /// # Errors
 /// Returns an error if the query fails.
 pub fn synced_uris_for_file(conn: &Connection, bare_uri: &str) -> Result<Vec<String>> {
-    let fragment_like = format!("{bare_uri}#%");
-    let mut stmt =
-        conn.prepare_cached("SELECT uri FROM bindings WHERE uri = ?1 OR uri LIKE ?2 ORDER BY uri")?;
+    // Escape LIKE metacharacters — file uris commonly contain `_` (a wildcard), so an
+    // unescaped `<uri>#%` could gather a *different* file's item bindings.
+    let fragment_like = format!("{}#%", like_escape(bare_uri));
+    let mut stmt = conn.prepare_cached(
+        "SELECT uri FROM bindings WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\' ORDER BY uri",
+    )?;
     let rows = stmt.query_map(params![bare_uri, fragment_like], |row| {
         row.get::<_, String>(0)
     })?;
@@ -188,10 +194,58 @@ pub fn get(conn: &Connection, item: ItemId) -> Result<Option<Binding>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get, set};
+    use super::{get, set, synced_uris_for_file};
     use crate::item::{upsert, NewItem};
     use crate::Db;
     use jkb_types::SyncMode;
+
+    #[test]
+    fn synced_uris_for_file_does_not_leak_across_underscore_siblings() {
+        // Two files whose names differ only where one has `_` and the other any char — a
+        // LIKE wildcard would conflate them when gathering a file's item bindings.
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            for (uid, uri) in [
+                ("a", "file:///repo/a_b.md#one"),
+                ("b", "file:///repo/a_b.md#two"),
+                ("c", "file:///repo/axb.md#three"), // sibling: `x` where the other has `_`
+            ] {
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: uid.to_owned(),
+                        kind: "task".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                set(
+                    conn,
+                    meta,
+                    item,
+                    uri,
+                    Some(SyncMode::Bidirectional),
+                    Some("tasks"),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let uris = db
+            .read(|conn| synced_uris_for_file(conn, "file:///repo/a_b.md"))
+            .unwrap();
+        assert_eq!(
+            uris,
+            vec![
+                "file:///repo/a_b.md#one".to_owned(),
+                "file:///repo/a_b.md#two".to_owned(),
+            ],
+            "the `axb.md` sibling must not be gathered via the `_` wildcard"
+        );
+    }
 
     #[test]
     fn binding_set_and_get_roundtrip() {

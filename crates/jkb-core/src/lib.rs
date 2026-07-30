@@ -21,6 +21,7 @@ pub mod mount;
 pub mod ns;
 pub mod placement;
 pub mod query;
+pub mod sql;
 pub mod sync_state;
 pub mod tag;
 pub mod task;
