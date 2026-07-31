@@ -22,7 +22,7 @@ use jkb_core::blob;
 use jkb_core::dsl::{slug, tokenize, unquote};
 use jkb_types::{EdgeType, Error as TypeError};
 
-use super::{SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
+use super::{SyncBlock, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
 use crate::{Error, Result};
 
 /// The `tasks` serializer (one file ⇄ many task items).
@@ -63,7 +63,10 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
             st.on_header(line, level, header_text);
         } else if let Some((indent, status, rest)) = task_line(line) {
             st.on_task(indent, status, rest)?;
+        } else if st.take_continuation(line) {
+            // An indented, non-blank line under an open task is that task's own body.
         } else {
+            st.open_task = None;
             st.text_run.push(line.to_owned());
         }
     }
@@ -83,7 +86,6 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
 #[derive(Default)]
 struct ParseState {
     doc: SyncDoc,
-    pos: i64,
     /// Every minted/claimed `local_id` (tasks and text), so none collide.
     used_ids: HashSet<String>,
     /// Every section slug path, so none collide.
@@ -96,30 +98,57 @@ struct ParseState {
     task_stack: Vec<(usize, String)>,
     /// Accumulated prose/blank lines awaiting a boundary.
     text_run: Vec<String>,
+    /// `(index into doc.items, own indent)` of the task whose body is still open, so an
+    /// indented line beneath it is appended to *it* rather than floating in the section.
+    open_task: Option<(usize, usize)>,
 }
 
 impl ParseState {
-    /// Emit any accumulated prose/blank lines as one verbatim `text` item.
+    /// If `line` continues the open task's body, append it to that task's content and
+    /// report `true`.
+    ///
+    /// A continuation is a **non-blank line indented deeper than its task** that is not
+    /// itself a task line — the shape every multi-line entry in a tasks file already uses
+    /// (a finding's failure scenario, a decision's rationale). It belongs to the *item*, not
+    /// to the section: stored on the section it drifts away from the task it explains and can
+    /// be stranded when the task moves (see `memory/sync-export-wins`).
+    ///
+    /// A blank line closes the body, so a second paragraph becomes ordinary section prose —
+    /// predictable, and it still round-trips byte-for-byte.
+    fn take_continuation(&mut self, line: &str) -> bool {
+        let Some((index, task_indent)) = self.open_task else {
+            return false;
+        };
+        let indent = line.len() - line.trim_start().len();
+        if line.trim().is_empty() || indent <= task_indent {
+            self.open_task = None;
+            return false;
+        }
+        // Any pending prose belongs before this task, which was already emitted.
+        let item = &mut self.doc.items[index];
+        item.content.push('\n');
+        item.content.push_str(line.trim_start());
+        true
+    }
+
+    /// Emit any accumulated prose/blank lines as one verbatim [`SyncProse`] block.
+    ///
+    /// Prose is **not** an item: it has no identity to give it. Minting one from a content
+    /// hash plus an occurrence counter produced ids that broke on the next edit, and the
+    /// orphans kept their sections alive forever (see `memory/sync-export-wins`).
     fn flush_text(&mut self) {
         if self.text_run.is_empty() {
             return;
         }
         let content = self.text_run.join("\n");
         self.text_run.clear();
-        let local_id = uniquify(
-            format!("text-{}", &blob::hash_bytes(content.as_bytes())[..8]),
-            &mut self.used_ids,
-        );
-        let mut item = SyncItem::new(local_id, "text", content);
-        item.section.clone_from(&self.current_section);
-        item.position = self.pos;
-        self.doc.items.push(item);
-        self.pos += 1;
+        self.doc.layout.push(SyncBlock::Prose(content));
     }
 
     /// Handle a `##` header: open a namespace-mapped section, resetting task nesting.
     fn on_header(&mut self, line: &str, level: usize, header_text: &str) {
         self.flush_text();
+        self.open_task = None;
         self.task_stack.clear();
         while self.sec_stack.last().is_some_and(|(lvl, _)| *lvl >= level) {
             self.sec_stack.pop();
@@ -132,12 +161,11 @@ impl ParseState {
         let path = uniquify(base, &mut self.used_sections);
         self.sec_stack.push((level, path.clone()));
         self.current_section = Some(path.clone());
+        self.doc.layout.push(SyncBlock::Section(path.clone()));
         self.doc.sections.push(SyncSection {
             path,
             header_line: line.to_owned(),
-            position: self.pos,
         });
-        self.pos += 1;
     }
 
     /// Handle a `- [ ]` task line: create the item, its hierarchy, and its edges.
@@ -167,15 +195,18 @@ impl ParseState {
 
         let mut item = SyncItem::new(local_id.clone(), "task", parsed.title);
         item.section.clone_from(&self.current_section);
-        item.position = self.pos;
         item.status = Some(status.to_owned());
         item.priority = parsed.priority;
         item.due = parsed.due;
         item.tags = parsed.tags;
         item.mirrors = parsed.mirrors;
         item.parent.clone_from(&parent);
+        // `position` is the KB-side ordering hint (`placements.position`), derived from the
+        // block index; document order itself lives in `layout`.
+        item.position = i64::try_from(self.doc.layout.len()).unwrap_or(i64::MAX);
+        self.doc.layout.push(SyncBlock::Item(local_id.clone()));
+        self.open_task = Some((self.doc.items.len(), indent));
         self.doc.items.push(item);
-        self.pos += 1;
 
         if let Some(p) = parent {
             self.doc.edges.push(SyncEdge {
@@ -247,12 +278,6 @@ fn visit<'a>(
     false
 }
 
-/// A section header or an item, interleaved by `position` when rendering.
-enum Block<'a> {
-    Section(&'a SyncSection),
-    Item(&'a SyncItem),
-}
-
 /// Render a [`SyncDoc`] back to file bytes: merge sections and items by `position` and
 /// emit each as a line (or verbatim block for `text`), with a single trailing newline.
 fn render_doc(doc: &SyncDoc) -> String {
@@ -269,33 +294,71 @@ fn render_doc(doc: &SyncDoc) -> String {
         }
     }
 
-    // Interleave sections and items in file order.
-    let mut blocks: Vec<(i64, Block)> = Vec::new();
-    for s in &doc.sections {
-        blocks.push((s.position, Block::Section(s)));
-    }
-    for i in &doc.items {
-        blocks.push((i.position, Block::Item(i)));
-    }
-    blocks.sort_by_key(|(p, _)| *p);
+    // Walk the layout — the document's own block order. Nothing is sorted and no ordinal is
+    // consulted, so there is no second sequence for this one to drift against.
+    let sections: HashMap<&str, &SyncSection> =
+        doc.sections.iter().map(|s| (s.path.as_str(), s)).collect();
+    let items: HashMap<&str, &SyncItem> =
+        doc.items.iter().map(|i| (i.local_id.as_str(), i)).collect();
 
     let mut lines: Vec<String> = Vec::new();
-    for (_, block) in blocks {
+    for block in &doc.layout {
         match block {
-            Block::Section(s) => lines.push(s.header_line.clone()),
-            Block::Item(i) if i.kind == "task" => {
-                lines.push(render_task(i, &parent_of, &deps));
+            SyncBlock::Prose(text) => lines.push(text.clone()),
+            SyncBlock::Section(path) => {
+                // A layout entry naming a section that is gone is simply skipped: the file
+                // must never grow a header for a section the document no longer has.
+                if let Some(s) = sections.get(path.as_str()) {
+                    lines.push(s.header_line.clone());
+                }
             }
-            Block::Item(i) => lines.push(i.content.clone()),
+            SyncBlock::Item(id) => {
+                if let Some(i) = items.get(id.as_str()) {
+                    if i.kind == "task" {
+                        lines.push(render_task(i, &parent_of, &deps));
+                    } else {
+                        // A non-task item (legacy `text`, from before prose left the item
+                        // model) renders verbatim so an un-migrated KB round-trips.
+                        lines.push(i.content.clone());
+                    }
+                }
+            }
         }
     }
+
+    // Anything the layout does not mention is appended, so a KB-created item or section can
+    // never be silently dropped from its file.
+    let listed: HashSet<&str> = doc
+        .layout
+        .iter()
+        .filter_map(|b| match b {
+            SyncBlock::Item(id) => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for i in &doc.items {
+        if !listed.contains(i.local_id.as_str()) {
+            lines.push(if i.kind == "task" {
+                render_task(i, &parent_of, &deps)
+            } else {
+                i.content.clone()
+            });
+        }
+    }
+
     let mut out = lines.join("\n");
     out.push('\n');
     out
 }
 
-/// Render one task line: indentation from its `parent_of` depth, a checkbox from its
-/// status, then the modifiers in a canonical order, then the trailing `^id`.
+/// Render one task: its line (indentation from `parent_of` depth, a checkbox from its
+/// status, the modifiers in canonical order, the trailing `^id`), followed by its **body** —
+/// every content line after the first, re-indented one level under the task line.
+///
+/// A task's content is `title\nbody…`: the first line is the title that carries the
+/// modifiers, the rest is prose belonging to this task. Re-indenting canonically (rather
+/// than preserving whatever the author typed) keeps `render` idempotent, which the engine
+/// relies on to use rendered bytes as the three-way base.
 fn render_task(
     item: &SyncItem,
     parent_of: &HashMap<&str, &str>,
@@ -309,7 +372,11 @@ fn render_task(
         Some("cancelled") => '-',
         _ => ' ',
     };
-    let mut parts: Vec<String> = vec![item.content.clone()];
+    let (title, body) = match item.content.split_once('\n') {
+        Some((title, body)) => (title, Some(body)),
+        None => (item.content.as_str(), None),
+    };
+    let mut parts: Vec<String> = vec![title.to_owned()];
     if let Some(p) = item.priority {
         parts.push(format!("!p{p}"));
     }
@@ -328,7 +395,16 @@ fn render_task(
         }
     }
     parts.push(format!("^{}", item.local_id));
-    format!("{indent}- [{checkbox}] {}", parts.join(" "))
+    let mut out = format!("{indent}- [{checkbox}] {}", parts.join(" "));
+    if let Some(body) = body {
+        for line in body.split('\n') {
+            out.push('\n');
+            out.push_str(&indent);
+            out.push_str("  ");
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// The nesting depth of `id` via `parent_of` (guarded against cycles).
@@ -613,7 +689,18 @@ fn bad(msg: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{SyncSerializer, TasksSerializer};
+    use super::{SyncBlock, SyncDoc, SyncSerializer, TasksSerializer};
+
+    /// The document's prose blocks, in order — prose lives inline in the layout.
+    fn prose_blocks(doc: &SyncDoc) -> Vec<&str> {
+        doc.layout
+            .iter()
+            .filter_map(|b| match b {
+                SyncBlock::Prose(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     const SAMPLE: &str = "\
 <!-- Legend: [x] done -->
@@ -664,15 +751,53 @@ Some description.
             && e.dst == "write-harness"
             && e.edge_type == jkb_types::EdgeType::ParentOf));
 
-        // Prose preserved as text items.
-        assert!(doc
-            .items
-            .iter()
-            .any(|i| i.kind == "text" && i.content.contains("Legend")));
-        assert!(doc
-            .items
-            .iter()
-            .any(|i| i.kind == "text" && i.content == "Some description."));
+        // Prose is preserved verbatim as `prose` blocks — NOT as items. Giving it item
+        // identity was the bug behind `memory/sync-export-wins`.
+        assert!(prose_blocks(&doc).iter().any(|p| p.contains("Legend")));
+        assert!(prose_blocks(&doc).contains(&"Some description."));
+        assert!(
+            !doc.items.iter().any(|i| i.kind == "text"),
+            "prose must not materialize as items"
+        );
+    }
+
+    /// An item's indented continuation lines are its **body**, carried on the item — so they
+    /// travel with it instead of being stranded in the section it used to live in.
+    #[test]
+    fn indented_continuation_lines_are_the_task_body_not_section_prose() {
+        let s = TasksSerializer;
+        let src = "## Alpha\n\n- [ ] first ^first\n  why this matters\n  and a second line\n- [ ] second ^second\n";
+        let doc = s.parse(src.as_bytes()).unwrap();
+
+        let first = doc.items.iter().find(|i| i.local_id == "first").unwrap();
+        assert_eq!(
+            first.content, "first\nwhy this matters\nand a second line",
+            "the continuation lines belong to the task, not the section"
+        );
+        assert!(
+            !prose_blocks(&doc)
+                .iter()
+                .any(|p| p.contains("why this matters")),
+            "a task's own body must not also be loose prose"
+        );
+        // The next task is unaffected by the one above it.
+        let second = doc.items.iter().find(|i| i.local_id == "second").unwrap();
+        assert_eq!(second.content, "second");
+
+        // Byte-exact round trip.
+        assert_eq!(String::from_utf8(s.render(&doc).unwrap()).unwrap(), src);
+
+        // A BLANK line closes the body: what follows is ordinary section prose. This is the
+        // rule `jkb task edit` enforces, so the two cannot disagree.
+        let split = s.parse(b"- [ ] t ^t\n  body\n\n  detached\n").unwrap();
+        assert_eq!(split.items[0].content, "t\nbody");
+        assert!(prose_blocks(&split).iter().any(|p| p.contains("detached")));
+
+        // A deeper `- [ ]` line is still a SUBTASK, never body text.
+        let nested = s.parse(b"- [ ] parent ^p\n  - [ ] child ^c\n").unwrap();
+        assert_eq!(nested.items.len(), 2);
+        assert_eq!(nested.items[0].content, "parent");
+        assert_eq!(nested.items[1].parent.as_deref(), Some("p"));
     }
 
     #[test]
@@ -855,10 +980,7 @@ Some description.
         assert!(tasks[0].content.is_empty());
         assert_eq!(tasks[1].status.as_deref(), Some("done"));
         assert_eq!(tasks[1].content, "done one");
-        // `- [~]bad` (no separator) is not a task; it survives as text prose.
-        assert!(doc
-            .items
-            .iter()
-            .any(|i| i.kind == "text" && i.content.contains("[~]bad")));
+        // `- [~]bad` (no separator) is not a task; it survives verbatim as prose.
+        assert!(prose_blocks(&doc).iter().any(|p| p.contains("[~]bad")));
     }
 }

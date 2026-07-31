@@ -19,11 +19,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use jkb_core::query::{Query, Scope};
-use jkb_core::{binding, claim, edge, item, mount, ns, placement, tag, task, undo, view, Db};
+use jkb_core::{
+    binding, blob, claim, edge, investigation, item, mount, ns, nstype, placement, tag, task, undo,
+    view, Db,
+};
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_ingest::Pipeline;
 use jkb_search::{Route, Searcher};
-use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, PlacementRole, SyncMode};
+use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, PlacementRole, Resolution, SyncMode};
 
 /// A local-first, agent-native knowledge base.
 #[derive(Parser)]
@@ -234,6 +237,246 @@ enum Command {
         #[command(subcommand)]
         cmd: ItemCmd,
     },
+    /// Walk the typed edge graph out from one item — the traversal read. Reconstructs
+    /// context an item's own body doesn't carry: what it depends on, what killed it, what
+    /// it answers. `--edge` narrows to specific edge types (repeatable).
+    Related {
+        /// The item uid to start from.
+        uid: String,
+        /// Only follow these edge types (repeatable; default: any).
+        #[arg(long = "edge")]
+        edges: Vec<String>,
+        /// How many hops to walk (default 1 = direct neighbours).
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Which way to follow edges.
+        #[arg(long, value_enum, default_value_t = DirArg::Both)]
+        direction: DirArg,
+    },
+    /// Investigations: open-ended, multi-agent knowledge work over a typed namespace
+    /// (frontier / confirmed core / tombstones). Run `jkb inv ls` to see yours.
+    Inv {
+        #[command(subcommand)]
+        cmd: InvCmd,
+    },
+    /// The content-addressed blob archive. File sync stores the bytes of every version it
+    /// settles and blobs are never deleted, so this is a complete history of every synced
+    /// file — the recovery path when a sync has written a wrong version over your work.
+    Blob {
+        #[command(subcommand)]
+        cmd: BlobCmd,
+    },
+    /// A synced file's history: every version the KB has bytes for, newest first.
+    /// Pair with `jkb blob cat <hash>` to read or diff any of them.
+    History {
+        /// The file path (or its `file://` uri).
+        path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlobCmd {
+    /// List stored blobs, newest first. `--contains` searches their bytes, which is how you
+    /// find the version of a file that still has a line you remember.
+    Ls {
+        /// Only blobs whose bytes contain this text.
+        #[arg(long)]
+        contains: Option<String>,
+        /// Maximum number of blobs (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Write a blob's raw bytes to stdout (pipe it to a file or `diff`).
+    Cat {
+        /// The blake3 hash (a unique prefix is enough).
+        hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InvCmd {
+    /// List every investigation and its strategy type.
+    Ls,
+    /// Create a typed investigation and seed its goal unit. `<path>` may be a bare name
+    /// (homed at `memory/<repo>/<name>` from the ambient repo, or `memory/<name>` outside
+    /// one) or an explicit `memory/…` path.
+    New {
+        /// The strategy type (`jkb inv ls` prints what is available).
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// The investigation name, or an explicit `memory/…` namespace path.
+        path: String,
+        /// The root intent. The acceptance predicate is appended for `--accept` presets.
+        #[arg(long, num_args = 1..)]
+        goal: Vec<String>,
+        /// Acceptance preset for `conjecture-attack`: prove / disprove / either.
+        #[arg(long)]
+        accept: Option<String>,
+        /// The goal unit's kind (default: the strategy's own goal kind).
+        #[arg(long = "goal-kind")]
+        goal_kind: Option<String>,
+    },
+    /// List the verbs the investigation's strategy provides.
+    Verbs {
+        /// The investigation namespace.
+        ns: String,
+    },
+    /// List the unit kinds and edge types the investigation's strategy uses.
+    Kinds {
+        /// The investigation namespace.
+        ns: String,
+    },
+    /// The ranked frontier: live, unblocked units — the work queue. Start here.
+    Frontier {
+        /// The investigation namespace.
+        ns: String,
+        /// Include units another agent has already claimed.
+        #[arg(long)]
+        all: bool,
+        /// Maximum number of units.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// The tombstones: dead ends and what killed each — read this BEFORE starting work.
+    Tombstones {
+        /// The investigation namespace.
+        ns: String,
+    },
+    /// The confirmed core: settled results, the current best model.
+    Core {
+        /// The investigation namespace.
+        ns: String,
+    },
+    /// The anti-retread check for one unit: dead ends in its neighbourhood.
+    Retread {
+        /// The unit uid about to be worked on.
+        uid: String,
+        /// How many hops to search for prior attempts (default 2).
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+    },
+    /// The signed-evidence balance for a unit, itemized by contributing edge.
+    Evidence {
+        /// The unit uid.
+        uid: String,
+    },
+    /// (Re)write the state-digest reflection unit — the default cold-start read.
+    Digest {
+        /// The investigation namespace.
+        ns: String,
+        /// Print the digest without writing the reflection unit.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Recompute every unit's resolution from its edges, and report what changed.
+    Rollup {
+        /// The investigation namespace.
+        ns: String,
+    },
+    /// Apply a strategy verb: the normal way to add to an investigation.
+    Do {
+        /// The investigation namespace.
+        ns: String,
+        /// The verb (see `jkb inv verbs <ns>`).
+        verb: String,
+        /// The new unit's body text.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// The unit this verb acts on.
+        #[arg(long = "on")]
+        target: Option<String>,
+        /// Weight for a signed evidence edge (`supports`/`contradicts`).
+        #[arg(long)]
+        weight: Option<f64>,
+        /// Extra `facet=value` tag (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Add a unit of an explicit kind, with explicit edges — the escape hatch under `do`.
+    Add {
+        /// The investigation namespace.
+        ns: String,
+        /// The unit kind (see `jkb inv kinds <ns>`).
+        kind: String,
+        /// The unit's body text.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// An edge from the new unit as `<type>:<target-uid>` (repeatable).
+        #[arg(long = "edge")]
+        edges: Vec<String>,
+        /// Weight applied to the edges (signed evidence).
+        #[arg(long)]
+        weight: Option<f64>,
+        /// A `facet=value` tag (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Link two existing units — including `equivalent_in_strength_to`, the anti-progress
+    /// edge, which is a judgement about two existing statements rather than a new unit.
+    Link {
+        /// The source unit uid.
+        src: String,
+        /// The edge type.
+        edge: String,
+        /// The destination unit uid.
+        dst: String,
+        /// Weight (signed evidence edges only).
+        #[arg(long)]
+        weight: Option<f64>,
+    },
+    /// Set a unit's `promise=` rank (the frontier ordering knob).
+    Promise {
+        /// The unit uid.
+        uid: String,
+        /// The rank; higher sorts first.
+        value: f64,
+    },
+    /// Set a unit's resolution: unresolved / success / `dead_end` / superseded / abandoned.
+    /// A dead end is retained, never deleted — link what killed it so it teaches.
+    Resolve {
+        /// The unit uid.
+        uid: String,
+        /// The resolution.
+        resolution: String,
+    },
+    /// Check whether a blocked route may be reopened: only a materially new mechanism,
+    /// invariant, construction, or obstruction qualifies (`conjecture-attack`).
+    Reopen {
+        /// The blocked route's uid.
+        route: String,
+        /// The uid of the new mechanism/invariant/construction/obstruction.
+        #[arg(long)]
+        mechanism: String,
+    },
+    /// Mark observations stale because the code moved (`debugging`): every observation whose
+    /// `commit-range=` is not `--window` is excluded from the frontier — never deleted.
+    Stale {
+        /// The investigation namespace.
+        ns: String,
+        /// The current commit range, e.g. `def456..HEAD`.
+        #[arg(long)]
+        window: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DirArg {
+    /// Follow edges away from the item ("what does this point at").
+    Out,
+    /// Follow edges into the item ("what points at this").
+    In,
+    /// Both directions.
+    Both,
+}
+
+impl From<DirArg> for edge::Direction {
+    fn from(d: DirArg) -> Self {
+        match d {
+            DirArg::Out => edge::Direction::Out,
+            DirArg::In => edge::Direction::In,
+            DirArg::Both => edge::Direction::Both,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -246,6 +489,17 @@ enum ItemCmd {
         /// Max preview characters. Default: unbounded for text-like kinds, 800 otherwise.
         #[arg(long)]
         preview: Option<usize>,
+    },
+    /// Delete an item and everything that cascades with it (placements, edges, tags, its
+    /// binding). Recorded in full, so `jkb undo` puts it all back. Refuses by default to
+    /// delete investigation memory (a `dead_end`/`superseded` tombstone, or a unit an edge
+    /// records as killed) or a synced-file-backed item that sync would just recreate.
+    Rm {
+        /// The item uid.
+        uid: String,
+        /// Delete anyway, past the memory / synced-file guards.
+        #[arg(long)]
+        force: bool,
     },
     /// Replace (or `--append` to) any item's content.
     Edit {
@@ -676,6 +930,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Item { cmd } => match cmd {
             ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
+            ItemCmd::Rm { uid, force } => cmd_item_rm(&db, &uid, force, json),
             ItemCmd::Edit {
                 uid,
                 text,
@@ -683,7 +938,146 @@ fn run(cli: Cli) -> Result<()> {
                 append,
             } => cmd_item_edit(&db, &uid, &text, stdin, append, json),
         },
+        Command::Related {
+            uid,
+            edges,
+            depth,
+            direction,
+        } => cmd_related(&db, &uid, &edges, depth, direction.into(), json),
+        Command::Inv { cmd } => cmd_inv(&db, cmd, global, json),
+        Command::Blob { cmd } => match cmd {
+            BlobCmd::Ls { contains, limit } => cmd_blob_ls(&db, contains.as_deref(), limit, json),
+            BlobCmd::Cat { hash } => cmd_blob_cat(&db, &hash),
+        },
+        Command::History { path } => cmd_history(&db, &path, json),
     }
+}
+
+/// `jkb blob ls` — list the archive, optionally searching blob bytes.
+fn cmd_blob_ls(db: &Db, contains: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    let needle = contains.map(|s| s.as_bytes().to_vec());
+    let blobs = db.read(move |conn| blob::list(conn, needle.as_deref(), limit))?;
+    if json {
+        let arr: Vec<serde_json::Value> = blobs
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "hash": b.hash, "size": b.size, "mime": b.mime, "created_at": b.created_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else if blobs.is_empty() {
+        println!("(no matching blobs)");
+    } else {
+        for b in &blobs {
+            println!(
+                "{}  {:>9}  {}",
+                &b.hash[..16.min(b.hash.len())],
+                b.size,
+                b.created_at
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `jkb blob cat <hash>` — raw bytes to stdout, accepting a unique hash prefix.
+fn cmd_blob_cat(db: &Db, hash: &str) -> Result<()> {
+    use std::io::Write as _;
+    let prefix = hash.to_owned();
+    // A full hash is 64 hex chars; anything shorter is treated as a prefix and must be
+    // unambiguous, so `cat` can never print the wrong version.
+    let matches = db.read(move |conn| {
+        let all = blob::list(conn, None, usize::MAX)?;
+        Ok(all
+            .into_iter()
+            .filter(|b| b.hash.starts_with(&prefix))
+            .collect::<Vec<_>>())
+    })?;
+    let found = match matches.as_slice() {
+        [one] => one.hash.clone(),
+        [] => anyhow::bail!("no blob with hash prefix `{hash}`"),
+        many => anyhow::bail!("`{hash}` matches {} blobs; use a longer prefix", many.len()),
+    };
+    let bytes = db
+        .read(move |conn| blob::load(conn, &found))?
+        .with_context(|| format!("blob `{hash}` vanished between listing and reading"))?;
+    std::io::stdout().write_all(&bytes)?;
+    Ok(())
+}
+
+/// `jkb history <path>` — every synced version of a file, newest first.
+fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
+    // Accept a bare path or a `file://` uri, and canonicalize so a relative path matches the
+    // absolute uri the journal stores.
+    let uri = if path.starts_with("file://") {
+        path.to_owned()
+    } else {
+        let abs = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(path))
+            .to_string_lossy()
+            .into_owned();
+        format!("file://{abs}")
+    };
+
+    let versions = db.read({
+        let uri = uri.clone();
+        move |conn| {
+            // The journal's changelog carries one entry per settle, each naming the blob
+            // holding that version's bytes.
+            let mut stmt = conn.prepare(
+                "SELECT ts, after FROM changelog
+                 WHERE entity_type = 'sync_state' AND entity_id = ?1 AND after IS NOT NULL
+                 ORDER BY id DESC",
+            )?;
+            let rows = stmt.query_map([&uri], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out: Vec<(String, String, String)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                let (ts, after) = row?;
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&after) else {
+                    continue;
+                };
+                let Some(hash) = v.get("base_blob_hash").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let status = v
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("ok")
+                    .to_owned();
+                if seen.insert(hash.to_owned()) {
+                    out.push((ts, hash.to_owned(), status));
+                }
+            }
+            Ok(out)
+        }
+    })?;
+
+    if json {
+        let arr: Vec<serde_json::Value> = versions
+            .iter()
+            .map(|(ts, hash, status)| {
+                serde_json::json!({ "ts": ts, "blob": hash, "status": status })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else if versions.is_empty() {
+        println!(
+            "(no recorded history for {uri})\n\
+             Versions synced before this build did not journal their blob hash — search the \
+             archive instead: jkb blob ls --contains \"<a line you remember>\""
+        );
+    } else {
+        for (ts, hash, status) in &versions {
+            println!("{ts}  {}  [{status}]", &hash[..16.min(hash.len())]);
+        }
+        println!("\nRead one with: jkb blob cat <hash>");
+    }
+    Ok(())
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -1335,6 +1729,7 @@ fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
             "{}",
             serde_json::json!({
                 "uid": meta.uid, "kind": meta.kind, "status": meta.status,
+                "resolution": meta.resolution,
                 "priority": meta.priority, "due": meta.due, "mime": meta.mime,
                 "namespace": namespace, "binding": binding, "content_chars": chars,
                 "tags": tags.iter().map(|(f, v)| serde_json::json!({"facet": f, "value": v})).collect::<Vec<_>>(),
@@ -1448,6 +1843,730 @@ fn cmd_tree(
     Ok(())
 }
 
+/// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
+fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
+    let id = require_uid(db, uid)?;
+    let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": removed.uid,
+                "kind": removed.kind,
+                "placements": removed.placements,
+                "edges": removed.edges,
+                "tags": removed.tags,
+            })
+        );
+    } else {
+        println!(
+            "removed {} [{}] — {} placement(s), {} edge(s), {} tag(s)",
+            removed.uid, removed.kind, removed.placements, removed.edges, removed.tags
+        );
+        println!("`jkb undo` restores it, including its edges.");
+    }
+    Ok(())
+}
+
+// ---- `jkb related` + `jkb inv …` (investigations, design Dmem.5/Dmem.9) ----
+
+/// Parse `--edge <type>` values into [`EdgeType`]s, rejecting unknown names with the list.
+fn parse_edge_types(names: &[String]) -> Result<Vec<EdgeType>> {
+    names
+        .iter()
+        .map(|name| {
+            EdgeType::from_str_opt(name).with_context(|| {
+                format!(
+                    "unknown edge type `{name}`; available: {}",
+                    EdgeType::ALL
+                        .iter()
+                        .map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
+/// Parse repeated `facet=value` arguments.
+fn parse_tag_args(tags: &[String]) -> Result<Vec<(String, String)>> {
+    tags.iter()
+        .map(|t| {
+            let (facet, value) = t
+                .split_once('=')
+                .with_context(|| format!("tag `{t}` must be `facet=value`"))?;
+            if facet.is_empty() {
+                anyhow::bail!("tag `{t}` needs a facet before `=`");
+            }
+            Ok((facet.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// Look up an item by uid or fail with a message naming it.
+fn require_uid(db: &Db, uid: &str) -> Result<ItemId> {
+    let owned = uid.to_owned();
+    db.read(move |conn| item::id_for_uid(conn, &owned))?
+        .with_context(|| format!("no item with uid `{uid}`"))
+}
+
+/// `jkb related <uid>` — walk the typed edge graph out from one item.
+fn cmd_related(
+    db: &Db,
+    uid: &str,
+    edge_names: &[String],
+    depth: usize,
+    direction: edge::Direction,
+    json: bool,
+) -> Result<()> {
+    let types = parse_edge_types(edge_names)?;
+    let start = require_uid(db, uid)?;
+    let hops = db.read(move |conn| edge::walk(conn, start, &types, depth, direction))?;
+
+    let mut rows = Vec::new();
+    for hop in &hops {
+        let id = hop.item;
+        let Some(meta) = db.read(move |conn| item::get(conn, id))? else {
+            continue;
+        };
+        rows.push((hop, meta));
+    }
+
+    if json {
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(hop, meta)| {
+                serde_json::json!({
+                    "uid": meta.uid,
+                    "kind": meta.kind,
+                    "status": meta.status,
+                    "resolution": meta.resolution,
+                    "depth": hop.depth,
+                    "via": hop.via.as_str(),
+                    "direction": match hop.direction {
+                        edge::Direction::Out => "out",
+                        edge::Direction::In => "in",
+                        edge::Direction::Both => "both",
+                    },
+                    "snippet": meta.content.as_deref().map(first_line),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else if rows.is_empty() {
+        println!("(no related items)");
+    } else {
+        for (hop, meta) in &rows {
+            let arrow = match hop.direction {
+                edge::Direction::In => "<-",
+                edge::Direction::Out | edge::Direction::Both => "->",
+            };
+            println!(
+                "{:>2}  {arrow} {:<26} [{}]{} — {}",
+                hop.depth,
+                format!("{} {}", hop.via.as_str(), meta.uid),
+                meta.kind,
+                meta.resolution
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default(),
+                meta.content.as_deref().map(first_line).unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `jkb inv new`'s namespace: an explicit `memory/…` path is used as given; a bare
+/// name is homed under the ambient repo (`memory/<repo>/<name>`, mirroring task homing,
+/// design D26/D32) or at `memory/<name>` outside a repo or with `--global`.
+fn investigation_path(db: &Db, name: &str, global: bool) -> Result<String> {
+    let root = investigation::MEMORY_ROOT;
+    if name == root || name.starts_with(&format!("{root}/")) {
+        return Ok(name.to_owned());
+    }
+    if global {
+        return Ok(format!("{root}/{name}"));
+    }
+    // The ambient mount namespace is e.g. `repos/jkb/openspec`; the repo *key* is the first
+    // segment after `repos/`, so every investigation about a repo lands under one root.
+    let repo = ambient_repo(db)?.and_then(|mount| {
+        mount
+            .strip_prefix("repos/")
+            .unwrap_or(&mount)
+            .split('/')
+            .next()
+            .map(str::to_owned)
+    });
+    Ok(match repo {
+        Some(repo) => format!("{root}/{repo}/{name}"),
+        None => format!("{root}/{name}"),
+    })
+}
+
+/// Print a bucket of investigation units, human or JSON.
+fn print_units(units: &[investigation::UnitRow], json: bool, show_rank: bool) {
+    if json {
+        let arr: Vec<serde_json::Value> = units
+            .iter()
+            .map(|u| {
+                serde_json::json!({
+                    "uid": u.uid,
+                    "kind": u.kind,
+                    "resolution": u.resolution,
+                    "rank": u.rank,
+                    "evidence": u.evidence,
+                    "namespace": u.namespace,
+                    "snippet": u.content.as_deref().map(first_line),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap_or_default()
+        );
+    } else if units.is_empty() {
+        println!("(empty)");
+    } else {
+        for u in units {
+            let rank = if show_rank {
+                format!(" rank {:.2}", u.rank)
+            } else {
+                String::new()
+            };
+            let evidence = if u.evidence.abs() < f64::EPSILON {
+                String::new()
+            } else {
+                format!(" ev {:+.2}", u.evidence)
+            };
+            println!(
+                "{:<34} [{}]{rank}{evidence} — {}",
+                u.uid,
+                u.kind,
+                u.content.as_deref().map(first_line).unwrap_or_default(),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // a flat dispatcher; one arm per `jkb inv` subcommand
+fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
+    match cmd {
+        InvCmd::Ls => {
+            let rows = db.read(investigation::list)?;
+            if json {
+                let arr: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "ns": r.ns_path, "type": r.type_name, "units": r.units,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else if rows.is_empty() {
+                println!(
+                    "(no investigations yet) available types: {}",
+                    nstype::AVAILABLE.join(", ")
+                );
+            } else {
+                for r in &rows {
+                    println!("{:<40} [{}] {} unit(s)", r.ns_path, r.type_name, r.units);
+                }
+            }
+            Ok(())
+        }
+        InvCmd::New {
+            type_name,
+            path,
+            goal,
+            accept,
+            goal_kind,
+        } => {
+            let strategy = nstype::resolve(&type_name)?;
+            let ns_path = investigation_path(db, &path, global)?;
+            // Default the goal unit to the strategy's own goal kind (`symptom`,
+            // `conjecture`, …) so the seeded unit reads naturally in its investigation.
+            let goal_kind = goal_kind.unwrap_or_else(|| {
+                strategy
+                    .node_kinds()
+                    .iter()
+                    .find(|k| k.base == nstype::BaseKind::Goal)
+                    .map_or(nstype::KIND_GOAL, |k| k.kind)
+                    .to_owned()
+            });
+            let mut body = goal.join(" ");
+            if body.trim().is_empty() {
+                body = format!("(state the goal for {ns_path} here)");
+            }
+            let mut tags = Vec::new();
+            if let Some(preset) = accept {
+                // The presets belong to the STRATEGY, so one strategy's predicate can never
+                // be stamped onto another's goal (a `debugging` symptom must not acquire the
+                // mathematical proof bar, which its `goal_predicate` would then ignore).
+                let presets = strategy.acceptance_presets();
+                anyhow::ensure!(
+                    !presets.is_empty(),
+                    "the `{}` strategy has no acceptance presets, so --accept does not apply \
+                     to it; state the bar in --goal instead",
+                    strategy.name()
+                );
+                let text = strategy.acceptance_text(&preset).with_context(|| {
+                    format!(
+                        "unknown acceptance preset `{preset}` for `{}`; expected one of {}",
+                        strategy.name(),
+                        presets.join(", ")
+                    )
+                })?;
+                // The acceptance predicate lives IN the goal body: the investigation
+                // terminates on it, so every agent that picks this up must read the same bar.
+                body = format!("{body}\n\n{text}");
+                tags.push((nstype::conjecture::FACET_ACCEPTANCE.to_owned(), preset));
+            }
+            let (ns_for_txn, body_for_txn) = (ns_path.clone(), body.clone());
+            let (uid, existed) = db.write_txn("cli", move |conn, meta| {
+                // Whether this namespace was ALREADY an investigation decides the wording
+                // below: `create` is idempotent, so a re-run must not claim to have created
+                // anything.
+                let existed = ns::get_type(conn, &ns_for_txn)?.is_some();
+                let id = investigation::create(
+                    conn,
+                    meta,
+                    &ns_for_txn,
+                    &type_name,
+                    &goal_kind,
+                    &body_for_txn,
+                    &tags,
+                )?;
+                Ok((
+                    item::get(conn, id)?.map(|m| m.uid).unwrap_or_default(),
+                    existed,
+                ))
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ns": ns_path, "goal_uid": uid, "type": strategy.name(),
+                        "created": !existed,
+                    })
+                );
+            } else if existed {
+                println!(
+                    "investigation {ns_path} [{}] already exists — left as it is",
+                    strategy.name()
+                );
+                println!("goal: {uid}");
+                println!("next: jkb inv digest {ns_path}");
+            } else {
+                println!("created investigation {ns_path} [{}]", strategy.name());
+                println!("goal: {uid}");
+                println!("next: jkb inv verbs {ns_path}");
+            }
+            Ok(())
+        }
+        InvCmd::Verbs { ns } => {
+            let owned = ns.clone();
+            let strategy = db
+                .read(move |conn| nstype::for_namespace(conn, &owned))?
+                .with_context(|| format!("`{ns}` is not an investigation namespace"))?
+                .1;
+            if json {
+                let arr: Vec<serde_json::Value> = strategy
+                    .verbs()
+                    .iter()
+                    .map(|v| {
+                        serde_json::json!({
+                            "verb": v.verb, "creates": v.kind, "about": v.about,
+                            "edge": v.edge.map(EdgeType::as_str),
+                            "target": match v.target {
+                                nstype::TargetRule::Required => "required",
+                                nstype::TargetRule::Optional => "optional",
+                                nstype::TargetRule::Forbidden => "none",
+                            },
+                            "resolves_target": v.resolves_target.map(Resolution::as_str),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                println!("{} [{}]\n{}", ns, strategy.name(), strategy.about());
+                for v in strategy.verbs() {
+                    let target = match v.target {
+                        nstype::TargetRule::Required => " --on <uid>",
+                        nstype::TargetRule::Optional => " [--on <uid>]",
+                        nstype::TargetRule::Forbidden => "",
+                    };
+                    println!("  {:<24}{target:<14} {}", v.verb, v.about);
+                }
+            }
+            Ok(())
+        }
+        InvCmd::Kinds { ns } => {
+            let owned = ns.clone();
+            let strategy = db
+                .read(move |conn| nstype::for_namespace(conn, &owned))?
+                .with_context(|| format!("`{ns}` is not an investigation namespace"))?
+                .1;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "type": strategy.name(),
+                        "base_kinds": nstype::BASE_KINDS,
+                        "kinds": strategy.node_kinds().iter().map(|k| serde_json::json!({
+                            "kind": k.kind, "about": k.about,
+                        })).collect::<Vec<_>>(),
+                        "edges": strategy.edge_types().iter().map(|e| e.as_str())
+                            .collect::<Vec<_>>(),
+                    }))?
+                );
+            } else {
+                println!("{} [{}]", ns, strategy.name());
+                println!("base kinds: {}", nstype::BASE_KINDS.join(", "));
+                for k in strategy.node_kinds() {
+                    println!("  {:<24} {}", k.kind, k.about);
+                }
+                println!(
+                    "edges: {}",
+                    strategy
+                        .edge_types()
+                        .iter()
+                        .map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Ok(())
+        }
+        InvCmd::Frontier { ns, all, limit } => {
+            let units = db.read(move |conn| investigation::frontier(conn, &ns, all, limit))?;
+            print_units(&units, json, true);
+            Ok(())
+        }
+        InvCmd::Core { ns } => {
+            let units = db.read(move |conn| investigation::confirmed_core(conn, &ns))?;
+            print_units(&units, json, false);
+            Ok(())
+        }
+        InvCmd::Tombstones { ns } => {
+            let tombs = db.read(move |conn| investigation::tombstones(conn, &ns))?;
+            if json {
+                let arr: Vec<serde_json::Value> = tombs
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "uid": t.unit.uid,
+                            "kind": t.unit.kind,
+                            "resolution": t.unit.resolution,
+                            "snippet": t.unit.content.as_deref().map(first_line),
+                            "killed_by": t.killed_by.iter().map(|(e, uid, body)| {
+                                serde_json::json!({
+                                    "edge": e.as_str(), "uid": uid,
+                                    "snippet": body.as_deref().map(first_line),
+                                })
+                            }).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else if tombs.is_empty() {
+                println!("(no dead ends recorded yet)");
+            } else {
+                for t in &tombs {
+                    println!(
+                        "{:<34} [{}] {} — {}",
+                        t.unit.uid,
+                        t.unit.kind,
+                        t.unit.resolution.as_deref().unwrap_or("unresolved"),
+                        t.unit
+                            .content
+                            .as_deref()
+                            .map(first_line)
+                            .unwrap_or_default(),
+                    );
+                    for (edge_type, uid, body) in &t.killed_by {
+                        println!(
+                            "    {} by {uid}: {}",
+                            edge_type.as_str(),
+                            body.as_deref().map(first_line).unwrap_or_default()
+                        );
+                    }
+                    if t.killed_by.is_empty() {
+                        println!("    (no edge records why — link what killed it)");
+                    }
+                }
+            }
+            Ok(())
+        }
+        InvCmd::Retread { uid, depth } => {
+            let start = require_uid(db, &uid)?;
+            let units = db.read(move |conn| investigation::anti_retread(conn, start, depth))?;
+            if !json && units.is_empty() {
+                println!("(nothing related has been ruled out — clear to proceed)");
+                return Ok(());
+            }
+            print_units(&units, json, false);
+            Ok(())
+        }
+        InvCmd::Evidence { uid } => {
+            let id = require_uid(db, &uid)?;
+            let (total, edges) = db.read(move |conn| {
+                Ok((
+                    edge::evidence_for(conn, id)?,
+                    edge::evidence_edges(conn, id)?,
+                ))
+            })?;
+            let mut rows = Vec::new();
+            for e in &edges {
+                let src = e.src;
+                if let Some(meta) = db.read(move |conn| item::get(conn, src))? {
+                    rows.push((e, meta));
+                }
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "uid": uid,
+                        "balance": total,
+                        "edges": rows.iter().map(|(e, meta)| serde_json::json!({
+                            "edge": e.edge_type.as_str(),
+                            "uid": meta.uid,
+                            "contribution": e.contribution,
+                            "snippet": meta.content.as_deref().map(first_line),
+                        })).collect::<Vec<_>>(),
+                    }))?
+                );
+            } else {
+                println!("{uid}: balance {total:+.2}");
+                for (e, meta) in &rows {
+                    println!(
+                        "  {:+.2} {:<12} {:<30} {}",
+                        e.contribution,
+                        e.edge_type.as_str(),
+                        meta.uid,
+                        meta.content.as_deref().map(first_line).unwrap_or_default()
+                    );
+                }
+                if rows.is_empty() {
+                    println!("  (no supports/contradicts edges)");
+                }
+            }
+            Ok(())
+        }
+        InvCmd::Digest { ns, dry_run } => {
+            if dry_run {
+                let body = db.read(move |conn| Ok(investigation::digest(conn, &ns)?.render()))?;
+                print!("{body}");
+                return Ok(());
+            }
+            let (uid, body) = db.write_txn("cli", move |conn, meta| {
+                let (id, body) = investigation::write_digest(conn, meta, &ns)?;
+                Ok((
+                    item::get(conn, id)?.map(|m| m.uid).unwrap_or_default(),
+                    body,
+                ))
+            })?;
+            if json {
+                println!("{}", serde_json::json!({"uid": uid, "digest": body}));
+            } else {
+                print!("{body}");
+                println!("\n(written to {uid})");
+            }
+            Ok(())
+        }
+        InvCmd::Rollup { ns } => {
+            let changed = db.write_txn("cli", move |conn, meta| {
+                investigation::roll_up(conn, meta, &ns)
+            })?;
+            if json {
+                let arr: Vec<serde_json::Value> = changed
+                    .iter()
+                    .map(|(uid, from, to)| {
+                        serde_json::json!({
+                            "uid": uid, "from": from.as_str(), "to": to.as_str(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else if changed.is_empty() {
+                println!("(every resolution already matches its edges)");
+            } else {
+                for (uid, from, to) in &changed {
+                    println!("{uid}: {} -> {}", from.as_str(), to.as_str());
+                }
+            }
+            Ok(())
+        }
+        InvCmd::Do {
+            ns,
+            verb,
+            text,
+            target,
+            weight,
+            tags,
+        } => {
+            let tags = parse_tag_args(&tags)?;
+            let content = text.join(" ");
+            let outcome = db.write_txn("cli", move |conn, meta| {
+                let call = investigation::VerbCall {
+                    verb: &verb,
+                    content: &content,
+                    target_uid: target.as_deref(),
+                    weight,
+                    tags: &tags,
+                };
+                investigation::apply_verb(conn, meta, &ns, &call)
+            })?;
+            let resolved = outcome.target_resolution.map(Resolution::as_str);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "uid": outcome.uid, "target_resolution": resolved,
+                    })
+                );
+            } else {
+                println!("{}", outcome.uid);
+                if let Some(r) = resolved {
+                    println!("target resolution -> {r}");
+                }
+            }
+            Ok(())
+        }
+        InvCmd::Add {
+            ns,
+            kind,
+            text,
+            edges,
+            weight,
+            tags,
+        } => {
+            let tags = parse_tag_args(&tags)?;
+            let mut parsed_edges = Vec::new();
+            for spec in &edges {
+                let (type_name, target) = spec
+                    .split_once(':')
+                    .with_context(|| format!("edge `{spec}` must be `<type>:<target-uid>`"))?;
+                let edge_type = EdgeType::from_str_opt(type_name)
+                    .with_context(|| format!("unknown edge type `{type_name}`"))?;
+                parsed_edges.push((edge_type, target.to_owned(), weight));
+            }
+            let content = text.join(" ");
+            let uid = db.write_txn("cli", move |conn, meta| {
+                let unit = investigation::NewUnit {
+                    kind,
+                    content,
+                    namespace: ns,
+                    tags,
+                    edges: parsed_edges,
+                    reverse_edges: Vec::new(),
+                };
+                let id = investigation::add(conn, meta, &unit)?;
+                Ok(item::get(conn, id)?.map(|m| m.uid).unwrap_or_default())
+            })?;
+            if json {
+                println!("{}", serde_json::json!({"uid": uid}));
+            } else {
+                println!("{uid}");
+            }
+            Ok(())
+        }
+        InvCmd::Link {
+            src,
+            edge: edge_name,
+            dst,
+            weight,
+        } => {
+            let edge_type = EdgeType::from_str_opt(&edge_name).with_context(|| {
+                format!(
+                    "unknown edge type `{edge_name}`; available: {}",
+                    EdgeType::ALL
+                        .iter()
+                        .map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            db.write_txn("cli", move |conn, meta| {
+                investigation::link(conn, meta, &src, edge_type, &dst, weight)
+            })?;
+            if !json {
+                println!("linked");
+            }
+            Ok(())
+        }
+        InvCmd::Promise { uid, value } => {
+            db.write_txn("cli", move |conn, meta| {
+                investigation::set_promise(conn, meta, &uid, value)
+            })?;
+            if !json {
+                println!("promise = {value}");
+            }
+            Ok(())
+        }
+        InvCmd::Resolve { uid, resolution } => {
+            // `resolve_unit` owns the guard (a task's lifecycle is `status`, not
+            // `resolution`) so every caller inherits it, not just this one.
+            db.write_txn("cli", move |conn, meta| {
+                investigation::resolve_unit(conn, meta, &uid, &resolution)
+            })?;
+            if !json {
+                println!("resolution set (the unit is retained — link what changed it)");
+            }
+            Ok(())
+        }
+        InvCmd::Reopen { route, mechanism } => {
+            // The whole operation (strategy check, gate, edges, gap supersession) lives in
+            // the engine so it is testable and every caller inherits the gate.
+            let outcome = db.write_txn("cli", move |conn, meta| {
+                investigation::reopen(conn, meta, &route, &mechanism)
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "mechanism_kind": outcome.mechanism_kind,
+                        "superseded_gaps": outcome.superseded_gaps,
+                        "reopened": !outcome.superseded_gaps.is_empty(),
+                    })
+                );
+            } else if outcome.superseded_gaps.is_empty() {
+                // Nothing was blocking it, so nothing was reopened — say so plainly rather
+                // than reporting a state change that did not happen.
+                println!(
+                    "nothing to reopen: no open gap was blocking it (recorded the {} as \
+                     informing the route)",
+                    outcome.mechanism_kind
+                );
+            } else {
+                println!("reopened on a new {}", outcome.mechanism_kind);
+                for uid in &outcome.superseded_gaps {
+                    println!("  superseded gap {uid}");
+                }
+            }
+            Ok(())
+        }
+        InvCmd::Stale { ns, window } => {
+            let marked = db.write_txn("cli", move |conn, meta| {
+                nstype::debugging::mark_stale_observations(conn, meta, &ns, &window)
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&marked)?);
+            } else if marked.is_empty() {
+                println!("(no observations went stale)");
+            } else {
+                for uid in &marked {
+                    println!("{uid} -> staleness=stale (excluded, not deleted)");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
 fn cmd_guide() {
     print!(
@@ -1481,8 +2600,43 @@ TASKS
   jkb task set <uid> --status done|open|in_progress|needs_review
   jkb task show <uid>         the full task body.
 
+RECOVERY (the archive nothing else exposes)
+  jkb history <path>          every synced version of a file, newest first.
+  jkb blob ls --contains "…"  find the version still carrying a line you remember.
+  jkb blob cat <hash>         write those bytes to stdout (pipe to a file or `diff`).
+      File sync stores the bytes of every version it settles and blobs are never deleted,
+      so a bad write that already landed on disk is recoverable.
+
+GRAPH
+  jkb related <uid> [--edge T] [--depth N] [--direction out|in|both]
+      Walk the typed edges out from an item — the context its own body doesn't carry
+      (what it depends on, what killed it, what it answers).
+
+INVESTIGATIONS (open-ended work with durable state — `memory/…`)
+  An investigation is a typed namespace holding a graph of units. Orient by reading three
+  buckets, in this order:
+    1. jkb inv digest <ns>          the state digest: all three buckets + the "done" test.
+    2. jkb inv tombstones <ns>      dead ends + WHAT KILLED EACH. Read before working.
+    3. jkb inv frontier <ns>        live, unblocked units, ranked — pick work here.
+  Then, before starting on a unit:
+       jkb inv retread <uid>        has anything near this already been ruled out?
+       jkb related <uid>            how does it connect to the goal?
+  Recording what you learn (each write is audited + undoable):
+       jkb inv verbs <ns>           the strategy's verbs — the normal way to add units.
+       jkb inv do <ns> <verb> "text" [--on <uid>] [--weight N] [--tag f=v]
+       jkb inv evidence <uid>       the signed supports/contradicts balance for a unit.
+       jkb inv link <src> <edge> <dst>          an edge no verb covers.
+       jkb inv resolve <uid> <resolution>       unresolved|success|dead_end|superseded|abandoned
+  Starting one:
+       jkb inv ls                   your investigations and their strategy types.
+       jkb inv new <type> <name> --goal "…" [--accept prove|disprove|either]
+  A dead end is NEVER deleted: resolve it `dead_end` and link what killed it (`refutes`,
+  `rules_out`). That graveyard is the memory — it is what stops the next agent re-treading.
+
 WRITE (all audited + undoable)
   jkb item edit <uid> [--append] <text>   replace/append an item's content.
+  jkb item rm <uid> [--force]             delete an item + its cascade; `jkb undo` restores
+                                          it. Refuses tombstones and synced-file items.
   jkb task tag add <uid> facet=value      apply a tag.
   jkb undo                                revert the last change.
 
@@ -1564,6 +2718,7 @@ fn cmd_item_show(db: &Db, uid: &str, preview_arg: Option<usize>, json: bool) -> 
             "uid": meta.uid,
             "kind": meta.kind,
             "status": meta.status,
+            "resolution": meta.resolution,
             "priority": meta.priority,
             "due": meta.due,
             "mime": meta.mime,
@@ -1609,6 +2764,9 @@ fn print_item_detail(
     println!("kind:      {}", meta.kind);
     if let Some(s) = &meta.status {
         println!("status:    {s}");
+    }
+    if let Some(r) = &meta.resolution {
+        println!("resolution: {r}");
     }
     if let Some(ns) = namespace {
         println!("namespace: {ns}");
@@ -2210,23 +3368,28 @@ fn cmd_task_edit(
         text.join(" ")
     };
     let id = resolve_task_uid(db, uid)?;
-    // A file-backed task is a single line in its source file: the tasks serializer renders
-    // the item's `content` verbatim as the checkbox line (`render_task`). Multi-line content
-    // — always the case for `--append`, and for any replacement containing a newline — would
-    // split that line on sync, detaching the trailing `^id` and losing the task's identity.
-    // Refuse it and point at the source-file flow the design gate already prescribes.
+    // A file-backed task is no longer a single line: the `tasks` serializer renders content
+    // after the first line as the task's indented **body**, so `--append` round-trips. One
+    // limit remains — a BLANK line closes a body on re-parse, so anything after it would
+    // detach from the task and drift into section prose. Refuse that precisely, rather than
+    // refusing every multi-line edit.
     let file_backed = uid.starts_with("file://");
-    if file_backed && (append || new_text.contains('\n')) {
+    if file_backed && new_text.contains("\n\n") {
         anyhow::bail!(
-            "`{uid}` is a file-backed task; its source line is single-line, so `--append` \
-             or multi-line content would corrupt it on sync. Edit the source file directly \
-             (add indented notes beneath its `^id` line), then run `jkb sync`."
+            "`{uid}` is a file-backed task: a blank line ends its body in the source file, so \
+             text after one would detach from the task on sync. Use single newlines, or edit \
+             the source file directly and run `jkb sync`."
         );
     }
     db.write_txn("cli", move |conn, meta| {
         let content = if append {
+            // A file-backed task's body is contiguous indented lines, so append with a single
+            // newline; a managed task's content is free-form, so keep the blank-line break.
+            let separator = if file_backed { "\n" } else { "\n\n" };
             match item::get_content(conn, id)? {
-                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{new_text}"),
+                Some(existing) if !existing.is_empty() => {
+                    format!("{existing}{separator}{new_text}")
+                }
                 _ => new_text,
             }
         } else {

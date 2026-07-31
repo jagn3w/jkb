@@ -5,7 +5,7 @@
 //! recursive CTE (design D6). A closure table is a v2 optimization.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use jkb_types::{Error as TypeError, NamespaceId};
@@ -296,6 +296,87 @@ pub fn get_metadata(conn: &Connection, id: NamespaceId) -> Result<Option<Value>>
         .query_row([id.get()], |row| row.get::<_, Option<String>>(0))
         .optional()?;
     Ok(raw.flatten().and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// The `metadata` key holding a namespace's **strategy type** (design Dmem.1). The
+/// value is a [`crate::nstype::NamespaceType`] name (e.g. `debugging`).
+///
+/// This is deliberately a metadata key rather than a new column: `namespaces.kind`
+/// (`logical`/`mount`/`system`) answers *how the namespace is backed*, which is
+/// orthogonal to *what protocol runs inside it*. A namespace with no `type` is untyped
+/// and behaves exactly as it did before (no descriptor, no frontier extras).
+pub const TYPE_KEY: &str = "type";
+
+/// Record the strategy `type_name` on the namespace `id`, merging into (not replacing)
+/// its existing metadata. Validating that `type_name` names a registered strategy is the
+/// caller's job (`crate::nstype::resolve`), so a namespace can be typed before the
+/// strategy that reads it is built.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn set_type(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: NamespaceId,
+    type_name: &str,
+) -> Result<()> {
+    let mut metadata = get_metadata(conn, id)?.unwrap_or_else(|| Value::Object(Map::new()));
+    // Non-object metadata (only reachable if written outside jkb) is replaced rather than
+    // silently dropping the type.
+    if !metadata.is_object() {
+        metadata = Value::Object(Map::new());
+    }
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(TYPE_KEY.to_owned(), Value::String(type_name.to_owned()));
+    }
+    set_metadata(conn, meta, id, &metadata)
+}
+
+/// The strategy type recorded on the namespace `path`, or `None` if it is untyped (or
+/// does not exist).
+///
+/// # Errors
+/// Returns an error if the path is malformed or a query fails.
+pub fn get_type(conn: &Connection, path: &str) -> Result<Option<String>> {
+    let Some(id) = get(conn, path)? else {
+        return Ok(None);
+    };
+    get_type_by_id(conn, id)
+}
+
+/// The strategy type recorded on the namespace `id`, or `None` if it is untyped.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn get_type_by_id(conn: &Connection, id: NamespaceId) -> Result<Option<String>> {
+    Ok(get_metadata(conn, id)?
+        .and_then(|m| m.get(TYPE_KEY).and_then(Value::as_str).map(str::to_owned)))
+}
+
+/// The strategy type governing `path`: its own `type`, else the nearest **typed
+/// ancestor**'s. An investigation types its root namespace once
+/// (`memory/<repo>/<name>`), and every sub-namespace inside it inherits that type — so a
+/// node filed under `memory/jkb/heisenbug/hypotheses` resolves the same strategy as the
+/// root. Returns the `(namespace path, type)` pair so callers can report *where* the type
+/// came from, or `None` if neither `path` nor any ancestor is typed.
+///
+/// # Errors
+/// Returns an error if the path is malformed or a query fails.
+pub fn effective_type(conn: &Connection, path: &str) -> Result<Option<(String, String)>> {
+    let mut current = normalize(path)?;
+    loop {
+        if let Some(id) = get(conn, &current)? {
+            if let Some(type_name) = get_type_by_id(conn, id)? {
+                return Ok(Some((current, type_name)));
+            }
+        }
+        // Truncate to the parent path in place (no allocation); a path with no `/` left
+        // is a root, so the walk is done.
+        match current.rfind('/') {
+            Some(cut) => current.truncate(cut),
+            None => return Ok(None),
+        }
+    }
 }
 
 /// Move the subtree rooted at `from` to `to`, rewriting paths and re-pointing the
@@ -619,5 +700,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(bare_meta.get("header_line").is_none());
+    }
+
+    #[test]
+    fn a_namespace_type_is_inherited_by_its_subtree_and_merges_with_metadata() {
+        use super::{effective_type, get_type, set_metadata, set_type};
+
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            let root = ensure(conn, "memory/jkb/heisenbug")?;
+            // Pre-existing metadata must survive typing the namespace.
+            set_metadata(conn, meta, root, &json!({ "position": 3 }))?;
+            set_type(conn, meta, root, "debugging")?;
+            ensure(conn, "memory/jkb/heisenbug/hypotheses")?;
+            ensure(conn, "memory/jkb/other")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let got = db
+            .read(|conn| get_type(conn, "memory/jkb/heisenbug"))
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("debugging"));
+        let merged = db
+            .read(|conn| {
+                let id = super::get(conn, "memory/jkb/heisenbug")?.unwrap();
+                get_metadata(conn, id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged["position"], 3, "typing must not clobber metadata");
+
+        // A child inherits the nearest typed ancestor's strategy…
+        let (source, type_name) = db
+            .read(|conn| effective_type(conn, "memory/jkb/heisenbug/hypotheses"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, "memory/jkb/heisenbug");
+        assert_eq!(type_name, "debugging");
+
+        // …but an unrelated sibling and its own `type` read stay untyped.
+        assert!(db
+            .read(|conn| get_type(conn, "memory/jkb/heisenbug/hypotheses"))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .read(|conn| effective_type(conn, "memory/jkb/other"))
+            .unwrap()
+            .is_none());
+        // A path that does not exist at all is untyped, not an error.
+        assert!(db
+            .read(|conn| effective_type(conn, "nowhere/at/all"))
+            .unwrap()
+            .is_none());
     }
 }

@@ -107,6 +107,11 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
         w.parse_error,
         w.quarantine_blob_hash,
     ])?;
+    // `base_blob_hash` is recorded here on purpose: the blob it names is the exact bytes of
+    // this file at this sync, and blobs are never deleted. Journalling the hash turns the
+    // blob store from an anonymous archive into a per-file **history** — "what did this file
+    // look like at each sync, and which blob holds it" — which is what you need when a sync
+    // has already written a wrong version over your work.
     changelog::append(
         conn,
         meta,
@@ -114,7 +119,12 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
         "sync_state",
         w.uri,
         None,
-        Some(&json!({ "status": w.status, "serializer": w.serializer })),
+        Some(&json!({
+            "status": w.status,
+            "serializer": w.serializer,
+            "base_blob_hash": w.base_blob_hash,
+            "last_synced_hash": w.last_synced_hash,
+        })),
     )?;
     Ok(())
 }

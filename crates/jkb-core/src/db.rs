@@ -81,8 +81,31 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         // Bumped with each migration: V001 init, V002 fts, V003 embeddings_meta version,
-        // V004 sync journal, V005 task claims, V006 items.status CHECK.
-        assert_eq!(user_version, 6);
+        // V004 sync journal, V005 task claims, V006 items.status CHECK,
+        // V007 memory core (items.resolution + edges.weight).
+        assert_eq!(user_version, 7);
+
+        // V007's additive columns exist and default to NULL (no back-fill).
+        conn.execute(
+            "INSERT INTO items (uid, kind, content) VALUES ('n:res', 'note', 'body')",
+            [],
+        )
+        .unwrap();
+        let resolution: Option<String> = conn
+            .query_row(
+                "SELECT resolution FROM items WHERE uid = 'n:res'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution, None, "resolution defaults to NULL = unresolved");
+
+        // The CHECK constraint rejects an unknown resolution at the storage boundary.
+        let bad = conn.execute(
+            "UPDATE items SET resolution = 'refuted' WHERE uid = 'n:res'",
+            [],
+        );
+        assert!(bad.is_err(), "unknown resolution must be rejected");
     }
 
     #[test]
@@ -120,7 +143,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 6);
+        assert_eq!(user_version, 7);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
