@@ -12,7 +12,9 @@ mod id;
 mod traits;
 
 pub use catalog::{check_version_drift, ensure_compatible, CatalogIdentity, VersionDrift};
-pub use enums::{ConflictPolicy, EdgeType, NamespaceKind, PlacementRole, SyncMode, TaskStatus};
+pub use enums::{
+    ConflictPolicy, EdgeType, NamespaceKind, PlacementRole, Resolution, SyncMode, TaskStatus,
+};
 pub use error::{Error, Result};
 pub use id::{EdgeId, ItemId, NamespaceId, Uid};
 pub use traits::Embedder;

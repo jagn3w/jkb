@@ -1,13 +1,15 @@
 //! The CLI query DSL parser: a concise string into a [`Query`] (task 8.2).
 //!
 //! Grammar (whitespace-separated tokens; `"…"` groups spaces):
-//! `kind:<k>` `status:<s>` `priority<op><n>` `due<op><date>`/`due:today`
-//! `tag:<facet><op><value>` `ns:<path>`/`ns:<path>/**` (comma-unions, repeatable)
-//! `is:ready` `blocks:<uid>` `~"<vector term>"` and bare/quoted words for FTS.
+//! `kind:<k>`/`kind:<a>,<b>` (negate with `-kind:…`) `status:<s>` `resolution:<r>`
+//! `priority<op><n>` `due<op><date>`/`due:today` `tag:<facet><op><value>` (negate with `-tag:…`)
+//! `ns:<path>`/`ns:<path>/**` (comma-unions, repeatable)
+//! `is:ready`/`is:frontier`/`is:tombstone`/`is:claimed`/`is:unclaimed`
+//! `blocks:<uid>` `~"<vector term>"` and bare/quoted words for FTS.
 //! Operators: `=`,`<`,`<=`,`>`,`>=` (and `:` as `=`). Malformed predicates produce
 //! an actionable [`crate::Error`].
 
-use jkb_types::Error as TypeError;
+use jkb_types::{Error as TypeError, Resolution};
 
 use super::{CmpOp, DueValue, Query, Scope, TagPred};
 use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
@@ -33,10 +35,40 @@ pub fn parse(input: &str) -> Result<Query> {
                 return Err(bad(&token, "expected a term after `~`, e.g. `~\"topic\"`"));
             }
             query.vector = Some(term);
+        } else if let Some(v) = token.strip_prefix("-kind:") {
+            for part in non_empty(v, &token, "kind")?.split(',') {
+                if part.is_empty() {
+                    return Err(bad(&token, "empty kind in `-kind:a,b`"));
+                }
+                query.exclude_kinds.push(part.to_owned());
+            }
         } else if let Some(v) = token.strip_prefix("kind:") {
-            query.kind = Some(non_empty(v, &token, "kind")?.to_owned());
+            let v = non_empty(v, &token, "kind")?;
+            // `kind:a,b` is a union; a single kind keeps using the scalar field so existing
+            // callers comparing `Query::kind` are unaffected.
+            if v.contains(',') {
+                for part in v.split(',') {
+                    if part.is_empty() {
+                        return Err(bad(&token, "empty kind in `kind:a,b`"));
+                    }
+                    query.kinds.push(part.to_owned());
+                }
+            } else {
+                query.kind = Some(v.to_owned());
+            }
         } else if let Some(v) = token.strip_prefix("status:") {
             query.status = Some(non_empty(v, &token, "status")?.to_owned());
+        } else if let Some(v) = token.strip_prefix("resolution:") {
+            let v = non_empty(v, &token, "resolution")?;
+            if Resolution::from_str_opt(v).is_none() {
+                return Err(bad(
+                    &token,
+                    "resolution is one of unresolved, success, dead_end, superseded, abandoned",
+                ));
+            }
+            query.resolution = Some(v.to_owned());
+        } else if let Some(v) = token.strip_prefix("-tag:") {
+            query.exclude_tags.push(parse_tag(v, &token)?);
         } else if let Some(v) = token.strip_prefix("tag:") {
             query.tags.push(parse_tag(v, &token)?);
         } else if let Some(v) = token.strip_prefix("ns:") {
@@ -44,7 +76,22 @@ pub fn parse(input: &str) -> Result<Query> {
         } else if let Some(v) = token.strip_prefix("is:") {
             match v {
                 "ready" => query.ready = true,
-                _ => return Err(bad(&token, "the only `is:` predicate is `is:ready`")),
+                // `is:frontier` bundles the claim filter so handing out work is safe by
+                // default (mirroring `is:ready`); a coordinator wanting the whole frontier
+                // including in-flight units builds the `Query` directly.
+                "frontier" => {
+                    query.frontier = true;
+                    query.claimed = Some(false);
+                }
+                "tombstone" => query.tombstone = true,
+                "claimed" => query.claimed = Some(true),
+                "unclaimed" => query.claimed = Some(false),
+                _ => {
+                    return Err(bad(
+                        &token,
+                        "the `is:` predicates are ready, frontier, tombstone, claimed, unclaimed",
+                    ))
+                }
             }
         } else if let Some(v) = token.strip_prefix("blocks:") {
             query.blocks = Some(non_empty(v, &token, "blocks")?.to_owned());
@@ -206,6 +253,41 @@ mod tests {
         let q = parse("is:ready blocks:task:abc").unwrap();
         assert!(q.ready);
         assert_eq!(q.blocks.as_deref(), Some("task:abc"));
+    }
+
+    #[test]
+    fn parses_the_investigation_predicates() {
+        let q = parse("is:frontier resolution:unresolved -tag:staleness=stale kind:hypothesis,gap")
+            .unwrap();
+        assert!(q.frontier);
+        assert_eq!(
+            q.claimed,
+            Some(false),
+            "`is:frontier` must exclude claimed work, like `is:ready`"
+        );
+        assert_eq!(q.resolution.as_deref(), Some("unresolved"));
+        assert_eq!(q.exclude_tags.len(), 1);
+        assert_eq!(q.exclude_tags[0].facet, "staleness");
+        assert!(q.tags.is_empty(), "`-tag:` must not also apply positively");
+        assert_eq!(q.kinds, vec!["hypothesis", "gap"]);
+        assert!(q.kind.is_none(), "a comma list uses `kinds`, not `kind`");
+
+        let q = parse("-kind:reflection,view").unwrap();
+        assert_eq!(q.exclude_kinds, vec!["reflection", "view"]);
+        assert!(q.kind.is_none() && q.kinds.is_empty(), "negation only");
+
+        let q = parse("is:tombstone").unwrap();
+        assert!(q.tombstone);
+        assert_eq!(parse("is:claimed").unwrap().claimed, Some(true));
+        assert_eq!(parse("is:unclaimed").unwrap().claimed, Some(false));
+    }
+
+    #[test]
+    fn unknown_resolution_and_is_predicates_are_rejected_with_the_valid_set() {
+        let err = parse("resolution:refuted").unwrap_err().to_string();
+        assert!(err.contains("dead_end"), "{err}");
+        let err = parse("is:blocked").unwrap_err().to_string();
+        assert!(err.contains("frontier"), "{err}");
     }
 
     #[test]

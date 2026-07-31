@@ -493,7 +493,8 @@ fn tasks_import_creates_items_sections_and_is_byte_stable() {
     let db = Db::open_in_memory().unwrap();
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
 
-    // First sync creates one item per task line + the prose text item.
+    // First sync creates one item per task line. Prose is NOT an item — it round-trips as
+    // namespace metadata (see `prose_is_not_an_item_so_a_section_cannot_outlive_the_file`).
     assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
     assert_eq!(task_count(&db), 3);
 
@@ -775,4 +776,338 @@ fn disk_reindent_survives_a_three_way_merge() {
             .contains("  - [ ] Fix flaky test"),
         "file lost its indentation"
     );
+}
+
+/// The `memory/sync-export-wins` regression, end to end.
+///
+/// Prose used to become `text` items whose ids (content hash + occurrence counter) broke on
+/// the next edit. An orphaned prose item kept its section namespace alive, `assemble_kb_doc`
+/// re-emitted that section's `##` header, and from then on the KB render disagreed with the
+/// disk forever — so every disk-only edit was resolved as a both-changed conflict and the
+/// stale header was written back over it.
+#[test]
+fn prose_is_not_an_item_so_a_section_cannot_outlive_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "# Plan\n\nPreamble.\n\n## Alpha\n\n- [ ] first\n  a continuation line\n\n## Beta\n\n- [ ] second\n",
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // Prose never materializes as an item, so it can never orphan.
+    let text_items: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM items WHERE kind = \'text\'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(text_items, 0, "prose must not become items");
+
+    // A settled file re-syncs UpToDate: the KB render reproduces the disk exactly.
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+
+    // Remove Beta's task (it is cancelled + detached, and its namespace survives)…
+    let without_task: String = fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("second"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&file, format!("{without_task}\n")).unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Imported), 1);
+
+    // …then remove its now-empty header. It must STAY removed.
+    let without_header: String = fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with("## Beta"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&file, format!("{without_header}\n")).unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Imported), 1);
+
+    for _ in 0..3 {
+        assert_eq!(
+            sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate),
+            1,
+            "a settled file must not keep flipping between disk and KB"
+        );
+        assert!(
+            !fs::read_to_string(&file).unwrap().contains("## Beta"),
+            "the retired section header came back: {}",
+            fs::read_to_string(&file).unwrap()
+        );
+    }
+    // The prose above it survived the whole exercise.
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("Preamble."), "prose was lost: {text}");
+    assert!(
+        text.contains("  a continuation line"),
+        "prose was lost: {text}"
+    );
+}
+
+/// Deleting a task line and putting it back must RE-ATTACH the same item, not fail on its
+/// uid. A removed line is detached rather than deleted, and it keeps its file-derived uid —
+/// so a plain insert hit `UNIQUE constraint failed: items.uid` and the whole sync errored.
+#[test]
+fn re_adding_a_deleted_task_line_reattaches_the_same_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Alpha\n\n- [ ] first ^first\n- [ ] second ^second\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let before = id_of(&db, &format!("{uri}#second"));
+
+    // Delete the line: the item is cancelled and detached, never destroyed.
+    fs::write(&file, "## Alpha\n\n- [ ] first ^first\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        status_of(&db, &format!("{uri}#second")).as_deref(),
+        Some("cancelled")
+    );
+
+    // Put it back: this must succeed, and resurrect the SAME item.
+    fs::write(
+        &file,
+        "## Alpha\n\n- [ ] first ^first\n- [ ] second ^second\n",
+    )
+    .unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Imported), 1, "sync must not fail");
+    assert_eq!(
+        id_of(&db, &format!("{uri}#second")),
+        before,
+        "the same item is re-attached, keeping its history and edges"
+    );
+    assert_eq!(
+        status_of(&db, &format!("{uri}#second")).as_deref(),
+        Some("open"),
+        "and it is live again"
+    );
+}
+
+/// The item id behind a binding uri (which is also the item uid), for identity assertions.
+fn id_of(db: &Db, uid: &str) -> i64 {
+    let uid = uid.to_owned();
+    db.read(move |conn| item::id_for_uid(conn, &uid))
+        .unwrap()
+        .expect("item exists")
+        .get()
+}
+
+/// A three-way merge must not delete content neither side touched. Prose has no identity, so
+/// it is taken wholesale from the disk side — omitting it silently stripped every blank line
+/// and paragraph out of a merged file (it destroyed a real openspec document).
+#[test]
+fn a_three_way_merge_keeps_the_files_prose() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "# Plan\n\nA paragraph of prose.\n\n## Alpha\n\n- [ ] first ^first\n  the first body\n- [ ] second ^second\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // Disjoint edits: the disk retitles `first`, the KB completes `second`.
+    fs::write(
+        &file,
+        "# Plan\n\nA paragraph of prose.\n\n## Alpha\n\n- [ ] first RETITLED ^first\n  the first body\n- [ ] second ^second\n",
+    )
+    .unwrap();
+    let second_uri = format!("{uri}#second");
+    db.write_txn("cli", move |conn, meta| {
+        let id = binding::item_for_uri(conn, &second_uri)?.expect("bound");
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Merged),
+        1,
+        "expected a three-way merge"
+    );
+
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(
+        text.contains("A paragraph of prose."),
+        "prose was deleted: {text}"
+    );
+    assert!(
+        text.contains("# Plan"),
+        "the title line was deleted: {text}"
+    );
+    assert!(
+        text.contains("  the first body"),
+        "a task body was deleted: {text}"
+    );
+    assert!(
+        text.contains("first RETITLED"),
+        "the disk edit was lost: {text}"
+    );
+    assert!(
+        text.contains("- [x] second"),
+        "the KB edit was lost: {text}"
+    );
+    // Blank lines survive, so the document still reads the way it was written.
+    assert!(
+        text.matches("\n\n").count() >= 3,
+        "blank lines were stripped: {text:?}"
+    );
+    // And it settles rather than flip-flopping.
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+}
+
+/// Every `##` header wedged into surrounding content — one whose neighbouring line is
+/// non-blank, meaning it split an item or its body instead of standing between blocks.
+///
+/// The shape actually observed was a header sitting between a task line and that task's own
+/// indented continuation, so checking only the line *before* (or only the line after) misses
+/// it. Both sides must be clear.
+fn headers_mid_item(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            l.starts_with("## ")
+                && ((*i > 0 && !lines[i - 1].trim().is_empty())
+                    || lines.get(i + 1).is_some_and(|n| !n.trim().is_empty()))
+        })
+        .map(|(_, l)| *l)
+        .collect()
+}
+
+/// Document order is the layout, not three drifting integer sequences.
+///
+/// Section order used to come from `namespaces.metadata.position`, item order from
+/// `placements.position`, and prose from its own ordinal — written at different times, and
+/// mixed across up to three different parses by a merge. The numbers stopped describing one
+/// document and a `##` header rendered into the middle of an item (twice, on a real file).
+/// These are the two paths that produced it: an export rendered purely from KB state, and a
+/// three-way merge.
+#[test]
+fn document_order_survives_kb_side_changes_and_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    let source = "# Plan\n\nIntro prose.\n\n## Alpha\n\n- [ ] first ^first\n  the first body\n  a second body line\n- [ ] second ^second\n\n## Beta\n\nSection prose.\n\n- [ ] third ^third\n  the third body\n";
+    fs::write(&file, source).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        source,
+        "byte-exact import"
+    );
+
+    // 1. A KB-side status change forces an EXPORT: the file is rendered from KB state alone,
+    //    which is where section/item ordinals used to be read from different writes.
+    db.write_txn("cli", {
+        let u = format!("{uri}#second");
+        move |conn, meta| {
+            let id = binding::item_for_uri(conn, &u)?.expect("bound");
+            task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+        }
+    })
+    .unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Exported), 1);
+    let exported = fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        exported,
+        source.replace("- [ ] second ^second", "- [x] second ^second"),
+        "an export must reproduce the file exactly but for the changed checkbox"
+    );
+    assert!(headers_mid_item(&exported).is_empty());
+
+    // 2. Re-homing an item KB-side changes its `placements.position` — the ordinal the old
+    //    render trusted. Document order must be unaffected.
+    db.write_txn("cli", {
+        let u = format!("{uri}#first");
+        move |conn, meta| {
+            let id = binding::item_for_uri(conn, &u)?.expect("bound");
+            let beta = ns::ensure(conn, "docs/plan/tasks-md/beta")?;
+            jkb_core::placement::set_primary(conn, meta, id, beta, 99)
+        }
+    })
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    let after_move = fs::read_to_string(&file).unwrap();
+    assert!(headers_mid_item(&after_move).is_empty(), "{after_move}");
+    assert!(
+        after_move.contains("Intro prose."),
+        "prose lost: {after_move}"
+    );
+    assert!(
+        after_move.contains("Section prose."),
+        "prose lost: {after_move}"
+    );
+    assert!(
+        after_move.contains("  the first body"),
+        "a task body was lost: {after_move}"
+    );
+
+    // 3. A three-way merge draws items from different parses; the layout must still be one
+    //    coherent document.
+    let disk: String = after_move.replace("- [ ] first", "- [ ] first RETITLED");
+    fs::write(&file, &disk).unwrap();
+    db.write_txn("cli", {
+        let u = format!("{uri}#third");
+        move |conn, meta| {
+            let id = binding::item_for_uri(conn, &u)?.expect("bound");
+            task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+        }
+    })
+    .unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Merged),
+        1,
+        "expected a three-way merge, got {:?}",
+        report.results.iter().map(|r| r.outcome).collect::<Vec<_>>()
+    );
+
+    let merged = fs::read_to_string(&file).unwrap();
+    assert!(
+        headers_mid_item(&merged).is_empty(),
+        "merge misplaced a header: {merged}"
+    );
+    assert!(
+        merged.contains("first RETITLED"),
+        "disk edit lost: {merged}"
+    );
+    assert!(merged.contains("- [x] third"), "KB edit lost: {merged}");
+    assert!(merged.contains("Intro prose."), "prose lost: {merged}");
+    assert!(merged.contains("Section prose."), "prose lost: {merged}");
+    assert!(merged.contains("  the third body"), "body lost: {merged}");
+    assert_eq!(
+        merged.matches("## ").count(),
+        2,
+        "sections duplicated or dropped"
+    );
+    // And it settles.
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
 }

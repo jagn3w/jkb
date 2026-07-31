@@ -16,6 +16,8 @@ pub struct DisplayItem {
     pub kind: String,
     /// Status (tasks).
     pub status: Option<String>,
+    /// Resolution — how a unit ended (investigation units); `None` = unresolved.
+    pub resolution: Option<String>,
     /// Priority (tasks).
     pub priority: Option<i64>,
     /// Due date (tasks).
@@ -35,6 +37,7 @@ impl DisplayItem {
             "uid": self.uid,
             "kind": self.kind,
             "status": self.status,
+            "resolution": self.resolution,
             "priority": self.priority,
             "due": self.due,
             "namespace": self.namespace,
@@ -47,6 +50,9 @@ impl DisplayItem {
         let mut parts = vec![format!("{:<24} [{}]", self.uid, self.kind)];
         if let Some(s) = &self.status {
             parts.push(format!("({s})"));
+        }
+        if let Some(r) = &self.resolution {
+            parts.push(format!("<{r}>"));
         }
         if let Some(p) = self.priority {
             parts.push(format!("!p{p}"));
@@ -89,7 +95,7 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
         for id in &ids {
             let row = conn
                 .prepare_cached(
-                    "SELECT id, uid, kind, status, priority, due, content, updated_at
+                    "SELECT id, uid, kind, status, resolution, priority, due, content, updated_at
                      FROM items WHERE id = ?1",
                 )?
                 .query_row([id], |r| {
@@ -98,14 +104,16 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<i64>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
                         r.get::<_, Option<String>>(6)?,
-                        r.get::<_, String>(7)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, String>(8)?,
                     ))
                 })
                 .ok();
-            let Some((id, uid, kind, status, priority, due, content, updated)) = row else {
+            let Some((id, uid, kind, status, resolution, priority, due, content, updated)) = row
+            else {
                 continue;
             };
             let namespace = conn
@@ -121,6 +129,7 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
                 uid,
                 kind,
                 status,
+                resolution,
                 priority,
                 due,
                 snippet: content.as_deref().map(snippet),

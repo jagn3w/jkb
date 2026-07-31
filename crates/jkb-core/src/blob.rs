@@ -47,10 +47,98 @@ pub fn load(conn: &Connection, hash: &str) -> Result<Option<Vec<u8>>> {
     Ok(bytes)
 }
 
+/// One stored blob's metadata (without its bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobInfo {
+    /// The blake3 hex key.
+    pub hash: String,
+    /// Size in bytes.
+    pub size: i64,
+    /// MIME type, if the writer recorded one.
+    pub mime: Option<String>,
+    /// When it was first stored (ISO).
+    pub created_at: String,
+}
+
+/// List stored blobs, newest first, optionally restricted to those **containing**
+/// `contains` as a byte substring.
+///
+/// This is the read side of the archive nothing else exposes. File sync stores the bytes
+/// of every version it settles, and blobs are never deleted — so the store already holds a
+/// complete history of every synced file, and until now there was no way to look at it. When
+/// a sync writes a wrong version over a file, searching the blobs for a line you remember is
+/// the recovery path.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn list(conn: &Connection, contains: Option<&[u8]>, limit: usize) -> Result<Vec<BlobInfo>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    // `instr` over two BLOBs is a byte-substring test, so this needs no lossy text
+    // conversion and works on non-UTF-8 content.
+    let mut stmt = conn.prepare_cached(
+        "SELECT hash, size, mime, created_at FROM blobs
+         WHERE ?1 IS NULL OR instr(bytes, ?1) > 0
+         ORDER BY created_at DESC, hash
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![contains, limit], |r| {
+        Ok(BlobInfo {
+            hash: r.get(0)?,
+            size: r.get(1)?,
+            mime: r.get(2)?,
+            created_at: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hash_bytes, load, store};
+    use super::{hash_bytes, list, load, store};
     use crate::Db;
+
+    #[test]
+    fn list_finds_a_blob_by_its_content() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, _m| {
+            for body in [
+                b"alpha version one".as_slice(),
+                b"beta version two".as_slice(),
+            ] {
+                store(conn, &hash_bytes(body), body, Some("text/plain"))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Unfiltered lists everything.
+        assert_eq!(db.read(|c| list(c, None, 100)).unwrap().len(), 2);
+
+        // A content search finds the version that carries a remembered line — the recovery
+        // path when a bad write has already landed on disk.
+        let hits = db.read(|c| list(c, Some(b"beta".as_slice()), 100)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            db.read({
+                let hash = hits[0].hash.clone();
+                move |c| load(c, &hash)
+            })
+            .unwrap()
+            .unwrap(),
+            b"beta version two"
+        );
+        assert_eq!(hits[0].size, 16);
+
+        // A miss is empty, not an error.
+        assert!(db
+            .read(|c| list(c, Some(b"gamma".as_slice()), 100))
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn hash_is_deterministic_and_hex() {

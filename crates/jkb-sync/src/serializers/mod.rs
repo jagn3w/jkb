@@ -30,12 +30,39 @@ use crate::{Error, Result};
 /// edges.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncDoc {
-    /// Section headers, in file order. Each maps to a namespace under the file's mirror.
+    /// Section headers. Each maps to a namespace under the file's mirror. **Order lives in
+    /// [`SyncDoc::layout`]**, not here.
     pub sections: Vec<SyncSection>,
-    /// The items the file serializes, in file order.
+    /// The items the file serializes.
     pub items: Vec<SyncItem>,
     /// Edges between items, referenced by `local_id`.
     pub edges: Vec<SyncEdge>,
+    /// The document's **block order** — the single authoritative answer to "what does this
+    /// file look like", and the only thing [`SyncSerializer::render`] consults for ordering.
+    ///
+    /// Order used to be inferred by merging three independent integer sequences: a section's
+    /// `namespaces.metadata.position`, an item's `placements.position`, and a prose block's
+    /// own ordinal. Those are written at different times by different code paths, and a
+    /// three-way merge draws items from up to three *different parses* — so the numbers stop
+    /// describing one coherent document and a `##` header renders into the middle of an item.
+    /// (Observed twice on a real file; see `memory/sync-export-wins`.)
+    ///
+    /// One ordered list, rewritten whole on every import, cannot drift against itself.
+    pub layout: Vec<SyncBlock>,
+}
+
+/// One block of a document, in file order.
+///
+/// Prose is stored **inline** here rather than as a separate collection: it has no identity
+/// to reference it by, and being a block in the order is the whole of what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncBlock {
+    /// A section header, by its slug path (the header text lives on [`SyncSection`]).
+    Section(String),
+    /// An item, by its `local_id`.
+    Item(String),
+    /// A verbatim run of prose/blank lines.
+    Prose(String),
 }
 
 /// A section header (`## …`) that maps to a namespace.
@@ -45,8 +72,6 @@ pub struct SyncSection {
     pub path: String,
     /// The literal header line, preserved verbatim for round-trip fidelity.
     pub header_line: String,
-    /// Order among sections in the file.
-    pub position: i64,
 }
 
 /// One item the file serializes.
@@ -61,7 +86,9 @@ pub struct SyncItem {
     pub content: String,
     /// The owning section's slug path; `None` = the file root (before any header).
     pub section: Option<String>,
-    /// Order within the owning section (tasks and text items interleave).
+    /// Order within the owning namespace, stored as `placements.position`. Derived from the
+    /// item's index in [`SyncDoc::layout`] — a KB-side concern (how a namespace lists its
+    /// items), never consulted when rendering the file.
     pub position: i64,
     /// Task status (`open`/`in_progress`/`needs_review`/`done`/`cancelled`); `None` for
     /// non-tasks.

@@ -3,7 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
-use jkb_types::{Error as TypeError, ItemId};
+use jkb_types::{Error as TypeError, ItemId, Resolution};
 
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
@@ -202,6 +202,9 @@ pub struct ItemMeta {
     pub mime: Option<String>,
     /// Task status, if a task.
     pub status: Option<String>,
+    /// How the unit **ended** — the outcome axis, orthogonal to `status` (design
+    /// Dmem.3). `None` (NULL) reads as [`jkb_types::Resolution::Unresolved`].
+    pub resolution: Option<String>,
     /// Priority, if set.
     pub priority: Option<i64>,
     /// Due date, if set.
@@ -218,7 +221,7 @@ pub struct ItemMeta {
 /// Returns an error if the query fails.
 pub fn get(conn: &Connection, item: ItemId) -> Result<Option<ItemMeta>> {
     conn.prepare_cached(
-        "SELECT id, uid, kind, content, content_hash, mime, status, priority, due,
+        "SELECT id, uid, kind, content, content_hash, mime, status, resolution, priority, due,
                 created_at, updated_at
          FROM items WHERE id = ?1",
     )?
@@ -231,14 +234,333 @@ pub fn get(conn: &Connection, item: ItemId) -> Result<Option<ItemMeta>> {
             content_hash: r.get(4)?,
             mime: r.get(5)?,
             status: r.get(6)?,
-            priority: r.get(7)?,
-            due: r.get(8)?,
-            created_at: r.get(9)?,
-            updated_at: r.get(10)?,
+            resolution: r.get(7)?,
+            priority: r.get(8)?,
+            due: r.get(9)?,
+            created_at: r.get(10)?,
+            updated_at: r.get(11)?,
         })
     })
     .optional()
     .map_err(Into::into)
+}
+
+/// Set `item`'s [`Resolution`] — how the unit **ended** (design Dmem.3), orthogonal to
+/// its `status`. Recorded in the changelog like any other mutation.
+///
+/// Setting a tombstone resolution ([`Resolution::DeadEnd`]/[`Resolution::Superseded`])
+/// deliberately does **not** delete anything: the unit is retained so the next agent can
+/// see it was tried. Link the edge that killed it ([`jkb_types::EdgeType::Refutes`],
+/// `RulesOut`, `Supersedes`) so the tombstone says *why*.
+///
+/// # Errors
+/// Returns [`jkb_types::Error::NotFound`] if `item` does not exist; otherwise a
+/// database error.
+pub fn set_resolution(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    resolution: Resolution,
+) -> Result<()> {
+    let before: Option<String> = conn
+        .prepare_cached("SELECT resolution FROM items WHERE id = ?1")?
+        .query_row([item.get()], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    conn.prepare_cached(
+        "UPDATE items SET resolution = ?2,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ?1",
+    )?
+    .execute(params![item.get(), resolution.as_str()])?;
+    changelog::append(
+        conn,
+        meta,
+        "update",
+        "items",
+        &item.get().to_string(),
+        Some(&json!({ "resolution": before })),
+        Some(&json!({ "resolution": resolution.as_str() })),
+    )?;
+    Ok(())
+}
+
+/// Read `item`'s [`Resolution`], defaulting a NULL column to
+/// [`Resolution::Unresolved`]. Returns `None` if the item does not exist.
+///
+/// # Errors
+/// Returns an error if the query fails, or a validation error if the stored string is
+/// not a known resolution (the `V007` CHECK constraint makes that unreachable in
+/// practice — it would mean the column was written outside jkb).
+pub fn get_resolution(conn: &Connection, item: ItemId) -> Result<Option<Resolution>> {
+    let raw: Option<Option<String>> = conn
+        .prepare_cached("SELECT resolution FROM items WHERE id = ?1")?
+        .query_row([item.get()], |row| row.get::<_, Option<String>>(0))
+        .optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+    let text = raw.unwrap_or_default();
+    Resolution::from_str_opt(&text).map(Some).ok_or_else(|| {
+        Error::Types(TypeError::Validation(format!(
+            "item {item} has unknown resolution `{text}`"
+        )))
+    })
+}
+
+/// What [`remove`] deleted, so a caller can report it honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    /// The removed item's uid.
+    pub uid: String,
+    /// The removed item's kind.
+    pub kind: String,
+    /// How many placements went with it.
+    pub placements: usize,
+    /// How many edges went with it (in both directions).
+    pub edges: usize,
+    /// How many tag applications went with it.
+    pub tags: usize,
+}
+
+/// A complete snapshot of `item` and everything that cascades with it, as the JSON the
+/// changelog stores in `before`.
+///
+/// `items` has `ON DELETE CASCADE` children (placements, edges, tag applications, the
+/// binding) and cascades do **not** pass through the repositories, so they generate no
+/// changelog entries of their own. Capturing them here is the only thing that makes the
+/// delete reversible — without it, `undo` would restore a naked item stripped of its
+/// placements and, worse, its edges.
+fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
+    let id = item.get();
+    let row = conn
+        .prepare_cached(
+            "SELECT uid, kind, content, content_hash, mime, status, resolution, priority, due,
+                    metadata, created_at, updated_at, claimant_id, claimed_at
+             FROM items WHERE id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "id": id,
+                "uid": r.get::<_, String>(0)?,
+                "kind": r.get::<_, String>(1)?,
+                "content": r.get::<_, Option<String>>(2)?,
+                "content_hash": r.get::<_, Option<String>>(3)?,
+                "mime": r.get::<_, Option<String>>(4)?,
+                "status": r.get::<_, Option<String>>(5)?,
+                "resolution": r.get::<_, Option<String>>(6)?,
+                "priority": r.get::<_, Option<i64>>(7)?,
+                "due": r.get::<_, Option<String>>(8)?,
+                "metadata": r.get::<_, String>(9)?,
+                "created_at": r.get::<_, String>(10)?,
+                "updated_at": r.get::<_, String>(11)?,
+                "claimant_id": r.get::<_, Option<String>>(12)?,
+                "claimed_at": r.get::<_, Option<String>>(13)?,
+            }))
+        })
+        .optional()?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+
+    let placements = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT namespace_id, role, position, metadata FROM placements WHERE item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "namespace_id": r.get::<_, i64>(0)?,
+                "role": r.get::<_, String>(1)?,
+                "position": r.get::<_, i64>(2)?,
+                "metadata": r.get::<_, String>(3)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tags = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT facet, value, props FROM tag_applications WHERE item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "facet": r.get::<_, String>(0)?,
+                "value": r.get::<_, String>(1)?,
+                "props": r.get::<_, String>(2)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let edges = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT src_item_id, dst_item_id, type, props, weight, created_at FROM edges
+             WHERE src_item_id = ?1 OR dst_item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "src": r.get::<_, i64>(0)?,
+                "dst": r.get::<_, i64>(1)?,
+                "type": r.get::<_, String>(2)?,
+                "props": r.get::<_, String>(3)?,
+                "weight": r.get::<_, Option<f64>>(4)?,
+                "created_at": r.get::<_, String>(5)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let binding = conn
+        .prepare_cached(
+            "SELECT uri, sync_mode, serializer, last_synced_hash, last_synced_at
+             FROM bindings WHERE item_id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "uri": r.get::<_, String>(0)?,
+                "sync_mode": r.get::<_, Option<String>>(1)?,
+                "serializer": r.get::<_, Option<String>>(2)?,
+                "last_synced_hash": r.get::<_, Option<String>>(3)?,
+                "last_synced_at": r.get::<_, Option<String>>(4)?,
+            }))
+        })
+        .optional()?;
+
+    Ok(json!({
+        "item": row,
+        "placements": placements,
+        "tags": tags,
+        "edges": edges,
+        "binding": binding,
+    }))
+}
+
+/// Whether `item` carries investigation **memory** that a delete would destroy: a tombstone
+/// resolution, or an incident `refutes`/`rules_out` edge recording that something was tried
+/// and killed. Returns the reason, or `None` if it holds no such memory.
+fn memory_reason(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    if let Some(resolution) = get_resolution(conn, item)? {
+        if resolution.is_tombstone() {
+            return Ok(Some(format!(
+                "it is a `{}` tombstone — the record that this was tried and did not work",
+                resolution.as_str()
+            )));
+        }
+    }
+    let killer: Option<String> = conn
+        .prepare_cached(
+            "SELECT type FROM edges
+             WHERE dst_item_id = ?1 AND type IN ('refutes', 'rules_out') LIMIT 1",
+        )?
+        .query_row([item.get()], |r| r.get(0))
+        .optional()?;
+    if let Some(edge_type) = killer {
+        return Ok(Some(format!(
+            "a `{edge_type}` edge records what killed it — deleting it loses why"
+        )));
+    }
+    Ok(None)
+}
+
+/// Delete `item` and everything that cascades with it (placements, edges, tag applications,
+/// its binding), recording a **complete snapshot** in the changelog so [`crate::undo`] can
+/// put it all back.
+///
+/// This is the escape hatch for detritus — an item the KB holds that nothing should reference
+/// any more — not a routine verb. Two guards stand in the way unless `force` is set, because
+/// each names a case where deleting is either destructive or a lie:
+///
+/// - **It is investigation memory.** A `dead_end`/`superseded` tombstone, or a unit with an
+///   incident `refutes`/`rules_out` edge, is the anti-retread record: the whole reason it is
+///   retained is so the next agent does not redo it (design Dmem.3/Dmem.8). Deleting one is
+///   the single most costly thing you can do to an investigation.
+/// - **It is bound to a synced file.** If the source file still declares it, the next sync
+///   recreates it — so the delete looks like it worked and then quietly undoes itself. Remove
+///   it from the file instead.
+///
+/// # Errors
+/// Returns [`jkb_types::Error::NotFound`] if `item` does not exist, a validation error if a
+/// guard refuses (naming the guard and that `--force` overrides it), or a database error.
+pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) -> Result<Removed> {
+    let before = snapshot(conn, item)?;
+
+    if !force {
+        if let Some(reason) = memory_reason(conn, item)? {
+            return Err(Error::Types(TypeError::Validation(format!(
+                "refusing to delete {item}: {reason}. Investigation memory is meant to be \
+                 retained — mark it `abandoned` with `jkb inv resolve` if it is merely stale. \
+                 Pass --force if you really mean to destroy it."
+            ))));
+        }
+        let uri = before
+            .get("binding")
+            .and_then(|b| b.get("uri"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if uri.starts_with("file://") {
+            return Err(Error::Types(TypeError::Validation(format!(
+                "refusing to delete {item}: it is bound to the synced file `{uri}`, so if that \
+                 file still declares it the next sync will recreate it. Remove it from the \
+                 source file instead, or pass --force if the file no longer has it."
+            ))));
+        }
+    }
+
+    let counts = |key: &str| {
+        before
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let removed = Removed {
+        uid: before["item"]["uid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        kind: before["item"]["kind"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        placements: counts("placements"),
+        edges: counts("edges"),
+        tags: counts("tags"),
+    };
+
+    // One DELETE; `PRAGMA foreign_keys = ON` cascades the children, which is why the snapshot
+    // above had to capture them.
+    conn.prepare_cached("DELETE FROM items WHERE id = ?1")?
+        .execute([item.get()])?;
+    changelog::append(
+        conn,
+        meta,
+        "delete",
+        "items",
+        &item.get().to_string(),
+        Some(&before),
+        None,
+    )?;
+    Ok(removed)
+}
+
+/// Set `item`'s resolution from a manual string, rejecting unknown values with an
+/// actionable error. The string boundary for the CLI and MCP edges (mirroring
+/// [`crate::task::set_status_str`]).
+///
+/// # Errors
+/// Returns a validation error if `resolution` is not one of
+/// `unresolved`/`success`/`dead_end`/`superseded`/`abandoned`, or the errors of
+/// [`set_resolution`].
+pub fn set_resolution_str(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    resolution: &str,
+) -> Result<()> {
+    let parsed = Resolution::from_str_opt(resolution).ok_or_else(|| {
+        Error::Types(TypeError::Validation(format!(
+            "unknown resolution `{resolution}`; expected one of {}",
+            Resolution::ALL
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    })?;
+    set_resolution(conn, meta, item, parsed)
 }
 
 /// Replace an item's `content` (and `content_hash`), bumping `updated_at` and
@@ -390,6 +712,64 @@ mod tests {
             ["n:accent"],
             "the `_sys` scope must not match the sibling `xsys`"
         );
+    }
+
+    #[test]
+    fn resolution_defaults_to_unresolved_and_round_trips() {
+        use super::{get, get_resolution, set_resolution, set_resolution_str};
+        use jkb_types::Resolution;
+
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |conn, meta| upsert(conn, meta, &note("n:1", None)))
+            .unwrap();
+
+        // A fresh item's NULL column reads as `unresolved` — no back-fill needed.
+        assert_eq!(
+            db.read(move |conn| get_resolution(conn, id)).unwrap(),
+            Some(Resolution::Unresolved)
+        );
+        assert_eq!(
+            db.read(move |conn| get(conn, id))
+                .unwrap()
+                .unwrap()
+                .resolution,
+            None,
+            "the stored column stays NULL until explicitly set"
+        );
+
+        // A tombstone resolution RETAINS the item (the graveyard is the memory).
+        db.write_txn("t", move |conn, meta| {
+            set_resolution(conn, meta, id, Resolution::DeadEnd)
+        })
+        .unwrap();
+        let meta = db.read(move |conn| get(conn, id)).unwrap().unwrap();
+        assert_eq!(meta.resolution.as_deref(), Some("dead_end"));
+        assert_eq!(meta.uid, "n:1", "the dead end is retained, not deleted");
+
+        // The string boundary rejects unknown values with the valid set named.
+        let err = db
+            .write_txn("t", move |conn, meta| {
+                set_resolution_str(conn, meta, id, "refuted")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refuted"), "{err}");
+        assert!(err.contains("dead_end"), "{err}");
+
+        // Setting a resolution is changelogged like any other mutation.
+        let updates: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM changelog
+                     WHERE entity_type = 'items' AND op = 'update'
+                       AND after LIKE '%dead_end%'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(updates, 1);
     }
 
     #[test]

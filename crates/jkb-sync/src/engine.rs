@@ -30,7 +30,7 @@ use jkb_types::{
 };
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::serializers::{resolve, SyncDoc, SyncItem, SyncSection, SyncSerializer};
+use crate::serializers::{resolve, SyncBlock, SyncDoc, SyncItem, SyncSection, SyncSerializer};
 use crate::{Error, Result};
 
 /// What happened when reconciling one file.
@@ -691,7 +691,9 @@ fn apply_doc(
     let file_ns_path = namespace_for(ctx, path);
     let file_ns = ns::ensure(conn, &file_ns_path)?;
 
-    // Sections → namespaces, with header/position stored for faithful re-render.
+    // Sections → namespaces, carrying only their header text. Their ORDER (and the file's
+    // prose) lives in the layout stored on the file namespace below — one sequence, so
+    // nothing can drift against anything else.
     let mut section_ns: HashMap<String, NamespaceId> = HashMap::new();
     for s in &doc.sections {
         let full = format!("{file_ns_path}/{}", s.path);
@@ -700,10 +702,17 @@ fn apply_doc(
             conn,
             meta,
             id,
-            &json!({ "header_line": s.header_line, "position": s.position, "sync_section": true }),
+            &json!({ "header_line": s.header_line, "sync_section": true }),
         )?;
         section_ns.insert(s.path.clone(), id);
     }
+    set_layout(conn, meta, file_ns, doc)?;
+    // A section the file no longer declares must stop being a section. Its namespace can
+    // legitimately survive — it may still hold cancelled tasks, which are deliberate history
+    // — but leaving `header_line` on it makes `assemble_kb_doc` re-emit a `##` header the
+    // file does not have, so the KB render disagrees with the disk forever and every later
+    // disk edit is resolved as a conflict (see `memory/sync-export-wins`).
+    retire_undeclared_sections(conn, meta, &file_ns_path, doc)?;
 
     // Existing items bound to this file, by local_id.
     let existing = existing_by_local(conn, bare_uri)?;
@@ -750,6 +759,103 @@ fn apply_doc(
     Ok(resolved.into_values().collect())
 }
 
+/// The metadata key holding a file's block order (and its prose, inline).
+const LAYOUT_KEY: &str = "layout";
+
+/// Serialize a document's layout for storage on the file's namespace.
+fn layout_json(doc: &SyncDoc) -> serde_json::Value {
+    let blocks: Vec<serde_json::Value> = doc
+        .layout
+        .iter()
+        .map(|b| match b {
+            SyncBlock::Section(path) => json!({ "section": path }),
+            SyncBlock::Item(id) => json!({ "item": id }),
+            SyncBlock::Prose(text) => json!({ "prose": text }),
+        })
+        .collect();
+    serde_json::Value::Array(blocks)
+}
+
+/// Store the document's layout on the file's own namespace, **merging** into whatever
+/// metadata it already carries (that namespace may be a mount's, with its own keys).
+fn set_layout(
+    conn: &Connection,
+    meta: &WriteMeta,
+    file_ns: NamespaceId,
+    doc: &SyncDoc,
+) -> Result<()> {
+    let mut metadata = ns::get_metadata(conn, file_ns)?
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(LAYOUT_KEY.to_owned(), layout_json(doc));
+    }
+    ns::set_metadata(conn, meta, file_ns, &metadata)?;
+    Ok(())
+}
+
+/// Read a stored layout back out of a namespace's metadata.
+fn read_layout(metadata: &serde_json::Value) -> Vec<SyncBlock> {
+    let Some(blocks) = metadata
+        .get(LAYOUT_KEY)
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|b| {
+            let text = |k: &str| {
+                b.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            if let Some(p) = text("section") {
+                Some(SyncBlock::Section(p))
+            } else if let Some(i) = text("item") {
+                Some(SyncBlock::Item(i))
+            } else {
+                text("prose").map(SyncBlock::Prose)
+            }
+        })
+        .collect()
+}
+
+/// Clear the section metadata of every namespace under the file that the document no longer
+/// declares, so it stops being rendered as a `##` header. The namespace and everything in it
+/// are left alone — this only retires its *section* role.
+fn retire_undeclared_sections(
+    conn: &Connection,
+    meta: &WriteMeta,
+    file_ns_path: &str,
+    doc: &SyncDoc,
+) -> Result<()> {
+    let declared: std::collections::HashSet<&str> =
+        doc.sections.iter().map(|s| s.path.as_str()).collect();
+    for (ns_id, ns_path) in ns::subtree(conn, file_ns_path)? {
+        if ns_path == file_ns_path {
+            continue;
+        }
+        if declared.contains(relative(file_ns_path, &ns_path).as_str()) {
+            continue;
+        }
+        let Some(mut metadata) = ns::get_metadata(conn, ns_id)? else {
+            continue;
+        };
+        let Some(map) = metadata.as_object_mut() else {
+            continue;
+        };
+        if map.remove("header_line").is_none() {
+            continue; // not a section to begin with
+        }
+        map.remove("position");
+        map.remove("sync_section");
+        map.remove("prose");
+        ns::set_metadata(conn, meta, ns_id, &metadata)?;
+    }
+    Ok(())
+}
+
 /// Create a new item for a [`SyncItem`], placing it under its home namespace and
 /// binding it to `uri`. `content_hash` is left `None` so two identical-title tasks do
 /// not dedup-collapse into one item (their `local_id`/uri is the real identity).
@@ -761,19 +867,30 @@ fn create_item(
     uri: &str,
     home: NamespaceId,
 ) -> Result<ItemId> {
-    let id = item::upsert(
-        conn,
-        meta,
-        &NewItem {
-            uid: uri.to_owned(),
-            kind: it.kind.clone(),
-            content: Some(it.content.clone()),
-            content_hash: None,
-            mime: None,
-        },
-    )?;
-    set_task_columns(conn, meta, id, it)?;
-    placement::place(conn, meta, id, home, PlacementRole::Primary, it.position)?;
+    // A line deleted from the file is detached, not deleted (design D25) — and it keeps its
+    // file-derived uid. Re-adding that same line mints the same uid, so a plain insert hits
+    // the UNIQUE constraint and the whole sync fails. Re-attaching instead is both the fix
+    // and the better semantics: deleting a line and putting it back restores the same item,
+    // with its edges, tags and history intact, rather than a stranger wearing its name.
+    let id = if let Some(existing) = item::id_for_uid(conn, uri)? {
+        update_item(conn, meta, existing, it, home)?;
+        existing
+    } else {
+        let id = item::upsert(
+            conn,
+            meta,
+            &NewItem {
+                uid: uri.to_owned(),
+                kind: it.kind.clone(),
+                content: Some(it.content.clone()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        set_task_columns(conn, meta, id, it)?;
+        placement::place(conn, meta, id, home, PlacementRole::Primary, it.position)?;
+        id
+    };
     binding::set(
         conn,
         meta,
@@ -900,25 +1017,28 @@ fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) ->
     let file_ns_path = namespace_for(ctx, path);
     let mut doc = SyncDoc::default();
 
-    // Sections: descendant namespaces carrying header metadata.
+    // The file namespace carries the document's layout — its block order and its prose.
+    // Sections are the descendant namespaces still carrying `header_line`: one the file
+    // stopped declaring was retired by `retire_undeclared_sections` and must not re-emit its
+    // header.
     if let Some(file_ns) = ns::get(conn, &file_ns_path)? {
-        let _ = file_ns;
+        if let Some(md) = ns::get_metadata(conn, file_ns)? {
+            doc.layout = read_layout(&md);
+        }
         for (ns_id, ns_path) in ns::subtree(conn, &file_ns_path)? {
             if ns_path == file_ns_path {
                 continue;
             }
-            if let Some(md) = ns::get_metadata(conn, ns_id)? {
-                if let Some(header) = md.get("header_line").and_then(|v| v.as_str()) {
-                    doc.sections.push(SyncSection {
-                        path: relative(&file_ns_path, &ns_path),
-                        header_line: header.to_owned(),
-                        position: md
-                            .get("position")
-                            .and_then(serde_json::Value::as_i64)
-                            .unwrap_or(0),
-                    });
-                }
-            }
+            let Some(md) = ns::get_metadata(conn, ns_id)? else {
+                continue;
+            };
+            let Some(header) = md.get("header_line").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            doc.sections.push(SyncSection {
+                path: relative(&file_ns_path, &ns_path),
+                header_line: header.to_owned(),
+            });
         }
     }
 
@@ -971,7 +1091,115 @@ fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) ->
             }
         }
     }
+
+    // A KB written before the layout model has none stored. Rebuild it from the legacy
+    // positional data (section `metadata.position`, item `placements.position`, and any
+    // `metadata.prose` from the intermediate model) so the assembled document still matches
+    // the file. Without this the render comes out empty-ordered, the KB looks changed, and
+    // sync exports that garbage over every file it manages — which is exactly what happened.
+    // The next import replaces it with a real layout.
+    if doc.layout.is_empty() {
+        doc.layout = legacy_layout(conn, ctx, path, &doc)?;
+    }
+
+    // An item's SECTION comes from the layout — the section header it sits under in the file
+    // — not from the namespace it happens to be placed in. The layout is authoritative for
+    // document structure, so the two must not be allowed to disagree: when they did, a
+    // KB-side re-home left the assembled doc permanently different from the base, and every
+    // subsequent disk edit came back as a conflict. Re-homing a file-backed item therefore
+    // does not move it between sections in its file; editing the file does.
+    apply_layout_sections(&mut doc);
     Ok(doc)
+}
+
+/// Reconstruct a layout for a KB that predates the layout model, from the ordinals it does
+/// have: each section's `namespaces.metadata.position`, each item's `placements.position`,
+/// and any prose stored under the intermediate `metadata.prose` key. Interleaving them by
+/// ordinal is precisely the old (fragile) ordering — which is correct *here*, because the
+/// goal is to reproduce what that KB last rendered, not to improve on it.
+fn legacy_layout(
+    conn: &Connection,
+    ctx: &Ctx,
+    path: &Path,
+    doc: &SyncDoc,
+) -> Result<Vec<SyncBlock>> {
+    let file_ns_path = namespace_for(ctx, path);
+    let mut blocks: Vec<(i64, SyncBlock)> = Vec::new();
+
+    if let Some(file_ns) = ns::get(conn, &file_ns_path)? {
+        collect_legacy_prose(conn, file_ns, &mut blocks)?;
+        for (ns_id, ns_path) in ns::subtree(conn, &file_ns_path)? {
+            if ns_path == file_ns_path {
+                continue;
+            }
+            let Some(md) = ns::get_metadata(conn, ns_id)? else {
+                continue;
+            };
+            if md.get("header_line").is_none() {
+                continue;
+            }
+            let position = md
+                .get("position")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            blocks.push((
+                position,
+                SyncBlock::Section(relative(&file_ns_path, &ns_path)),
+            ));
+            collect_legacy_prose(conn, ns_id, &mut blocks)?;
+        }
+    }
+    for item in &doc.items {
+        blocks.push((item.position, SyncBlock::Item(item.local_id.clone())));
+    }
+    blocks.sort_by_key(|(p, _)| *p);
+    Ok(blocks.into_iter().map(|(_, b)| b).collect())
+}
+
+/// Pull any intermediate-model `metadata.prose` entries off a namespace into `blocks`.
+fn collect_legacy_prose(
+    conn: &Connection,
+    ns_id: NamespaceId,
+    blocks: &mut Vec<(i64, SyncBlock)>,
+) -> Result<()> {
+    let Some(md) = ns::get_metadata(conn, ns_id)? else {
+        return Ok(());
+    };
+    let Some(entries) = md.get("prose").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let Some(content) = entry.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let position = entry
+            .get("position")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        blocks.push((position, SyncBlock::Prose(content.to_owned())));
+    }
+    Ok(())
+}
+
+/// Set each item's `section` from its position in the layout (the nearest preceding section
+/// block). Items absent from the layout keep the section derived from their placement.
+fn apply_layout_sections(doc: &mut SyncDoc) {
+    let mut current: Option<String> = None;
+    let mut by_id: HashMap<&str, Option<String>> = HashMap::new();
+    for block in &doc.layout {
+        match block {
+            SyncBlock::Section(path) => current = Some(path.clone()),
+            SyncBlock::Item(id) => {
+                by_id.insert(id.as_str(), current.clone());
+            }
+            SyncBlock::Prose(_) => {}
+        }
+    }
+    for item in &mut doc.items {
+        if let Some(section) = by_id.get(item.local_id.as_str()) {
+            item.section.clone_from(section);
+        }
+    }
 }
 
 /// An item's `(kind, content, status, priority, due)` columns.
@@ -1267,6 +1495,23 @@ fn three_way(base: &SyncDoc, disk: &SyncDoc, kb: &SyncDoc) -> ThreeWay {
     merged
         .edges
         .retain(|e| present.contains(&e.src) && present.contains(&e.dst));
+
+    // Take the LAYOUT (block order + prose) wholesale from the disk side, which is the
+    // structural skeleton this merge is built on and which *is* the file's own text. Merging
+    // ordinals from three different parses is exactly what used to put a `##` header in the
+    // middle of an item; one side's layout is coherent by construction. Blocks naming items
+    // that did not survive the merge are dropped, and `render` appends anything the layout
+    // does not mention, so a KB-only item is never lost.
+    let source = if disk.layout.is_empty() { kb } else { disk };
+    merged.layout = source
+        .layout
+        .iter()
+        .filter(|b| match b {
+            SyncBlock::Item(id) => present.contains(id),
+            _ => true,
+        })
+        .cloned()
+        .collect();
     ThreeWay::Merged(merged)
 }
 

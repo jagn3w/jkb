@@ -69,7 +69,8 @@ implementation checklist and the **source of truth for what's done**.
   `SyncSerializer` generalized from a content string to `parse(bytes) -> SyncDoc` /
   `render(&SyncDoc) -> bytes` (`SyncDoc { sections, items, edges }`), split into
   `serializers/{mod,document,tasks}.rs`. Ships the **`tasks` serializer** (one `tasks.md`
-  ⇄ many `kind='task'` items): `##` headers → namespaces, prose/legend → `text` items,
+  ⇄ many `kind='task'` items): `##` headers → namespaces, prose/legend → `SyncProse` blocks
+  stored as namespace `metadata.prose` (**never items** — see the sync note below),
   checkbox status (`[ ]/[x]/[~]/[-]`), quick-add modifiers (`!p @ #f=v +ns`), `needs:^id`
   → `depends_on`, indentation → `parent_of`, and a **visible trailing `^id`** stable
   identity (minted deterministically when absent; write-back stamps it). The engine
@@ -99,8 +100,9 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **203 tests** green (68 core + 15 embed + 14 types + 8 index + 23 ingest + 7 search
-  + 29 sync + 33 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama, live-URL); `clippy -D warnings` clean
+- **299 tests** green (117 core = 92 unit + 12 query + 13 investigation; 15 embed + 17 types
+  + 8 index + 23 ingest + 7 search + 35 sync + 62 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+  live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
   `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
@@ -493,6 +495,100 @@ and `jkb item show <uid>` (kind-aware details + a bounded preview, never the who
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.
+
+## Investigation namespaces (Dmem, the `jkb-memory` change) — `memory/`
+
+`memory/` is no longer an empty reserved root: it holds **investigations** — open-ended,
+multi-agent knowledge work whose state outlives any one context (design
+`openspec/changes/jkb-memory/`, Dmem.0–9). The bet is the same one jkb was founded on:
+coordination lives in the *store* (items + typed edges), never in agent chat.
+
+- **The universal shape (Dmem.0).** An investigation is a typed namespace holding a typed,
+  scored graph read back as three buckets — **frontier** (live + unblocked, ranked),
+  **confirmed core** (settled results), **tombstones** (dead ends + the edge to what killed
+  each) — plus a `reflection` **digest**. It terminates on a **goal predicate**, never a timer.
+- **Thin base + pluggable strategy (Dmem.1).** `jkb-core/src/nstype/` is the seam:
+  `trait NamespaceType` declares node kinds, edge subset, verbs (as *data* — `VerbSpec`),
+  `frontier`, `ranking`, `resolution_rollup`, and `goal_predicate`; `resolve(name)` mirrors
+  `jkb_sync::serializers::resolve` (one match arm + one `AVAILABLE` entry per strategy). A
+  namespace's type lives in `namespaces.metadata.type` (`ns::set_type`/`effective_type`, which
+  **inherits** down the subtree). Untyped namespaces behave exactly as before.
+- **Two registered strategies.** `nstype/debugging.rs` (symptom → hypothesis → experiment →
+  observation → root-cause → fix → **verify**; mutable system, so observations carry
+  `commit-range=` and go `staleness=stale`, excluded from frontier/ranking but never deleted)
+  and `nstype/conjecture.rs` (prove **or** disprove one conjecture under one structure —
+  approach-family registry + `family_pressure`, blocked-with-reason via a `gap` the route
+  `depends_on`, gated `reopen_gate`, `is_anti_progress` over `equivalent_in_strength_to`,
+  adversarial `audit`, and `open_gaps_under` as the machine-checkable "no partial results" bar;
+  prove vs disprove differ **only** by the acceptance preset on the goal).
+- **Schema (`V007`, additive).** `items.resolution` (indexed, CHECK-constrained: `unresolved|
+  success|dead_end|superseded|abandoned`; NULL reads as `unresolved`, so nothing is back-filled)
+  and `edges.weight REAL` (signed evidence; NULL reads as 1.0). Memory units are ordinary items
+  of non-task kinds with NULL `status` — **no new tables**.
+- **Query primitives.** `Query` gained `resolution`, `kinds` (union), `exclude_kinds`
+  (`-kind:k`), `exclude_tags` (`-tag:f=v`), `frontier`, `tombstone`, `claimed`; the DSL gained
+  `resolution:<r>`, `is:frontier`, `is:tombstone`, `is:claimed`/`is:unclaimed`. `is:frontier` is a
+  strict generalization of `is:ready` — for a task (NULL resolution) it selects exactly the same
+  rows, and nothing may write a task's `resolution` (`investigation::resolve_unit` and `roll_up`
+  both refuse) or the two would diverge. Every strategy's frontier starts from
+  `nstype::base_frontier`, which excludes `NON_WORK_KINDS` (`reflection` — a digest is memory
+  *about* the investigation, not work in it).
+- **Engine + surface.** `jkb-core/src/investigation.rs` owns create/add/`apply_verb`/the three
+  buckets/`anti_retread`/`roll_up`/`digest`; `jkb related <uid>` is the new edge-walk read
+  (`edge::walk`), and `jkb inv ls|new|verbs|kinds|frontier|core|tombstones|retread|evidence|
+  digest|rollup|do|add|link|promise|resolve|reopen|stale` is the surface. `jkb inv new` also
+  saves three per-bucket views so the buckets are reachable from the generic `jkb view` surface.
+- **Never hard-delete a dead end.** Resolve it and link the edge that killed it. The graveyard
+  is the memory — it is the single highest-value thing in the store.
+- **Deliberately deferred** (documented in Dmem.7, do not build without a design pass): the
+  evolutionary-search / tournament / blackboard / literature-synthesis strategies, the
+  software-swarm retrofit, bi-temporal validity, the scheduled reflection pass, and an MCP
+  memory surface. Driving investigations at large fan-out is
+  `task:scale-up-the-task-swarm-to-drive-18c6cc7853efc280`, not part of this change.
+
+## Sync: prose is not an item (the `memory/sync-export-wins` fix)
+
+The `tasks` serializer used to turn every non-item line into a `text` item whose identity was
+a content hash plus an occurrence counter. That identity cannot survive an edit — two blank
+lines are indistinguishable, and inserting a line above shifts every ordinal below — so old
+prose items orphaned. An orphan stayed *placed* in its section namespace, `assemble_kb_doc`
+emitted a `##` header for **every** namespace carrying `header_line` metadata regardless of
+whether the file still declared it, and from then on the KB render permanently disagreed with
+the disk: `kb_changed` was stuck true, so every disk-only edit was resolved as a both-changed
+conflict and the stale header was written back over it.
+
+Two changes close it:
+
+- **Prose is never an item.** It carries no knowledge, nothing links to it, nothing queries
+  it — giving it an identity (a content hash plus an occurrence counter) produced ids that
+  broke on the next edit.
+- **One authoritative `SyncDoc::layout`** replaces three drifting integer sequences. Document
+  order used to be reconstructed by merging a section's `namespaces.metadata.position`, an
+  item's `placements.position`, and a prose block's own ordinal — written at different times,
+  and mixed across up to three *different parses* by a three-way merge. The numbers stopped
+  describing one document and a `##` header rendered into the middle of an item (observed
+  twice on a real file). Now `layout: Vec<SyncBlock>` (`Section(path)` | `Item(local_id)` |
+  `Prose(text)`, prose inline) is stored whole on the file's namespace and is the **only**
+  thing `render` consults for ordering; a merge takes it wholesale from the disk side, and
+  anything it does not mention is appended rather than dropped. `SyncItem::position` survives
+  only as the KB-side `placements.position` hint, never as document order.
+- **An item's `section` is derived from the layout**, not from the namespace it is placed in,
+  so the two cannot disagree. (Consequence: re-homing a *file-backed* item does not move it
+  between sections in its file — edit the file for that. Before, the disagreement made the KB
+  permanently differ from the base and turned every later disk edit into a conflict.)
+- **`retire_undeclared_sections`** clears `header_line`/`position`/`sync_section`/`prose` from
+  any namespace under the file the document no longer declares. The namespace and its contents
+  survive (it may hold cancelled tasks, which are deliberate history); it just stops being a
+  *section*. This covers the other way a section outlived its file — a cancelled **task**.
+
+Related, same root: **`create_item` re-attaches**. A line deleted from a file is detached, not
+deleted (D25), and keeps its file-derived uid — so re-adding it hit `UNIQUE constraint failed:
+items.uid` and failed the whole sync. It now updates and re-binds the existing item, so
+deleting a line and putting it back restores the same item with its edges and history.
+
+Legacy `text` items migrate lazily: the new parser emits none, so each file's next import
+cancels + detaches them exactly as designed, and `render` still emits a non-task item verbatim
+so an un-migrated KB round-trips rather than losing lines.
 
 ## Namespace organization (D32) — a global, multi-repo layout
 

@@ -199,9 +199,10 @@ fn mount_and_sync_imports_files() {
 }
 
 #[test]
-fn task_edit_refuses_newline_edits_on_file_backed_tasks() {
-    // A file-backed task is a single source line; `--append` (or multi-line content)
-    // would split it on sync and detach its `^id`. The CLI must refuse such edits.
+fn task_edit_appends_a_body_to_a_file_backed_task_but_refuses_a_blank_line() {
+    // A file-backed task's content after the first line is its indented BODY in the source
+    // file, so `--append` round-trips. Only a blank line is refused: it ends the body on
+    // re-parse, so anything after it would detach from the task and drift into section prose.
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let repo = TempDir::new().unwrap();
@@ -236,27 +237,52 @@ fn task_edit_refuses_newline_edits_on_file_backed_tasks() {
     let uid = &stdout[start..start + stdout[start..].find('"').unwrap()];
     assert!(uid.contains("tasks.md#"), "unexpected uid: {uid}");
 
-    // `--append` is refused with a message pointing at the source-file flow.
-    jkb(&db)
-        .args(["task", "edit", uid, "--append", "Design: use trait X"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("file-backed"))
-        .stderr(predicate::str::contains("run `jkb sync`"));
-
-    // A multi-line replacement is refused too (content carrying a newline).
+    // A multi-line replacement is fine: the extra lines become the task's body.
     jkb(&db)
         .args(["task", "edit", uid, "line one\nline two"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("file-backed"));
+        .success()
+        .stdout(predicate::str::contains("edited"));
 
-    // A single-line replacement round-trips and is allowed.
+    // A blank line WOULD detach the tail from the task, so it is still refused.
+    jkb(&db)
+        .args(["task", "edit", uid, "title\n\ndetached tail"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("blank line"));
+
+    // A single-line replacement is of course fine.
     jkb(&db)
         .args(["task", "edit", uid, "renamed", "title"])
         .assert()
         .success()
         .stdout(predicate::str::contains("edited"));
+
+    // `--append` now works on a file-backed task, and the appended body SURVIVES a sync
+    // round trip as indented lines under the task — the point of carrying it on the item.
+    jkb(&db)
+        .args(["task", "edit", uid, "--append", "Design: use trait X"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended"));
+    jkb(&db).args(["sync", "work"]).assert().success();
+    let on_disk = std::fs::read_to_string(repo.path().join("tasks.md")).unwrap();
+    assert!(
+        on_disk.contains("  Design: use trait X"),
+        "the appended body must render indented under its task: {on_disk}"
+    );
+    // And it settles — no flip-flop between disk and KB.
+    jkb(&db)
+        .args(["sync", "work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 up-to-date"));
+    // The body is the task's own content, so `task show` displays it.
+    jkb(&db)
+        .args(["task", "show", uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Design: use trait X"));
 
     // The guard is specific to file-backed tasks: a managed task still appends fine.
     jkb(&db)
@@ -1382,4 +1408,629 @@ fn find_guards_unscoped_and_tree_bounds_depth() {
         .assert()
         .success()
         .stdout(predicate::str::contains("deep"));
+}
+
+/// Pull the first `uid` out of a `--json` command's output.
+fn uid_from(assert: &assert_cmd::assert::Assert) -> String {
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON, got {out:?}: {e}"));
+    let uid = match &v {
+        serde_json::Value::Array(items) => items
+            .first()
+            .and_then(|i| i.get("uid"))
+            .and_then(serde_json::Value::as_str),
+        other => other.get("uid").and_then(serde_json::Value::as_str),
+    };
+    uid.unwrap_or_else(|| panic!("no uid in {out}")).to_owned()
+}
+
+/// The investigation surface, driven exactly as an agent would: create, record a dead end,
+/// read the three buckets, check anti-retread, and walk the graph.
+#[test]
+#[allow(clippy::too_many_lines)] // one investigation driven end to end over the CLI
+fn an_investigation_runs_end_to_end_over_the_cli() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // No investigations yet — the empty listing names the available strategies rather than
+    // leaving an agent guessing.
+    jkb(&db).args(["inv", "ls"]).assert().success().stdout(
+        predicate::str::contains("debugging").and(predicate::str::contains("conjecture-attack")),
+    );
+
+    // An unknown strategy is rejected with the list, not silently created untyped.
+    jkb(&db)
+        .args(["--global", "inv", "new", "evolutionary-search", "hunt"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown investigation type"));
+
+    // Create one. Outside a repo it homes at `memory/<name>`.
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "debugging",
+            "flaky",
+            "--goal",
+            "sync flakes on a clean tree",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("memory/flaky"));
+
+    let goal = uid_from(
+        &jkb(&db)
+            .args(["--json", "inv", "frontier", "memory/flaky"])
+            .assert()
+            .success(),
+    );
+
+    // The verbs come from the descriptor, so `jkb inv verbs` is self-documenting.
+    jkb(&db)
+        .args(["inv", "verbs", "memory/flaky"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hypothesize").and(predicate::str::contains("rule-out")));
+
+    // A verb from the other strategy is refused, listing the ones that exist.
+    jkb(&db)
+        .args(["inv", "do", "memory/flaky", "family", "flow formulations"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "is not a verb of the `debugging` strategy",
+        ));
+
+    // Two hypotheses; kill one.
+    let dead = uid_from(
+        &jkb(&db)
+            .args([
+                "--json",
+                "inv",
+                "do",
+                "memory/flaky",
+                "hypothesize",
+                "mtime granularity",
+                "--on",
+                &goal,
+            ])
+            .assert()
+            .success(),
+    );
+    let live = uid_from(
+        &jkb(&db)
+            .args([
+                "--json",
+                "inv",
+                "do",
+                "memory/flaky",
+                "hypothesize",
+                "hash read before flush",
+                "--on",
+                &goal,
+            ])
+            .assert()
+            .success(),
+    );
+    jkb(&db)
+        .args([
+            "inv",
+            "do",
+            "memory/flaky",
+            "refute",
+            "mtimes differ by 4ms",
+            "--on",
+            &dead,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("target resolution -> dead_end"));
+
+    // The tombstones bucket shows the dead end AND why it died.
+    jkb(&db)
+        .args(["inv", "tombstones", "memory/flaky"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(dead.clone())
+                .and(predicate::str::contains("refutes by"))
+                .and(predicate::str::contains("4ms")),
+        );
+
+    // …and it is gone from the frontier, while the live hypothesis remains.
+    jkb(&db)
+        .args(["inv", "frontier", "memory/flaky"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(live.clone())
+                .and(predicate::str::contains(dead.clone()).not()),
+        );
+
+    // Weighted evidence, read back itemized.
+    jkb(&db)
+        .args([
+            "inv",
+            "do",
+            "memory/flaky",
+            "support",
+            "fsync makes 200 runs pass",
+            "--on",
+            &live,
+            "--weight",
+            "3",
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["inv", "evidence", &live])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("balance +3.00"));
+
+    // Anti-retread before working the live hypothesis: its refuted sibling surfaces.
+    jkb(&db)
+        .args(["inv", "retread", &live, "--depth", "2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(dead.clone()));
+
+    // `jkb related` walks the graph — the goal's inbound edges reach both hypotheses.
+    jkb(&db)
+        .args(["related", &goal, "--direction", "in"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(live.clone()).and(predicate::str::contains(dead.clone())));
+    // An unknown edge type is rejected with the vocabulary.
+    jkb(&db)
+        .args(["related", &goal, "--edge", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown edge type"));
+
+    // The digest renders all three buckets and is written as one reflection unit.
+    jkb(&db)
+        .args(["inv", "digest", "memory/flaky"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("## Frontier")
+                .and(predicate::str::contains("## Tombstones"))
+                .and(predicate::str::contains("Acceptance: not met")),
+        );
+    jkb(&db)
+        .args(["--global", "--json", "query", "kind:reflection"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("digest"));
+
+    // A dead end is retained, not deleted: `stat` still finds it, resolution and all.
+    jkb(&db)
+        .args(["stat", &dead])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resolution: dead_end"));
+
+    // The `is:frontier` DSL term works over the ordinary query path too.
+    jkb(&db)
+        .args(["--global", "query", "is:frontier kind:hypothesis"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(live).and(predicate::str::contains(dead).not()));
+
+    // Every write went through the audited writer-actor, so `undo` applies here as well.
+    jkb(&db).args(["undo"]).assert().success();
+}
+
+/// `jkb item rm` deletes an item and its cascade, is reversible by `jkb undo`, and refuses
+/// the two cases where deleting is destructive or a lie.
+#[test]
+fn item_rm_is_guarded_and_undoable() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // A plain note, placed and tagged, is removable.
+    jkb(&db)
+        .args(["task", "add", "scratch note", "+notes/tmp"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--global", "--json", "find", "notes/tmp"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = v[0]["uid"].as_str().unwrap().to_owned();
+
+    jkb(&db)
+        .args(["item", "rm", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed").and(predicate::str::contains("jkb undo")));
+    jkb(&db).args(["stat", &uid]).assert().failure();
+
+    // `jkb undo` brings it back — the delete-only transaction is what undo targets.
+    jkb(&db).args(["undo"]).assert().success();
+    jkb(&db).args(["stat", &uid]).assert().success();
+
+    // An investigation tombstone is refused: it is the anti-retread record.
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "debugging",
+            "guard",
+            "--goal",
+            "a symptom",
+        ])
+        .assert()
+        .success();
+    let goal = uid_from(
+        &jkb(&db)
+            .args(["--json", "inv", "frontier", "memory/guard"])
+            .assert()
+            .success(),
+    );
+    let dead = uid_from(
+        &jkb(&db)
+            .args([
+                "--json",
+                "inv",
+                "do",
+                "memory/guard",
+                "hypothesize",
+                "a wrong idea",
+                "--on",
+                &goal,
+            ])
+            .assert()
+            .success(),
+    );
+    jkb(&db)
+        .args([
+            "inv",
+            "do",
+            "memory/guard",
+            "refute",
+            "disproved by measurement",
+            "--on",
+            &dead,
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["item", "rm", &dead])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("tombstone").and(predicate::str::contains("--force")));
+    // Still there, and still in the tombstones bucket.
+    jkb(&db)
+        .args(["inv", "tombstones", "memory/guard"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(dead.clone()));
+    // `--force` gets through, and is still undoable.
+    jkb(&db)
+        .args(["item", "rm", &dead, "--force"])
+        .assert()
+        .success();
+    jkb(&db).args(["undo"]).assert().success();
+    jkb(&db).args(["stat", &dead]).assert().success();
+}
+
+/// Code-review regressions at the CLI edge (review 20260730-003611-jkb-memory-1): the digest
+/// is not offered as work, `inv new` is idempotent and refuses a re-type, `--accept` is
+/// strategy-scoped, and `inv resolve` refuses a task.
+#[test]
+fn the_inv_surface_refuses_cross_strategy_and_task_misuse() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "debugging",
+            "probe",
+            "--goal",
+            "a symptom",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created investigation"));
+
+    // `--accept` belongs to conjecture-attack; applying it to debugging would stamp the
+    // mathematical proof bar onto a symptom body that `goal_predicate` never reads.
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "debugging",
+            "probe2",
+            "--accept",
+            "prove",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("has no acceptance presets")
+                .and(predicate::str::contains("debugging")),
+        );
+
+    // The digest must not show up as frontier work, nor inside its own rendering.
+    jkb(&db)
+        .args(["inv", "digest", "memory/probe"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["inv", "frontier", "memory/probe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reflection").not());
+
+    // Re-running `inv new` is idempotent and says so rather than claiming a fresh create.
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "debugging",
+            "probe",
+            "--goal",
+            "ignored",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already exists"));
+    // Exactly one goal unit, still holding the original body.
+    jkb(&db)
+        .args(["--global", "--json", "query", "kind:symptom"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("a symptom").and(predicate::str::contains("ignored").not()),
+        );
+
+    // Re-typing is refused.
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "conjecture-attack",
+            "probe",
+            "--goal",
+            "a conjecture",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "already a `debugging` investigation",
+        ));
+
+    // `inv resolve` refuses a task and points at the right command.
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "an ordinary task"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let task_uid = v["uid"].as_str().unwrap().to_owned();
+    jkb(&db)
+        .args(["inv", "resolve", &task_uid, "dead_end"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("is a task").and(predicate::str::contains("jkb task set")),
+        );
+    // …so the task is untouched and still on the ready frontier.
+    jkb(&db)
+        .args(["--global", "task", "next"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("an ordinary task"));
+}
+
+/// The `conjecture-attack` acceptance preset is the only prove-vs-disprove difference, the
+/// seeded goal body carries the enumerated bar, and a blocked route only reopens on a
+/// materially new mechanism.
+#[test]
+#[allow(clippy::too_many_lines)] // one investigation driven end to end over the CLI
+fn a_conjecture_investigation_seeds_its_predicate_and_gates_reopening() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "conjecture-attack",
+            "jacobian",
+            "--goal",
+            "Resolve the Jacobian Conjecture.",
+            "--accept",
+            "disprove",
+        ])
+        .assert()
+        .success();
+
+    let goal = uid_from(
+        &jkb(&db)
+            .args(["--json", "inv", "frontier", "memory/jacobian"])
+            .assert()
+            .success(),
+    );
+    jkb(&db).args(["cat", &goal]).assert().success().stdout(
+        predicate::str::contains("Acceptance predicate (disprove)")
+            .and(predicate::str::contains("INSUFFICIENT")),
+    );
+
+    // An unknown preset is rejected with the valid set.
+    jkb(&db)
+        .args([
+            "--global",
+            "inv",
+            "new",
+            "conjecture-attack",
+            "other",
+            "--accept",
+            "maybe",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown acceptance preset"));
+
+    // Blocking a route on a gap takes it off the frontier — with the reason attached.
+    let route = uid_from(
+        &jkb(&db)
+            .args([
+                "--json",
+                "inv",
+                "do",
+                "memory/jacobian",
+                "approach",
+                "degree growth",
+            ])
+            .assert()
+            .success(),
+    );
+    jkb(&db)
+        .args([
+            "inv",
+            "do",
+            "memory/jacobian",
+            "gap",
+            "needs a uniform degree bound",
+            "--on",
+            &route,
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["inv", "frontier", "memory/jacobian"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(route.clone()).not());
+
+    // A partial result is progress worth recording, but not grounds to reopen.
+    let partial = uid_from(
+        &jkb(&db)
+            .args([
+                "--json",
+                "inv",
+                "do",
+                "memory/jacobian",
+                "partial",
+                "holds for degree <= 4",
+            ])
+            .assert()
+            .success(),
+    );
+    jkb(&db)
+        .args(["inv", "reopen", &route, "--mechanism", &partial])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot reopen with a `partial-result`",
+        ));
+
+    let mechanism = uid_from(
+        &jkb(&db)
+            .args([
+                "--json",
+                "inv",
+                "do",
+                "memory/jacobian",
+                "mechanism",
+                "a valuation filtration",
+            ])
+            .assert()
+            .success(),
+    );
+    jkb(&db)
+        .args(["inv", "reopen", &route, "--mechanism", &mechanism])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("superseded gap"));
+    // With its gap superseded, the route is back on the frontier.
+    jkb(&db)
+        .args(["inv", "frontier", "memory/jacobian"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(route));
+}
+
+/// The blob archive is the recovery path when a sync has already written a wrong version
+/// over a file: every settled version's bytes are stored and never deleted, so you can find
+/// the one carrying a line you remember and read it back.
+#[test]
+fn blob_archive_recovers_a_previous_version_of_a_synced_file() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = TempDir::new().unwrap();
+    let file = repo.path().join("tasks.md");
+    std::fs::write(
+        &file,
+        "## Alpha\n\nA line I will regret losing.\n\n- [ ] first ^first\n",
+    )
+    .unwrap();
+
+    jkb(&db)
+        .args([
+            "mount",
+            "create",
+            "work",
+            repo.path().to_str().unwrap(),
+            "--serializer",
+            "tasks",
+            "--include",
+            "**/tasks.md",
+        ])
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "work"]).assert().success();
+
+    // Someone clobbers the file and it settles, so the disk no longer has the line.
+    std::fs::write(&file, "## Alpha\n\n- [ ] first ^first\n").unwrap();
+    jkb(&db).args(["sync", "work"]).assert().success();
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("regret"));
+
+    // The archive still has the version that does.
+    let out = jkb(&db)
+        .args(["--json", "blob", "ls", "--contains", "regret"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let hash = v[0]["hash"]
+        .as_str()
+        .expect("a blob carrying the lost line");
+
+    // …and `blob cat` reads it back byte-for-byte.
+    let recovered = jkb(&db).args(["blob", "cat", hash]).output().unwrap();
+    let text = String::from_utf8(recovered.stdout).unwrap();
+    assert!(text.contains("A line I will regret losing."), "got: {text}");
+    assert!(text.contains("- [ ] first ^first"));
+
+    // A hash prefix works; an ambiguous or unknown one is refused rather than guessing.
+    jkb(&db)
+        .args(["blob", "cat", &hash[..12]])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["blob", "cat", "ffffffffffffffff"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no blob with hash prefix"));
+
+    // `jkb history` lists that file's settled versions, newest first.
+    jkb(&db)
+        .args(["history", file.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("jkb blob cat"));
 }
