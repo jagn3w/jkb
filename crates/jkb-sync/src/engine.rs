@@ -48,6 +48,10 @@ pub enum Outcome {
     Conflict,
     /// The file failed to parse and was quarantined (last-good items kept, bytes stashed).
     Quarantined,
+    /// Neither side changed in substance, but the stored bytes were not today's canonical
+    /// rendering, so the file and the base were re-settled to it. Reported separately from
+    /// `UpToDate` because it does write the file.
+    Normalized,
     /// Neither side changed since the last sync.
     UpToDate,
     /// The mount's `sync_mode` does not permit the needed direction.
@@ -437,6 +441,22 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
 
     match (disk_changed, kb_changed) {
         (false, false) => {
+            // Nothing changed in substance. If either side's bytes are not what today's
+            // serializer renders, settle that skew ONCE rather than re-deriving it on every
+            // future sync: a stale base means the byte fast path can never hit again, so an
+            // upgraded serializer would leave a permanent per-file cost behind it.
+            let stale = base_hash.as_deref() != Some(kb_hash.as_str())
+                || base_hash.as_deref() != Some(disk_hash.as_str());
+            if stale && ctx.exports() {
+                // The three renderings are equal here by construction (that is what
+                // `(false, false)` means), so writing `kb_bytes` cannot change the document —
+                // only its formatting.
+                if kb_bytes != disk_bytes {
+                    write_file(path, &kb_bytes)?;
+                }
+                mark_ok(conn, meta, &bare_uri, &ser_name, &kb_hash, &kb_bytes)?;
+                return Ok(Outcome::Normalized);
+            }
             if was_flagged {
                 // A previously quarantined/conflicted file is now clean again.
                 mark_ok(conn, meta, &bare_uri, &ser_name, &kb_hash, &kb_bytes)?;

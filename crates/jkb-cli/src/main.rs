@@ -3036,16 +3036,17 @@ fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool) -> Result<()> {
 /// Reconcile one mount and print its summary.
 fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
     use jkb_sync::Outcome::{
-        Conflict, Created, Exported, Imported, Merged, Quarantined, Skipped, UpToDate,
+        Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Skipped, UpToDate,
     };
     let report = jkb_sync::sync(db, ns_path)?;
     println!(
-        "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} conflicts, \
-         {} quarantined, {} up-to-date, {} skipped",
+        "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
+         {} conflicts, {} quarantined, {} up-to-date, {} skipped",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
         report.count(Merged),
+        report.count(Normalized),
         report.count(Conflict),
         report.count(Quarantined),
         report.count(UpToDate),

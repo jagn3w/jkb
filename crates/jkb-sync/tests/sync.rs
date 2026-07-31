@@ -1165,20 +1165,23 @@ fn a_renderer_change_is_not_mistaken_for_a_content_change() {
     })
     .unwrap();
 
-    // Neither side changed in substance, so nothing must be written in either direction.
+    // Neither side changed in substance. The skew is settled once, and the document is
+    // untouched — only the stale base is brought up to today's canonical rendering.
     let before = fs::read_to_string(&file).unwrap();
     let report = sync(&db, "docs/plan").unwrap();
     assert_eq!(
-        report.count(Outcome::UpToDate),
+        report.count(Outcome::Normalized),
         1,
-        "a renderer-only difference must read as UpToDate, got {:?}",
+        "a renderer-only difference must normalize, not import/export/conflict, got {:?}",
         report.results.iter().map(|r| r.outcome).collect::<Vec<_>>()
     );
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         before,
-        "the file was rewritten"
+        "the file was already canonical, so normalizing must not touch it"
     );
+    // Self-healing: having settled once, the byte fast path hits again.
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
 
     // And with the DISK also edited, the one real change wins outright instead of colliding
     // with the phantom and producing a conflict.
@@ -1198,4 +1201,74 @@ fn a_renderer_change_is_not_mistaken_for_a_content_change() {
     assert!(fs::read_to_string(&file)
         .unwrap()
         .contains("first RETITLED"));
+}
+
+/// Normalizing rewrites the FILE when its bytes are not today's canonical rendering, so the
+/// skew a serializer upgrade leaves behind is settled once instead of being re-derived on
+/// every future sync. The document must be unchanged — only its formatting.
+#[test]
+fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    // Canonical modifier order is priority, due, tags. Written the other way round, this is
+    // the same document rendered differently.
+    let non_canonical = "## Alpha\n\n- [ ] first #size=small !p1 ^first\n";
+    fs::write(&file, non_canonical).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    // The first sight of a file imports it, which already writes the canonical form back.
+    sync(&db, "docs/plan").unwrap();
+    let canonical = fs::read_to_string(&file).unwrap();
+    assert!(
+        canonical.contains("!p1 #size=small"),
+        "import normalizes: {canonical}"
+    );
+
+    // Put the non-canonical bytes back on disk *and* in the journal, which is the state an
+    // upgraded serializer leaves: both sides agree, neither matches today's rendering.
+    fs::write(&file, non_canonical).unwrap();
+    let uri = uri_for(&file);
+    db.write_txn("t", {
+        let uri = uri.clone();
+        move |conn, meta| {
+            let hash = jkb_core::blob::hash_bytes(non_canonical.as_bytes());
+            jkb_core::blob::store(conn, &hash, non_canonical.as_bytes(), None)?;
+            jkb_core::sync_state::upsert(
+                conn,
+                meta,
+                &jkb_core::sync_state::SyncStateWrite {
+                    uri: &uri,
+                    serializer: "tasks",
+                    status: "ok",
+                    last_synced_hash: Some(&hash),
+                    base_blob_hash: Some(&hash),
+                    parse_error: None,
+                    quarantine_blob_hash: None,
+                },
+            )
+        }
+    })
+    .unwrap();
+
+    // One normalize: the file is rewritten to the canonical form, same document.
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Normalized),
+        1,
+        "got {:?}",
+        report.results.iter().map(|r| r.outcome).collect::<Vec<_>>()
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), canonical);
+    // The task itself is untouched — normalizing is formatting, never content.
+    assert_eq!(
+        status_of(&db, &format!("{uri}#first")).as_deref(),
+        Some("open")
+    );
+
+    // Settled: no further writes, and the byte fast path hits from here on.
+    for _ in 0..3 {
+        assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+        assert_eq!(fs::read_to_string(&file).unwrap(), canonical);
+    }
 }
