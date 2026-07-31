@@ -1111,3 +1111,91 @@ fn document_order_survives_kb_side_changes_and_merges() {
     // And it settles.
     assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
 }
+
+/// A change to how a file is *rendered* must not read as a change to what it *contains*.
+///
+/// Direction used to be decided on raw byte hashes, where the KB side is whatever today's
+/// serializer renders. Any change to the renderer therefore moved every file's bytes while
+/// no item moved, manufacturing a phantom KB edit across a whole mount at once: with the
+/// disk unchanged the phantom won and exported over real work, and where the disk had also
+/// moved it produced conflicts that were not conflicts.
+///
+/// Simulated here the way it actually happens — the stored base is bytes an older serializer
+/// wrote (non-canonical for today's), while the KB's content is untouched.
+#[test]
+fn a_renderer_change_is_not_mistaken_for_a_content_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    // The renderer emits modifiers in a canonical order (priority, due, tags, ...), so the
+    // same document written with them in another order is byte-different but identical in
+    // substance — the shape a serializer upgrade leaves behind.
+    fs::write(
+        &file,
+        "## Alpha\n\n- [ ] first !p1 #size=small ^first\n- [ ] second ^second\n",
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // Rewrite the journal's base to bytes that are semantically identical but not what
+    // today's serializer renders — exactly the state a serializer upgrade leaves behind.
+    let uri = uri_for(&file);
+    let stale = "## Alpha\n\n- [ ] first #size=small !p1 ^first\n- [ ] second ^second\n";
+    db.write_txn("t", {
+        let uri = uri.clone();
+        move |conn, meta| {
+            let hash = jkb_core::blob::hash_bytes(stale.as_bytes());
+            jkb_core::blob::store(conn, &hash, stale.as_bytes(), None)?;
+            jkb_core::sync_state::upsert(
+                conn,
+                meta,
+                &jkb_core::sync_state::SyncStateWrite {
+                    uri: &uri,
+                    serializer: "tasks",
+                    status: "ok",
+                    last_synced_hash: Some(&hash),
+                    base_blob_hash: Some(&hash),
+                    parse_error: None,
+                    quarantine_blob_hash: None,
+                },
+            )
+        }
+    })
+    .unwrap();
+
+    // Neither side changed in substance, so nothing must be written in either direction.
+    let before = fs::read_to_string(&file).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::UpToDate),
+        1,
+        "a renderer-only difference must read as UpToDate, got {:?}",
+        report.results.iter().map(|r| r.outcome).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        before,
+        "the file was rewritten"
+    );
+
+    // And with the DISK also edited, the one real change wins outright instead of colliding
+    // with the phantom and producing a conflict.
+    fs::write(
+        &file,
+        "## Alpha\n\n- [ ] first RETITLED !p1 #size=small ^first\n- [ ] second ^second\n",
+    )
+    .unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Imported),
+        1,
+        "the disk's real edit must simply win, got {:?}",
+        report.results.iter().map(|r| r.outcome).collect::<Vec<_>>()
+    );
+    assert_eq!(report.conflicts().len(), 0);
+    assert!(fs::read_to_string(&file)
+        .unwrap()
+        .contains("first RETITLED"));
+}

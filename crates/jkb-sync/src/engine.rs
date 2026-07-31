@@ -338,6 +338,11 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
 }
 
 /// Reconcile a single file within the current transaction.
+// A linear pipeline — read disk, assemble KB, decide direction, act — ending in one arm per
+// direction. Splitting it further would mean threading the same seven parameters through more
+// helpers than it saves; the stages that carry real logic (`decide_direction`, `missing_file`)
+// are already extracted and separately testable.
+#[allow(clippy::too_many_lines)]
 fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Result<Outcome> {
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
@@ -376,13 +381,16 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
     let kb_has_items = !kb_doc.items.is_empty();
 
     let Some((disk_bytes, disk_doc)) = disk else {
-        // File missing but the KB has items bound to it: export to create the file. This
-        // covers both a previously-synced file that was deleted on disk (journal present)
-        // and a KB-created binding not yet written (journal absent — e.g. `task add --sync`).
-        if ctx.exports() && kb_has_items {
-            return finish_export(conn, meta, ctx, path, &bare_uri, &ser_name, &kb_bytes);
-        }
-        return Ok(Outcome::Skipped);
+        return missing_file(
+            conn,
+            meta,
+            ctx,
+            path,
+            &bare_uri,
+            &ser_name,
+            &kb_bytes,
+            kb_has_items,
+        );
     };
 
     let disk_hash = hash(&disk_bytes);
@@ -403,14 +411,28 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
                 Outcome::Created,
             );
         }
-        if kb_has_items && ctx.exports() {
-            return finish_export(conn, meta, ctx, path, &bare_uri, &ser_name, &kb_bytes);
-        }
-        return Ok(Outcome::Skipped);
+        return missing_file(
+            conn,
+            meta,
+            ctx,
+            path,
+            &bare_uri,
+            &ser_name,
+            &kb_bytes,
+            kb_has_items,
+        );
     }
 
-    let disk_changed = base_hash.as_deref() != Some(disk_hash.as_str());
-    let kb_changed = base_hash.as_deref() != Some(kb_hash.as_str());
+    let (disk_changed, kb_changed, base_doc) = decide_direction(
+        conn,
+        serializer.as_ref(),
+        journal.as_ref(),
+        base_hash.as_deref(),
+        Sides {
+            disk: (&disk_doc, &disk_hash),
+            kb: (&kb_bytes, &kb_hash),
+        },
+    )?;
     let was_flagged = journal.as_ref().is_some_and(|j| j.status != "ok");
 
     match (disk_changed, kb_changed) {
@@ -447,7 +469,83 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
             &disk_bytes,
             &kb_doc,
             &kb_bytes,
+            &base_doc.unwrap_or_default(),
         ),
+    }
+}
+
+/// Nothing can be imported (the file is gone, or the mount is export-only). If the KB still
+/// has items bound to this path, export to write it — that covers a previously-synced file
+/// deleted on disk and a KB-created binding not yet written (`task add --sync`). Otherwise
+/// there is nothing to reconcile.
+#[allow(clippy::too_many_arguments)]
+fn missing_file(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    bare_uri: &str,
+    ser_name: &str,
+    kb_bytes: &[u8],
+    kb_has_items: bool,
+) -> Result<Outcome> {
+    if ctx.exports() && kb_has_items {
+        return finish_export(conn, meta, ctx, path, bare_uri, ser_name, kb_bytes);
+    }
+    Ok(Outcome::Skipped)
+}
+
+/// The two sides a direction decision compares against the base.
+#[derive(Clone, Copy)]
+struct Sides<'a> {
+    /// The parsed disk document and its raw byte hash.
+    disk: (&'a SyncDoc, &'a str),
+    /// The rendered KB bytes and their hash.
+    kb: (&'a [u8], &'a str),
+}
+
+/// Decide which side(s) changed, and return the parsed base alongside so a three-way merge
+/// does not have to load it twice.
+///
+/// The comparison is between **documents, not bytes**. `kb` bytes are what *today's*
+/// serializer renders; the stored base is bytes some earlier version of it wrote. Comparing
+/// those directly conflates "the content changed" with "the renderer changed" — and the
+/// second manufactures a phantom edit on every file in a mount at once, which has silently
+/// exported over real work and, where the disk had also moved, produced a wall of conflicts
+/// that were not conflicts. Re-rendering the base through today's serializer puts every side
+/// in the same vocabulary, so only genuine differences survive.
+///
+/// Byte equality stays the fast path: identical bytes cannot be a changed document, so a
+/// settled file still costs two hashes and no parse.
+fn decide_direction(
+    conn: &Connection,
+    serializer: &dyn SyncSerializer,
+    journal: Option<&sync_state::SyncState>,
+    base_hash: Option<&str>,
+    sides: Sides<'_>,
+) -> Result<(bool, bool, Option<SyncDoc>)> {
+    let (disk_doc, disk_hash) = sides.disk;
+    let (kb_bytes, kb_hash) = sides.kb;
+    let disk_bytes_differ = base_hash != Some(disk_hash);
+    let kb_bytes_differ = base_hash != Some(kb_hash);
+    if !disk_bytes_differ && !kb_bytes_differ {
+        return Ok((false, false, None));
+    }
+
+    let base_doc = load_base_doc(conn, journal, serializer)?;
+    match &base_doc {
+        Some(doc) => {
+            let canonical = serializer.render(doc)?;
+            Ok((
+                serializer.render(disk_doc)? != canonical,
+                kb_bytes != canonical,
+                base_doc,
+            ))
+        }
+        // No base document to compare against: the blob is gone (a journal predating the
+        // blob store, or one whose blob was pruned). The byte comparison is then all the
+        // information there is.
+        None => Ok((disk_bytes_differ, kb_bytes_differ, None)),
     }
 }
 
@@ -535,9 +633,9 @@ fn three_way_resolve(
     disk_bytes: &[u8],
     kb_doc: &SyncDoc,
     kb_bytes: &[u8],
+    base_doc: &SyncDoc,
 ) -> Result<Outcome> {
-    let base_doc = load_base_doc(conn, journal, serializer)?;
-    match three_way(&base_doc, disk_doc, kb_doc) {
+    match three_way(base_doc, disk_doc, kb_doc) {
         ThreeWay::Merged(merged) => {
             let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
             let rendered = serializer.render(&merged)?;
@@ -1523,13 +1621,13 @@ fn load_base_doc(
     conn: &Connection,
     journal: Option<&sync_state::SyncState>,
     serializer: &dyn SyncSerializer,
-) -> Result<SyncDoc> {
+) -> Result<Option<SyncDoc>> {
     let Some(hash) = journal.and_then(|j| j.base_blob_hash.as_deref()) else {
-        return Ok(SyncDoc::default());
+        return Ok(None);
     };
     match blob::load(conn, hash)? {
-        Some(bytes) => serializer.parse(&bytes),
-        None => Ok(SyncDoc::default()),
+        Some(bytes) => Ok(Some(serializer.parse(&bytes)?)),
+        None => Ok(None),
     }
 }
 
