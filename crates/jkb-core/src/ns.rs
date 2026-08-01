@@ -4,7 +4,7 @@
 //! The tree is stored as an adjacency list (`parent_id`); subtree reads use a
 //! recursive CTE (design D6). A closure table is a v2 optimization.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
@@ -50,6 +50,12 @@ fn kind_for(path: &str) -> &'static str {
 /// Ensure the namespace at `path` and all of its ancestors exist, returning the
 /// id of the leaf. Idempotent: already-present namespaces are left untouched.
 ///
+/// A path listed in [`crate::nstype::RESERVED_TYPES`] is stamped with its type as it is
+/// created (design D33.4), so a reserved root is never left untyped — whether it arrives
+/// on a fresh database, via `jkb ns mk tasks`, or as a side effect of the first
+/// `task add`. The stamp is seeded rather than changelogged, matching how `V001` seeds the
+/// `_sys` namespaces: it is schema, not a user edit.
+///
 /// # Errors
 /// Returns an error if the path is invalid or a statement fails.
 pub fn ensure(conn: &Connection, path: &str) -> Result<NamespaceId> {
@@ -71,9 +77,40 @@ pub fn ensure(conn: &Connection, path: &str) -> Result<NamespaceId> {
             .query_row(params![current, parent, kind_for(&current)], |row| {
                 row.get(0)
             })?;
+        seed_reserved_type(conn, &current)?;
         parent = Some(id);
     }
     Ok(NamespaceId::new(id))
+}
+
+/// Stamp the declared type on a reserved namespace, if `path` is one and it is not already
+/// typed. Never clobbers an existing type, so re-typing by hand survives.
+fn seed_reserved_type(conn: &Connection, path: &str) -> Result<()> {
+    let Some((_, type_name)) = crate::nstype::RESERVED_TYPES
+        .iter()
+        .find(|(reserved, _)| *reserved == path)
+    else {
+        return Ok(());
+    };
+    let sql = format!(
+        "UPDATE namespaces SET metadata = json_set({METADATA_OBJ}, '$.{TYPE_KEY}', ?2)
+         WHERE path = ?1 AND {} IS NULL",
+        type_expr()
+    );
+    conn.prepare_cached(&sql)?
+        .execute(params![path, type_name])?;
+    Ok(())
+}
+
+/// `namespaces.metadata` as a JSON object, tolerating NULL and (only reachable if written
+/// outside jkb) non-JSON — mirroring [`get_metadata`], which drops what will not parse
+/// rather than failing the read. `json_extract` *raises* on invalid JSON, so every SQL
+/// reader of the type key goes through this.
+const METADATA_OBJ: &str = "CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END";
+
+/// The SQL expression reading a namespace's [`TYPE_KEY`], NULL when untyped.
+fn type_expr() -> String {
+    format!("json_extract({METADATA_OBJ}, '$.{TYPE_KEY}')")
 }
 
 /// Look up the id of an existing namespace by path.
@@ -307,10 +344,10 @@ pub fn get_metadata(conn: &Connection, id: NamespaceId) -> Result<Option<Value>>
 /// and behaves exactly as it did before (no descriptor, no frontier extras).
 pub const TYPE_KEY: &str = "type";
 
-/// Record the strategy `type_name` on the namespace `id`, merging into (not replacing)
-/// its existing metadata. Validating that `type_name` names a registered strategy is the
-/// caller's job (`crate::nstype::resolve`), so a namespace can be typed before the
-/// strategy that reads it is built.
+/// Record the type `type_name` on the namespace `id`, merging into (not replacing) its
+/// existing metadata. Validating that `type_name` names a registered type is otherwise the
+/// caller's job (`crate::nstype::resolve`), so a namespace can be typed before the strategy
+/// that reads it is built.
 ///
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
@@ -332,7 +369,25 @@ pub fn set_type(
     set_metadata(conn, meta, id, &metadata)
 }
 
-/// The strategy type recorded on the namespace `path`, or `None` if it is untyped (or
+/// Remove the type from the namespace `id`, leaving the rest of its metadata intact. The
+/// namespace reverts to untyped: it enforces no contract of its own and falls back to its
+/// nearest typed ancestor's, exactly as an ordinary namespace does.
+///
+/// The inverse of [`set_type`], for a namespace typed by mistake — a `debugging`
+/// investigation started in the wrong place, say. Items already placed are untouched; only
+/// the rule governing future writes changes.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn clear_type(conn: &Connection, meta: &WriteMeta, id: NamespaceId) -> Result<()> {
+    let mut metadata = get_metadata(conn, id)?.unwrap_or_else(|| Value::Object(Map::new()));
+    if let Some(map) = metadata.as_object_mut() {
+        map.remove(TYPE_KEY);
+    }
+    set_metadata(conn, meta, id, &metadata)
+}
+
+/// The type recorded on the namespace `path`, or `None` if it is untyped (or
 /// does not exist).
 ///
 /// # Errors
@@ -363,20 +418,39 @@ pub fn get_type_by_id(conn: &Connection, id: NamespaceId) -> Result<Option<Strin
 /// # Errors
 /// Returns an error if the path is malformed or a query fails.
 pub fn effective_type(conn: &Connection, path: &str) -> Result<Option<(String, String)>> {
-    let mut current = normalize(path)?;
-    loop {
-        if let Some(id) = get(conn, &current)? {
-            if let Some(type_name) = get_type_by_id(conn, id)? {
-                return Ok(Some((current, type_name)));
-            }
-        }
-        // Truncate to the parent path in place (no allocation); a path with no `/` left
-        // is a root, so the walk is done.
-        match current.rfind('/') {
-            Some(cut) => current.truncate(cut),
-            None => return Ok(None),
-        }
+    // One query over the whole ancestor chain rather than a query per level: this runs on
+    // every placement now (design D33.2), and ingest places one item per chunk.
+    let ancestors = ancestor_paths(&normalize(path)?);
+    let placeholders = (1..=ancestors.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `placeholders` is generated from a count, never from user input; the paths themselves
+    // are bound parameters.
+    let type_expr = type_expr();
+    let sql = format!(
+        "SELECT path, {type_expr} FROM namespaces
+         WHERE path IN ({placeholders}) AND {type_expr} IS NOT NULL
+         ORDER BY length(path) DESC LIMIT 1"
+    );
+    let found = conn
+        .prepare_cached(&sql)?
+        .query_row(params_from_iter(ancestors.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()?;
+    Ok(found)
+}
+
+/// `path` and every ancestor of it, deepest first (`a/b/c` → `a/b/c`, `a/b`, `a`).
+fn ancestor_paths(path: &str) -> Vec<String> {
+    let mut out = vec![path.to_owned()];
+    let mut current = path;
+    while let Some(cut) = current.rfind('/') {
+        current = &current[..cut];
+        out.push(current.to_owned());
     }
+    out
 }
 
 /// Move the subtree rooted at `from` to `to`, rewriting paths and re-pointing the
@@ -477,8 +551,8 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        children, ensure, get_metadata, move_subtree, normalize, roots, set_metadata, subtree,
-        subtree_leaf_count, subtree_leaf_counts,
+        children, clear_type, ensure, get, get_metadata, get_type, move_subtree, normalize, roots,
+        set_metadata, set_type, subtree, subtree_leaf_count, subtree_leaf_counts,
     };
     use crate::item::{upsert, NewItem};
     use crate::{placement, Db};
@@ -753,5 +827,69 @@ mod tests {
             .read(|conn| effective_type(conn, "nowhere/at/all"))
             .unwrap()
             .is_none());
+    }
+
+    /// Clearing is the inverse of setting: a namespace typed by mistake reverts to
+    /// untyped and falls back to inheriting its nearest typed ancestor's contract.
+    #[test]
+    fn clearing_a_type_reverts_a_namespace_to_untyped() {
+        use crate::nstype::for_namespace;
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            let id = ensure(conn, "memory/oops")?;
+            set_type(conn, meta, id, "debugging")
+        })
+        .unwrap();
+        assert_eq!(
+            db.read(|conn| get_type(conn, "memory/oops"))
+                .unwrap()
+                .as_deref(),
+            Some("debugging")
+        );
+
+        db.write_txn("t", |conn, meta| {
+            let id = get(conn, "memory/oops")?.expect("exists");
+            clear_type(conn, meta, id)
+        })
+        .unwrap();
+        assert!(db
+            .read(|conn| get_type(conn, "memory/oops"))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .read(|conn| for_namespace(conn, "memory/oops"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// A type is **not** a location marker (design D33.5): nothing resolves "which namespace
+    /// carries the `tasks` contract" to find the tasks root, so several namespaces may carry
+    /// the same contract without one silently winning. `tasks/` is the tasks root because
+    /// the D32 layout reserves it.
+    #[test]
+    fn a_contract_may_type_several_namespaces_and_locates_nothing() {
+        use crate::{nstype, task};
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            for path in ["work/todo", "alpha/queue", "a/b/c/d"] {
+                let id = ensure(conn, path)?;
+                set_type(conn, meta, id, nstype::tasks::NAME)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // All three hold the contract; none of them is "the tasks root".
+        for path in ["work/todo", "alpha/queue", "a/b/c/d"] {
+            assert_eq!(
+                db.read(move |conn| get_type(conn, path))
+                    .unwrap()
+                    .as_deref(),
+                Some(nstype::tasks::NAME),
+                "{path}"
+            );
+        }
+        assert_eq!(task::DEFAULT_ROOT, "tasks");
+        assert_eq!(task::DEFAULT_HOME, "tasks/inbox");
     }
 }

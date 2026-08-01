@@ -14,8 +14,15 @@ use crate::{changelog, Result};
 /// Place `item` under `namespace` with the given `role` and `position`. Idempotent
 /// on `(item, namespace, role)`: re-placing updates the position.
 ///
+/// This is the **writer boundary** for a typed namespace's contract (design D33.2): it is
+/// the single choke point through which an item enters a namespace, so
+/// [`crate::nstype::check_placement`] runs here and the guarantee holds for every writer —
+/// the task repo, the sync engine, the ingest pipeline — not only for the engine that
+/// happens to know the namespace is typed. Untyped namespaces are unaffected.
+///
 /// # Errors
-/// Returns an error if a statement or the changelog append fails.
+/// Returns a validation error if the namespace's type does not accept the item's kind;
+/// otherwise an error if a statement or the changelog append fails.
 pub fn place(
     conn: &Connection,
     meta: &WriteMeta,
@@ -24,6 +31,7 @@ pub fn place(
     role: PlacementRole,
     position: i64,
 ) -> Result<()> {
+    crate::nstype::check_placement(conn, item, namespace)?;
     let rowid: i64 = conn
         .prepare_cached(
             "INSERT INTO placements (item_id, namespace_id, role, position)

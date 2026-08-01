@@ -82,8 +82,21 @@ mod tests {
             .unwrap();
         // Bumped with each migration: V001 init, V002 fts, V003 embeddings_meta version,
         // V004 sync journal, V005 task claims, V006 items.status CHECK,
-        // V007 memory core (items.resolution + edges.weight).
-        assert_eq!(user_version, 7);
+        // V007 memory core (items.resolution + edges.weight),
+        // V008 reserved namespace types.
+        assert_eq!(user_version, 8);
+
+        // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
+        // not seeded by a migration, so only the `_sys` markers are typed here.
+        let journals: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM namespaces
+                 WHERE json_extract(metadata, '$.type') = 'journal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journals, 3, "_sys/{{transactions,ingestions,sync}}");
 
         // V007's additive columns exist and default to NULL (no back-fill).
         conn.execute(
@@ -143,7 +156,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 7);
+        assert_eq!(user_version, 8);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

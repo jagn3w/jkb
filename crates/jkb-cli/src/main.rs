@@ -559,6 +559,22 @@ enum NsCmd {
     Mv { from: String, to: String },
     /// Remove an empty namespace (no child namespaces or item placements).
     Rm { path: String },
+    /// Show or set a namespace's type. A type states what may live in the namespace
+    /// (enforced on every write) and, for an investigation strategy, the verbs that
+    /// drive it. Inherited by the whole subtree. With no `<type>`, shows the current one.
+    Type {
+        /// The namespace path. Omit with `--list`.
+        path: Option<String>,
+        /// The type to apply; omit to show the current one.
+        type_name: Option<String>,
+        /// List every registered namespace type and exit.
+        #[arg(long, conflicts_with_all = ["path", "type_name"])]
+        list: bool,
+        /// Remove the namespace's own type, reverting it to untyped (it then inherits its
+        /// nearest typed ancestor's, if any). Items already placed are untouched.
+        #[arg(long, conflicts_with_all = ["type_name", "list"])]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1139,12 +1155,13 @@ fn ambient_repo(db: &Db) -> Result<Option<String>> {
 /// forces the global tree.
 fn apply_ambient_tasks(query: &mut Query, db: &Db, global: bool) -> Result<()> {
     if query.scope == Scope::All {
+        let root = task::DEFAULT_ROOT;
         let base = if global {
-            "tasks".to_owned()
+            root.to_owned()
         } else {
             match ambient_repo(db)? {
-                Some(repo) => format!("tasks/{repo}"),
-                None => "tasks".to_owned(),
+                Some(repo) => format!("{root}/{repo}"),
+                None => root.to_owned(),
             }
         };
         query.scope = Scope::Subtree(base);
@@ -2084,7 +2101,7 @@ fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
             accept,
             goal_kind,
         } => {
-            let strategy = nstype::resolve(&type_name)?;
+            let strategy = nstype::resolve_strategy(&type_name)?;
             let ns_path = investigation_path(db, &path, global)?;
             // Default the goal unit to the strategy's own goal kind (`symptom`,
             // `conjecture`, …) so the seeded unit reads naturally in its investigation.
@@ -2167,11 +2184,7 @@ fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
             Ok(())
         }
         InvCmd::Verbs { ns } => {
-            let owned = ns.clone();
-            let strategy = db
-                .read(move |conn| nstype::for_namespace(conn, &owned))?
-                .with_context(|| format!("`{ns}` is not an investigation namespace"))?
-                .1;
+            let strategy = investigation_strategy(db, &ns)?;
             if json {
                 let arr: Vec<serde_json::Value> = strategy
                     .verbs()
@@ -2204,11 +2217,7 @@ fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
             Ok(())
         }
         InvCmd::Kinds { ns } => {
-            let owned = ns.clone();
-            let strategy = db
-                .read(move |conn| nstype::for_namespace(conn, &owned))?
-                .with_context(|| format!("`{ns}` is not an investigation namespace"))?
-                .1;
+            let strategy = investigation_strategy(db, &ns)?;
             if json {
                 println!(
                     "{}",
@@ -2874,6 +2883,162 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
             db.write_txn("cli", move |conn, meta| ns::remove(conn, meta, &p))?;
             report(json, &path, "removed namespace");
         }
+        NsCmd::Type {
+            path,
+            type_name,
+            list,
+            clear,
+        } => cmd_ns_type(db, path, type_name, list, clear, json)?,
+    }
+    Ok(())
+}
+
+/// The investigation strategy governing `ns`, refusing an untyped namespace and one typed
+/// with a *contract* (design D33.1) — a contract type has no verbs, frontier or acceptance
+/// predicate, so `jkb inv` on one is a user error, not an empty listing.
+fn investigation_strategy(db: &Db, ns: &str) -> Result<&'static dyn nstype::NamespaceType> {
+    let owned = ns.to_owned();
+    let (source, strategy) = db
+        .read(move |conn| nstype::for_namespace(conn, &owned))?
+        .with_context(|| format!("`{ns}` is not an investigation namespace"))?;
+    anyhow::ensure!(
+        strategy.role() == nstype::TypeRole::Investigation,
+        "`{ns}` is typed `{}` (from `{source}`), a contract that {} — it is not an \
+         investigation, so it has no verbs or frontier",
+        strategy.name(),
+        strategy.about()
+    );
+    Ok(strategy)
+}
+
+/// `jkb ns type` — show, set, or list namespace types (design D33).
+fn cmd_ns_type(
+    db: &Db,
+    path: Option<String>,
+    type_name: Option<String>,
+    list: bool,
+    clear: bool,
+    json: bool,
+) -> Result<()> {
+    if list {
+        return list_namespace_types(json);
+    }
+    let path = path.context("`jkb ns type` needs a <path> (or `--list`)")?;
+
+    if clear {
+        let p = path.clone();
+        let had = db.write_txn("cli", move |conn, meta| {
+            let Some(id) = ns::get(conn, &p)? else {
+                return Ok(None);
+            };
+            let had = ns::get_type_by_id(conn, id)?;
+            if had.is_some() {
+                ns::clear_type(conn, meta, id)?;
+            }
+            Ok(had)
+        })?;
+        match had {
+            Some(name) => report(json, &path, &format!("cleared type `{name}`")),
+            None => report(json, &path, "already untyped"),
+        }
+        return Ok(());
+    }
+
+    let Some(type_name) = type_name else {
+        // Show: report the namespace's OWN type and, separately, the one it inherits, so
+        // "why is this enforced here?" is answerable without walking the tree by hand.
+        let (exists, own, effective) = {
+            let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+            db.read(move |conn| {
+                Ok((
+                    ns::get(conn, &p1)?.is_some(),
+                    ns::get_type(conn, &p2)?,
+                    ns::effective_type(conn, &p3)?,
+                ))
+            })?
+        };
+        // A namespace that does not exist must not read as "untyped" — that is the answer a
+        // typo gets, and it looks exactly like a valid one.
+        anyhow::ensure!(
+            exists,
+            "namespace `{path}` does not exist (create it with `jkb ns mk {path}`)"
+        );
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ns": path,
+                    "type": own,
+                    "effective_type": effective.as_ref().map(|(_, t)| t),
+                    "inherited_from": effective.as_ref().map(|(src, _)| src),
+                }))?
+            );
+        } else if let Some((source, name)) = effective {
+            let ty = nstype::resolve(&name)?;
+            if source == path {
+                println!("{path}: {name} — {}", ty.about());
+            } else {
+                println!("{path}: {name} (inherited from {source}) — {}", ty.about());
+            }
+        } else {
+            println!("{path}: untyped");
+        }
+        return Ok(());
+    };
+
+    // Reject an unknown type before opening a transaction, so the error names what IS
+    // available rather than leaving a namespace typed with something unresolvable.
+    let ty = nstype::resolve(&type_name)?;
+    let (p, t) = (path.clone(), type_name.clone());
+    db.write_txn("cli", move |conn, meta| {
+        let id = ns::ensure(conn, &p)?;
+        ns::set_type(conn, meta, id, &t)
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ns": path, "type": ty.name(),
+            }))?
+        );
+    } else {
+        println!("{path}: {} — {}", ty.name(), ty.about());
+    }
+    Ok(())
+}
+
+/// `jkb ns type --list` — every registered type, grouped by role.
+fn list_namespace_types(json: bool) -> Result<()> {
+    let rows = nstype::AVAILABLE
+        .iter()
+        .map(|name| nstype::resolve(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|ty| {
+                serde_json::json!({
+                    "type": ty.name(),
+                    "role": match ty.role() {
+                        nstype::TypeRole::Investigation => "investigation",
+                        nstype::TypeRole::Contract => "contract",
+                    },
+                    "about": ty.about(),
+                    "accepts": ty.accepted_kinds(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+    for (role, label) in [
+        (nstype::TypeRole::Investigation, "investigation strategies"),
+        (nstype::TypeRole::Contract, "contracts"),
+    ] {
+        println!("{label}:");
+        for ty in rows.iter().filter(|t| t.role() == role) {
+            println!("  {:<18} {}", ty.name(), ty.about());
+        }
     }
     Ok(())
 }
@@ -3083,9 +3248,10 @@ fn resolve_task_home(
             anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
         }
     } else if flags.backlog {
+        let root = task::DEFAULT_ROOT;
         match ambient_repo(db)? {
-            Some(repo) => spec.home = format!("tasks/{repo}/.backlog"),
-            None if confirm_global_backlog()? => spec.home = String::from("tasks/.backlog"),
+            Some(repo) => spec.home = format!("{root}/{repo}/.backlog"),
+            None if confirm_global_backlog()? => spec.home = format!("{root}/.backlog"),
             None => anyhow::bail!(
                 "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
             ),
@@ -3093,10 +3259,10 @@ fn resolve_task_home(
     } else if let Some(repo) = ambient_repo(db)? {
         // Inside a repo with no target: home at the per-repo inbox, mirrored into
         // the global inbox so it stays a complete capture view (D26.3).
-        spec.home = format!("tasks/{repo}/inbox");
+        spec.home = format!("{}/{repo}/inbox", task::DEFAULT_ROOT);
         spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
     }
-    // else: outside a repo with no target → home stays `tasks/inbox` (DEFAULT_HOME).
+    // else: outside a repo with no target → the home stays `DEFAULT_HOME`.
     Ok(())
 }
 

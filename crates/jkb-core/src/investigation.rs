@@ -106,7 +106,10 @@ pub fn create(
     goal_body: &str,
     tags: &[(String, String)],
 ) -> Result<ItemId> {
-    let strategy = nstype::resolve(type_name)?;
+    // `resolve_strategy`, not `resolve`: a contract type (`tasks`, `views`, `journal`) has
+    // no verbs and no acceptance predicate, so typing a namespace with one here would
+    // produce an investigation that can never be driven or finished.
+    let strategy = nstype::resolve_strategy(type_name)?;
     if !strategy.accepts_kind(goal_kind) {
         return Err(reject_kind(strategy, goal_kind));
     }
@@ -1091,12 +1094,10 @@ fn uid_of(conn: &Connection, id: ItemId) -> Result<String> {
 
 /// An actionable "that kind is not part of this strategy" error.
 fn reject_kind(strategy: &'static dyn NamespaceType, kind: &str) -> Error {
-    let mut kinds: Vec<&str> = nstype::BASE_KINDS.to_vec();
-    kinds.extend(strategy.node_kinds().iter().map(|k| k.kind));
     Error::Types(TypeError::Validation(format!(
         "`{kind}` is not a unit kind of the `{}` strategy; kinds: {}",
         strategy.name(),
-        kinds.join(", ")
+        strategy.accepted_kinds().join(", ")
     )))
 }
 

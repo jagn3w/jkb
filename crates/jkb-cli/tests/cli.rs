@@ -2034,3 +2034,181 @@ fn blob_archive_recovers_a_previous_version_of_a_synced_file() {
         .success()
         .stdout(predicate::str::contains("jkb blob cat"));
 }
+
+/// `jkb ns type` shows, sets and lists namespace types, and the reserved roots carry theirs
+/// without anyone applying it (design D33.4).
+#[test]
+fn ns_type_shows_sets_and_lists_namespace_types() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // `--list` groups by role, so a contract is never mistaken for something `inv` drives.
+    jkb(&db)
+        .args(["ns", "type", "--list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("investigation strategies"))
+        .stdout(predicate::str::contains("debugging"))
+        .stdout(predicate::str::contains("contracts"))
+        .stdout(predicate::str::contains("journal"));
+
+    // A reserved system namespace is typed by the migration, with no user action.
+    jkb(&db)
+        .args(["ns", "type", "_sys/sync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("journal"));
+
+    // Creating the `tasks` root types it, and the subtree inherits — reported as inherited
+    // so "why is this enforced here?" is answerable.
+    jkb(&db)
+        .args(["ns", "mk", "tasks/scratch"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ns", "type", "tasks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tasks"));
+    jkb(&db)
+        .args(["--json", "ns", "type", "tasks/scratch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"effective_type\": \"tasks\""))
+        .stdout(predicate::str::contains("\"inherited_from\": \"tasks\""))
+        .stdout(predicate::str::contains("\"type\": null"));
+
+    // An ordinary namespace is untyped, and setting an unknown type is refused by name.
+    jkb(&db)
+        .args(["ns", "mk", "references/web"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ns", "type", "references/web"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("untyped"));
+    jkb(&db)
+        .args(["ns", "type", "references/web", "no-such-type"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown namespace type"));
+}
+
+/// The writer boundary: a typed namespace's contract is enforced on any write, and `jkb inv`
+/// refuses a contract-typed namespace rather than reporting an empty verb list (design D33).
+#[test]
+fn a_namespace_contract_is_enforced_on_write_and_contracts_are_not_investigations() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let note = dir.path().join("note.md");
+    std::fs::write(&note, "a note that is not a task").unwrap();
+
+    // Ingesting a document into the `tasks` tree is refused: `tasks` holds tasks only.
+    jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "tasks/jkb"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("typed `tasks`"))
+        .stderr(predicate::str::contains("accepts: task"));
+
+    // …and the same document lands fine in an untyped namespace.
+    jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "references/web"])
+        .assert()
+        .success();
+
+    // A task in the tasks tree is exactly what the contract allows.
+    jkb(&db)
+        .args(["task", "add", "a real task", "+tasks/jkb"])
+        .assert()
+        .success();
+
+    // `inv` on a contract namespace is a user error naming the type, not an empty listing.
+    jkb(&db)
+        .args(["inv", "verbs", "tasks"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is typed `tasks`"));
+    jkb(&db)
+        .args(["--global", "inv", "new", "tasks", "hunt"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is a contract type"));
+}
+
+/// A type is **not** a location marker (design D33.5). The reserved roots — `tasks/`,
+/// `repos/`, `media/`, `_sys/` — are special cases of the fixed D32 layout, so several
+/// namespaces may carry the same contract and none of them relocates anything.
+/// `--clear` is the plain inverse of setting a type.
+#[test]
+fn a_contract_may_type_several_namespaces_and_relocates_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    // Two namespaces may carry the `tasks` contract; neither becomes "the tasks root".
+    jkb(&db)
+        .args(["ns", "type", "work/todo", "tasks"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ns", "type", "alpha/queue", "tasks"])
+        .assert()
+        .success();
+
+    // Task homing is unmoved: `tasks/` is the root because the layout reserves it.
+    jkb(&db)
+        .args(["task", "add", "still in the reserved root"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("at tasks/inbox"));
+
+    // Both still enforce their contract where they are.
+    let note = dir.path().join("n.md");
+    std::fs::write(&note, "not a task").unwrap();
+    jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "work/todo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("accepts: task"));
+
+    // `--clear` reverts a namespace typed by mistake.
+    jkb(&db)
+        .args(["ns", "type", "work/todo", "--clear"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared type"));
+    jkb(&db)
+        .args(["ns", "type", "work/todo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("untyped"));
+    jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "work/todo"])
+        .assert()
+        .success();
+}
+
+/// Showing the type of a namespace that does not exist must not read as "untyped" — that is
+/// what a typo gets, and it looks exactly like a valid answer.
+#[test]
+fn ns_type_show_distinguishes_a_missing_namespace_from_an_untyped_one() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    jkb(&db)
+        .args(["ns", "mk", "references/web"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ns", "type", "references/web"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("untyped"));
+
+    jkb(&db)
+        .args(["ns", "type", "totally/made/up"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not exist"));
+}
