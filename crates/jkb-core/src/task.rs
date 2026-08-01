@@ -24,6 +24,14 @@ use crate::query::{Query, Scope, TagPred};
 use crate::store::WriteMeta;
 use crate::{binding, changelog, edge, item, ns, placement, tag, Error, Result};
 
+/// The tasks root: a **reserved root** of the fixed D32 layout, not something discovered.
+///
+/// It is a literal because the layout says so. Resolving it from the namespace *type*
+/// system was tried and removed (design D33.5): that made a type mean both "what may live
+/// here" (naturally many-to-many) and "where this subsystem points" (singular), which then
+/// needed a uniqueness guard, an escape hatch and a re-seeding guard to hold together. The
+/// `tasks` contract says only what may live under this root.
+pub const DEFAULT_ROOT: &str = "tasks";
 /// The default logical home a task is placed under when none is given (design D19).
 pub const DEFAULT_HOME: &str = "tasks/inbox";
 /// The default binding for a new task: not written to any repo (design D19/D3).
@@ -196,11 +204,11 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
 /// under `tasks/`. A leading `repos/` is stripped so `repos/jkb/openspec/x` mirrors at
 /// `tasks/jkb/openspec/x`, keeping all of a repo's tasks under `tasks/<repo>/**`.
 fn tasks_mirror_ns(home: &str) -> Option<String> {
-    if home == "tasks" || home.starts_with("tasks/") {
+    if home == DEFAULT_ROOT || home.starts_with(&format!("{DEFAULT_ROOT}/")) {
         return None;
     }
     let rest = home.strip_prefix("repos/").unwrap_or(home);
-    Some(format!("tasks/{rest}"))
+    Some(format!("{DEFAULT_ROOT}/{rest}"))
 }
 
 /// Ensure a task homed at `home` (its Primary namespace) has a `tasks/…` Reference mirror

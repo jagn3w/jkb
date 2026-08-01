@@ -1,10 +1,22 @@
-//! Typed namespaces: the pluggable **investigation strategy** seam (design Dmem.1).
+//! Typed namespaces: the pluggable namespace-behaviour seam (design Dmem.1, D33).
 //!
-//! A namespace can declare a *strategy* (`namespaces.metadata.type`, written by
-//! [`crate::ns::set_type`]). The strategy is a [`NamespaceType`] descriptor: it declares
-//! the item kinds and edge types the investigation uses, the verbs an agent drives it
-//! with, how a unit's outcome rolls up from its edges, how the frontier is ranked, and
-//! the acceptance test that says the investigation is finished.
+//! A namespace can declare a *type* (`namespaces.metadata.type`, written by
+//! [`crate::ns::set_type`]) which resolves to a [`NamespaceType`] descriptor. A descriptor
+//! plays one of two [roles](TypeRole):
+//!
+//! - **[`TypeRole::Investigation`]** — a coordination *strategy*: it declares the item
+//!   kinds and edge types the investigation uses, the verbs an agent drives it with, how a
+//!   unit's outcome rolls up from its edges, how the frontier is ranked, and the acceptance
+//!   test that says the investigation is finished ([`debugging`], [`conjecture`]).
+//! - **[`TypeRole::Contract`]** — nothing but a statement of what may live in the
+//!   namespace, enforced at the writer boundary ([`tasks`], [`views`], [`journal`]). A
+//!   contract type has no verbs, no frontier and no acceptance predicate, and says so
+//!   rather than stubbing them.
+//!
+//! ## The guarantee
+//! [`check_placement`] is called from `placement::place` — the single choke point through
+//! which an item enters a namespace — so a namespace's declared contract holds for *every*
+//! writer, not only for the engine that happens to know about it (design D33.2).
 //!
 //! ## Why a descriptor rather than match arms
 //! The substrate is universal — items, typed edges, tags, claims, changelog, search — but
@@ -21,18 +33,23 @@
 //!
 //! ## Registration
 //! [`resolve`] maps a name to a descriptor and rejects unknown names with the available
-//! list — mirroring `jkb_sync::serializers::resolve`. Adding a strategy is one `static`
+//! list — mirroring `jkb_sync::serializers::resolve`. Adding a type is one `static`
 //! plus one match arm plus one entry in [`AVAILABLE`]; nothing else in the engine changes.
+//! [`RESERVED_TYPES`] maps the reserved roots (design D32) to the contract each carries, so
+//! they are typed on creation rather than by anyone remembering to.
 //!
 //! Untyped namespaces (every namespace that predates this) resolve to no descriptor and
 //! behave exactly as before.
 
 pub mod conjecture;
 pub mod debugging;
+pub mod journal;
+pub mod tasks;
+pub mod views;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use jkb_types::{EdgeType, Error as TypeError, ItemId, Resolution};
+use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, Resolution};
 
 use crate::query::{Query, Scope};
 use crate::{edge, Result};
@@ -50,6 +67,24 @@ pub const KIND_REFLECTION: &str = "reflection";
 /// extends this set; it never removes from it, so the generic reads (`inv digest`,
 /// ancestry walks) work in any investigation.
 pub const BASE_KINDS: &[&str] = &[KIND_GOAL, KIND_NODE, KIND_ARTIFACT, KIND_REFLECTION];
+
+/// Every kind an investigation namespace accepts: [`BASE_KINDS`] **plus `task`**.
+///
+/// Ordinary work legitimately lives inside an investigation namespace — that is precisely
+/// what makes `is:frontier` a strict generalization of `is:ready` (Dmem: for a task, with
+/// its NULL resolution, the two select exactly the same rows). A strategy's vocabulary
+/// therefore may not exclude tasks, or the writer-boundary check would break an invariant
+/// the memory design already shipped.
+///
+/// Contract types override [`NamespaceType::base_kinds`] to `&[]` instead, which is what
+/// keeps *them* exact.
+pub const INVESTIGATION_KINDS: &[&str] = &[
+    KIND_GOAL,
+    KIND_NODE,
+    KIND_ARTIFACT,
+    KIND_REFLECTION,
+    tasks::KIND_TASK,
+];
 
 /// The tag facet carrying a unit's frontier rank (higher = more promising).
 pub const FACET_PROMISE: &str = "promise";
@@ -227,7 +262,19 @@ impl DoneState {
     }
 }
 
-/// A registered investigation strategy.
+/// What a namespace type governs (design D33.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeRole {
+    /// A coordination protocol: verbs, a frontier, a ranking and an acceptance predicate.
+    /// `jkb inv` drives these.
+    Investigation,
+    /// A statement of what may live in the namespace, and nothing more. No verbs, no
+    /// frontier, no acceptance predicate — a contract type says so rather than stubbing
+    /// them, so `jkb inv verbs`/`new` on one is a clean user error instead of an empty list.
+    Contract,
+}
+
+/// A registered namespace type.
 ///
 /// `Send + Sync` and `'static` so a resolved descriptor can be used from the writer
 /// thread and held across calls.
@@ -235,25 +282,54 @@ pub trait NamespaceType: Send + Sync {
     /// The stable name stored in `namespaces.metadata.type`.
     fn name(&self) -> &'static str;
 
-    /// One-line description of what this strategy is for.
+    /// One-line description of what this type is for.
     fn about(&self) -> &'static str;
 
-    /// The item kinds this strategy uses, beyond [`BASE_KINDS`].
+    /// Which of the two roles this type plays. Defaults to [`TypeRole::Investigation`] —
+    /// the role every type had before contract types existed.
+    fn role(&self) -> TypeRole {
+        TypeRole::Investigation
+    }
+
+    /// The item kinds this type uses, beyond [`NamespaceType::base_kinds`].
     fn node_kinds(&self) -> &'static [NodeKindSpec];
 
-    /// The subset of the global edge vocabulary this strategy uses. Advisory: it drives
+    /// The base kinds this type inherits. Investigation strategies get
+    /// [`INVESTIGATION_KINDS`] (the four universal roles, plus `task`); a contract type
+    /// overrides this to `&[]`, which is what makes its [`NamespaceType::accepts_kind`]
+    /// *exact* — the `tasks` contract accepts `task` and nothing else, not `task` plus five
+    /// investigation kinds.
+    fn base_kinds(&self) -> &'static [&'static str] {
+        INVESTIGATION_KINDS
+    }
+
+    /// The subset of the global edge vocabulary this type uses. Advisory: it drives
     /// `--help` and `jkb inv kinds`, and is *not* enforced on writes — an investigation
     /// must always be able to record an association it has no vocabulary for yet
     /// (design Dmem.8, pitfall 1: no over-structuring).
-    fn edge_types(&self) -> &'static [EdgeType];
+    fn edge_types(&self) -> &'static [EdgeType] {
+        &[]
+    }
 
-    /// The verbs `jkb inv do` dispatches for this strategy.
-    fn verbs(&self) -> &'static [VerbSpec];
+    /// The verbs `jkb inv do` dispatches for this type. Empty for a contract type.
+    fn verbs(&self) -> &'static [VerbSpec] {
+        &[]
+    }
 
-    /// Whether `kind` is a valid unit kind here: one of [`BASE_KINDS`] or one of
-    /// [`NamespaceType::node_kinds`].
+    /// Whether `kind` is a valid item kind here: one of [`NamespaceType::base_kinds`] or one
+    /// of [`NamespaceType::node_kinds`].
     fn accepts_kind(&self, kind: &str) -> bool {
-        BASE_KINDS.contains(&kind) || self.node_kinds().iter().any(|k| k.kind == kind)
+        self.base_kinds().contains(&kind) || self.node_kinds().iter().any(|k| k.kind == kind)
+    }
+
+    /// Every kind this type accepts, in declaration order — the actionable half of a
+    /// rejection message.
+    fn accepted_kinds(&self) -> Vec<&'static str> {
+        self.base_kinds()
+            .iter()
+            .copied()
+            .chain(self.node_kinds().iter().map(|k| k.kind))
+            .collect()
     }
 
     /// The frontier query for `scope`: the ranked work queue. The default is
@@ -289,9 +365,16 @@ pub trait NamespaceType: Send + Sync {
     /// if not, what is missing? Terminates on this predicate, never on a timer
     /// (design Dmem.0).
     ///
+    /// The default is only reachable for a [`TypeRole::Contract`] type, where "this has no
+    /// acceptance test" is the truthful answer — so it errors saying that, rather than
+    /// returning a [`DoneState`] the caller would have to distrust.
+    ///
     /// # Errors
-    /// Returns an error if a query fails.
-    fn goal_predicate(&self, conn: &Connection, ns_path: &str) -> Result<DoneState>;
+    /// Returns an error if a query fails, or a validation error if this is a contract type.
+    fn goal_predicate(&self, conn: &Connection, ns_path: &str) -> Result<DoneState> {
+        let _ = (conn, ns_path);
+        Err(not_an_investigation(self.name()))
+    }
 
     /// The named acceptance presets this strategy offers, if any — the enumerated bars a new
     /// goal can be seeded with. Empty (the default) means the strategy's "done" test is not
@@ -310,27 +393,155 @@ pub trait NamespaceType: Send + Sync {
     }
 }
 
-/// The strategies registered in this build.
-pub const AVAILABLE: &[&str] = &[debugging::NAME, conjecture::NAME];
+/// The investigation **strategies** registered in this build — the types `jkb inv new`
+/// accepts. A subset of [`AVAILABLE`].
+pub const STRATEGIES: &[&str] = &[debugging::NAME, conjecture::NAME];
+
+/// Every namespace type registered in this build, strategies and contracts alike.
+pub const AVAILABLE: &[&str] = &[
+    debugging::NAME,
+    conjecture::NAME,
+    tasks::NAME,
+    views::NAME,
+    journal::NAME,
+];
+
+/// The contract each reserved root carries (design D33.4). Applied from two directions so a
+/// reserved namespace is never left untyped: migration `V008` back-fills existing
+/// databases, and [`crate::ns::ensure`] stamps a reserved path as it creates it.
+///
+/// ## A type is not a location marker
+/// The direction here is one-way: a **reserved root** (design D32's fixed layout — `tasks`,
+/// `repos`, `media`, `references`, `memory`, `_sys`) is told which contract it carries. The
+/// inverse — asking "which namespace carries the `tasks` contract?" to *find* the tasks root
+/// — is deliberately not supported. `tasks/` is the tasks root because the layout reserves
+/// it, full stop; the contract only says what may live there.
+///
+/// These roots are a handful of declared special cases, and generalizing them into a
+/// location-discovery mechanism made a type mean two things at once (a constraint, which is
+/// naturally many-to-many, and a location, which is singular) — which then needed a
+/// uniqueness guard, an escape hatch, and a re-seeding guard to hold together. The layout
+/// belongs in the layout.
+pub const RESERVED_TYPES: &[(&str, &str)] = &[
+    ("tasks", tasks::NAME),
+    ("_sys/views", views::NAME),
+    ("_sys/sync", journal::NAME),
+    ("_sys/transactions", journal::NAME),
+    ("_sys/ingestions", journal::NAME),
+];
 
 static DEBUGGING: debugging::Debugging = debugging::Debugging;
 static CONJECTURE: conjecture::ConjectureAttack = conjecture::ConjectureAttack;
+static TASKS: tasks::Tasks = tasks::Tasks;
+static VIEWS: views::Views = views::Views;
+static JOURNAL: journal::Journal = journal::Journal;
 
-/// Resolve a strategy by name, rejecting unknown names with an actionable error listing
-/// what *is* available (mirroring `jkb_sync::serializers::resolve`).
+/// Resolve a namespace type by name, rejecting unknown names with an actionable error
+/// listing what *is* available (mirroring `jkb_sync::serializers::resolve`).
 ///
 /// # Errors
-/// Returns a validation error if `name` is not a strategy in this build.
+/// Returns a validation error if `name` is not a type in this build.
 pub fn resolve(name: &str) -> Result<&'static dyn NamespaceType> {
     match name {
         debugging::NAME => Ok(&DEBUGGING),
         conjecture::NAME => Ok(&CONJECTURE),
+        tasks::NAME => Ok(&TASKS),
+        views::NAME => Ok(&VIEWS),
+        journal::NAME => Ok(&JOURNAL),
         other => Err(TypeError::Validation(format!(
-            "unknown investigation type `{other}`; available: {}",
+            "unknown namespace type `{other}`; available: {}",
             AVAILABLE.join(", ")
         ))
         .into()),
     }
+}
+
+/// Resolve a name that must be an investigation **strategy**, rejecting a contract type
+/// with an error that says why rather than letting `jkb inv new` type a namespace with
+/// something that has no verbs and no acceptance predicate.
+///
+/// # Errors
+/// Returns a validation error if `name` is unknown or is not a strategy.
+pub fn resolve_strategy(name: &str) -> Result<&'static dyn NamespaceType> {
+    // An unknown name is reported against the STRATEGY list, not the full one: offering
+    // `tasks` or `journal` as alternatives to a misspelled strategy would be a worse answer
+    // than the misspelling.
+    let Ok(ty) = resolve(name) else {
+        return Err(TypeError::Validation(format!(
+            "unknown investigation type `{name}`; available: {}",
+            STRATEGIES.join(", ")
+        ))
+        .into());
+    };
+    if ty.role() != TypeRole::Investigation {
+        return Err(TypeError::Validation(format!(
+            "`{name}` is a contract type ({}), not an investigation strategy; strategies: {}",
+            ty.about(),
+            STRATEGIES.join(", ")
+        ))
+        .into());
+    }
+    Ok(ty)
+}
+
+/// The error a [`TypeRole::Contract`] type answers investigation questions with.
+fn not_an_investigation(name: &str) -> crate::Error {
+    TypeError::Validation(format!(
+        "`{name}` is a contract type: it constrains what may live in the namespace and has \
+         no verbs, frontier or acceptance predicate"
+    ))
+    .into()
+}
+
+/// Reject an item whose `kind` the namespace's type does not accept, naming the namespace,
+/// the type, and what it *does* accept.
+fn reject_kind(ns_path: &str, ty: &dyn NamespaceType, kind: &str) -> crate::Error {
+    let accepted = ty.accepted_kinds();
+    let accepted = if accepted.is_empty() {
+        "nothing (it surfaces a system table and holds no items)".to_owned()
+    } else {
+        accepted.join(", ")
+    };
+    TypeError::Validation(format!(
+        "namespace `{ns_path}` is typed `{}`, which does not accept items of kind `{kind}`; \
+         it accepts: {accepted}",
+        ty.name()
+    ))
+    .into()
+}
+
+/// Validate that `item` may be placed under `namespace` (design D33.2).
+///
+/// Called from `crate::placement::place` — the single choke point through which an item
+/// enters a namespace — so a typed namespace's contract holds for every writer, not only
+/// for the engine that knows about it. An **untyped** namespace accepts anything, which is
+/// every namespace that predates typing.
+///
+/// # Errors
+/// Returns a validation error if the namespace's effective type rejects the item's kind;
+/// otherwise a database error.
+pub fn check_placement(conn: &Connection, item: ItemId, namespace: NamespaceId) -> Result<()> {
+    let Some(path): Option<String> = conn
+        .prepare_cached("SELECT path FROM namespaces WHERE id = ?1")?
+        .query_row([namespace.get()], |row| row.get(0))
+        .optional()?
+    else {
+        // A placement into a namespace that does not exist fails on the foreign key a
+        // moment later; there is no contract to check.
+        return Ok(());
+    };
+    let Some((_, ty)) = for_namespace(conn, &path)? else {
+        return Ok(());
+    };
+    let kind: Option<String> = conn
+        .prepare_cached("SELECT kind FROM items WHERE id = ?1")?
+        .query_row([item.get()], |row| row.get(0))
+        .optional()?;
+    let Some(kind) = kind else { return Ok(()) };
+    if ty.accepts_kind(&kind) {
+        return Ok(());
+    }
+    Err(reject_kind(&path, ty, &kind))
 }
 
 /// The strategy governing the namespace `path` — its own `type` or the nearest typed
@@ -440,15 +651,40 @@ pub fn default_rollup(conn: &Connection, node: ItemId) -> Result<Resolution> {
 
 #[cfg(test)]
 mod tests {
-    use super::{for_namespace, resolve, AVAILABLE, BASE_KINDS};
-    use crate::{ns, Db};
+    use super::{
+        check_placement, for_namespace, resolve, resolve_strategy, TypeRole, AVAILABLE, BASE_KINDS,
+        RESERVED_TYPES, STRATEGIES,
+    };
+    use crate::{item, ns, placement, Db};
+    use jkb_types::PlacementRole;
 
     #[test]
-    fn resolve_known_and_unknown_strategies() {
+    fn resolve_known_and_unknown_types() {
         for name in AVAILABLE {
             assert_eq!(resolve(name).unwrap().name(), *name);
         }
-        let err = match resolve("evolutionary-search") {
+        let err = match resolve("no-such-type") {
+            Ok(_) => panic!("expected an unknown-type error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("unknown namespace type `no-such-type`"),
+            "{err}"
+        );
+        for name in AVAILABLE {
+            assert!(err.contains(name), "{err} must list {name}");
+        }
+    }
+
+    #[test]
+    fn resolve_strategy_refuses_unknown_names_and_contract_types() {
+        for name in STRATEGIES {
+            assert_eq!(resolve_strategy(name).unwrap().name(), *name);
+        }
+
+        // An unknown name is reported against the STRATEGY list — offering `journal` as an
+        // alternative to a misspelled strategy would be a worse answer than the misspelling.
+        let err = match resolve_strategy("evolutionary-search") {
             Ok(_) => panic!("expected an unknown-type error"),
             Err(e) => e.to_string(),
         };
@@ -457,12 +693,24 @@ mod tests {
         // listing what this build does have.
         assert!(err.contains("debugging"), "{err}");
         assert!(err.contains("conjecture-attack"), "{err}");
+        assert!(
+            !err.contains("journal"),
+            "contracts are not strategies: {err}"
+        );
+
+        // A registered contract type is refused with *why*, not with "unknown".
+        let err = match resolve_strategy(super::tasks::NAME) {
+            Ok(_) => panic!("expected a contract-type rejection"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("is a contract type"), "{err}");
     }
 
     #[test]
     fn every_strategy_inherits_the_base_kinds_and_declares_unique_verbs() {
-        for name in AVAILABLE {
+        for name in STRATEGIES {
             let strategy = resolve(name).unwrap();
+            assert_eq!(strategy.role(), TypeRole::Investigation);
             for base in BASE_KINDS {
                 assert!(
                     strategy.accepts_kind(base),
@@ -490,14 +738,52 @@ mod tests {
         }
     }
 
+    /// A contract type is *exact*: it must not inherit the four investigation base kinds,
+    /// or `tasks` would silently accept a `goal` and the contract would mean nothing.
     #[test]
-    fn a_namespace_resolves_its_strategy_by_inheritance_and_untyped_stays_untyped() {
+    fn a_contract_type_accepts_only_its_own_kinds_and_answers_no_investigation_questions() {
+        for name in AVAILABLE.iter().filter(|n| !STRATEGIES.contains(n)) {
+            let ty = resolve(name).unwrap();
+            assert_eq!(ty.role(), TypeRole::Contract, "{name}");
+            assert!(ty.verbs().is_empty(), "{name} is a contract with verbs");
+            for base in BASE_KINDS {
+                assert!(
+                    !ty.accepts_kind(base),
+                    "the {name} contract must not inherit the base kind {base}"
+                );
+            }
+            // The acceptance predicate says "I am a contract" rather than faking a verdict.
+            let db = Db::open_in_memory().unwrap();
+            let err = db
+                .read(move |conn| {
+                    Ok(ty
+                        .goal_predicate(conn, "tasks")
+                        .err()
+                        .map(|e| e.to_string()))
+                })
+                .unwrap()
+                .unwrap_or_default();
+            assert!(err.contains("is a contract type"), "{name}: {err}");
+        }
+
+        let tasks = resolve(super::tasks::NAME).unwrap();
+        assert!(tasks.accepts_kind("task"));
+        assert!(!tasks.accepts_kind("view"));
+        // `journal` accepts nothing at all — the whole point.
+        assert!(resolve(super::journal::NAME)
+            .unwrap()
+            .accepted_kinds()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_namespace_resolves_its_type_by_inheritance_and_untyped_stays_untyped() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
             let root = ns::ensure(conn, "memory/jkb/bug")?;
             ns::set_type(conn, meta, root, "debugging")?;
             ns::ensure(conn, "memory/jkb/bug/hypotheses")?;
-            ns::ensure(conn, "tasks/jkb")?;
+            ns::ensure(conn, "repos/jkb/docs")?;
             Ok(())
         })
         .unwrap();
@@ -511,8 +797,104 @@ mod tests {
 
         // An ordinary namespace has no descriptor and is unaffected.
         assert!(db
-            .read(|conn| for_namespace(conn, "tasks/jkb"))
+            .read(|conn| for_namespace(conn, "repos/jkb/docs"))
             .unwrap()
             .is_none());
+    }
+
+    /// The reserved roots are typed as they are created, without anyone applying the type
+    /// (design D33.4) — and the type reaches the whole subtree by inheritance.
+    #[test]
+    fn ensure_stamps_the_reserved_roots_and_the_subtree_inherits() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, _meta| {
+            for (path, _) in RESERVED_TYPES {
+                ns::ensure(conn, path)?;
+            }
+            ns::ensure(conn, "tasks/jkb/.backlog")?;
+            Ok(())
+        })
+        .unwrap();
+
+        for (path, expected) in RESERVED_TYPES {
+            let got = db.read(move |conn| ns::get_type(conn, path)).unwrap();
+            assert_eq!(got.as_deref(), Some(*expected), "{path}");
+        }
+        let (source, ty) = db
+            .read(|conn| for_namespace(conn, "tasks/jkb/.backlog"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((source.as_str(), ty.name()), ("tasks", super::tasks::NAME));
+    }
+
+    /// The guarantee this whole change exists for: a raw `item::upsert` + `placement::place`
+    /// into a typed namespace is checked, not just the investigation engine's own writes.
+    #[test]
+    fn placement_enforces_the_namespace_contract_for_any_writer() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .write_txn("t", |conn, meta| {
+                let ns_id = ns::ensure(conn, "tasks/jkb")?;
+                let note = item::upsert(
+                    conn,
+                    meta,
+                    &item::NewItem {
+                        uid: "note:stray".to_owned(),
+                        kind: "note".to_owned(),
+                        content: Some("filed in the wrong place".to_owned()),
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                // The check must fire here, not in `investigation::add`, which this path
+                // never touches.
+                Ok(check_placement(conn, note, ns_id)
+                    .err()
+                    .map(|e| e.to_string()))
+            })
+            .unwrap()
+            .unwrap_or_default();
+        assert!(err.contains("typed `tasks`"), "{err}");
+        assert!(err.contains("kind `note`"), "{err}");
+        assert!(err.contains("accepts: task"), "{err}");
+
+        // …and it fires through `placement::place` itself, rolling the transaction back.
+        let outcome = db.write_txn("t", |conn, meta| {
+            let ns_id = ns::ensure(conn, "_sys/views")?;
+            let note = item::upsert(
+                conn,
+                meta,
+                &item::NewItem {
+                    uid: "note:stray2".to_owned(),
+                    kind: "note".to_owned(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            placement::place(conn, meta, note, ns_id, PlacementRole::Primary, 0)
+        });
+        assert!(
+            outcome.is_err(),
+            "a note must not be placed under _sys/views"
+        );
+
+        // An untyped namespace still takes anything — every namespace that predates typing.
+        db.write_txn("t", |conn, meta| {
+            let ns_id = ns::ensure(conn, "references/web")?;
+            let note = item::upsert(
+                conn,
+                meta,
+                &item::NewItem {
+                    uid: "note:fine".to_owned(),
+                    kind: "note".to_owned(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            placement::place(conn, meta, note, ns_id, PlacementRole::Primary, 0)
+        })
+        .unwrap();
     }
 }

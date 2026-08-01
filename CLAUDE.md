@@ -100,8 +100,8 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **299 tests** green (117 core = 92 unit + 12 query + 13 investigation; 15 embed + 17 types
-  + 8 index + 23 ingest + 7 search + 35 sync + 62 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+- **313 tests** green (130 core = 102 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 8 index + 23 ingest + 7 search + 40 sync + 68 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
   live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
@@ -608,3 +608,50 @@ The two axes are unchanged: these are *logical* namespaces; a subtree may be a `
 mount or `managed:`. `jkb mount ls` lists mounts; `jkb ns rm` removes an empty namespace.
 The 2026-07-24 migration moved the old top-level `openspec`/`codereviews` mounts under
 `repos/jkb/…` and dropped a stray `<ns>`.
+
+## Typed namespaces (D33) — the retrofit, COMPLETE and green
+
+`jkb-memory` shipped the *mechanism* for typed namespaces (Dmem.1); this change retrofits
+the hand-coded namespaces onto it and makes the type a **guarantee** rather than a hint
+(design `openspec/changes/jkb-typed-namespaces/`).
+
+- **A type now has a role.** `nstype::TypeRole::{Investigation, Contract}`. An
+  *investigation* type is a coordination strategy (verbs, frontier, ranking, acceptance
+  predicate — `debugging`, `conjecture-attack`). A *contract* type states only what may live
+  in the namespace: `verbs`/`edge_types` default to empty and `goal_predicate` defaults to an
+  error that **says** "this is a contract type" instead of faking a `DoneState`.
+  `base_kinds()` is overridable — strategies get `INVESTIGATION_KINDS` (the four base roles
+  **plus `task`**, because tasks legitimately live in an investigation namespace: that is
+  what makes `is:frontier` a strict generalization of `is:ready`), contracts override to
+  `&[]` and are exact.
+- **The contract is enforced at the writer boundary.** `nstype::check_placement` runs inside
+  `placement::place` — the single choke point through which an item enters a namespace — so
+  it binds the task repo, the sync engine, the ingest pipeline and any future writer, not
+  just the investigation engine. Untyped namespaces are unaffected. `ns::effective_type` is
+  now **one** query over the ancestor chain (it is on that hot path), with `json_extract`
+  guarded by `json_valid`. Edges are still **not** validated (Dmem.8 pitfall 1).
+- **Three contracts, applied automatically.** `tasks` (accepts `task`), `views` (accepts
+  `view`), `journal` (accepts **nothing** — the `_sys/*` markers surface a system table and
+  hold no items; one contract covers `_sys/sync`, `_sys/transactions`, `_sys/ingestions`).
+  `nstype::RESERVED_TYPES` maps each reserved root to its contract; migration **`V008`**
+  back-fills existing DBs and `ns::ensure` stamps a reserved path as it creates it (seeded,
+  not changelogged — matching how `V001` seeds `_sys`).
+- **A type is NOT a location marker.** This was built and removed — record it so it is not
+  re-added. Resolving the tasks root from the type system (`ns::typed_root`,
+  `NamespaceType::locator`) fused a **contract** (what may live here — naturally
+  many-to-many; `journal` types all three `_sys` markers) with a **location** (where a
+  subsystem points — singular), and needed four propping mechanisms: a `locator()` trait
+  marker, a uniqueness guard in `set_type`, `clear_type` as an escape hatch, and a
+  re-seed guard. `tasks/`, `repos/`, `media/`, `references/`, `memory/`, `_sys/` are
+  **reserved roots of the fixed D32 layout** — declared special cases, not instances of a
+  general mechanism. `task::DEFAULT_ROOT` is a literal and `task.rs` is unchanged.
+  `nstype::RESERVED_TYPES` is deliberately **one-way**: a reserved root is told its
+  contract; nothing searches for a contract to find a root.
+- **Surface.** `jkb ns type [path] [type] [--list] [--clear]` shows a namespace's own type
+  *and* the inherited one with its source (a path that does not exist errors rather than
+  reading as "untyped"), sets, clears, or lists types grouped by role. `ns::clear_type`
+  survived the removal above on its own merit: the plain inverse of setting a type.
+- **Deliberately deferred:** per-namespace-type command dispatch beyond `jkb inv do`
+  (`jkb task` already is the task surface, keyed by item kind), edge validation, and
+  status-lifecycle validation in the descriptor (guarded by `TaskStatus::from_manual_str`
+  and the `V006` CHECK — a third copy is a third disagreement).
