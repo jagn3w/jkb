@@ -149,8 +149,9 @@ enum Command {
     Ls {
         /// The namespace whose children to list (default: top-level namespaces).
         path: Option<String>,
-        /// Include terminal (`done`/`cancelled`) tasks (hidden by default).
-        #[arg(long)]
+        /// Show hidden entries: terminal (`done`/`cancelled`) tasks and `chunk` items,
+        /// which are derived index units rather than content.
+        #[arg(short = 'a', long)]
         all: bool,
         /// Long format: kind, status, and namespace/uid per row.
         #[arg(short = 'l', long)]
@@ -190,8 +191,9 @@ enum Command {
     Tree {
         /// The namespace to root the tree at (default: top-level roots).
         path: Option<String>,
-        /// Include terminal (`done`/`cancelled`) items in the counts.
-        #[arg(long)]
+        /// Show hidden entries: terminal (`done`/`cancelled`) items and `chunk` items,
+        /// in both the listing and the counts.
+        #[arg(short = 'a', long)]
         all: bool,
         /// Maximum depth to descend (default: 4; deeper folders show `…`). Raise for more.
         #[arg(long)]
@@ -1354,9 +1356,19 @@ struct Child {
     ns_type: Option<String>,
     /// The one-line description of [`Child::ns_type`], for a tooltip.
     ns_type_about: Option<String>,
+    /// For an item that others were derived from: how many `chunk` items came out of it.
+    /// Chunks are index units, not content — the tree hides them and shows their count here,
+    /// against the document they belong to. `None` when there are none.
+    chunk_count: Option<i64>,
     /// The item's `updated_at` (for `ls -t`); `None` for namespaces.
     updated: Option<String>,
 }
+
+/// The item kind ingest produces per document fragment. Chunks are derived index units:
+/// they are rebuildable from the VFS, nothing links *to* them, and listing them buries each
+/// ingested document under its own pieces. The tree hides them unless `--all` and surfaces
+/// their count against the document they came from.
+const KIND_CHUNK: &str = "chunk";
 
 /// Render a per-kind leaf breakdown as `8 task · 4 document`, ordered by kind name.
 ///
@@ -1373,6 +1385,15 @@ fn format_leaf_kinds(kinds: &BTreeMap<String, i64>) -> String {
 }
 
 impl Child {
+    /// The item's hidden chunk count as a suffix, e.g. ` (3 chunks)`, or empty. Shows where
+    /// the fragments went for a document the tree no longer expands into.
+    fn chunk_label(&self) -> String {
+        self.chunk_count
+            .filter(|n| *n > 0)
+            .map(|n| format!(" ({n} chunk{})", if n == 1 { "" } else { "s" }))
+            .unwrap_or_default()
+    }
+
     /// The namespace's own type as a bracketed label, e.g. ` [tasks]`, or empty.
     fn type_label(&self) -> String {
         self.ns_type
@@ -1393,6 +1414,7 @@ impl Child {
             "leaf_kinds": self.leaf_kinds,
             "type": self.ns_type,
             "type_about": self.ns_type_about,
+            "chunk_count": self.chunk_count,
             "updated": self.updated,
         })
     }
@@ -1453,11 +1475,13 @@ fn list_children(
     for (ns_id, ns_path) in ns_children {
         let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
         let has_sub = !ns::children(conn, &ns_path)?.is_empty();
-        // Any placement role, so `tasks/…` mirror namespaces (Reference placements) count
-        // as having children — the symbolic-link view of tasks homed elsewhere.
-        let has_items = !placement::items_in(conn, ns_id, None)?.is_empty();
-        let leaf_kinds = leaf_counts.get(&ns_id).cloned().unwrap_or_default();
-        let leaf_count = leaf_kinds.values().sum();
+        let mut leaf_kinds = leaf_counts.get(&ns_id).cloned().unwrap_or_default();
+        if !all {
+            // Chunks are hidden below, so they must not be counted here either — a folder
+            // reporting "1 chunk" that shows nothing when opened is worse than no count.
+            leaf_kinds.remove(KIND_CHUNK);
+        }
+        let leaf_count: i64 = leaf_kinds.values().sum();
         // The namespace's OWN type, not `effective_type`: labelling every namespace under a
         // typed root would be noise, and where the type was *applied* is the useful fact.
         let ns_type = ns::get_type_by_id(conn, ns_id)?;
@@ -1469,13 +1493,14 @@ fn list_children(
             kind: "namespace".to_owned(),
             reference: ns_path,
             label,
-            has_children: has_sub || has_items,
+            has_children: has_sub || leaf_count > 0,
             status: None,
             priority: None,
             leaf_count: Some(leaf_count),
             leaf_kinds: Some(leaf_kinds),
             ns_type,
             ns_type_about,
+            chunk_count: None,
             updated: None,
         });
     }
@@ -1484,7 +1509,10 @@ fn list_children(
         if let Some(ns_id) = ns::get(conn, p)? {
             // Any placement role: a `tasks/…` mirror surfaces the task even though its
             // primary home is elsewhere (the symbolic-link view).
-            for item_id in placement::items_in(conn, ns_id, None)? {
+            let placed = placement::items_in(conn, ns_id, None)?;
+            // One grouped query for every document's chunk count, not one per document.
+            let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
+            for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
                 };
@@ -1492,6 +1520,12 @@ fn list_children(
                 // ignored files, revealed only on explicit toggle.
                 let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
                 if !all && terminal {
+                    continue;
+                }
+                // Same treatment for chunks, and for the same reason: they are derived index
+                // units, not content. Listing them doubles every ingested document under its
+                // own fragments. Their count rides on the document instead (below).
+                if !all && meta.kind == KIND_CHUNK {
                     continue;
                 }
                 out.push(Child {
@@ -1505,6 +1539,7 @@ fn list_children(
                     leaf_kinds: None,
                     ns_type: None,
                     ns_type_about: None,
+                    chunk_count: chunk_counts.get(&item_id).copied(),
                     updated: Some(meta.updated_at.clone()),
                 });
             }
@@ -1614,10 +1649,11 @@ fn print_ls_row(parent: Option<&str>, c: &Child, opts: LsOpts) {
             _ => String::new(),
         };
         println!(
-            "{arrow} {:<10} {loc}{}{}{status}",
+            "{arrow} {:<10} {loc}{}{}{}{status}",
             c.kind,
             c.label,
-            c.type_label()
+            c.type_label(),
+            c.chunk_label()
         );
     }
 }
@@ -1895,8 +1931,9 @@ fn print_tree(nodes: &[TreeNode], prefix: &str) {
             ""
         };
         println!(
-            "{prefix}{branch}{}{ns_type}{leaves}{status}{elided}",
-            node.child.label
+            "{prefix}{branch}{}{ns_type}{leaves}{}{status}{elided}",
+            node.child.label,
+            node.child.chunk_label()
         );
         print_tree(&node.children, &format!("{prefix}{cont}"));
     }

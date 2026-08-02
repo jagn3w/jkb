@@ -47,8 +47,13 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
     if (child.ref.kind === "namespace") {
       item.description = namespaceDescription(child);
       item.tooltip = namespaceTooltip(child);
-    } else if (child.status) {
-      item.description = child.status;
+    } else {
+      // A document's chunks are hidden (they are index units, not content), so say how many
+      // there were rather than leaving them unaccounted for.
+      const chunks = child.chunkCount
+        ? `${child.chunkCount} chunk${child.chunkCount === 1 ? "" : "s"}`
+        : "";
+      item.description = [child.status ?? "", chunks].filter(Boolean).join(" · ");
     }
     item.command = {
       command: "jkb.openDetails",

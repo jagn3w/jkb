@@ -550,6 +550,50 @@ pub fn set_resolution_str(
     set_resolution(conn, meta, item, parsed)
 }
 
+/// How many items of `kind` were **derived from** each of `parents`, as a
+/// `parent -> count` map (parents with none are absent).
+///
+/// The motivating case is chunks: ingest stores a document plus one item per chunk, each
+/// linked `chunk --derived_from--> document`. A tree that lists those chunks alongside the
+/// document buries the real content under its own index units, but the *number* of them is
+/// worth showing next to the document they came from — so this counts them in one grouped
+/// query rather than a lookup per document.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn derived_kind_counts(
+    conn: &Connection,
+    parents: &[ItemId],
+    kind: &str,
+) -> Result<std::collections::HashMap<ItemId, i64>> {
+    let mut out = std::collections::HashMap::new();
+    if parents.is_empty() {
+        return Ok(out);
+    }
+    // Placeholders are generated from a count; every value is bound.
+    let placeholders = (2..2 + parents.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT e.dst_item_id, COUNT(*) FROM edges e
+         JOIN items i ON i.id = e.src_item_id
+         WHERE e.type = 'derived_from' AND i.kind = ?1 AND e.dst_item_id IN ({placeholders})
+         GROUP BY e.dst_item_id"
+    );
+    let mut params: Vec<rusqlite::types::Value> = vec![kind.to_owned().into()];
+    params.extend(parents.iter().map(|p| p.get().into()));
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (id, count) = row?;
+        out.insert(ItemId::new(id), count);
+    }
+    Ok(out)
+}
+
 /// Replace an item's `content` (and `content_hash`), bumping `updated_at` and
 /// recording the change. Used by file sync when a bound file changes on disk; the
 /// FTS index follows automatically via the `V002` triggers.

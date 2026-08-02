@@ -2314,3 +2314,76 @@ fn ls_labels_a_namespaces_own_type_but_not_an_inherited_one() {
         .success()
         .stdout(predicate::str::contains("[tasks]").not());
 }
+
+/// Chunks are derived index units, not content: listing them buries each ingested document
+/// under its own fragments. They are hidden (and uncounted) by default, revealed by `--all`,
+/// and their number rides on the document they came from.
+#[test]
+fn ls_hides_chunks_by_default_and_counts_them_on_their_document() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let doc = dir.path().join("big.md");
+    std::fs::write(
+        &doc,
+        format!("# Doc\n\n{}", "lorem ipsum dolor sit amet. ".repeat(200)),
+    )
+    .unwrap();
+    jkb(&db)
+        .args(["ingest", doc.to_str().unwrap(), "--ns", "repos/jkb/docs"])
+        .assert()
+        .success();
+
+    let out = jkb(&db)
+        .args(["--json", "ls", "repos/jkb/docs"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let children = v["children"].as_array().unwrap();
+    assert!(
+        children.iter().all(|c| c["kind"] != "chunk"),
+        "chunks must not be listed by default: {children:?}"
+    );
+    let document = children.iter().find(|c| c["kind"] == "document").unwrap();
+    let chunks = document["chunk_count"].as_i64().unwrap();
+    assert!(
+        chunks > 1,
+        "the document should report its chunks: {chunks}"
+    );
+
+    // The subtree count agrees with the listing — a folder must not claim leaves it hides.
+    let out = jkb(&db)
+        .args(["--json", "ls", "repos/jkb"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let docs = &v["children"][0];
+    assert!(docs["leaf_kinds"]["chunk"].is_null(), "{docs}");
+    assert_eq!(docs["leaf_count"], 1);
+
+    // `--all` reveals them, in the listing and the counts alike.
+    let out = jkb(&db)
+        .args(["--json", "ls", "repos/jkb/docs", "--all"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let shown = v["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "chunk")
+        .count();
+    assert_eq!(i64::try_from(shown).unwrap(), chunks);
+    let out = jkb(&db)
+        .args(["--json", "ls", "repos/jkb", "-a"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["children"][0]["leaf_kinds"]["chunk"], chunks);
+
+    // The human tree names the count against the document rather than listing fragments.
+    jkb(&db)
+        .args(["tree", "repos"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("({chunks} chunks)")));
+}

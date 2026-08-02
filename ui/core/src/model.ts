@@ -37,6 +37,12 @@ export interface TreeChild {
   readonly nsType?: string | null;
   /** One-line description of {@link TreeChild.nsType}, for a tooltip. */
   readonly nsTypeAbout?: string | null;
+  /**
+   * For an item others were derived from: how many `chunk` items came out of it. Chunks are
+   * derived index units, so the tree does not list them — it shows their count against the
+   * document they belong to. Absent when there are none.
+   */
+  readonly chunkCount?: number | null;
   /** Task status, when the child is a task; otherwise absent. */
   readonly status?: string | null;
   /** Task priority (lower = more important), when set; drives ranking + colour. */

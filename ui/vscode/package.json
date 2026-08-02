@@ -55,7 +55,7 @@
     }
   },
   "scripts": {
-    "build": "node esbuild.mjs",
+    "build": "tsc -p tsconfig.json --noEmit && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
