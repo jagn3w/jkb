@@ -11,6 +11,7 @@ mod output;
 mod owner;
 mod service;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1341,13 +1342,45 @@ struct Child {
     priority: Option<i64>,
     /// For namespaces: count of visible item leaves anywhere in the subtree (respecting the
     /// terminal-status toggle). `None` for item children. Lets the pane flag which folders
-    /// lead to real content.
+    /// lead to real content. This is the sum of [`Child::leaf_kinds`].
     leaf_count: Option<i64>,
+    /// For namespaces: the same leaves broken down by item `kind`, ordered by kind name.
+    /// A folder holding 8 tasks and 4 documents is not described by "12", and calling that
+    /// 12 tasks is simply wrong — so the breakdown, not the total, is what a tree renders.
+    leaf_kinds: Option<BTreeMap<String, i64>>,
+    /// For namespaces: the type recorded on **this** namespace, if any. Deliberately its
+    /// *own* type rather than the inherited one — a label on every namespace under a typed
+    /// root would be noise, and the interesting fact is where the type was applied.
+    ns_type: Option<String>,
+    /// The one-line description of [`Child::ns_type`], for a tooltip.
+    ns_type_about: Option<String>,
     /// The item's `updated_at` (for `ls -t`); `None` for namespaces.
     updated: Option<String>,
 }
 
+/// Render a per-kind leaf breakdown as `8 task · 4 document`, ordered by kind name.
+///
+/// Kinds are **not** pluralized: they are `items.kind` values verbatim, and English
+/// pluralization of an open vocabulary goes wrong fast (`hypothesis` → `hypothesiss`). The
+/// count in front makes the reading unambiguous without it.
+fn format_leaf_kinds(kinds: &BTreeMap<String, i64>) -> String {
+    kinds
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(kind, n)| format!("{n} {kind}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 impl Child {
+    /// The namespace's own type as a bracketed label, e.g. ` [tasks]`, or empty.
+    fn type_label(&self) -> String {
+        self.ns_type
+            .as_deref()
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default()
+    }
+
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "kind": self.kind,
@@ -1357,6 +1390,9 @@ impl Child {
             "status": self.status,
             "priority": self.priority,
             "leaf_count": self.leaf_count,
+            "leaf_kinds": self.leaf_kinds,
+            "type": self.ns_type,
+            "type_about": self.ns_type_about,
             "updated": self.updated,
         })
     }
@@ -1420,7 +1456,15 @@ fn list_children(
         // Any placement role, so `tasks/…` mirror namespaces (Reference placements) count
         // as having children — the symbolic-link view of tasks homed elsewhere.
         let has_items = !placement::items_in(conn, ns_id, None)?.is_empty();
-        let leaf_count = leaf_counts.get(&ns_id).copied().unwrap_or(0);
+        let leaf_kinds = leaf_counts.get(&ns_id).cloned().unwrap_or_default();
+        let leaf_count = leaf_kinds.values().sum();
+        // The namespace's OWN type, not `effective_type`: labelling every namespace under a
+        // typed root would be noise, and where the type was *applied* is the useful fact.
+        let ns_type = ns::get_type_by_id(conn, ns_id)?;
+        let ns_type_about = ns_type
+            .as_deref()
+            .and_then(|name| nstype::resolve(name).ok())
+            .map(|t| t.about().to_owned());
         out.push(Child {
             kind: "namespace".to_owned(),
             reference: ns_path,
@@ -1429,6 +1473,9 @@ fn list_children(
             status: None,
             priority: None,
             leaf_count: Some(leaf_count),
+            leaf_kinds: Some(leaf_kinds),
+            ns_type,
+            ns_type_about,
             updated: None,
         });
     }
@@ -1455,6 +1502,9 @@ fn list_children(
                     status: meta.status,
                     priority: meta.priority,
                     leaf_count: None,
+                    leaf_kinds: None,
+                    ns_type: None,
+                    ns_type_about: None,
                     updated: Some(meta.updated_at.clone()),
                 });
             }
@@ -1549,8 +1599,12 @@ fn print_ls_row(parent: Option<&str>, c: &Child, opts: LsOpts) {
         };
         let updated = c.updated.as_deref().unwrap_or("");
         println!(
-            "{:<10} {:<12} {:<24} {}{status}",
-            c.kind, updated, loc, c.label
+            "{:<10} {:<12} {:<24} {}{}{status}",
+            c.kind,
+            updated,
+            loc,
+            c.label,
+            c.type_label()
         );
     } else {
         let arrow = if c.has_children { "▸" } else { " " };
@@ -1559,7 +1613,12 @@ fn print_ls_row(parent: Option<&str>, c: &Child, opts: LsOpts) {
             (true, Some(p), k) if k != "namespace" => format!("{p}/"),
             _ => String::new(),
         };
-        println!("{arrow} {:<10} {loc}{}{status}", c.kind, c.label);
+        println!(
+            "{arrow} {:<10} {loc}{}{}{status}",
+            c.kind,
+            c.label,
+            c.type_label()
+        );
     }
 }
 
@@ -1808,12 +1867,19 @@ fn print_tree(nodes: &[TreeNode], prefix: &str) {
         } else {
             ("├─ ", "│  ")
         };
+        // Show WHAT is in the subtree, not just how much: a bare number invites reading
+        // every leaf as a task, which is what this display used to claim.
         let leaves = node
             .child
-            .leaf_count
+            .leaf_kinds
+            .as_ref()
             .filter(|_| node.child.kind == "namespace")
-            .map(|n| format!(" ({n})"))
+            .map(|kinds| match format_leaf_kinds(kinds) {
+                s if s.is_empty() => String::new(),
+                s => format!(" ({s})"),
+            })
             .unwrap_or_default();
+        let ns_type = node.child.type_label();
         let status = node
             .child
             .status
@@ -1829,7 +1895,7 @@ fn print_tree(nodes: &[TreeNode], prefix: &str) {
             ""
         };
         println!(
-            "{prefix}{branch}{}{leaves}{status}{elided}",
+            "{prefix}{branch}{}{ns_type}{leaves}{status}{elided}",
             node.child.label
         );
         print_tree(&node.children, &format!("{prefix}{cont}"));

@@ -100,8 +100,8 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **313 tests** green (130 core = 102 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 8 index + 23 ingest + 7 search + 40 sync + 68 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+- **316 tests** green (131 core = 103 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 8 index + 23 ingest + 7 search + 40 sync + 71 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
   live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
@@ -485,6 +485,16 @@ client of the `jkb` CLI** (`jkb … --json`), never a bespoke backend — anythi
 the terminal can too. It drives two general CLI reads: `jkb ls [path]` (lazy tree children:
 sub-namespaces + items homed there, `has_children`, hides `done`/`cancelled` unless `--all`)
 and `jkb item show <uid>` (kind-aware details + a bounded preview, never the whole document).
+
+A folder's count is a **per-kind breakdown**, not a total: `ns::subtree_leaf_counts` groups
+the one recursive CTE by `items.kind` and returns `BTreeMap<String, i64>`, surfaced as
+`leaf_kinds` on `jkb ls --json` and rendered `8 task · 2 document` (kinds are *not*
+pluralized — `items.kind` is an open vocabulary and `hypothesis` has no regular plural). A
+bare total previously rendered as "N task(s) in subtree", so a folder of documents read as a
+folder of tasks. `jkb ls --json` also carries `type`/`type_about` — the namespace's **own**
+type (`ns::get_type_by_id`, never `effective_type`), so a typed root is labelled `[tasks]`
+and the subtree that merely inherits it is not. The portable formatter is
+`ui/core/src/summary.ts` (`formatLeafKinds`/`totalLeaves`), shared with any future host.
 
 - `ui/core` (`@jkb/core`) — **portable TypeScript, no `vscode`/Node**: the `JkbClient`
   transport interface, models, the node-kind registry, detail HTML rendering. A future web

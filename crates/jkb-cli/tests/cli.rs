@@ -2212,3 +2212,105 @@ fn ns_type_show_distinguishes_a_missing_namespace_from_an_untyped_one() {
         .failure()
         .stderr(predicate::str::contains("does not exist"));
 }
+
+/// A folder's count must say *what* is in the subtree, not just how much. The tree pane
+/// used to render one total and label it "task(s)", so a folder of documents read as a
+/// folder of tasks.
+#[test]
+fn ls_reports_subtree_leaves_broken_down_by_kind() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let note = dir.path().join("n.md");
+    std::fs::write(&note, "a document, not a task").unwrap();
+
+    jkb(&db)
+        .args(["task", "add", "one", "+repos/jkb/notes"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "add", "two", "+repos/jkb/notes"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "repos/jkb/notes"])
+        .assert()
+        .success();
+
+    // JSON carries the per-kind breakdown, and `leaf_count` stays its sum.
+    let out = jkb(&db)
+        .args(["--json", "ls", "repos/jkb"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let notes = &v["children"][0];
+    assert_eq!(notes["ref"], "repos/jkb/notes");
+    assert_eq!(notes["leaf_kinds"]["task"], 2);
+    assert_eq!(notes["leaf_kinds"]["document"], 1);
+    let total: i64 = notes["leaf_kinds"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_i64().unwrap())
+        .sum();
+    assert_eq!(notes["leaf_count"].as_i64().unwrap(), total);
+
+    // The human tree names the kinds rather than emitting a bare number.
+    jkb(&db)
+        .args(["tree", "repos"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 task"))
+        .stdout(predicate::str::contains("1 document"));
+
+    // An item leaf has no breakdown at all.
+    let out = jkb(&db)
+        .args(["--json", "ls", "repos/jkb/notes"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let items = v["children"].as_array().unwrap();
+    assert!(items.iter().all(|c| c["leaf_kinds"].is_null()));
+}
+
+/// A namespace's **own** type is labelled; one that merely inherits it is not — a label on
+/// every namespace under a typed root would be noise.
+#[test]
+fn ls_labels_a_namespaces_own_type_but_not_an_inherited_one() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "one", "+tasks/jkb/inbox"])
+        .assert()
+        .success();
+
+    // `tasks` carries the contract (seeded on creation) and reports it with its meaning.
+    let out = jkb(&db).args(["--json", "ls"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tasks = v["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["ref"] == "tasks")
+        .expect("tasks root");
+    assert_eq!(tasks["type"], "tasks");
+    assert!(tasks["type_about"].as_str().unwrap().contains("tasks"));
+
+    // `tasks/jkb` inherits it and carries none of its own.
+    let out = jkb(&db).args(["--json", "ls", "tasks"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for child in v["children"].as_array().unwrap() {
+        assert!(child["type"].is_null(), "{child} must not claim a type");
+    }
+
+    // The human listing shows the label only where the type is applied.
+    jkb(&db)
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tasks [tasks]"));
+    jkb(&db)
+        .args(["ls", "tasks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[tasks]").not());
+}
