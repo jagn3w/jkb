@@ -91,9 +91,13 @@ jobs:
 
       # pnpm only (never npm): the store is content-addressed and the lockfile is
       # pnpm-lock.yaml. `--frozen-lockfile` fails rather than silently resolving new versions.
+      # Pin from ui/package.json's `packageManager` rather than a floating major. The
+      # workspace config is version-sensitive — pnpm 11 renamed `onlyBuiltDependencies` to
+      # `allowBuilds`, and reading the wrong key fails the install outright — so CI must run
+      # the version the config was written for.
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          package_json_file: ui/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22
