@@ -2,7 +2,14 @@
 
 import * as vscode from "vscode";
 
-import { kindInfo, type JkbClient, type NodeRef, type TreeChild } from "@jkb/core";
+import {
+  formatLeafKinds,
+  kindInfo,
+  totalLeaves,
+  type JkbClient,
+  type NodeRef,
+  type TreeChild,
+} from "@jkb/core";
 
 import { nodeIcon, nodeUri } from "./decorations.js";
 
@@ -38,14 +45,15 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
     item.resourceUri = nodeUri(child);
     item.contextValue = kind;
     if (child.ref.kind === "namespace") {
-      // Indicate whether the folder's subtree leads to real content: show the count of
-      // visible leaves when there are any, and mark truly-empty branches so drilling in
-      // isn't a surprise. Respects the done/cancelled toggle (the count comes from `jkb ls`).
-      const n = child.leafCount ?? 0;
-      item.description = n > 0 ? String(n) : "empty";
-      item.tooltip = n > 0 ? `${n} task(s) in subtree` : "no tasks in subtree";
-    } else if (child.status) {
-      item.description = child.status;
+      item.description = namespaceDescription(child);
+      item.tooltip = namespaceTooltip(child);
+    } else {
+      // A document's chunks are hidden (they are index units, not content), so say how many
+      // there were rather than leaving them unaccounted for.
+      const chunks = child.chunkCount
+        ? `${child.chunkCount} chunk${child.chunkCount === 1 ? "" : "s"}`
+        : "";
+      item.description = [child.status ?? "", chunks].filter(Boolean).join(" · ");
     }
     item.command = {
       command: "jkb.openDetails",
@@ -64,3 +72,46 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
     return [...children];
   }
 }
+
+/**
+ * The dim text beside a folder: its own type (when it has one) and what its subtree
+ * actually holds, e.g. `[tasks] 8 task · 2 document`.
+ *
+ * The breakdown replaces a bare total that read as a task count for every kind of leaf —
+ * a folder of documents is not a folder of 12 tasks. Kinds are capped so a long tail cannot
+ * push the row off-screen; the tooltip carries the full list.
+ */
+function namespaceDescription(child: TreeChild): string {
+  const parts: string[] = [];
+  if (child.nsType) parts.push(`[${child.nsType}]`);
+  const breakdown = formatLeafKinds(child.leafKinds, { maxKinds: DESCRIPTION_KIND_LIMIT });
+  // Fall back to the total when the host has a count but no breakdown (an older `jkb`).
+  const total = totalLeaves(child.leafKinds) || (child.leafCount ?? 0);
+  parts.push(breakdown || (total > 0 ? String(total) : "empty"));
+  return parts.join(" ");
+}
+
+/** The hover text: the full breakdown plus what the namespace's type means. */
+function namespaceTooltip(child: TreeChild): vscode.MarkdownString {
+  const lines: string[] = [];
+  if (child.nsType) {
+    const about = child.nsTypeAbout ? ` — ${child.nsTypeAbout}` : "";
+    lines.push(`**type \`${child.nsType}\`**${about}`, "");
+  }
+  const entries = Object.entries(child.leafKinds ?? {}).filter(([, n]) => n > 0);
+  if (entries.length === 0) {
+    lines.push("No items in this subtree.");
+  } else {
+    entries.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const total = totalLeaves(child.leafKinds);
+    lines.push(`${total} item${total === 1 ? "" : "s"} in subtree:`, "");
+    for (const [kind, n] of entries) lines.push(`- ${n} \`${kind}\``);
+  }
+  return new vscode.MarkdownString(lines.join("\n"));
+}
+
+/**
+ * How many kinds a tree row shows before collapsing the rest into `+N more`. Three keeps
+ * the common cases (tasks; tasks + docs; a mixed ingest folder) fully legible.
+ */
+const DESCRIPTION_KIND_LIMIT = 3;

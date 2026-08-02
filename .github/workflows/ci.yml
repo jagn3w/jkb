@@ -75,3 +75,41 @@ jobs:
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The `ui/` pnpm workspace, gated separately: it needs neither the Rust toolchain nor the
+  # disk cleanup above, so it runs in parallel and fails fast on its own.
+  #
+  # This job exists because `scripts/check.sh` *skips* the UI when pnpm is missing. A skip
+  # locally must not become a skip in CI, or a type error merges on a green tick.
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm only (never npm): the store is content-addressed and the lockfile is
+      # pnpm-lock.yaml. `--frozen-lockfile` fails rather than silently resolving new versions.
+      # Pin from ui/package.json's `packageManager` rather than a floating major. The
+      # workspace config is version-sensitive — pnpm 11 renamed `onlyBuiltDependencies` to
+      # `allowBuilds`, and reading the wrong key fails the install outright — so CI must run
+      # the version the config was written for.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: install
+        run: pnpm install --frozen-lockfile
+
+      # `build` is the whole gate: each package type-checks before emitting, and `pnpm -r`
+      # runs topologically so @jkb/core's .d.ts exists before the adapter checks against it.
+      # (`pnpm -r run typecheck` alone is NOT equivalent — every typecheck is --noEmit, so on
+      # a clean checkout nothing produces that .d.ts and the adapter cannot resolve it.)
+      - name: build (type-checks)
+        run: pnpm run build

@@ -18,9 +18,31 @@ export interface TreeChild {
   /**
    * For a namespace: how many visible item leaves live anywhere in its subtree (respecting
    * the terminal-status toggle). Lets the host indicate which folders lead to real content.
-   * Absent for item leaves.
+   * Absent for item leaves. This is the sum of {@link TreeChild.leafKinds}.
    */
   readonly leafCount?: number | null;
+  /**
+   * For a namespace: the same leaves broken down by item kind (`task`, `document`, …).
+   * A folder holding 8 tasks and 4 documents is not described by "12", and rendering that
+   * 12 as a task count is simply wrong — so hosts should render this, not the bare total.
+   * Absent for item leaves.
+   */
+  readonly leafKinds?: Readonly<Record<string, number>> | null;
+  /**
+   * For a namespace: the type recorded on **this** namespace (`tasks`, `debugging`, …), if
+   * any. Deliberately its *own* type rather than the one it inherits — a label on every
+   * namespace beneath a typed root would be noise, and where the type was applied is the
+   * fact worth showing. Absent for item leaves and untyped namespaces.
+   */
+  readonly nsType?: string | null;
+  /** One-line description of {@link TreeChild.nsType}, for a tooltip. */
+  readonly nsTypeAbout?: string | null;
+  /**
+   * For an item others were derived from: how many `chunk` items came out of it. Chunks are
+   * derived index units, so the tree does not list them — it shows their count against the
+   * document they belong to. Absent when there are none.
+   */
+  readonly chunkCount?: number | null;
   /** Task status, when the child is a task; otherwise absent. */
   readonly status?: string | null;
   /** Task priority (lower = more important), when set; drives ranking + colour. */

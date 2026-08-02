@@ -184,13 +184,19 @@ pub fn subtree_leaf_count(conn: &Connection, path: &str, include_terminal: bool)
     Ok(count)
 }
 
-/// Leaf counts (see [`subtree_leaf_count`]) for **every direct child** of `parent`
-/// (or every root namespace when `parent` is `None`), computed in a single grouped
-/// recursive query keyed by each child's own subtree. This replaces N independent
-/// descendant walks — one per child — when listing a wide namespace.
+/// Leaf counts **broken down by item kind** (see [`subtree_leaf_count`] for the total) for
+/// **every direct child** of `parent` (or every root namespace when `parent` is `None`),
+/// computed in a single grouped recursive query keyed by each child's own subtree. This
+/// replaces N independent descendant walks — one per child — when listing a wide namespace.
 ///
-/// The returned map holds only children with a non-zero count; a child absent from
-/// the map has zero visible leaves. `include_terminal` matches [`subtree_leaf_count`].
+/// The breakdown is what a tree pane needs: a folder holding 8 tasks and 4 documents is not
+/// meaningfully described by "12", and labelling that 12 as tasks is simply wrong. Callers
+/// wanting the total sum the values.
+///
+/// The returned map holds only children with at least one visible leaf, and each inner map
+/// only kinds with a non-zero count; a child absent from the map has no visible leaves.
+/// Kinds are ordered by name (`BTreeMap`) so rendering is stable across calls.
+/// `include_terminal` matches [`subtree_leaf_count`].
 ///
 /// # Errors
 /// Returns an error if the path is invalid or the query fails.
@@ -198,7 +204,7 @@ pub fn subtree_leaf_counts(
     conn: &Connection,
     parent: Option<&str>,
     include_terminal: bool,
-) -> Result<std::collections::HashMap<NamespaceId, i64>> {
+) -> Result<std::collections::HashMap<NamespaceId, std::collections::BTreeMap<String, i64>>> {
     // The recursive part is shared; only the anchor (direct children of `parent`, or the
     // roots) differs. Each anchored child carries its own id as `root_id` down its subtree,
     // so a single grouped COUNT(DISTINCT) yields per-child leaf totals. The `depth < 256`
@@ -209,12 +215,12 @@ pub fn subtree_leaf_counts(
              FROM namespaces n JOIN sub ON n.parent_id = sub.id
              WHERE sub.depth < 256
          )
-         SELECT sub.root_id, COUNT(DISTINCT p.item_id)
+         SELECT sub.root_id, i.kind, COUNT(DISTINCT p.item_id)
          FROM sub
          JOIN placements p ON p.namespace_id = sub.id
          JOIN items i ON i.id = p.item_id
          WHERE (?1 OR i.status IS NULL OR i.status NOT IN ('done', 'cancelled'))
-         GROUP BY sub.root_id";
+         GROUP BY sub.root_id, i.kind";
     let mut out = std::collections::HashMap::new();
     match parent {
         None => {
@@ -224,11 +230,17 @@ pub fn subtree_leaf_counts(
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![include_terminal], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })?;
             for row in rows {
-                let (id, count) = row?;
-                out.insert(NamespaceId::new(id), count);
+                let (id, kind, count) = row?;
+                out.entry(NamespaceId::new(id))
+                    .or_insert_with(std::collections::BTreeMap::new)
+                    .insert(kind, count);
             }
         }
         Some(p) => {
@@ -241,11 +253,17 @@ pub fn subtree_leaf_counts(
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![include_terminal, normalized], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })?;
             for row in rows {
-                let (id, count) = row?;
-                out.insert(NamespaceId::new(id), count);
+                let (id, kind, count) = row?;
+                out.entry(NamespaceId::new(id))
+                    .or_insert_with(std::collections::BTreeMap::new)
+                    .insert(kind, count);
             }
         }
     }
@@ -644,7 +662,8 @@ mod tests {
                 let expected = db
                     .read(move |conn| subtree_leaf_count(conn, &p, include_terminal))
                     .unwrap();
-                assert_eq!(batched.get(&id).copied().unwrap_or(0), expected, "{path}");
+                let total: i64 = batched.get(&id).map_or(0, |k| k.values().sum());
+                assert_eq!(total, expected, "{path}");
             }
         }
 
@@ -658,12 +677,58 @@ mod tests {
             let expected = db
                 .read(move |conn| subtree_leaf_count(conn, &p, true))
                 .unwrap();
-            assert_eq!(
-                root_counts.get(&id).copied().unwrap_or(0),
-                expected,
-                "{path}"
-            );
+            let total: i64 = root_counts.get(&id).map_or(0, |k| k.values().sum());
+            assert_eq!(total, expected, "{path}");
         }
+    }
+
+    /// The breakdown is the point: a folder holding several kinds must report them
+    /// separately, not as one number the caller is free to mislabel.
+    #[test]
+    fn subtree_leaf_counts_break_down_by_kind() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            let mixed = ensure(conn, "repos/jkb/notes")?;
+            for (uid, kind) in [
+                ("task:a", "task"),
+                ("task:b", "task"),
+                ("doc:c", "document"),
+                ("note:d", "note"),
+            ] {
+                let id = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: uid.to_owned(),
+                        kind: kind.to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                placement::place(conn, meta, id, mixed, PlacementRole::Primary, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let counts = db
+            .read(|conn| subtree_leaf_counts(conn, Some("repos/jkb"), false))
+            .unwrap();
+        let id = db
+            .read(|conn| get(conn, "repos/jkb/notes"))
+            .unwrap()
+            .unwrap();
+        let breakdown = counts.get(&id).expect("notes has leaves");
+        assert_eq!(breakdown.get("task"), Some(&2));
+        assert_eq!(breakdown.get("document"), Some(&1));
+        assert_eq!(breakdown.get("note"), Some(&1));
+        assert_eq!(breakdown.values().sum::<i64>(), 4);
+        // Ordered by kind name, so a rendered breakdown is stable across calls.
+        assert_eq!(
+            breakdown.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["document", "note", "task"]
+        );
     }
 
     #[test]

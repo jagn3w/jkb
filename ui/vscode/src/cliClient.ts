@@ -28,6 +28,10 @@ interface RawChild {
   label: string;
   has_children: boolean;
   leaf_count: number | null;
+  leaf_kinds: Record<string, number> | null;
+  type: string | null;
+  type_about: string | null;
+  chunk_count: number | null;
   status: string | null;
   priority: number | null;
 }
@@ -155,6 +159,10 @@ function toTreeChild(c: RawChild): TreeChild {
     label: c.label,
     hasChildren: c.has_children,
     leafCount: c.leaf_count,
+    leafKinds: c.leaf_kinds,
+    nsType: c.type,
+    nsTypeAbout: c.type_about,
+    chunkCount: c.chunk_count,
     status: c.status,
     priority: c.priority,
   };

@@ -2,7 +2,15 @@ packages:
   - core
   - vscode
 
-# Allow esbuild's install script to fetch its platform binary. pnpm blocks dependency
-# build scripts by default; esbuild is the only one permitted here.
+# esbuild's install script fetches its platform binary; without it the VS Code adapter
+# cannot bundle. pnpm blocks dependency build scripts by default (supply-chain defence) and
+# esbuild is the only one allowed here.
+#
+# Both spellings are kept deliberately: pnpm 11 reads `allowBuilds`, pnpm 10 reads
+# `onlyBuiltDependencies`, and a mismatch is not a warning — the install fails with
+# ERR_PNPM_IGNORED_BUILDS. Carrying both means either version installs cleanly.
+allowBuilds:
+  esbuild: true
+
 onlyBuiltDependencies:
   - esbuild

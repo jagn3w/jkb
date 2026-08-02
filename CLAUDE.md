@@ -100,8 +100,8 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **313 tests** green (130 core = 102 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 8 index + 23 ingest + 7 search + 40 sync + 68 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+- **317 tests** green (131 core = 103 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 8 index + 23 ingest + 7 search + 40 sync + 72 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
   live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
@@ -486,12 +486,38 @@ the terminal can too. It drives two general CLI reads: `jkb ls [path]` (lazy tre
 sub-namespaces + items homed there, `has_children`, hides `done`/`cancelled` unless `--all`)
 and `jkb item show <uid>` (kind-aware details + a bounded preview, never the whole document).
 
+**Chunks are hidden.** Ingest stores one `chunk` item per document fragment; listing them
+buried every ingested document under its own pieces. `jkb ls`/`tree` omit `kind='chunk'` from
+both the listing *and* the counts unless `-a`/`--all`, and surface the number against the
+document instead (`Doc (9 chunks)`, `chunk_count` in JSON, via the new
+`item::derived_kind_counts` over the `chunk --derived_from--> document` edge). `--all` now
+means "show hidden entries" — terminal tasks *and* chunks — and `-a` is finally wired.
+
+A folder's count is a **per-kind breakdown**, not a total: `ns::subtree_leaf_counts` groups
+the one recursive CTE by `items.kind` and returns `BTreeMap<String, i64>`, surfaced as
+`leaf_kinds` on `jkb ls --json` and rendered `8 task · 2 document` (kinds are *not*
+pluralized — `items.kind` is an open vocabulary and `hypothesis` has no regular plural). A
+bare total previously rendered as "N task(s) in subtree", so a folder of documents read as a
+folder of tasks. `jkb ls --json` also carries `type`/`type_about` — the namespace's **own**
+type (`ns::get_type_by_id`, never `effective_type`), so a typed root is labelled `[tasks]`
+and the subtree that merely inherits it is not. The portable formatter is
+`ui/core/src/summary.ts` (`formatLeafKinds`/`totalLeaves`), shared with any future host.
+
 - `ui/core` (`@jkb/core`) — **portable TypeScript, no `vscode`/Node**: the `JkbClient`
   transport interface, models, the node-kind registry, detail HTML rendering. A future web
   app reuses it with an HTTP-backed client.
 - `ui/vscode` (`jkb-explorer`) — the VS Code adapter: `CliJkbClient` (spawns the CLI), a
   `TreeDataProvider`, a Webview details host; bundled with esbuild. `cd ui && pnpm install &&
   pnpm run build`, then F5 in `ui/vscode`.
+
+**The UI is gated.** `pnpm run build` from `ui/` is the single correct entry point and is what
+`./scripts/check.sh` and the CI `ui` job run. Two traps it closes: esbuild **strips types
+without checking them**, so the adapter's `build` runs `tsc --noEmit` first; and every
+package's `typecheck` is `--noEmit`, so a bare `pnpm -r run typecheck` cannot resolve
+`@jkb/core` on a clean tree (nothing emits its `.d.ts`) — `-r run build` is topological, so
+core emits before the adapter checks. `check.sh` skips the UI when pnpm is missing (it lives
+under `PNPM_HOME`, which `~/.zshrc` only exports for interactive shells); the CI job never
+skips.
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.
