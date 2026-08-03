@@ -257,7 +257,11 @@ scope ≤ `EXACT_SCORING_CAP` (256) → exact `VectorIndexer::distances_for` (th
 noted there); larger restricted scope → over-fetch `k×8`, filter, grow ×2 to
 `OVERFETCH_CAP` (2048). `fts_ranked` over-fetches-then-filters (FTS candidates are
 small). Hybrid = RRF (K=60). `SearchHit { item, route, score (higher=better),
-distance, namespace_path, source_document }`. `Error` bridges `jkb_core` + `jkb_index`
+distance, namespace_path, source_document }`. `jkb search --json` **resolves**
+those ids: every hit carries `uid`/`kind`/`status`/`snippet` and `source_document` is an
+object (`{id,uid,kind}`), not a bare row id — a result identified only by an integer is not
+interpretable by the agent that asked for it, and search is the one read an agent cannot
+fall back to `query` for. `Error` bridges `jkb_core` + `jkb_index`
 (mirrors `jkb-ingest`); use `Db::read_with::<_, Error, _>` to `?` across both.
 
 ## Section 10 — jkb-core task DAG (DONE, for reference)

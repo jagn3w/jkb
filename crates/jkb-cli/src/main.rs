@@ -1277,6 +1277,20 @@ fn cmd_search(
     let hits = searcher.search(db, &query, route, limit)?;
 
     if json {
+        // Resolve every hit (and every `source_document`) to a real item before emitting.
+        // A search result identified only by a row id is not interpretable by the agent that
+        // asked for it: `jkb query --json` returns uid/kind/snippet, and search — the
+        // flagship read — must not be the one surface that answers in opaque integers.
+        let mut ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
+        ids.extend(hits.iter().filter_map(|h| h.source_document));
+        ids.sort_unstable_by_key(|i| i.get());
+        ids.dedup_by_key(|i| i.get());
+        let resolved: std::collections::HashMap<i64, output::DisplayItem> =
+            output::fetch_items(db, &ids)?
+                .into_iter()
+                .map(|i| (i.id, i))
+                .collect();
+
         let mut arr = Vec::new();
         for hit in &hits {
             let ctx: Vec<serde_json::Value> = match context {
@@ -1294,13 +1308,22 @@ fn cmd_search(
                     .collect(),
                 None => Vec::new(),
             };
+            let item = resolved.get(&hit.item.get());
+            let source = hit
+                .source_document
+                .and_then(|d| resolved.get(&d.get()))
+                .map(|d| serde_json::json!({ "id": d.id, "uid": d.uid, "kind": d.kind }));
             arr.push(serde_json::json!({
                 "item": hit.item.get(),
+                "uid": item.map(|i| i.uid.clone()),
+                "kind": item.map(|i| i.kind.clone()),
+                "status": item.and_then(|i| i.status.clone()),
+                "snippet": item.and_then(|i| i.snippet.clone()),
                 "route": hit.route.as_str(),
                 "score": hit.score,
                 "distance": hit.distance,
                 "namespace": hit.namespace_path,
-                "source_document": hit.source_document.map(ItemId::get),
+                "source_document": source,
                 "context": ctx,
             }));
         }
@@ -3868,8 +3891,22 @@ fn cmd_index(db: &Db) -> Result<()> {
         return Ok(());
     }
     println!("index: embedding {pending} pending item(s)…");
-    let embedded = pipeline.index_pending(db)?;
-    println!("index: embedded {embedded} item(s)");
+    let report = pipeline.index_pending(db)?;
+    println!(
+        "index: {} vector(s) written — {} embedded, {} derived from chunks",
+        report.total(),
+        report.embedded,
+        report.derived
+    );
+    if report.failed > 0 {
+        // Report rather than fail: the run wrote everything it could, and the skipped items
+        // stay pending so a later run retries them.
+        eprintln!(
+            "index: {} item(s) skipped; rerun to retry. first error: {}",
+            report.failed,
+            report.first_error.as_deref().unwrap_or("(none recorded)")
+        );
+    }
     Ok(())
 }
 

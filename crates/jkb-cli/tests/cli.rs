@@ -2387,3 +2387,49 @@ fn ls_hides_chunks_by_default_and_counts_them_on_their_document() {
         .success()
         .stdout(predicate::str::contains(format!("({chunks} chunks)")));
 }
+
+/// A search result must be interpretable by the agent that asked for it. `search --json`
+/// used to answer in bare row ids — no uid, no kind — so a caller could not tell a chunk
+/// from the document it came from without scraping the human output.
+#[test]
+fn search_json_identifies_each_hit_by_uid_and_kind() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let note = dir.path().join("n.md");
+    std::fs::write(&note, "distributed systems reason about partial failure").unwrap();
+    jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "references/web"])
+        .assert()
+        .success();
+
+    // The `fts` route needs no embedder, so this stays offline.
+    let out = jkb(&db)
+        .args([
+            "--global",
+            "search",
+            "partial failure",
+            "--route",
+            "fts",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let hits = hits.as_array().expect("array of hits");
+    assert!(!hits.is_empty(), "expected an fts hit");
+
+    for hit in hits {
+        assert!(hit["uid"].is_string(), "hit has no uid: {hit}");
+        assert!(hit["kind"].is_string(), "hit has no kind: {hit}");
+        // `source_document` resolves to an object, not a bare id, so provenance is
+        // readable without a second lookup.
+        if !hit["source_document"].is_null() {
+            assert!(hit["source_document"]["uid"].is_string(), "{hit}");
+            assert_eq!(hit["source_document"]["kind"], "document", "{hit}");
+        }
+    }
+    // Classifying results by kind is now a direct read, which is what makes measuring the
+    // document-vs-chunk mix tractable at all.
+    let kinds: Vec<&str> = hits.iter().filter_map(|h| h["kind"].as_str()).collect();
+    assert!(kinds.iter().all(|k| !k.is_empty()));
+}

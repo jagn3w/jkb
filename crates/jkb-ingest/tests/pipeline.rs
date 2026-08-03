@@ -18,11 +18,26 @@ use proptest::prelude::*;
 /// can exercise the "embedder down" path.
 struct FakeEmbedder {
     healthy: bool,
+    /// Reject any input longer than this, as ollama does past its context window. `None`
+    /// accepts anything.
+    max_chars: Option<usize>,
 }
 
 impl FakeEmbedder {
     fn arc(healthy: bool) -> Arc<dyn Embedder + Send + Sync> {
-        Arc::new(Self { healthy })
+        Arc::new(Self {
+            healthy,
+            max_chars: None,
+        })
+    }
+
+    /// An embedder that refuses over-long input, standing in for ollama's
+    /// "the input length exceeds the context length".
+    fn arc_with_limit(max_chars: usize) -> Arc<dyn Embedder + Send + Sync> {
+        Arc::new(Self {
+            healthy: true,
+            max_chars: Some(max_chars),
+        })
     }
 }
 
@@ -35,6 +50,11 @@ impl Embedder for FakeEmbedder {
         16
     }
     fn embed(&self, text: &str) -> TypesResult<Vec<f32>> {
+        if self.max_chars.is_some_and(|m| text.chars().count() > m) {
+            return Err(jkb_types::Error::EmbedderUnavailable(
+                "test: the input length exceeds the context length".to_owned(),
+            ));
+        }
         let mut v = vec![0.0f32; 16];
         for (i, b) in text.bytes().enumerate() {
             v[i % 16] += f32::from(b);
@@ -182,8 +202,8 @@ fn index_pending_embeds_captured_items() {
     let before = pipeline(true).unembedded_count(&db).unwrap();
     assert!(before >= 1);
 
-    let embedded = pipeline(true).index_pending(&db).unwrap();
-    assert_eq!(embedded, before, "all pending items get embedded");
+    let report = pipeline(true).index_pending(&db).unwrap();
+    assert_eq!(report.total(), before, "all pending items get embedded");
     assert_eq!(pipeline(true).unembedded_count(&db).unwrap(), 0);
 }
 
@@ -330,6 +350,106 @@ fn empty_and_whitespace_items_are_excluded_from_the_embed_pass() {
     // Only the one real-content item counts as pending.
     assert_eq!(p.unembedded_count(&db).unwrap(), 1);
     // The embed pass embeds exactly that one (never sending empty content to the model).
-    assert_eq!(p.index_pending(&db).unwrap(), 1);
+    assert_eq!(p.index_pending(&db).unwrap().total(), 1);
     assert_eq!(p.unembedded_count(&db).unwrap(), 0);
+}
+
+/// The regression this whole change exists for: one item the embedder rejects must not
+/// discard the whole backfill. Before, `index_pending` propagated the first error, so a
+/// single oversized item threw away every other item's vector.
+#[test]
+fn index_pending_skips_a_rejected_item_and_keeps_the_rest() {
+    let db = open_db();
+    // Capture with the embedder down so everything lands in the pending set.
+    let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(4);
+    pipeline(false)
+        .ingest(&db, text.as_bytes(), &doc(&text), "docs")
+        .unwrap();
+    // An oversized non-document item, which has no chunks to fall back on.
+    let huge = "x".repeat(500);
+    db.write_txn("t", move |conn, meta| {
+        let id = jkb_core::item::upsert(
+            conn,
+            meta,
+            &jkb_core::item::NewItem {
+                uid: "note:huge".to_owned(),
+                kind: "note".to_owned(),
+                content: Some(huge.clone()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        let ns = jkb_core::ns::ensure(conn, "docs")?;
+        jkb_core::placement::place(conn, meta, id, ns, jkb_types::PlacementRole::Primary, 0)
+    })
+    .unwrap();
+
+    let pipe = Pipeline::new(FakeEmbedder::arc_with_limit(120));
+    let report = pipe.index_pending(&db).unwrap();
+
+    // The run SUCCEEDED, skipped only the offender, and still wrote everything else.
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert!(report.embedded > 0, "{report:?}");
+    assert_eq!(
+        report.derived, 1,
+        "the document is derived, not embedded: {report:?}"
+    );
+    assert!(
+        report
+            .first_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("context length"),
+        "{report:?}"
+    );
+    // Only the rejected item is still pending — everything else was committed.
+    assert_eq!(pipe.unembedded_count(&db).unwrap(), 1);
+}
+
+/// A document's vector is the mean of its chunks', not an embedding of its truncated text:
+/// a vector claiming to describe a document while describing only its opening ranks against
+/// queries about the opening and misses everything after it.
+#[test]
+fn a_documents_vector_is_the_centroid_of_its_chunks() {
+    let db = open_db();
+    let pipe = pipeline(true);
+    let text = "one two three four five six seven eight nine ten eleven twelve ".repeat(6);
+    let outcome = pipe
+        .ingest(&db, text.as_bytes(), &doc(&text), "docs")
+        .unwrap();
+    assert!(outcome.chunk_count > 1, "need several chunks to average");
+
+    let indexer = VectorIndexer::new(FakeEmbedder::arc(true));
+    let doc_id = outcome.document;
+    let (doc_vec, chunk_vecs) = db
+        .read(move |conn| {
+            let chunk_ids: Vec<_> = {
+                let mut stmt = conn.prepare(
+                    "SELECT src_item_id FROM edges WHERE dst_item_id = ?1 AND type = 'derived_from'",
+                )?;
+                let rows = stmt.query_map([doc_id.get()], |r| {
+                    Ok(jkb_types::ItemId::new(r.get::<_, i64>(0)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let chunks = indexer.vectors_for(conn, &chunk_ids).unwrap();
+            let d = indexer.vectors_for(conn, &[doc_id]).unwrap();
+            Ok((
+                d.get(&doc_id).cloned().expect("document has a vector"),
+                chunks.into_values().collect::<Vec<_>>(),
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(chunk_vecs.len(), outcome.chunk_count);
+    #[allow(clippy::cast_precision_loss)]
+    let n = chunk_vecs.len() as f32;
+    for i in 0..doc_vec.len() {
+        let mean: f32 = chunk_vecs.iter().map(|v| v[i]).sum::<f32>() / n;
+        assert!(
+            (doc_vec[i] - mean).abs() < 1e-5,
+            "component {i}: {} != mean {mean}",
+            doc_vec[i]
+        );
+    }
 }
