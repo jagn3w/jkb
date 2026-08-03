@@ -322,6 +322,69 @@ pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> 
     Ok(added)
 }
 
+/// Make `child` a subtask of `parent` (a `parent_of` edge, parent -> child).
+///
+/// A parent with any non-terminal child leaves the ready frontier (design D34.3), so this
+/// is how a task too big for one branch is split into the pieces that actually get worked.
+/// Cycle-guarded by [`edge::link`], so a task cannot become its own ancestor.
+///
+/// # Errors
+/// Returns a validation error if the edge would create a cycle; otherwise a database error.
+pub fn add_subtask(
+    conn: &Connection,
+    meta: &WriteMeta,
+    parent: ItemId,
+    child: ItemId,
+) -> Result<()> {
+    edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
+    Ok(())
+}
+
+/// The direct subtasks of `parent`, ordered by priority (asc, nulls last) then uid — the
+/// same ordering [`ready`] uses, so the list reads as a work queue.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, i.uid, i.content, i.status, i.priority, i.due
+           FROM edges e JOIN items i ON i.id = e.dst_item_id
+          WHERE e.src_item_id = ?1 AND e.type = 'parent_of'
+          ORDER BY i.priority IS NULL, i.priority, i.uid",
+    )?;
+    let rows = stmt.query_map([parent.get()], |r| {
+        Ok(TaskRow {
+            id: ItemId::new(r.get(0)?),
+            uid: r.get(1)?,
+            title: r.get(2)?,
+            status: r.get(3)?,
+            priority: r.get(4)?,
+            due: r.get(5)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Whether every subtask of `parent` has reached a terminal status (`done`/`cancelled`).
+/// True when there are no subtasks at all — a leaf is trivially complete.
+///
+/// This is the second half of the auto-close rule (design D34.4): a merged branch is
+/// evidence the work landed, but a task with unfinished children did not finish.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn subtasks_all_terminal(conn: &Connection, parent: ItemId) -> Result<bool> {
+    let open: i64 = conn
+        .prepare_cached(
+            "SELECT count(*) FROM edges e JOIN items c ON c.id = e.dst_item_id
+              WHERE e.src_item_id = ?1 AND e.type = 'parent_of'
+                AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'",
+        )?
+        .query_row([parent.get()], |r| r.get(0))?;
+    Ok(open == 0)
+}
+
 /// Add a `depends_on` edge from `task` to the task with uid `dep_uid`. The edge is
 /// rejected if it would introduce a cycle (via [`edge::link`]).
 ///

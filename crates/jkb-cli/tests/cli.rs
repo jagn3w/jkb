@@ -2433,3 +2433,88 @@ fn search_json_identifies_each_hit_by_uid_and_kind() {
     let kinds: Vec<&str> = hits.iter().filter_map(|h| h["kind"].as_str()).collect();
     assert!(kinds.iter().all(|k| !k.is_empty()));
 }
+
+/// A parent with unfinished subtasks is held off the ready frontier — you work the leaves.
+/// `is:ready` and `is:frontier` must agree, since for a task they are the same question.
+#[test]
+fn a_parent_with_open_subtasks_is_not_on_the_frontier() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "big feature"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let parent = v[0]["uid"].as_str().unwrap().to_owned();
+
+    for child in ["part one", "part two"] {
+        jkb(&db)
+            .args(["task", "add", child, "--under", &parent])
+            .assert()
+            .success();
+    }
+
+    // The frontier offers the leaves, not the container.
+    let ready = jkb(&db)
+        .args(["--global", "task", "next"])
+        .output()
+        .unwrap();
+    let ready = String::from_utf8_lossy(&ready.stdout);
+    assert!(
+        ready.contains("part one") && ready.contains("part two"),
+        "{ready}"
+    );
+    assert!(
+        !ready.contains("big feature"),
+        "parent must be held: {ready}"
+    );
+
+    // `is:frontier` must agree with `is:ready` — they are one concept for tasks.
+    for term in ["is:ready", "is:frontier"] {
+        let out = jkb(&db)
+            .args(["--global", "query", &format!("kind:task {term}")])
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !s.contains("big feature"),
+            "{term} must hold the parent: {s}"
+        );
+    }
+
+    // `task show` explains the hold rather than leaving it a mystery.
+    jkb(&db)
+        .args(["task", "show", &parent])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("subtasks (2 open of 2)"))
+        .stdout(predicate::str::contains("held off the ready frontier"));
+
+    // Terminal includes cancelled: the parent becomes workable once nothing is outstanding.
+    let out = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for t in v.as_array().unwrap() {
+        let uid = t["uid"].as_str().unwrap();
+        if uid != parent {
+            jkb(&db)
+                .args(["task", "set", uid, "--status", "done"])
+                .assert()
+                .success();
+        }
+    }
+    let ready = jkb(&db)
+        .args(["--global", "task", "next"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&ready.stdout).contains("big feature"),
+        "parent should return to the frontier once its subtasks are terminal"
+    );
+}

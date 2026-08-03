@@ -109,6 +109,53 @@ else
   warn "skipping watcher service (--no-service)"
 fi
 
+# --- git hooks -----------------------------------------------------------------------
+# Install the repo-local post-merge hook (design D34.5): re-run setup.sh and close
+# branch-completed tasks after a pull.
+#
+# The wrinkle: `core.hooksPath` set globally REPLACES .git/hooks entirely, so a repo-local
+# hook is silently dead when one is configured. That is the same failure class as a build
+# that "passes" without type-checking, so we detect it and install a chainer into the global
+# directory rather than quietly doing nothing.
+say "installing git hooks"
+hooks_src="$repo_root/scripts/hooks/post-merge"
+if [ -f "$hooks_src" ]; then
+  git_dir="$(git -C "$repo_root" rev-parse --git-dir 2>/dev/null || true)"
+  if [ -n "$git_dir" ]; then
+    case "$git_dir" in /*) ;; *) git_dir="$repo_root/$git_dir" ;; esac
+    mkdir -p "$git_dir/hooks"
+    cp "$hooks_src" "$git_dir/hooks/post-merge"
+    chmod +x "$git_dir/hooks/post-merge"
+    echo "  • repo hook:  $git_dir/hooks/post-merge"
+
+    global_hooks="$(git config --get core.hooksPath || true)"
+    if [ -n "$global_hooks" ]; then
+      global_hooks="${global_hooks/#\~/$HOME}"
+      mkdir -p "$global_hooks"
+      chainer="$global_hooks/post-merge"
+      if [ ! -f "$chainer" ]; then
+        cat > "$chainer" <<'CHAIN'
+#!/bin/sh
+# Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
+# repo-local hook if one exists (mirrors the commit-msg chainer).
+repo_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/post-merge"
+[ -x "$repo_hook" ] && exec "$repo_hook" "$@"
+exit 0
+CHAIN
+        chmod +x "$chainer"
+        echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)"
+      else
+        # Something is already there; do not clobber it, but say so, because a chainer that
+        # does not dispatch means the repo hook never runs.
+        grep -q "hooks/post-merge" "$chainer" 2>/dev/null \
+          || warn "$chainer exists but may not chain to the repo hook — check it by hand"
+      fi
+    fi
+  else
+    warn "not a git repo; skipping hook install"
+  fi
+fi
+
 say "setup complete"
 echo "  • jkb:        $(command -v jkb)"
 echo "  • database:   $db"

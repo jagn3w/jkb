@@ -550,6 +550,23 @@ pub fn set_resolution_str(
     set_resolution(conn, meta, item, parsed)
 }
 
+/// The path of the namespace an item is primarily placed under, if it has one.
+///
+/// "Primary" is the item's home as opposed to a `reference` mirror, so this answers *where
+/// this item lives* rather than everywhere it is visible.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn primary_namespace(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+              WHERE p.item_id = ?1 AND p.role = 'primary' LIMIT 1",
+        )?
+        .query_row([item.get()], |r| r.get(0))
+        .optional()?)
+}
+
 /// How many items of `kind` were **derived from** each of `parents`, as a
 /// `parent -> count` map (parents with none are absent).
 ///

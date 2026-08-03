@@ -100,8 +100,8 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **317 tests** green (131 core = 103 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 8 index + 23 ingest + 7 search + 40 sync + 72 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+- **324 tests** green (133 core = 105 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 9 index + 25 ingest + 7 search + 40 sync + 78 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
   live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
@@ -457,6 +457,37 @@ RESOLVER agent; `merge-queue.sh` rebase/fast-forwards, runs the gate, marks the 
 `done` on green, ejects on conflict/red). Pipelined (no per-round barrier), the merge
 queue the one serial stage; the coordinator loop claims each group before dispatch,
 releases on settle, and runs `task reclaim --keep <owner>` each pass as the crash net.
+
+## Task branch lifecycle (D34) — subtasks, branch tags, merge-driven close
+
+Two chores that were manual — re-running `setup.sh` after a pull, and closing tasks whose PR
+landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle/`).
+
+- **Subtasks are `parent_of` edges.** The edge type existed and the `tasks` serializer already
+  wrote it from indentation; nothing read it. Now **a task with a non-terminal child is off
+  the frontier** — you work the leaves, the parent is a container. One anti-join
+  (`SUBTASK_CLAUSE`), added to `is:ready` and `is:frontier` **identically**, because those two
+  must stay equivalent for tasks. `jkb task add --under <uid>` creates one (inheriting the
+  parent's home); `jkb task show` lists them and says why the parent is held. Deliberately no
+  status rollup: auto-close is a separate, git-triggered decision, and two mechanisms racing
+  to close one task is how it closes for the wrong reason.
+- **`jkb task start <uid>`** claims the task *and* tags `branch=`/`repo=`/`base=` from the
+  ambient git repo — one moment, one command, so the tag is never missing on exactly the
+  tasks that needed it. It refuses the trunk branch (which would auto-close instantly).
+- **Merge detection is strategy-agnostic** (`jkb-cli/src/gitrepo.rs`). `--is-ancestor` and
+  `git cherry` both report *not merged* for **squash**, GitHub's most popular strategy, since
+  it rewrites the branch into one new commit. The check that works for all three asks a
+  different question — `git merge-tree --write-tree trunk branch` equalling trunk's own tree
+  means the branch **adds nothing**, however it landed. Falls back to `--is-ancestor` on git
+  <2.38 and *says so*. `base=` exists because refs alone cannot separate a rebase-merged
+  branch (GitHub fast-forwards, leaving it byte-identical to trunk) from one just created.
+- **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
+  is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
+  close costs one command, a wrong close buries unfinished work.
+- **`scripts/hooks/post-merge`** (installed by `setup.sh`) runs `setup.sh` when the pull
+  touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
+  the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
+  `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
 
 ## Design gate (D28) — human design, swarm implementation
 
