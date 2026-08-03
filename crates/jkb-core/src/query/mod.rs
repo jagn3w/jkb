@@ -146,6 +146,19 @@ pub struct Query {
     pub limit: Option<usize>,
 }
 
+/// A unit with an unfinished `parent_of` child is not itself workable — the leaves are.
+///
+/// Shared verbatim by `is:ready` and `is:frontier` because those two must stay equivalent
+/// for tasks (a task's `resolution` is always NULL, so the frontier clauses collapse onto
+/// the ready ones). Putting this rule in only one of them would break that the moment a
+/// task had a subtask.
+const SUBTASK_CLAUSE: &str = "
+                 AND NOT EXISTS (
+                     SELECT 1 FROM edges pe JOIN items c ON pe.dst_item_id = c.id
+                     WHERE pe.src_item_id = i.id AND pe.type = 'parent_of'
+                       AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
+                 )";
+
 impl Query {
     /// Evaluate the structured filter (plus any FTS `match`) and return the matching
     /// item ids, ordered by id. The `~"…"` vector term is ignored here (see the
@@ -297,16 +310,21 @@ impl Query {
             // frontier (design D27.1): work already in flight must not be handed out
             // twice. This is a plain column predicate — no anti-join. The owner-existence
             // reclaim NULLs a dead owner's `claimant_id`, which drops the task back in.
-            clauses.push(
+            //
+            // A task with an unfinished **subtask** is likewise off the frontier (design
+            // D34.3): `parent_of` runs parent -> child, so a parent is a container and the
+            // leaves are the units of work. Handing out the parent would have an agent
+            // claim work that is really several pieces, which is the situation subtasks
+            // exist to split.
+            clauses.push(format!(
                 "i.claimant_id IS NULL
                  AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
                  AND NOT EXISTS (
                      SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
                      WHERE e.src_item_id = i.id AND e.type = 'depends_on'
                        AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
-                 )"
-                .to_owned(),
-            );
+                 ){SUBTASK_CLAUSE}"
+            ));
         }
         if self.frontier {
             // The generalized frontier (design Dmem.3): a unit is on it when it is itself
@@ -331,7 +349,7 @@ impl Query {
                      WHERE e.src_item_id = i.id AND e.type = 'depends_on'
                        AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
                        AND (d.resolution IS NULL OR d.resolution = 'unresolved')
-                 )"
+                 ){SUBTASK_CLAUSE}"
             ));
         }
         if self.tombstone {

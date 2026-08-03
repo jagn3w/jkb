@@ -7,6 +7,7 @@
 //! current directory (design D19), overridable with `--global`.
 
 mod commands;
+mod gitrepo;
 mod output;
 mod owner;
 mod service;
@@ -604,6 +605,11 @@ enum TaskCmd {
         /// Force a `managed:` (KB-only) binding, overriding mount inference.
         #[arg(long)]
         managed: bool,
+        /// Make this a subtask of `<uid>`: the parent leaves the ready frontier until every
+        /// subtask is terminal, so a task too big for one branch is split into the pieces
+        /// that get worked. Defaults the new task's home to the parent's.
+        #[arg(long)]
+        under: Option<String>,
     },
     /// List the ready frontier (optionally scoped/filtered by DSL terms).
     Next {
@@ -701,6 +707,36 @@ enum TaskCmd {
         /// The liveness-checkable owner id (default: this process's `host:pid`).
         #[arg(long)]
         owner: Option<String>,
+    },
+    /// Start work: claim the task and record the branch and repo it is being done on, so
+    /// `jkb task close-merged` can close it once that branch lands. Both default from the
+    /// git repo in the current directory.
+    Start {
+        /// The task uid.
+        uid: String,
+        /// The branch (default: the current branch here).
+        #[arg(long)]
+        branch: Option<String>,
+        /// The repo key (default: the basename of this git repo's root).
+        #[arg(long)]
+        repo: Option<String>,
+        /// The liveness-checkable owner id (default: this process's `host:pid`).
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Close tasks whose `branch=` has landed in this repo's trunk. A task closes only when
+    /// its branch is merged AND all of its subtasks are terminal; anything else is
+    /// reported. Works with merge-commit, squash, and rebase merges alike.
+    CloseMerged {
+        /// Only consider tasks tagged with this repo (default: this git repo's key).
+        #[arg(long)]
+        repo: Option<String>,
+        /// The trunk to measure against (default: `origin/HEAD`, else main/master/trunk).
+        #[arg(long)]
+        trunk: Option<String>,
+        /// Report what would close without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Release a task's claim held by an owner (defaults to this process).
     Release {
@@ -3422,18 +3458,46 @@ fn resolve_task_binding(
 
 /// Handle `task add`: parse the quick-add line, derive the home (design D26 homing) and
 /// the storage binding (D26.5), then create the task through the writer-actor.
-fn cmd_task_add(db: &Db, text: &[String], flags: &AddFlags, json: bool) -> Result<()> {
+fn cmd_task_add(
+    db: &Db,
+    text: &[String],
+    flags: &AddFlags,
+    under: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let input = text.join(" ");
     let qa = task::parse_quick_add(&input)?;
-    let had_explicit_placement = !qa.placements.is_empty();
+    let mut had_explicit_placement = !qa.placements.is_empty();
     let uid = task::mint_uid(&qa.title);
     let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
+
+    // A subtask defaults to living beside its parent: splitting a task should not scatter
+    // the pieces across namespaces, and `--under` is the only signal about where it belongs.
+    let parent = match under {
+        Some(p) => {
+            let pid = resolve_task_uid(db, p)?;
+            if !had_explicit_placement {
+                if let Some(home) = db.read(move |conn| item::primary_namespace(conn, pid))? {
+                    spec.home = home;
+                    had_explicit_placement = true;
+                }
+            }
+            Some(pid)
+        }
+        None => None,
+    };
 
     resolve_task_home(db, &mut spec, flags, had_explicit_placement)?;
     let synced_file = resolve_task_binding(db, &mut spec, flags, &uid)?;
 
     let home = spec.home.clone();
-    let id = db.write_txn("cli", move |conn, meta| task::create(conn, meta, &spec))?;
+    let id = db.write_txn("cli", move |conn, meta| {
+        let id = task::create(conn, meta, &spec)?;
+        if let Some(parent) = parent {
+            task::add_subtask(conn, meta, parent, id)?;
+        }
+        Ok(id)
+    })?;
     if json {
         println!(
             "{}",
@@ -3456,6 +3520,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             backlog,
             sync,
             managed,
+            under,
         } => cmd_task_add(
             db,
             &text,
@@ -3464,6 +3529,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
                 sync,
                 managed,
             },
+            under.as_deref(),
             json,
         )?,
         TaskCmd::Next { terms, limit } => {
@@ -3481,6 +3547,25 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         TaskCmd::Show { uid } => {
             let id = resolve_task_uid(db, &uid)?;
             output::print_item_full(db, id, json)?;
+            // Subtasks are shown after the body: a parent is off the ready frontier until
+            // they are all terminal, so "why isn't this actionable?" must be answerable
+            // from the same command that shows the task.
+            let subs = db.read(move |conn| task::subtasks(conn, id))?;
+            if !subs.is_empty() && !json {
+                let open = subs
+                    .iter()
+                    .filter(|t| !matches!(t.status.as_deref(), Some("done" | "cancelled")))
+                    .count();
+                println!("\nsubtasks ({open} open of {}):", subs.len());
+                for t in &subs {
+                    let status = t.status.as_deref().unwrap_or("?");
+                    let title = t.title.as_deref().unwrap_or("");
+                    println!("  [{status:^12}] {} — {}", t.uid, first_line(title));
+                }
+                if open > 0 {
+                    println!("this task is held off the ready frontier until they are done");
+                }
+            }
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         other => cmd_task_mutate(db, other, json)?,
@@ -3601,12 +3686,213 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             report(json, &uid, "bound");
         }
         TaskCmd::Claim { uid, owner } => cmd_task_claim(db, &uid, owner, true, json)?,
+        TaskCmd::Start {
+            uid,
+            branch,
+            repo,
+            owner,
+        } => cmd_task_start(db, &uid, branch, repo, owner, json)?,
+        TaskCmd::CloseMerged {
+            repo,
+            trunk,
+            dry_run,
+        } => cmd_task_close_merged(db, repo, trunk, dry_run, json)?,
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read subcommands are dispatched by `cmd_task` and never reach here.
         TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Mirror => {
             unreachable!()
         }
+    }
+    Ok(())
+}
+
+/// The facet recording which branch a task is being done on, and which repo that branch is
+/// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
+const FACET_BRANCH: &str = "branch";
+const FACET_REPO: &str = "repo";
+/// The trunk commit the branch was cut from, recorded at `task start`. Without it a
+/// rebase-merged branch — which GitHub fast-forwards, leaving it byte-identical to trunk —
+/// cannot be told apart from a branch that was just created and never touched.
+const FACET_BASE: &str = "base";
+
+/// `task start` — claim the task and record where the work is happening.
+///
+/// Claiming and tagging together is the point: "I am starting this" and "here is the branch
+/// that will finish it" are the same moment, and splitting them is how the tag ends up
+/// missing on exactly the tasks that needed it.
+fn cmd_task_start(
+    db: &Db,
+    uid: &str,
+    branch: Option<String>,
+    repo: Option<String>,
+    owner: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let branch = match branch {
+        Some(b) => b,
+        None => gitrepo::current_branch(&cwd)?.context(
+            "not on a branch here (detached HEAD?) — pass --branch, or run inside a git repo",
+        )?,
+    };
+    let repo = match repo {
+        Some(r) => r,
+        None => gitrepo::key(&cwd)?
+            .context("not inside a git repo — pass --repo, or run this from the repo")?,
+    };
+    // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
+    // anything merged, since trunk is trivially "merged into" itself.
+    if let Some(t) = gitrepo::trunk(&cwd)? {
+        let trunk_name = t.rsplit('/').next().unwrap_or(&t);
+        anyhow::ensure!(
+            branch != trunk_name,
+            "`{branch}` is this repo's trunk — start work on a feature branch, or the task \
+             would auto-close immediately"
+        );
+    }
+
+    // Trunk's tip right now is this branch's base (see FACET_BASE).
+    let base = gitrepo::rev(
+        &cwd,
+        &gitrepo::trunk(&cwd)?.unwrap_or_else(|| "HEAD".to_owned()),
+    )?;
+
+    let id = resolve_task_uid(db, uid)?;
+    let owner = owner.unwrap_or_else(owner::self_owner);
+    let (o, b, r, base_sha) = (owner.clone(), branch.clone(), repo.clone(), base.clone());
+    db.write_txn("cli", move |conn, meta| {
+        claim::claim(conn, meta, id, &o)?;
+        tag::apply(conn, meta, id, FACET_BRANCH, &b)?;
+        tag::apply(conn, meta, id, FACET_REPO, &r)?;
+        if let Some(sha) = &base_sha {
+            tag::apply(conn, meta, id, FACET_BASE, sha)?;
+        }
+        Ok(())
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "uid": uid, "branch": branch, "repo": repo, "owner": owner })
+        );
+    } else {
+        println!("started {uid} on {repo}@{branch} (owner {owner})");
+    }
+    Ok(())
+}
+
+/// `task close-merged` — close tasks whose branch has landed (design D34.4).
+fn cmd_task_close_merged(
+    db: &Db,
+    repo: Option<String>,
+    trunk: Option<String>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = match repo {
+        Some(r) => r,
+        None => gitrepo::key(&cwd)?
+            .context("not inside a git repo — pass --repo, or run this from the repo")?,
+    };
+    let trunk_ref = match trunk {
+        Some(t) => t,
+        None => gitrepo::trunk(&cwd)?.context(
+            "could not determine this repo's trunk (no origin/HEAD and no main/master/trunk) \
+             — pass --trunk",
+        )?,
+    };
+
+    // Every open task tagged for this repo that names a branch.
+    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo}"))?;
+    let ids = db.read(move |conn| query.evaluate(conn))?;
+
+    let mut closed = Vec::new();
+    let mut blocked = Vec::new();
+    let mut pending = Vec::new();
+    let mut warned_fallback = false;
+
+    for id in ids {
+        let (uid, status, branch, base) = db
+            .read(move |conn| {
+                let meta = item::get(conn, id)?;
+                let tags = tag::applications(conn, id)?;
+                let of = |facet: &str| {
+                    tags.iter()
+                        .find(|(f, _)| f == facet)
+                        .map(|(_, v)| v.clone())
+                };
+                Ok(meta.map(|m| (m.uid, m.status, of(FACET_BRANCH), of(FACET_BASE))))
+            })?
+            .unwrap_or_default();
+        let Some(branch) = branch else { continue };
+        if matches!(status.as_deref(), Some("done" | "cancelled")) {
+            continue;
+        }
+
+        let (state, fell_back) = gitrepo::is_merged(&cwd, &branch, &trunk_ref, base.as_deref())?;
+        if fell_back && !warned_fallback {
+            warned_fallback = true;
+            eprintln!(
+                "warning: this git lacks `merge-tree --write-tree` (needs 2.38+), so \
+                 squash-merged branches will read as unmerged"
+            );
+        }
+        match state {
+            gitrepo::MergeState::Merged => {
+                // A merged branch is evidence, not proof: a task with unfinished subtasks
+                // did not finish, whatever landed (design D34.4).
+                if db.read(move |conn| task::subtasks_all_terminal(conn, id))? {
+                    if !dry_run {
+                        db.write_txn("cli", move |conn, meta| {
+                            task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+                        })?;
+                    }
+                    closed.push((uid, branch));
+                } else {
+                    blocked.push((uid, branch));
+                }
+            }
+            gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
+                pending.push((uid, branch));
+            }
+            // A missing branch is ambiguous — merged-and-deleted, or a typo. Never closed.
+            gitrepo::MergeState::BranchMissing => blocked.push((uid, format!("{branch} (gone)"))),
+            gitrepo::MergeState::NoTrunk => {
+                anyhow::bail!("trunk `{trunk_ref}` does not resolve in this repo")
+            }
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "repo": repo,
+                "trunk": trunk_ref,
+                "dry_run": dry_run,
+                "closed": closed.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
+                    .collect::<Vec<_>>(),
+                "blocked": blocked.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
+                    .collect::<Vec<_>>(),
+                "pending": pending.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    let verb = if dry_run { "would close" } else { "closed" };
+    for (uid, branch) in &closed {
+        println!("{verb} {uid} ({branch} merged)");
+    }
+    for (uid, branch) in &blocked {
+        println!("held  {uid} ({branch}) — subtasks still open, or branch gone");
+    }
+    if closed.is_empty() && blocked.is_empty() {
+        println!(
+            "nothing to close ({} task(s) still in flight)",
+            pending.len()
+        );
     }
     Ok(())
 }

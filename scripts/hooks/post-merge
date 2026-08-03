@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Repo-local post-merge hook (design D34.5). Installed by scripts/setup.sh.
+#
+# Fires after any merge that changes the work tree — which is every `git pull` that brings
+# something in. Two chores that were previously manual:
+#
+#   1. re-run setup.sh, so the installed `jkb` binary and the VS Code extension match what
+#      was just pulled — but ONLY when the merge touched something setup.sh installs;
+#   2. close tasks whose branch has now landed (`jkb task close-merged`).
+#
+# Never fails the merge. A hook that can break `git pull` is worse than the chore it
+# replaces, so every step is best-effort and reports rather than exits non-zero.
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$repo_root" ] || exit 0
+
+# `post-merge` runs with $1 = 1 when the merge was a squash. ORIG_HEAD is the pre-merge tip
+# either way, so it is the honest range for "what did this pull bring in".
+range="ORIG_HEAD..HEAD"
+git rev-parse --verify --quiet ORIG_HEAD >/dev/null 2>&1 || range="HEAD^..HEAD"
+changed="$(git diff --name-only "$range" 2>/dev/null)"
+
+# --- 1. setup.sh, only when it would actually change something -----------------------
+# setup.sh installs the binary (crates/), the extension (ui/) and the service (scripts/).
+# A pull touching only openspec/ or docs cannot affect any of them, and a full cargo
+# install is ~1-2 minutes we should not spend on every pull.
+if [ -x "$repo_root/scripts/setup.sh" ] &&
+   printf '%s\n' "$changed" | grep -qE '^(crates/|ui/|scripts/|Cargo\.(toml|lock)$)'; then
+    echo "jkb: pulled changes touch crates/ ui/ or scripts/ — running setup.sh"
+    "$repo_root/scripts/setup.sh" || echo "jkb: setup.sh failed (continuing; re-run by hand)"
+else
+    echo "jkb: no build-affecting changes pulled — skipping setup.sh"
+fi
+
+# --- 2. close tasks whose branch landed ----------------------------------------------
+# Runs in every repo that installs this hook, not just jkb: `close-merged` scopes itself to
+# the repo it is run from and needs nothing but git.
+if command -v jkb >/dev/null 2>&1; then
+    jkb task close-merged || echo "jkb: close-merged failed (continuing)"
+fi
+
+exit 0
