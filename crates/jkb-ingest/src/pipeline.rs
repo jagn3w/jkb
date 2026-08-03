@@ -183,7 +183,7 @@ impl Pipeline {
             });
         }
 
-        self.embed_and_complete(db, &source_hash, &items)?;
+        self.embed_and_complete(db, &source_hash, document, &items)?;
         Ok(Outcome {
             document,
             chunk_count,
@@ -308,15 +308,32 @@ impl Pipeline {
     }
 
     /// Embed `items` (off-thread), write the vectors, and mark the ingestion complete.
+    ///
+    /// `document`'s own vector is **averaged from its chunks** rather than embedded from its
+    /// text — see [`Pipeline::derive_document_vectors`] for why a truncated document vector
+    /// is worse than none. This is the same rule the `index_pending` mop-up applies, so a
+    /// document gets the same vector whichever path indexed it.
     fn embed_and_complete(
         &self,
         db: &Db,
         source_hash: &str,
+        document: ItemId,
         items: &[(ItemId, String)],
     ) -> Result<()> {
         let mut embeddings = Vec::with_capacity(items.len());
-        for (id, content) in items {
+        for (id, content) in items.iter().filter(|(id, _)| *id != document) {
             embeddings.push((*id, self.embedder.embed(content)?));
+        }
+        let chunk_vectors: Vec<Vec<f32>> = embeddings.iter().map(|(_, v)| v.clone()).collect();
+        match centroid(&chunk_vectors) {
+            Some(c) => embeddings.push((document, c)),
+            // No chunks (a source short enough that chunking produced none): the document's
+            // own text is short by construction, so embedding it directly is safe.
+            None => {
+                if let Some((_, text)) = items.iter().find(|(id, _)| *id == document) {
+                    embeddings.push((document, self.embedder.embed(text)?));
+                }
+            }
         }
 
         let vector = VectorIndexer::new(self.embedder.clone());
@@ -347,21 +364,27 @@ impl Pipeline {
     /// by the `tasks` file serializer) is a content item with nothing to embed, and
     /// asking the model to embed `""` yields a zero-length vector — so those are skipped
     /// here rather than sent to the embedder.
-    fn pending_items(&self, db: &Db) -> Result<Vec<(ItemId, String)>> {
+    fn pending_items(&self, db: &Db) -> Result<Vec<Pending>> {
         let table = VectorIndexer::new(self.embedder.clone())
             .table_name()
             .to_owned();
-        let rows = db.read_with::<Vec<(ItemId, String)>, Error, _>(move |conn| {
+        let rows = db.read_with::<Vec<Pending>, Error, _>(move |conn| {
             let sql = pending_rows_sql(conn, &table)?;
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
-                .query_map([], |r| Ok((ItemId::new(r.get(0)?), r.get::<_, String>(1)?)))?
+                .query_map([], |r| {
+                    Ok(Pending {
+                        id: ItemId::new(r.get(0)?),
+                        content: r.get::<_, String>(1)?,
+                        kind: r.get::<_, String>(2)?,
+                    })
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
         Ok(rows
             .into_iter()
-            .filter(|(_, content)| !content.trim().is_empty())
+            .filter(|p| !p.content.trim().is_empty())
             .collect())
     }
 
@@ -380,17 +403,50 @@ impl Pipeline {
     /// # Errors
     /// Returns [`jkb_types::Error::EmbedderUnavailable`] (via [`Error::Types`]) if
     /// the embedder is down, or a database error.
-    pub fn index_pending(&self, db: &Db) -> Result<usize> {
+    pub fn index_pending(&self, db: &Db) -> Result<IndexReport> {
         let pending = self.pending_items(db)?;
+        let mut report = IndexReport::default();
         if pending.is_empty() {
-            return Ok(0);
+            return Ok(report);
         }
         // Actionable failure if the embedder is down (D21 / task 7.5).
         self.embedder.health_check()?;
 
-        let mut embeddings = Vec::with_capacity(pending.len());
-        for (id, content) in &pending {
-            embeddings.push((*id, self.embedder.embed(content)?));
+        // A document is embedded from its chunks, not from its own text (see
+        // `derive_document_vectors`), so it is held back until the chunks are in.
+        let (documents, direct): (Vec<Pending>, Vec<Pending>) =
+            pending.into_iter().partition(|p| p.kind == KIND_DOCUMENT);
+
+        for batch in direct.chunks(EMBED_BATCH) {
+            let mut embeddings = Vec::with_capacity(batch.len());
+            for item in batch {
+                match self.embedder.embed(&item.content) {
+                    Ok(v) => embeddings.push((item.id, v)),
+                    // One bad item must not discard the whole backfill. A run over tens of
+                    // thousands of items will meet a transient failure eventually; losing
+                    // every other item's work to it makes the mop-up path unusable exactly
+                    // when it is most needed.
+                    Err(e) => {
+                        report.failed += 1;
+                        report.note_failure(&e.to_string());
+                    }
+                }
+            }
+            report.embedded += self.store_vectors(db, embeddings)?;
+        }
+
+        report.derived = self.derive_document_vectors(db, &documents)?;
+        Ok(report)
+    }
+
+    /// Write a batch of vectors in one transaction, returning how many landed.
+    ///
+    /// Committing per batch rather than once at the end is what makes a long backfill
+    /// resumable: interrupting it keeps everything already written, and re-running picks up
+    /// only what is still missing.
+    fn store_vectors(&self, db: &Db, embeddings: Vec<(ItemId, Vec<f32>)>) -> Result<usize> {
+        if embeddings.is_empty() {
+            return Ok(0);
         }
         let count = embeddings.len();
         let vector = VectorIndexer::new(self.embedder.clone());
@@ -402,6 +458,53 @@ impl Pipeline {
             Ok(())
         })?;
         Ok(count)
+    }
+
+    /// Give each document a vector **averaged from its chunks** rather than embedded from
+    /// its own text.
+    ///
+    /// A document's content is the whole source — a transcript can be a hundred times the
+    /// embedder's context. Embedding it directly means embedding a truncated prefix, which
+    /// does not merely lose information: it produces a vector that claims to describe the
+    /// document while describing only its opening, so the document ranks against queries
+    /// about its beginning and misses everything after. The chunks already cover the whole
+    /// text, so their centroid is both cheaper (no model call) and more faithful.
+    ///
+    /// A document with no chunks (short enough that ingest made none, or created by a path
+    /// that does not chunk) falls back to embedding its own content, which is safe because
+    /// it is short by construction.
+    fn derive_document_vectors(&self, db: &Db, documents: &[Pending]) -> Result<usize> {
+        if documents.is_empty() {
+            return Ok(0);
+        }
+        let mut derived = Vec::new();
+        let mut fallback = Vec::new();
+        for doc in documents {
+            let id = doc.id;
+            let embedder = self.embedder.clone();
+            let vectors = db.read_with::<Vec<Vec<f32>>, Error, _>(move |conn| {
+                let chunk_ids = chunk_ids_of(conn, id)?;
+                let indexer = VectorIndexer::new(embedder);
+                Ok(indexer
+                    .vectors_for(conn, &chunk_ids)?
+                    .into_values()
+                    .collect())
+            })?;
+            match centroid(&vectors) {
+                Some(c) => derived.push((doc.id, c)),
+                None => fallback.push(doc),
+            }
+        }
+        for doc in fallback {
+            if let Ok(v) = self.embedder.embed(&doc.content) {
+                derived.push((doc.id, v));
+            }
+        }
+        let mut written = 0;
+        for batch in derived.chunks(EMBED_BATCH) {
+            written += self.store_vectors(db, batch.to_vec())?;
+        }
+        Ok(written)
     }
 }
 
@@ -419,12 +522,91 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 fn pending_rows_sql(conn: &Connection, table: &str) -> rusqlite::Result<String> {
     Ok(if table_exists(conn, table)? {
         format!(
-            "SELECT id, content FROM items
+            "SELECT id, content, kind FROM items
              WHERE content IS NOT NULL AND id NOT IN (SELECT item_id FROM {table})"
         )
     } else {
-        "SELECT id, content FROM items WHERE content IS NOT NULL".to_owned()
+        "SELECT id, content, kind FROM items WHERE content IS NOT NULL".to_owned()
     })
+}
+
+/// The item kind ingest stores a whole source document as. Its chunks are separate items
+/// linked back to it by `derived_from`.
+const KIND_DOCUMENT: &str = "document";
+
+/// How many vectors to compute before committing. Small enough that an interrupted backfill
+/// loses at most this much work, large enough that per-transaction overhead stays noise
+/// against the model call that dominates each item.
+const EMBED_BATCH: usize = 256;
+
+/// One un-embedded item awaiting a vector.
+struct Pending {
+    id: ItemId,
+    content: String,
+    kind: String,
+}
+
+/// What one [`Pipeline::index_pending`] run did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IndexReport {
+    /// Items embedded by calling the model.
+    pub embedded: usize,
+    /// Documents whose vector was averaged from their chunks (no model call).
+    pub derived: usize,
+    /// Items skipped because the embedder rejected them. They stay pending, so a later run
+    /// retries them; the run itself still succeeds.
+    pub failed: usize,
+    /// The first failure's message, so a caller can say *why* without a log scrape.
+    pub first_error: Option<String>,
+}
+
+impl IndexReport {
+    /// Total vectors written this run.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.embedded + self.derived
+    }
+
+    fn note_failure(&mut self, message: &str) {
+        if self.first_error.is_none() {
+            self.first_error = Some(message.to_owned());
+        }
+    }
+}
+
+/// The chunk items derived from `document`, via the `derived_from` edge ingest writes.
+fn chunk_ids_of(conn: &Connection, document: ItemId) -> rusqlite::Result<Vec<ItemId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.src_item_id FROM edges e
+         JOIN items i ON i.id = e.src_item_id
+         WHERE e.dst_item_id = ?1 AND e.type = 'derived_from' AND i.kind = 'chunk'",
+    )?;
+    let rows = stmt.query_map([document.get()], |r| Ok(ItemId::new(r.get(0)?)))?;
+    rows.collect()
+}
+
+/// The mean of `vectors`, or `None` if there are none (or they disagree on length).
+///
+/// Deliberately *not* re-normalized: the vec table stores raw embeddings and
+/// `vec_distance_cosine` normalizes at comparison time, so scaling here would be a no-op
+/// that only obscured what is stored.
+fn centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let first = vectors.first()?;
+    let dim = first.len();
+    if dim == 0 || vectors.iter().any(|v| v.len() != dim) {
+        return None;
+    }
+    let mut sum = vec![0.0_f64; dim];
+    for v in vectors {
+        for (acc, x) in sum.iter_mut().zip(v) {
+            *acc += f64::from(*x);
+        }
+    }
+    // A count that does not fit in u32 is not a real chunk count; failing the average is
+    // better than silently losing precision in the divisor.
+    let n = f64::from(u32::try_from(vectors.len()).ok()?);
+    #[allow(clippy::cast_possible_truncation)] // f64 mean back to the f32 the table stores
+    Some(sum.into_iter().map(|x| (x / n) as f32).collect())
 }
 
 /// The document item id for `hash` (uid `b3:<hash>`).

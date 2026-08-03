@@ -23,11 +23,22 @@ pub const DEFAULT_DIM: usize = 768;
 
 /// Upper bound on input length before we truncate.
 ///
-/// `nomic-embed-text` accepts roughly 8192 tokens; at a conservative ~4 chars per
-/// token that is ~32k chars. We truncate deterministically rather than fail so
-/// capture never breaks on an overlong document (design D12, mirroring
-/// arch-helper's char cap).
-pub const MAX_INPUT_CHARS: usize = 8192 * 4;
+/// The 8192 in `nomic-embed-text`'s model card is its *architectural* max sequence
+/// length, not what ollama runs it at: ollama loads the model with its default
+/// `num_ctx` of 2048 tokens and returns a 500 (`the input length exceeds the context
+/// length`) past that. Passing `options.num_ctx` does not raise it for the embeddings
+/// endpoint.
+///
+/// Chars are a poor proxy for tokens — density swings the ratio several-fold — so this
+/// is sized for the *worst* case rather than the typical one. Measured against a live
+/// ollama: space-separated prose fails between 10k and 11k chars, but dense text with no
+/// spaces fails between 4k and 8k. At ~2 chars/token worst case, 2048 tokens is ~4k chars.
+///
+/// This is a backstop, not the main defence: an over-long *document* should never reach
+/// the embedder at all (`jkb-ingest` chunks it and derives the document's vector from its
+/// chunks). What this bound actually protects is the paths with no chunker in front of
+/// them — above all a long search query, which is embedded verbatim.
+pub const MAX_INPUT_CHARS: usize = 2048 * 2;
 
 /// Configuration for the ollama embedder.
 ///

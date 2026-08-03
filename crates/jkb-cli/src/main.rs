@@ -3868,8 +3868,22 @@ fn cmd_index(db: &Db) -> Result<()> {
         return Ok(());
     }
     println!("index: embedding {pending} pending item(s)…");
-    let embedded = pipeline.index_pending(db)?;
-    println!("index: embedded {embedded} item(s)");
+    let report = pipeline.index_pending(db)?;
+    println!(
+        "index: {} vector(s) written — {} embedded, {} derived from chunks",
+        report.total(),
+        report.embedded,
+        report.derived
+    );
+    if report.failed > 0 {
+        // Report rather than fail: the run wrote everything it could, and the skipped items
+        // stay pending so a later run retries them.
+        eprintln!(
+            "index: {} item(s) skipped; rerun to retry. first error: {}",
+            report.failed,
+            report.first_error.as_deref().unwrap_or("(none recorded)")
+        );
+    }
     Ok(())
 }
 

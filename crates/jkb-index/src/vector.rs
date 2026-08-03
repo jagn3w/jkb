@@ -151,6 +151,47 @@ impl VectorIndexer {
         Ok(())
     }
 
+    /// The stored vectors for `ids`, as an `item_id -> embedding` map. Ids with no vector
+    /// are absent. Returns empty if no vec table exists yet.
+    ///
+    /// Reading vectors back out is what lets a parent item derive its vector from its
+    /// children instead of from a truncated copy of its own text — `jkb-ingest` averages a
+    /// document's chunk vectors rather than embedding the first few thousand characters of
+    /// a document that may be a hundred times that long.
+    ///
+    /// # Errors
+    /// Returns [`crate::Error`] if a statement fails or a stored blob is not a whole
+    /// number of `f32`s of the table's dimension.
+    pub fn vectors_for(
+        &self,
+        conn: &Connection,
+        ids: &[ItemId],
+    ) -> Result<std::collections::HashMap<ItemId, Vec<f32>>> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() || !self.table_exists(conn)? {
+            return Ok(out);
+        }
+        // Placeholders are generated from a count; the ids themselves are bound.
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT item_id, embedding FROM {} WHERE item_id IN ({placeholders})",
+            self.table
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(ids.iter().map(|i| i.get())),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )?;
+        for row in rows {
+            let (id, bytes) = row?;
+            out.insert(ItemId::new(id), bytes_to_embedding(&bytes, self.dim)?);
+        }
+        Ok(out)
+    }
+
     /// K-nearest-neighbour search for `query`, returning up to `k` `(item_id,
     /// distance)` pairs nearest-first. Returns empty if no vec table exists yet.
     ///
@@ -306,9 +347,40 @@ fn embedding_to_bytes(v: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// Decode a little-endian `f32` blob written by [`embedding_to_bytes`], validating that it
+/// is a whole number of floats of the expected dimension — a short or misaligned blob means
+/// the table and the catalog disagree, which must surface rather than yield a silent
+/// half-vector.
+fn bytes_to_embedding(bytes: &[u8], dim: usize) -> Result<Vec<f32>> {
+    if bytes.len() != dim * 4 {
+        return Err(TypesError::Validation(format!(
+            "stored embedding is {} bytes, expected {} ({dim} x f32)",
+            bytes.len(),
+            dim * 4
+        ))
+        .into());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{embedding_to_bytes, register};
+    use super::{bytes_to_embedding, embedding_to_bytes, register};
+
+    #[test]
+    fn embedding_bytes_round_trip_and_reject_a_wrong_length_blob() {
+        let v = vec![0.5_f32, -1.25, 0.0, 3.5];
+        let bytes = embedding_to_bytes(&v);
+        assert_eq!(bytes_to_embedding(&bytes, 4).unwrap(), v);
+        // A blob that is not exactly dim x f32 means the table and catalog disagree; that
+        // must surface rather than yield a silent half-vector.
+        assert!(bytes_to_embedding(&bytes, 8).is_err());
+        assert!(bytes_to_embedding(&bytes[..7], 4).is_err());
+    }
+
     use rusqlite::Connection;
 
     #[test]
