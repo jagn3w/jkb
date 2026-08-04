@@ -714,6 +714,15 @@ for (const rep of reports.filter(Boolean)) {
 }
 log(`${raw.length} raw finding(s) from ${reports.filter(Boolean).length}/${reviewers.length} reviewers`)
 
+// Order by severity BEFORE deduplicating or capping. Both of those keep whatever comes first,
+// and arrival order is reviewer order — which is arbitrary. Left unsorted, collapsing a
+// duplicate keeps whichever reviewer happened to run first rather than the graver reading of
+// the same defect, and the verify cap spends its budget on an early reviewer's nits while a
+// later reviewer's must-fix goes unverified.
+const SEV_RANK = { 'must-fix': 0, concern: 1, nit: 2 }
+const bySeverityFirst = (a, b) => (SEV_RANK[a.severity] ?? 3) - (SEV_RANK[b.severity] ?? 3)
+raw.sort(bySeverityFirst)
+
 // Deterministic dedup: same file and line, or a summary already seen. Near-duplicates that
 // survive this are merged by the ranking pass, which can read them together and judge.
 const seen = new Set()
@@ -727,7 +736,7 @@ const deduped = raw.filter((f) => {
 })
 if (deduped.length !== raw.length) log(`${raw.length - deduped.length} exact duplicate(s) collapsed`)
 if (deduped.length === 0) {
-  return { findings: [], reviewers: reviewers.length, raw: 0, refuted: 0, note: 'no findings' }
+  return { findings: [], reviewers: reviewers.length, raw: raw.length, refuted: 0, note: 'no findings' }
 }
 
 // VERIFY. Each finding faces SKEPTICS fresh skeptics with different angles; it survives on a
@@ -804,14 +813,10 @@ if (survivors.length === 0) {
 // RANK. One pass over all survivors together: merge near-duplicates and put severity on a
 // single scale, which no individual finder could do (design D37.4).
 phase('Rank')
-const RANK_ORDER = { 'must-fix': 0, concern: 1, nit: 2 }
 // The fallback is a real ordering, not the arrival order. The ranking agent is one API call
 // away from failing (it did, on the first full run, to a session limit), and handing back an
 // unsorted list makes a review look uncalibrated when only its last step was lost.
-const bySeverity = (list, note) => ({
-  findings: [...list].sort((a, b) => (RANK_ORDER[a.severity] ?? 3) - (RANK_ORDER[b.severity] ?? 3)),
-  note,
-})
+const bySeverity = (list, note) => ({ findings: [...list].sort(bySeverityFirst), note })
 const ranked =
   EFFORT === 'low'
     ? bySeverity(survivors, 'ranking pass skipped at low effort; sorted by severity, not merged')
