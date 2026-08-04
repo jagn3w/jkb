@@ -854,10 +854,13 @@ const judged = await parallel(
       ).then((rest) => ({ votes: [v1, ...rest].filter(Boolean), stage1: v1 }))
     }).then(({ votes }) => {
       const real = votes
-      // A skeptic that died counts as no opinion; with none surviving, keep the finding and
-      // let the human judge rather than dropping it silently.
+      // A skeptic that died counts as no opinion; with none surviving, keep the finding and let
+      // the human judge rather than dropping it silently — but SAY SO. An unchecked finding
+      // that presents identically to a verified one is the same dishonesty as reporting a
+      // crashed scout as an empty diff: the reader cannot tell which claims were tested.
       const stood = real.filter((v) => !v.refuted)
       const survives = real.length === 0 || stood.length >= Math.ceil(real.length / 2)
+      const unchecked = real.length === 0
       // Carry what the surviving skeptics verified into the finding. A skeptic that fails to
       // refute still routinely corrects one — narrows its scope, disproves a supporting claim,
       // or says the severity is overstated — and that correction is the best evidence in the
@@ -866,6 +869,7 @@ const judged = await parallel(
       const enriched = {
         ...f,
         skeptics: stood.map((v) => v.reason).filter(Boolean).join(' || ').slice(0, 1200),
+        ...(unchecked ? { unverified: true } : {}),
       }
       return { finding: enriched, survives, votes: real }
     })
