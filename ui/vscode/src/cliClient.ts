@@ -70,15 +70,11 @@ export class CliJkbClient implements JkbClient {
   constructor(private readonly cfg: CliConfig) {}
 
   async listChildren(ref: NodeRef | null, opts?: ListOptions): Promise<TreeChild[]> {
-    // A namespace expands to `jkb ls`; a task expands to its subtasks. Both commands emit
-    // the same `{children}` shape, so the two node kinds cost a different command rather
-    // than a different model.
-    const args =
-      ref && ref.kind === "item"
-        ? ["task", "subtasks", ref.uid]
-        : ref
-          ? ["ls", ref.path]
-          : ["ls"];
+    // Containment is a behaviour, not a node kind: `jkb ls` lists the children of a pure
+    // namespace or of a parent task alike, so the client passes the node's address and does
+    // not branch. A node that contains nothing is never asked (see the tree's hasChildren
+    // guard).
+    const args = ref ? ["ls", ref.kind === "item" ? ref.uid : ref.path] : ["ls"];
     if (opts?.includeTerminal) args.push("--all");
     const out = await this.json<{ children: RawChild[] }>(args);
     return out.children.map(toTreeChild);

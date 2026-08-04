@@ -1532,11 +1532,59 @@ fn item_label(meta: &item::ItemMeta) -> String {
 /// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
 /// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
 /// tasks are hidden unless `all`.
+/// The children of a parent task, as [`Child`] rows — the container behaviour a task takes
+/// on when it has subtasks.
+fn subtask_children(
+    conn: &rusqlite::Connection,
+    parent: jkb_types::ItemId,
+    all: bool,
+) -> jkb_core::Result<Vec<Child>> {
+    let rows: Vec<_> = task::subtasks(conn, parent)?
+        .into_iter()
+        .filter(|t| all || !matches!(t.status.as_deref(), Some("done" | "cancelled")))
+        .collect();
+    let ids: Vec<_> = rows.iter().map(|t| t.id).collect();
+    let counts = task::subtask_counts(conn, &ids)?;
+    Ok(rows
+        .into_iter()
+        .map(|t| {
+            let subtasks = counts.get(&t.id).copied();
+            Child {
+                kind: "task".to_owned(),
+                reference: t.uid,
+                label: t.title.unwrap_or_default(),
+                // Nesting is recursive: a child that is itself a parent contains in turn.
+                has_children: subtasks.is_some_and(|(total, _)| total > 0),
+                status: t.status,
+                priority: t.priority,
+                leaf_count: None,
+                leaf_kinds: None,
+                ns_type: None,
+                ns_type_about: None,
+                chunk_count: None,
+                subtasks,
+                updated: None,
+            }
+        })
+        .collect())
+}
+
 fn list_children(
     conn: &rusqlite::Connection,
     path: Option<&str>,
     all: bool,
 ) -> jkb_core::Result<Vec<Child>> {
+    // "Container" is a behaviour, not a node kind. A pure namespace is a node that ONLY
+    // contains; a parent task both is a task and contains its subtasks. So `ls` resolves a
+    // namespace first (the common case, and the historical meaning) and falls back to an
+    // item uid — one command lists the children of anything that has any.
+    if let Some(p) = path {
+        if ns::get(conn, p)?.is_none() {
+            if let Some(id) = item::id_for_uid(conn, p)? {
+                return subtask_children(conn, id, all);
+            }
+        }
+    }
     let mut out = Vec::new();
 
     let ns_children = match path {
@@ -1588,6 +1636,17 @@ fn list_children(
             // One grouped query for every document's chunk count, not one per document.
             let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
             let subtask_counts = task::subtask_counts(conn, &placed)?;
+            // A subtask is reached by expanding its parent, so listing it here as well
+            // would show it twice. Hide it ONLY when its parent is in this same listing:
+            // a subtask whose parent lives elsewhere has no row to expand, and hiding it
+            // unconditionally would make it unreachable rather than merely un-duplicated.
+            let visible: std::collections::HashSet<i64> = placed.iter().map(|i| i.get()).collect();
+            let parents = task::parents_of(conn, &placed)?;
+            let nested_here = |id: ItemId| {
+                parents
+                    .get(&id)
+                    .is_some_and(|ps| ps.iter().any(|p| visible.contains(&p.get())))
+            };
             for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
@@ -1602,6 +1661,9 @@ fn list_children(
                 // units, not content. Listing them doubles every ingested document under its
                 // own fragments. Their count rides on the document instead (below).
                 if !all && meta.kind == KIND_CHUNK {
+                    continue;
+                }
+                if nested_here(item_id) {
                     continue;
                 }
                 let subtasks = subtask_counts.get(&item_id).copied();
@@ -1949,7 +2011,9 @@ fn tree_nodes(
 ) -> jkb_core::Result<Vec<TreeNode>> {
     let mut out = Vec::new();
     for child in list_children(conn, path, all)? {
-        let descend = child.kind == "namespace" && depth_left != Some(0);
+        // Descend into any container, not just namespaces — otherwise de-duplicating a
+        // subtask out of its namespace listing would make it unreachable in `tree`.
+        let descend = child.has_children && depth_left != Some(0);
         let children = if descend {
             tree_nodes(conn, Some(&child.reference), all, depth_left.map(|d| d - 1))?
         } else {
@@ -3738,40 +3802,10 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
 /// Sharing the shape is the point: the tree expands a namespace and a parent task with one
 /// parser, so nesting subtasks costs the UI a different *command*, not a different model.
 fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
+    // A thin alias over the container read: `jkb ls <task-uid>` is the same call. It exists
+    // for discoverability from the task surface, not as a second implementation.
     let id = resolve_task_uid(db, uid)?;
-    // One read: the children, then their own subtask counts so nesting is recursive rather
-    // than one level deep. `TaskRow` already carries the id, so no uid round-trips.
-    let children = db.read(move |conn| {
-        let rows: Vec<_> = task::subtasks(conn, id)?
-            .into_iter()
-            .filter(|t| all || !matches!(t.status.as_deref(), Some("done" | "cancelled")))
-            .collect();
-        let ids: Vec<_> = rows.iter().map(|t| t.id).collect();
-        let counts = task::subtask_counts(conn, &ids)?;
-        Ok(rows
-            .into_iter()
-            .map(|t| {
-                let subtasks = counts.get(&t.id).copied();
-                Child {
-                    kind: "task".to_owned(),
-                    reference: t.uid,
-                    label: t.title.unwrap_or_default(),
-                    // A child that is itself a parent expands in turn.
-                    has_children: subtasks.is_some_and(|(total, _)| total > 0),
-                    status: t.status,
-                    priority: t.priority,
-                    leaf_count: None,
-                    leaf_kinds: None,
-                    ns_type: None,
-                    ns_type_about: None,
-                    chunk_count: None,
-                    subtasks,
-                    updated: None,
-                }
-            })
-            .collect::<Vec<_>>())
-    })?;
-
+    let children = db.read(move |conn| subtask_children(conn, id, all))?;
     if json {
         let arr: Vec<_> = children.iter().map(Child::to_json).collect();
         println!(

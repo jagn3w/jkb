@@ -2593,3 +2593,75 @@ fn ls_marks_a_parent_expandable_and_task_subtasks_lists_its_children() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["children"].as_array().unwrap().len(), 2);
 }
+
+/// Containment is a behaviour, not a node kind: `jkb ls` lists the children of a pure
+/// namespace and of a parent task alike, and a subtask appears exactly once — under its
+/// parent, not also as a sibling in the namespace they share.
+#[test]
+fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "big feature"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let parent = v[0]["uid"].as_str().unwrap().to_owned();
+    for child in ["part one", "part two"] {
+        jkb(&db)
+            .args(["task", "add", child, "--under", &parent])
+            .assert()
+            .success();
+    }
+
+    // The namespace lists the parent only — the subtasks are reached by expanding it.
+    let out = jkb(&db)
+        .args(["--json", "ls", "tasks/inbox"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["children"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a subtask must not also be a sibling: {rows:?}"
+    );
+    assert_eq!(rows[0]["ref"], parent.as_str());
+    assert_eq!(rows[0]["has_children"], true);
+
+    // The SAME command lists a parent task's children.
+    let out = jkb(&db).args(["--json", "ls", &parent]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kids = v["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    assert!(kids.iter().all(|k| k["kind"] == "task"));
+
+    // `tree` descends into any container, so de-duplicating must not hide them there.
+    jkb(&db)
+        .args(["tree", "tasks/inbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("part one"))
+        .stdout(predicate::str::contains("part two"));
+
+    // A subtask homed OUTSIDE its parent's namespace still shows in its own namespace —
+    // hiding it there would make it unreachable, not merely un-duplicated.
+    jkb(&db)
+        .args(["task", "add", "elsewhere", "--under", &parent, "+other/ns"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--json", "ls", "other/ns"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["children"].as_array().unwrap().len(),
+        1,
+        "a subtask whose parent is not in this listing must remain visible"
+    );
+}

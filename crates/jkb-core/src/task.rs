@@ -366,6 +366,42 @@ pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
         .map_err(Into::into)
 }
 
+/// The `parent_of` parents of each of `children`, as `child -> parents`; children with no
+/// parent are absent.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn parents_of(
+    conn: &Connection,
+    children: &[ItemId],
+) -> Result<std::collections::HashMap<ItemId, Vec<ItemId>>> {
+    let mut out: std::collections::HashMap<ItemId, Vec<ItemId>> = std::collections::HashMap::new();
+    if children.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = (1..=children.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Placeholders are generated from a count; every value is bound.
+    let sql = format!(
+        "SELECT dst_item_id, src_item_id FROM edges
+          WHERE type = 'parent_of' AND dst_item_id IN ({placeholders})"
+    );
+    let params: Vec<rusqlite::types::Value> = children.iter().map(|c| c.get().into()).collect();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (child, parent) = row?;
+        out.entry(ItemId::new(child))
+            .or_default()
+            .push(ItemId::new(parent));
+    }
+    Ok(out)
+}
+
 /// Subtask counts for many parents at once, as `parent -> (total, open)`; parents with no
 /// subtasks are absent.
 ///
