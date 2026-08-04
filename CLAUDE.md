@@ -498,6 +498,18 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   `jkb related` traversal, `derived_from` as provenance for search's `source_document`, and
   the `tasks` serializer's indentation + three-way merge `Sig`. `task::add_subtask` writes
   edge and placement in one call so they cannot drift.
+- **Containment is a relationship between items (D35).** `containment(child_item_id PRIMARY
+  KEY, parent_item_id, position)` — its own table, keyed on the **child**, because "X is
+  contained by Y" is a property of X and not of one of X's several placements (a home plus
+  the `tasks/<repo>` mirror). The PK makes *at most one container* structural. `placements`
+  is untouched and still carries `namespace_id`, so `ns:tasks/**` scoping still finds a
+  contained item: listing and scoping ask different questions and both stay right. A
+  contained item is listed under its container **and nowhere else**, even when homed in
+  another namespace — never unreachable, since expanding the container always reaches it.
+  Rejected alternatives are recorded in the design: a namespace per parent (derives a path
+  from a mutable title — the identity failure the sync prose bug already taught, and it grows
+  the organizational tree with content) and `placements.parent_item_id` (stores one fact once
+  per placement).
 - **Containment is a behaviour, not a node kind.** A *pure namespace* is a node that only
   contains; a parent task both **is** a task and **contains** its subtasks; a document
   **contains** its chunks. So `jkb ls <path-or-uid>` is the one container read — it resolves

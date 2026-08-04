@@ -1543,8 +1543,8 @@ fn contained_children(
     parent: jkb_types::ItemId,
     all: bool,
 ) -> jkb_core::Result<Vec<Child>> {
-    let ids = placement::items_under(conn, parent)?;
-    let subtask_counts = task::subtask_counts(conn, &ids)?;
+    let ids = jkb_core::containment::children(conn, parent)?;
+    let subtask_counts = jkb_core::containment::child_counts(conn, &ids)?;
     let chunk_counts = item::derived_kind_counts(conn, &ids, KIND_CHUNK)?;
     let mut out = Vec::new();
     for id in ids {
@@ -1645,7 +1645,7 @@ fn list_children(
             let placed = placement::items_directly_in(conn, ns_id)?;
             // One grouped query for every document's chunk count, not one per document.
             let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
-            let subtask_counts = task::subtask_counts(conn, &placed)?;
+            let subtask_counts = jkb_core::containment::child_counts(conn, &placed)?;
             for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;

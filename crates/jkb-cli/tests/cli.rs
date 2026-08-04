@@ -2664,8 +2664,9 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
         .stdout(predicate::str::contains("part one"))
         .stdout(predicate::str::contains("part two"));
 
-    // A subtask homed OUTSIDE its parent's namespace still shows in its own namespace —
-    // hiding it there would make it unreachable, not merely un-duplicated.
+    // Containment is a property of the ITEM, not of one of its placements: a subtask homed
+    // in a different namespace is listed under its parent and nowhere else. It lives inside
+    // the parent; the namespace placement serves scoping and search, not listing.
     jkb(&db)
         .args(["task", "add", "elsewhere", "--under", &parent, "+other/ns"])
         .assert()
@@ -2677,7 +2678,22 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         v["children"].as_array().unwrap().len(),
-        1,
-        "a subtask whose parent is not in this listing must remain visible"
+        0,
+        "a contained item is listed under its container, not in its namespace"
     );
+
+    // …but it must never become unreachable. It is listed under its parent, and namespace
+    // scoping still finds it — which is exactly why the placement is kept alongside.
+    let out = jkb(&db).args(["--json", "ls", &parent]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["children"].as_array().unwrap().len(),
+        3,
+        "reachable by expanding its container"
+    );
+    jkb(&db)
+        .args(["--global", "query", "kind:task ns:other/ns"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("elsewhere"));
 }

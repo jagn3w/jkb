@@ -336,35 +336,11 @@ pub fn add_subtask(
     parent: ItemId,
     child: ItemId,
 ) -> Result<()> {
-    // The edge records the relationship (and refuses a cycle); the placement records where
-    // the child lives. Both in one call so they cannot drift — this is the only supported
-    // way to make a subtask.
+    // The edge records the relationship and refuses a cycle; the containment row records
+    // that the child lives inside the parent. Both here so they cannot drift — this is the
+    // only supported way to make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
-
-    // Contain the child in whichever namespace it shares with its parent. A task mirrored
-    // into `tasks/<repo>` keeps its flat row there deliberately: that mirror is an index of
-    // every task, and nesting inside it would hide subtasks from the view built to list
-    // them all (design D35).
-    let shared: Vec<(i64, i64)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT c.namespace_id, c.position FROM placements c
-               JOIN placements p ON p.namespace_id = c.namespace_id
-              WHERE c.item_id = ?1 AND p.item_id = ?2",
-        )?;
-        let rows = stmt.query_map([child.get(), parent.get()], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for (ns, position) in shared {
-        conn.prepare_cached(
-            "UPDATE placements SET parent_item_id = ?3
-              WHERE item_id = ?1 AND namespace_id = ?2",
-        )?
-        .execute(params![child.get(), ns, parent.get()])?;
-        let _ = position;
-    }
-    Ok(())
+    crate::containment::contain(conn, meta, child, parent, 0)
 }
 
 /// The direct subtasks of `parent`, ordered by priority (asc, nulls last) then uid — the
@@ -373,12 +349,12 @@ pub fn add_subtask(
 /// # Errors
 /// Returns an error if the query fails.
 pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
-    // Reads the PLACEMENT, not the edge: containment is where a node lives (design D35).
+    // Reads containment, not the edge: containment is where a node lives (design D35).
     let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT i.id, i.uid, i.content, i.status, i.priority, i.due
-           FROM placements p JOIN items i ON i.id = p.item_id
-          WHERE p.parent_item_id = ?1
-          ORDER BY i.priority IS NULL, i.priority, i.uid",
+        "SELECT i.id, i.uid, i.content, i.status, i.priority, i.due
+           FROM containment c JOIN items i ON i.id = c.child_item_id
+          WHERE c.parent_item_id = ?1
+          ORDER BY c.position, i.priority IS NULL, i.priority, i.uid",
     )?;
     let rows = stmt.query_map([parent.get()], |r| {
         Ok(TaskRow {
@@ -394,88 +370,6 @@ pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
         .map_err(Into::into)
 }
 
-/// The `parent_of` parents of each of `children`, as `child -> parents`; children with no
-/// parent are absent.
-///
-/// # Errors
-/// Returns an error if the query fails.
-pub fn parents_of(
-    conn: &Connection,
-    children: &[ItemId],
-) -> Result<std::collections::HashMap<ItemId, Vec<ItemId>>> {
-    let mut out: std::collections::HashMap<ItemId, Vec<ItemId>> = std::collections::HashMap::new();
-    if children.is_empty() {
-        return Ok(out);
-    }
-    let placeholders = (1..=children.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Placeholders are generated from a count; every value is bound.
-    let sql = format!(
-        "SELECT dst_item_id, src_item_id FROM edges
-          WHERE type = 'parent_of' AND dst_item_id IN ({placeholders})"
-    );
-    let params: Vec<rusqlite::types::Value> = children.iter().map(|c| c.get().into()).collect();
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (child, parent) = row?;
-        out.entry(ItemId::new(child))
-            .or_default()
-            .push(ItemId::new(parent));
-    }
-    Ok(out)
-}
-
-/// Subtask counts for many parents at once, as `parent -> (total, open)`; parents with no
-/// subtasks are absent.
-///
-/// Batched because the tree asks this for every item it lists — one query per row is the
-/// N+1 the listing already avoids for namespace leaf counts.
-///
-/// # Errors
-/// Returns an error if the query fails.
-pub fn subtask_counts(
-    conn: &Connection,
-    parents: &[ItemId],
-) -> Result<std::collections::HashMap<ItemId, (i64, i64)>> {
-    let mut out = std::collections::HashMap::new();
-    if parents.is_empty() {
-        return Ok(out);
-    }
-    let placeholders = (1..=parents.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Placeholders are generated from a count; every value is bound.
-    let sql = format!(
-        "SELECT parent, COUNT(*), SUM(open) FROM (
-             SELECT DISTINCT p.parent_item_id AS parent, c.id AS child,
-                    CASE WHEN c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
-                         THEN 1 ELSE 0 END AS open
-               FROM placements p JOIN items c ON c.id = p.item_id
-              WHERE p.parent_item_id IN ({placeholders})
-         ) GROUP BY parent"
-    );
-    let params: Vec<rusqlite::types::Value> = parents.iter().map(|p| p.get().into()).collect();
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, total, open) = row?;
-        out.insert(ItemId::new(id), (total, open));
-    }
-    Ok(out)
-}
-
 /// Whether every subtask of `parent` has reached a terminal status (`done`/`cancelled`).
 /// True when there are no subtasks at all — a leaf is trivially complete.
 ///
@@ -487,9 +381,9 @@ pub fn subtask_counts(
 pub fn subtasks_all_terminal(conn: &Connection, parent: ItemId) -> Result<bool> {
     let open: i64 = conn
         .prepare_cached(
-            "SELECT count(*) FROM edges e JOIN items c ON c.id = e.dst_item_id
-              WHERE e.src_item_id = ?1 AND e.type = 'parent_of'
-                AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'",
+            "SELECT count(*) FROM containment c JOIN items i ON i.id = c.child_item_id
+              WHERE c.parent_item_id = ?1
+                AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'",
         )?
         .query_row([parent.get()], |r| r.get(0))?;
     Ok(open == 0)

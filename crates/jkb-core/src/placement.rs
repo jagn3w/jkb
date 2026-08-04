@@ -31,56 +31,16 @@ pub fn place(
     role: PlacementRole,
     position: i64,
 ) -> Result<()> {
-    place_under(conn, meta, item, namespace, None, role, position)
-}
-
-/// Place `item` in `namespace`, **contained by** `parent` (design D35).
-///
-/// A placement says where a node lives: in this namespace, inside this container. `None`
-/// puts it directly in the namespace, which is what [`place`] does. Listing a container is
-/// then one query over one table rather than a per-relationship read plus a filter.
-///
-/// `namespace` is still required and still meaningful — namespace scoping (`ns:tasks/**`)
-/// resolves through it, so a contained item must remain findable by scope. Containment adds
-/// *where inside* the namespace, it does not replace *which* namespace.
-///
-/// # Errors
-/// Returns a validation error if the namespace's type does not accept the item's kind;
-/// otherwise an error if a statement or the changelog append fails.
-pub fn place_under(
-    conn: &Connection,
-    meta: &WriteMeta,
-    item: ItemId,
-    namespace: NamespaceId,
-    parent: Option<ItemId>,
-    role: PlacementRole,
-    position: i64,
-) -> Result<()> {
     crate::nstype::check_placement(conn, item, namespace)?;
-    // A node cannot contain itself. Deeper cycles are refused by `edge::link` when the
-    // relationship is recorded; this is the one case a placement can create on its own.
-    if parent == Some(item) {
-        return Err(
-            jkb_types::Error::Validation(format!("item {item} cannot contain itself")).into(),
-        );
-    }
     let rowid: i64 = conn
         .prepare_cached(
-            "INSERT INTO placements (item_id, namespace_id, role, position, parent_item_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(item_id, namespace_id, role) DO UPDATE SET
-                 position = excluded.position,
-                 parent_item_id = excluded.parent_item_id
+            "INSERT INTO placements (item_id, namespace_id, role, position)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(item_id, namespace_id, role) DO UPDATE SET position = excluded.position
              RETURNING rowid",
         )?
         .query_row(
-            params![
-                item.get(),
-                namespace.get(),
-                role.as_str(),
-                position,
-                parent.map(ItemId::get)
-            ],
+            params![item.get(), namespace.get(), role.as_str(), position],
             |row| row.get(0),
         )?;
     let after = json!({
@@ -88,7 +48,6 @@ pub fn place_under(
         "namespace_id": namespace.get(),
         "role": role.as_str(),
         "position": position,
-        "parent_item_id": parent.map(ItemId::get),
     });
     changelog::append(
         conn,
@@ -195,40 +154,20 @@ pub fn unplace(
 /// ordered by position.
 ///
 /// Distinct from [`items_in`], which returns everything placed in the namespace including
-/// contained nodes. Both are correct for their question: a subtask *is* in `tasks/jkb`
-/// (which is why `ns:tasks/**` scoping finds it), but it is *listed* under its parent, not
-/// beside it.
+/// contained nodes. Both answer their own question correctly: a subtask *is* in `tasks/jkb`
+/// (which is why `ns:tasks/**` scoping finds it), but it is *listed* under its container,
+/// not beside it.
 ///
 /// # Errors
 /// Returns an error if the query fails.
 pub fn items_directly_in(conn: &Connection, namespace: NamespaceId) -> Result<Vec<ItemId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT item_id, position FROM placements
-          WHERE namespace_id = ?1 AND parent_item_id IS NULL
-          ORDER BY position, item_id",
+        "SELECT p.item_id FROM placements p
+          WHERE p.namespace_id = ?1
+            AND NOT EXISTS (SELECT 1 FROM containment c WHERE c.child_item_id = p.item_id)
+          ORDER BY p.position, p.item_id",
     )?;
     let rows = stmt.query_map([namespace.get()], |r| r.get::<_, i64>(0))?;
-    Ok(rows
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(ItemId::new)
-        .collect())
-}
-
-/// The items **contained by** `parent`, in placement order — the container behaviour a
-/// node takes on (design D35).
-///
-/// One query over one table, whatever the container is: a task's subtasks and a document's
-/// chunks are the same read, because containment is recorded the same way for both.
-///
-/// # Errors
-/// Returns an error if the query fails.
-pub fn items_under(conn: &Connection, parent: ItemId) -> Result<Vec<ItemId>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT item_id, position FROM placements
-          WHERE parent_item_id = ?1 ORDER BY position, item_id",
-    )?;
-    let rows = stmt.query_map([parent.get()], |r| r.get::<_, i64>(0))?;
     Ok(rows
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()

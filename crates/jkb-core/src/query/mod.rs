@@ -154,8 +154,8 @@ pub struct Query {
 /// task had a subtask.
 const SUBTASK_CLAUSE: &str = "
                  AND NOT EXISTS (
-                     SELECT 1 FROM edges pe JOIN items c ON pe.dst_item_id = c.id
-                     WHERE pe.src_item_id = i.id AND pe.type = 'parent_of'
+                     SELECT 1 FROM containment ct JOIN items c ON c.id = ct.child_item_id
+                     WHERE ct.parent_item_id = i.id
                        AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
                  )";
 

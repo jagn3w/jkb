@@ -14,6 +14,7 @@ mod store;
 pub mod binding;
 pub mod blob;
 pub mod claim;
+pub mod containment;
 pub mod dsl;
 pub mod edge;
 pub mod investigation;

@@ -271,18 +271,17 @@ impl Pipeline {
                             },
                         )?;
                         edge::link(conn, meta, chunk_id, document, EdgeType::DerivedFrom, None)?;
-                        // The document CONTAINS its chunks (design D35): the placement
-                        // records that, so listing the document is one query and the chunks
-                        // never appear as flat siblings beside it.
-                        placement::place_under(
+                        placement::place(
                             conn,
                             meta,
                             chunk_id,
                             ns_id,
-                            Some(document),
                             PlacementRole::Chunk,
                             position,
                         )?;
+                        // The document CONTAINS its chunks (design D35), so they are listed
+                        // by expanding it rather than as flat siblings beside it.
+                        jkb_core::containment::contain(conn, meta, chunk_id, document, position)?;
                         items.push((chunk_id, chunk.clone()));
                     }
 
