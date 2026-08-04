@@ -271,11 +271,15 @@ impl Pipeline {
                             },
                         )?;
                         edge::link(conn, meta, chunk_id, document, EdgeType::DerivedFrom, None)?;
-                        placement::place(
+                        // The document CONTAINS its chunks (design D35): the placement
+                        // records that, so listing the document is one query and the chunks
+                        // never appear as flat siblings beside it.
+                        placement::place_under(
                             conn,
                             meta,
                             chunk_id,
                             ns_id,
+                            Some(document),
                             PlacementRole::Chunk,
                             position,
                         )?;

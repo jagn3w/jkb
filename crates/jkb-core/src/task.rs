@@ -336,7 +336,34 @@ pub fn add_subtask(
     parent: ItemId,
     child: ItemId,
 ) -> Result<()> {
+    // The edge records the relationship (and refuses a cycle); the placement records where
+    // the child lives. Both in one call so they cannot drift — this is the only supported
+    // way to make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
+
+    // Contain the child in whichever namespace it shares with its parent. A task mirrored
+    // into `tasks/<repo>` keeps its flat row there deliberately: that mirror is an index of
+    // every task, and nesting inside it would hide subtasks from the view built to list
+    // them all (design D35).
+    let shared: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT c.namespace_id, c.position FROM placements c
+               JOIN placements p ON p.namespace_id = c.namespace_id
+              WHERE c.item_id = ?1 AND p.item_id = ?2",
+        )?;
+        let rows = stmt.query_map([child.get(), parent.get()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (ns, position) in shared {
+        conn.prepare_cached(
+            "UPDATE placements SET parent_item_id = ?3
+              WHERE item_id = ?1 AND namespace_id = ?2",
+        )?
+        .execute(params![child.get(), ns, parent.get()])?;
+        let _ = position;
+    }
     Ok(())
 }
 
@@ -346,10 +373,11 @@ pub fn add_subtask(
 /// # Errors
 /// Returns an error if the query fails.
 pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
+    // Reads the PLACEMENT, not the edge: containment is where a node lives (design D35).
     let mut stmt = conn.prepare_cached(
-        "SELECT i.id, i.uid, i.content, i.status, i.priority, i.due
-           FROM edges e JOIN items i ON i.id = e.dst_item_id
-          WHERE e.src_item_id = ?1 AND e.type = 'parent_of'
+        "SELECT DISTINCT i.id, i.uid, i.content, i.status, i.priority, i.due
+           FROM placements p JOIN items i ON i.id = p.item_id
+          WHERE p.parent_item_id = ?1
           ORDER BY i.priority IS NULL, i.priority, i.uid",
     )?;
     let rows = stmt.query_map([parent.get()], |r| {
@@ -424,13 +452,13 @@ pub fn subtask_counts(
         .join(", ");
     // Placeholders are generated from a count; every value is bound.
     let sql = format!(
-        "SELECT e.src_item_id,
-                COUNT(*),
-                SUM(CASE WHEN c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
-                         THEN 1 ELSE 0 END)
-           FROM edges e JOIN items c ON c.id = e.dst_item_id
-          WHERE e.type = 'parent_of' AND e.src_item_id IN ({placeholders})
-          GROUP BY e.src_item_id"
+        "SELECT parent, COUNT(*), SUM(open) FROM (
+             SELECT DISTINCT p.parent_item_id AS parent, c.id AS child,
+                    CASE WHEN c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
+                         THEN 1 ELSE 0 END AS open
+               FROM placements p JOIN items c ON c.id = p.item_id
+              WHERE p.parent_item_id IN ({placeholders})
+         ) GROUP BY parent"
     );
     let params: Vec<rusqlite::types::Value> = parents.iter().map(|p| p.get().into()).collect();
     let mut stmt = conn.prepare_cached(&sql)?;

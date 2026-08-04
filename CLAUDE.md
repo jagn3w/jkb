@@ -484,6 +484,20 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
 - **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
   is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
   close costs one command, a wrong close buries unfinished work.
+- **Containment is a placement, not a derived view (D35).** `placements.parent_item_id`
+  (migration `V009`) says where a node lives: *in namespace N, contained by item P*. `NULL`
+  means directly in the namespace. Listing is then one query over one table —
+  `items_directly_in` for a namespace, `items_under` for a container — with **no filter, no
+  edge join and no de-duplication rule**. It previously simulated this at read time, placing
+  the child in its container's namespace and hiding it again on the way out.
+  `namespace_id` is deliberately kept alongside: `ns:tasks/**` scoping resolves through it,
+  so a contained item must stay findable by scope. `ON DELETE SET NULL`, never CASCADE —
+  deleting a container returns its children to the namespace rather than deleting their
+  placement rows, which would make them invisible rather than un-parented.
+- **The edges survive, carrying what a placement cannot** — `edge::link`'s cycle guard,
+  `jkb related` traversal, `derived_from` as provenance for search's `source_document`, and
+  the `tasks` serializer's indentation + three-way merge `Sig`. `task::add_subtask` writes
+  edge and placement in one call so they cannot drift.
 - **Containment is a behaviour, not a node kind.** A *pure namespace* is a node that only
   contains; a parent task both **is** a task and **contains** its subtasks; a document
   **contains** its chunks. So `jkb ls <path-or-uid>` is the one container read — it resolves

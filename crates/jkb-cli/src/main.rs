@@ -1532,75 +1532,48 @@ fn item_label(meta: &item::ItemMeta) -> String {
 /// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
 /// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
 /// tasks are hidden unless `all`.
-/// The children of any item that contains others — the container behaviour a node takes on.
+/// The children of any item that contains others — the container behaviour a node takes on
+/// (design D35).
 ///
-/// Two relationships qualify today, and they are different edges for good reason: a task
-/// *decomposes into* subtasks (`parent_of`, authored), while a document is *fragmented into*
-/// chunks (`derived_from`, generated and rebuildable). The tree does not care which — it
-/// asks a node for its children — so the difference stays here.
+/// One read for every container. A task's subtasks and a document's chunks are the same
+/// query because containment is recorded the same way for both: on the placement. Nothing
+/// here branches on what kind of node it is.
 fn contained_children(
     conn: &rusqlite::Connection,
     parent: jkb_types::ItemId,
     all: bool,
 ) -> jkb_core::Result<Vec<Child>> {
-    let chunks = item::derived_children(conn, parent, KIND_CHUNK)?;
-    if !chunks.is_empty() {
-        return Ok(chunks
-            .into_iter()
-            .map(|c| Child {
-                label: item_label(&c),
-                kind: c.kind,
-                reference: c.uid,
-                has_children: false,
-                status: c.status,
-                priority: c.priority,
-                leaf_count: None,
-                leaf_kinds: None,
-                ns_type: None,
-                ns_type_about: None,
-                chunk_count: None,
-                subtasks: None,
-                updated: Some(c.updated_at),
-            })
-            .collect());
+    let ids = placement::items_under(conn, parent)?;
+    let subtask_counts = task::subtask_counts(conn, &ids)?;
+    let chunk_counts = item::derived_kind_counts(conn, &ids, KIND_CHUNK)?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(meta) = item::get(conn, id)? else {
+            continue;
+        };
+        if !all && matches!(meta.status.as_deref(), Some("done" | "cancelled")) {
+            continue;
+        }
+        let subtasks = subtask_counts.get(&id).copied();
+        let chunks = chunk_counts.get(&id).copied().unwrap_or(0);
+        out.push(Child {
+            label: item_label(&meta),
+            kind: meta.kind,
+            reference: meta.uid,
+            // Containment nests: a child that contains in turn expands in turn.
+            has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
+            status: meta.status,
+            priority: meta.priority,
+            leaf_count: None,
+            leaf_kinds: None,
+            ns_type: None,
+            ns_type_about: None,
+            chunk_count: (chunks > 0).then_some(chunks),
+            subtasks,
+            updated: Some(meta.updated_at),
+        });
     }
-    subtask_children(conn, parent, all)
-}
-
-/// The children of a parent task, as [`Child`] rows.
-fn subtask_children(
-    conn: &rusqlite::Connection,
-    parent: jkb_types::ItemId,
-    all: bool,
-) -> jkb_core::Result<Vec<Child>> {
-    let rows: Vec<_> = task::subtasks(conn, parent)?
-        .into_iter()
-        .filter(|t| all || !matches!(t.status.as_deref(), Some("done" | "cancelled")))
-        .collect();
-    let ids: Vec<_> = rows.iter().map(|t| t.id).collect();
-    let counts = task::subtask_counts(conn, &ids)?;
-    Ok(rows
-        .into_iter()
-        .map(|t| {
-            let subtasks = counts.get(&t.id).copied();
-            Child {
-                kind: "task".to_owned(),
-                reference: t.uid,
-                label: t.title.unwrap_or_default(),
-                // Nesting is recursive: a child that is itself a parent contains in turn.
-                has_children: subtasks.is_some_and(|(total, _)| total > 0),
-                status: t.status,
-                priority: t.priority,
-                leaf_count: None,
-                leaf_kinds: None,
-                ns_type: None,
-                ns_type_about: None,
-                chunk_count: None,
-                subtasks,
-                updated: None,
-            }
-        })
-        .collect())
+    Ok(out)
 }
 
 fn list_children(
@@ -1666,27 +1639,13 @@ fn list_children(
         if let Some(ns_id) = ns::get(conn, p)? {
             // Any placement role: a `tasks/…` mirror surfaces the task even though its
             // primary home is elsewhere (the symbolic-link view).
-            let placed = placement::items_in(conn, ns_id, None)?;
+            // Directly placed only: a contained node is listed under its container, not
+            // beside it. It is still IN this namespace — `ns:` scoping finds it — which is
+            // exactly why the placement keeps both the namespace and the parent.
+            let placed = placement::items_directly_in(conn, ns_id)?;
             // One grouped query for every document's chunk count, not one per document.
             let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
             let subtask_counts = task::subtask_counts(conn, &placed)?;
-            // A contained node is reached by expanding its container, so listing it here
-            // as well would show it twice. Hide it ONLY when its container is in this same
-            // listing: one whose container lives elsewhere has no row to expand, and hiding
-            // it unconditionally would make it unreachable rather than un-duplicated.
-            //
-            // Both containment edges count — a subtask under its parent task, a chunk under
-            // its source document — because the duplicate is the same shape either way.
-            let visible: std::collections::HashSet<i64> = placed.iter().map(|i| i.get()).collect();
-            let parents = task::parents_of(conn, &placed)?;
-            let sources = item::derived_from(conn, &placed)?;
-            let nested_here = |id: ItemId| {
-                let contained_by = |m: &std::collections::HashMap<ItemId, Vec<ItemId>>| {
-                    m.get(&id)
-                        .is_some_and(|ps| ps.iter().any(|p| visible.contains(&p.get())))
-                };
-                contained_by(&parents) || contained_by(&sources)
-            };
             for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
@@ -1695,9 +1654,6 @@ fn list_children(
                 // ignored files, revealed only on explicit toggle.
                 let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
                 if !all && terminal {
-                    continue;
-                }
-                if nested_here(item_id) {
                     continue;
                 }
                 let subtasks = subtask_counts.get(&item_id).copied();
@@ -3841,7 +3797,7 @@ fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
     // A thin alias over the container read: `jkb ls <task-uid>` is the same call. It exists
     // for discoverability from the task surface, not as a second implementation.
     let id = resolve_task_uid(db, uid)?;
-    let children = db.read(move |conn| subtask_children(conn, id, all))?;
+    let children = db.read(move |conn| contained_children(conn, id, all))?;
     if json {
         let arr: Vec<_> = children.iter().map(Child::to_json).collect();
         println!(
