@@ -2315,11 +2315,12 @@ fn ls_labels_a_namespaces_own_type_but_not_an_inherited_one() {
         .stdout(predicate::str::contains("[tasks]").not());
 }
 
-/// Chunks are derived index units, not content: listing them buries each ingested document
-/// under its own fragments. They are hidden (and uncounted) by default, revealed by `--all`,
-/// and their number rides on the document they came from.
+/// Chunks are derived index units, not content: listing them flat buries each ingested
+/// document under its own fragments. A document *contains* them, so they are reached by
+/// expanding it, their number rides on the document, and they are left out of folder counts
+/// unless `--all`.
 #[test]
-fn ls_hides_chunks_by_default_and_counts_them_on_their_document() {
+fn ls_nests_chunks_under_their_document_and_counts_them_there() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let doc = dir.path().join("big.md");
@@ -2360,19 +2361,34 @@ fn ls_hides_chunks_by_default_and_counts_them_on_their_document() {
     assert!(docs["leaf_kinds"]["chunk"].is_null(), "{docs}");
     assert_eq!(docs["leaf_count"], 1);
 
-    // `--all` reveals them, in the listing and the counts alike.
+    // Chunks are reached by EXPANDING the document, not by a flag: the document is a
+    // container, so `ls <document-uid>` lists them in document order. They are never flat
+    // siblings, because that is the duplicate the containment model exists to prevent.
+    assert_eq!(
+        document["has_children"], true,
+        "a document with chunks expands"
+    );
+    let doc_uid = document["ref"].as_str().unwrap().to_owned();
+    let out = jkb(&db).args(["--json", "ls", &doc_uid]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed = v["children"].as_array().unwrap();
+    assert_eq!(i64::try_from(listed.len()).unwrap(), chunks);
+    assert!(listed.iter().all(|c| c["kind"] == "chunk"), "{listed:?}");
     let out = jkb(&db)
         .args(["--json", "ls", "repos/jkb/docs", "--all"])
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let shown = v["children"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|c| c["kind"] == "chunk")
-        .count();
-    assert_eq!(i64::try_from(shown).unwrap(), chunks);
+    assert!(
+        v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["kind"] != "chunk"),
+        "--all must not re-flatten chunks — they would then appear twice"
+    );
+    // `--all` still adds them to the per-folder counts, which is a separate question from
+    // where they are listed: a folder reading "55,553 chunk" is noise by default.
     let out = jkb(&db)
         .args(["--json", "ls", "repos/jkb", "-a"])
         .output()

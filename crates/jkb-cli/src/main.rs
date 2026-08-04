@@ -150,8 +150,8 @@ enum Command {
     Ls {
         /// The namespace whose children to list (default: top-level namespaces).
         path: Option<String>,
-        /// Show hidden entries: terminal (`done`/`cancelled`) tasks and `chunk` items,
-        /// which are derived index units rather than content.
+        /// Show terminal (`done`/`cancelled`) tasks, and count `chunk` items in the
+        /// per-folder totals. Chunks are always reachable by expanding their document.
         #[arg(short = 'a', long)]
         all: bool,
         /// Long format: kind, status, and namespace/uid per row.
@@ -192,8 +192,8 @@ enum Command {
     Tree {
         /// The namespace to root the tree at (default: top-level roots).
         path: Option<String>,
-        /// Show hidden entries: terminal (`done`/`cancelled`) items and `chunk` items,
-        /// in both the listing and the counts.
+        /// Show terminal (`done`/`cancelled`) items, and count `chunk` items in the
+        /// per-folder totals. Chunks are always reachable by expanding their document.
         #[arg(short = 'a', long)]
         all: bool,
         /// Maximum depth to descend (default: 4; deeper folders show `…`). Raise for more.
@@ -1532,8 +1532,42 @@ fn item_label(meta: &item::ItemMeta) -> String {
 /// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
 /// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
 /// tasks are hidden unless `all`.
-/// The children of a parent task, as [`Child`] rows — the container behaviour a task takes
-/// on when it has subtasks.
+/// The children of any item that contains others — the container behaviour a node takes on.
+///
+/// Two relationships qualify today, and they are different edges for good reason: a task
+/// *decomposes into* subtasks (`parent_of`, authored), while a document is *fragmented into*
+/// chunks (`derived_from`, generated and rebuildable). The tree does not care which — it
+/// asks a node for its children — so the difference stays here.
+fn contained_children(
+    conn: &rusqlite::Connection,
+    parent: jkb_types::ItemId,
+    all: bool,
+) -> jkb_core::Result<Vec<Child>> {
+    let chunks = item::derived_children(conn, parent, KIND_CHUNK)?;
+    if !chunks.is_empty() {
+        return Ok(chunks
+            .into_iter()
+            .map(|c| Child {
+                label: item_label(&c),
+                kind: c.kind,
+                reference: c.uid,
+                has_children: false,
+                status: c.status,
+                priority: c.priority,
+                leaf_count: None,
+                leaf_kinds: None,
+                ns_type: None,
+                ns_type_about: None,
+                chunk_count: None,
+                subtasks: None,
+                updated: Some(c.updated_at),
+            })
+            .collect());
+    }
+    subtask_children(conn, parent, all)
+}
+
+/// The children of a parent task, as [`Child`] rows.
 fn subtask_children(
     conn: &rusqlite::Connection,
     parent: jkb_types::ItemId,
@@ -1581,7 +1615,7 @@ fn list_children(
     if let Some(p) = path {
         if ns::get(conn, p)?.is_none() {
             if let Some(id) = item::id_for_uid(conn, p)? {
-                return subtask_children(conn, id, all);
+                return contained_children(conn, id, all);
             }
         }
     }
@@ -1636,16 +1670,22 @@ fn list_children(
             // One grouped query for every document's chunk count, not one per document.
             let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
             let subtask_counts = task::subtask_counts(conn, &placed)?;
-            // A subtask is reached by expanding its parent, so listing it here as well
-            // would show it twice. Hide it ONLY when its parent is in this same listing:
-            // a subtask whose parent lives elsewhere has no row to expand, and hiding it
-            // unconditionally would make it unreachable rather than merely un-duplicated.
+            // A contained node is reached by expanding its container, so listing it here
+            // as well would show it twice. Hide it ONLY when its container is in this same
+            // listing: one whose container lives elsewhere has no row to expand, and hiding
+            // it unconditionally would make it unreachable rather than un-duplicated.
+            //
+            // Both containment edges count — a subtask under its parent task, a chunk under
+            // its source document — because the duplicate is the same shape either way.
             let visible: std::collections::HashSet<i64> = placed.iter().map(|i| i.get()).collect();
             let parents = task::parents_of(conn, &placed)?;
+            let sources = item::derived_from(conn, &placed)?;
             let nested_here = |id: ItemId| {
-                parents
-                    .get(&id)
-                    .is_some_and(|ps| ps.iter().any(|p| visible.contains(&p.get())))
+                let contained_by = |m: &std::collections::HashMap<ItemId, Vec<ItemId>>| {
+                    m.get(&id)
+                        .is_some_and(|ps| ps.iter().any(|p| visible.contains(&p.get())))
+                };
+                contained_by(&parents) || contained_by(&sources)
             };
             for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
@@ -1657,22 +1697,18 @@ fn list_children(
                 if !all && terminal {
                     continue;
                 }
-                // Same treatment for chunks, and for the same reason: they are derived index
-                // units, not content. Listing them doubles every ingested document under its
-                // own fragments. Their count rides on the document instead (below).
-                if !all && meta.kind == KIND_CHUNK {
-                    continue;
-                }
                 if nested_here(item_id) {
                     continue;
                 }
                 let subtasks = subtask_counts.get(&item_id).copied();
+                let chunks = chunk_counts.get(&item_id).copied().unwrap_or(0);
                 out.push(Child {
                     label: item_label(&meta),
                     kind: meta.kind,
                     reference: meta.uid,
-                    // A task with subtasks expands to them; every other item is a leaf.
-                    has_children: subtasks.is_some_and(|(total, _)| total > 0),
+                    // Anything that contains expands: a task into its subtasks, a document
+                    // into its chunks.
+                    has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
                     status: meta.status,
                     priority: meta.priority,
                     leaf_count: None,

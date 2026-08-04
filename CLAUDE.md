@@ -485,16 +485,24 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
   close costs one command, a wrong close buries unfinished work.
 - **Containment is a behaviour, not a node kind.** A *pure namespace* is a node that only
-  contains; a parent task both **is** a task and **contains** its subtasks. So `jkb ls
-  <path-or-uid>` is the one container read — it resolves a namespace first (the historical
-  meaning) and falls back to an item uid — and `jkb tree` descends into **any** child with
-  `has_children`, not just namespaces. `jkb task subtasks` is a thin alias for
+  contains; a parent task both **is** a task and **contains** its subtasks; a document
+  **contains** its chunks. So `jkb ls <path-or-uid>` is the one container read — it resolves
+  a namespace first (the historical meaning) and falls back to an item uid — and `jkb tree`
+  descends into **any** child with `has_children`. `jkb task subtasks` is a thin alias for
   discoverability, not a second implementation. The UI passes a node's address and does not
-  branch on kind.
-- **A subtask is listed once.** `--under` homes a subtask beside its parent, so it would
-  otherwise appear both as a namespace sibling and nested under the parent. `ls` hides it
-  **only where its parent is in the same listing** — a subtask homed elsewhere keeps its own
-  row, because hiding it there would make it unreachable rather than merely un-duplicated.
+  branch on kind. The two containment edges stay distinct where it matters: a task
+  *decomposes into* subtasks (`parent_of`, authored), a document is *fragmented into* chunks
+  (`derived_from`, generated and rebuildable).
+- **A contained node is listed once.** `--under` homes a subtask beside its parent, and
+  ingest places chunks beside their document, so either would otherwise appear both as a
+  namespace sibling and nested under its container. `ls` hides it **only where its container
+  is in the same listing** — one homed elsewhere keeps its own row, because hiding it there
+  would make it unreachable rather than merely un-duplicated.
+- **Chunks are nested, not flag-hidden.** They were previously dropped from listings unless
+  `--all`; now they are reached by expanding their document (`jkb ls <document-uid>`, in
+  document order via the `chunk` placement's `position`). `--all` no longer re-flattens them
+  — that would reintroduce the duplicate — it governs terminal tasks and whether chunks count
+  toward per-folder totals, which is a separate question from where they are listed.
 - **The explorer shows the hold.** A task carries `subtask_count`/`open_subtask_count` and
   the row reads `2 of 4 subtasks open`, with a hover saying the parent is held. Without it a
   container renders identically to the pickable tasks beside it, which is worse than having
