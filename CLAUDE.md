@@ -100,9 +100,9 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **327 tests** green (133 core = 105 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 9 index + 25 ingest + 7 search + 40 sync + 81 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
-  live-URL); `clippy -D warnings` clean
+- **342 tests** green (132 core = 104 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 9 index + 25 ingest + 7 search + 40 sync + 91 cli/e2e/sessions + 6 mcp; +2 `#[ignore]`:
+  live-ollama, live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
   `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
@@ -537,6 +537,42 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
+
+## Parallel task sessions (D36) — driving tasks by hand, safely
+
+The manual counterpart of `/task-swarm`: the same isolation and the same merge queue, driven
+by a human (design `openspec/changes/jkb-parallel-sessions/`). Before this, clicking "Work
+this task with Claude" twice gave two agents one checkout, and neither claimed its task.
+
+- **A session is a git worktree** — `<repo>/.jkb/work/<session>` on branch `task/<session>`,
+  one per task. `.jkb/` is added to `.git/info/exclude` on first use (locally, not by editing
+  someone else's `.gitignore`), because otherwise the first session makes the tree dirty and
+  `land` refuses a dirty target.
+- **`jkb task work <uid>`** opens or *returns* the session — idempotent, so the button cannot
+  fork the work. **`land`** rebases detached (never checking the branch out, which git refuses
+  while the session holds it), fast-forwards the target, runs the gate on the integrated
+  result, and rolls the target back on red. **`abandon`** drops it; **`sessions`** lists what
+  is in flight; **`gate`** shows/sets the verify command.
+- **The land target** is the branch you started from — unless that is trunk, in which case a
+  branch is cut from trunk named after the first task and sessions hang off *that* (landing on
+  trunk would make every task read as merged, D34.3). Later sessions join the batch the live
+  ones share. Recorded as the `onto=` tag beside D34's `branch=`/`repo=`/`base=`.
+- **The gate is remembered per repo** in `namespaces.metadata.gate` on `repos/<repo>`:
+  `--gate` wins, then the stored command, then autodetect (`scripts/check.sh`, `scripts/test.sh`,
+  `make test`) — and a flag or a detection is *stored*, so the guess is made once. The chosen
+  command is always printed; a gate that silently did not run is worse than none, because the
+  landing reads as verified.
+- **A session's claim is owned by the worktree, the pid is only attendance** (D36.6). Owner ids
+  gained the form `session:<pid>:<worktree>`; `owner_pid` still reads field 1, and `is_alive`
+  gained one clause: alive if the pid lives **or** the worktree exists. `jkb task work` exits in
+  a second, so a plain `host:pid` owner would be dead on arrival and `doctor --fix` would free
+  the task mid-session. Live pid is a good positive signal and a bad negative one — closing a
+  terminal does not finish the work, and freeing the claim then is how a swarm run starts the
+  same task on a second branch. Only `land`/`abandon`, which remove the worktree, free a claim;
+  `sessions` and `doctor` report a dead-pid session as **unattended**.
+- `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
+  algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
+  directly and it must work in any repo.
 
 ## Design gate (D28) — human design, swarm implementation
 

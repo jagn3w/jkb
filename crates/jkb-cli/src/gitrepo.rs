@@ -38,6 +38,36 @@ pub fn root(dir: &Path) -> Result<Option<PathBuf>> {
         .map(PathBuf::from))
 }
 
+/// The **main** working copy's root, even when `dir` is inside a linked worktree.
+///
+/// [`root`] answers "which checkout am I in", which is the wrong question for anything that
+/// belongs to the repository as a whole: session worktrees and the land lock all live under
+/// the main copy's `.jkb/`, or a session that ran `jkb` from inside another session would
+/// nest its own `.jkb/work` inside a checkout.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn main_root(dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(here) = root(dir)? else {
+        return Ok(None);
+    };
+    // `--path-format=absolute` needs git 2.31; without it the answer would be relative to
+    // git's cwd, which is not `here` when `dir` is a subdirectory. Falling back to this
+    // checkout is right for the overwhelmingly common case of not being in a worktree.
+    let Some(common) = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?
+    .filter(|s| !s.is_empty()) else {
+        return Ok(Some(here));
+    };
+    Ok(Some(
+        PathBuf::from(common)
+            .parent()
+            .map_or(here, Path::to_path_buf),
+    ))
+}
+
 /// The repo's short name — the basename of its root. This is the `repo=` tag value and
 /// mirrors the `repos/<repo>` / `tasks/<repo>` namespace key (design D26/D32).
 ///
@@ -111,6 +141,230 @@ pub fn trunk(dir: &Path) -> Result<Option<String>> {
 /// Returns an error if `git` cannot be executed.
 pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
     Ok(git(dir, &["rev-parse", reference])?.filter(|s| !s.is_empty()))
+}
+
+/// Run `git` in `dir` for its exit status, returning `(ok, combined output)`. Used by the
+/// mutating half of this module (worktrees, branches, rebase), where the failure text is
+/// what the user needs to see and a non-zero exit is not "this ref does not exist".
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed at all.
+fn git_run(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running `git {}`", args.join(" ")))?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.success(), text.trim().to_owned()))
+}
+
+/// Run `git` in `dir`, turning a non-zero exit into an error carrying git's own message.
+fn git_must(dir: &Path, args: &[&str]) -> Result<String> {
+    let (ok, text) = git_run(dir, args)?;
+    anyhow::ensure!(ok, "git {}: {text}", args.join(" "));
+    Ok(text)
+}
+
+/// One entry of `git worktree list` — a checkout of this repository.
+#[derive(Debug, Clone)]
+pub struct Worktree {
+    /// The worktree's absolute path.
+    pub path: PathBuf,
+    /// The branch checked out there, or `None` when detached.
+    pub branch: Option<String>,
+}
+
+/// Every worktree of the repository containing `dir`, main copy included.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn worktrees(dir: &Path) -> Result<Vec<Worktree>> {
+    let Some(text) = git(dir, &["worktree", "list", "--porcelain"])? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            // A blank line separates records, but the last one may have none — flush on the
+            // next header instead of relying on the trailing separator.
+            if let Some(prev) = path.take() {
+                out.push(Worktree {
+                    path: prev,
+                    branch: branch.take(),
+                });
+            }
+            path = Some(PathBuf::from(p));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.trim_start_matches("refs/heads/").to_owned());
+        }
+    }
+    if let Some(p) = path {
+        out.push(Worktree { path: p, branch });
+    }
+    Ok(out)
+}
+
+/// The worktree in which `branch` is currently checked out, if any. `git` refuses to check
+/// one branch out twice, so this is what decides whether a land can borrow an existing
+/// checkout or must make its own.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    Ok(worktrees(dir)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+        .map(|w| w.path))
+}
+
+/// Add a worktree at `path` checked out to `branch`, creating that branch from `start` when
+/// it does not exist yet.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or refuses to create the worktree.
+pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
+    let path_s = path.to_string_lossy().into_owned();
+    if has_branch(dir, branch)? {
+        git_must(dir, &["worktree", "add", &path_s, branch])?;
+    } else {
+        git_must(dir, &["worktree", "add", "-b", branch, &path_s, start])?;
+    }
+    Ok(())
+}
+
+/// Remove the worktree at `path` and prune the administrative entry. `force` discards
+/// uncommitted changes; without it git refuses a dirty worktree, which is the check the
+/// caller wants.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or refuses to remove the worktree.
+pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
+    let path_s = path.to_string_lossy().into_owned();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path_s);
+    git_must(dir, &args)?;
+    let _ = git_run(dir, &["worktree", "prune"])?;
+    Ok(())
+}
+
+/// Whether a local branch named `branch` exists.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
+    Ok(git(
+        dir,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?
+    .is_some())
+}
+
+/// Create branch `branch` at `start` if it does not already exist. Returns whether it was
+/// created.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or refuses to create the branch.
+pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
+    if has_branch(dir, branch)? {
+        return Ok(false);
+    }
+    git_must(dir, &["branch", branch, start])?;
+    Ok(true)
+}
+
+/// Delete branch `branch`, discarding unmerged commits when `force`.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or refuses to delete the branch.
+pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
+    git_must(dir, &["branch", if force { "-D" } else { "-d" }, branch])?;
+    Ok(())
+}
+
+/// Whether the working tree at `dir` has uncommitted changes (staged, unstaged, or
+/// untracked). Untracked files count: a session's new module is untracked until it is
+/// added, and landing without it would land a branch that does not build.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn is_dirty(dir: &Path) -> Result<bool> {
+    Ok(git(dir, &["status", "--porcelain"])?.is_some_and(|s| !s.is_empty()))
+}
+
+/// How many commits `branch` has that `onto` does not.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn ahead_count(dir: &Path, onto: &str, branch: &str) -> Result<usize> {
+    Ok(
+        git(dir, &["rev-list", "--count", &format!("{onto}..{branch}")])?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// The outcome of [`graft`]: what happened to the target branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Graft {
+    /// `onto` was fast-forwarded to `branch`'s commits, rebased onto its live tip.
+    Landed,
+    /// The rebase hit a conflict; nothing changed. The branch's author must rebase it.
+    Conflict,
+}
+
+/// Rebase `branch` onto the live tip of `onto` and fast-forward `onto` to the result, in the
+/// working tree at `dir` (which must be checked out to `onto`). Returns the pre-graft tip of
+/// `onto` alongside the outcome, so a caller whose gate goes red can roll back to it.
+///
+/// The rebase runs on a **detached HEAD** at `branch` rather than via `git rebase <onto>
+/// <branch>`, because that form checks `branch` out first and git refuses while the session
+/// worktree holds it (design D36.4). Detaching does not claim the ref.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed, or if the working tree cannot be put on
+/// `onto` to begin with.
+pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
+    git_must(dir, &["switch", onto])?;
+    let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
+
+    if !git_run(dir, &["checkout", "--detach", branch])?.0 {
+        git_must(dir, &["switch", onto])?;
+        return Ok((Graft::Conflict, pre));
+    }
+    if !git_run(dir, &["rebase", onto])?.0 {
+        let _ = git_run(dir, &["rebase", "--abort"])?;
+        git_must(dir, &["switch", onto])?;
+        return Ok((Graft::Conflict, pre));
+    }
+    let grafted = rev(dir, "HEAD")?.context("rebase produced no commit")?;
+    git_must(dir, &["switch", onto])?;
+    if !git_run(dir, &["merge", "--ff-only", &grafted])?.0 {
+        reset_hard(dir, &pre)?;
+        return Ok((Graft::Conflict, pre));
+    }
+    Ok((Graft::Landed, pre))
+}
+
+/// Hard-reset the working tree at `dir` to `reference` — the rollback after a red gate.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or the reset fails.
+pub fn reset_hard(dir: &Path, reference: &str) -> Result<()> {
+    git_must(dir, &["reset", "--hard", reference])?;
+    Ok(())
 }
 
 /// Whether `reference` resolves to a commit in `dir`.

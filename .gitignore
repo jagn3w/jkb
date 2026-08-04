@@ -20,3 +20,8 @@ openspec/
 
 # /task-swarm integration + per-task git worktrees
 .swarm/
+
+# `jkb task work` sessions: per-task git worktrees, the land target's checkout, the land
+# lock. Committed here as well as written to .git/info/exclude, so a fresh clone of jkb
+# never sees them even before the first session runs.
+.jkb/

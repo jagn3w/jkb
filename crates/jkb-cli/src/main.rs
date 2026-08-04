@@ -11,6 +11,7 @@ mod gitrepo;
 mod output;
 mod owner;
 mod service;
+mod session;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -732,6 +733,54 @@ enum TaskCmd {
         /// The liveness-checkable owner id (default: this process's `host:pid`).
         #[arg(long)]
         owner: Option<String>,
+    },
+    /// Open an isolated session for a task: its own git worktree and branch, claimed so no
+    /// other terminal — or swarm run — starts the same task. Re-running returns the same
+    /// session, so it is safe to invoke from a button.
+    Work {
+        /// The task uid.
+        uid: String,
+        /// The branch this session's work will land on (default: the branch you are on, or
+        /// a new one cut from trunk and named after this task).
+        #[arg(long)]
+        onto: Option<String>,
+    },
+    /// Land a session: rebase its branch onto the target, fast-forward, run the gate, and on
+    /// green mark the task done and clean the session up. Serialized per repo.
+    Land {
+        /// The task uid.
+        uid: String,
+        /// The command that verifies the integrated result (remembered for this repo).
+        #[arg(long)]
+        gate: Option<String>,
+        /// Land without running a gate.
+        #[arg(long, conflicts_with = "gate")]
+        no_gate: bool,
+        /// Keep the session worktree and branch after landing.
+        #[arg(long)]
+        keep_worktree: bool,
+    },
+    /// Drop a session without landing it: release the claim, reopen the task, remove the
+    /// worktree. The branch is kept unless you ask for it to go.
+    Abandon {
+        /// The task uid.
+        uid: String,
+        /// Discard uncommitted changes in the session worktree.
+        #[arg(long)]
+        force: bool,
+        /// Also delete the session branch (its commits are lost).
+        #[arg(long)]
+        delete_branch: bool,
+    },
+    /// List the task sessions in flight in this repo.
+    Sessions,
+    /// Show, set, or clear the command that verifies a landing in this repo.
+    Gate {
+        /// The command to remember (omit to show the current one).
+        cmd: Option<String>,
+        /// Forget this repo's gate command.
+        #[arg(long, conflicts_with = "cmd")]
+        clear: bool,
     },
     /// Close tasks whose `branch=` has landed in this repo's trunk. A task closes only when
     /// its branch is merged AND all of its subtasks are terminal; anything else is
@@ -2848,6 +2897,18 @@ TASKS
   jkb task set <uid> --status done|open|in_progress|needs_review
   jkb task show <uid>         the full task body.
 
+WORKING A TASK IN PARALLEL (each session is its own git worktree)
+  jkb task work <uid>         open (or return to) this task's session: its own checkout and
+                              branch `task/<session>`, claimed so nothing else starts it.
+                              Work and COMMIT inside the printed worktree, nowhere else.
+  jkb task land <uid>         rebase the session onto its target, run the repo's gate, and
+                              on green mark the task done and remove the session. Serial:
+                              one land at a time, so a red gate means YOUR branch broke it.
+  jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
+  jkb task sessions           what is in flight here, and which sessions are unattended.
+  jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
+      If you are inside a session, land is the human's call — commit, and say you are done.
+
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
   jkb blob ls --contains "…"  find the version still carrying a line you remember.
@@ -3646,6 +3707,11 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         }
         TaskCmd::Subtasks { uid, all } => cmd_task_subtasks(db, &uid, all, json)?,
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
+        cmd @ (TaskCmd::Work { .. }
+        | TaskCmd::Land { .. }
+        | TaskCmd::Abandon { .. }
+        | TaskCmd::Sessions
+        | TaskCmd::Gate { .. }) => cmd_task_session(db, cmd, json)?,
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
@@ -3700,25 +3766,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             stdin,
             append,
         } => cmd_task_edit(db, &uid, &text, stdin, append, json)?,
-        TaskCmd::Tag { cmd } => {
-            let (uid, facet_value, adding) = match cmd {
-                TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, true),
-                TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, false),
-            };
-            let (facet, value) = facet_value
-                .split_once('=')
-                .context("tag must be `facet=value`, e.g. `size=small`")?;
-            let (facet, value) = (facet.to_owned(), value.to_owned());
-            let id = resolve_task_uid(db, &uid)?;
-            db.write_txn("cli", move |conn, meta| {
-                if adding {
-                    tag::apply(conn, meta, id, &facet, &value)
-                } else {
-                    tag::remove(conn, meta, id, &facet, &value)
-                }
-            })?;
-            report(json, &uid, if adding { "tagged" } else { "untagged" });
-        }
+        TaskCmd::Tag { cmd } => cmd_task_tag(db, cmd, json)?,
         TaskCmd::Depend { uid, dep } => {
             let id = resolve_task_uid(db, &uid)?;
             let dep_uid = canonical_task_uid(&dep);
@@ -3777,12 +3825,17 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         } => cmd_task_close_merged(db, repo, trunk, dry_run, json)?,
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
-        // The read subcommands are dispatched by `cmd_task` and never reach here.
+        // The read and session subcommands are dispatched by `cmd_task` and never reach here.
         TaskCmd::Add { .. }
         | TaskCmd::Next { .. }
         | TaskCmd::Show { .. }
         | TaskCmd::Subtasks { .. }
-        | TaskCmd::Mirror => {
+        | TaskCmd::Mirror
+        | TaskCmd::Work { .. }
+        | TaskCmd::Land { .. }
+        | TaskCmd::Abandon { .. }
+        | TaskCmd::Sessions
+        | TaskCmd::Gate { .. } => {
             unreachable!()
         }
     }
@@ -3886,6 +3939,706 @@ fn cmd_task_start(
         println!("started {uid} on {repo}@{branch} (owner {owner})");
     }
     Ok(())
+}
+
+/// `task tag add|rm <uid> <facet>=<value>` — apply or remove one facet tag.
+fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
+    let (uid, facet_value, adding) = match cmd {
+        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, true),
+        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, false),
+    };
+    let (facet, value) = facet_value
+        .split_once('=')
+        .context("tag must be `facet=value`, e.g. `size=small`")?;
+    let (facet, value) = (facet.to_owned(), value.to_owned());
+    let id = resolve_task_uid(db, &uid)?;
+    db.write_txn("cli", move |conn, meta| {
+        if adding {
+            tag::apply(conn, meta, id, &facet, &value)
+        } else {
+            tag::remove(conn, meta, id, &facet, &value)
+        }
+    })?;
+    report(json, &uid, if adding { "tagged" } else { "untagged" });
+    Ok(())
+}
+
+/// Dispatch the parallel-session subcommands (design D36): open a session, land it, drop it,
+/// list what is in flight, or configure the gate that guards a landing.
+fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
+        TaskCmd::Work { uid, onto } => cmd_task_work(db, &uid, onto.as_deref(), json),
+        TaskCmd::Land {
+            uid,
+            gate,
+            no_gate,
+            keep_worktree,
+        } => cmd_task_land(db, &uid, gate.as_deref(), no_gate, keep_worktree, json),
+        TaskCmd::Abandon {
+            uid,
+            force,
+            delete_branch,
+        } => cmd_task_abandon(db, &uid, force, delete_branch, json),
+        TaskCmd::Sessions => cmd_task_sessions(db, json),
+        TaskCmd::Gate { cmd, clear } => cmd_task_gate(db, cmd.as_deref(), clear, json),
+        _ => unreachable!("cmd_task_mutate routes only session subcommands here"),
+    }
+}
+
+/// The branch a session's work lands on (design D36.3). Recorded at `task work` so a resumed
+/// session — and `task land` itself — target the branch the batch was always going to, not
+/// whatever happens to be checked out later.
+const FACET_ONTO: &str = "onto";
+
+/// A task's facet tags as a lookup.
+fn task_tags(db: &Db, id: ItemId) -> Result<BTreeMap<String, String>> {
+    Ok(db
+        .read(move |conn| tag::applications(conn, id))?
+        .into_iter()
+        .collect())
+}
+
+/// What the session commands need to know about the repo they are running in.
+struct RepoCtx {
+    /// The **main** copy's root — where `.jkb/` lives, even when invoked from inside a
+    /// session worktree.
+    root: PathBuf,
+    /// The repo key, matching the `repo=` tag and the `repos/<repo>` namespace (D26/D32).
+    key: String,
+    /// The trunk ref (`origin/main`, `main`, …), if this repo has a discoverable one.
+    trunk: Option<String>,
+}
+
+impl RepoCtx {
+    /// The trunk's short branch name (`origin/main` → `main`), for comparing against a
+    /// checked-out branch and for cutting new branches.
+    fn trunk_name(&self) -> Option<&str> {
+        self.trunk
+            .as_deref()
+            .map(|t| t.rsplit('/').next().unwrap_or(t))
+    }
+}
+
+/// Resolve the repo the current directory belongs to.
+fn repo_ctx() -> Result<RepoCtx> {
+    let cwd = std::env::current_dir()?;
+    let root = gitrepo::main_root(&cwd)?.context(
+        "not inside a git repo — a task session is a git worktree, so run this from the repo",
+    )?;
+    let key = gitrepo::key(&root)?.context("could not determine this repo's name")?;
+    let trunk = gitrepo::trunk(&root)?;
+    Ok(RepoCtx { root, key, trunk })
+}
+
+/// One task, as far as the session commands care.
+struct SessionTask {
+    uid: String,
+    status: String,
+    onto: Option<String>,
+    owner: Option<String>,
+}
+
+/// This repo's tasks indexed by the session branch each records.
+///
+/// `branch=` is the only link from a worktree back to its task — there is deliberately no
+/// session state file to fall out of step with git (design D36.2).
+fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
+    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo_key}"))?;
+    let ids = db.read(move |conn| query.evaluate(conn))?;
+    let claims: BTreeMap<i64, String> = db
+        .read(claim::claimed)?
+        .into_iter()
+        .map(|c| (c.id.get(), c.owner))
+        .collect();
+    let mut out = BTreeMap::new();
+    for id in ids {
+        let (meta, tags) = db.read(move |conn| {
+            let meta = item::get(conn, id)?;
+            let tags = tag::applications(conn, id)?;
+            Ok((meta, tags))
+        })?;
+        let tags: BTreeMap<String, String> = tags.into_iter().collect();
+        let (Some(meta), Some(branch)) = (meta, tags.get(FACET_BRANCH)) else {
+            continue;
+        };
+        out.insert(
+            branch.clone(),
+            SessionTask {
+                uid: meta.uid,
+                status: meta.status.unwrap_or_default(),
+                onto: tags.get(FACET_ONTO).cloned(),
+                owner: claims.get(&id.get()).cloned(),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// `task work` — open (or return) an isolated session for a task (design D36.2).
+///
+/// Idempotent by construction: the task's own `branch=` tag names its session, so a second
+/// invocation hands back the same worktree instead of forking the work onto a second branch.
+fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<()> {
+    let ctx = repo_ctx()?;
+    let cwd = std::env::current_dir()?;
+    let id = resolve_task_uid(db, uid)?;
+
+    let status = db
+        .read(move |conn| item::get(conn, id))?
+        .and_then(|m| m.status);
+    if let Some(status) = status.as_deref() {
+        anyhow::ensure!(
+            !matches!(status, "done" | "cancelled"),
+            "{uid} is already {status} — there is nothing to work"
+        );
+    }
+
+    // Session worktrees live inside the repo, so the first one must not make it dirty.
+    session::ensure_excluded(&ctx.root)?;
+
+    let tags = task_tags(db, id)?;
+    let sessions = session::discover(&ctx.root)?;
+    // A session already recorded on the task keeps its name, so a second invocation returns
+    // the same worktree instead of forking the work onto a second branch.
+    let name = if let Some(existing) = tags
+        .get(FACET_BRANCH)
+        .and_then(|b| session::name_from_branch(b))
+    {
+        existing.to_owned()
+    } else {
+        let taken: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.name.clone()).collect();
+        session::mint_name(uid, |n| {
+            taken.contains(n) || session::worktree_path(&ctx.root, n).exists()
+        })
+    };
+    let branch = session::branch_for(&name);
+    let worktree = session::worktree_path(&ctx.root, &name);
+    let onto = resolve_onto(db, &ctx, &cwd, &tags, onto, &name)?;
+
+    // Claim first: if someone else is on this task, stop before making a worktree they
+    // would have to clean up.
+    let owner = owner::session_owner(&worktree);
+    claim_session(db, id, uid, &owner, &worktree)?;
+
+    let resumed = sessions.iter().any(|s| s.branch == branch);
+    if !resumed {
+        if let Some(parent) = worktree.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        anyhow::ensure!(
+            !worktree.exists(),
+            "{} exists but git does not know it as a worktree — remove it, or run \
+             `git worktree prune`",
+            worktree.display()
+        );
+        if let Err(e) = gitrepo::worktree_add(&ctx.root, &worktree, &branch, &onto) {
+            // Do not leave the task claimed for a session that failed to open.
+            let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
+            return Err(e);
+        }
+    }
+
+    // Record where the work is happening, exactly as `task start` does (D34.1), plus the
+    // land target so `land` and a resumed `work` agree on it.
+    let base = gitrepo::rev(&ctx.root, &onto)?;
+    let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
+    db.write_txn("cli", move |conn, meta| {
+        tag::apply(conn, meta, id, FACET_BRANCH, &b)?;
+        tag::apply(conn, meta, id, FACET_REPO, &r)?;
+        tag::apply(conn, meta, id, FACET_ONTO, &o)?;
+        if let Some(sha) = &base {
+            tag::apply(conn, meta, id, FACET_BASE, sha)?;
+        }
+        Ok(())
+    })?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": uid,
+                "session": name,
+                "worktree": worktree,
+                "branch": branch,
+                "onto": onto,
+                "resumed": resumed,
+                "owner": owner,
+            })
+        );
+    } else {
+        let verb = if resumed { "resumed" } else { "opened" };
+        println!("{verb} session {name} for {uid}");
+        println!("  worktree: {}", worktree.display());
+        println!("  branch:   {branch} (lands on {onto})");
+        println!("  next:     cd {} && claude", worktree.display());
+        println!("  finish:   jkb task land {uid}");
+    }
+    Ok(())
+}
+
+/// Decide which branch this session's work will land on (design D36.3).
+fn resolve_onto(
+    db: &Db,
+    ctx: &RepoCtx,
+    cwd: &Path,
+    tags: &BTreeMap<String, String>,
+    flag: Option<&str>,
+    session_name: &str,
+) -> Result<String> {
+    if let Some(branch) = flag {
+        anyhow::ensure!(
+            Some(branch) != ctx.trunk_name(),
+            "refusing to land on {branch}: it is this repo's trunk, and a task tagged with \
+             it would read as merged the moment anything lands"
+        );
+        if !gitrepo::has_branch(&ctx.root, branch)? {
+            gitrepo::create_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
+        }
+        return Ok(branch.to_owned());
+    }
+    // A session that already has a target keeps it.
+    if let Some(branch) = tags.get(FACET_ONTO) {
+        if gitrepo::has_branch(&ctx.root, branch)? {
+            return Ok(branch.clone());
+        }
+    }
+    // Join the batch the other live sessions are landing on.
+    if let Some(branch) = batch_onto(db, ctx)? {
+        return Ok(branch);
+    }
+    // The branch you invoked from — unless that is trunk (landing there closes tasks
+    // instantly, D34.3) or another session's branch (that would stack sessions).
+    if let Some(branch) = gitrepo::current_branch(cwd)? {
+        if Some(branch.as_str()) != ctx.trunk_name() && session::name_from_branch(&branch).is_none()
+        {
+            return Ok(branch);
+        }
+    }
+    // Cut the batch branch from trunk, named after this task — the first of the batch.
+    gitrepo::create_branch(&ctx.root, session_name, &batch_start(ctx, cwd)?)?;
+    Ok(session_name.to_owned())
+}
+
+/// The commit a new batch branch is cut from.
+///
+/// The **local** trunk when that is where you are standing, and only otherwise the trunk ref
+/// — which is usually `origin/main`. A local trunk ahead of its remote is the ordinary case
+/// (you just merged a PR and pulled, or you commit locally first), and cutting the batch from
+/// the remote ref there would silently start the work behind commits you already have, then
+/// land it as if it were on top of them.
+fn batch_start(ctx: &RepoCtx, cwd: &Path) -> Result<String> {
+    if let Some(branch) = gitrepo::current_branch(cwd)? {
+        if Some(branch.as_str()) == ctx.trunk_name() {
+            return Ok(branch);
+        }
+    }
+    ctx.trunk.clone().context(
+        "could not determine this repo's trunk, so there is nothing to cut a branch from \
+         — pass --onto <branch> naming one that exists",
+    )
+}
+
+/// The land target the repo's other live sessions share, if they agree on one.
+///
+/// This is what makes a second session started from trunk join the first one's batch instead
+/// of cutting a branch of its own. Sessions that disagree are left alone: guessing which of
+/// two batches a new task belongs to is worse than asking for `--onto`.
+fn batch_onto(db: &Db, ctx: &RepoCtx) -> Result<Option<String>> {
+    let by_branch = tasks_by_branch(db, &ctx.key)?;
+    let mut found: Option<String> = None;
+    for s in session::discover(&ctx.root)? {
+        let Some(onto) = by_branch.get(&s.branch).and_then(|t| t.onto.clone()) else {
+            continue;
+        };
+        if !gitrepo::has_branch(&ctx.root, &onto)? {
+            continue;
+        }
+        match &found {
+            None => found = Some(onto),
+            Some(f) if *f == onto => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    if found.is_none() {
+        // No sessions yet, but a batch checkout may survive from an earlier one.
+        let base = session::base_worktree(&ctx.root);
+        if let Some(w) = gitrepo::worktrees(&ctx.root)?
+            .into_iter()
+            .find(|w| session::same_path(&w.path, &base))
+        {
+            return Ok(w.branch);
+        }
+    }
+    Ok(found)
+}
+
+/// Take the session's claim, taking over from this session's own previous process (a resume)
+/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
+fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -> Result<()> {
+    let held = db
+        .read(claim::claimed)?
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(|c| c.owner);
+    if let Some(prev) = &held {
+        let same_session =
+            owner::session_worktree(prev).is_some_and(|w| session::same_path(&w, worktree));
+        if !same_session && owner::is_alive(prev) {
+            let where_ = owner::session_worktree(prev).map_or_else(
+                || format!("owner {prev}"),
+                |w| format!("a session in {}", w.display()),
+            );
+            anyhow::bail!(
+                "{uid} is already being worked by {where_} — finish or abandon that session, \
+                 or work a different task"
+            );
+        }
+    }
+    let (o, had) = (owner.to_owned(), held.is_some());
+    let ok = db.write_txn("cli", move |conn, meta| {
+        // Clearing first is what lets a resumed session re-take its own claim under a new
+        // pid: the CAS in `claim` only accepts a free task or the identical owner string.
+        if had {
+            claim::clear(conn, meta, id)?;
+        }
+        claim::claim(conn, meta, id, &o)
+    })?;
+    anyhow::ensure!(ok, "could not claim {uid}");
+    Ok(())
+}
+
+/// `task land` — the merge queue for one session (design D36.4).
+fn cmd_task_land(
+    db: &Db,
+    uid: &str,
+    gate_flag: Option<&str>,
+    no_gate: bool,
+    keep_worktree: bool,
+    json: bool,
+) -> Result<()> {
+    let ctx = repo_ctx()?;
+    let id = resolve_task_uid(db, uid)?;
+    let tags = task_tags(db, id)?;
+    let branch = tags
+        .get(FACET_BRANCH)
+        .cloned()
+        .with_context(|| format!("{uid} has no session — run `jkb task work {uid}` first"))?;
+    let sess = session::discover(&ctx.root)?
+        .into_iter()
+        .find(|s| s.branch == branch)
+        .with_context(|| {
+            format!(
+                "no session worktree for {branch} — it may already have landed, or been removed"
+            )
+        })?;
+    let onto = tags
+        .get(FACET_ONTO)
+        .cloned()
+        .context("this session records no land target — re-run `jkb task work` with --onto")?;
+    anyhow::ensure!(
+        gitrepo::has_branch(&ctx.root, &onto)?,
+        "the land target {onto} no longer exists"
+    );
+
+    anyhow::ensure!(
+        !gitrepo::is_dirty(&sess.worktree)?,
+        "{} has uncommitted changes — commit them in the session before landing",
+        sess.worktree.display()
+    );
+    let ahead = gitrepo::ahead_count(&ctx.root, &onto, &branch)?;
+    anyhow::ensure!(
+        ahead > 0,
+        "{branch} has no commits that {onto} does not — nothing to land"
+    );
+
+    // Landing is serial: two grafts at once would each gate a tree the other is changing.
+    let _lock = session::LandLock::acquire(&ctx.root)?;
+
+    let land_dir = land_dir_for(&ctx, &onto)?;
+    anyhow::ensure!(
+        !gitrepo::is_dirty(&land_dir)?,
+        "{} (checked out to {onto}) has uncommitted changes — landing would roll them back \
+         on a red gate",
+        land_dir.display()
+    );
+
+    let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
+    if outcome == gitrepo::Graft::Conflict {
+        anyhow::bail!(
+            "{branch} does not rebase cleanly onto {onto} — nothing changed. Rebase it where \
+             the context is: cd {} && git rebase {onto}, fix the conflict, then land again",
+            sess.worktree.display()
+        );
+    }
+
+    let (gate, source) = session::resolve_gate(db, &ctx.root, &ctx.key, gate_flag, no_gate)?;
+    if !json {
+        println!(
+            "gate: {} ({})",
+            gate.as_deref().unwrap_or("(none)"),
+            source.label()
+        );
+    }
+    if let Some(cmd) = &gate {
+        let (passed, output) = session::run_gate(&land_dir, cmd, json)?;
+        if !passed {
+            gitrepo::reset_hard(&land_dir, &pre)?;
+            let tail = output
+                .map(|o| format!("\n{}", tail_lines(&o, 20)))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "gate failed on the integrated result — {onto} rolled back to {}, {branch} \
+                 untouched. Reproduce in the session (cd {} && {cmd}) and land again.{tail}",
+                &pre[..pre.len().min(8)],
+                sess.worktree.display()
+            );
+        }
+    }
+
+    // Landed: the task is done, the claim is free, and the session branch is a duplicate of
+    // commits now in `onto`.
+    db.write_txn("cli", move |conn, meta| {
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
+        claim::clear(conn, meta, id)?;
+        Ok(())
+    })?;
+    let mut cleaned = false;
+    if !keep_worktree {
+        gitrepo::worktree_remove(&ctx.root, &sess.worktree, false)?;
+        gitrepo::delete_branch(&ctx.root, &branch, true)?;
+        cleaned = true;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": uid, "landed": true, "branch": branch, "onto": onto,
+                "commits": ahead, "gate": gate, "gate_source": source.label(),
+                "session_removed": cleaned,
+            })
+        );
+    } else {
+        println!("landed: {branch} → {onto} ({ahead} commit(s)); {uid} is done");
+        if cleaned {
+            println!("  removed session {} and its branch", sess.name);
+        }
+    }
+    Ok(())
+}
+
+/// The working tree to graft in: wherever `onto` is already checked out, else a checkout of
+/// it under `.jkb/base`. `git` refuses to check one branch out twice, so borrowing an
+/// existing checkout is not an optimization — it is the only option when there is one.
+fn land_dir_for(ctx: &RepoCtx, onto: &str) -> Result<PathBuf> {
+    if let Some(dir) = gitrepo::worktree_for_branch(&ctx.root, onto)? {
+        return Ok(dir);
+    }
+    let base = session::base_worktree(&ctx.root);
+    if let Some(parent) = base.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    gitrepo::worktree_add(&ctx.root, &base, onto, onto)?;
+    Ok(base)
+}
+
+/// The last `n` lines of `text` — enough of a failed gate to act on, without replaying the
+/// whole build.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// `task abandon` — drop a session without landing it (design D36.6).
+fn cmd_task_abandon(
+    db: &Db,
+    uid: &str,
+    force: bool,
+    delete_branch: bool,
+    json: bool,
+) -> Result<()> {
+    let ctx = repo_ctx()?;
+    let id = resolve_task_uid(db, uid)?;
+    let tags = task_tags(db, id)?;
+    let branch = tags
+        .get(FACET_BRANCH)
+        .cloned()
+        .with_context(|| format!("{uid} has no session"))?;
+    let sess = session::discover(&ctx.root)?
+        .into_iter()
+        .find(|s| s.branch == branch);
+
+    if let Some(sess) = &sess {
+        if !force {
+            anyhow::ensure!(
+                !gitrepo::is_dirty(&sess.worktree)?,
+                "{} has uncommitted changes — commit them, or pass --force to discard them",
+                sess.worktree.display()
+            );
+        }
+        gitrepo::worktree_remove(&ctx.root, &sess.worktree, force)?;
+    }
+    if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
+        gitrepo::delete_branch(&ctx.root, &branch, true)?;
+    }
+    // Release and reopen: the task is available again, and its claim is gone with the
+    // worktree that held it.
+    db.write_txn("cli", move |conn, meta| {
+        claim::clear(conn, meta, id)?;
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Open)?;
+        Ok(())
+    })?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": uid, "abandoned": true, "branch": branch,
+                "worktree_removed": sess.is_some(), "branch_deleted": delete_branch,
+            })
+        );
+    } else {
+        println!("abandoned {uid}; it is open again");
+        if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
+            println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
+        }
+    }
+    Ok(())
+}
+
+/// `task sessions` — what is in flight in this repo.
+fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
+    let ctx = repo_ctx()?;
+    let sessions = session::discover(&ctx.root)?;
+    let by_branch = tasks_by_branch(db, &ctx.key)?;
+
+    let mut rows = Vec::new();
+    for s in &sessions {
+        let task = by_branch.get(&s.branch);
+        let onto = task.and_then(|t| t.onto.clone());
+        let ahead = match &onto {
+            Some(o) => gitrepo::ahead_count(&ctx.root, o, &s.branch)?,
+            None => 0,
+        };
+        rows.push(serde_json::json!({
+            "session": s.name,
+            "worktree": s.worktree,
+            "branch": s.branch,
+            "onto": onto,
+            "uid": task.map(|t| t.uid.clone()),
+            "status": task.map(|t| t.status.clone()),
+            // A session with no live process is unattended, not finished (D36.6).
+            "attended": task.and_then(|t| t.owner.as_deref()).is_some_and(owner::is_attended),
+            "dirty": gitrepo::is_dirty(&s.worktree)?,
+            "commits": ahead,
+        }));
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        println!("(no sessions in {})", ctx.key);
+    } else {
+        for r in &rows {
+            let flag = |k: &str| r[k].as_bool().unwrap_or(false);
+            let mut notes = Vec::new();
+            if !flag("attended") {
+                notes.push("unattended");
+            }
+            if flag("dirty") {
+                notes.push("uncommitted");
+            }
+            let notes = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", notes.join(", "))
+            };
+            println!(
+                "{:<28} {} → {}  {} commit(s){notes}",
+                r["session"].as_str().unwrap_or("?"),
+                r["branch"].as_str().unwrap_or("?"),
+                r["onto"].as_str().unwrap_or("?"),
+                r["commits"],
+            );
+            if let Some(uid) = r["uid"].as_str() {
+                println!("  {uid} ({})", r["status"].as_str().unwrap_or("?"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `task gate` — show, set, or clear the command that verifies a landing here (D36.5).
+fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<()> {
+    let ctx = repo_ctx()?;
+    if clear {
+        session::set_gate(db, &ctx.key, None)?;
+    } else if let Some(cmd) = cmd {
+        session::set_gate(db, &ctx.key, Some(cmd))?;
+    }
+    let stored = session::stored_gate(db, &ctx.key)?;
+    let detected = if stored.is_none() {
+        session::autodetect_gate(&ctx.root)
+    } else {
+        None
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"repo": ctx.key, "gate": stored, "would_detect": detected})
+        );
+    } else {
+        match (&stored, &detected) {
+            (Some(g), _) => println!("gate for {}: {g}", ctx.key),
+            (None, Some(d)) => println!("gate for {}: (none stored; would use {d})", ctx.key),
+            (None, None) => println!(
+                "gate for {}: (none — landings here are UNVERIFIED; set one with \
+                 `jkb task gate '<cmd>'`)",
+                ctx.key
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// The `doctor` line for this repo's task sessions. Best-effort: `doctor` is often run
+/// outside a git repo entirely, and that is not a fault to report.
+fn report_sessions(db: &Db) {
+    let Ok(ctx) = repo_ctx() else { return };
+    let Ok(sessions) = session::discover(&ctx.root) else {
+        return;
+    };
+    if sessions.is_empty() {
+        return;
+    }
+    let by_branch = tasks_by_branch(db, &ctx.key).unwrap_or_default();
+    let unattended: Vec<&session::Session> = sessions
+        .iter()
+        .filter(|s| {
+            !by_branch
+                .get(&s.branch)
+                .and_then(|t| t.owner.as_deref())
+                .is_some_and(owner::is_attended)
+        })
+        .collect();
+    println!(
+        "task sessions: {} in flight, {} unattended",
+        sessions.len(),
+        unattended.len()
+    );
+    for s in unattended {
+        let uid = by_branch
+            .get(&s.branch)
+            .map_or("(no task)", |t| t.uid.as_str());
+        println!(
+            "  {} — {uid}: resume with `cd {}`, or drop it with `jkb task abandon {uid}`",
+            s.name,
+            s.worktree.display()
+        );
+    }
 }
 
 /// `task close-merged` — close tasks whose branch has landed (design D34.4).
@@ -4373,6 +5126,12 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
             println!("  run `jkb doctor --fix` to clear them");
         }
     }
+
+    // Task sessions in this repo (design D36.6). A session whose process is gone is
+    // *unattended*, not orphaned: its worktree keeps the claim on purpose, because the
+    // half-written branch is still there. Doctor's job is to make it visible, since an
+    // unattended session is otherwise indistinguishable from one you are sitting in.
+    report_sessions(db);
 
     // Cloud-sync-folder warning (design D23).
     match jkb_core::cloud_sync_warning(db_path) {
