@@ -88,12 +88,17 @@ impl Fixture {
 
     /// Open a session and return its JSON description.
     fn work(&self, uid: &str) -> serde_json::Value {
-        let out = self
-            .jkb()
-            .args(["task", "work", uid, "--json"])
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "task work {uid}: {out:?}");
+        self.work_args(&["task", "work", uid, "--json"])
+    }
+
+    /// Open a session aimed at an explicit land target.
+    fn work_onto(&self, uid: &str, onto: &str) -> serde_json::Value {
+        self.work_args(&["task", "work", uid, "--onto", onto, "--json"])
+    }
+
+    fn work_args(&self, args: &[&str]) -> serde_json::Value {
+        let out = self.jkb().args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
@@ -359,14 +364,19 @@ fn abandoning_reopens_the_task_and_removes_the_worktree() {
     f.jkb().args(["task", "work", &uid]).assert().success();
 }
 
-/// A session whose process is gone is unattended, not free — the branch is still there.
+/// A session outlives the process that opened it: the worktree is the liveness signal, and
+/// the claim must survive the owner-existence reclaim.
+///
+/// It must also be *reported as a plain session*. Nothing can observe whether anyone is
+/// sitting in one — the owner's pid belongs to the one-second `jkb task work` process — so a
+/// report that labels sessions "unattended" labels every one of them, including the one you
+/// are working in, and advises abandoning it.
 #[test]
-fn an_unattended_session_keeps_its_claim_and_is_reported() {
+fn a_session_survives_the_process_that_opened_it_and_is_reported_plainly() {
     let f = Fixture::new();
     let uid = f.add_task("walked away task");
     f.work(&uid); // the `jkb` process that claimed it has already exited
 
-    // The owner-existence reclaim must NOT free it: the worktree is the liveness signal.
     f.jkb()
         .args(["task", "reclaim"])
         .assert()
@@ -378,12 +388,215 @@ fn an_unattended_session_keeps_its_claim_and_is_reported() {
         .args(["task", "sessions"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("unattended"));
+        .stdout(predicate::str::contains("walked-away-task"))
+        .stdout(predicate::str::contains("unattended").not());
     f.jkb()
         .args(["doctor"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("1 in flight, 1 unattended"));
+        .stdout(predicate::str::contains("task sessions: 1 in flight"))
+        .stdout(predicate::str::contains("unattended").not());
+}
+
+/// `.jkb/base` is a reusable checkout. Landing a second batch onto a different branch used to
+/// die on `git worktree add` into the existing directory, and stay dead until it was deleted
+/// by hand.
+#[test]
+fn landing_onto_a_second_target_reuses_the_base_checkout() {
+    let f = Fixture::new();
+    // Batch one: cut from trunk, landed, so `.jkb/base` is left holding that branch.
+    let a = f.add_task("first batch task");
+    let sa = f.work(&a);
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+    f.jkb()
+        .args(["task", "land", &a, "--no-gate"])
+        .assert()
+        .success();
+    assert!(
+        f.repo.join(".jkb/base").exists(),
+        "the batch checkout survives"
+    );
+
+    // Batch two: a different target entirely.
+    let b = f.add_task("second batch task");
+    let sb = f.work_onto(&b, "other-batch");
+    assert_eq!(sb["onto"].as_str().unwrap(), "other-batch");
+    commit_in(
+        Path::new(sb["worktree"].as_str().unwrap()),
+        "b.txt",
+        "b\n",
+        "b",
+    );
+    f.jkb()
+        .args(["task", "land", &b, "--no-gate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed"));
+    assert!(git(&f.repo, &["ls-tree", "-r", "--name-only", "other-batch"]).contains("b.txt"));
+}
+
+/// A merged batch must not keep attracting new sessions, and must not stay undeletable
+/// because jkb is holding a checkout of it.
+#[test]
+fn a_merged_batch_is_released_rather_than_rejoined() {
+    let f = Fixture::new();
+    let a = f.add_task("batch opener");
+    let sa = f.work(&a);
+    let batch = sa["onto"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+    f.jkb()
+        .args(["task", "land", &a, "--no-gate"])
+        .assert()
+        .success();
+
+    // Merge the batch into trunk, the way finishing a PR would.
+    git(&f.repo, &["merge", "-q", "--ff-only", &batch]);
+
+    // A new task must start a NEW batch, not rejoin the merged one...
+    let b = f.add_task("task after the merge");
+    let sb = f.work(&b);
+    assert_ne!(
+        sb["onto"].as_str().unwrap(),
+        batch,
+        "a merged batch must not attract new work"
+    );
+    // ...and the merged branch must be deletable, which it is not while a worktree holds it.
+    git(&f.repo, &["branch", "-d", &batch]);
+}
+
+/// A task can carry two `branch=` values — `jkb task start` writes one too. Picking the wrong
+/// one opens a second session for a task that already has one, and then `land` cannot find it.
+#[test]
+fn a_second_branch_tag_does_not_fork_the_session() {
+    let f = Fixture::new();
+    let uid = f.add_task("task tagged twice");
+    let first = f.work(&uid);
+    // A tag that sorts AFTER the session's own branch, which is what a naive map keeps.
+    f.jkb()
+        .args(["task", "tag", "add", &uid, "branch=zzz-stale-branch"])
+        .assert()
+        .success();
+
+    let again = f.work(&uid);
+    assert_eq!(
+        again["worktree"], first["worktree"],
+        "the live session must win over a stale branch tag"
+    );
+    let wt = PathBuf::from(again["worktree"].as_str().unwrap());
+    commit_in(&wt, "x.txt", "x\n", "x");
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed"));
+}
+
+/// `task work` sets the location facets rather than adding to them, so re-targeting a session
+/// cannot leave the task claiming two land targets at once.
+#[test]
+fn retargeting_a_session_replaces_the_facets_it_records() {
+    let f = Fixture::new();
+    let uid = f.add_task("retargeted task");
+    f.work_onto(&uid, "batch-one");
+    f.work_onto(&uid, "batch-two");
+
+    // `item show` is the read that carries tags; `task show` does not.
+    let out = f
+        .jkb()
+        .args(["item", "show", &uid, "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let onto: Vec<&str> = v["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["facet"] == "onto")
+        .map(|t| t["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(onto, vec!["batch-two"], "one target, not two");
+}
+
+/// `--keep-worktree` must leave the session on what actually landed. `graft` rebases a
+/// detached HEAD, so the branch ref stays on its pre-rebase commits unless it is moved.
+///
+/// The target has to have *moved* since the session branch was cut, or the rebase is a no-op
+/// fast-forward and the branch is already on the landed commit for the wrong reason — so an
+/// earlier session lands first.
+#[test]
+fn keeping_the_worktree_moves_its_branch_to_what_landed() {
+    let f = Fixture::new();
+    let first = f.add_task("earlier task");
+    let uid = f.add_task("kept session task");
+    let s1 = f.work(&first);
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s1["worktree"].as_str().unwrap()),
+        "f.txt",
+        "f\n",
+        "f",
+    );
+    commit_in(&wt, "k.txt", "k\n", "k");
+
+    // Move the target out from under the kept session, so its land is a real rebase.
+    f.jkb()
+        .args(["task", "land", &first, "--no-gate"])
+        .assert()
+        .success();
+    let before = git(&f.repo, &["rev-parse", &branch]);
+
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate", "--keep-worktree"])
+        .assert()
+        .success();
+
+    assert!(wt.exists(), "the worktree was kept");
+    assert_ne!(
+        git(&f.repo, &["rev-parse", &branch]),
+        before,
+        "the rebase produced a new commit, so the branch must have moved to it"
+    );
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-list", "--count", &format!("{onto}..{branch}")]
+        ),
+        "0",
+        "the kept session must sit on what landed, not on its pre-rebase commits"
+    );
+}
+
+/// jkb appends its exclusion; it must never rewrite a file whose contents it did not author.
+#[test]
+fn excluding_jkb_preserves_existing_ignore_rules() {
+    let f = Fixture::new();
+    let exclude = f.repo.join(".git/info/exclude");
+    // Contents jkb cannot read as UTF-8 — the case that used to be treated as "empty".
+    let original = b"# mine\n/secret-scratch/\n\xff\xfe not utf-8\n".to_vec();
+    std::fs::write(&exclude, &original).unwrap();
+
+    let uid = f.add_task("task in a repo with local ignores");
+    f.work(&uid);
+
+    let after = std::fs::read(&exclude).unwrap();
+    assert!(
+        after.starts_with(original.as_slice()),
+        "the user's ignore rules must survive verbatim"
+    );
+    assert!(String::from_utf8_lossy(&after).contains("/.jkb/"));
 }
 
 /// The gate is per repo and configurable — the setting a landing depends on must be

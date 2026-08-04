@@ -562,14 +562,28 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   `make test`) — and a flag or a detection is *stored*, so the guess is made once. The chosen
   command is always printed; a gate that silently did not run is worse than none, because the
   landing reads as verified.
-- **A session's claim is owned by the worktree, the pid is only attendance** (D36.6). Owner ids
-  gained the form `session:<pid>:<worktree>`; `owner_pid` still reads field 1, and `is_alive`
-  gained one clause: alive if the pid lives **or** the worktree exists. `jkb task work` exits in
-  a second, so a plain `host:pid` owner would be dead on arrival and `doctor --fix` would free
-  the task mid-session. Live pid is a good positive signal and a bad negative one — closing a
-  terminal does not finish the work, and freeing the claim then is how a swarm run starts the
-  same task on a second branch. Only `land`/`abandon`, which remove the worktree, free a claim;
-  `sessions` and `doctor` report a dead-pid session as **unattended**.
+- **A session's claim is owned by the worktree; the pid is provenance, not liveness** (D36.6).
+  Owner ids gained the form `session:<pid>:<worktree>`, and `is_alive` judges a session owner
+  **only** by whether its worktree exists. `jkb task work` exits in a second, so a plain
+  `host:pid` owner would be dead on arrival and `doctor --fix` would free the task mid-session.
+  The pid is not consulted even as a fallback: it belongs to a process that has already exited,
+  so it can only ever be wrong — falsely dead (its original bug) or, once recycled, falsely
+  alive for a session `land` already removed. Only `land`/`abandon`, which remove the worktree,
+  free a claim. There is deliberately **no attended/unattended axis**: nothing observable can
+  tell a session you are sitting in from one you walked away from, and a flag built on that pid
+  labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
+  is observable — uncommitted work and commits ahead.
+- **Location facets are set, not added.** `branch=`/`repo=`/`onto=`/`base=` go through
+  `set_facet`, which clears the facet's other values first. `tag::apply` is additive, which is
+  right for open-ended facets and wrong here: a second `branch=` is a contradiction, not extra
+  information, and readers that collapse the multi-map pick one and mint a second session for a
+  task that already has one. `task_tags` therefore returns **all** values per facet, and the
+  session lookup matches a task's recorded branches against the worktrees that actually exist.
+- **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
+  whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
+  would wedge landing until the directory was deleted by hand), and it is removed once its batch
+  has merged — otherwise it both attracts new sessions onto a dead branch and stops
+  `git branch -d` from deleting it.
 - `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
   algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
   directly and it must work in any repo.

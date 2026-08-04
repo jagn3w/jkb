@@ -44,7 +44,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("jkb.workTask", (child?: TreeChild) =>
       workTaskWithClaude(client, child),
     ),
-    vscode.commands.registerCommand("jkb.landTask", (child?: TreeChild) => landTask(child)),
+    vscode.commands.registerCommand("jkb.landTask", (child?: TreeChild) =>
+      landTask(client, child),
+    ),
   );
 }
 
@@ -219,14 +221,15 @@ async function workTaskWithClaude(client: CliJkbClient, child?: TreeChild): Prom
  * Run in a terminal rather than captured, because the gate is a build — the user needs to
  * watch it, and a red one needs its output.
  */
-function landTask(child?: TreeChild): void {
+function landTask(client: CliJkbClient, child?: TreeChild): void {
   const uid = taskUid(child, "land");
   if (!uid) return;
   const cwd = repoFolder();
   if (!cwd) return;
   const terminal = vscode.window.createTerminal({ name: `jkb land: ${uid.slice(-24)}`, cwd });
   terminal.show();
-  terminal.sendText(`jkb task land ${shellQuote(uid)}`);
+  // Built by the client so it carries the configured cliPath/dbPath, like every other call.
+  terminal.sendText(client.terminalCommand(["task", "land", uid]));
 }
 
 /** Single-quote a string for safe use in a POSIX shell. */

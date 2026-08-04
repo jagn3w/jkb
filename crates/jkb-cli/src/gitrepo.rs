@@ -316,11 +316,23 @@ pub fn ahead_count(dir: &Path, onto: &str, branch: &str) -> Result<usize> {
     )
 }
 
+/// Check `branch` out in the working tree at `dir`.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or refuses the switch (a dirty tree, or the
+/// branch being checked out in another worktree).
+pub fn switch_to(dir: &Path, branch: &str) -> Result<()> {
+    git_must(dir, &["switch", branch])?;
+    Ok(())
+}
+
 /// The outcome of [`graft`]: what happened to the target branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Graft {
-    /// `onto` was fast-forwarded to `branch`'s commits, rebased onto its live tip.
-    Landed,
+    /// `onto` was fast-forwarded to `branch`'s commits, rebased onto its live tip. Carries
+    /// the commit the rebase produced, so the caller can point the branch at what actually
+    /// landed instead of leaving it on its pre-rebase commits.
+    Landed { grafted: String },
     /// The rebase hit a conflict; nothing changed. The branch's author must rebase it.
     Conflict,
 }
@@ -331,7 +343,8 @@ pub enum Graft {
 ///
 /// The rebase runs on a **detached HEAD** at `branch` rather than via `git rebase <onto>
 /// <branch>`, because that form checks `branch` out first and git refuses while the session
-/// worktree holds it (design D36.4). Detaching does not claim the ref.
+/// worktree holds it (design D36.4). Detaching does not claim the ref — which also means it
+/// does not *move* it: `branch` still points at its pre-rebase commits when this returns.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed, or if the working tree cannot be put on
@@ -355,7 +368,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
         reset_hard(dir, &pre)?;
         return Ok((Graft::Conflict, pre));
     }
-    Ok((Graft::Landed, pre))
+    Ok((Graft::Landed { grafted }, pre))
 }
 
 /// Hard-reset the working tree at `dir` to `reference` — the rollback after a red gate.

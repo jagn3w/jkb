@@ -7,6 +7,7 @@
 //! and its claim) — there is no session state file to drift.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -124,8 +125,13 @@ pub struct Session {
 /// The exclusion goes in `.git/info/exclude` rather than `.gitignore`: it is local, needs no
 /// commit, and jkb has no business editing a tracked file in someone else's repo.
 ///
+/// This **appends** and never rewrites. Read the file to decide whether the entry is already
+/// there, by all means — but a read that failed must not become an empty `current` that a
+/// whole-file write then makes true, destroying ignore rules jkb did not author. Appending
+/// makes the worst case a duplicate line, which git ignores.
+///
 /// # Errors
-/// Returns an error only if the exclude file exists but cannot be read or appended to.
+/// Returns an error if the entry cannot be appended.
 pub fn ensure_excluded(repo_root: &Path) -> Result<()> {
     let exclude = repo_root.join(".git").join("info").join("exclude");
     let Some(parent) = exclude.parent() else {
@@ -136,21 +142,26 @@ pub fn ensure_excluded(repo_root: &Path) -> Result<()> {
     if !parent.exists() {
         return Ok(());
     }
-    let current = fs::read_to_string(&exclude).unwrap_or_default();
+    // Bytes, not `read_to_string`: an exclude file in some other encoding is still a file
+    // whose contents matter, and it must not be a reason to fail or to overwrite.
+    let current = fs::read(&exclude).unwrap_or_default();
+    let text = String::from_utf8_lossy(&current);
     let entry = format!("/{JKB_DIR}/");
-    if current.lines().any(|l| l.trim() == entry) {
+    if text.lines().any(|l| l.trim() == entry) {
         return Ok(());
     }
-    let sep = if current.is_empty() || current.ends_with('\n') {
+    let sep = if current.is_empty() || current.ends_with(b"\n") {
         ""
     } else {
         "\n"
     };
-    fs::write(
-        &exclude,
-        format!("{current}{sep}# jkb task sessions (git worktrees)\n{entry}\n"),
-    )
-    .with_context(|| format!("appending to {}", exclude.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)
+        .with_context(|| format!("opening {}", exclude.display()))?;
+    write!(file, "{sep}# jkb task sessions (git worktrees)\n{entry}\n")
+        .with_context(|| format!("appending to {}", exclude.display()))?;
     Ok(())
 }
 
@@ -233,7 +244,7 @@ impl LandLock {
                     let alive = holder
                         .trim()
                         .parse::<u32>()
-                        .is_ok_and(|pid| crate::owner::is_attended(&format!("host:{pid}")));
+                        .is_ok_and(crate::owner::pid_alive);
                     anyhow::ensure!(
                         !alive,
                         "another `jkb task land` is running here (pid {}) — landing is serial \

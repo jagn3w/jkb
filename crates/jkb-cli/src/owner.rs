@@ -23,8 +23,9 @@ pub fn self_owner() -> String {
 
 /// The owner id for a session working in `worktree`: `session:<this pid>:<worktree>`.
 ///
-/// The pid records who is *attending* the session right now; the worktree records that the
-/// session exists at all. See [`is_alive`] for why the two are not the same question.
+/// The pid is **provenance** — which `jkb task work` process opened the session — and is
+/// deliberately *not* a liveness signal: that process exits within a second, long before
+/// anyone reads the claim. Liveness is the worktree; see [`is_alive`].
 #[must_use]
 pub fn session_owner(worktree: &Path) -> String {
     format!(
@@ -51,12 +52,11 @@ pub fn session_worktree(owner: &str) -> Option<PathBuf> {
     Some(PathBuf::from(rest.join(":")))
 }
 
-/// Whether `owner`'s process is running right now — for a session, whether anyone is sitting
-/// in it. A session with no live pid is *unattended*, not finished: its branch is still
-/// there and the task is still its owner's (design D36.6).
+/// Whether a process with this pid exists — the raw probe, for callers that hold a pid
+/// rather than an owner id (the land lock's stale-holder check).
 #[must_use]
-pub fn is_attended(owner: &str) -> bool {
-    owner_pid(owner).is_some_and(pid_exists)
+pub fn pid_alive(pid: u32) -> bool {
+    pid_exists(pid)
 }
 
 /// Best-effort local hostname (informational; single-host — the pid is what liveness
@@ -90,18 +90,21 @@ pub fn owner_pid(owner: &str) -> Option<u32> {
 /// we cannot parse a pid from is treated as **not alive** (reclaimable) so a malformed
 /// claim never wedges a task forever.
 ///
-/// A **session** owner (`session:<pid>:<worktree>`, design D36.6) is additionally alive
-/// while its worktree exists. `jkb task work` exits in under a second, so its pid would be
-/// gone immediately; the thing that persists — and that means "this work is in flight" — is
-/// the checkout. Freeing the claim when the terminal closes is the wrong direction of error:
-/// the half-written branch is still there, and a swarm run or a second click would start the
-/// same task again on a second branch.
+/// A **session** owner (`session:<pid>:<worktree>`, design D36.6) is judged **only** by its
+/// worktree. `jkb task work` exits in under a second, so its pid is gone before anyone reads
+/// the claim; the thing that persists — and that means "this work is in flight" — is the
+/// checkout. Freeing the claim when a terminal closes is the wrong direction of error: the
+/// half-written branch is still there, and a swarm run or a second click would start the same
+/// task again on a second branch.
+///
+/// The pid is ignored here rather than consulted as a fallback, so a *recycled* pid cannot
+/// keep a removed session's claim alive after `land`/`abandon` took its worktree away.
 #[must_use]
 pub fn is_alive(owner: &str) -> bool {
-    if owner_pid(owner).is_some_and(pid_exists) {
-        return true;
+    if let Some(worktree) = session_worktree(owner) {
+        return worktree.exists();
     }
-    session_worktree(owner).is_some_and(|w| w.exists())
+    owner_pid(owner).is_some_and(pid_exists)
 }
 
 /// Whether a process with this pid exists. `ps -p <pid> -o pid=` prints the pid and exits 0
@@ -116,7 +119,7 @@ fn pid_exists(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_alive, is_attended, owner_pid, self_owner, session_owner, session_worktree};
+    use super::{is_alive, owner_pid, self_owner, session_owner, session_worktree};
 
     #[test]
     fn self_owner_is_host_colon_pid() {
@@ -154,15 +157,19 @@ mod tests {
         assert_eq!(owner_pid(&owner), Some(std::process::id()));
         assert_eq!(session_worktree(&owner).as_deref(), Some(tmp.path()));
 
-        // A dead pid but a live worktree: the session is unattended, NOT reclaimable.
+        // A dead pid but a live worktree: still claimed. The pid is provenance, not liveness.
         let orphan = format!("session:4294967290:{}", tmp.path().display());
         assert!(is_alive(&orphan), "a live worktree keeps the claim");
-        assert!(!is_attended(&orphan), "nobody is sitting in it");
 
         // Remove the worktree and the claim becomes reclaimable — `land`/`abandon` are the
-        // only commands that do this.
-        let gone = format!("session:4294967290:{}", tmp.path().join("nope").display());
-        assert!(!is_alive(&gone));
+        // only commands that do this. A live pid must NOT keep it alive: pids are recycled,
+        // and this one belongs to a process that exited long ago.
+        let gone = format!(
+            "session:{}:{}",
+            std::process::id(),
+            tmp.path().join("nope").display()
+        );
+        assert!(!is_alive(&gone), "the worktree alone decides");
 
         // Non-session owners are unaffected: pid alone still decides.
         assert!(session_worktree("host:123").is_none());

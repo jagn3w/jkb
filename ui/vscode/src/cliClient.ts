@@ -88,6 +88,21 @@ export class CliJkbClient implements JkbClient {
     return this.json<SessionInfo>(["task", "work", uid], cwd);
   }
 
+  /**
+   * The shell command line for `args`, carrying the same `cliPath`/`dbPath` every spawned
+   * call uses.
+   *
+   * For commands that must run in a terminal the user watches rather than be captured — a
+   * landing runs the repo's build. Composing the line by hand instead would silently target
+   * the default database, marking tasks done in a KB the explorer is not even showing.
+   */
+  terminalCommand(args: string[]): string {
+    const parts = [this.cfg.cliPath];
+    if (this.cfg.dbPath) parts.push("--db", this.cfg.dbPath);
+    parts.push(...args);
+    return parts.map(shellQuote).join(" ");
+  }
+
   async listChildren(ref: NodeRef | null, opts?: ListOptions): Promise<TreeChild[]> {
     // Containment is a behaviour, not a node kind: `jkb ls` lists the children of a pure
     // namespace or of a parent task alike, so the client passes the node's address and does
@@ -168,6 +183,11 @@ export class CliJkbClient implements JkbClient {
       });
     });
   }
+}
+
+/** Single-quote a string for safe use in a POSIX shell. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 function toTreeChild(c: RawChild): TreeChild {
