@@ -109,6 +109,16 @@ const VERDICT = {
   required: ['refuted', 'reason'],
 }
 
+const GROUPS = {
+  type: 'object',
+  properties: {
+    // Indices of findings that are the same defect. Singletons may be omitted.
+    groups: { type: 'array', items: { type: 'array', items: { type: 'integer' } } },
+    note: { type: 'string' },
+  },
+  required: ['groups'],
+}
+
 const RANKED = {
   type: 'object',
   properties: {
@@ -174,9 +184,12 @@ For each finding give:
   scenario     CONCRETE inputs or state, then the wrong result. If you cannot write this, you
                do not have a finding yet — either find the concrete case or drop it.
   fix          the direction in a sentence. Not a patch.
-  severity     must-fix (wrong now / next run / loses data) · concern (wrong under conditions
-               that will occur) · nit (small or local). Severity is earned by how concrete and
-               inevitable the harm is — never by how strongly you hold the view.
+  severity     must-fix · concern · nit. The test for must-fix is **would you hold the merge
+               for this?** — ask it of each finding individually and answer honestly; on a
+               healthy change that is a small handful at most. nit is small or local, and you
+               should be using it: a run where nearly everything is "concern" has told the
+               reader nothing and left them to prioritize unaided. Severity is earned by how
+               concrete and inevitable the harm is, never by how strongly you hold the view.
   kind         defect or quality.
 
 Report NOTHING you are not prepared to defend against a skeptic reading the real code. A
@@ -184,11 +197,14 @@ finding that turns out to be already handled costs the reader exactly as much at
 real one. Returning an empty list is a perfectly good outcome — say in \`coverage\` what you
 examined and why nothing engaged your question.
 
-AT MOST ${PER_REVIEWER_CAP} FINDINGS. This is a hard cap, and it is not a target — most reviews
-should come in well under it. If you have more candidates, report only the ones you would
-defend first and say in \`coverage\` how many you set aside and roughly what they were. Every
-finding you report is independently re-verified by other agents reading the code, so padding
-the list is expensive as well as noisy.
+AT MOST ${PER_REVIEWER_CAP} FINDINGS — a ceiling, emphatically not a target. Coming back with
+one finding you are sure of is a better review than ${PER_REVIEWER_CAP} you are hedging on, and
+returning none is better still when there is nothing. The bar for each is: **would you raise
+this with the author face to face, and be confident it was worth their time?** If you would
+soften it to "you might want to consider…", it does not clear the bar. If you have more
+candidates than the cap, report the ones you would defend first and say in \`coverage\` how many
+you set aside and what they were. Every finding is independently re-verified by other agents
+reading the code, so padding costs real money as well as attention.
 
 READING BUDGET. Some files here are thousands of lines. Locate what you need with \`grep -n\`
 and read bounded ranges around it; do not read a large file end to end. Read *widely* — many
@@ -595,6 +611,28 @@ read, and why each step of the claimed failure path follows. If you cannot write
 answer is refuted.`
 }
 
+function consolidatePrompt(findings) {
+  const list = findings
+    .map((f, i) => `${i}. [${f.severity}] ${f.file}:${f.line} — ${(f.summary || '').slice(0, 180)}`)
+    .join('\n')
+  return `Group the code-review findings below by WHICH DEFECT THEY ARE, so the same one is not verified several times over. This is a cheap consolidation step: judge from the summaries alone, do not read any code, and do not evaluate whether the findings are correct.
+
+${list}
+
+Two findings belong in the same group when **one change would resolve both** — the same defect
+reported by different reviewers in different words, or reported at two locations that are the
+same underlying problem (a rule and the doc that describes it; the same mistake at two lines of
+one function). Reviewers here work from different angles, so the same defect routinely arrives
+described three different ways.
+
+Do NOT group merely related things: two different bugs in one function, or two instances that
+would each need their own fix, are separate. When unsure, leave them separate — wrongly merging
+loses a finding, while wrongly splitting only costs one more verification.
+
+Return \`groups\` as arrays of indices, listing only groups of two or more. Anything you do not
+mention stays on its own.`
+}
+
 function rankPrompt(findings) {
   return `You are the RANKING pass of a code review in the repo at ${REPO}. Every finding below already survived adversarial verification. Your job is calibration and consolidation — NOT re-reviewing, and NOT finding anything new.
 
@@ -739,15 +777,48 @@ if (deduped.length === 0) {
   return { findings: [], reviewers: reviewers.length, raw: raw.length, refuted: 0, note: 'no findings' }
 }
 
+// CONSOLIDATE. Deterministic dedup only catches an identical file:line or summary, but the same
+// defect routinely arrives from three angles in three wordings at three locations — and each
+// copy would otherwise buy its own skeptics, which is the expensive stage. One cheap agent
+// judging from summaries alone collapses them first. It is best-effort: a failure here costs
+// duplicate verification, never a lost finding.
+phase('Verify')
+let candidates = deduped
+if (deduped.length > 3) {
+  const grouped = await agent(consolidatePrompt(deduped), {
+    label: 'consolidate',
+    phase: 'Verify',
+    schema: GROUPS,
+  })
+  const merged = []
+  const claimed = new Set()
+  for (const group of (grouped && grouped.groups) || []) {
+    // Trust nothing about the indices: out-of-range or already-used ones are dropped rather
+    // than allowed to drop a finding or duplicate one.
+    const members = [...new Set(group)]
+      .filter((i) => Number.isInteger(i) && i >= 0 && i < deduped.length && !claimed.has(i))
+    if (members.length < 2) continue
+    members.forEach((i) => claimed.add(i))
+    const picked = members.map((i) => deduped[i]).sort(bySeverityFirst)
+    // Keep the gravest reading, and record every lens that saw it — agreement across angles is
+    // itself evidence, and the ranking pass is told to weigh it.
+    merged.push({ ...picked[0], lens: picked.map((f) => f.lens).join(' + ') })
+  }
+  const singles = deduped.filter((_, i) => !claimed.has(i))
+  candidates = [...merged, ...singles].sort(bySeverityFirst)
+  if (candidates.length !== deduped.length) {
+    log(`${deduped.length - candidates.length} near-duplicate(s) consolidated before verification`)
+  }
+}
+
 // VERIFY. Each finding faces SKEPTICS fresh skeptics with different angles; it survives on a
 // majority failing to refute it (design D37.3).
-phase('Verify')
 // Verification dominates the cost of a review — it is the one stage multiplied by the number of
 // findings — so it is STAGED rather than flat. One decisive skeptic runs first and kills the
 // cheap mistakes; only findings that survive it AND are worth the money face the other two.
 // 2-of-3 is preserved for those: stage one standing plus at least one of stage two.
-const toVerify = deduped.slice(0, VERIFY_CAP)
-const unverified = deduped.slice(VERIFY_CAP)
+const toVerify = candidates.slice(0, VERIFY_CAP)
+const unverified = candidates.slice(VERIFY_CAP)
 if (unverified.length) {
   log(`NOTE: ${unverified.length} finding(s) past the verify cap of ${VERIFY_CAP} are reported UNVERIFIED, not dropped`)
 }
