@@ -575,12 +575,24 @@ these go wrong. But read it in BOUNDED pieces:
 Reading one large file end to end costs more than the finding is worth, and buys nothing over
 reading the right two hundred lines.
 
-DEFAULT TO REFUTED WHEN UNCERTAIN. A false finding costs the reader the same attention as a true
-one, and a reviewer that cries wolf stops being read at all — including when it is right. Only
-let it stand if, having genuinely tried, you cannot break it from your angle.
+THE BURDEN OF PROOF IS ON THE FINDING. It stands only if you can POSITIVELY ESTABLISH it against
+the real code — not merely fail to disprove it. These are different bars, and the difference is
+the whole job: "I could not find a guard" is not the same as "I confirmed there is no guard on
+any path that reaches this", and only the second earns refuted=false.
 
-Return refuted=true with the specific reason (quote the guard, name the divergence, cite the
-decision), or refuted=false with what you verified and failed to break.`
+So refuted=true covers three cases, not one:
+  · you found the guard, the divergence, or the recorded decision that kills it; OR
+  · you could not establish a load-bearing part of the claim — the scenario's conditions are not
+    actually reachable, or you could not confirm the code does what the finding says; OR
+  · you ran out of certainty. Uncertainty refutes. Say what you could not establish.
+
+A false finding costs the reader the same attention as a true one, and a reviewer that cries
+wolf stops being read at all — including when it is right.
+
+Return refuted=true with the specific reason (the guard you found, or the part you could not
+establish), or refuted=false with the concrete chain you verified in the code: which lines you
+read, and why each step of the claimed failure path follows. If you cannot write that chain, the
+answer is refuted.`
 }
 
 function rankPrompt(findings) {
@@ -616,13 +628,25 @@ ${JSON.stringify(findings, null, 2)}
    is a nit. **Demote it.**
    Be willing to move things DOWN generally. If everything is must-fix, nothing is.
 
-3. ORDER most severe first, and within a severity, by how much damage it does.
+   THE TEST FOR must-fix IS: **would you hold the merge for this?** Ask it of each one
+   individually and answer honestly. On a healthy change the answer is yes for a handful at
+   most — if you are marking more than about a fifth of the set must-fix, you are not
+   calibrating, you are relaying. The previous run of this reviewer put 34 of 45 findings on
+   "concern", which is the same failure one tier down: a severity every finding shares carries
+   no information and leaves the reader to prioritize unaided, which is the job you are here to
+   do.
+
+3. ORDER STRICTLY, most damaging first — a total order across the whole set, not just grouped by
+   tier. The reader works down this list and stops when they run out of time, so position 1 must
+   genuinely be the thing most worth their next hour.
 
 4. SHARPEN each summary to one line that states the DEFECT — what is wrong — rather than the
    topic. "X is never removed, so a second Y wedges" beats "cleanup issue in X". Keep the
    scenario concrete. Do not lengthen anything.
 
-Return the consolidated, calibrated, ordered list, plus a one-line \`note\` on what you merged.`
+Return the consolidated, calibrated, ordered list, plus a \`note\` giving what you merged and —
+in one sentence — why the must-fix set is the size it is. If it is empty, say that plainly;
+a change with nothing worth holding the merge for is a normal and good outcome.`
 }
 
 // ---------------------------------------------------------------------------
