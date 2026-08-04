@@ -25,7 +25,8 @@
       { "command": "jkb.toggleTerminal", "title": "jkb: Show/Hide Completed Tasks", "icon": "$(eye)" },
       { "command": "jkb.search", "title": "jkb: Search", "icon": "$(search)" },
       { "command": "jkb.openDetails", "title": "jkb: Open Details" },
-      { "command": "jkb.workTask", "title": "jkb: Work this task with Claude", "icon": "$(sparkle)" }
+      { "command": "jkb.workTask", "title": "jkb: Work this task with Claude", "icon": "$(sparkle)" },
+      { "command": "jkb.landTask", "title": "jkb: Land this task", "icon": "$(git-merge)" }
     ],
     "menus": {
       "view/title": [
@@ -35,7 +36,8 @@
       ],
       "view/item/context": [
         { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "inline" },
-        { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "jkb@1" }
+        { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "jkb@1" },
+        { "command": "jkb.landTask", "when": "view == jkb.explorer && viewItem == task", "group": "jkb@2" }
       ]
     },
     "configuration": {

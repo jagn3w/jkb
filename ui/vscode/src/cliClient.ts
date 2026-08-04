@@ -66,8 +66,42 @@ interface RawItem {
   preview_truncated: boolean;
 }
 
+/** `jkb task work --json`: the isolated checkout a task is being worked in (design D36). */
+export interface SessionInfo {
+  readonly uid: string;
+  readonly session: string;
+  readonly worktree: string;
+  readonly branch: string;
+  readonly onto: string;
+  readonly resumed: boolean;
+}
+
 export class CliJkbClient implements JkbClient {
   constructor(private readonly cfg: CliConfig) {}
+
+  /**
+   * Open (or return) the task's session — its own git worktree and branch, claimed so no
+   * other terminal or swarm run starts the same task. Must run inside the repo, which is
+   * why this one takes a cwd: sessions are git state, not KB state.
+   */
+  async openSession(uid: string, cwd: string): Promise<SessionInfo> {
+    return this.json<SessionInfo>(["task", "work", uid], cwd);
+  }
+
+  /**
+   * The shell command line for `args`, carrying the same `cliPath`/`dbPath` every spawned
+   * call uses.
+   *
+   * For commands that must run in a terminal the user watches rather than be captured — a
+   * landing runs the repo's build. Composing the line by hand instead would silently target
+   * the default database, marking tasks done in a KB the explorer is not even showing.
+   */
+  terminalCommand(args: string[]): string {
+    const parts = [this.cfg.cliPath];
+    if (this.cfg.dbPath) parts.push("--db", this.cfg.dbPath);
+    parts.push(...args);
+    return parts.map(shellQuote).join(" ");
+  }
 
   async listChildren(ref: NodeRef | null, opts?: ListOptions): Promise<TreeChild[]> {
     // Containment is a behaviour, not a node kind: `jkb ls` lists the children of a pure
@@ -125,17 +159,17 @@ export class CliJkbClient implements JkbClient {
 
   // ---- process plumbing ----
 
-  private async json<T>(args: string[]): Promise<T> {
-    const out = await this.run([...args, "--json"]);
+  private async json<T>(args: string[], cwd?: string): Promise<T> {
+    const out = await this.run([...args, "--json"], cwd);
     return JSON.parse(out) as T;
   }
 
-  private run(args: string[]): Promise<string> {
+  private run(args: string[], cwd?: string): Promise<string> {
     const full: string[] = [];
     if (this.cfg.dbPath) full.push("--db", this.cfg.dbPath);
     full.push(...args);
     return new Promise((resolve, reject) => {
-      const child = spawn(this.cfg.cliPath, full);
+      const child = spawn(this.cfg.cliPath, full, cwd ? { cwd } : {});
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d) => (stdout += d));
@@ -149,6 +183,11 @@ export class CliJkbClient implements JkbClient {
       });
     });
   }
+}
+
+/** Single-quote a string for safe use in a POSIX shell. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 function toTreeChild(c: RawChild): TreeChild {

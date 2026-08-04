@@ -46,6 +46,24 @@ exact); `grep` for a *literal string* in content; `search` for *fuzzy/semantic* 
 - `jkb task show <uid>` — the full task body.
 - `jkb task set <uid> --status open|in_progress|needs_review|done` (`blocked` is derived, never set).
 
+## Working tasks in parallel (a session is a git worktree)
+
+Several tasks can be worked at once without sharing a checkout. Each session has its own
+worktree and branch, and its task is claimed, so nothing else — another terminal, a swarm
+run — starts the same one.
+
+- `jkb task work <uid>` — open (or return to) the task's session. Work and **commit** inside
+  the worktree it prints, and nowhere else. Running it twice returns the same session.
+- `jkb task land <uid>` — rebase the session onto its target branch, run the repo's gate, and
+  on green mark the task done and clean the session up. Landing is serial, so a red gate
+  means *your* branch broke the integrated result.
+- `jkb task abandon <uid>` — drop the session and reopen the task (the branch is kept).
+- `jkb task sessions` — what is in flight, and which sessions nobody is sitting in.
+- `jkb task gate ["<cmd>"]` — the command that verifies a landing here (remembered per repo).
+
+If you are working *inside* a session, landing is the human's call: commit your work and say
+so. Do not mark the task done, and do not merge or rebase onto the target yourself.
+
 ## Recover a previous version
 
 File sync stores the bytes of **every version it settles**, and blobs are never deleted — so
