@@ -2905,7 +2905,7 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               on green mark the task done and remove the session. Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
-  jkb task sessions           what is in flight here, and which sessions are unattended.
+  jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
       If you are inside a session, land is the human's call — commit, and say you are done.
 
@@ -5231,10 +5231,10 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         }
     }
 
-    // Task sessions in this repo (design D36.6). A session whose process is gone is
-    // *unattended*, not orphaned: its worktree keeps the claim on purpose, because the
-    // half-written branch is still there. Doctor's job is to make it visible, since an
-    // unattended session is otherwise indistinguishable from one you are sitting in.
+    // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on
+    // purpose — the half-written branch is still there — so a session is never reported as
+    // orphaned. Doctor lists every one, because nothing observable distinguishes a session
+    // you are working in from one you walked away from.
     report_sessions(db);
 
     // Cloud-sync-folder warning (design D23).

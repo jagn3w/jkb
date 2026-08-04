@@ -588,6 +588,74 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
   directly and it must work in any repo.
 
+## Code review (D37) — our own reviewer, because the host's is not composable
+
+`/review-log` used to wrap the host's `/code-review`, which reports to the user rather than
+returning findings — so the wrapper's middle step was a hole. We write the reviewer now
+(design `openspec/changes/jkb-code-review/`), which makes these prompts a load-bearing input
+to the project. `.claude/workflows/code-review.js` holds all of it and returns structured
+findings; `/review` prints them, `/review-log` files them as tasks. Portable: it runs in any
+git repo, and project context is used when found and skipped when absent.
+
+- **Two axes, because they miss different things.** Eight **lenses** run horizontally (one
+  question, whole diff); a dynamic number of **feature reviewers** run vertically (one
+  capability, end to end — is it complete across its surfaces, coherent between its parts, and
+  does it actually work when run?). A two-agent scout (survey ∥ context, both bounded) clusters
+  the diff into functional units the way `/task-swarm`'s SCHEDULER clusters tasks. Two of this
+  repo's escaped bugs were feature-level: `8a50925` shipped a frontier rule with no view, and
+  `16d4e4d` ran to completion having embedded 0 of 56,402 items.
+- **A ninth reviewer, `structure`, owns "is there a better way to factor this?"** — deliberately
+  not a lens, because it asks whether the code is well built rather than whether it is wrong. It
+  must name **what the shape costs today** or the finding is dropped, and it is verified by its
+  own skeptic asking whether the change is worth the churn — the defect skeptics would refute
+  every structural suggestion by construction, since a suggestion has no reproduction. The eight
+  lenses are told structure is not theirs, so they stay on defects. Duplication straddles: copies
+  that can **drift apart** are a defect (`contract`); copies that are merely repetitive belong to
+  `structure`.
+- **Quality is priced, not capped.** A structural finding can reach `concern` or `must-fix` — a
+  missing seam where an invariant needed a choke point outranks a bounds check — but it earns the
+  rank with evidence, on the same ladder defects use. `concern` requires citing where the cost is
+  **already being paid** (the second place that had to change and did not; two live names for one
+  concept); `must-fix` requires showing the mechanism that makes a property unenforceable or
+  forces a coming change to go wrong. "This would be better" is a nit however well argued, and
+  the ranking pass demotes it — a bar that is checkable without re-reading the code, unlike a
+  ceiling, which was the blunt first version of this rule.
+- **The lenses are derived from kinds of assumption, not from our bug history** — a defect is a
+  violated assumption, and each kind has a testing discipline that exists because nothing else
+  finds it: `input` (boundary/fuzz), `state` (state machine — *what happens the second time?*),
+  `inference` (*X is treated as evidence of Y — when do they come apart?*), `contract`
+  (integration — *who else touches this fact?*), `concurrency`, `failure` (fault injection),
+  `scale` (load), `intent` (oracle — does it do what its name, docs, types and **tests** claim,
+  including *would this test fail if the change were reverted?*). Fitting the set to our own 57
+  past findings would have produced something that transfers to no other repo. **Security is
+  not a ninth lens**: injection is `input`, authorization is `contract`, "this token proves that
+  claim" is `inference`, and each of those three is told to cover its half; `/security-review`
+  is the dedicated pass.
+- **Recall first, then filter with software.** Fan out wide, then put every finding to three
+  fresh skeptics with *different angles* (already handled? / does it reproduce? / is it real and
+  in scope?) that **default to refuted when uncertain**; it survives on 2 of 3. A false positive
+  costs the reader the same attention as a real finding, and repeated, costs the reviewer its
+  credibility — after which the true findings are not read either.
+- **Severity is assigned once, at the end.** Finders each see only their own findings, so their
+  severities are not comparable. One ranking pass merges near-duplicates and puts everything on
+  one scale: `must-fix`/`concern`/`nit` → `!p1`/`!p2`/`!p3`. Quality findings are in scope but
+  **capped at nit**; pure tidiness is out entirely (`/simplify` covers it).
+- **Accuracy is measured, never fed back.** Findings are tasks, so `done` vs `cancelled` gives an
+  acceptance rate, reported per run. It is deliberately not used to suppress a class: a class
+  that keeps being dismissed may be a real problem the team keeps deciding not to fix, and
+  silently ceasing to report it would turn that decision into an invisible one.
+- **Verification is the cost, and it is a product of three terms.** The first full run cost 153
+  agents and 6.5M tokens on a 2,851-line diff, ~85% of it verification: `findings (69) × skeptics
+  (3, on everything) × context per skeptic (a whole 5,271-line main.rs)`. Each term multiplies
+  the others, so all three are bounded — a per-reviewer finding cap (which also improves output:
+  forced to pick five, a reviewer reports its five best rather than padding), **staged**
+  verification (one decisive skeptic kills cheap mistakes; only non-nit survivors face the other
+  two, preserving 2-of-3 for those), and bounded reading (`grep -n` the enclosing function, never
+  a large file end to end — the largest single lever). Findings past the verify cap are reported
+  `unverified`, never dropped, or a budget limit would look like a clean review. **Budget ~30
+  agents per 1,000 diff lines at `medium`**; above ~2,000 lines, several smaller ranges are both
+  cheaper and a better review.
+
 ## Design gate (D28) — human design, swarm implementation
 
 The swarm implementers run headless (Workflow sub-agents) and **cannot ask the user** about
