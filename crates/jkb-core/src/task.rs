@@ -366,6 +366,52 @@ pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
         .map_err(Into::into)
 }
 
+/// Subtask counts for many parents at once, as `parent -> (total, open)`; parents with no
+/// subtasks are absent.
+///
+/// Batched because the tree asks this for every item it lists — one query per row is the
+/// N+1 the listing already avoids for namespace leaf counts.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn subtask_counts(
+    conn: &Connection,
+    parents: &[ItemId],
+) -> Result<std::collections::HashMap<ItemId, (i64, i64)>> {
+    let mut out = std::collections::HashMap::new();
+    if parents.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = (1..=parents.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Placeholders are generated from a count; every value is bound.
+    let sql = format!(
+        "SELECT e.src_item_id,
+                COUNT(*),
+                SUM(CASE WHEN c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
+                         THEN 1 ELSE 0 END)
+           FROM edges e JOIN items c ON c.id = e.dst_item_id
+          WHERE e.type = 'parent_of' AND e.src_item_id IN ({placeholders})
+          GROUP BY e.src_item_id"
+    );
+    let params: Vec<rusqlite::types::Value> = parents.iter().map(|p| p.get().into()).collect();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, total, open) = row?;
+        out.insert(ItemId::new(id), (total, open));
+    }
+    Ok(out)
+}
+
 /// Whether every subtask of `parent` has reached a terminal status (`done`/`cancelled`).
 /// True when there are no subtasks at all — a leaf is trivially complete.
 ///

@@ -53,7 +53,19 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
       const chunks = child.chunkCount
         ? `${child.chunkCount} chunk${child.chunkCount === 1 ? "" : "s"}`
         : "";
-      item.description = [child.status ?? "", chunks].filter(Boolean).join(" · ");
+      // A parent with open subtasks is NOT workable — the frontier withholds it. Saying so
+      // is the point of nesting: without it the container reads as one more pickable task.
+      const open = child.openSubtaskCount ?? 0;
+      const total = child.subtaskCount ?? 0;
+      const subtasks = total > 0 ? `${open} of ${total} subtasks open` : "";
+      item.description = [child.status ?? "", subtasks, chunks].filter(Boolean).join(" · ");
+      if (open > 0) {
+        item.tooltip = new vscode.MarkdownString(
+          `**held** — ${open} of ${total} subtasks still open.\n\n` +
+            "Work the subtasks; this task returns to the ready frontier once they are all " +
+            "done or cancelled.",
+        );
+      }
     }
     item.command = {
       command: "jkb.openDetails",
@@ -65,7 +77,9 @@ export class JkbTreeProvider implements vscode.TreeDataProvider<TreeChild> {
 
   async getChildren(child?: TreeChild): Promise<TreeChild[]> {
     const ref: NodeRef | null = child ? child.ref : null;
-    if (ref && ref.kind === "item") return []; // items are leaves in the first pass
+    // Only a node the listing marked expandable is asked for children — a leaf task must
+    // not cost a subprocess per row just to discover it has none.
+    if (child && !child.hasChildren) return [];
     const children = await this.client.listChildren(ref, {
       includeTerminal: this.includeTerminal,
     });

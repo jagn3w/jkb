@@ -708,6 +708,15 @@ enum TaskCmd {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// List a task's subtasks. Emits the same shape as `jkb ls`, so a tree can expand a
+    /// parent into its children with the same parser it uses for a namespace.
+    Subtasks {
+        /// The parent task uid.
+        uid: String,
+        /// Include terminal (`done`/`cancelled`) subtasks.
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
     /// Start work: claim the task and record the branch and repo it is being done on, so
     /// `jkb task close-merged` can close it once that branch lands. Both default from the
     /// git repo in the current directory.
@@ -1415,6 +1424,10 @@ struct Child {
     ns_type: Option<String>,
     /// The one-line description of [`Child::ns_type`], for a tooltip.
     ns_type_about: Option<String>,
+    /// For a task with subtasks: `(total, open)`. A parent with open subtasks is held off
+    /// the ready frontier, so the tree must be able to show it as a container rather than
+    /// as one more pickable task sitting beside its own children.
+    subtasks: Option<(i64, i64)>,
     /// For an item that others were derived from: how many `chunk` items came out of it.
     /// Chunks are index units, not content — the tree hides them and shows their count here,
     /// against the document they belong to. `None` when there are none.
@@ -1474,6 +1487,8 @@ impl Child {
             "type": self.ns_type,
             "type_about": self.ns_type_about,
             "chunk_count": self.chunk_count,
+            "subtask_count": self.subtasks.map(|(total, _)| total),
+            "open_subtask_count": self.subtasks.map(|(_, open)| open),
             "updated": self.updated,
         })
     }
@@ -1560,6 +1575,7 @@ fn list_children(
             ns_type,
             ns_type_about,
             chunk_count: None,
+            subtasks: None,
             updated: None,
         });
     }
@@ -1571,6 +1587,7 @@ fn list_children(
             let placed = placement::items_in(conn, ns_id, None)?;
             // One grouped query for every document's chunk count, not one per document.
             let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
+            let subtask_counts = task::subtask_counts(conn, &placed)?;
             for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
@@ -1587,11 +1604,13 @@ fn list_children(
                 if !all && meta.kind == KIND_CHUNK {
                     continue;
                 }
+                let subtasks = subtask_counts.get(&item_id).copied();
                 out.push(Child {
                     label: item_label(&meta),
                     kind: meta.kind,
                     reference: meta.uid,
-                    has_children: false,
+                    // A task with subtasks expands to them; every other item is a leaf.
+                    has_children: subtasks.is_some_and(|(total, _)| total > 0),
                     status: meta.status,
                     priority: meta.priority,
                     leaf_count: None,
@@ -1599,6 +1618,7 @@ fn list_children(
                     ns_type: None,
                     ns_type_about: None,
                     chunk_count: chunk_counts.get(&item_id).copied(),
+                    subtasks,
                     updated: Some(meta.updated_at.clone()),
                 });
             }
@@ -1611,6 +1631,7 @@ fn list_children(
 /// Flags for `jkb ls` (the ergonomic listing verb).
 #[derive(Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // a CLI flags bag, not state
+#[derive(Default)]
 struct LsOpts {
     all: bool,
     long: bool,
@@ -3567,6 +3588,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
                 }
             }
         }
+        TaskCmd::Subtasks { uid, all } => cmd_task_subtasks(db, &uid, all, json)?,
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         other => cmd_task_mutate(db, other, json)?,
     }
@@ -3700,8 +3722,67 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read subcommands are dispatched by `cmd_task` and never reach here.
-        TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Mirror => {
+        TaskCmd::Add { .. }
+        | TaskCmd::Next { .. }
+        | TaskCmd::Show { .. }
+        | TaskCmd::Subtasks { .. }
+        | TaskCmd::Mirror => {
             unreachable!()
+        }
+    }
+    Ok(())
+}
+
+/// `task subtasks <uid>` — a parent's children, shaped exactly like `jkb ls` output.
+///
+/// Sharing the shape is the point: the tree expands a namespace and a parent task with one
+/// parser, so nesting subtasks costs the UI a different *command*, not a different model.
+fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
+    let id = resolve_task_uid(db, uid)?;
+    // One read: the children, then their own subtask counts so nesting is recursive rather
+    // than one level deep. `TaskRow` already carries the id, so no uid round-trips.
+    let children = db.read(move |conn| {
+        let rows: Vec<_> = task::subtasks(conn, id)?
+            .into_iter()
+            .filter(|t| all || !matches!(t.status.as_deref(), Some("done" | "cancelled")))
+            .collect();
+        let ids: Vec<_> = rows.iter().map(|t| t.id).collect();
+        let counts = task::subtask_counts(conn, &ids)?;
+        Ok(rows
+            .into_iter()
+            .map(|t| {
+                let subtasks = counts.get(&t.id).copied();
+                Child {
+                    kind: "task".to_owned(),
+                    reference: t.uid,
+                    label: t.title.unwrap_or_default(),
+                    // A child that is itself a parent expands in turn.
+                    has_children: subtasks.is_some_and(|(total, _)| total > 0),
+                    status: t.status,
+                    priority: t.priority,
+                    leaf_count: None,
+                    leaf_kinds: None,
+                    ns_type: None,
+                    ns_type_about: None,
+                    chunk_count: None,
+                    subtasks,
+                    updated: None,
+                }
+            })
+            .collect::<Vec<_>>())
+    })?;
+
+    if json {
+        let arr: Vec<_> = children.iter().map(Child::to_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "path": uid, "children": arr }))?
+        );
+    } else if children.is_empty() {
+        println!("(no subtasks)");
+    } else {
+        for c in &children {
+            print_ls_row(None, c, LsOpts::default());
         }
     }
     Ok(())

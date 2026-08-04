@@ -2518,3 +2518,78 @@ fn a_parent_with_open_subtasks_is_not_on_the_frontier() {
         "parent should return to the frontier once its subtasks are terminal"
     );
 }
+
+/// The tree must be able to expand a parent into its subtasks, and must say the parent is
+/// held — a container that renders identically to its own children invites picking it up.
+#[test]
+fn ls_marks_a_parent_expandable_and_task_subtasks_lists_its_children() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "big feature"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let parent = v[0]["uid"].as_str().unwrap().to_owned();
+    for child in ["part one", "part two"] {
+        jkb(&db)
+            .args(["task", "add", child, "--under", &parent])
+            .assert()
+            .success();
+    }
+
+    // `ls` marks the parent expandable and reports the open/total split; the leaves do not.
+    let out = jkb(&db)
+        .args(["--json", "ls", "tasks/inbox"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["children"].as_array().unwrap();
+    let p = rows.iter().find(|c| c["ref"] == parent.as_str()).unwrap();
+    assert_eq!(p["has_children"], true, "parent must expand: {p}");
+    assert_eq!(p["subtask_count"], 2);
+    assert_eq!(p["open_subtask_count"], 2);
+    for leaf in rows.iter().filter(|c| c["ref"] != parent.as_str()) {
+        assert_eq!(
+            leaf["has_children"], false,
+            "a leaf must not expand: {leaf}"
+        );
+        assert!(leaf["subtask_count"].is_null(), "{leaf}");
+    }
+
+    // `task subtasks` emits the same shape as `ls`, so one parser drives both.
+    let out = jkb(&db)
+        .args(["--json", "task", "subtasks", &parent])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kids = v["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    for k in kids {
+        assert_eq!(k["kind"], "task");
+        assert!(k["ref"].is_string() && k["label"].is_string(), "{k}");
+    }
+
+    // Terminal subtasks are hidden like terminal tasks elsewhere, revealed by --all.
+    let first = kids[0]["ref"].as_str().unwrap().to_owned();
+    jkb(&db)
+        .args(["task", "set", &first, "--status", "done"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--json", "task", "subtasks", &parent])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["children"].as_array().unwrap().len(), 1);
+    let out = jkb(&db)
+        .args(["--json", "task", "subtasks", &parent, "--all"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["children"].as_array().unwrap().len(), 2);
+}

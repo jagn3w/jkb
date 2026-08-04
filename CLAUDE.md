@@ -100,8 +100,8 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **324 tests** green (133 core = 105 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 9 index + 25 ingest + 7 search + 40 sync + 78 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+- **325 tests** green (133 core = 105 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 9 index + 25 ingest + 7 search + 40 sync + 79 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
   live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
@@ -484,6 +484,13 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
 - **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
   is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
   close costs one command, a wrong close buries unfinished work.
+- **The explorer nests them.** `jkb ls --json` gives a task `subtask_count`/
+  `open_subtask_count` and sets `has_children` when it has any, so the tree expands a parent
+  into its children; `jkb task subtasks <uid>` emits the **same `{children}` shape as
+  `jkb ls`**, so the two node kinds cost a different *command*, not a different model. The
+  row reads `2 of 4 subtasks open` and the hover says the parent is held — without that a
+  container renders identically to the pickable tasks beside it, which is worse than having
+  no subtasks at all.
 - **`scripts/hooks/post-merge`** (installed by `setup.sh`) runs `setup.sh` when the pull
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
