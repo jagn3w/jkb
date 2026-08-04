@@ -32,6 +32,8 @@ interface RawChild {
   type: string | null;
   type_about: string | null;
   chunk_count: number | null;
+  subtask_count: number | null;
+  open_subtask_count: number | null;
   status: string | null;
   priority: number | null;
 }
@@ -68,11 +70,11 @@ export class CliJkbClient implements JkbClient {
   constructor(private readonly cfg: CliConfig) {}
 
   async listChildren(ref: NodeRef | null, opts?: ListOptions): Promise<TreeChild[]> {
-    const args = ["ls"];
-    if (ref) {
-      if (ref.kind !== "namespace") return []; // items are leaves in the first pass
-      args.push(ref.path);
-    }
+    // Containment is a behaviour, not a node kind: `jkb ls` lists the children of a pure
+    // namespace or of a parent task alike, so the client passes the node's address and does
+    // not branch. A node that contains nothing is never asked (see the tree's hasChildren
+    // guard).
+    const args = ref ? ["ls", ref.kind === "item" ? ref.uid : ref.path] : ["ls"];
     if (opts?.includeTerminal) args.push("--all");
     const out = await this.json<{ children: RawChild[] }>(args);
     return out.children.map(toTreeChild);
@@ -163,6 +165,8 @@ function toTreeChild(c: RawChild): TreeChild {
     nsType: c.type,
     nsTypeAbout: c.type_about,
     chunkCount: c.chunk_count,
+    subtaskCount: c.subtask_count,
+    openSubtaskCount: c.open_subtask_count,
     status: c.status,
     priority: c.priority,
   };

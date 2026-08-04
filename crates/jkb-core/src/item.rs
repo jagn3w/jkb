@@ -550,6 +550,82 @@ pub fn set_resolution_str(
     set_resolution(conn, meta, item, parsed)
 }
 
+/// The items each of `children` was **derived from**, as `child -> sources`; children with
+/// no `derived_from` edge are absent. The inverse of [`derived_kind_counts`], batched for a
+/// listing that must know which of its rows are already reachable via a container.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn derived_from(
+    conn: &Connection,
+    children: &[ItemId],
+) -> Result<std::collections::HashMap<ItemId, Vec<ItemId>>> {
+    let mut out: std::collections::HashMap<ItemId, Vec<ItemId>> = std::collections::HashMap::new();
+    if children.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = (1..=children.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Placeholders are generated from a count; every value is bound.
+    let sql = format!(
+        "SELECT src_item_id, dst_item_id FROM edges
+          WHERE type = 'derived_from' AND src_item_id IN ({placeholders})"
+    );
+    let params: Vec<rusqlite::types::Value> = children.iter().map(|c| c.get().into()).collect();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (child, source) = row?;
+        out.entry(ItemId::new(child))
+            .or_default()
+            .push(ItemId::new(source));
+    }
+    Ok(out)
+}
+
+/// The items **derived from** `parent` of the given `kind`, in document order.
+///
+/// The motivating case is a document's chunks: ingest links `chunk --derived_from-->
+/// document` and records the fragment's index as the `chunk` placement's `position`, which
+/// is the only faithful ordering (a uid ending `:10` sorts before `:9` lexicographically).
+/// Items with no such placement sort last, by uid, so an unexpected shape still lists.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn derived_children(conn: &Connection, parent: ItemId, kind: &str) -> Result<Vec<ItemMeta>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, i.uid, i.kind, i.content, i.content_hash, i.mime, i.status,
+                i.resolution, i.priority, i.due, i.created_at, i.updated_at
+           FROM edges e
+           JOIN items i ON i.id = e.src_item_id
+           LEFT JOIN placements p ON p.item_id = i.id AND p.role = 'chunk'
+          WHERE e.dst_item_id = ?1 AND e.type = 'derived_from' AND i.kind = ?2
+          ORDER BY p.position IS NULL, p.position, i.uid",
+    )?;
+    let rows = stmt.query_map(params![parent.get(), kind], |row| {
+        Ok(ItemMeta {
+            id: ItemId::new(row.get(0)?),
+            uid: row.get(1)?,
+            kind: row.get(2)?,
+            content: row.get(3)?,
+            content_hash: row.get(4)?,
+            mime: row.get(5)?,
+            status: row.get(6)?,
+            resolution: row.get(7)?,
+            priority: row.get(8)?,
+            due: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// The path of the namespace an item is primarily placed under, if it has one.
 ///
 /// "Primary" is the item's home as opposed to a `reference` mirror, so this answers *where

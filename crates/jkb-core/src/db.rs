@@ -83,8 +83,8 @@ mod tests {
         // Bumped with each migration: V001 init, V002 fts, V003 embeddings_meta version,
         // V004 sync journal, V005 task claims, V006 items.status CHECK,
         // V007 memory core (items.resolution + edges.weight),
-        // V008 reserved namespace types.
-        assert_eq!(user_version, 8);
+        // V008 reserved namespace types, V009 placement containment.
+        assert_eq!(user_version, 9);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -156,7 +156,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 8);
+        assert_eq!(user_version, 9);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

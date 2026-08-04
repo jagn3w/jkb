@@ -10,6 +10,11 @@ export interface JkbClient {
   /**
    * The direct children of `ref`, or the top-level namespaces when `ref` is `null`.
    * Backed by `jkb ls`.
+   *
+   * `ref` may be any *container*: a pure namespace, or an item that contains others (a
+   * task with subtasks). Containment is a behaviour a node takes on, not a separate kind —
+   * so there is one call here rather than one per kind. `TreeChild.hasChildren` says
+   * whether a node has the behaviour at all.
    */
   listChildren(ref: NodeRef | null, opts?: ListOptions): Promise<readonly TreeChild[]>;
 

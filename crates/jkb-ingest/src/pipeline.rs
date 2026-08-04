@@ -279,6 +279,9 @@ impl Pipeline {
                             PlacementRole::Chunk,
                             position,
                         )?;
+                        // The document CONTAINS its chunks (design D35), so they are listed
+                        // by expanding it rather than as flat siblings beside it.
+                        jkb_core::containment::contain(conn, meta, chunk_id, document, position)?;
                         items.push((chunk_id, chunk.clone()));
                     }
 

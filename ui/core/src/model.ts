@@ -43,6 +43,13 @@ export interface TreeChild {
    * document they belong to. Absent when there are none.
    */
   readonly chunkCount?: number | null;
+  /**
+   * For a task with subtasks: how many there are in total, and how many are still open.
+   * A parent with open subtasks is held off the ready frontier, so the tree must show it
+   * as a container rather than as one more pickable task beside its own children.
+   */
+  readonly subtaskCount?: number | null;
+  readonly openSubtaskCount?: number | null;
   /** Task status, when the child is a task; otherwise absent. */
   readonly status?: string | null;
   /** Task priority (lower = more important), when set; drives ranking + colour. */

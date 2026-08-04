@@ -150,8 +150,8 @@ enum Command {
     Ls {
         /// The namespace whose children to list (default: top-level namespaces).
         path: Option<String>,
-        /// Show hidden entries: terminal (`done`/`cancelled`) tasks and `chunk` items,
-        /// which are derived index units rather than content.
+        /// Show terminal (`done`/`cancelled`) tasks, and count `chunk` items in the
+        /// per-folder totals. Chunks are always reachable by expanding their document.
         #[arg(short = 'a', long)]
         all: bool,
         /// Long format: kind, status, and namespace/uid per row.
@@ -192,8 +192,8 @@ enum Command {
     Tree {
         /// The namespace to root the tree at (default: top-level roots).
         path: Option<String>,
-        /// Show hidden entries: terminal (`done`/`cancelled`) items and `chunk` items,
-        /// in both the listing and the counts.
+        /// Show terminal (`done`/`cancelled`) items, and count `chunk` items in the
+        /// per-folder totals. Chunks are always reachable by expanding their document.
         #[arg(short = 'a', long)]
         all: bool,
         /// Maximum depth to descend (default: 4; deeper folders show `…`). Raise for more.
@@ -707,6 +707,15 @@ enum TaskCmd {
         /// The liveness-checkable owner id (default: this process's `host:pid`).
         #[arg(long)]
         owner: Option<String>,
+    },
+    /// List a task's subtasks. Emits the same shape as `jkb ls`, so a tree can expand a
+    /// parent into its children with the same parser it uses for a namespace.
+    Subtasks {
+        /// The parent task uid.
+        uid: String,
+        /// Include terminal (`done`/`cancelled`) subtasks.
+        #[arg(short = 'a', long)]
+        all: bool,
     },
     /// Start work: claim the task and record the branch and repo it is being done on, so
     /// `jkb task close-merged` can close it once that branch lands. Both default from the
@@ -1415,6 +1424,10 @@ struct Child {
     ns_type: Option<String>,
     /// The one-line description of [`Child::ns_type`], for a tooltip.
     ns_type_about: Option<String>,
+    /// For a task with subtasks: `(total, open)`. A parent with open subtasks is held off
+    /// the ready frontier, so the tree must be able to show it as a container rather than
+    /// as one more pickable task sitting beside its own children.
+    subtasks: Option<(i64, i64)>,
     /// For an item that others were derived from: how many `chunk` items came out of it.
     /// Chunks are index units, not content — the tree hides them and shows their count here,
     /// against the document they belong to. `None` when there are none.
@@ -1474,6 +1487,8 @@ impl Child {
             "type": self.ns_type,
             "type_about": self.ns_type_about,
             "chunk_count": self.chunk_count,
+            "subtask_count": self.subtasks.map(|(total, _)| total),
+            "open_subtask_count": self.subtasks.map(|(_, open)| open),
             "updated": self.updated,
         })
     }
@@ -1517,11 +1532,66 @@ fn item_label(meta: &item::ItemMeta) -> String {
 /// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
 /// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
 /// tasks are hidden unless `all`.
+/// The children of any item that contains others — the container behaviour a node takes on
+/// (design D35).
+///
+/// One read for every container. A task's subtasks and a document's chunks are the same
+/// query because containment is recorded the same way for both: on the placement. Nothing
+/// here branches on what kind of node it is.
+fn contained_children(
+    conn: &rusqlite::Connection,
+    parent: jkb_types::ItemId,
+    all: bool,
+) -> jkb_core::Result<Vec<Child>> {
+    let ids = jkb_core::containment::children(conn, parent)?;
+    let subtask_counts = jkb_core::containment::child_counts(conn, &ids)?;
+    let chunk_counts = item::derived_kind_counts(conn, &ids, KIND_CHUNK)?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(meta) = item::get(conn, id)? else {
+            continue;
+        };
+        if !all && matches!(meta.status.as_deref(), Some("done" | "cancelled")) {
+            continue;
+        }
+        let subtasks = subtask_counts.get(&id).copied();
+        let chunks = chunk_counts.get(&id).copied().unwrap_or(0);
+        out.push(Child {
+            label: item_label(&meta),
+            kind: meta.kind,
+            reference: meta.uid,
+            // Containment nests: a child that contains in turn expands in turn.
+            has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
+            status: meta.status,
+            priority: meta.priority,
+            leaf_count: None,
+            leaf_kinds: None,
+            ns_type: None,
+            ns_type_about: None,
+            chunk_count: (chunks > 0).then_some(chunks),
+            subtasks,
+            updated: Some(meta.updated_at),
+        });
+    }
+    Ok(out)
+}
+
 fn list_children(
     conn: &rusqlite::Connection,
     path: Option<&str>,
     all: bool,
 ) -> jkb_core::Result<Vec<Child>> {
+    // "Container" is a behaviour, not a node kind. A pure namespace is a node that ONLY
+    // contains; a parent task both is a task and contains its subtasks. So `ls` resolves a
+    // namespace first (the common case, and the historical meaning) and falls back to an
+    // item uid — one command lists the children of anything that has any.
+    if let Some(p) = path {
+        if ns::get(conn, p)?.is_none() {
+            if let Some(id) = item::id_for_uid(conn, p)? {
+                return contained_children(conn, id, all);
+            }
+        }
+    }
     let mut out = Vec::new();
 
     let ns_children = match path {
@@ -1560,6 +1630,7 @@ fn list_children(
             ns_type,
             ns_type_about,
             chunk_count: None,
+            subtasks: None,
             updated: None,
         });
     }
@@ -1568,9 +1639,13 @@ fn list_children(
         if let Some(ns_id) = ns::get(conn, p)? {
             // Any placement role: a `tasks/…` mirror surfaces the task even though its
             // primary home is elsewhere (the symbolic-link view).
-            let placed = placement::items_in(conn, ns_id, None)?;
+            // Directly placed only: a contained node is listed under its container, not
+            // beside it. It is still IN this namespace — `ns:` scoping finds it — which is
+            // exactly why the placement keeps both the namespace and the parent.
+            let placed = placement::items_directly_in(conn, ns_id)?;
             // One grouped query for every document's chunk count, not one per document.
             let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
+            let subtask_counts = jkb_core::containment::child_counts(conn, &placed)?;
             for item_id in placed {
                 let Some(meta) = item::get(conn, item_id)? else {
                     continue;
@@ -1581,17 +1656,15 @@ fn list_children(
                 if !all && terminal {
                     continue;
                 }
-                // Same treatment for chunks, and for the same reason: they are derived index
-                // units, not content. Listing them doubles every ingested document under its
-                // own fragments. Their count rides on the document instead (below).
-                if !all && meta.kind == KIND_CHUNK {
-                    continue;
-                }
+                let subtasks = subtask_counts.get(&item_id).copied();
+                let chunks = chunk_counts.get(&item_id).copied().unwrap_or(0);
                 out.push(Child {
                     label: item_label(&meta),
                     kind: meta.kind,
                     reference: meta.uid,
-                    has_children: false,
+                    // Anything that contains expands: a task into its subtasks, a document
+                    // into its chunks.
+                    has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
                     status: meta.status,
                     priority: meta.priority,
                     leaf_count: None,
@@ -1599,6 +1672,7 @@ fn list_children(
                     ns_type: None,
                     ns_type_about: None,
                     chunk_count: chunk_counts.get(&item_id).copied(),
+                    subtasks,
                     updated: Some(meta.updated_at.clone()),
                 });
             }
@@ -1611,6 +1685,7 @@ fn list_children(
 /// Flags for `jkb ls` (the ergonomic listing verb).
 #[derive(Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // a CLI flags bag, not state
+#[derive(Default)]
 struct LsOpts {
     all: bool,
     long: bool,
@@ -1928,7 +2003,9 @@ fn tree_nodes(
 ) -> jkb_core::Result<Vec<TreeNode>> {
     let mut out = Vec::new();
     for child in list_children(conn, path, all)? {
-        let descend = child.kind == "namespace" && depth_left != Some(0);
+        // Descend into any container, not just namespaces — otherwise de-duplicating a
+        // subtask out of its namespace listing would make it unreachable in `tree`.
+        let descend = child.has_children && depth_left != Some(0);
         let children = if descend {
             tree_nodes(conn, Some(&child.reference), all, depth_left.map(|d| d - 1))?
         } else {
@@ -3567,6 +3644,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
                 }
             }
         }
+        TaskCmd::Subtasks { uid, all } => cmd_task_subtasks(db, &uid, all, json)?,
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         other => cmd_task_mutate(db, other, json)?,
     }
@@ -3700,8 +3778,37 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read subcommands are dispatched by `cmd_task` and never reach here.
-        TaskCmd::Add { .. } | TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Mirror => {
+        TaskCmd::Add { .. }
+        | TaskCmd::Next { .. }
+        | TaskCmd::Show { .. }
+        | TaskCmd::Subtasks { .. }
+        | TaskCmd::Mirror => {
             unreachable!()
+        }
+    }
+    Ok(())
+}
+
+/// `task subtasks <uid>` — a parent's children, shaped exactly like `jkb ls` output.
+///
+/// Sharing the shape is the point: the tree expands a namespace and a parent task with one
+/// parser, so nesting subtasks costs the UI a different *command*, not a different model.
+fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
+    // A thin alias over the container read: `jkb ls <task-uid>` is the same call. It exists
+    // for discoverability from the task surface, not as a second implementation.
+    let id = resolve_task_uid(db, uid)?;
+    let children = db.read(move |conn| contained_children(conn, id, all))?;
+    if json {
+        let arr: Vec<_> = children.iter().map(Child::to_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "path": uid, "children": arr }))?
+        );
+    } else if children.is_empty() {
+        println!("(no subtasks)");
+    } else {
+        for c in &children {
+            print_ls_row(None, c, LsOpts::default());
         }
     }
     Ok(())

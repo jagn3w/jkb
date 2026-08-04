@@ -336,8 +336,11 @@ pub fn add_subtask(
     parent: ItemId,
     child: ItemId,
 ) -> Result<()> {
+    // The edge records the relationship and refuses a cycle; the containment row records
+    // that the child lives inside the parent. Both here so they cannot drift — this is the
+    // only supported way to make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
-    Ok(())
+    crate::containment::contain(conn, meta, child, parent, 0)
 }
 
 /// The direct subtasks of `parent`, ordered by priority (asc, nulls last) then uid — the
@@ -346,11 +349,12 @@ pub fn add_subtask(
 /// # Errors
 /// Returns an error if the query fails.
 pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
+    // Reads containment, not the edge: containment is where a node lives (design D35).
     let mut stmt = conn.prepare_cached(
         "SELECT i.id, i.uid, i.content, i.status, i.priority, i.due
-           FROM edges e JOIN items i ON i.id = e.dst_item_id
-          WHERE e.src_item_id = ?1 AND e.type = 'parent_of'
-          ORDER BY i.priority IS NULL, i.priority, i.uid",
+           FROM containment c JOIN items i ON i.id = c.child_item_id
+          WHERE c.parent_item_id = ?1
+          ORDER BY c.position, i.priority IS NULL, i.priority, i.uid",
     )?;
     let rows = stmt.query_map([parent.get()], |r| {
         Ok(TaskRow {
@@ -377,9 +381,9 @@ pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
 pub fn subtasks_all_terminal(conn: &Connection, parent: ItemId) -> Result<bool> {
     let open: i64 = conn
         .prepare_cached(
-            "SELECT count(*) FROM edges e JOIN items c ON c.id = e.dst_item_id
-              WHERE e.src_item_id = ?1 AND e.type = 'parent_of'
-                AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'",
+            "SELECT count(*) FROM containment c JOIN items i ON i.id = c.child_item_id
+              WHERE c.parent_item_id = ?1
+                AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'",
         )?
         .query_row([parent.get()], |r| r.get(0))?;
     Ok(open == 0)

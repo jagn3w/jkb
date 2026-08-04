@@ -2315,11 +2315,12 @@ fn ls_labels_a_namespaces_own_type_but_not_an_inherited_one() {
         .stdout(predicate::str::contains("[tasks]").not());
 }
 
-/// Chunks are derived index units, not content: listing them buries each ingested document
-/// under its own fragments. They are hidden (and uncounted) by default, revealed by `--all`,
-/// and their number rides on the document they came from.
+/// Chunks are derived index units, not content: listing them flat buries each ingested
+/// document under its own fragments. A document *contains* them, so they are reached by
+/// expanding it, their number rides on the document, and they are left out of folder counts
+/// unless `--all`.
 #[test]
-fn ls_hides_chunks_by_default_and_counts_them_on_their_document() {
+fn ls_nests_chunks_under_their_document_and_counts_them_there() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let doc = dir.path().join("big.md");
@@ -2360,19 +2361,34 @@ fn ls_hides_chunks_by_default_and_counts_them_on_their_document() {
     assert!(docs["leaf_kinds"]["chunk"].is_null(), "{docs}");
     assert_eq!(docs["leaf_count"], 1);
 
-    // `--all` reveals them, in the listing and the counts alike.
+    // Chunks are reached by EXPANDING the document, not by a flag: the document is a
+    // container, so `ls <document-uid>` lists them in document order. They are never flat
+    // siblings, because that is the duplicate the containment model exists to prevent.
+    assert_eq!(
+        document["has_children"], true,
+        "a document with chunks expands"
+    );
+    let doc_uid = document["ref"].as_str().unwrap().to_owned();
+    let out = jkb(&db).args(["--json", "ls", &doc_uid]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed = v["children"].as_array().unwrap();
+    assert_eq!(i64::try_from(listed.len()).unwrap(), chunks);
+    assert!(listed.iter().all(|c| c["kind"] == "chunk"), "{listed:?}");
     let out = jkb(&db)
         .args(["--json", "ls", "repos/jkb/docs", "--all"])
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let shown = v["children"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|c| c["kind"] == "chunk")
-        .count();
-    assert_eq!(i64::try_from(shown).unwrap(), chunks);
+    assert!(
+        v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["kind"] != "chunk"),
+        "--all must not re-flatten chunks — they would then appear twice"
+    );
+    // `--all` still adds them to the per-folder counts, which is a separate question from
+    // where they are listed: a folder reading "55,553 chunk" is noise by default.
     let out = jkb(&db)
         .args(["--json", "ls", "repos/jkb", "-a"])
         .output()
@@ -2517,4 +2533,167 @@ fn a_parent_with_open_subtasks_is_not_on_the_frontier() {
         String::from_utf8_lossy(&ready.stdout).contains("big feature"),
         "parent should return to the frontier once its subtasks are terminal"
     );
+}
+
+/// The tree must be able to expand a parent into its subtasks, and must say the parent is
+/// held — a container that renders identically to its own children invites picking it up.
+#[test]
+fn ls_marks_a_parent_expandable_and_task_subtasks_lists_its_children() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "big feature"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let parent = v[0]["uid"].as_str().unwrap().to_owned();
+    for child in ["part one", "part two"] {
+        jkb(&db)
+            .args(["task", "add", child, "--under", &parent])
+            .assert()
+            .success();
+    }
+
+    // `ls` marks the parent expandable and reports the open/total split; the leaves do not.
+    let out = jkb(&db)
+        .args(["--json", "ls", "tasks/inbox"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["children"].as_array().unwrap();
+    let p = rows.iter().find(|c| c["ref"] == parent.as_str()).unwrap();
+    assert_eq!(p["has_children"], true, "parent must expand: {p}");
+    assert_eq!(p["subtask_count"], 2);
+    assert_eq!(p["open_subtask_count"], 2);
+    for leaf in rows.iter().filter(|c| c["ref"] != parent.as_str()) {
+        assert_eq!(
+            leaf["has_children"], false,
+            "a leaf must not expand: {leaf}"
+        );
+        assert!(leaf["subtask_count"].is_null(), "{leaf}");
+    }
+
+    // `task subtasks` emits the same shape as `ls`, so one parser drives both.
+    let out = jkb(&db)
+        .args(["--json", "task", "subtasks", &parent])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kids = v["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    for k in kids {
+        assert_eq!(k["kind"], "task");
+        assert!(k["ref"].is_string() && k["label"].is_string(), "{k}");
+    }
+
+    // Terminal subtasks are hidden like terminal tasks elsewhere, revealed by --all.
+    let first = kids[0]["ref"].as_str().unwrap().to_owned();
+    jkb(&db)
+        .args(["task", "set", &first, "--status", "done"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--json", "task", "subtasks", &parent])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["children"].as_array().unwrap().len(), 1);
+    let out = jkb(&db)
+        .args(["--json", "task", "subtasks", &parent, "--all"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["children"].as_array().unwrap().len(), 2);
+}
+
+/// Containment is a behaviour, not a node kind: `jkb ls` lists the children of a pure
+/// namespace and of a parent task alike, and a subtask appears exactly once — under its
+/// parent, not also as a sibling in the namespace they share.
+#[test]
+fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "big feature"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let parent = v[0]["uid"].as_str().unwrap().to_owned();
+    for child in ["part one", "part two"] {
+        jkb(&db)
+            .args(["task", "add", child, "--under", &parent])
+            .assert()
+            .success();
+    }
+
+    // The namespace lists the parent only — the subtasks are reached by expanding it.
+    let out = jkb(&db)
+        .args(["--json", "ls", "tasks/inbox"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["children"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a subtask must not also be a sibling: {rows:?}"
+    );
+    assert_eq!(rows[0]["ref"], parent.as_str());
+    assert_eq!(rows[0]["has_children"], true);
+
+    // The SAME command lists a parent task's children.
+    let out = jkb(&db).args(["--json", "ls", &parent]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kids = v["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    assert!(kids.iter().all(|k| k["kind"] == "task"));
+
+    // `tree` descends into any container, so de-duplicating must not hide them there.
+    jkb(&db)
+        .args(["tree", "tasks/inbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("part one"))
+        .stdout(predicate::str::contains("part two"));
+
+    // Containment is a property of the ITEM, not of one of its placements: a subtask homed
+    // in a different namespace is listed under its parent and nowhere else. It lives inside
+    // the parent; the namespace placement serves scoping and search, not listing.
+    jkb(&db)
+        .args(["task", "add", "elsewhere", "--under", &parent, "+other/ns"])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--json", "ls", "other/ns"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["children"].as_array().unwrap().len(),
+        0,
+        "a contained item is listed under its container, not in its namespace"
+    );
+
+    // …but it must never become unreachable. It is listed under its parent, and namespace
+    // scoping still finds it — which is exactly why the placement is kept alongside.
+    let out = jkb(&db).args(["--json", "ls", &parent]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["children"].as_array().unwrap().len(),
+        3,
+        "reachable by expanding its container"
+    );
+    jkb(&db)
+        .args(["--global", "query", "kind:task ns:other/ns"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("elsewhere"));
 }

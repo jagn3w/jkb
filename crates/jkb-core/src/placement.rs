@@ -150,6 +150,31 @@ pub fn unplace(
     Ok(rowids.len())
 }
 
+/// The items placed **directly** in `namespace` — those not contained by another item —
+/// ordered by position.
+///
+/// Distinct from [`items_in`], which returns everything placed in the namespace including
+/// contained nodes. Both answer their own question correctly: a subtask *is* in `tasks/jkb`
+/// (which is why `ns:tasks/**` scoping finds it), but it is *listed* under its container,
+/// not beside it.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn items_directly_in(conn: &Connection, namespace: NamespaceId) -> Result<Vec<ItemId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.item_id FROM placements p
+          WHERE p.namespace_id = ?1
+            AND NOT EXISTS (SELECT 1 FROM containment c WHERE c.child_item_id = p.item_id)
+          ORDER BY p.position, p.item_id",
+    )?;
+    let rows = stmt.query_map([namespace.get()], |r| r.get::<_, i64>(0))?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(ItemId::new)
+        .collect())
+}
+
 /// The items directly placed under `namespace`, optionally filtered by `role`,
 /// ordered by position.
 ///

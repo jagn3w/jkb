@@ -100,8 +100,8 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **324 tests** green (133 core = 105 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 9 index + 25 ingest + 7 search + 40 sync + 78 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
+- **327 tests** green (133 core = 105 unit + 12 query + 16 investigation; 15 embed + 17 types
+  + 9 index + 25 ingest + 7 search + 40 sync + 81 cli/e2e + 6 mcp; +2 `#[ignore]`: live-ollama,
   live-URL); `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
@@ -484,6 +484,55 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
 - **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
   is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
   close costs one command, a wrong close buries unfinished work.
+- **Containment is a placement, not a derived view (D35).** `placements.parent_item_id`
+  (migration `V009`) says where a node lives: *in namespace N, contained by item P*. `NULL`
+  means directly in the namespace. Listing is then one query over one table —
+  `items_directly_in` for a namespace, `items_under` for a container — with **no filter, no
+  edge join and no de-duplication rule**. It previously simulated this at read time, placing
+  the child in its container's namespace and hiding it again on the way out.
+  `namespace_id` is deliberately kept alongside: `ns:tasks/**` scoping resolves through it,
+  so a contained item must stay findable by scope. `ON DELETE SET NULL`, never CASCADE —
+  deleting a container returns its children to the namespace rather than deleting their
+  placement rows, which would make them invisible rather than un-parented.
+- **The edges survive, carrying what a placement cannot** — `edge::link`'s cycle guard,
+  `jkb related` traversal, `derived_from` as provenance for search's `source_document`, and
+  the `tasks` serializer's indentation + three-way merge `Sig`. `task::add_subtask` writes
+  edge and placement in one call so they cannot drift.
+- **Containment is a relationship between items (D35).** `containment(child_item_id PRIMARY
+  KEY, parent_item_id, position)` — its own table, keyed on the **child**, because "X is
+  contained by Y" is a property of X and not of one of X's several placements (a home plus
+  the `tasks/<repo>` mirror). The PK makes *at most one container* structural. `placements`
+  is untouched and still carries `namespace_id`, so `ns:tasks/**` scoping still finds a
+  contained item: listing and scoping ask different questions and both stay right. A
+  contained item is listed under its container **and nowhere else**, even when homed in
+  another namespace — never unreachable, since expanding the container always reaches it.
+  Rejected alternatives are recorded in the design: a namespace per parent (derives a path
+  from a mutable title — the identity failure the sync prose bug already taught, and it grows
+  the organizational tree with content) and `placements.parent_item_id` (stores one fact once
+  per placement).
+- **Containment is a behaviour, not a node kind.** A *pure namespace* is a node that only
+  contains; a parent task both **is** a task and **contains** its subtasks; a document
+  **contains** its chunks. So `jkb ls <path-or-uid>` is the one container read — it resolves
+  a namespace first (the historical meaning) and falls back to an item uid — and `jkb tree`
+  descends into **any** child with `has_children`. `jkb task subtasks` is a thin alias for
+  discoverability, not a second implementation. The UI passes a node's address and does not
+  branch on kind. The two containment edges stay distinct where it matters: a task
+  *decomposes into* subtasks (`parent_of`, authored), a document is *fragmented into* chunks
+  (`derived_from`, generated and rebuildable).
+- **A contained node is listed once.** `--under` homes a subtask beside its parent, and
+  ingest places chunks beside their document, so either would otherwise appear both as a
+  namespace sibling and nested under its container. `ls` hides it **only where its container
+  is in the same listing** — one homed elsewhere keeps its own row, because hiding it there
+  would make it unreachable rather than merely un-duplicated.
+- **Chunks are nested, not flag-hidden.** They were previously dropped from listings unless
+  `--all`; now they are reached by expanding their document (`jkb ls <document-uid>`, in
+  document order via the `chunk` placement's `position`). `--all` no longer re-flattens them
+  — that would reintroduce the duplicate — it governs terminal tasks and whether chunks count
+  toward per-folder totals, which is a separate question from where they are listed.
+- **The explorer shows the hold.** A task carries `subtask_count`/`open_subtask_count` and
+  the row reads `2 of 4 subtasks open`, with a hover saying the parent is held. Without it a
+  container renders identically to the pickable tasks beside it, which is worse than having
+  no subtasks at all.
 - **`scripts/hooks/post-merge`** (installed by `setup.sh`) runs `setup.sh` when the pull
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
