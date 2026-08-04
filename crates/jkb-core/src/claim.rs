@@ -135,6 +135,44 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
     Ok(true)
 }
 
+/// Clear `item`'s claim regardless of who holds it, returning whether one was cleared.
+///
+/// [`release`] is owner-scoped on purpose — one agent must not drop another's claim while
+/// the work is live. This is the exception: it exists for the moment the work *stops being
+/// live*, where the holder is irrelevant because there is nothing left to hand out. Called
+/// from `task::set_status` when a task reaches a terminal status, so a completed task never
+/// keeps a claim that `doctor` would later report as orphaned.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn clear(conn: &Connection, meta: &WriteMeta, item: ItemId) -> Result<bool> {
+    let before = read_before(conn, item)?;
+    let changed = conn
+        .prepare_cached(
+            "UPDATE items
+                SET claimant_id = NULL,
+                    claimed_at = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+              WHERE id = ?1 AND claimant_id IS NOT NULL",
+        )?
+        .execute([item.get()])?;
+    if let (1, Some(before)) = (changed, before) {
+        changelog::append(
+            conn,
+            meta,
+            "release",
+            "items",
+            &item.get().to_string(),
+            Some(&json!({
+                "claimant_id": before.claimant_id,
+                "claimed_at": before.claimed_at,
+            })),
+            Some(&json!({ "claimant_id": null, "claimed_at": null })),
+        )?;
+    }
+    Ok(changed == 1)
+}
+
 /// Release `item`'s claim held by `owner`, clearing the claim columns.
 ///
 /// A CAS that NULLs `claimant_id`/`claimed_at` only `WHERE claimant_id = ?owner`, so it

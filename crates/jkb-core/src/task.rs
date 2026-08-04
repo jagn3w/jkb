@@ -434,6 +434,14 @@ pub fn set_status(
         Some(&json!({ "status": before })),
         Some(&json!({ "status": status.as_str() })),
     )?;
+    // A terminal task holds no claim. Claiming marks work in flight, and finished work is
+    // not in flight — so the claim is cleared here rather than at each caller, which is
+    // what stops a completed task turning up later as an orphan in `jkb doctor`. Cleared
+    // regardless of holder (unlike `claim::release`) because with the work over there is
+    // nothing left to hand out and no one to protect it from.
+    if status.is_terminal() {
+        crate::claim::clear(conn, meta, task)?;
+    }
     Ok(())
 }
 
@@ -678,6 +686,47 @@ fn bad(token: &str, expected: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// A finished task must not keep a claim. `jkb task start` claims and
+    /// `jkb task close-merged` completes, so without this every auto-closed task turned up
+    /// as an orphaned claim in `doctor` — the manual cleanup that automation was removing.
+    #[test]
+    fn completing_a_task_clears_its_claim() {
+        use crate::claim;
+        let db = crate::Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |conn, meta| {
+                let id = super::create(conn, meta, &super::NewTask::new("task:c", "claimed"))?;
+                claim::claim(conn, meta, id, "host:1")?;
+                Ok(id)
+            })
+            .unwrap();
+        let held = |want: jkb_types::ItemId| {
+            db.read(claim::claimed)
+                .unwrap()
+                .into_iter()
+                .any(|c| c.id == want)
+        };
+        assert!(held(id));
+
+        // Terminal in either direction clears it...
+        db.write_txn("t", move |conn, meta| {
+            super::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+        })
+        .unwrap();
+        assert!(!held(id), "a done task must not still be claimed");
+
+        // ...while a non-terminal transition leaves an in-flight claim alone.
+        let id2 = db
+            .write_txn("t", |conn, meta| {
+                let id = super::create(conn, meta, &super::NewTask::new("task:d", "wip"))?;
+                claim::claim(conn, meta, id, "host:2")?;
+                super::set_status(conn, meta, id, jkb_types::TaskStatus::NeedsReview)?;
+                Ok(id)
+            })
+            .unwrap();
+        assert!(held(id2), "needs_review is not terminal — the claim stays");
+    }
+
     use super::{
         add_dependency, create, is_blocked, mint_uid, parse_quick_add, ready, set_due,
         set_primary_home, set_priority, set_status_str, NewTask, QuickAdd,
