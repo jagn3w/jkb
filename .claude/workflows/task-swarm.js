@@ -244,8 +244,27 @@ Return ok=true with a one-line confirmation. Do not fabricate changes.`
 }
 
 function claimPrompt(group, verb) {
-  const cmds = group.tasks
-    .map((t) => `${JKB}${DB} task ${verb} ${t.uid} --owner '${OWNER}'`)
+  // On claim, also record WHERE the work is landing. `onto=` is the integration branch, and
+  // it is the same facet `jkb task work` writes for a hand-driven session — so `jkb staging
+  // ls` sees swarm work and manual work in one view instead of only the half it was told
+  // about (design D38.1/D38.2). `tag set` rather than `tag add`: a second `onto=` is a
+  // contradiction, and the swarm re-tags a group on every pass.
+  const locate =
+    verb === 'claim'
+      ? [`repo=$(basename "$(git -C ${REPO} rev-parse --show-toplevel)")`]
+          .concat(
+            group.tasks.flatMap((t) => [
+              `${JKB}${DB} task tag set ${t.uid} onto=${INTEGRATION}`,
+              `${JKB}${DB} task tag set ${t.uid} repo="$repo"`,
+            ]),
+          )
+          .join(' && ')
+      : null
+  const cmds = [
+    group.tasks.map((t) => `${JKB}${DB} task ${verb} ${t.uid} --owner '${OWNER}'`).join(' && '),
+    locate,
+  ]
+    .filter(Boolean)
     .join(' && ')
   const flip = verb === 'claim' ? ' (claiming also flips each task to in_progress)' : ''
   return `Mechanical step — run these jkb commands in the main copy at ${REPO} and report. ${verb === 'claim' ? 'CLAIM' : 'RELEASE'} this work-group's tasks for owner '${OWNER}'${flip}:
@@ -253,6 +272,17 @@ function claimPrompt(group, verb) {
 ${cmds}
 
 Run them, then return ok=true (detail = any command that returned false/failed). This is bookkeeping — change no code, touch no git.`
+}
+
+// Record the implementer's branch on every task in the group, so `jkb staging ls` can show
+// the sub-branch and its commits exactly as it does for a hand-driven session (D38.2).
+function branchTagPrompt(group, branch) {
+  const cmds = group.tasks.map((t) => `${JKB}${DB} task tag set ${t.uid} branch=${branch}`).join(' && ')
+  return `Mechanical step — in the main copy at ${REPO}, record this group's working branch:
+
+${cmds}
+
+Return ok=true (detail = any that failed). Bookkeeping only — change no code, touch no git.`
 }
 
 function statusPrompt(group, status) {
@@ -336,6 +366,16 @@ async function processGroup(group) {
         continue
       }
       branch = impl.branch
+
+      // Record the branch on the group's tasks so `jkb staging ls` shows the sub-branch and
+      // its commits, exactly as it does for a hand-driven session (D38.2). Set once the
+      // implementer has actually produced one — before that there is nothing true to record.
+      await agent(branchTagPrompt(group, branch), {
+        label: `tag:${label}#${attempt}`,
+        phase: 'Implement',
+        schema: ACK,
+        model: 'haiku',
+      })
 
       // Entering review: the WHOLE group is `needs_review` (transient — a reviewer is
       // reviewing; it no longer unblocks dependents, D27.7).

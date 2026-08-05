@@ -2,7 +2,7 @@
 //! lines or `--json`.
 
 use anyhow::Result;
-use jkb_core::Db;
+use jkb_core::{tag, Db};
 use jkb_types::ItemId;
 use serde_json::{json, Value};
 
@@ -179,11 +179,18 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
             )?
             .query_row([id], |r| r.get::<_, String>(0))
             .ok();
-        Ok(Some((uid, kind, status, priority, due, content, namespace)))
+        // Tags carry where the work is happening (`branch=`/`onto=`) and whether it has been
+        // reviewed (`reviewed=`/`review=`) — the state D38 introduced. Showing a task without
+        // them means the only way to see why it will or will not land is another command.
+        let tags = tag::applications(conn, ItemId::new(id))?;
+        Ok(Some((
+            uid, kind, status, priority, due, content, namespace, tags,
+        )))
     })?;
-    let Some((uid, kind, status, priority, due, content, namespace)) = row else {
+    let Some((uid, kind, status, priority, due, content, namespace, tags)) = row else {
         anyhow::bail!("item {id} no longer exists");
     };
+    let tag_pairs: Vec<String> = tags.iter().map(|(f, v)| format!("{f}={v}")).collect();
     if as_json {
         let v = json!({
             "id": id,
@@ -194,6 +201,8 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
             "due": due,
             "namespace": namespace,
             "content": content,
+            "tags": tags.iter().map(|(f, v)| json!({"facet": f, "value": v}))
+                .collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
@@ -210,6 +219,9 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
         }
         if let Some(ns) = &namespace {
             println!("namespace: {ns}");
+        }
+        if !tag_pairs.is_empty() {
+            println!("tags:      {}", tag_pairs.join(", "));
         }
         println!();
         println!("{}", content.as_deref().unwrap_or("(no content)"));

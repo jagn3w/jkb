@@ -100,9 +100,25 @@ jkb sync "$ns"
 Findings home under `repos/<repo>/codereviews/<folder>/…` and auto-mirror to
 `tasks/<repo>/codereviews/…` (D26/D32). A running `jkb sync --watch` will not see a
 just-created mount until it restarts, so the one-shot `jkb sync` is what lands them now.
-`mount create` is idempotent, so re-running a review is safe.
+`mount create` is idempotent, so re-running a review is safe. Pass every option you want
+kept — it is the update command too, and an omitted flag no longer resets the stored value,
+but restating `--serializer tasks` costs nothing and reads clearly.
 
-## 5. Report accuracy, then the findings
+## 5. Record the review against the branch
+
+The findings now exist, so point the branch's tasks at them (design D38.4). This is what lets
+`jkb task land` require a review instead of trusting that one happened:
+
+```sh
+jkb task review record --findings "$ns"
+```
+
+It defaults to the current branch and its HEAD, tags every task carrying that `branch=` with
+`reviewed=<sha>` and `review=<ns>`, and moves `in_progress` tasks to `needs_review`. A branch
+no task claims — trunk, an ad-hoc range — matches nothing and says so; that is a note, not a
+failure, because reviewing an arbitrary range is a legitimate thing to do.
+
+## 6. Report accuracy, then the findings
 
 Before the findings, report how far this reviewer has earned trust here. Findings are tasks, so
 their status says whether they were acted on (design D37.6):
@@ -122,3 +138,10 @@ Then print the findings (severity · `file:line` · summary, most severe first) 
 summary: `N findings (H must-fix, M concern, L nit) from R raw, K refuted`. Say they are mounted
 at `repos/<repo>/codereviews/<folder>` (git-ignored on disk) and browsable under
 `tasks/<repo>/codereviews/…`.
+
+Finally, say whether the branch can now land. You already know — the reader should not have to
+discover it at `land` time:
+
+- **no must-fix findings** → "this branch is landable (`jkb task land <uid>`)".
+- **must-fix findings** → name them, and say landing is blocked until each is `done` or
+  `cancelled`. `jkb staging ls` shows the same count against the task.

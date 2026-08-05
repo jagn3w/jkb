@@ -861,3 +861,42 @@ fn no_review_lands_but_records_a_waiver() {
         "the waiver is recorded on the task, not just printed"
     );
 }
+
+/// `tag add` appends and `tag set` replaces. The distinction is load-bearing: `/task-swarm`
+/// re-tags a group on every pass, and an appending `onto=` would leave the task claiming two
+/// land targets at once — while a command named `add` must not silently delete a value.
+#[test]
+fn tag_add_appends_but_tag_set_replaces() {
+    let f = Fixture::new();
+    let uid = f.add_task("tagged task");
+
+    // An open-ended facet legitimately holds several values.
+    for v in ["ui", "cli"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "add", &uid, &format!("area={v}")])
+            .assert()
+            .success();
+    }
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("area=ui"))
+        .stdout(predicate::str::contains("area=cli"));
+
+    // `set` collapses a facet to one value — what the location facets need.
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "onto=batch-one"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "onto=batch-two"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("onto=batch-two"))
+        .stdout(predicate::str::contains("onto=batch-one").not());
+}

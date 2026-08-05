@@ -885,6 +885,16 @@ enum TaskTagCmd {
         /// The tag as `facet=value`.
         facet_value: String,
     },
+    /// Make `facet=value` the facet's **only** value, replacing any others.
+    ///
+    /// Use for facets with one true answer — `branch=`, `repo=`, `onto=`, `base=` — where a
+    /// second value is a contradiction rather than extra information (design D36.6).
+    Set {
+        /// The task uid.
+        uid: String,
+        /// The tag as `facet=value`.
+        facet_value: String,
+    },
     /// Remove `facet=value` from a task.
     Rm {
         /// The task uid.
@@ -4143,9 +4153,10 @@ fn cmd_task_start(
 
 /// `task tag add|rm <uid> <facet>=<value>` — apply or remove one facet tag.
 fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
-    let (uid, facet_value, adding) = match cmd {
-        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, true),
-        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, false),
+    let (uid, facet_value, mode) = match cmd {
+        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, TagMode::Add),
+        TaskTagCmd::Set { uid, facet_value } => (uid, facet_value, TagMode::Set),
+        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, TagMode::Rm),
     };
     let (facet, value) = facet_value
         .split_once('=')
@@ -4153,13 +4164,25 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
     let (facet, value) = (facet.to_owned(), value.to_owned());
     let id = resolve_task_uid(db, &uid)?;
     db.write_txn("cli", move |conn, meta| {
-        if adding {
-            tag::apply(conn, meta, id, &facet, &value)
-        } else {
-            tag::remove(conn, meta, id, &facet, &value)
+        match mode {
+            // `add` is additive, honest to its name: an open-ended facet legitimately holds
+            // several values, and a command called `add` must not silently delete one.
+            TagMode::Add => tag::apply(conn, meta, id, &facet, &value),
+            // `set` replaces the facet's other values. Right for the facets answering "where
+            // is this being worked" — a second `onto=` is a contradiction, not extra
+            // information, and a reader collapsing the multi-map picks one at random (D36.6).
+            TagMode::Set => set_facet(conn, meta, id, &facet, &value),
+            TagMode::Rm => tag::remove(conn, meta, id, &facet, &value),
         }
     })?;
-    report(json, &uid, if adding { "tagged" } else { "untagged" });
+    report(
+        json,
+        &uid,
+        match mode {
+            TagMode::Add | TagMode::Set => "tagged",
+            TagMode::Rm => "untagged",
+        },
+    );
     Ok(())
 }
 
@@ -4194,6 +4217,17 @@ fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Gate { cmd, clear } => cmd_task_gate(db, cmd.as_deref(), clear, json),
         _ => unreachable!("cmd_task_mutate routes only session subcommands here"),
     }
+}
+
+/// How `task tag` should write a facet.
+#[derive(Clone, Copy)]
+enum TagMode {
+    /// Append a value, keeping any others.
+    Add,
+    /// Make this the facet's only value.
+    Set,
+    /// Remove this value.
+    Rm,
 }
 
 /// The branch a session's work lands on (design D36.3). Recorded at `task work` so a resumed
