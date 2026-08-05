@@ -5,7 +5,7 @@
 // renders the same labels — the same reason `summary.ts` lives here.
 
 /** Where a task sits in the pipeline. Derived by the CLI, never stored. */
-export type StagedState = "implementing" | "review" | "landed";
+export type StagedState = "implementing" | "review" | "landed" | "dropped";
 
 /** One task on a staging branch. */
 export interface StagedTask {
@@ -62,9 +62,15 @@ export function formatTaskSummary(t: StagedTask): string {
   return parts.join(" · ");
 }
 
-/** Whether this task may land right now, and why not when it may not. */
+/**
+ * Why this task cannot land right now, or `null` when it can.
+ *
+ * Terminal states get a reason too rather than reading as landable — `null` means "go ahead",
+ * and a landed or cancelled task is the one thing that must never be offered a landing.
+ */
 export function landBlocker(t: StagedTask): string | null {
-  if (t.state === "landed") return null;
+  if (t.state === "landed") return "It has already landed on this branch.";
+  if (t.state === "dropped") return "It was cancelled, so it will not be landing.";
   if (t.dirty) return "It has uncommitted changes — commit them in the session first.";
   if (t.commits === 0) return "It has no commits that the staging branch does not.";
   if (t.open_must_fix > 0) {

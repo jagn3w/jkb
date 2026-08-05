@@ -815,6 +815,12 @@ fn landing_requires_a_review_with_no_open_must_fix_findings() {
         .stderr(predicate::str::contains("a real must-fix problem"));
     assert_eq!(git(&f.repo, &["rev-parse", &onto]), before);
 
+    // The row must carry the same count the gate enforces. A row saying only "reviewed"
+    // about a task the gate is about to refuse is worse than no row: it reads as landable.
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert_eq!(t["open_must_fix"], 1);
+    assert_eq!(t["state"].as_str().unwrap(), "review");
+
     // 3. Dismissing the finding lets it land. Concerns and nits never blocked.
     f.jkb()
         .args(["--global", "task", "set", &finding, "--status", "cancelled"])
@@ -899,4 +905,22 @@ fn tag_add_appends_but_tag_set_replaces() {
         .success()
         .stdout(predicate::str::contains("onto=batch-two"))
         .stdout(predicate::str::contains("onto=batch-one").not());
+}
+
+/// A cancelled task is `dropped`, never `landed`. Those are opposite outcomes, and an earlier
+/// derivation inferred "landed" from "no session and not `open`/`in_progress`" — which quietly
+/// reported every cancelled task as shipped.
+#[test]
+fn a_cancelled_task_reads_as_dropped_not_landed() {
+    let f = Fixture::new();
+    let uid = f.add_task("doomed task");
+    f.work(&uid);
+    f.jkb()
+        .args(["--global", "task", "set", &uid, "--status", "cancelled"])
+        .assert()
+        .success();
+
+    let rows = f.staging(&["--all"]);
+    let t = &rows[0]["tasks"][0];
+    assert_eq!(t["state"].as_str().unwrap(), "dropped");
 }

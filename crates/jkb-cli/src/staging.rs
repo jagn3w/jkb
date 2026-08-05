@@ -37,6 +37,10 @@ pub(crate) enum State {
     Review,
     /// Done, and its branch is in the staging branch.
     Landed,
+    /// Cancelled: it was on this branch and will not be landing. Distinct from `Landed`,
+    /// which is the opposite outcome — reporting the two as one would say a dropped task
+    /// shipped.
+    Dropped,
 }
 
 impl State {
@@ -45,6 +49,7 @@ impl State {
             Self::Implementing => "implementing",
             Self::Review => "review",
             Self::Landed => "landed",
+            Self::Dropped => "dropped",
         }
     }
 }
@@ -137,7 +142,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 
         let mut staged = Vec::new();
         for t in group {
-            staged.push(stage_task(ctx, &branch, t, &sessions)?);
+            staged.push(stage_task(db, ctx, &branch, t, &sessions)?);
         }
         // Most-recently-touched work is what you are looking for; a stable tie-break keeps
         // the listing from reshuffling between redraws.
@@ -161,6 +166,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 
 /// Resolve one task's session, state and review standing.
 fn stage_task(
+    db: &Db,
     ctx: &RepoCtx,
     onto: &str,
     t: &RepoTask,
@@ -172,12 +178,14 @@ fn stage_task(
     let sess = sessions.iter().find(|s| branches.contains(&s.branch));
     let status = t.meta.status.clone().unwrap_or_default();
 
-    let state = if status == "needs_review" {
-        State::Review
-    } else if status == "done" || sess.is_none() && status != "open" && status != "in_progress" {
-        State::Landed
-    } else {
-        State::Implementing
+    // Read the status directly. An earlier version inferred `landed` from "no session and
+    // not open/in_progress", which quietly called a **cancelled** task landed — the one
+    // status that means the opposite.
+    let state = match status.as_str() {
+        "needs_review" => State::Review,
+        "done" => State::Landed,
+        "cancelled" => State::Dropped,
+        _ => State::Implementing,
     };
 
     let (dirty, commits) = match sess {
@@ -186,6 +194,14 @@ fn stage_task(
             gitrepo::ahead_count(&ctx.root, onto, &s.branch)?,
         ),
         None => (false, 0),
+    };
+
+    // The same count the land gate uses, so a row can never say "reviewed" about a task the
+    // gate is about to refuse.
+    let review_ns = facet_one(&t.tags, crate::review::FACET_REVIEW).cloned();
+    let open_must_fix = match &review_ns {
+        Some(ns) => crate::review::open_must_fix(db, ns)?.len(),
+        None => 0,
     };
 
     Ok(StagedTask {
@@ -200,8 +216,8 @@ fn stage_task(
         dirty,
         commits,
         reviewed: facet_one(&t.tags, crate::review::FACET_REVIEWED).cloned(),
-        review_ns: facet_one(&t.tags, crate::review::FACET_REVIEW).cloned(),
+        review_ns,
         review_waived: facet_one(&t.tags, crate::review::FACET_REVIEW_WAIVED).cloned(),
-        open_must_fix: 0,
+        open_must_fix,
     })
 }

@@ -124,9 +124,10 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
   }
 }
 
-/** A glyph that distinguishes the three states at a glance. */
+/** A glyph that distinguishes the states at a glance. */
 function stateIcon(t: StagedTask): string {
   if (t.state === "landed") return "check";
+  if (t.state === "dropped") return "circle-slash";
   if (t.state === "review") return "eye";
   return t.dirty ? "circle-outline" : "circle-filled";
 }
