@@ -10,8 +10,10 @@ mod commands;
 mod gitrepo;
 mod output;
 mod owner;
+mod review;
 mod service;
 mod session;
+mod staging;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -111,6 +113,15 @@ enum Command {
         /// moving without editing the mount.
         #[arg(long, value_enum, conflicts_with = "watch")]
         conflict: Option<PolicyArg>,
+    },
+    /// Staging branches: what is in flight, and where it will land.
+    ///
+    /// A staging branch is the branch a batch of tasks lands on before it reaches trunk —
+    /// the same thing `/task-swarm` calls its integration branch. It is derived from tasks'
+    /// `onto=` facets plus git, never stored (design D38.1).
+    Staging {
+        #[command(subcommand)]
+        cmd: StagingCmd,
     },
     /// Install/print the sync watcher as an OS service (launchd/systemd).
     Service {
@@ -562,6 +573,17 @@ enum MountCmd {
 }
 
 #[derive(Subcommand)]
+enum StagingCmd {
+    /// List staging branches and the tasks landing on each.
+    Ls {
+        /// Include branches already merged into trunk (hidden by default: a spent batch
+        /// must never be offered as a land target).
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum NsCmd {
     /// List namespaces (children of `scope`, or top-level if omitted).
     Ls { scope: Option<String> },
@@ -770,6 +792,15 @@ enum TaskCmd {
         /// Keep the session worktree and branch after landing.
         #[arg(long)]
         keep_worktree: bool,
+        /// Land without a recorded review. The waiver is recorded on the task, so a
+        /// bypass is visible rather than invisible.
+        #[arg(long)]
+        no_review: bool,
+    },
+    /// Record that a code review ran, so `task land` can require one.
+    Review {
+        #[command(subcommand)]
+        cmd: TaskReviewCmd,
     },
     /// Drop a session without landing it: release the claim, reopen the task, remove the
     /// worktree. The branch is kept unless you ask for it to go.
@@ -826,6 +857,23 @@ enum TaskCmd {
     /// Ensure every task homed outside `tasks/` has a `tasks/…` mirror (symbolic link),
     /// so `tasks/**` is the complete task index. Idempotent; sync does this automatically.
     Mirror,
+}
+
+#[derive(Subcommand)]
+enum TaskReviewCmd {
+    /// Record a review against a branch: tags every task working that branch with the
+    /// reviewed SHA and the findings namespace, and moves `in_progress` to `needs_review`.
+    Record {
+        /// The reviewed branch (default: the current branch here).
+        #[arg(long)]
+        branch: Option<String>,
+        /// The reviewed HEAD (default: this branch's HEAD).
+        #[arg(long)]
+        sha: Option<String>,
+        /// The namespace holding the review's findings.
+        #[arg(long)]
+        findings: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -986,6 +1034,9 @@ fn run(cli: Cli) -> Result<()> {
             watch,
             conflict.map(|p| ConflictPolicy::from(p).as_str()),
         ),
+        Command::Staging { cmd } => match cmd {
+            StagingCmd::Ls { all } => cmd_staging_ls(&db, all, cli.json),
+        },
         Command::Service { cmd } => match cmd {
             ServiceCmd::Print => service::print(&db_path),
             ServiceCmd::Install => service::install(&db_path),
@@ -3972,6 +4023,7 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             dry_run,
         } => cmd_task_close_merged(db, repo, trunk, dry_run, json)?,
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
+        TaskCmd::Review { cmd } => cmd_task_review(db, cmd, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read and session subcommands are dispatched by `cmd_task` and never reach here.
         TaskCmd::Add { .. }
@@ -4017,12 +4069,12 @@ fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
 
 /// The facet recording which branch a task is being done on, and which repo that branch is
 /// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
-const FACET_BRANCH: &str = "branch";
-const FACET_REPO: &str = "repo";
+pub(crate) const FACET_BRANCH: &str = "branch";
+pub(crate) const FACET_REPO: &str = "repo";
 /// The trunk commit the branch was cut from, recorded at `task start`. Without it a
 /// rebase-merged branch — which GitHub fast-forwards, leaving it byte-identical to trunk —
 /// cannot be told apart from a branch that was just created and never touched.
-const FACET_BASE: &str = "base";
+pub(crate) const FACET_BASE: &str = "base";
 
 /// `task start` — claim the task and record where the work is happening.
 ///
@@ -4121,7 +4173,18 @@ fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             gate,
             no_gate,
             keep_worktree,
-        } => cmd_task_land(db, &uid, gate.as_deref(), no_gate, keep_worktree, json),
+            no_review,
+        } => cmd_task_land(
+            db,
+            &uid,
+            LandFlags {
+                gate: gate.clone(),
+                no_gate,
+                keep_worktree,
+                no_review,
+            },
+            json,
+        ),
         TaskCmd::Abandon {
             uid,
             force,
@@ -4136,7 +4199,7 @@ fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
 /// The branch a session's work lands on (design D36.3). Recorded at `task work` so a resumed
 /// session — and `task land` itself — target the branch the batch was always going to, not
 /// whatever happens to be checked out later.
-const FACET_ONTO: &str = "onto";
+pub(crate) const FACET_ONTO: &str = "onto";
 
 /// A task's facet tags, **every** value per facet.
 ///
@@ -4153,12 +4216,18 @@ fn task_tags(db: &Db, id: ItemId) -> Result<BTreeMap<String, Vec<String>>> {
 }
 
 /// The values recorded for one facet.
-fn facet_values<'a>(tags: &'a BTreeMap<String, Vec<String>>, facet: &str) -> &'a [String] {
+pub(crate) fn facet_values<'a>(
+    tags: &'a BTreeMap<String, Vec<String>>,
+    facet: &str,
+) -> &'a [String] {
     tags.get(facet).map_or(&[], Vec::as_slice)
 }
 
 /// The single value of a facet that should only ever have one (`onto`, `repo`, `base`).
-fn facet_one<'a>(tags: &'a BTreeMap<String, Vec<String>>, facet: &str) -> Option<&'a String> {
+pub(crate) fn facet_one<'a>(
+    tags: &'a BTreeMap<String, Vec<String>>,
+    facet: &str,
+) -> Option<&'a String> {
     facet_values(tags, facet).first()
 }
 
@@ -4167,7 +4236,7 @@ fn facet_one<'a>(tags: &'a BTreeMap<String, Vec<String>>, facet: &str) -> Option
 /// `tag::apply` is additive, which is right for open-ended facets and wrong for the ones that
 /// answer "where is this being worked" — a second value there is not extra information, it is
 /// a contradiction the readers have to guess their way through.
-fn set_facet(
+pub(crate) fn set_facet(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
     id: ItemId,
@@ -4183,20 +4252,20 @@ fn set_facet(
 }
 
 /// What the session commands need to know about the repo they are running in.
-struct RepoCtx {
+pub(crate) struct RepoCtx {
     /// The **main** copy's root — where `.jkb/` lives, even when invoked from inside a
     /// session worktree.
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     /// The repo key, matching the `repo=` tag and the `repos/<repo>` namespace (D26/D32).
-    key: String,
+    pub(crate) key: String,
     /// The trunk ref (`origin/main`, `main`, …), if this repo has a discoverable one.
-    trunk: Option<String>,
+    pub(crate) trunk: Option<String>,
 }
 
 impl RepoCtx {
     /// The trunk's short branch name (`origin/main` → `main`), for comparing against a
     /// checked-out branch and for cutting new branches.
-    fn trunk_name(&self) -> Option<&str> {
+    pub(crate) fn trunk_name(&self) -> Option<&str> {
         self.trunk
             .as_deref()
             .map(|t| t.rsplit('/').next().unwrap_or(t))
@@ -4204,7 +4273,7 @@ impl RepoCtx {
 }
 
 /// Resolve the repo the current directory belongs to.
-fn repo_ctx() -> Result<RepoCtx> {
+pub(crate) fn repo_ctx() -> Result<RepoCtx> {
     let cwd = std::env::current_dir()?;
     let root = gitrepo::main_root(&cwd)?.context(
         "not inside a git repo — a task session is a git worktree, so run this from the repo",
@@ -4227,26 +4296,68 @@ struct SessionTask {
 /// session state file to fall out of step with git (design D36.2). A task carrying two of
 /// them is indexed under both, so a worktree is found whichever one names it.
 fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
-    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo_key}"))?;
-    let ids = db.read(move |conn| query.evaluate(conn))?;
     let mut out = BTreeMap::new();
-    for id in ids {
-        let tags = task_tags(db, id)?;
-        let Some(meta) = db.read(move |conn| item::get(conn, id))? else {
-            continue;
-        };
-        for branch in facet_values(&tags, FACET_BRANCH) {
-            out.insert(
-                branch.clone(),
-                SessionTask {
-                    uid: meta.uid.clone(),
-                    status: meta.status.clone().unwrap_or_default(),
-                    onto: facet_one(&tags, FACET_ONTO).cloned(),
-                },
-            );
+    for t in repo_tasks(db, repo_key)? {
+        for branch in facet_values(&t.tags, FACET_BRANCH) {
+            out.insert(branch.clone(), t.session_task());
         }
     }
     Ok(out)
+}
+
+/// One of this repo's tasks with everything the session and staging reads need.
+pub(crate) struct RepoTask {
+    pub(crate) meta: jkb_core::item::ItemMeta,
+    pub(crate) tags: BTreeMap<String, Vec<String>>,
+}
+
+impl RepoTask {
+    pub(crate) fn session_task(&self) -> SessionTask {
+        SessionTask {
+            uid: self.meta.uid.clone(),
+            status: self.meta.status.clone().unwrap_or_default(),
+            onto: facet_one(&self.tags, FACET_ONTO).cloned(),
+        }
+    }
+
+    /// The first line of the task's body — what a human calls the task.
+    pub(crate) fn title(&self) -> String {
+        self.meta
+            .content
+            .as_deref()
+            .and_then(|c| c.lines().find(|l| !l.trim().is_empty()))
+            .unwrap_or(&self.meta.uid)
+            .trim()
+            .to_owned()
+    }
+}
+
+/// Every task tagged `repo=<repo_key>`, with its rows and tags, in **one** database read.
+///
+/// The previous shape issued the query, then a `tag::applications` *and* an `item::get` per
+/// task — each a round-trip serialized on the writer thread, over a set that grows with every
+/// task ever worked in this repo. That is fine for `task sessions` at three sessions and not
+/// fine for a view that redraws on every database write (design D38.2).
+pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
+    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo_key}"))?;
+    Ok(db.read(move |conn| {
+        let ids = query.evaluate(conn)?;
+        let metas = item::get_many(conn, &ids)?;
+        let tags = tag::applications_for(conn, &ids)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(meta) = metas.get(&id) else { continue };
+            let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (facet, value) in tags.get(&id).cloned().unwrap_or_default() {
+                grouped.entry(facet).or_default().push(value);
+            }
+            out.push(RepoTask {
+                meta: meta.clone(),
+                tags: grouped,
+            });
+        }
+        Ok(out)
+    })?)
 }
 
 /// The live session for a task, matched against **all** the branches it records.
@@ -4547,14 +4658,22 @@ fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -
 }
 
 /// `task land` — the merge queue for one session (design D36.4).
-fn cmd_task_land(
-    db: &Db,
-    uid: &str,
-    gate_flag: Option<&str>,
+/// The flags of `task land`, grouped so the signature stays under the bool-argument lint.
+struct LandFlags {
+    gate: Option<String>,
     no_gate: bool,
     keep_worktree: bool,
-    json: bool,
-) -> Result<()> {
+    no_review: bool,
+}
+
+fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
+    let LandFlags {
+        gate: gate_flag,
+        no_gate,
+        keep_worktree,
+        no_review,
+    } = flags;
+    let gate_flag = gate_flag.as_deref();
     let ctx = repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
     let tags = task_tags(db, id)?;
@@ -4587,6 +4706,11 @@ fn cmd_task_land(
         ahead > 0,
         "{branch} has no commits that {onto} does not — nothing to land"
     );
+
+    // The review gate (design D38.5), before the graft: a refusal must not have moved a
+    // branch first. Concerns and nits do not block — only must-fix findings do.
+    let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
+    review::enforce(db, uid, id, &tags, &head, no_review, json)?;
 
     // Landing is serial: two grafts at once would each gate a tree the other is changing.
     let _lock = session::LandLock::acquire(&ctx.root)?;
@@ -4632,6 +4756,47 @@ fn cmd_task_land(
         }
     }
 
+    settle_landing(
+        db,
+        id,
+        &ctx,
+        &sess,
+        Landed {
+            uid,
+            branch: &branch,
+            onto: &onto,
+            grafted: &grafted,
+            ahead,
+            gate: gate.as_deref(),
+            gate_source: source.label(),
+            keep_worktree,
+        },
+        json,
+    )
+}
+
+/// What a successful graft produced, for the bookkeeping that follows it.
+#[derive(Clone, Copy)]
+struct Landed<'a> {
+    uid: &'a str,
+    branch: &'a str,
+    onto: &'a str,
+    grafted: &'a str,
+    ahead: usize,
+    gate: Option<&'a str>,
+    gate_source: &'a str,
+    keep_worktree: bool,
+}
+
+/// Mark the task done, free the claim, and dispose of the session (design D36.4).
+fn settle_landing(
+    db: &Db,
+    id: ItemId,
+    ctx: &RepoCtx,
+    sess: &session::Session,
+    landed: Landed<'_>,
+    json: bool,
+) -> Result<()> {
     // Landed: the task is done, the claim is free, and the session branch is a duplicate of
     // commits now in `onto`.
     db.write_txn("cli", move |conn, meta| {
@@ -4640,15 +4805,15 @@ fn cmd_task_land(
         Ok(())
     })?;
     let mut cleaned = false;
-    if keep_worktree {
+    if landed.keep_worktree {
         // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
         // commits. Left there, the kept session reads as N commits ahead of a target that
         // already contains its work, and a second `land` re-runs the whole graft. Move it to
         // what actually landed; the worktree is verified clean above, so nothing is lost.
-        gitrepo::reset_hard(&sess.worktree, &grafted)?;
+        gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
     } else {
         gitrepo::worktree_remove(&ctx.root, &sess.worktree, false)?;
-        gitrepo::delete_branch(&ctx.root, &branch, true)?;
+        gitrepo::delete_branch(&ctx.root, landed.branch, true)?;
         cleaned = true;
     }
 
@@ -4656,13 +4821,16 @@ fn cmd_task_land(
         println!(
             "{}",
             serde_json::json!({
-                "uid": uid, "landed": true, "branch": branch, "onto": onto,
-                "commits": ahead, "gate": gate, "gate_source": source.label(),
+                "uid": landed.uid, "landed": true, "branch": landed.branch, "onto": landed.onto,
+                "commits": landed.ahead, "gate": landed.gate, "gate_source": landed.gate_source,
                 "session_removed": cleaned,
             })
         );
     } else {
-        println!("landed: {branch} → {onto} ({ahead} commit(s)); {uid} is done");
+        println!(
+            "landed: {} → {} ({} commit(s)); {} is done",
+            landed.branch, landed.onto, landed.ahead, landed.uid
+        );
         if cleaned {
             println!("  removed session {} and its branch", sess.name);
         }
@@ -5416,4 +5584,143 @@ fn output_line(item: &output::DisplayItem) -> String {
 fn first_line(content: &str) -> String {
     let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     line.trim().chars().take(100).collect()
+}
+
+/// `jkb staging ls` — the staging branches in this repo and what is landing on each.
+///
+/// The one read behind both the explorer's branch picker and its In Flight view (design
+/// D38.2), so the two cannot disagree about what is live.
+fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
+    let ctx = repo_ctx()?;
+    let rows = staging::collect(db, &ctx, all)?;
+
+    if json {
+        let v: Vec<_> = rows
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "branch": s.branch,
+                    "merged": s.merged,
+                    "ahead": s.ahead,
+                    "checkout": s.checkout,
+                    "tasks": s.tasks.iter().map(|t| serde_json::json!({
+                        "uid": t.uid,
+                        "title": t.title,
+                        "status": t.status,
+                        "state": t.state.as_str(),
+                        "branch": t.branch,
+                        "worktree": t.worktree,
+                        "dirty": t.dirty,
+                        "commits": t.commits,
+                        "reviewed": t.reviewed,
+                        "review_ns": t.review_ns,
+                        "review_waived": t.review_waived,
+                        "open_must_fix": t.open_must_fix,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("(no staging branches in {})", ctx.key);
+        println!("one is created the first time you run `jkb task work <uid>`");
+        return Ok(());
+    }
+    for s in &rows {
+        let merged = if s.merged { "  [merged]" } else { "" };
+        println!(
+            "{}  {} commit(s) vs trunk · {} task(s){merged}",
+            s.branch,
+            s.ahead,
+            s.tasks.len()
+        );
+        for t in &s.tasks {
+            let mut notes = vec![t.state.as_str().to_owned()];
+            if t.commits > 0 {
+                notes.push(format!("{} commit(s)", t.commits));
+            }
+            if t.dirty {
+                notes.push("uncommitted".to_owned());
+            }
+            if t.open_must_fix > 0 {
+                notes.push(format!("{} must-fix open", t.open_must_fix));
+            } else if t.reviewed.is_some() {
+                notes.push("reviewed".to_owned());
+            }
+            if t.review_waived.is_some() {
+                notes.push("review waived".to_owned());
+            }
+            println!("    {}  [{}]", truncate(&t.title, 60), notes.join(" · "));
+            println!("      {}", t.uid);
+        }
+    }
+    Ok(())
+}
+
+/// `jkb task review record` — record that a review ran against a branch (design D38.4).
+fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
+    let TaskReviewCmd::Record {
+        branch,
+        sha,
+        findings,
+    } = cmd;
+    let ctx = repo_ctx()?;
+    let cwd = std::env::current_dir()?;
+    let branch = match branch {
+        Some(b) => b,
+        None => gitrepo::current_branch(&cwd)?
+            .context("not on a branch here (detached HEAD?) — pass --branch")?,
+    };
+    let sha = match sha {
+        Some(s) => Some(s),
+        None => gitrepo::rev(&ctx.root, &branch)?,
+    };
+
+    let recorded = review::record(db, &ctx.key, &branch, sha.as_deref(), &findings)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "branch": branch,
+                "sha": sha,
+                "findings": findings,
+                "tasks": recorded.iter().map(|r| serde_json::json!({
+                    "uid": r.uid, "moved_to_review": r.moved_to_review,
+                })).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+    if recorded.is_empty() {
+        // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and
+        // not an error (design D38.4).
+        println!("no task records branch={branch} — nothing to tag (review still filed)");
+        return Ok(());
+    }
+    println!(
+        "recorded review of {branch}@{} -> {findings}",
+        sha.as_deref().unwrap_or("unknown")
+    );
+    for r in &recorded {
+        let moved = if r.moved_to_review {
+            " (now needs_review)"
+        } else {
+            ""
+        };
+        println!("  {}{moved}", r.uid);
+    }
+    Ok(())
+}
+
+/// Shorten `s` to `n` characters with an ellipsis, for one-line listings.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(n.saturating_sub(1)).collect();
+    format!("{head}…")
 }

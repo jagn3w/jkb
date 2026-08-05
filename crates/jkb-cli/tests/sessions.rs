@@ -5,6 +5,10 @@
 //! These drive the real binary against a real git repo, because everything interesting here
 //! is git behaviour (a branch cannot be checked out twice; a rebase conflicts) rather than
 //! anything a mock would reproduce.
+//!
+//! Every `land` here passes `--no-review`: these tests are about landing *mechanics*, and the
+//! review gate (design D38.5) has its own tests in `staging.rs`. Without the flag each of
+//! these would be re-testing the gate and nothing else.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,14 +155,14 @@ fn two_sessions_are_worked_in_parallel_and_land_in_sequence() {
 
     // A gate that passes, remembered for the repo on the first land.
     f.jkb()
-        .args(["task", "land", &a, "--gate", "true"])
+        .args(["task", "land", &a, "--gate", "true", "--no-review"])
         .assert()
         .success()
         .stdout(predicate::str::contains("landed"));
 
     // The second land needs no --gate: the repo remembers (design D36.5).
     f.jkb()
-        .args(["task", "land", &b])
+        .args(["task", "land", &b, "--no-review"])
         .assert()
         .success()
         .stdout(predicate::str::contains("landed"))
@@ -257,7 +261,7 @@ fn a_red_gate_rolls_the_target_back_and_keeps_the_session() {
     let before = git(&f.repo, &["rev-parse", &onto]);
 
     f.jkb()
-        .args(["task", "land", &uid, "--gate", "false"])
+        .args(["task", "land", &uid, "--gate", "false", "--no-review"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("gate failed"));
@@ -294,13 +298,13 @@ fn a_conflicting_second_land_ejects_without_touching_the_target() {
     );
 
     f.jkb()
-        .args(["task", "land", &a, "--no-gate"])
+        .args(["task", "land", &a, "--no-gate", "--no-review"])
         .assert()
         .success();
     let after_a = git(&f.repo, &["rev-parse", &onto]);
 
     f.jkb()
-        .args(["task", "land", &b, "--no-gate"])
+        .args(["task", "land", &b, "--no-gate", "--no-review"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("does not rebase cleanly"))
@@ -322,7 +326,7 @@ fn a_session_with_uncommitted_work_refuses_to_land() {
     std::fs::write(wt.join("d.txt"), "edited but not committed\n").unwrap();
 
     f.jkb()
-        .args(["task", "land", &uid, "--no-gate"])
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("uncommitted changes"));
@@ -335,7 +339,7 @@ fn landing_a_session_with_no_commits_says_so() {
     let uid = f.add_task("untouched task");
     f.work(&uid);
     f.jkb()
-        .args(["task", "land", &uid, "--no-gate"])
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("nothing to land"));
@@ -414,7 +418,7 @@ fn landing_onto_a_second_target_reuses_the_base_checkout() {
         "a",
     );
     f.jkb()
-        .args(["task", "land", &a, "--no-gate"])
+        .args(["task", "land", &a, "--no-gate", "--no-review"])
         .assert()
         .success();
     assert!(
@@ -433,7 +437,7 @@ fn landing_onto_a_second_target_reuses_the_base_checkout() {
         "b",
     );
     f.jkb()
-        .args(["task", "land", &b, "--no-gate"])
+        .args(["task", "land", &b, "--no-gate", "--no-review"])
         .assert()
         .success()
         .stdout(predicate::str::contains("landed"));
@@ -455,7 +459,7 @@ fn a_merged_batch_is_released_rather_than_rejoined() {
         "a",
     );
     f.jkb()
-        .args(["task", "land", &a, "--no-gate"])
+        .args(["task", "land", &a, "--no-gate", "--no-review"])
         .assert()
         .success();
 
@@ -495,7 +499,7 @@ fn a_second_branch_tag_does_not_fork_the_session() {
     let wt = PathBuf::from(again["worktree"].as_str().unwrap());
     commit_in(&wt, "x.txt", "x\n", "x");
     f.jkb()
-        .args(["task", "land", &uid, "--no-gate"])
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
         .assert()
         .success()
         .stdout(predicate::str::contains("landed"));
@@ -553,13 +557,20 @@ fn keeping_the_worktree_moves_its_branch_to_what_landed() {
 
     // Move the target out from under the kept session, so its land is a real rebase.
     f.jkb()
-        .args(["task", "land", &first, "--no-gate"])
+        .args(["task", "land", &first, "--no-gate", "--no-review"])
         .assert()
         .success();
     let before = git(&f.repo, &["rev-parse", &branch]);
 
     f.jkb()
-        .args(["task", "land", &uid, "--no-gate", "--keep-worktree"])
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--no-gate",
+            "--keep-worktree",
+            "--no-review",
+        ])
         .assert()
         .success();
 
@@ -619,4 +630,234 @@ fn the_gate_is_remembered_and_editable() {
         .assert()
         .success()
         .stdout(predicate::str::contains("UNVERIFIED"));
+}
+
+// ---------------------------------------------------------------------------
+// Staging branches and the review gate (design D38)
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// `jkb staging ls --json`.
+    fn staging(&self, extra: &[&str]) -> serde_json::Value {
+        let mut args = vec!["staging", "ls", "--json"];
+        args.extend_from_slice(extra);
+        let out = self.jkb().args(&args).output().unwrap();
+        assert!(out.status.success(), "staging ls: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// File a must-fix finding under `ns` and return its uid.
+    fn add_finding(&self, ns: &str, text: &str) -> String {
+        let out = self
+            .jkb()
+            .args([
+                "--global",
+                "task",
+                "add",
+                text,
+                "!p1",
+                &format!("+{ns}"),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "add finding: {out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["uid"].as_str().unwrap().to_owned()
+    }
+}
+
+/// `staging ls` groups live sessions under the branch they land on, and derives each task's
+/// state rather than storing it (design D38.1/D38.2).
+#[test]
+fn staging_ls_groups_tasks_under_the_branch_they_land_on() {
+    let f = Fixture::new();
+    let a = f.add_task("first staged task");
+    let b = f.add_task("second staged task");
+    let sa = f.work(&a);
+    let onto = sa["onto"].as_str().unwrap().to_owned();
+    // The second session joins the batch the first one opened — the swarm's integration
+    // branch model, driven by hand (D36.3).
+    let sb = f.work(&b);
+    assert_eq!(sb["onto"].as_str().unwrap(), onto);
+
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+
+    let rows = f.staging(&[]);
+    assert_eq!(rows.as_array().unwrap().len(), 1, "one staging branch");
+    let row = &rows[0];
+    assert_eq!(row["branch"].as_str().unwrap(), onto);
+    assert_eq!(row["merged"], false);
+    let tasks = row["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    for t in tasks {
+        assert_eq!(t["state"].as_str().unwrap(), "implementing");
+        assert_eq!(t["open_must_fix"], 0);
+        assert!(t["reviewed"].is_null());
+    }
+    // The one with a commit reports it; the other does not.
+    let committed = tasks.iter().find(|t| t["uid"] == a.as_str()).unwrap();
+    assert_eq!(committed["commits"], 1);
+    assert_eq!(committed["title"].as_str().unwrap(), "first staged task");
+
+    // A task whose `onto=` branch no longer exists is not a phantom staging branch.
+    f.jkb()
+        .args(["task", "abandon", &a, "--force", "--delete-branch"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "abandon", &b, "--force", "--delete-branch"])
+        .assert()
+        .success();
+    git(&f.repo, &["branch", "-D", &onto]);
+    assert!(f.staging(&[]).as_array().unwrap().is_empty());
+}
+
+/// Recording a review tags the task and moves it into `needs_review` — the only author of
+/// that transition (design D38.4/D38.6).
+#[test]
+fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed task");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/run-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now needs_review"));
+
+    assert_eq!(f.status_of(&uid), "needs_review");
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert_eq!(t["state"].as_str().unwrap(), "review");
+    assert_eq!(t["review_ns"].as_str().unwrap(), "reviews/run-1");
+    let first_sha = t["reviewed"].as_str().unwrap().to_owned();
+
+    // Recording again replaces the SHA rather than accumulating a second one: a task with two
+    // `reviewed=` values is a contradiction, and a reader collapsing the multi-map picks one.
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "b.txt",
+        "b",
+        "b",
+    );
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/run-2"])
+        .assert()
+        .success();
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert_ne!(t["reviewed"].as_str().unwrap(), first_sha);
+    assert_eq!(t["review_ns"].as_str().unwrap(), "reviews/run-2");
+
+    // A branch no task claims is a note, not an error — reviewing an arbitrary range is a
+    // legitimate thing to do.
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "main"])
+        .args(["--findings", "reviews/run-3"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no task records branch=main"));
+}
+
+/// The land gate: unreviewed refuses, an open must-fix refuses, cancelling it lets the
+/// landing through, and `--no-review` records a visible waiver (design D38.5).
+#[test]
+fn landing_requires_a_review_with_no_open_must_fix_findings() {
+    let f = Fixture::new();
+    let uid = f.add_task("gated task");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let worktree = s["worktree"].as_str().unwrap().to_owned();
+    commit_in(Path::new(&worktree), "a.txt", "a", "a");
+
+    // 1. No review recorded at all.
+    let before = git(&f.repo, &["rev-parse", &onto]);
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no recorded review"));
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &onto]),
+        before,
+        "a refusal must not have moved the target"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+
+    // 2. Reviewed, but the review left a must-fix finding open.
+    let finding = f.add_finding("reviews/gate", "a real must-fix problem");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/gate"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("open must-fix finding"))
+        .stderr(predicate::str::contains("a real must-fix problem"));
+    assert_eq!(git(&f.repo, &["rev-parse", &onto]), before);
+
+    // 3. Dismissing the finding lets it land. Concerns and nits never blocked.
+    f.jkb()
+        .args(["--global", "task", "set", &finding, "--status", "cancelled"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is done"));
+    assert_eq!(f.status_of(&uid), "done");
+    assert_ne!(git(&f.repo, &["rev-parse", &onto]), before);
+}
+
+/// `--no-review` lands without a review but leaves a mark, so a bypass is visible.
+#[test]
+fn no_review_lands_but_records_a_waiver() {
+    let f = Fixture::new();
+    let uid = f.add_task("waived task");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--no-gate",
+            "--no-review",
+            "--keep-worktree",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("WAIVED"));
+
+    let t = &f.staging(&["--all"])[0]["tasks"][0];
+    assert!(
+        t["review_waived"].as_str().is_some(),
+        "the waiver is recorded on the task, not just printed"
+    );
 }

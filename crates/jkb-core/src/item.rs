@@ -1,5 +1,7 @@
 //! Item repository: the atomic knowledge/graph node.
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
@@ -230,6 +232,53 @@ pub fn get(conn: &Connection, item: ItemId) -> Result<Option<ItemMeta>> {
     })
     .optional()
     .map_err(Into::into)
+}
+
+/// Every row in `items`, keyed by id, in one query.
+///
+/// Batches [`get`] for callers holding a candidate set. A per-item `get` is a round-trip
+/// serialized on the writer thread, so a caller resolving N items pays N of them — fine for
+/// three, not for a view that redraws on every database write.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn get_many(conn: &Connection, items: &[ItemId]) -> Result<HashMap<ItemId, ItemMeta>> {
+    let mut out = HashMap::new();
+    if items.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; items.len()].join(", ");
+    let sql = format!(
+        "SELECT id, uid, kind, content, content_hash, mime, status, resolution, priority, due,
+                created_at, updated_at
+         FROM items WHERE id IN ({placeholders})"
+    );
+    let params: Vec<rusqlite::types::Value> = items
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(id.get()))
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok(ItemMeta {
+            id: ItemId::new(r.get(0)?),
+            uid: r.get(1)?,
+            kind: r.get(2)?,
+            content: r.get(3)?,
+            content_hash: r.get(4)?,
+            mime: r.get(5)?,
+            status: r.get(6)?,
+            resolution: r.get(7)?,
+            priority: r.get(8)?,
+            due: r.get(9)?,
+            created_at: r.get(10)?,
+            updated_at: r.get(11)?,
+        })
+    })?;
+    for row in rows {
+        let meta = row?;
+        out.insert(meta.id, meta);
+    }
+    Ok(out)
 }
 
 /// Set `item`'s [`Resolution`] — how the unit **ended** (design Dmem.3), orthogonal to
