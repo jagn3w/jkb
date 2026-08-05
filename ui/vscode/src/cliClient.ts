@@ -11,6 +11,7 @@ import type {
   MutationIntent,
   NodeDetails,
   NodeRef,
+  StagingBranch,
   TreeChild,
 } from "@jkb/core";
 
@@ -76,16 +77,51 @@ export interface SessionInfo {
   readonly resumed: boolean;
 }
 
+/** `jkb task add --json`: the task that was created. */
+export interface CreatedTask {
+  readonly uid: string;
+  readonly home: string;
+}
+
 export class CliJkbClient implements JkbClient {
   constructor(private readonly cfg: CliConfig) {}
+
+  /**
+   * Create a task from a raw **quick-add line**, so `!p1 @2026-08-12 #area=ui` behave exactly
+   * as they do in the terminal (design D38.7). Accepting only a title would be a second,
+   * poorer task grammar living in the UI.
+   *
+   * `home` places it in a namespace; `under` makes it a subtask of a task, inheriting that
+   * task's home.
+   */
+  async addTask(text: string, opts: { home?: string; under?: string }): Promise<CreatedTask> {
+    const args = ["--global", "task", "add", text];
+    if (opts.under) args.push("--under", opts.under);
+    else if (opts.home) args.push(`+${opts.home}`);
+    return this.json<CreatedTask>(args);
+  }
+
+  /**
+   * The staging branches in this repo and what is landing on each — the one read behind both
+   * the branch picker and the In Flight view, so the two cannot disagree (design D38.2).
+   */
+  async staging(cwd: string, includeMerged = false): Promise<StagingBranch[]> {
+    const args = ["staging", "ls"];
+    if (includeMerged) args.push("--all");
+    return this.json<StagingBranch[]>(args, cwd);
+  }
 
   /**
    * Open (or return) the task's session — its own git worktree and branch, claimed so no
    * other terminal or swarm run starts the same task. Must run inside the repo, which is
    * why this one takes a cwd: sessions are git state, not KB state.
    */
-  async openSession(uid: string, cwd: string): Promise<SessionInfo> {
-    return this.json<SessionInfo>(["task", "work", uid], cwd);
+  async openSession(uid: string, cwd: string, onto?: string): Promise<SessionInfo> {
+    const args = ["task", "work", uid];
+    // Omitting `--onto` is not the same as passing a value: it keeps `resolve_onto`'s
+    // fallback chain, which is what "Let jkb decide" means in the picker (design D38.3).
+    if (onto) args.push("--onto", onto);
+    return this.json<SessionInfo>(args, cwd);
   }
 
   /**

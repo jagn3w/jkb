@@ -8,10 +8,11 @@ import * as path from "node:path";
 
 import * as vscode from "vscode";
 
-import type { NodeRef, TreeChild } from "@jkb/core";
+import { landBlocker, type NodeRef, type StagingBranch, type TreeChild } from "@jkb/core";
 
 import { CliJkbClient } from "./cliClient.js";
 import { JkbDecorationProvider } from "./decorations.js";
+import { InFlightProvider, type FlightNode } from "./inflight.js";
 import { DetailsPanel } from "./detailsPanel.js";
 import { JkbTreeProvider } from "./tree.js";
 
@@ -19,14 +20,20 @@ export function activate(context: vscode.ExtensionContext): void {
   const client = makeClient();
   const tree = new JkbTreeProvider(client);
   const decorations = new JkbDecorationProvider();
+  const inflight = new InFlightProvider(client, () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
 
   // Refresh the tree only. Decorations follow automatically: each node's resource URI
   // encodes its status/priority, so a changed node is a *new* URI (freshly decorated) and
   // an unchanged node keeps its cached decoration — no colour flashing on refresh.
-  const refreshAll = () => tree.refresh();
+  // In Flight rides the same signal: it is derived from the same tasks.
+  const refreshAll = () => {
+    tree.refresh();
+    inflight.refresh();
+  };
 
   context.subscriptions.push(
     vscode.window.createTreeView("jkb.explorer", { treeDataProvider: tree }),
+    vscode.window.createTreeView("jkb.inflight", { treeDataProvider: inflight }),
     vscode.window.registerFileDecorationProvider(decorations),
     watchDatabase(refreshAll),
     vscode.commands.registerCommand("jkb.refresh", refreshAll),
@@ -47,7 +54,87 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("jkb.landTask", (child?: TreeChild) =>
       landTask(client, child),
     ),
+    vscode.commands.registerCommand("jkb.newTask", (child?: TreeChild) =>
+      createTask(client, child, refreshAll),
+    ),
+    vscode.commands.registerCommand("jkb.newSubtask", (child?: TreeChild) =>
+      createSubtask(client, child, refreshAll),
+    ),
+    vscode.commands.registerCommand("jkb.inflight.refresh", () => inflight.refresh()),
+    vscode.commands.registerCommand("jkb.inflight.toggleMerged", () => {
+      const shown = inflight.toggleMerged();
+      vscode.window.setStatusBarMessage(
+        `jkb: merged staging branches ${shown ? "shown" : "hidden"}`,
+        2000,
+      );
+    }),
+    vscode.commands.registerCommand("jkb.inflight.openSession", (node?: FlightNode) =>
+      openSessionTerminal(node),
+    ),
+    vscode.commands.registerCommand("jkb.inflight.land", (node?: FlightNode) =>
+      landFromFlight(client, node),
+    ),
+    vscode.commands.registerCommand("jkb.inflight.abandon", (node?: FlightNode) =>
+      abandonFromFlight(client, node),
+    ),
+    vscode.commands.registerCommand("jkb.inflight.openFindings", (node?: FlightNode) =>
+      openFindings(client, node),
+    ),
   );
+}
+
+/**
+ * Create a task homed in the namespace that was right-clicked.
+ *
+ * The input takes a **raw quick-add line**, not just a title, so `!p1 @2026-08-12 #area=ui`
+ * work exactly as they do in the terminal (design D38.7). This is the D31 rule applied to a
+ * write: the UI is a client of the CLI, and one that accepted only a title would be a second,
+ * poorer task-creation grammar.
+ */
+async function createTask(
+  client: CliJkbClient,
+  child: TreeChild | undefined,
+  refresh: () => void,
+): Promise<void> {
+  if (!child || child.ref.kind !== "namespace") {
+    vscode.window.showWarningMessage("jkb: right-click a folder to add a task to it.");
+    return;
+  }
+  const path = child.ref.path;
+  await addTask(refresh, `New task in ${path}`, (text) => client.addTask(text, { home: path }));
+}
+
+/** Create a subtask of the task that was right-clicked; it inherits the parent's home. */
+async function createSubtask(
+  client: CliJkbClient,
+  child: TreeChild | undefined,
+  refresh: () => void,
+): Promise<void> {
+  const uid = taskUid(child, "add a subtask to");
+  if (!uid) return;
+  await addTask(refresh, `New subtask of "${child?.label ?? uid}"`, (text) =>
+    client.addTask(text, { under: uid }),
+  );
+}
+
+/** Prompt for a quick-add line, create the task, and reveal it. */
+async function addTask(
+  refresh: () => void,
+  prompt: string,
+  create: (text: string) => Promise<{ uid: string }>,
+): Promise<void> {
+  const text = await vscode.window.showInputBox({
+    prompt,
+    placeHolder: "Title, plus optional !p1  @2026-08-12  #facet=value",
+  });
+  if (!text || !text.trim()) return;
+  try {
+    const created = await create(text.trim());
+    refresh();
+    vscode.window.setStatusBarMessage(`jkb: created ${created.uid}`, 4000);
+  } catch (e) {
+    vscode.window.showErrorMessage(`jkb: ${(e as Error).message}`);
+  }
 }
 
 export function deactivate(): void {
@@ -185,9 +272,12 @@ async function workTaskWithClaude(client: CliJkbClient, child?: TreeChild): Prom
   const cwd = repoFolder();
   if (!cwd) return;
 
+  const onto = await pickStagingBranch(client, cwd);
+  if (onto === undefined) return; // cancelled — open no session
+
   let session;
   try {
-    session = await client.openSession(uid, cwd);
+    session = await client.openSession(uid, cwd, onto || undefined);
   } catch (e) {
     vscode.window.showErrorMessage(`jkb: ${(e as Error).message}`);
     return;
@@ -216,6 +306,69 @@ async function workTaskWithClaude(client: CliJkbClient, child?: TreeChild): Prom
 }
 
 /**
+ * Ask which staging branch this session should land on (design D38.3).
+ *
+ * A staging branch is the branch a batch of tasks lands on before trunk — the same thing
+ * `/task-swarm` calls its integration branch. `resolve_onto` has always been able to pick one
+ * from four fallbacks, and has always done it invisibly; this makes the choice *visible and
+ * overridable*, not mandatory.
+ *
+ * Returns the branch name, `""` for "let jkb decide" (pass no `--onto`, keeping the fallback
+ * chain exactly), or `undefined` when the user cancelled.
+ */
+async function pickStagingBranch(
+  client: CliJkbClient,
+  cwd: string,
+): Promise<string | undefined> {
+  let branches: readonly StagingBranch[] = [];
+  try {
+    branches = await client.staging(cwd);
+  } catch {
+    // Outside a git repo, or a jkb too old to know `staging ls`. Falling back to the
+    // fallback chain is strictly better than refusing to open a session.
+    return "";
+  }
+
+  const auto = {
+    label: "$(sparkle) Let jkb decide",
+    description: branches.length
+      ? "join the batch already in flight"
+      : "cut a new batch from trunk",
+    value: "",
+  };
+  const create = {
+    label: "$(add) New staging branch…",
+    description: "cut a fresh branch from trunk",
+    value: " new",
+  };
+  const existing = branches.map((b) => ({
+    label: `$(git-branch) ${b.branch}`,
+    description: `${b.tasks.length} task${b.tasks.length === 1 ? "" : "s"} · ${b.ahead} commit${
+      b.ahead === 1 ? "" : "s"
+    } ahead of trunk`,
+    value: b.branch,
+  }));
+
+  // "Let jkb decide" leads, because the fallback chain is usually right: a picker with no
+  // default turns a one-click action into a decision you must make every time, which is how
+  // people stop using it.
+  const pick = await vscode.window.showQuickPick([auto, ...existing, create], {
+    placeHolder: "Where should this task's work land?",
+  });
+  if (!pick) return undefined;
+  if (pick.value !== " new") return pick.value;
+
+  const name = await vscode.window.showInputBox({
+    prompt: "Name for the new staging branch (cut from trunk)",
+    placeHolder: "e.g. ui-and-staging",
+    validateInput: (v) =>
+      /^[\w./-]+$/.test(v.trim()) ? undefined : "letters, digits, and . _ - / only",
+  });
+  const trimmed = name?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
  * Land a task's session: rebase onto the target, run the gate, mark it done.
  *
  * Run in a terminal rather than captured, because the gate is a build — the user needs to
@@ -235,4 +388,73 @@ function landTask(client: CliJkbClient, child?: TreeChild): void {
 /** Single-quote a string for safe use in a POSIX shell. */
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+// ---------------------------------------------------------------------------
+// In Flight row actions — each one reuses a command that already exists.
+// ---------------------------------------------------------------------------
+
+/** Open a terminal in the task's session worktree. */
+function openSessionTerminal(node?: FlightNode): void {
+  if (node?.kind !== "task" || !node.task.worktree) {
+    vscode.window.showWarningMessage("jkb: that task has no session checkout.");
+    return;
+  }
+  const terminal = vscode.window.createTerminal({
+    name: `jkb: ${node.task.uid.slice(-24)}`,
+    cwd: node.task.worktree,
+  });
+  terminal.show();
+}
+
+/** Land the task, in a terminal — the gate is a build, and a red one needs its output. */
+function landFromFlight(client: CliJkbClient, node?: FlightNode): void {
+  if (node?.kind !== "task") return;
+  const blocker = landBlocker(node.task);
+  if (blocker) {
+    // Say why before spending a build on a refusal the row already knew about.
+    vscode.window.showWarningMessage(`jkb: ${node.task.title} cannot land yet. ${blocker}`);
+    return;
+  }
+  const cwd = repoFolder();
+  if (!cwd) return;
+  const terminal = vscode.window.createTerminal({
+    name: `jkb land: ${node.task.uid.slice(-24)}`,
+    cwd,
+  });
+  terminal.show();
+  terminal.sendText(client.terminalCommand(["task", "land", node.task.uid]));
+}
+
+/** Abandon the session, after confirming — it discards a checkout. */
+async function abandonFromFlight(client: CliJkbClient, node?: FlightNode): Promise<void> {
+  if (node?.kind !== "task") return;
+  const t = node.task;
+  const warn = t.dirty ? " It has uncommitted changes, which will be lost." : "";
+  const ok = await vscode.window.showWarningMessage(
+    `Abandon the session for "${t.title}"?${warn} The task returns to open.`,
+    { modal: true },
+    "Abandon",
+  );
+  if (ok !== "Abandon") return;
+  const cwd = repoFolder();
+  if (!cwd) return;
+  const terminal = vscode.window.createTerminal({ name: `jkb abandon`, cwd });
+  terminal.show();
+  const args = ["task", "abandon", t.uid];
+  if (t.dirty) args.push("--force");
+  terminal.sendText(client.terminalCommand(args));
+}
+
+/** Open the task's review findings in the explorer's details panel. */
+async function openFindings(client: CliJkbClient, node?: FlightNode): Promise<void> {
+  if (node?.kind !== "task") return;
+  const ns = node.task.review_ns;
+  if (!ns) {
+    vscode.window.showInformationMessage(
+      "jkb: no review recorded for this task yet — run /review-log in its session.",
+    );
+    return;
+  }
+  DetailsPanel.show(client, { kind: "namespace", path: ns }, () => {});
 }
