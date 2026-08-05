@@ -784,6 +784,53 @@ coordination lives in the *store* (items + typed edges), never in agent chat.
   memory surface. Driving investigations at large fan-out is
   `task:scale-up-the-task-swarm-to-drive-18c6cc7853efc280`, not part of this change.
 
+## Sync: one directory, one synced file (the `openspec` collapse)
+
+A `tasks`-serializer mount over `openspec/` overwrote **62 of 63 files**: in each change
+folder `design.md`, `proposal.md` and `.openspec.yaml` were left byte-identical to one
+another, and every markdown header in the tree was stripped. Two independent defects lined up.
+
+- **`namespace_for` drops the filename.** A file's namespace is derived from its *containing
+  directory*, so every file in a directory shares one namespace — and with it the `layout`
+  that `assemble_kb_doc` reads and that `render` treats as the sole authority on document
+  order (see the prose note below). Items were correctly per-file, via
+  `binding::synced_uris_for_file`; the document *structure* was not. So each file rendered
+  whichever sibling last wrote the shared layout.
+- **`mount create` is a full-row replace that doubles as the update command.** Its SQL sets
+  every column from the arguments, so a re-run that omitted `--include` wrote NULL over the
+  stored glob. The mount had been restricted to `**/tasks.md`; one re-run to change the
+  conflict policy silently removed that restriction, and the next sync discovered the whole
+  tree.
+
+Three guards, each closing a different link:
+
+- **`Outcome::Collided`.** `colliding_paths` refuses — reads nothing, writes nothing — any
+  file sharing a namespace with another synced file. It checks both the current batch and the
+  bindings already in the KB, so a single watch event still sees the sibling it would collide
+  with. Gated on `SyncSerializer::requires_exclusive_namespace()`: `tasks` opts in, `document`
+  does not, because one item per whole file consults no layout and many of them share a
+  directory safely. Two files in a directory are not a merge to resolve — nothing in the store
+  says which file the shared layout belongs to — so refusing is the only correct answer.
+- **`mount create` preserves what you did not name.** It reads the existing mount and only
+  applies the flags actually passed (`FieldEdit::{Keep,Set,Clear}`); `--no-include` /
+  `--no-exclude` clear explicitly. It prints the resulting configuration every time, and
+  `mount ls` now shows mode/policy/globs — a mount whose glob had been dropped previously
+  looked identical to one that still had it.
+- **`jkb sync --conflict <policy>`** overrides the policy for one run. The only way to unstick
+  a conflicted file used to be re-creating the mount with a different `--policy`, which is
+  precisely the write that dropped the glob. The mount no longer has to be edited to get a
+  sync moving.
+
+**Still true, and deliberately not fixed here:** a `tasks` mount can hold at most one synced
+file per directory. Making a file's namespace include its own name would re-home every synced
+item, so it is a migration and a design pass, not a bug fix — tracked in the backlog.
+
+**Recovery, for next time.** `blobs` is content-addressed and never garbage-collected, and
+file sync stores the bytes of every version it settles — so the store is a complete history of
+every synced file. `jkb blob ls --contains "<a line you remember>"` finds the version, `jkb
+blob cat <hash>` writes it out. That is how all 62 files were recovered here; the originals
+were the import cohort, distinguishable from the damaged exports by still having headers.
+
 ## Sync: prose is not an item (the `memory/sync-export-wins` fix)
 
 The `tasks` serializer used to turn every non-item line into a `text` item whose identity was

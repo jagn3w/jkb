@@ -14,7 +14,7 @@
 //! last-good items are left intact, the failing bytes are stashed, and the journal is
 //! flagged `needs_attention` — rather than overwritten.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use globset::{Glob, GlobMatcher};
@@ -56,6 +56,14 @@ pub enum Outcome {
     UpToDate,
     /// The mount's `sync_mode` does not permit the needed direction.
     Skipped,
+    /// Another synced file in this mount maps to the same namespace, so the two would share
+    /// one layout and each would render the other's content. Nothing was read or written.
+    ///
+    /// [`namespace_for`] derives a file's namespace from its **containing directory** and
+    /// drops the filename, so a directory can carry at most one synced file. Two of them is
+    /// not a merge to resolve — it is an ambiguity with no correct answer, and exporting
+    /// under it silently overwrites one file with the other's content.
+    Collided,
 }
 
 /// The result of reconciling one file.
@@ -91,6 +99,14 @@ impl SyncReport {
     #[must_use]
     pub fn merged(&self) -> Vec<&Path> {
         self.paths_with(Outcome::Merged)
+    }
+
+    /// The paths refused because they share a namespace with another synced file
+    /// ([`Outcome::Collided`]). These need a mount whose globs select one file per
+    /// directory, not a conflict resolution.
+    #[must_use]
+    pub fn collided(&self) -> Vec<&Path> {
+        self.paths_with(Outcome::Collided)
     }
 
     fn paths_with(&self, outcome: Outcome) -> Vec<&Path> {
@@ -135,12 +151,40 @@ impl Ctx {
 /// `file://` path, its serializer is unknown, or a filesystem/database operation
 /// fails. Conflicts and quarantines are reported in the [`SyncReport`], not as errors.
 pub fn sync(db: &Db, mount_ns: &str) -> Result<SyncReport> {
-    let ctx = load_ctx(db, mount_ns)?;
+    sync_with_policy(db, mount_ns, None)
+}
+
+/// Run a one-shot sync, optionally overriding the mount's conflict policy **for this run
+/// only** (design D25: the policy is a mount property, but resolving one stuck file should
+/// not require editing the mount).
+///
+/// Before this existed, the only way to resolve a conflict was to re-create the mount with a
+/// different `--policy` — a write that also reset every property the caller did not restate,
+/// which is how a mount's include glob was dropped and 62 files were overwritten. A per-run
+/// override means the mount is never edited to get a sync unstuck.
+///
+/// # Errors
+/// Same as [`sync`], plus a validation error if `policy` is not a known policy name.
+pub fn sync_with_policy(db: &Db, mount_ns: &str, policy: Option<&str>) -> Result<SyncReport> {
+    let mut ctx = load_ctx(db, mount_ns)?;
     let _ = resolve(&ctx.serializer)?; // fail fast on an unknown mount serializer
+    if let Some(p) = policy {
+        ctx.conflict_policy = validated_policy(p)?;
+    }
 
     let filter = Filter::build(&read_globs(db, mount_ns)?)?;
     let paths = discover(db, &ctx, &filter)?;
     reconcile_all(db, &ctx, paths)
+}
+
+/// The known conflict-policy names, as stored in `mounts.conflict_policy`.
+fn validated_policy(p: &str) -> Result<String> {
+    match p {
+        "disk_wins" | "kb_wins" | "manual" => Ok(p.to_owned()),
+        other => Err(Error::Types(TypeError::Validation(format!(
+            "unknown conflict policy `{other}`; available: disk_wins, kb_wins, manual"
+        )))),
+    }
 }
 
 /// Reconcile only the given `paths` (e.g. the paths named by filesystem-watch events),
@@ -165,8 +209,18 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.
 fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
+    let colliding = colliding_paths(db, ctx, &paths)?;
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
+        // Refuse before opening a transaction: a collided file must not be read *or*
+        // written, because its namespace's layout describes a different document.
+        if colliding.contains(&path) {
+            results.push(FileResult {
+                path,
+                outcome: Outcome::Collided,
+            });
+            continue;
+        }
         let ctx = ctx.clone();
         let p = path.clone();
         let outcome = db.write_txn_with::<Outcome, Error, _>("sync", move |conn, meta| {
@@ -339,6 +393,62 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
     }
 
     Ok(set.into_iter().collect())
+}
+
+/// The paths that must not be reconciled because another file maps to the same namespace.
+///
+/// [`namespace_for`] derives a file's namespace from its containing directory and drops the
+/// filename, so every file in one directory shares a namespace — and with it the `layout`
+/// that [`assemble_kb_doc`] reads and [`SyncSerializer::render`] treats as the sole authority
+/// on document order. Two files there do not merge: each renders the *other's* prose and
+/// sections, and the export silently overwrites both with the same bytes.
+///
+/// This is not hypothetical. A `tasks` mount over a directory tree holding `design.md`,
+/// `proposal.md` and `tasks.md` per folder collapsed 30 files onto 10 documents and stripped
+/// every markdown header from 62 files. Refusing is the only safe answer: there is no
+/// evidence in the store saying which file the shared layout belongs to.
+///
+/// Collisions are found both **within this batch** (a full `sync`) and **against files
+/// already bound in the KB** (a watch-driven `sync_paths` that sees only one of the pair).
+fn colliding_paths(db: &Db, ctx: &Ctx, paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+    // `document` maps a whole file to one item and reads no layout, so many of them share a
+    // directory safely. Only formats that keep document structure on the namespace care.
+    if !resolve(&ctx.serializer)?.requires_exclusive_namespace() {
+        return Ok(BTreeSet::new());
+    }
+    // Every file the KB already syncs under this mount, so a one-path watch event still sees
+    // the sibling it would collide with.
+    let mount_ns = ctx.mount_ns.clone();
+    let bound = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
+    let mut known: BTreeSet<PathBuf> = paths.iter().cloned().collect();
+    for uri in bound {
+        let Some(raw) = uri.strip_prefix("file://") else {
+            continue;
+        };
+        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
+        let path = PathBuf::from(bare);
+        if path.starts_with(&ctx.dir) {
+            known.insert(path);
+        }
+    }
+
+    let mut by_ns: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for path in &known {
+        by_ns
+            .entry(namespace_for(ctx, path))
+            .or_default()
+            .push(path.clone());
+    }
+    // Only the paths we were actually asked about are reported; a collision between two
+    // files neither of which is in this batch is not this run's business.
+    let requested: BTreeSet<&PathBuf> = paths.iter().collect();
+    let mut out = BTreeSet::new();
+    for group in by_ns.into_values() {
+        if group.len() > 1 {
+            out.extend(group.into_iter().filter(|p| requested.contains(p)));
+        }
+    }
+    Ok(out)
 }
 
 /// Reconcile a single file within the current transaction.

@@ -47,6 +47,12 @@ impl SyncSerializer for TasksSerializer {
     fn quarantine_on_parse_error(&self) -> bool {
         true
     }
+
+    /// One `tasks.md` per directory. Sections and document order live on the file's
+    /// (directory-derived) namespace, so a second file there would render this one's content.
+    fn requires_exclusive_namespace(&self) -> bool {
+        true
+    }
 }
 
 /// Parse the whole file into a [`SyncDoc`]. A single trailing newline is normalized

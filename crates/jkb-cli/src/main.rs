@@ -107,6 +107,10 @@ enum Command {
         /// Keep watching for changes until interrupted (Ctrl-C).
         #[arg(long)]
         watch: bool,
+        /// Override the mount's conflict policy for THIS RUN only, to get a stuck file
+        /// moving without editing the mount.
+        #[arg(long, value_enum, conflicts_with = "watch")]
+        conflict: Option<PolicyArg>,
     },
     /// Install/print the sync watcher as an OS service (launchd/systemd).
     Service {
@@ -530,21 +534,28 @@ enum MountCmd {
         ns: String,
         /// Backing directory.
         dir: PathBuf,
-        /// Sync direction.
-        #[arg(long, value_enum, default_value_t = ModeArg::Bidirectional)]
-        mode: ModeArg,
-        /// File-format serializer.
-        #[arg(long, default_value = "document")]
-        serializer: String,
-        /// Include glob (e.g. `**/*.md`).
+        /// Sync direction (default `bidirectional`; kept as-is when re-running).
+        #[arg(long, value_enum)]
+        mode: Option<ModeArg>,
+        /// File-format serializer (default `document`; kept as-is when re-running).
         #[arg(long)]
+        serializer: Option<String>,
+        /// Include glob (e.g. `**/*.md`). Kept as-is when re-running; clear with
+        /// `--no-include`.
+        #[arg(long, conflicts_with = "no_include")]
         include: Option<String>,
-        /// Exclude glob.
+        /// Drop the stored include glob, syncing every file under the directory.
         #[arg(long)]
+        no_include: bool,
+        /// Exclude glob. Kept as-is when re-running; clear with `--no-exclude`.
+        #[arg(long, conflicts_with = "no_exclude")]
         exclude: Option<String>,
-        /// Conflict policy.
-        #[arg(long, value_enum, default_value_t = PolicyArg::Manual)]
-        policy: PolicyArg,
+        /// Drop the stored exclude glob.
+        #[arg(long)]
+        no_exclude: bool,
+        /// Conflict policy (default `manual`; kept as-is when re-running).
+        #[arg(long, value_enum)]
+        policy: Option<PolicyArg>,
     },
     /// List all mounts (namespace → serializer → backing directory).
     Ls,
@@ -965,7 +976,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
         Command::Mount { cmd } => cmd_mount(&db, cmd, json),
-        Command::Sync { ns, watch } => cmd_sync(&db, ns.as_deref(), watch),
+        Command::Sync {
+            ns,
+            watch,
+            conflict,
+        } => cmd_sync(
+            &db,
+            ns.as_deref(),
+            watch,
+            conflict.map(|p| ConflictPolicy::from(p).as_str()),
+        ),
         Command::Service { cmd } => match cmd {
             ServiceCmd::Print => service::print(&db_path),
             ServiceCmd::Install => service::install(&db_path),
@@ -3381,17 +3401,21 @@ fn cmd_mount(db: &Db, cmd: MountCmd, json: bool) -> Result<()> {
             mode,
             serializer,
             include,
+            no_include,
             exclude,
+            no_exclude,
             policy,
         } => cmd_mount_create(
             db,
             &ns,
             &dir,
-            mode.into(),
-            &serializer,
-            include.as_deref(),
-            exclude.as_deref(),
-            policy.into(),
+            MountEdit {
+                mode: mode.map(Into::into),
+                serializer,
+                include: FieldEdit::from_flags(include, no_include),
+                exclude: FieldEdit::from_flags(exclude, no_exclude),
+                policy: policy.map(Into::into),
+            },
         ),
         MountCmd::Ls => cmd_mount_ls(db, json),
     }
@@ -3409,6 +3433,9 @@ fn cmd_mount_ls(db: &Db, json: bool) -> Result<()> {
                     "serializer": m.serializer,
                     "backing": m.backing_uri,
                     "sync_mode": m.sync_mode,
+                    "conflict_policy": m.conflict_policy,
+                    "include_glob": m.include_glob,
+                    "exclude_glob": m.exclude_glob,
                 })
             })
             .collect();
@@ -3416,24 +3443,84 @@ fn cmd_mount_ls(db: &Db, json: bool) -> Result<()> {
     } else if mounts.is_empty() {
         println!("(no mounts)");
     } else {
+        // The globs and the policy decide which files a sync will touch and what it does when
+        // both sides changed. Listing only the serializer and directory made a mount whose
+        // include glob had been dropped look identical to one that still had it.
         for (path, m) in &mounts {
             println!("{path}  [{}]  {}", m.serializer, m.backing_uri);
+            println!(
+                "    mode={}  policy={}  include={}  exclude={}",
+                m.sync_mode,
+                m.conflict_policy,
+                m.include_glob.as_deref().unwrap_or("(none)"),
+                m.exclude_glob.as_deref().unwrap_or("(none)"),
+            );
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_mount_create(
-    db: &Db,
-    ns_path: &str,
-    dir: &Path,
-    mode: SyncMode,
-    serializer: &str,
-    include: Option<&str>,
-    exclude: Option<&str>,
-    policy: ConflictPolicy,
-) -> Result<()> {
+/// What a `mount create` invocation asked to change. Every field distinguishes "not
+/// mentioned" from "set to this", because `mount create` doubles as the update command and a
+/// re-run that silently reset the fields you did not name is how a mount's include glob was
+/// once dropped — after which the `tasks` serializer discovered every file in the tree and
+/// overwrote 62 of them.
+struct MountEdit {
+    mode: Option<SyncMode>,
+    serializer: Option<String>,
+    include: FieldEdit,
+    exclude: FieldEdit,
+    policy: Option<ConflictPolicy>,
+}
+
+/// An optional field's requested change: leave it, set it, or clear it. A bare `Option`
+/// cannot express all three, and collapsing "leave" onto "clear" is the whole bug.
+enum FieldEdit {
+    Keep,
+    Set(String),
+    Clear,
+}
+
+impl FieldEdit {
+    fn from_flags(value: Option<String>, clear: bool) -> Self {
+        match (value, clear) {
+            (Some(v), _) => Self::Set(v),
+            (None, true) => Self::Clear,
+            (None, false) => Self::Keep,
+        }
+    }
+
+    /// Resolve against what the mount already stores.
+    fn apply(&self, current: Option<String>) -> Option<String> {
+        match self {
+            Self::Keep => current,
+            Self::Set(v) => Some(v.clone()),
+            Self::Clear => None,
+        }
+    }
+}
+
+/// Parse a stored `mounts.sync_mode`. The strings are the ones [`SyncMode::as_str`] writes.
+fn parse_sync_mode(s: &str) -> Option<SyncMode> {
+    match s {
+        "import" => Some(SyncMode::Import),
+        "export" => Some(SyncMode::Export),
+        "bidirectional" => Some(SyncMode::Bidirectional),
+        _ => None,
+    }
+}
+
+/// Parse a stored `mounts.conflict_policy` (see [`ConflictPolicy::as_str`]).
+fn parse_conflict_policy(s: &str) -> Option<ConflictPolicy> {
+    match s {
+        "disk_wins" => Some(ConflictPolicy::DiskWins),
+        "kb_wins" => Some(ConflictPolicy::KbWins),
+        "manual" => Some(ConflictPolicy::Manual),
+        _ => None,
+    }
+}
+
+fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Result<()> {
     let abs = std::fs::canonicalize(dir)
         .with_context(|| format!("resolving mount directory {}", dir.display()))?;
     // The backing path is stored verbatim in the `file://` uri and later resolved for sync,
@@ -3444,10 +3531,43 @@ fn cmd_mount_create(
         anyhow::anyhow!("mount directory path is not valid UTF-8: {}", abs.display())
     })?;
     let backing = format!("file://{abs_str}");
-    let (ns_path, serializer) = (ns_path.to_owned(), serializer.to_owned());
-    let include = include.map(str::to_owned);
-    let exclude = exclude.map(str::to_owned);
+    let ns_path = ns_path.to_owned();
     let ns_display = ns_path.clone();
+
+    // Read what the mount already is, so an update only changes what was actually named.
+    let existing = {
+        let ns_path = ns_path.clone();
+        db.read(move |conn| match ns::get(conn, &ns_path)? {
+            Some(id) => mount::get(conn, id),
+            None => Ok(None),
+        })?
+    };
+
+    let mode = edit.mode.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|m| parse_sync_mode(&m.sync_mode))
+            .unwrap_or(SyncMode::Bidirectional)
+    });
+    let serializer = edit
+        .serializer
+        .or_else(|| existing.as_ref().map(|m| m.serializer.clone()))
+        .unwrap_or_else(|| "document".to_owned());
+    let include = edit
+        .include
+        .apply(existing.as_ref().and_then(|m| m.include_glob.clone()));
+    let exclude = edit
+        .exclude
+        .apply(existing.as_ref().and_then(|m| m.exclude_glob.clone()));
+    let policy = edit.policy.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|m| parse_conflict_policy(&m.conflict_policy))
+            .unwrap_or(ConflictPolicy::Manual)
+    });
+
+    let updating = existing.is_some();
+    let (ser, inc, exc) = (serializer.clone(), include.clone(), exclude.clone());
     db.write_txn("cli", move |conn, meta| {
         let ns_id = ns::ensure(conn, &ns_path)?;
         mount::create(
@@ -3456,17 +3576,28 @@ fn cmd_mount_create(
             ns_id,
             &backing,
             mode,
-            &serializer,
-            include.as_deref(),
-            exclude.as_deref(),
+            &ser,
+            inc.as_deref(),
+            exc.as_deref(),
             policy,
         )
     })?;
-    println!("mounted {ns_display} -> {}", abs.display());
+    let verb = if updating { "updated mount" } else { "mounted" };
+    println!("{verb} {ns_display} -> {}", abs.display());
+    // Print the resulting configuration, not just the path: an update that silently kept or
+    // dropped a glob is exactly the failure this command now guards against, so the answer
+    // has to be visible at the moment it is decided.
+    println!(
+        "  serializer={serializer}  mode={}  policy={}  include={}  exclude={}",
+        mode.as_str(),
+        policy.as_str(),
+        include.as_deref().unwrap_or("(none)"),
+        exclude.as_deref().unwrap_or("(none)"),
+    );
     Ok(())
 }
 
-fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool) -> Result<()> {
+fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool, conflict: Option<&str>) -> Result<()> {
     let debounce = std::time::Duration::from_millis(300);
     if watch {
         let stop = Arc::new(AtomicBool::new(false));
@@ -3485,28 +3616,29 @@ fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool) -> Result<()> {
     }
 
     if let Some(ns) = ns_path {
-        report_sync(db, ns)?;
+        report_sync(db, ns, conflict)?;
     } else {
         let paths = db.read(jkb_core::mount::all_paths)?;
         if paths.is_empty() {
             println!("no mounts configured");
         }
         for ns in paths {
-            report_sync(db, &ns)?;
+            report_sync(db, &ns, conflict)?;
         }
     }
     Ok(())
 }
 
 /// Reconcile one mount and print its summary.
-fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
+fn report_sync(db: &Db, ns_path: &str, conflict: Option<&str>) -> Result<()> {
     use jkb_sync::Outcome::{
-        Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Skipped, UpToDate,
+        Collided, Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Skipped,
+        UpToDate,
     };
-    let report = jkb_sync::sync(db, ns_path)?;
+    let report = jkb_sync::sync_with_policy(db, ns_path, conflict)?;
     println!(
         "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
-         {} conflicts, {} quarantined, {} up-to-date, {} skipped",
+         {} conflicts, {} quarantined, {} up-to-date, {} skipped, {} collided",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
@@ -3516,12 +3648,28 @@ fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
         report.count(Quarantined),
         report.count(UpToDate),
         report.count(Skipped),
+        report.count(Collided),
     );
     for path in report.conflicts() {
         println!("  conflict: {}", path.display());
     }
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
+    }
+    // Not a conflict to resolve: two files cannot share one namespace, so the mount's globs
+    // have to select one per directory. Say so, because the fix is configuration, not a merge.
+    for path in report.collided() {
+        println!(
+            "  REFUSED (another synced file shares its namespace): {}",
+            path.display()
+        );
+    }
+    if report.count(Collided) > 0 {
+        println!(
+            "  this serializer keeps a file's sections and order on its directory's \
+             namespace, so one directory can hold at most one synced file."
+        );
+        println!("  narrow the mount, e.g. `jkb mount create <ns> <dir> --include '**/tasks.md'`");
     }
     Ok(())
 }

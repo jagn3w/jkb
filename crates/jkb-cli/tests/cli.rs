@@ -2697,3 +2697,80 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
         .success()
         .stdout(predicate::str::contains("elsewhere"));
 }
+
+/// Re-running `mount create` must not reset the properties you did not name.
+///
+/// `mount create` doubles as the update command, and its SQL is a full-row replace. A re-run
+/// that omitted `--include` therefore wrote NULL over the stored glob — after which a `tasks`
+/// mount discovered every file in the tree. That is not hypothetical: it overwrote 62 files.
+#[test]
+fn re_running_mount_create_preserves_unnamed_properties() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let backing = dir.path().join("backing");
+    std::fs::create_dir_all(&backing).unwrap();
+
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--serializer", "tasks", "--include", "**/tasks.md"])
+        .args(["--policy", "manual"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include=**/tasks.md"));
+
+    // Change ONLY the policy. The glob and serializer must survive.
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--policy", "disk-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated mount"))
+        .stdout(predicate::str::contains("include=**/tasks.md"))
+        .stdout(predicate::str::contains("serializer=tasks"))
+        .stdout(predicate::str::contains("policy=disk_wins"));
+
+    // `mount ls` shows what the mount will actually do, so a dropped glob is visible.
+    jkb(&db)
+        .args(["mount", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include=**/tasks.md"));
+
+    // Clearing is possible, but only when asked for explicitly.
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--no-include"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include=(none)"));
+}
+
+/// Two `tasks` files in one directory are refused by `jkb sync`, with the fix named.
+#[test]
+fn sync_refuses_two_tasks_files_in_one_directory() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let backing = dir.path().join("backing");
+    std::fs::create_dir_all(&backing).unwrap();
+    let tasks = backing.join("tasks.md");
+    let design = backing.join("design.md");
+    std::fs::write(&tasks, "## Plan\n\n- [ ] do it !p1\n").unwrap();
+    let design_body = "# Design\n\nProse belonging to design.md alone.\n";
+    std::fs::write(&design, design_body).unwrap();
+
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--serializer", "tasks", "--include", "**/*.md"])
+        .assert()
+        .success();
+
+    jkb(&db)
+        .args(["sync", "docs/m"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 collided"))
+        .stdout(predicate::str::contains("REFUSED"));
+
+    // Refusing means refusing: neither file was rewritten.
+    assert_eq!(std::fs::read_to_string(&design).unwrap(), design_body);
+}

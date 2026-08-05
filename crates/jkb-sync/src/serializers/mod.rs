@@ -163,6 +163,21 @@ pub trait SyncSerializer: Send + Sync {
     fn quarantine_on_parse_error(&self) -> bool {
         false
     }
+
+    /// Whether this format needs its file's namespace **to itself**.
+    ///
+    /// A multi-item serializer stores the document's structure — its `layout`, and the
+    /// `header_line` of each section — on the namespace derived from the file's *containing
+    /// directory* (the filename is not part of the path). `render` treats that layout as the
+    /// sole authority on document order, so two such files in one directory each render the
+    /// other's prose and sections, and exporting overwrites both with the same bytes.
+    ///
+    /// `document` maps a whole file to one item's content and consults no layout, so many of
+    /// them share a directory safely — which is the normal case for a documents mount, and
+    /// why this is opt-in rather than a blanket rule.
+    fn requires_exclusive_namespace(&self) -> bool {
+        false
+    }
 }
 
 /// The serializer names available in this build.

@@ -1272,3 +1272,102 @@ fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
         assert_eq!(fs::read_to_string(&file).unwrap(), canonical);
     }
 }
+
+/// Two `tasks` files in one directory must be refused, not merged.
+///
+/// `namespace_for` derives a file's namespace from its containing directory and drops the
+/// filename, so siblings share the `layout` that `render` treats as the sole authority on
+/// document order. Before this guard, syncing a directory holding `tasks.md` beside any other
+/// markdown file exported the *same* rendered bytes over both — real damage, not a
+/// hypothetical: 30 files collapsed onto 10 documents and 62 lost every markdown header.
+#[test]
+fn two_tasks_files_in_one_directory_are_refused_not_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let design = dir.path().join("design.md");
+    let tasks_body = "## Plan\n\n- [ ] ship the thing !p1\n";
+    let design_body = "# Design\n\nProse that belongs to design.md alone.\n";
+    fs::write(&tasks, tasks_body).unwrap();
+    fs::write(&design, design_body).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+
+    let report = sync(&db, "docs/change").unwrap();
+    assert_eq!(
+        report.count(Outcome::Collided),
+        2,
+        "both files must be refused"
+    );
+    assert_eq!(report.collided().len(), 2);
+
+    // Neither file was read or written: refusing must not be a partial import.
+    assert_eq!(fs::read_to_string(&tasks).unwrap(), tasks_body);
+    assert_eq!(fs::read_to_string(&design).unwrap(), design_body);
+
+    // Re-running stays refused rather than drifting into a merge on the second pass.
+    assert_eq!(
+        sync(&db, "docs/change").unwrap().count(Outcome::Collided),
+        2
+    );
+    assert_eq!(fs::read_to_string(&design).unwrap(), design_body);
+
+    // Narrowing the mount to one file per directory is the fix, and it works immediately.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/tasks.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    let report = sync(&db, "docs/change").unwrap();
+    assert_eq!(report.count(Outcome::Created), 1);
+    assert_eq!(report.count(Outcome::Collided), 0);
+    assert_eq!(
+        fs::read_to_string(&design).unwrap(),
+        design_body,
+        "a file outside the globs is never touched"
+    );
+}
+
+/// A watch event naming only one of a colliding pair still refuses it — the sibling is found
+/// through its bindings, not through the batch it happened to arrive in.
+#[test]
+fn a_single_path_event_still_sees_the_sibling_it_would_collide_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] first !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 1);
+
+    // A second file appears in the same directory; the watcher reports only that one.
+    let notes = dir.path().join("notes.md");
+    let notes_body = "# Notes\n\nNot a task file.\n";
+    fs::write(&notes, notes_body).unwrap();
+    let report = sync_paths(&db, "docs/change", std::slice::from_ref(&notes)).unwrap();
+    assert_eq!(report.count(Outcome::Collided), 1);
+    assert_eq!(fs::read_to_string(&notes).unwrap(), notes_body);
+}
