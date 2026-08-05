@@ -1,7 +1,7 @@
 export const meta = {
   name: 'code-review',
   description:
-    'Reviews a diff along eight assumption-kind lenses plus one holistic reviewer per functional unit, deduplicates, puts every finding to three adversarial skeptics, and returns the survivors ranked and severity-calibrated. Returns structured findings, so a command can act on them.',
+    'Reviews a diff along nine specialist lenses plus one holistic reviewer per functional unit, consolidates duplicates, and ranks the result. At effort "high" every finding is additionally put to three adversarial skeptics, batched by file, and survives on a majority. Returns structured findings, so a command can act on them.',
   whenToUse:
     'Called by /review (prints findings) and /review-log (writes them as jkb tasks). Works in any git repo; project conventions, design docs and review history are used when present and skipped when absent.',
   phases: [
@@ -18,22 +18,31 @@ export const meta = {
 const cfg = (typeof args === 'string' ? JSON.parse(args) : args) || {}
 const REPO = cfg.repo || '.'
 const RANGE = cfg.range || '' // e.g. "main...HEAD"; empty = working tree vs HEAD
-const EFFORT = ['low', 'medium', 'high'].includes(cfg.effort) ? cfg.effort : 'high'
+// Two tiers, not three (design D37.9). `low` files findings without verifying them at all;
+// `high` verifies them by vote. There is deliberately no middle: a single skeptic is neither
+// cheap nor a vote, and the measured per-finding kill rate (6%) did not pay for one.
+const EFFORT = cfg.effort === 'high' ? 'high' : 'low'
+if (cfg.effort && !['low', 'high'].includes(cfg.effort)) {
+  log(`NOTE: effort "${cfg.effort}" is not a tier; there is no medium — running "low" (unverified). Pass "high" to verify by vote.`)
+}
+const VERIFY = EFFORT === 'high'
 const FOCUS = cfg.focus || '' // optional free-text steer from the user
 
-// Effort scales the two expensive dimensions and nothing else: how many skeptics each
-// finding must survive, and how many functional units get their own holistic reviewer.
-// The eight lenses always all run — a lens skipped is a class of bug nobody looked for.
-const SKEPTICS = EFFORT === 'low' ? 1 : 3
-const FEATURE_CAP = EFFORT === 'low' ? 2 : EFFORT === 'medium' ? 3 : 5
+// Effort scales how much is looked at, not how hard: the nine lenses always all run, because a
+// lens skipped is a class of bug nobody looked for.
+const FEATURE_CAP = VERIFY ? 5 : 3
 // Findings each reviewer may report. Unbounded, twelve reviewers produced 69 raw findings on a
-// 2.8k-line diff, and since every one is then multiplied by the skeptics, this number sets the
-// cost of the whole run. It also improves what comes back: a reviewer forced to pick its five
-// best reports its five best, rather than padding with everything it noticed.
-const PER_REVIEWER_CAP = EFFORT === 'low' ? 3 : EFFORT === 'medium' ? 5 : 8
+// 2.8k-line diff. It bounds the reader's load at `low` and the verification bill at `high`, and
+// it improves what comes back: a reviewer forced to pick its five best reports its five best,
+// rather than padding with everything it noticed.
+const PER_REVIEWER_CAP = VERIFY ? 8 : 5
 // Hard ceiling on how many findings enter verification. Anything beyond it is still REPORTED,
 // marked unverified — dropping findings silently would make a budget look like a clean review.
-const VERIFY_CAP = EFFORT === 'low' ? 15 : EFFORT === 'medium' ? 30 : 50
+const VERIFY_CAP = 60
+// Findings a single skeptic judges in one pass. Batching is the whole reason verification is
+// affordable: loading the code around a finding is the expensive part, and a second finding a
+// few lines away costs almost nothing extra to judge once that context is in hand.
+const VERIFY_BATCH = 5
 
 const diffCmd = RANGE ? `git diff ${RANGE}` : 'git diff HEAD'
 const statCmd = RANGE ? `git diff --stat ${RANGE}` : 'git diff --stat HEAD'
@@ -100,13 +109,23 @@ const CONTEXT = {
   required: ['conventions', 'design', 'patterns'],
 }
 
-const VERDICT = {
+const BATCH_VERDICT = {
   type: 'object',
   properties: {
-    refuted: { type: 'boolean' },
-    reason: { type: 'string' },
+    verdicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' }, // the finding's number in the batch
+          refuted: { type: 'boolean' },
+          reason: { type: 'string' },
+        },
+        required: ['id', 'refuted', 'reason'],
+      },
+    },
   },
-  required: ['refuted', 'reason'],
+  required: ['verdicts'],
 }
 
 const GROUPS = {
@@ -567,48 +586,46 @@ code.** If the cited evidence is not there, the stated cost is not real and the 
 refuted — not merely over-graded.`,
 }
 
-function refutePrompt(finding, angle) {
-  return `You are a SKEPTIC. Your job is to REFUTE a code-review finding by reading the actual code in the repo at ${REPO}. You are not here to confirm it — a finding that survives you should have survived a real attempt to kill it.
+function batchRefutePrompt(batch, angle) {
+  const file = batch[0].file
+  const list = batch
+    .map(
+      (f, i) =>
+        `${i}. line ${f.line} · [${f.severity}] ${f.summary}\n   scenario: ${f.scenario}`,
+    )
+    .join('\n\n')
+  return `You are a SKEPTIC. Your job is to REFUTE code-review findings by reading the actual code in the repo at ${REPO}. You are not here to confirm them — a finding that survives you should have survived a real attempt to kill it.
 
-THE FINDING
-  file:     ${finding.file}:${finding.line}
-  claim:    ${finding.summary}
-  scenario: ${finding.scenario}
-  severity: ${finding.severity}
+All of these are in **${file}**, and they are given to you together on purpose: you will read this
+file's code once and judge them all against it. That is the point of the batch — the reading is
+the expensive part, and a finding a few lines from one you have already read costs almost nothing
+more to judge properly. Judge each one on its own merits; they are unrelated except in location,
+and nothing about one is evidence about another.
 
-YOUR ANGLE
+THE FINDINGS
+${list}
+
+YOUR ANGLE — apply it to every finding:
 ${angle.ask}
 
-Read the real code — do not reason from the finding's description of it, which is exactly where
-these go wrong. But read it in BOUNDED pieces:
+Read the real code — do not reason from the findings' descriptions of it, which is exactly where
+these go wrong. Read it in bounded pieces:
+  · \`${RANGE ? `git diff ${RANGE} -- ${file}` : `git diff HEAD -- ${file}`}\` for what the change did here.
+  · \`grep -n\` to locate each cited line's enclosing function, and read those ranges — a couple
+    of hundred lines each, not the whole file. Files here run to thousands of lines.
+  · \`grep -n\` again for the specific callers or guards your angle needs.
 
-  · \`${RANGE ? `git diff ${RANGE} -- ${finding.file}` : `git diff HEAD -- ${finding.file}`}\` for what the change did to this file.
-  · \`grep -n\` to locate the function containing line ${finding.line}, then read that range — a
-    couple of hundred lines around it, not the file. Files here run to thousands of lines.
-  · \`grep -n\` again for the specific callers or guards your angle needs, and read only those
-    ranges.
+THE BURDEN OF PROOF IS ON EACH FINDING. It stands only if you can POSITIVELY ESTABLISH it against
+the real code — not merely fail to disprove it. "I could not find a guard" is not "I confirmed
+there is no guard on any path that reaches this", and only the second earns refuted=false.
 
-Reading one large file end to end costs more than the finding is worth, and buys nothing over
-reading the right two hundred lines.
+So refuted=true covers three cases: you found the guard, divergence or recorded decision that
+kills it; OR you could not establish a load-bearing part of the claim; OR you ran out of
+certainty. Uncertainty refutes — say what you could not establish.
 
-THE BURDEN OF PROOF IS ON THE FINDING. It stands only if you can POSITIVELY ESTABLISH it against
-the real code — not merely fail to disprove it. These are different bars, and the difference is
-the whole job: "I could not find a guard" is not the same as "I confirmed there is no guard on
-any path that reaches this", and only the second earns refuted=false.
-
-So refuted=true covers three cases, not one:
-  · you found the guard, the divergence, or the recorded decision that kills it; OR
-  · you could not establish a load-bearing part of the claim — the scenario's conditions are not
-    actually reachable, or you could not confirm the code does what the finding says; OR
-  · you ran out of certainty. Uncertainty refutes. Say what you could not establish.
-
-A false finding costs the reader the same attention as a true one, and a reviewer that cries
-wolf stops being read at all — including when it is right.
-
-Return refuted=true with the specific reason (the guard you found, or the part you could not
-establish), or refuted=false with the concrete chain you verified in the code: which lines you
-read, and why each step of the claimed failure path follows. If you cannot write that chain, the
-answer is refuted.`
+Return one verdict per finding, keyed by its number above. For refuted=false, give the concrete
+chain you verified: which lines you read and why each step of the claimed failure path follows.
+If you cannot write that chain, the answer is refuted.`
 }
 
 function consolidatePrompt(findings) {
@@ -634,7 +651,13 @@ mention stays on its own.`
 }
 
 function rankPrompt(findings) {
-  return `You are the RANKING pass of a code review in the repo at ${REPO}. Every finding below already survived adversarial verification. Your job is calibration and consolidation — NOT re-reviewing, and NOT finding anything new.
+  return `You are the RANKING pass of a code review in the repo at ${REPO}. Your job is calibration and consolidation — NOT re-reviewing, and NOT finding anything new.
+
+${
+  VERIFY
+    ? `Every finding below survived adversarial verification by a majority of three skeptics.`
+    : `These findings are UNVERIFIED — no skeptic has read the code to check them. They were found by specialist reviewers and filed as-is, on the reasoning that whoever picks one up finds out cheaply whether it is real. Weigh them accordingly: where a finding's own scenario is vague or its reasoning does not hold together on its face, say so in the summary rather than presenting it with unearned confidence. You still must not re-review the code.`
+}
 
 Each finding carries \`skeptics\`: what the skeptics who failed to refute it actually verified.
 Read those. A skeptic that let a finding stand often still corrected part of it — narrowed its
@@ -688,9 +711,61 @@ a change with nothing worth holding the merge for is a normal and good outcome.`
 }
 
 // ---------------------------------------------------------------------------
+// Ranking and return — shared by both tiers, so a verified and an unverified run come back in
+// the same shape and differ only in whether the findings carry `unverified`.
+// ---------------------------------------------------------------------------
+// The fallback is a real ordering, not arrival order. The ranking agent is one API call away
+// from failing (it did, on the first full run, to a session limit), and handing back an unsorted
+// list makes a review look uncalibrated when only its last step was lost.
+// Severity order, defined here beside both its users: `bySeverityFirst` is closed over by
+// `bySeverity` below and used directly in the run section, so declaring it later left a
+// temporal dead zone that happened to be safe only because of call ordering.
+const SEV_RANK = { 'must-fix': 0, concern: 1, nit: 2 }
+const bySeverityFirst = (a, b) => (SEV_RANK[a.severity] ?? 3) - (SEV_RANK[b.severity] ?? 3)
+const bySeverity = (list, note) => ({ findings: [...list].sort(bySeverityFirst), note })
+
+async function finish(survivors, rawCount, killed, reviewerCount, scout) {
+  if (survivors.length === 0) {
+    return { range: RANGE || 'working tree', effort: EFFORT, reviewers: reviewerCount, raw: rawCount, refuted: killed, findings: [], note: killed ? 'every finding was refuted' : 'no findings' }
+  }
+  // Ranking runs at BOTH tiers. It is one agent, and it is the difference between a list a
+  // reader can act on and a pile they must triage themselves: severity from the finders is not
+  // comparable across reviewers, so without it the output has no usable order.
+  phase('Rank')
+  const ranked =
+    (await agent(rankPrompt(survivors), { label: 'rank', phase: 'Rank', schema: RANKED })) ||
+    bySeverity(survivors, 'ranking pass failed; sorted by severity, not merged or recalibrated')
+
+  const counts = ranked.findings.reduce((acc, f) => ({ ...acc, [f.severity]: (acc[f.severity] || 0) + 1 }), {})
+  log(
+    `done · ${ranked.findings.length} finding(s): ` +
+      `${counts['must-fix'] || 0} must-fix, ${counts.concern || 0} concern, ${counts.nit || 0} nit`,
+  )
+  return {
+    range: RANGE || 'working tree',
+    effort: EFFORT,
+    verified: VERIFY,
+    reviewers: reviewerCount,
+    features: scout.features.map((f) => f.name),
+    context: {
+      conventions: Boolean(scout.conventions),
+      design: Boolean(scout.design),
+      patterns: Boolean(scout.patterns),
+    },
+    raw: rawCount,
+    refuted: killed,
+    findings: ranked.findings,
+    note: ranked.note || '',
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
-log(`code review · ${RANGE || 'working tree'} · effort ${EFFORT} · ${LENSES.length} lenses, ${SKEPTICS} skeptic(s) per finding`)
+log(
+  `code review · ${RANGE || 'working tree'} · effort ${EFFORT} · ${LENSES.length + 1} lenses · ` +
+    (VERIFY ? `verified by vote (3 angles, batched by file)` : `unverified — findings filed as found`),
+)
 
 phase('Scout')
 // Two bounded agents in parallel rather than one that does everything: the combined version
@@ -757,8 +832,6 @@ log(`${raw.length} raw finding(s) from ${reports.filter(Boolean).length}/${revie
 // duplicate keeps whichever reviewer happened to run first rather than the graver reading of
 // the same defect, and the verify cap spends its budget on an early reviewer's nits while a
 // later reviewer's must-fix goes unverified.
-const SEV_RANK = { 'must-fix': 0, concern: 1, nit: 2 }
-const bySeverityFirst = (a, b) => (SEV_RANK[a.severity] ?? 3) - (SEV_RANK[b.severity] ?? 3)
 raw.sort(bySeverityFirst)
 
 // Deterministic dedup: same file and line, or a summary already seen. Near-duplicates that
@@ -811,73 +884,91 @@ if (deduped.length > 3) {
   }
 }
 
-// VERIFY. Each finding faces SKEPTICS fresh skeptics with different angles; it survives on a
-// majority failing to refute it (design D37.3).
-// Verification dominates the cost of a review — it is the one stage multiplied by the number of
-// findings — so it is STAGED rather than flat. One decisive skeptic runs first and kills the
-// cheap mistakes; only findings that survive it AND are worth the money face the other two.
-// 2-of-3 is preserved for those: stage one standing plus at least one of stage two.
+// VERIFY. Each batch faces all three angles; a finding survives on a majority of the verdicts
+// cast about it failing to refute it — a true 2-of-3 (design D37.3).
+// At `low` nothing is verified: the findings are filed as they are, and whoever picks one up
+// discovers cheaply whether it is real. The measured per-finding kill rate was 6%, which does
+// not pay for three skeptics per finding up front (design D37.9).
+if (!VERIFY) {
+  const filed = candidates.map((f) => ({ ...f, unverified: true }))
+  log(`${filed.length} finding(s) filed unverified (effort low — pass "high" to verify by vote)`)
+  return await finish(filed, raw.length, 0, reviewers.length, scout)
+}
+
+// Verification dominates the cost of a review — it is the one stage multiplied by findings — so
+// skeptics are BATCHED BY FILE. Loading the code around a finding is the expensive part; a
+// second finding a few lines away costs almost nothing more to judge once that context is in
+// hand. Each batch faces all three angles, so the vote is a true 2-of-3.
 const toVerify = candidates.slice(0, VERIFY_CAP)
 const unverified = candidates.slice(VERIFY_CAP)
 if (unverified.length) {
   log(`NOTE: ${unverified.length} finding(s) past the verify cap of ${VERIFY_CAP} are reported UNVERIFIED, not dropped`)
 }
 
+// Group by file, ordered by line, then chunk — so a batch is a contiguous neighbourhood rather
+// than an arbitrary handful. Quality findings batch separately: they face the "is this worth
+// it?" angle, which the defect angles would refute by construction.
+const batches = []
+for (const kind of ['defect', 'quality']) {
+  const byFile = new Map()
+  for (const f of toVerify.filter((x) => (x.kind === 'quality') === (kind === 'quality'))) {
+    if (!byFile.has(f.file)) byFile.set(f.file, [])
+    byFile.get(f.file).push(f)
+  }
+  for (const list of byFile.values()) {
+    list.sort((a, b) => (a.line || 0) - (b.line || 0))
+    for (let i = 0; i < list.length; i += VERIFY_BATCH) {
+      batches.push({ kind, items: list.slice(i, i + VERIFY_BATCH) })
+    }
+  }
+}
+log(`verifying ${toVerify.length} finding(s) in ${batches.length} batch(es) by file`)
+
 const judged = await parallel(
-  toVerify.map((f) => () => {
-    // Quality findings face the "is this worth it?" skeptic instead of the defect ones, which
-    // would refute every structural suggestion for having no reproduction.
-    const first = f.kind === 'quality' ? QUALITY_ANGLE : ANGLES[1] // 'reproduce' is the decisive one
-    return agent(refutePrompt(f, first), {
-      label: `refute:${first.key}:${f.file.split('/').pop()}`.slice(0, 40),
-      phase: 'Verify',
-      schema: VERDICT,
-    }).then((v1) => {
-      // Refuted at stage one, or a quality finding (which only ever gets its one skeptic), or
-      // a nit (not worth two more agents) — settle here.
-      const escalate =
-        SKEPTICS > 1 &&
-        v1 &&
-        !v1.refuted &&
-        f.kind !== 'quality' &&
-        f.severity !== 'nit' &&
-        (!budget.total || budget.remaining() > 80_000)
-      if (!escalate) return { votes: [v1].filter(Boolean), stage1: v1 }
-      return parallel(
-        [ANGLES[0], ANGLES[2]].map((a) => () =>
-          agent(refutePrompt(f, a), {
-            label: `refute:${a.key}:${f.file.split('/').pop()}`.slice(0, 40),
-            phase: 'Verify',
-            schema: VERDICT,
-          }),
-        ),
-      ).then((rest) => ({ votes: [v1, ...rest].filter(Boolean), stage1: v1 }))
-    }).then(({ votes }) => {
-      const real = votes
-      // A skeptic that died counts as no opinion; with none surviving, keep the finding and let
-      // the human judge rather than dropping it silently — but SAY SO. An unchecked finding
-      // that presents identically to a verified one is the same dishonesty as reporting a
-      // crashed scout as an empty diff: the reader cannot tell which claims were tested.
-      const stood = real.filter((v) => !v.refuted)
-      const survives = real.length === 0 || stood.length >= Math.ceil(real.length / 2)
-      const unchecked = real.length === 0
-      // Carry what the surviving skeptics verified into the finding. A skeptic that fails to
-      // refute still routinely corrects one — narrows its scope, disproves a supporting claim,
-      // or says the severity is overstated — and that correction is the best evidence in the
-      // run, because it came from someone reading the code in order to kill it. Discarding it
-      // was throwing away the most careful work in the pipeline.
-      const enriched = {
-        ...f,
-        skeptics: stood.map((v) => v.reason).filter(Boolean).join(' || ').slice(0, 1200),
-        ...(unchecked ? { unverified: true } : {}),
-      }
-      return { finding: enriched, survives, votes: real }
-    })
+  batches.map((batch) => () => {
+    const angles = batch.kind === 'quality' ? [QUALITY_ANGLE] : ANGLES
+    const where = `${batch.items[0].file.split('/').pop()}@${batch.items[0].line}`
+    return parallel(
+      angles.map((a) => () =>
+        agent(batchRefutePrompt(batch.items, a), {
+          label: `refute:${a.key}:${where}`.slice(0, 40),
+          phase: 'Verify',
+          schema: BATCH_VERDICT,
+        }),
+      ),
+    ).then((results) =>
+      batch.items.map((f, i) => {
+        // Collect this finding's verdict from each angle that returned one. A skeptic that died,
+        // or that omitted an id, counts as no opinion rather than as a vote either way.
+        const votes = results
+          .filter(Boolean)
+          .map((r) => (r.verdicts || []).find((v) => v.id === i))
+          .filter(Boolean)
+        const stood = votes.filter((v) => !v.refuted)
+        const survives = votes.length === 0 || stood.length >= Math.ceil(votes.length / 2)
+        // An unchecked finding that presents identically to a verified one is the same
+        // dishonesty as reporting a crashed scout as an empty diff: the reader cannot tell
+        // which claims were tested.
+        const unchecked = votes.length === 0
+        // Carry what the surviving skeptics verified. A skeptic that fails to refute still
+        // routinely corrects a finding — narrows its scope, disproves a supporting claim, says
+        // the severity is overstated — and that is the most careful work in the run.
+        return {
+          finding: {
+            ...f,
+            skeptics: stood.map((v) => v.reason).filter(Boolean).join(' || ').slice(0, 1200),
+            ...(unchecked ? { unverified: true } : {}),
+          },
+          survives,
+        }
+      }),
+    )
   }),
 )
 
-const verified = judged.filter(Boolean).filter((j) => j.survives).map((j) => j.finding)
-const killed = judged.filter(Boolean).length - verified.length
+const flatJudged = judged.filter(Boolean).flat()
+const verified = flatJudged.filter((j) => j.survives).map((j) => j.finding)
+const killed = flatJudged.length - verified.length
 // Findings past the verify cap are carried through unverified rather than dropped, and say so.
 const survivors = [...verified, ...unverified.map((f) => ({ ...f, unverified: true }))]
 log(`${verified.length} survived verification, ${killed} refuted${unverified.length ? `, ${unverified.length} unverified` : ''}`)
@@ -885,37 +976,4 @@ if (survivors.length === 0) {
   return { findings: [], reviewers: reviewers.length, raw: raw.length, refuted: killed, note: 'every finding was refuted' }
 }
 
-// RANK. One pass over all survivors together: merge near-duplicates and put severity on a
-// single scale, which no individual finder could do (design D37.4).
-phase('Rank')
-// The fallback is a real ordering, not the arrival order. The ranking agent is one API call
-// away from failing (it did, on the first full run, to a session limit), and handing back an
-// unsorted list makes a review look uncalibrated when only its last step was lost.
-const bySeverity = (list, note) => ({ findings: [...list].sort(bySeverityFirst), note })
-const ranked =
-  EFFORT === 'low'
-    ? bySeverity(survivors, 'ranking pass skipped at low effort; sorted by severity, not merged')
-    : (await agent(rankPrompt(survivors), { label: 'rank', phase: 'Rank', schema: RANKED })) ||
-      bySeverity(survivors, 'ranking pass failed; sorted by severity, not merged or recalibrated')
-
-const counts = ranked.findings.reduce((acc, f) => ({ ...acc, [f.severity]: (acc[f.severity] || 0) + 1 }), {})
-log(
-  `done · ${ranked.findings.length} finding(s): ` +
-    `${counts['must-fix'] || 0} must-fix, ${counts.concern || 0} concern, ${counts.nit || 0} nit`,
-)
-
-return {
-  range: RANGE || 'working tree',
-  effort: EFFORT,
-  reviewers: reviewers.length,
-  features: scout.features.map((f) => f.name),
-  context: {
-    conventions: Boolean(scout.conventions),
-    design: Boolean(scout.design),
-    patterns: Boolean(scout.patterns),
-  },
-  raw: raw.length,
-  refuted: killed,
-  findings: ranked.findings,
-  note: ranked.note || '',
-}
+return await finish(survivors, raw.length, killed, reviewers.length, scout)

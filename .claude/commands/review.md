@@ -1,6 +1,6 @@
 ---
-description: Review the current change with nine specialized reviewers plus one holistic reviewer per functional unit, adversarially verified. Prints findings; use /review-log to file them as tasks.
-argument-hint: "[range]  [low|medium|high]  [-- anything to focus on]"
+description: Review the current change with nine specialized reviewers plus one holistic reviewer per functional unit. Prints findings; use /review-log to file them as tasks.
+argument-hint: "[range]  [low|high]  [-- anything to focus on]"
 ---
 
 Run this repo's own code reviewer (design D37) and report what it finds. It works in any git
@@ -17,9 +17,14 @@ Arguments given: `$ARGUMENTS`
     (`range: ""`), which is the common case mid-change;
   - otherwise, the branch's own commits: `<trunk>...HEAD`, where trunk is `origin/HEAD`'s
     target else `main`/`master`. If HEAD *is* trunk, review the working tree and say so.
-- **Effort**: `low` | `medium` | `high`, default **`medium`**. It scales findings per reviewer
-  (3/5/8), how many functional units get a holistic reviewer (2/3/5), the verify cap (15/30/50)
-  and whether verification escalates past one skeptic. The nine lenses always all run.
+- **Effort**: `low` (default) or `high`. There is deliberately **no medium**.
+  - `low` — the nine lenses and the feature reviewers run, duplicates are consolidated, the set
+    is ranked, and the findings are filed **unverified**. Whoever picks one up finds out cheaply
+    whether it is real. This is the right default: measured, only ~6% of findings were refuted,
+    which does not pay for skeptics up front.
+  - `high` — adds adversarial verification. Every finding faces three angles and survives on a
+    majority; skeptics are batched by file, so a group of findings in one region shares the cost
+    of reading it. Use before merging something risky.
 - **Focus**: anything after `--` is passed to every reviewer as an extra thing to watch for.
 
 Confirm you are in a git repo (`git rev-parse --show-toplevel`) and record its absolute path.
@@ -36,18 +41,20 @@ one makes every field `undefined`):
 {
   "repo": "<abs path to the repo root>",
   "range": "<range, or \"\" for the working tree>",
-  "effort": "medium",
+  "effort": "low",
   "focus": "<focus text, or \"\">"
 }
 ```
 
-This deliberately opts into multi-agent orchestration: 9 lenses + up to 5 feature reviewers,
-then staged verification of each finding. **Budget roughly 30 agents per 1,000 diff lines at
-`medium`.** Before launching, get the size (`git diff --shortstat <range>`) and say what it will
-cost. Over ~2,000 changed lines, tell the user it is cheaper *and a better review* to run
-several smaller ranges — a reviewer reasoning about 3,000 lines at once reasons worse about each
-of them — and offer `low` as the alternative. It runs in the background and notifies on
-completion.
+This deliberately opts into multi-agent orchestration. Roughly, for a 1,000-line diff:
+**`low` ≈ 15 agents** (2 scouts, 9 lenses, ≤3 feature reviewers, consolidate, rank) and
+**`high` ≈ 15 + one agent per file-batch × 3 angles**, so it scales with how many *files* carry
+findings rather than with how many findings there are.
+
+Before launching, get the size (`git diff --shortstat <range>`) and say what it will cost. Over
+~2,000 changed lines, say it is cheaper *and a better review* to run several smaller ranges — a
+reviewer reasoning about 3,000 lines at once reasons worse about each of them. It runs in the
+background and notifies on completion.
 
 ## 3. Report
 
@@ -58,8 +65,11 @@ The workflow returns `{findings, raw, refuted, reviewers, features, context, not
   found no conventions file reviewed a different, weaker thing, and the reader should know;
 - `raw → refuted → findings`, so the filtering is visible;
 - each finding: **severity** · `file:line` · the summary, then the scenario and the fix
-  direction, most severe first. Group by severity. Mark any carrying `unverified: true` as such
-  — they were past the verify cap and no skeptic read them.
+  direction, most severe first. Group by severity.
+- whether the run was **verified** (`verified: true`) or filed unverified. At `low` every
+  finding carries `unverified: true` and that is expected — say once that nothing was
+  skeptic-checked, rather than repeating it per finding. At `high`, flag the individual ones
+  that still carry it: those were past the verify cap or lost their skeptics.
 - if `findings` is empty, say whether that is because nothing was found or because everything
   was refuted (`note` says which).
 

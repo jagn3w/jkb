@@ -1,6 +1,6 @@
 ---
 description: Run this repo's code reviewer and log each finding as a task in .codereviews/<datetime>-<branch>-<N>/tasks.md, mounted into jkb
-argument-hint: "[range]  [low|medium|high]  [-- anything to focus on]"
+argument-hint: "[range]  [low|high]  [-- anything to focus on]"
 ---
 
 You are running a **logged code review**: run the reviewer, then persist every finding as an
@@ -32,8 +32,14 @@ describe** — same resolution rules, same `scriptPath` lookup, same `args` obje
 is one workflow with two thin callers precisely so that "what counts as a finding" cannot differ
 between them (design D37.7).
 
-It returns `{findings, raw, refuted, reviewers, features, context, note}`. Each finding carries
-`severity` (`must-fix` / `concern` / `nit`), `file`, `line`, `summary`, `scenario`, `fix`, `kind`.
+It returns `{findings, raw, refuted, reviewers, verified, features, context, note}`. Each finding
+carries `severity` (`must-fix` / `concern` / `nit`), `file`, `line`, `summary`, `scenario`,
+`fix`, `kind`, and possibly `unverified`.
+
+At the default `low` effort nothing is skeptic-checked — findings are filed as found, because
+only ~6% were ever refuted and discovering a false one while fixing it is cheaper than three
+skeptics per finding up front. Note that in the doc's header line so a reader knows what they
+are looking at; do not annotate every task with it.
 
 ## 3. Log the findings as tasks
 
