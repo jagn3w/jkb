@@ -2982,13 +2982,28 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
   jkb task work <uid>         open (or return to) this task's session: its own checkout and
                               branch `task/<session>`, claimed so nothing else starts it.
                               Work and COMMIT inside the printed worktree, nowhere else.
+                              --onto <branch> names the STAGING branch it lands on; omit it
+                              and jkb joins the batch in flight, or cuts one from trunk.
   jkb task land <uid>         rebase the session onto its target, run the repo's gate, and
                               on green mark the task done and remove the session. Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
+                              REFUSES a task with no recorded review, or whose review left a
+                              must-fix (!p1) finding open. --no-review records a waiver.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
   jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
       If you are inside a session, land is the human's call — commit, and say you are done.
+
+STAGING BRANCHES (where a batch lands before trunk — the swarm's integration branch)
+  jkb staging ls [--all]      every staging branch and the tasks landing on it: each task's state
+                              (implementing / review / landed), its commits, and how many
+                              must-fix findings its review left open. --all shows merged ones.
+  jkb task review record --findings <ns>
+                              record that a review ran against the current branch, so `land`
+                              can require one. /review-log does this for you.
+  jkb task tag set <uid> <f>=<v>
+                              make <v> the facet's ONLY value (add appends). Use for the
+                              single-answer facets: branch=, onto=, repo=, base=.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.

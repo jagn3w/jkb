@@ -52,14 +52,27 @@ Several tasks can be worked at once without sharing a checkout. Each session has
 worktree and branch, and its task is claimed, so nothing else — another terminal, a swarm
 run — starts the same one.
 
-- `jkb task work <uid>` — open (or return to) the task's session. Work and **commit** inside
-  the worktree it prints, and nowhere else. Running it twice returns the same session.
+- `jkb task work <uid> [--onto <branch>]` — open (or return to) the task's session. Work and
+  **commit** inside the worktree it prints, and nowhere else. Running it twice returns the
+  same session. `--onto` names the **staging branch** its work lands on; omit it and jkb
+  joins the batch already in flight, or cuts one from trunk.
 - `jkb task land <uid>` — rebase the session onto its target branch, run the repo's gate, and
   on green mark the task done and clean the session up. Landing is serial, so a red gate
   means *your* branch broke the integrated result.
 - `jkb task abandon <uid>` — drop the session and reopen the task (the branch is kept).
 - `jkb task sessions` — what is in flight, with uncommitted work and commits ahead.
 - `jkb task gate ["<cmd>"]` — the command that verifies a landing here (remembered per repo).
+- `jkb staging ls [--all]` — the staging branches in this repo and what is landing on each:
+  every task's state (`implementing` / `review` / `landed`), its commits, and whether its
+  review left anything must-fix open. A staging branch is the same thing `/task-swarm` calls
+  its integration branch, and both paths show up here.
+- `jkb task review record --findings <ns>` — record that a review ran against the current
+  branch. `/review-log` does this for you; `jkb task land` requires it.
+
+**Landing is review-gated.** `jkb task land` refuses a task with no recorded review, or whose
+review left a `!p1` must-fix finding open (concerns and nits never block). Fix or
+`jkb task set <uid> --status cancelled` each one, then land. `--no-review` overrides and
+records a visible `review-waived=` on the task.
 
 If you are working *inside* a session, landing is the human's call: commit your work and say
 so. Do not mark the task done, and do not merge or rebase onto the target yourself.

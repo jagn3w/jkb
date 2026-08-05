@@ -588,6 +588,60 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
   directly and it must work in any repo.
 
+## Staging branches and review-gated landing (D38)
+
+The branch a batch of tasks lands on before trunk. It is the **same thing** `/task-swarm`
+calls its integration branch — cut from trunk, sub-branches rebase and fast-forward into it
+linearly, the gate runs on the integrated result — reached by hand instead of by a
+coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
+
+- **A staging branch is derived, never stored.** It is any git branch named by some task's
+  `onto=` facet that still exists. There is no `kind='staging'` item and no table: which
+  branches exist and which tasks are on them live in the facets, sessions live in git
+  worktrees, merge state comes from `gitrepo::is_merged` (squash-safe, D34.2). A staging
+  *item* would copy facts git owns and then need reconciling — the failure D36.2 avoided by
+  refusing a session state file.
+- **`jkb staging ls [--all]` is the ONE read** behind both the explorer's branch picker and
+  its In Flight view, so the two cannot disagree about what is live. Each task carries a
+  derived `state`: `implementing` / `review` / `landed`. A branch adding nothing to trunk is
+  either landed *or* freshly cut and still empty, and refs cannot tell those apart — **live
+  work is the tie-break**, or the branch cut by the very first `task work` is hidden from the
+  picker that exists to offer it.
+- **Review state is two facets on the task**: `reviewed=<sha>` and `review=<ns>`. It is the
+  one fact here with nowhere authoritative to live — git does not know, and the reviewer is a
+  Claude workflow the CLI cannot run, so the CLI can only *require a record*. It deliberately
+  does **not** live on the review folder's namespace metadata, which the sync engine owns
+  (`layout`, `header_line`, `prose`); a second writer there is the class of bug that collapsed
+  `openspec/`. Recording is keyed by **branch** — that is what a review knows — and a branch
+  no task claims is a note, not an error.
+- **The gate: reviewed, and no open must-fix.** `jkb task land` refuses a task with no
+  `reviewed=`, or whose review has a `!p1` finding that is neither `done` nor `cancelled`
+  (counted with `priority<=1`, terminal statuses filtered in Rust — `is:ready` is wrong
+  because a *blocked* must-fix must still block). Checked **before the graft**, so a refusal
+  has moved nothing. Concerns and nits never block: a previous run put 34 of 45 findings on
+  `concern`, and blocking on those would make the override the normal path within a week.
+  `--no-review` overrides and records `review-waived=<sha>` — an override nobody can see is
+  indistinguishable from a rule that does not exist.
+- **Status and the gate are not fused.** A task in `needs_review` with nothing outstanding
+  lands; one moved back to `in_progress` with an open must-fix does not. Fusing them would
+  make `jkb task set --status` the bypass. `needs_review` is the display state (D27.7);
+  the findings decide landing. Recording a review is the **only** author of that transition.
+- **`jkb task tag set`** is the sibling of `add`/`rm` that makes a value a facet's only one.
+  `add` stays additive, honest to its name — an open-ended facet legitimately holds several
+  values. `set` is for `branch=`/`onto=`/`repo=`/`base=`, where a second value is a
+  contradiction and a reader collapsing the multi-map picks one at random (D36.6). Load-bearing
+  because `/task-swarm` re-tags a group on every pass.
+- **The swarm records where it is working.** `/task-swarm` sets `onto=<integration>`/`repo=`
+  at claim and `branch=` once the implementer has one, so `staging ls` shows swarm work and
+  hand-driven work in one view rather than the half it was told about. `/review-log` calls
+  `jkb task review record` after mounting its findings, and says whether the branch can land.
+- **Deliberately unchanged:** `scripts/merge-queue.sh`. The swarm already runs a fresh
+  REVIEWER before a group reaches the queue (D27.6) — that *is* its gate, and stricter.
+  Requiring `reviewed=` there would make the REVIEWER write facets to satisfy a check its own
+  approval already answered. **Review staleness** is recorded (`reviewed=<sha>`) but not
+  enforced: making every post-review fixup force a re-review is the fastest way to make people
+  reach for `--no-review` by reflex.
+
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
 `/review-log` used to wrap the host's `/code-review`, which reports to the user rather than
