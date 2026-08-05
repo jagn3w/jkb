@@ -8,7 +8,13 @@ import * as path from "node:path";
 
 import * as vscode from "vscode";
 
-import { landBlocker, type NodeRef, type StagingBranch, type TreeChild } from "@jkb/core";
+import {
+  landBlocker,
+  type NodeRef,
+  type StagedTask,
+  type StagingBranch,
+  type TreeChild,
+} from "@jkb/core";
 
 import { CliJkbClient } from "./cliClient.js";
 import { JkbDecorationProvider } from "./decorations.js";
@@ -377,6 +383,28 @@ async function pickStagingBranch(
 function landTask(client: CliJkbClient, child?: TreeChild): void {
   const uid = taskUid(child, "land");
   if (!uid) return;
+  // The Explorer has no StagedTask in hand, so there is nothing to pre-check against; the CLI
+  // gate is still the authority either way.
+  land(client, uid, undefined);
+}
+
+/**
+ * Land a task, in a terminal — the gate is a build, and a red one needs its output.
+ *
+ * One implementation for both the Explorer and In Flight. They were separate six-line copies
+ * where only In Flight pre-checked the blocker, so the same task landed differently depending
+ * on which tree you clicked, and any later change to UI landing (`--onto`, prompting for
+ * `--no-review`) had to be made twice with nothing forcing the second.
+ */
+function land(client: CliJkbClient, uid: string, task: StagedTask | undefined): void {
+  if (task) {
+    const blocker = landBlocker(task);
+    if (blocker) {
+      // Say why, rather than spending a build on a refusal the row already knew about.
+      vscode.window.showWarningMessage(`jkb: ${task.title} cannot land yet. ${blocker}`);
+      return;
+    }
+  }
   const cwd = repoFolder();
   if (!cwd) return;
   const terminal = vscode.window.createTerminal({ name: `jkb land: ${uid.slice(-24)}`, cwd });
@@ -410,20 +438,7 @@ function openSessionTerminal(node?: FlightNode): void {
 /** Land the task, in a terminal — the gate is a build, and a red one needs its output. */
 function landFromFlight(client: CliJkbClient, node?: FlightNode): void {
   if (node?.kind !== "task") return;
-  const blocker = landBlocker(node.task);
-  if (blocker) {
-    // Say why before spending a build on a refusal the row already knew about.
-    vscode.window.showWarningMessage(`jkb: ${node.task.title} cannot land yet. ${blocker}`);
-    return;
-  }
-  const cwd = repoFolder();
-  if (!cwd) return;
-  const terminal = vscode.window.createTerminal({
-    name: `jkb land: ${node.task.uid.slice(-24)}`,
-    cwd,
-  });
-  terminal.show();
-  terminal.sendText(client.terminalCommand(["task", "land", node.task.uid]));
+  land(client, node.task.uid, node.task);
 }
 
 /** Abandon the session, after confirming — it discards a checkout. */

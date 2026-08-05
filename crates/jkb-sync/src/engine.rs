@@ -26,7 +26,8 @@ use jkb_core::{
     binding, blob, edge, item, mount, ns, placement, sync_state, tag, task, Db, WriteMeta,
 };
 use jkb_types::{
-    EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, SyncMode, TaskStatus,
+    ConflictPolicy, EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, SyncMode,
+    TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -56,6 +57,14 @@ pub enum Outcome {
     UpToDate,
     /// The mount's `sync_mode` does not permit the needed direction.
     Skipped,
+    /// A both-changed file was resolved by the conflict policy in favour of **disk**; the
+    /// KB side was discarded. Reported apart from `Imported` because a policy resolution
+    /// throws work away, and that should never be indistinguishable from an ordinary import.
+    ResolvedFromDisk,
+    /// A both-changed file was resolved in favour of the **KB**; the on-disk bytes were
+    /// overwritten. The losing bytes are blobbed first, so `jkb blob ls --contains` can still
+    /// recover them.
+    ResolvedFromKb,
     /// Another synced file in this mount maps to the same namespace, so the two would share
     /// one layout and each would render the other's content. Nothing was read or written.
     ///
@@ -99,6 +108,25 @@ impl SyncReport {
     #[must_use]
     pub fn merged(&self) -> Vec<&Path> {
         self.paths_with(Outcome::Merged)
+    }
+
+    /// The paths a conflict policy resolved, and which side won. A resolution discards the
+    /// other side's edits, so it is reported per file rather than folded into the counts.
+    #[must_use]
+    pub fn resolved(&self) -> Vec<(&Path, &'static str)> {
+        self.results
+            .iter()
+            .filter_map(|r| match r.outcome {
+                Outcome::ResolvedFromDisk => {
+                    Some((r.path.as_path(), "disk won, KB edits discarded"))
+                }
+                Outcome::ResolvedFromKb => Some((
+                    r.path.as_path(),
+                    "KB won, on-disk edits overwritten (blobbed first)",
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The paths refused because they share a namespace with another synced file
@@ -164,27 +192,23 @@ pub fn sync(db: &Db, mount_ns: &str) -> Result<SyncReport> {
 /// override means the mount is never edited to get a sync unstuck.
 ///
 /// # Errors
-/// Same as [`sync`], plus a validation error if `policy` is not a known policy name.
-pub fn sync_with_policy(db: &Db, mount_ns: &str, policy: Option<&str>) -> Result<SyncReport> {
+/// Same as [`sync`].
+pub fn sync_with_policy(
+    db: &Db,
+    mount_ns: &str,
+    policy: Option<ConflictPolicy>,
+) -> Result<SyncReport> {
     let mut ctx = load_ctx(db, mount_ns)?;
     let _ = resolve(&ctx.serializer)?; // fail fast on an unknown mount serializer
     if let Some(p) = policy {
-        ctx.conflict_policy = validated_policy(p)?;
+        // Typed, so there is no string to re-validate: the caller already has the enum, and
+        // passing it as text meant a third hand-written spelling that could disagree.
+        p.as_str().clone_into(&mut ctx.conflict_policy);
     }
 
     let filter = Filter::build(&read_globs(db, mount_ns)?)?;
     let paths = discover(db, &ctx, &filter)?;
-    reconcile_all(db, &ctx, paths)
-}
-
-/// The known conflict-policy names, as stored in `mounts.conflict_policy`.
-fn validated_policy(p: &str) -> Result<String> {
-    match p {
-        "disk_wins" | "kb_wins" | "manual" => Ok(p.to_owned()),
-        other => Err(Error::Types(TypeError::Validation(format!(
-            "unknown conflict policy `{other}`; available: disk_wins, kb_wins, manual"
-        )))),
-    }
+    reconcile_all(db, &ctx, &filter, paths)
 }
 
 /// Reconcile only the given `paths` (e.g. the paths named by filesystem-watch events),
@@ -204,17 +228,31 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
             relevant.push(path.clone());
         }
     }
-    reconcile_all(db, &ctx, relevant)
+    reconcile_all(db, &ctx, &filter, relevant)
 }
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.
-fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
-    let colliding = colliding_paths(db, ctx, &paths)?;
+fn reconcile_all(db: &Db, ctx: &Ctx, filter: &Filter, paths: Vec<PathBuf>) -> Result<SyncReport> {
+    let colliding = colliding_paths(db, ctx, filter, &paths)?;
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
-        // Refuse before opening a transaction: a collided file must not be read *or*
-        // written, because its namespace's layout describes a different document.
+        // Refuse before reconciling: a collided file must not be read *or* written, because
+        // its namespace's layout describes a different document. The refusal IS journalled
+        // `needs_attention`, exactly as a quarantine is — a file that has silently stopped
+        // syncing must not keep its stale `status='ok'`. `jkb sync --watch` discards the
+        // report entirely, so without this the only signal of a mount that stopped working
+        // was noticing the KB and the file had drifted.
         if colliding.contains(&path) {
+            let ctx = ctx.clone();
+            let p = path.clone();
+            let others: Vec<String> = colliding
+                .iter()
+                .filter(|o| **o != path && namespace_for(&ctx, o) == namespace_for(&ctx, &path))
+                .map(|o| o.display().to_string())
+                .collect();
+            db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
+                journal_collision(conn, meta, &ctx, &p, &others)
+            })?;
             results.push(FileResult {
                 path,
                 outcome: Outcome::Collided,
@@ -410,7 +448,12 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
 ///
 /// Collisions are found both **within this batch** (a full `sync`) and **against files
 /// already bound in the KB** (a watch-driven `sync_paths` that sees only one of the pair).
-fn colliding_paths(db: &Db, ctx: &Ctx, paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+fn colliding_paths(
+    db: &Db,
+    ctx: &Ctx,
+    filter: &Filter,
+    paths: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>> {
     // `document` maps a whole file to one item and reads no layout, so many of them share a
     // directory safely. Only formats that keep document structure on the namespace care.
     if !resolve(&ctx.serializer)?.requires_exclusive_namespace() {
@@ -427,7 +470,16 @@ fn colliding_paths(db: &Db, ctx: &Ctx, paths: &[PathBuf]) -> Result<BTreeSet<Pat
         };
         let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
         let path = PathBuf::from(bare);
-        if path.starts_with(&ctx.dir) {
+        // Filtered exactly as `discover` filters a bound file, so this set is "what this
+        // mount syncs" and nothing else. Previously only `starts_with(dir)` applied, so an
+        // *excluded* sibling still counted as a collision and the mount could not be
+        // unwedged by any configuration at all.
+        //
+        // `accepts_bound`, not `accepts`: an already-bound file keeps syncing even when a
+        // narrowed `include` no longer selects it (that is deliberate — narrowing must not
+        // silently orphan bound files), so `include` cannot clear a collision between two
+        // already-bound files and `exclude` is the remedy. The refusal message says so.
+        if filter.accepts_bound(&ctx.dir, &path) {
             known.insert(path);
         }
     }
@@ -449,6 +501,69 @@ fn colliding_paths(db: &Db, ctx: &Ctx, paths: &[PathBuf]) -> Result<BTreeSet<Pat
         }
     }
     Ok(out)
+}
+
+/// Journal a refused collision as `needs_attention`, preserving whatever the file last
+/// synced to.
+///
+/// Mirrors [`quarantine`]: same status, same "keep the last-good base and hash" rule, and the
+/// same reason — a file jkb has stopped syncing must say so where `jkb doctor` and the
+/// watcher look, rather than keeping the `ok` from its last successful sync. It stores no
+/// blob because nothing was read; the file on disk is untouched and is its own record.
+fn journal_collision(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    siblings: &[String],
+) -> Result<()> {
+    let bare_uri = file_uri(path);
+    // ONLY a file that has synced before is journalled. The harm this addresses is a
+    // previously-good file going stale at `status='ok'` while it silently stops syncing;
+    // a file that never synced has no stale row to correct, and inventing one would give it
+    // a journal entry with no base — which `reconcile` then reads as "both sides changed",
+    // turning what should be a first import into a three-way merge.
+    let Some(journal) = sync_state::get(conn, &bare_uri)? else {
+        return Ok(());
+    };
+    let journal = Some(journal);
+    let msg = if siblings.is_empty() {
+        format!(
+            "another synced file shares this file's namespace ({}); the `{}` serializer keeps \
+             a file's sections and document order there, so one directory can hold at most \
+             one synced file. Narrow the mount's include glob.",
+            namespace_for(ctx, path),
+            ctx.serializer,
+        )
+    } else {
+        format!(
+            "shares its namespace ({}) with {}; the `{}` serializer keeps a file's sections \
+             and document order there, so one directory can hold at most one synced file. \
+             Narrow the mount's include glob.",
+            namespace_for(ctx, path),
+            siblings.join(", "),
+            ctx.serializer,
+        )
+    };
+    let last = journal.as_ref().and_then(|j| j.last_synced_hash.clone());
+    let base = journal.as_ref().and_then(|j| j.base_blob_hash.clone());
+    let quar = journal
+        .as_ref()
+        .and_then(|j| j.quarantine_blob_hash.clone());
+    sync_state::upsert(
+        conn,
+        meta,
+        &sync_state::SyncStateWrite {
+            uri: &bare_uri,
+            serializer: &ctx.serializer,
+            status: "needs_attention",
+            last_synced_hash: last.as_deref(),
+            base_blob_hash: base.as_deref(),
+            parse_error: Some(&msg),
+            quarantine_blob_hash: quar.as_deref(),
+        },
+    )?;
+    Ok(())
 }
 
 /// Reconcile a single file within the current transaction.
@@ -786,9 +901,17 @@ fn three_way_resolve(
                 serializer,
                 disk_doc,
                 disk_bytes,
-                Outcome::Imported,
+                Outcome::ResolvedFromDisk,
             ),
-            "kb_wins" => finish_export(conn, meta, ctx, path, bare_uri, ser_name, kb_bytes),
+            "kb_wins" => {
+                // Blob the bytes about to be overwritten BEFORE overwriting them. `settle`
+                // stores only the winning render, so without this the disk side a `kb_wins`
+                // resolution discards is gone for good — unlike every other sync outcome,
+                // which is recoverable from the archive.
+                blob::store(conn, &blob::hash_bytes(disk_bytes), disk_bytes, None)?;
+                finish_export(conn, meta, ctx, path, bare_uri, ser_name, kb_bytes)?;
+                Ok(Outcome::ResolvedFromKb)
+            }
             _ => {
                 // manual: overwrite neither side; flag the file so `doctor` can surface it.
                 let base = journal.and_then(|j| j.base_blob_hash.clone());

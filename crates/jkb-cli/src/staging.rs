@@ -24,9 +24,8 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use jkb_core::Db;
 
-use crate::{
-    facet_one, facet_values, gitrepo, session, RepoCtx, RepoTask, FACET_BRANCH, FACET_ONTO,
-};
+use crate::repo::{facet_one, facet_values, RepoCtx, RepoTask, FACET_BRANCH, FACET_ONTO};
+use crate::{gitrepo, session};
 
 /// Where a task sits in the pipeline. Derived, never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +43,16 @@ pub(crate) enum State {
 }
 
 impl State {
+    /// Position in the pipeline, for ordering a listing: live work first, history last.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Implementing => 0,
+            Self::Review => 1,
+            Self::Landed => 2,
+            Self::Dropped => 3,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Implementing => "implementing",
@@ -97,7 +106,7 @@ pub(crate) struct Staging {
 /// # Errors
 /// Returns an error if git or the database cannot be read.
 pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Vec<Staging>> {
-    let tasks = crate::repo_tasks(db, &ctx.key)?;
+    let tasks = crate::repo::repo_tasks(db, &ctx.key)?;
     let sessions = session::discover(&ctx.root)?;
 
     // Group tasks by the branch they land on. A task with no `onto=` is not on a staging
@@ -109,11 +118,19 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         }
     }
 
+    // Everything git-wide is resolved ONCE, before the loop. This read backs a view that
+    // refreshes on every database write, and the per-branch shape (a `show-ref` plus a
+    // `merge-tree` probe plus a full `worktree list`, ~6 spawns at ~11ms each) meant a repo
+    // with a dozen branches spent about a second per redraw — which during a swarm run, where
+    // claims and tags land continuously, never caught up.
+    let existing = gitrepo::local_branches(&ctx.root)?;
+    let worktrees = gitrepo::worktrees(&ctx.root)?;
+
     let mut out = Vec::new();
     for (branch, group) in by_onto {
         // A branch deleted by hand simply stops being a staging branch — the tags that named
         // it are stale bookkeeping, not evidence that it exists.
-        if !gitrepo::has_branch(&ctx.root, &branch)? {
+        if !existing.contains(&branch) {
             continue;
         }
         // A branch that adds nothing to trunk is either **landed** or **freshly cut and still
@@ -124,14 +141,20 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         let has_live_work = group
             .iter()
             .any(|t| !matches!(t.meta.status.as_deref(), Some("done" | "cancelled")));
-        let merged = !has_live_work
-            && match &ctx.trunk {
+        // The merge probe (`merge-tree --write-tree`, several `rev-parse`s) only runs when
+        // live work has not already answered the question — and its answer is only *needed*
+        // when a merged branch would be hidden.
+        let merged = if has_live_work {
+            false
+        } else {
+            match &ctx.trunk {
                 Some(trunk) => {
                     gitrepo::is_merged(&ctx.root, &branch, trunk, None)?.0
                         == gitrepo::MergeState::Merged
                 }
                 None => false,
-            };
+            }
+        };
         if merged && !include_merged {
             continue;
         }
@@ -142,22 +165,21 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 
         let mut staged = Vec::new();
         for t in group {
-            staged.push(stage_task(db, ctx, &branch, t, &sessions)?);
+            staged.push(stage_task(db, ctx, &branch, t, &sessions, &existing)?);
         }
-        // Most-recently-touched work is what you are looking for; a stable tie-break keeps
-        // the listing from reshuffling between redraws.
-        staged.sort_by(|a, b| {
-            a.state
-                .as_str()
-                .cmp(b.state.as_str())
-                .then(a.uid.cmp(&b.uid))
-        });
+        // Pipeline order — what is being built, then what is under review, then what is
+        // finished — with a stable uid tie-break so the listing does not reshuffle between
+        // redraws. Sorting on the state *string* was alphabetical, which put `dropped` first.
+        staged.sort_by_key(|t| (t.state.rank(), t.uid.clone()));
 
         out.push(Staging {
             branch: branch.clone(),
             merged,
             ahead,
-            checkout: gitrepo::worktree_for_branch(&ctx.root, &branch)?,
+            checkout: worktrees
+                .iter()
+                .find(|w| w.branch.as_deref() == Some(branch.as_str()))
+                .map(|w| w.path.clone()),
             tasks: staged,
         });
     }
@@ -171,6 +193,7 @@ fn stage_task(
     onto: &str,
     t: &RepoTask,
     sessions: &[session::Session],
+    existing: &std::collections::BTreeSet<String>,
 ) -> Result<StagedTask> {
     // Match by worktree rather than by "the task's branch tag": a task that picked up a
     // second `branch=` still resolves to the session that actually exists on disk (D36.2).
@@ -188,30 +211,44 @@ fn stage_task(
         _ => State::Implementing,
     };
 
-    let (dirty, commits) = match sess {
-        Some(s) => (
-            gitrepo::is_dirty(&s.worktree)?,
-            gitrepo::ahead_count(&ctx.root, onto, &s.branch)?,
-        ),
-        None => (false, 0),
+    // The branch this task's work is on: its session's, or — for a swarm task, whose branch
+    // is not a `.jkb/work` session — whichever `branch=` it recorded that still exists.
+    let work_branch = sess.map(|s| s.branch.clone()).or_else(|| {
+        branches
+            .iter()
+            .find(|b| existing.contains(*b))
+            .or_else(|| branches.first())
+            .cloned()
+    });
+
+    // `dirty` is only knowable with a checkout, but commits are not: counting them from the
+    // recorded branch is what makes a swarm task — which `/task-swarm` tags specifically so
+    // it shows up here — report the work it actually has. Deriving both from a session
+    // worktree made every swarm row claim 0 commits, and the tooltip assert it had nothing
+    // to land while its branch was several commits ahead.
+    let dirty = match sess {
+        Some(s) => gitrepo::is_dirty(&s.worktree)?,
+        None => false,
+    };
+    let commits = match &work_branch {
+        Some(b) if existing.contains(b) => gitrepo::ahead_count(&ctx.root, onto, b)?,
+        _ => 0,
     };
 
     // The same count the land gate uses, so a row can never say "reviewed" about a task the
     // gate is about to refuse.
-    let review_ns = facet_one(&t.tags, crate::review::FACET_REVIEW).cloned();
-    let open_must_fix = match &review_ns {
-        Some(ns) => crate::review::open_must_fix(db, ns)?.len(),
-        None => 0,
-    };
+    // Every recorded review, not just the newest: a second `/review-log` run must not retire
+    // the first run's still-open must-fix findings.
+    let review_nss = facet_values(&t.tags, crate::review::FACET_REVIEW).to_vec();
+    let open_must_fix = crate::review::open_must_fix(db, &review_nss)?.len();
+    let review_ns = review_nss.last().cloned();
 
     Ok(StagedTask {
         uid: t.meta.uid.clone(),
         title: t.title(),
         status,
         state,
-        branch: sess
-            .map(|s| s.branch.clone())
-            .or_else(|| branches.first().cloned()),
+        branch: work_branch,
         worktree: sess.map(|s| s.worktree.clone()),
         dirty,
         commits,

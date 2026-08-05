@@ -22,14 +22,17 @@ import type { CliJkbClient } from "./cliClient.js";
 /** A row: either a staging branch or one task on it. */
 export type FlightNode =
   | { readonly kind: "branch"; readonly branch: StagingBranch }
-  | { readonly kind: "task"; readonly task: StagedTask; readonly onto: string };
+  | { readonly kind: "task"; readonly task: StagedTask; readonly onto: string }
+  // A failed read is a ROW, not an empty tree. An empty tree means "nothing is in flight",
+  // which is a completely different fact — and a stale `jkb.cliPath` or a DB carrying a newer
+  // migration than the installed binary (a failure this project has hit) renders identically
+  // to a quiet repo unless the failure is shown.
+  | { readonly kind: "error"; readonly message: string };
 
 export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
   private readonly emitter = new vscode.EventEmitter<FlightNode | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
   private includeMerged = false;
-  /** The last error, shown as a row rather than a popup — this view polls. */
-  private lastError: string | null = null;
 
   constructor(
     private readonly client: CliJkbClient,
@@ -48,6 +51,17 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
   }
 
   getTreeItem(node: FlightNode): vscode.TreeItem {
+    if (node.kind === "error") {
+      const item = new vscode.TreeItem("Could not read staging branches");
+      item.description = node.message;
+      item.iconPath = new vscode.ThemeIcon("error");
+      item.tooltip = new vscode.MarkdownString(
+        `\`jkb staging ls\` failed:\n\n\`\`\`\n${node.message}\n\`\`\`\n\n` +
+          "This is **not** an empty repo — the read did not succeed. Check `jkb.cliPath` " +
+          "points at a current binary and that it can open the database.",
+      );
+      return item;
+    }
     if (node.kind === "branch") {
       const b = node.branch;
       const item = new vscode.TreeItem(
@@ -95,7 +109,7 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
   }
 
   async getChildren(node?: FlightNode): Promise<FlightNode[]> {
-    if (node?.kind === "task") return [];
+    if (node?.kind === "task" || node?.kind === "error") return [];
     if (node?.kind === "branch") {
       return node.branch.tasks.map((task) => ({
         kind: "task" as const,
@@ -107,20 +121,13 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
     if (!cwd) return [];
     try {
       const rows = await this.client.staging(cwd, this.includeMerged);
-      this.lastError = null;
       return rows.map((branch) => ({ kind: "branch" as const, branch }));
     } catch (e) {
-      // Outside a git repo this read legitimately fails, and this view refreshes on every
-      // database write — a popup per refresh would be unusable. The message is available on
-      // demand instead.
-      this.lastError = (e as Error).message;
-      return [];
+      // Reported as a row, not a popup: this view refreshes on every database write, so a
+      // dialog per refresh would be unusable — but silence would make a broken CLI look like
+      // an idle repo.
+      return [{ kind: "error", message: (e as Error).message }];
     }
-  }
-
-  /** The last failure, for a caller that wants to surface it deliberately. */
-  error(): string | null {
-    return this.lastError;
   }
 }
 

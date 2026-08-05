@@ -734,6 +734,9 @@ fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
     );
     assert_eq!(f.status_of(&uid), "in_progress");
 
+    // A review must have produced findings to be recordable: an empty namespace means the
+    // findings never reached the KB, which the gate must not read as clean.
+    f.add_finding("reviews/run-1", "something to fix");
     f.jkb()
         .args(["task", "review", "record", "--branch", &branch])
         .args(["--findings", "reviews/run-1"])
@@ -755,6 +758,7 @@ fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
         "b",
         "b",
     );
+    f.add_finding("reviews/run-2", "a second-run finding");
     f.jkb()
         .args(["task", "review", "record", "--branch", &branch])
         .args(["--findings", "reviews/run-2"])
@@ -763,9 +767,13 @@ fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
     let t = &f.staging(&[])[0]["tasks"][0];
     assert_ne!(t["reviewed"].as_str().unwrap(), first_sha);
     assert_eq!(t["review_ns"].as_str().unwrap(), "reviews/run-2");
+    // Both runs still gate: re-recording must not retire the first run's open must-fix
+    // findings, or fixing one finding and re-reviewing would silently un-block the rest.
+    assert_eq!(t["open_must_fix"], 2);
 
     // A branch no task claims is a note, not an error — reviewing an arbitrary range is a
     // legitimate thing to do.
+    f.add_finding("reviews/run-3", "a third finding");
     f.jkb()
         .args(["task", "review", "record", "--branch", "main"])
         .args(["--findings", "reviews/run-3"])
@@ -923,4 +931,121 @@ fn a_cancelled_task_reads_as_dropped_not_landed() {
     let rows = f.staging(&["--all"]);
     let t = &rows[0]["tasks"][0];
     assert_eq!(t["state"].as_str().unwrap(), "dropped");
+}
+
+/// The gate must fail CLOSED. A review recorded against a namespace that holds no findings is
+/// a review whose findings never reached the KB — a quarantined `tasks.md`, a typo, a renamed
+/// namespace — and reading that as "clean" is the one direction a safety check must not fail.
+#[test]
+fn a_review_with_no_findings_is_refused_not_read_as_clean() {
+    let f = Fixture::new();
+    let uid = f.add_task("gate-fails-closed task");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+
+    // Recording is refused at the point it can still be fixed.
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/never-synced"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no findings found"));
+
+    // And a task that somehow carries such a facet pair still cannot land: the gate checks
+    // that findings exist, not merely that a namespace was named.
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "reviewed=deadbeef"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "set",
+            &uid,
+            "review=reviews/never-synced",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("holds no findings at all"));
+    assert_eq!(f.status_of(&uid), "in_progress");
+}
+
+/// A failed land must leave no waiver behind. `--no-review` records one only once the landing
+/// has actually happened — otherwise a task carries a permanent "deliberately unreviewed" mark
+/// for something that never occurred, and the UI reads it as landable while the CLI refuses.
+#[test]
+fn a_failed_land_records_no_waiver() {
+    let f = Fixture::new();
+    let uid = f.add_task("failing waived task");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+
+    // A red gate fails the land after the graft.
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "false", "--no-review"])
+        .assert()
+        .failure();
+
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert!(
+        t["review_waived"].is_null(),
+        "a land that failed must not leave a waiver: {t}"
+    );
+    assert!(t["reviewed"].is_null());
+}
+
+/// Abandoning must not free a claim this session does not hold. The swarm's tasks now appear
+/// in the same views, so another implementer's live work is one right-click away.
+#[test]
+fn abandon_refuses_a_claim_held_by_someone_else() {
+    let f = Fixture::new();
+    let uid = f.add_task("someone elses task");
+    // A claim held by an owner that is not a session here — what a swarm implementer looks
+    // like from this process's point of view.
+    f.jkb()
+        .args(["--global", "task", "claim", &uid, "--owner", "swarm:12345"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "set",
+            &uid,
+            "branch=swarm-task/thing",
+        ])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("claimed by swarm:12345"));
+    assert_eq!(f.status_of(&uid), "in_progress");
+
+    // --force is the deliberate override.
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "open");
 }

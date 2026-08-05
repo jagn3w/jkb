@@ -10,6 +10,7 @@ mod commands;
 mod gitrepo;
 mod output;
 mod owner;
+mod repo;
 mod review;
 mod service;
 mod session;
@@ -1042,7 +1043,7 @@ fn run(cli: Cli) -> Result<()> {
             &db,
             ns.as_deref(),
             watch,
-            conflict.map(|p| ConflictPolicy::from(p).as_str()),
+            conflict.map(ConflictPolicy::from),
         ),
         Command::Staging { cmd } => match cmd {
             StagingCmd::Ls { all } => cmd_staging_ls(&db, all, cli.json),
@@ -3576,26 +3577,6 @@ impl FieldEdit {
     }
 }
 
-/// Parse a stored `mounts.sync_mode`. The strings are the ones [`SyncMode::as_str`] writes.
-fn parse_sync_mode(s: &str) -> Option<SyncMode> {
-    match s {
-        "import" => Some(SyncMode::Import),
-        "export" => Some(SyncMode::Export),
-        "bidirectional" => Some(SyncMode::Bidirectional),
-        _ => None,
-    }
-}
-
-/// Parse a stored `mounts.conflict_policy` (see [`ConflictPolicy::as_str`]).
-fn parse_conflict_policy(s: &str) -> Option<ConflictPolicy> {
-    match s {
-        "disk_wins" => Some(ConflictPolicy::DiskWins),
-        "kb_wins" => Some(ConflictPolicy::KbWins),
-        "manual" => Some(ConflictPolicy::Manual),
-        _ => None,
-    }
-}
-
 fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Result<()> {
     let abs = std::fs::canonicalize(dir)
         .with_context(|| format!("resolving mount directory {}", dir.display()))?;
@@ -3622,7 +3603,7 @@ fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Resu
     let mode = edit.mode.unwrap_or_else(|| {
         existing
             .as_ref()
-            .and_then(|m| parse_sync_mode(&m.sync_mode))
+            .and_then(|m| SyncMode::from_db_str(&m.sync_mode))
             .unwrap_or(SyncMode::Bidirectional)
     });
     let serializer = edit
@@ -3638,7 +3619,7 @@ fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Resu
     let policy = edit.policy.unwrap_or_else(|| {
         existing
             .as_ref()
-            .and_then(|m| parse_conflict_policy(&m.conflict_policy))
+            .and_then(|m| ConflictPolicy::from_db_str(&m.conflict_policy))
             .unwrap_or(ConflictPolicy::Manual)
     });
 
@@ -3673,7 +3654,12 @@ fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Resu
     Ok(())
 }
 
-fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool, conflict: Option<&str>) -> Result<()> {
+fn cmd_sync(
+    db: &Db,
+    ns_path: Option<&str>,
+    watch: bool,
+    conflict: Option<ConflictPolicy>,
+) -> Result<()> {
     let debounce = std::time::Duration::from_millis(300);
     if watch {
         let stop = Arc::new(AtomicBool::new(false));
@@ -3694,6 +3680,17 @@ fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool, conflict: Option<&str>)
     if let Some(ns) = ns_path {
         report_sync(db, ns, conflict)?;
     } else {
+        // `--conflict` is a per-run override for unwedging ONE stuck file. Applied across
+        // every mount it silently resolves every conflict in the KB the same way, and
+        // `kb_wins` overwrites disk bytes that were never blobbed — unrecoverable, unlike a
+        // bad import. Requiring the namespace keeps the blast radius the size of the
+        // intention.
+        anyhow::ensure!(
+            conflict.is_none(),
+            "--conflict needs a namespace: it resolves conflicts destructively, and across \
+             every mount `kb_wins` would overwrite disk edits that no blob holds. Name the \
+             mount you are unwedging, e.g. `jkb sync <ns> --conflict disk-wins`."
+        );
         let paths = db.read(jkb_core::mount::all_paths)?;
         if paths.is_empty() {
             println!("no mounts configured");
@@ -3706,21 +3703,22 @@ fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool, conflict: Option<&str>)
 }
 
 /// Reconcile one mount and print its summary.
-fn report_sync(db: &Db, ns_path: &str, conflict: Option<&str>) -> Result<()> {
+fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<()> {
     use jkb_sync::Outcome::{
-        Collided, Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Skipped,
-        UpToDate,
+        Collided, Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined,
+        ResolvedFromDisk, ResolvedFromKb, Skipped, UpToDate,
     };
     let report = jkb_sync::sync_with_policy(db, ns_path, conflict)?;
     println!(
         "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
-         {} conflicts, {} quarantined, {} up-to-date, {} skipped, {} collided",
+         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} collided",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
         report.count(Merged),
         report.count(Normalized),
         report.count(Conflict),
+        report.count(ResolvedFromDisk) + report.count(ResolvedFromKb),
         report.count(Quarantined),
         report.count(UpToDate),
         report.count(Skipped),
@@ -3728,6 +3726,11 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<&str>) -> Result<()> {
     );
     for path in report.conflicts() {
         println!("  conflict: {}", path.display());
+    }
+    // A policy resolution throws one side's edits away. Say which side won, per file, so a
+    // destructive resolution is visible at the moment it happens rather than discovered later.
+    for (path, how) in report.resolved() {
+        println!("  RESOLVED {} — {how}", path.display());
     }
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
@@ -3745,7 +3748,12 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<&str>) -> Result<()> {
             "  this serializer keeps a file's sections and order on its directory's \
              namespace, so one directory can hold at most one synced file."
         );
-        println!("  narrow the mount, e.g. `jkb mount create <ns> <dir> --include '**/tasks.md'`");
+        // `--exclude`, not `--include`: an already-bound file keeps syncing even when a
+        // narrowed include no longer selects it, so only exclusion drops a bound sibling.
+        println!(
+            "  exclude the sibling, e.g. `jkb mount create <ns> <dir> --exclude '**/design.md'` \
+             (a narrowed --include does not drop a file that is already bound)"
+        );
     }
     Ok(())
 }
@@ -4092,15 +4100,6 @@ fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The facet recording which branch a task is being done on, and which repo that branch is
-/// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
-pub(crate) const FACET_BRANCH: &str = "branch";
-pub(crate) const FACET_REPO: &str = "repo";
-/// The trunk commit the branch was cut from, recorded at `task start`. Without it a
-/// rebase-merged branch — which GitHub fast-forwards, leaving it byte-identical to trunk —
-/// cannot be told apart from a branch that was just created and never touched.
-pub(crate) const FACET_BASE: &str = "base";
-
 /// `task start` — claim the task and record where the work is happening.
 ///
 /// Claiming and tagging together is the point: "I am starting this" and "here is the branch
@@ -4137,7 +4136,7 @@ fn cmd_task_start(
         );
     }
 
-    // Trunk's tip right now is this branch's base (see FACET_BASE).
+    // Trunk's tip right now is this branch's base (see repo::FACET_BASE).
     let base = gitrepo::rev(
         &cwd,
         &gitrepo::trunk(&cwd)?.unwrap_or_else(|| "HEAD".to_owned()),
@@ -4148,10 +4147,10 @@ fn cmd_task_start(
     let (o, b, r, base_sha) = (owner.clone(), branch.clone(), repo.clone(), base.clone());
     db.write_txn("cli", move |conn, meta| {
         claim::claim(conn, meta, id, &o)?;
-        tag::apply(conn, meta, id, FACET_BRANCH, &b)?;
-        tag::apply(conn, meta, id, FACET_REPO, &r)?;
+        tag::apply(conn, meta, id, repo::FACET_BRANCH, &b)?;
+        tag::apply(conn, meta, id, repo::FACET_REPO, &r)?;
         if let Some(sha) = &base_sha {
-            tag::apply(conn, meta, id, FACET_BASE, sha)?;
+            tag::apply(conn, meta, id, repo::FACET_BASE, sha)?;
         }
         Ok(())
     })?;
@@ -4186,7 +4185,7 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
             // `set` replaces the facet's other values. Right for the facets answering "where
             // is this being worked" — a second `onto=` is a contradiction, not extra
             // information, and a reader collapsing the multi-map picks one at random (D36.6).
-            TagMode::Set => set_facet(conn, meta, id, &facet, &value),
+            TagMode::Set => repo::set_facet(conn, meta, id, &facet, &value),
             TagMode::Rm => tag::remove(conn, meta, id, &facet, &value),
         }
     })?;
@@ -4245,180 +4244,16 @@ enum TagMode {
     Rm,
 }
 
-/// The branch a session's work lands on (design D36.3). Recorded at `task work` so a resumed
-/// session — and `task land` itself — target the branch the batch was always going to, not
-/// whatever happens to be checked out later.
-pub(crate) const FACET_ONTO: &str = "onto";
-
-/// A task's facet tags, **every** value per facet.
-///
-/// Tags are a multi-map: `tag::apply` adds, so a task can legitimately carry two `branch=`
-/// values — one from `jkb task start` (D34) and one from `task work`. Collapsing them to a
-/// single value silently picks one, and picking the wrong `branch=` makes `task work` mint a
-/// second session for a task that already has one.
-fn task_tags(db: &Db, id: ItemId) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (facet, value) in db.read(move |conn| tag::applications(conn, id))? {
-        out.entry(facet).or_default().push(value);
-    }
-    Ok(out)
-}
-
-/// The values recorded for one facet.
-pub(crate) fn facet_values<'a>(
-    tags: &'a BTreeMap<String, Vec<String>>,
-    facet: &str,
-) -> &'a [String] {
-    tags.get(facet).map_or(&[], Vec::as_slice)
-}
-
-/// The single value of a facet that should only ever have one (`onto`, `repo`, `base`).
-pub(crate) fn facet_one<'a>(
-    tags: &'a BTreeMap<String, Vec<String>>,
-    facet: &str,
-) -> Option<&'a String> {
-    facet_values(tags, facet).first()
-}
-
-/// Set a facet to exactly one value, removing any others it already had.
-///
-/// `tag::apply` is additive, which is right for open-ended facets and wrong for the ones that
-/// answer "where is this being worked" — a second value there is not extra information, it is
-/// a contradiction the readers have to guess their way through.
-pub(crate) fn set_facet(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    facet: &str,
-    value: &str,
-) -> jkb_core::Result<()> {
-    for (f, v) in tag::applications(conn, id)? {
-        if f == facet && v != value {
-            tag::remove(conn, meta, id, &f, &v)?;
-        }
-    }
-    tag::apply(conn, meta, id, facet, value)
-}
-
-/// What the session commands need to know about the repo they are running in.
-pub(crate) struct RepoCtx {
-    /// The **main** copy's root — where `.jkb/` lives, even when invoked from inside a
-    /// session worktree.
-    pub(crate) root: PathBuf,
-    /// The repo key, matching the `repo=` tag and the `repos/<repo>` namespace (D26/D32).
-    pub(crate) key: String,
-    /// The trunk ref (`origin/main`, `main`, …), if this repo has a discoverable one.
-    pub(crate) trunk: Option<String>,
-}
-
-impl RepoCtx {
-    /// The trunk's short branch name (`origin/main` → `main`), for comparing against a
-    /// checked-out branch and for cutting new branches.
-    pub(crate) fn trunk_name(&self) -> Option<&str> {
-        self.trunk
-            .as_deref()
-            .map(|t| t.rsplit('/').next().unwrap_or(t))
-    }
-}
-
-/// Resolve the repo the current directory belongs to.
-pub(crate) fn repo_ctx() -> Result<RepoCtx> {
-    let cwd = std::env::current_dir()?;
-    let root = gitrepo::main_root(&cwd)?.context(
-        "not inside a git repo — a task session is a git worktree, so run this from the repo",
-    )?;
-    let key = gitrepo::key(&root)?.context("could not determine this repo's name")?;
-    let trunk = gitrepo::trunk(&root)?;
-    Ok(RepoCtx { root, key, trunk })
-}
-
-/// One task, as far as the session commands care.
-struct SessionTask {
-    uid: String,
-    status: String,
-    onto: Option<String>,
-}
-
-/// This repo's tasks indexed by **every** branch each records.
-///
-/// `branch=` is the only link from a worktree back to its task — there is deliberately no
-/// session state file to fall out of step with git (design D36.2). A task carrying two of
-/// them is indexed under both, so a worktree is found whichever one names it.
-fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
-    let mut out = BTreeMap::new();
-    for t in repo_tasks(db, repo_key)? {
-        for branch in facet_values(&t.tags, FACET_BRANCH) {
-            out.insert(branch.clone(), t.session_task());
-        }
-    }
-    Ok(out)
-}
-
-/// One of this repo's tasks with everything the session and staging reads need.
-pub(crate) struct RepoTask {
-    pub(crate) meta: jkb_core::item::ItemMeta,
-    pub(crate) tags: BTreeMap<String, Vec<String>>,
-}
-
-impl RepoTask {
-    pub(crate) fn session_task(&self) -> SessionTask {
-        SessionTask {
-            uid: self.meta.uid.clone(),
-            status: self.meta.status.clone().unwrap_or_default(),
-            onto: facet_one(&self.tags, FACET_ONTO).cloned(),
-        }
-    }
-
-    /// The first line of the task's body — what a human calls the task.
-    pub(crate) fn title(&self) -> String {
-        self.meta
-            .content
-            .as_deref()
-            .and_then(|c| c.lines().find(|l| !l.trim().is_empty()))
-            .unwrap_or(&self.meta.uid)
-            .trim()
-            .to_owned()
-    }
-}
-
-/// Every task tagged `repo=<repo_key>`, with its rows and tags, in **one** database read.
-///
-/// The previous shape issued the query, then a `tag::applications` *and* an `item::get` per
-/// task — each a round-trip serialized on the writer thread, over a set that grows with every
-/// task ever worked in this repo. That is fine for `task sessions` at three sessions and not
-/// fine for a view that redraws on every database write (design D38.2).
-pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
-    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo_key}"))?;
-    Ok(db.read(move |conn| {
-        let ids = query.evaluate(conn)?;
-        let metas = item::get_many(conn, &ids)?;
-        let tags = tag::applications_for(conn, &ids)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            let Some(meta) = metas.get(&id) else { continue };
-            let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (facet, value) in tags.get(&id).cloned().unwrap_or_default() {
-                grouped.entry(facet).or_default().push(value);
-            }
-            out.push(RepoTask {
-                meta: meta.clone(),
-                tags: grouped,
-            });
-        }
-        Ok(out)
-    })?)
-}
-
 /// The live session for a task, matched against **all** the branches it records.
 ///
 /// Matching by worktree rather than by "the task's branch tag" is what makes a task that
 /// picked up a second `branch=` (from `jkb task start`, or an earlier `--onto`) still resolve
 /// to the session that actually exists on disk.
 fn session_for(
-    ctx: &RepoCtx,
+    ctx: &repo::RepoCtx,
     tags: &BTreeMap<String, Vec<String>>,
 ) -> Result<Option<session::Session>> {
-    let branches = facet_values(tags, FACET_BRANCH);
+    let branches = repo::facet_values(tags, repo::FACET_BRANCH);
     Ok(session::discover(&ctx.root)?
         .into_iter()
         .find(|s| branches.contains(&s.branch)))
@@ -4429,7 +4264,7 @@ fn session_for(
 /// Idempotent by construction: the task's own `branch=` tag names its session, so a second
 /// invocation hands back the same worktree instead of forking the work onto a second branch.
 fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let cwd = std::env::current_dir()?;
     let id = resolve_task_uid(db, uid)?;
 
@@ -4446,13 +4281,13 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     // Session worktrees live inside the repo, so the first one must not make it dirty.
     session::ensure_excluded(&ctx.root)?;
 
-    let tags = task_tags(db, id)?;
+    let tags = repo::task_tags(db, id)?;
     let sessions = session::discover(&ctx.root)?;
     // A session already recorded on the task keeps its name, so a second invocation returns
     // the same worktree instead of forking the work onto a second branch. A task may record
     // more than one branch (a `jkb task start` before a `task work`, or an earlier `--onto`),
     // so prefer the one that has a live worktree over merely the first that parses.
-    let recorded = facet_values(&tags, FACET_BRANCH);
+    let recorded = repo::facet_values(&tags, repo::FACET_BRANCH);
     let existing = recorded
         .iter()
         .find(|b| sessions.iter().any(|s| s.branch == **b))
@@ -4506,11 +4341,11 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     let base = gitrepo::rev(&ctx.root, &onto)?;
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
     db.write_txn("cli", move |conn, meta| {
-        set_facet(conn, meta, id, FACET_BRANCH, &b)?;
-        set_facet(conn, meta, id, FACET_REPO, &r)?;
-        set_facet(conn, meta, id, FACET_ONTO, &o)?;
+        repo::set_facet(conn, meta, id, repo::FACET_BRANCH, &b)?;
+        repo::set_facet(conn, meta, id, repo::FACET_REPO, &r)?;
+        repo::set_facet(conn, meta, id, repo::FACET_ONTO, &o)?;
         if let Some(sha) = &base {
-            set_facet(conn, meta, id, FACET_BASE, sha)?;
+            repo::set_facet(conn, meta, id, repo::FACET_BASE, sha)?;
         }
         Ok(())
     })?;
@@ -4542,7 +4377,7 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
 /// Decide which branch this session's work will land on (design D36.3).
 fn resolve_onto(
     db: &Db,
-    ctx: &RepoCtx,
+    ctx: &repo::RepoCtx,
     cwd: &Path,
     tags: &BTreeMap<String, Vec<String>>,
     flag: Option<&str>,
@@ -4560,7 +4395,7 @@ fn resolve_onto(
         return Ok(branch.to_owned());
     }
     // A session that already has a target keeps it.
-    if let Some(branch) = facet_one(tags, FACET_ONTO) {
+    if let Some(branch) = repo::facet_one(tags, repo::FACET_ONTO) {
         if gitrepo::has_branch(&ctx.root, branch)? {
             return Ok(branch.clone());
         }
@@ -4589,7 +4424,7 @@ fn resolve_onto(
 /// (you just merged a PR and pulled, or you commit locally first), and cutting the batch from
 /// the remote ref there would silently start the work behind commits you already have, then
 /// land it as if it were on top of them.
-fn batch_start(ctx: &RepoCtx, cwd: &Path) -> Result<String> {
+fn batch_start(ctx: &repo::RepoCtx, cwd: &Path) -> Result<String> {
     if let Some(branch) = gitrepo::current_branch(cwd)? {
         if Some(branch.as_str()) == ctx.trunk_name() {
             return Ok(branch);
@@ -4606,8 +4441,8 @@ fn batch_start(ctx: &RepoCtx, cwd: &Path) -> Result<String> {
 /// This is what makes a second session started from trunk join the first one's batch instead
 /// of cutting a branch of its own. Sessions that disagree are left alone: guessing which of
 /// two batches a new task belongs to is worse than asking for `--onto`.
-fn batch_onto(db: &Db, ctx: &RepoCtx) -> Result<Option<String>> {
-    let by_branch = tasks_by_branch(db, &ctx.key)?;
+fn batch_onto(db: &Db, ctx: &repo::RepoCtx) -> Result<Option<String>> {
+    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
     let mut found: Option<String> = None;
     for s in session::discover(&ctx.root)? {
         let Some(onto) = by_branch.get(&s.branch).and_then(|t| t.onto.clone()) else {
@@ -4639,7 +4474,7 @@ fn batch_onto(db: &Db, ctx: &RepoCtx) -> Result<Option<String>> {
 }
 
 /// The branch checked out in `.jkb/base`, if that worktree exists.
-fn base_branch(ctx: &RepoCtx) -> Result<Option<String>> {
+fn base_branch(ctx: &repo::RepoCtx) -> Result<Option<String>> {
     let base = session::base_worktree(&ctx.root);
     Ok(gitrepo::worktrees(&ctx.root)?
         .into_iter()
@@ -4654,7 +4489,7 @@ fn base_branch(ctx: &RepoCtx) -> Result<Option<String>> {
 ///
 /// A repo with no discoverable trunk cannot answer the question, so the batch is kept: losing
 /// a live batch is worse than reusing a spent one.
-fn batch_is_spent(ctx: &RepoCtx, branch: &str) -> Result<bool> {
+fn batch_is_spent(ctx: &repo::RepoCtx, branch: &str) -> Result<bool> {
     let Some(trunk) = &ctx.trunk else {
         return Ok(false);
     };
@@ -4663,7 +4498,7 @@ fn batch_is_spent(ctx: &RepoCtx, branch: &str) -> Result<bool> {
 
 /// Remove `.jkb/base`, freeing the branch it holds. It is only ever a checkout cache; `land`
 /// makes a new one on demand.
-fn release_base_worktree(ctx: &RepoCtx) -> Result<()> {
+fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
     let base = session::base_worktree(&ctx.root);
     if base.exists() {
         gitrepo::worktree_remove(&ctx.root, &base, true)?;
@@ -4723,21 +4558,21 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
         no_review,
     } = flags;
     let gate_flag = gate_flag.as_deref();
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
-    let tags = task_tags(db, id)?;
+    let tags = repo::task_tags(db, id)?;
     anyhow::ensure!(
-        !facet_values(&tags, FACET_BRANCH).is_empty(),
+        !repo::facet_values(&tags, repo::FACET_BRANCH).is_empty(),
         "{uid} has no session — run `jkb task work {uid}` first"
     );
     let sess = session_for(&ctx, &tags)?.with_context(|| {
         format!(
             "no session worktree for {} — it may already have landed, or been removed",
-            facet_values(&tags, FACET_BRANCH).join(", ")
+            repo::facet_values(&tags, repo::FACET_BRANCH).join(", ")
         )
     })?;
     let branch = sess.branch.clone();
-    let onto = facet_one(&tags, FACET_ONTO)
+    let onto = repo::facet_one(&tags, repo::FACET_ONTO)
         .cloned()
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
     anyhow::ensure!(
@@ -4757,9 +4592,11 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
     );
 
     // The review gate (design D38.5), before the graft: a refusal must not have moved a
-    // branch first. Concerns and nits do not block — only must-fix findings do.
+    // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
+    // only *owed* here; it is written after the landing actually happens, so a land that then
+    // fails on the graft or the gate build leaves no waiver for something that never occurred.
     let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
-    review::enforce(db, uid, id, &tags, &head, no_review, json)?;
+    let waiver_owed = review::enforce(db, uid, &tags, no_review, json)?;
 
     // Landing is serial: two grafts at once would each gate a tree the other is changing.
     let _lock = session::LandLock::acquire(&ctx.root)?;
@@ -4819,6 +4656,7 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
             gate: gate.as_deref(),
             gate_source: source.label(),
             keep_worktree,
+            waiver: waiver_owed.then_some(head.as_str()),
         },
         json,
     )
@@ -4835,22 +4673,29 @@ struct Landed<'a> {
     gate: Option<&'a str>,
     gate_source: &'a str,
     keep_worktree: bool,
+    /// The branch HEAD to record as `review-waived=`, when `--no-review` carried this land.
+    waiver: Option<&'a str>,
 }
 
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
 fn settle_landing(
     db: &Db,
     id: ItemId,
-    ctx: &RepoCtx,
+    ctx: &repo::RepoCtx,
     sess: &session::Session,
     landed: Landed<'_>,
     json: bool,
 ) -> Result<()> {
     // Landed: the task is done, the claim is free, and the session branch is a duplicate of
-    // commits now in `onto`.
+    // commits now in `onto`. The waiver is recorded here, in the same transaction, because it
+    // describes a landing that has now definitely happened.
+    let waiver = landed.waiver.map(str::to_owned);
     db.write_txn("cli", move |conn, meta| {
         task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
         claim::clear(conn, meta, id)?;
+        if let Some(sha) = &waiver {
+            repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, sha)?;
+        }
         Ok(())
     })?;
     let mut cleaned = false;
@@ -4895,7 +4740,7 @@ fn settle_landing(
 /// refuses a path that already exists, so adding a second one would fail the moment a batch
 /// landed onto a different branch than the last, and keep failing until the directory was
 /// deleted by hand.
-fn land_dir_for(ctx: &RepoCtx, onto: &str) -> Result<PathBuf> {
+fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
     if let Some(dir) = gitrepo::worktree_for_branch(&ctx.root, onto)? {
         return Ok(dir);
     }
@@ -4941,17 +4786,38 @@ fn cmd_task_abandon(
     delete_branch: bool,
     json: bool,
 ) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
-    let tags = task_tags(db, id)?;
+    let tags = repo::task_tags(db, id)?;
     let sess = session_for(&ctx, &tags)?;
     // Prefer the branch that actually has a worktree; fall back to the recorded one so a
     // session whose checkout was deleted by hand can still be cleaned up in the KB.
     let branch = sess
         .as_ref()
         .map(|s| s.branch.clone())
-        .or_else(|| facet_one(&tags, FACET_BRANCH).cloned())
+        .or_else(|| repo::facet_one(&tags, repo::FACET_BRANCH).cloned())
         .with_context(|| format!("{uid} has no session"))?;
+
+    // Abandoning is for **this** session's work. Since the swarm now tags its tasks with
+    // `branch=`/`onto=` so they appear in the same views (D38), a task another IMPLEMENTER is
+    // actively building is one right-click away — and `claim::clear` has no owner CAS, so it
+    // would free a live claim and let the next SCHEDULER pass dispatch a second builder while
+    // the first keeps going. Refuse a claim this session does not hold unless forced.
+    let held = db
+        .read(claim::claimed)?
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(|c| c.owner);
+    if let Some(owner) = &held {
+        let mine = sess.as_ref().is_some_and(|s| {
+            owner::session_worktree(owner).is_some_and(|w| session::same_path(&w, &s.worktree))
+        });
+        if !mine && !force {
+            anyhow::bail!(
+                "{uid} is claimed by {owner}, not by a session here — abandoning it would                  free a claim someone else is working under. Use `jkb task release {uid}                  --owner {owner}` if you are sure it is dead, or pass --force."
+            );
+        }
+    }
 
     if let Some(sess) = &sess {
         if !force {
@@ -4993,9 +4859,9 @@ fn cmd_task_abandon(
 
 /// `task sessions` — what is in flight in this repo.
 fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let sessions = session::discover(&ctx.root)?;
-    let by_branch = tasks_by_branch(db, &ctx.key)?;
+    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
 
     let mut rows = Vec::new();
     for s in &sessions {
@@ -5050,7 +4916,7 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
 
 /// `task gate` — show, set, or clear the command that verifies a landing here (D36.5).
 fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     if clear {
         session::set_gate(db, &ctx.key, None)?;
     } else if let Some(cmd) = cmd {
@@ -5088,14 +4954,14 @@ fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<
 /// a session you are working in from one you walked away from (design D36.6), and a report
 /// that guesses would tell you to abandon the work you are doing.
 fn report_sessions(db: &Db) {
-    let Ok(ctx) = repo_ctx() else { return };
+    let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
         return;
     };
     if sessions.is_empty() {
         return;
     }
-    let by_branch = tasks_by_branch(db, &ctx.key).unwrap_or_default();
+    let by_branch = repo::tasks_by_branch(db, &ctx.key).unwrap_or_default();
     println!("task sessions: {} in flight", sessions.len());
     for s in &sessions {
         let uid = by_branch
@@ -5111,6 +4977,32 @@ fn report_sessions(db: &Db) {
 }
 
 /// `task close-merged` — close tasks whose branch has landed (design D34.4).
+/// The uid, status and location facets `close-merged` needs for one task.
+type CloseMergedRow = (String, Option<String>, Option<String>, Option<String>);
+
+/// Read one task's uid, status, `branch=` and `base=` in a single database round-trip.
+fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
+    Ok(db
+        .read(move |conn| {
+            let meta = item::get(conn, id)?;
+            let tags = tag::applications(conn, id)?;
+            let of = |facet: &str| {
+                tags.iter()
+                    .find(|(f, _)| f == facet)
+                    .map(|(_, v)| v.clone())
+            };
+            Ok(meta.map(|m| {
+                (
+                    m.uid,
+                    m.status,
+                    of(repo::FACET_BRANCH),
+                    of(repo::FACET_BASE),
+                )
+            }))
+        })?
+        .unwrap_or_default())
+}
+
 fn cmd_task_close_merged(
     db: &Db,
     repo: Option<String>,
@@ -5133,7 +5025,7 @@ fn cmd_task_close_merged(
     };
 
     // Every open task tagged for this repo that names a branch.
-    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo}"))?;
+    let query = jkb_core::query::parse(&format!("kind:task tag:{}={repo}", repo::FACET_REPO))?;
     let ids = db.read(move |conn| query.evaluate(conn))?;
 
     let mut closed = Vec::new();
@@ -5142,18 +5034,7 @@ fn cmd_task_close_merged(
     let mut warned_fallback = false;
 
     for id in ids {
-        let (uid, status, branch, base) = db
-            .read(move |conn| {
-                let meta = item::get(conn, id)?;
-                let tags = tag::applications(conn, id)?;
-                let of = |facet: &str| {
-                    tags.iter()
-                        .find(|(f, _)| f == facet)
-                        .map(|(_, v)| v.clone())
-                };
-                Ok(meta.map(|m| (m.uid, m.status, of(FACET_BRANCH), of(FACET_BASE))))
-            })?
-            .unwrap_or_default();
+        let (uid, status, branch, base) = close_merged_row(db, id)?;
         let Some(branch) = branch else { continue };
         if matches!(status.as_deref(), Some("done" | "cancelled")) {
             continue;
@@ -5640,7 +5521,7 @@ fn first_line(content: &str) -> String {
 /// The one read behind both the explorer's branch picker and its In Flight view (design
 /// D38.2), so the two cannot disagree about what is live.
 fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let rows = staging::collect(db, &ctx, all)?;
 
     if json {
@@ -5716,7 +5597,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
         sha,
         findings,
     } = cmd;
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let cwd = std::env::current_dir()?;
     let branch = match branch {
         Some(b) => b,
@@ -5727,6 +5608,20 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
         Some(s) => Some(s),
         None => gitrepo::rev(&ctx.root, &branch)?,
     };
+
+    // Refuse a findings namespace that holds nothing, here, where the caller can still fix it.
+    // A review recorded against an empty namespace is a review whose findings never reached
+    // the KB — a quarantined `tasks.md`, a typo, a namespace renamed since — and the land gate
+    // must never read that as a clean review. It is caught at both ends deliberately: this is
+    // the actionable moment, the gate is the one that must not be bypassed.
+    let found = review::findings_in(db, std::slice::from_ref(&findings))?;
+    anyhow::ensure!(
+        found.total > 0,
+        "no findings found under `{findings}` — nothing was recorded. A review whose findings \
+         never reached the KB must not be recorded as one: check the namespace exists \
+         (`jkb ls {findings}`), that `jkb sync` imported the review's tasks.md, and that it \
+         was not quarantined (`jkb doctor`)."
+    );
 
     let recorded = review::record(db, &ctx.key, &branch, sha.as_deref(), &findings)?;
 

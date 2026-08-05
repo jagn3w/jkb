@@ -76,7 +76,11 @@ export function landBlocker(t: StagedTask): string | null {
   if (t.open_must_fix > 0) {
     return `Its review left ${plural(t.open_must_fix, "must-fix finding")} open. Fix or cancel each one, then land.`;
   }
-  if (!t.reviewed && !t.review_waived) {
+  // Mirrors the CLI predicate exactly: `reviewed=` present, nothing must-fix outstanding. A
+  // past `review-waived=` is deliberately NOT a pass — the CLI's gate does not consult it, so
+  // accepting it here made the row read "Landable" for a task `jkb task land` then refused.
+  // A waiver covers the landing it was granted for, not the next one.
+  if (!t.reviewed) {
     return "No review has been recorded. Run /review-log in the session, or land with --no-review.";
   }
   return null;

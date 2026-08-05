@@ -88,6 +88,38 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
             }
             continue;
         }
+        // A mount edit is inverted by putting the previous configuration back. `jkb mount
+        // create` doubles as the update command, so without this the generic insert inverse
+        // would `DELETE FROM mounts` and destroy a mount that existed before the transaction,
+        // leaving its `file://` bindings with nothing to sync them.
+        if op == "update" && table == "mounts" {
+            if let Some(before) = before {
+                let snap: Value = serde_json::from_str(&before).map_err(|e| {
+                    TypeError::Validation(format!("unreadable mount before-state: {e}"))
+                })?;
+                let ns_id: i64 = entity_id
+                    .parse()
+                    .map_err(|_| TypeError::Validation(format!("bad entity id '{entity_id}'")))?;
+                let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
+                reverted += conn
+                    .prepare_cached(
+                        "UPDATE mounts
+                            SET backing_uri = ?2, sync_mode = ?3, serializer = ?4,
+                                include_glob = ?5, exclude_glob = ?6, conflict_policy = ?7
+                          WHERE namespace_id = ?1",
+                    )?
+                    .execute(params![
+                        ns_id,
+                        field("backing_uri"),
+                        field("sync_mode"),
+                        field("serializer"),
+                        field("include_glob"),
+                        field("exclude_glob"),
+                        field("conflict_policy"),
+                    ])?;
+            }
+            continue;
+        }
         if op != "insert" {
             continue;
         }

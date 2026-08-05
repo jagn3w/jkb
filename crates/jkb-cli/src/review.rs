@@ -12,7 +12,8 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use jkb_core::{item, task, Db};
+use jkb_core::query::{Query, Scope};
+use jkb_core::{item, tag, task, Db};
 use jkb_types::{ItemId, TaskStatus};
 
 /// The branch HEAD a review ran against.
@@ -29,27 +30,45 @@ pub(crate) struct OpenFinding {
     pub(crate) title: String,
 }
 
-/// The open must-fix findings of the review at `review_ns`.
+/// The findings of the review(s) at `review_nss`, split into open must-fix and total seen.
 ///
-/// Counted with `kind:task ns:<review_ns>/** priority<=1`, filtering terminal statuses in
-/// Rust: the DSL has `status:<s>` but no `-status:`, and `is:ready` is the wrong instrument
-/// because a **blocked** must-fix finding must still block landing.
+/// The scope is built as a **typed** [`Query`] rather than by interpolating the namespace
+/// into the DSL. Interpolation made the namespace name re-parseable: a path containing `,`
+/// (which `/review-log` does not rewrite — it only replaces `/`) split into two scopes that
+/// match nothing, and any unresolvable path yields an empty candidate set. That is
+/// indistinguishable from "clean" unless the caller also knows how many findings exist,
+/// which is why this returns the total as well.
+///
+/// Terminal statuses are filtered in Rust: the DSL has `status:<s>` but no `-status:`, and
+/// `is:ready` is the wrong instrument because a **blocked** must-fix finding must still block.
 ///
 /// # Errors
-/// Returns an error if the query or the read fails.
-pub(crate) fn open_must_fix(db: &Db, review_ns: &str) -> Result<Vec<OpenFinding>> {
-    let query = jkb_core::query::parse(&format!("kind:task ns:{review_ns}/** priority<=1"))?;
+/// Returns an error if the read fails.
+pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
+    if review_nss.is_empty() {
+        return Ok(Findings::default());
+    }
+    let query = Query {
+        kind: Some("task".to_owned()),
+        // A union over every recorded review: re-running `/review-log` must not retire the
+        // previous run's still-open findings (design D38.5).
+        scope: Scope::Union(review_nss.iter().cloned().map(Scope::Subtree).collect()),
+        ..Query::default()
+    };
     Ok(db.read(move |conn| {
         let ids = query.evaluate(conn)?;
         let metas = item::get_many(conn, &ids)?;
-        let mut out = Vec::new();
+        let mut out = Findings {
+            total: ids.len(),
+            open_must_fix: Vec::new(),
+        };
         for id in ids {
             let Some(m) = metas.get(&id) else { continue };
             let status = m.status.as_deref().unwrap_or("open");
-            if status == "done" || status == "cancelled" {
+            if status == "done" || status == "cancelled" || m.priority.unwrap_or(i64::MAX) > 1 {
                 continue;
             }
-            out.push(OpenFinding {
+            out.open_must_fix.push(OpenFinding {
                 uid: m.uid.clone(),
                 title: m
                     .content
@@ -64,12 +83,34 @@ pub(crate) fn open_must_fix(db: &Db, review_ns: &str) -> Result<Vec<OpenFinding>
     })?)
 }
 
+/// What a review's namespaces actually contain.
+#[derive(Default)]
+pub(crate) struct Findings {
+    /// Every finding item found, whatever its priority or status. Zero here means the
+    /// namespace resolved to nothing — **not** that the review was clean.
+    pub(crate) total: usize,
+    pub(crate) open_must_fix: Vec<OpenFinding>,
+}
+
+/// The open must-fix findings for one namespace — the count a staging row shows.
+///
+/// # Errors
+/// Returns an error if the read fails.
+pub(crate) fn open_must_fix(db: &Db, review_nss: &[String]) -> Result<Vec<OpenFinding>> {
+    Ok(findings_in(db, review_nss)?.open_must_fix)
+}
+
 /// Why a task may not land, if it may not.
 pub(crate) enum GateVerdict {
     /// Reviewed, with nothing must-fix outstanding.
     Passed,
     /// No `reviewed=` facet: no review has been recorded for this task.
     NeverReviewed,
+    /// A review is recorded, but its namespace(s) hold no finding items at all. That is not
+    /// a clean review — it is a review whose findings never reached the KB (a quarantined
+    /// `tasks.md`, a typo'd `--findings`, a namespace renamed since). Treating it as clean is
+    /// the gate failing **open**, which is the one direction a safety check must not fail.
+    NoFindingsRecorded(Vec<String>),
     /// Reviewed, but the review has open must-fix findings.
     OpenFindings(Vec<OpenFinding>),
 }
@@ -80,21 +121,27 @@ pub(crate) enum GateVerdict {
 /// run put 34 of 45 findings on `concern`, and blocking on those would make `--no-review` the
 /// normal path within a week.
 ///
+/// **Every** recorded `review=` namespace is consulted, not just the newest: re-running
+/// `/review-log` must not silently retire the previous run's still-open must-fix findings.
+///
 /// # Errors
 /// Returns an error if the findings cannot be read.
 pub(crate) fn gate(db: &Db, tags: &BTreeMap<String, Vec<String>>) -> Result<GateVerdict> {
-    if crate::facet_one(tags, FACET_REVIEWED).is_none() {
+    if crate::repo::facet_one(tags, FACET_REVIEWED).is_none() {
         return Ok(GateVerdict::NeverReviewed);
     }
-    let Some(ns) = crate::facet_one(tags, FACET_REVIEW) else {
-        // Reviewed but no findings namespace recorded: nothing to check against.
-        return Ok(GateVerdict::Passed);
-    };
-    let open = open_must_fix(db, ns)?;
-    if open.is_empty() {
+    let nss = crate::repo::facet_values(tags, FACET_REVIEW).to_vec();
+    if nss.is_empty() {
+        return Ok(GateVerdict::NoFindingsRecorded(nss));
+    }
+    let found = findings_in(db, &nss)?;
+    if found.total == 0 {
+        return Ok(GateVerdict::NoFindingsRecorded(nss));
+    }
+    if found.open_must_fix.is_empty() {
         Ok(GateVerdict::Passed)
     } else {
-        Ok(GateVerdict::OpenFindings(open))
+        Ok(GateVerdict::OpenFindings(found.open_must_fix))
     }
 }
 
@@ -103,34 +150,45 @@ pub(crate) fn gate(db: &Db, tags: &BTreeMap<String, Vec<String>>) -> Result<Gate
 /// `no_review` records a waiver instead of refusing. The waiver is *stored*, because an
 /// override nobody can see is indistinguishable from a rule that does not exist.
 ///
+/// Returns whether a waiver is **owed** — the gate did not pass and `--no-review` carried the
+/// landing. The caller records it only once the landing has actually happened: writing it here
+/// left a permanent waiver behind for a land that then failed on the graft or the gate build,
+/// marking a task as deliberately-unreviewed for something that never occurred.
+///
 /// # Errors
-/// Returns an error — the refusal itself — when the task has no recorded review, or its
-/// review has open must-fix findings.
+/// Returns an error — the refusal itself — when the task has no recorded review, its review
+/// namespace holds no findings at all, or its review has open must-fix findings.
 pub(crate) fn enforce(
     db: &Db,
     uid: &str,
-    id: ItemId,
     tags: &BTreeMap<String, Vec<String>>,
-    head: &str,
     no_review: bool,
     json: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let verdict = gate(db, tags)?;
     if matches!(verdict, GateVerdict::Passed) {
-        return Ok(());
+        return Ok(false);
     }
     if no_review {
-        waive(db, id, head)?;
         if !json {
-            println!("review: WAIVED with --no-review (recorded as review-waived={head})");
+            println!(
+                "review: WAIVED with --no-review (recorded on the task if this land succeeds)"
+            );
         }
-        return Ok(());
+        return Ok(true);
     }
     match verdict {
-        GateVerdict::Passed => Ok(()),
+        GateVerdict::Passed => Ok(false),
         GateVerdict::NeverReviewed => anyhow::bail!(
             "{uid} has no recorded review — run `/review-log` in the session (it records the \
              review itself), or land with --no-review to record a waiver instead"
+        ),
+        GateVerdict::NoFindingsRecorded(nss) => anyhow::bail!(
+            "{uid} records a review of {} but that namespace holds no findings at all — so \
+             the review's findings never reached the KB (a quarantined tasks.md, a typo'd \
+             --findings, or a namespace renamed since). Re-run `/review-log`, or land with \
+             --no-review. This is NOT read as a clean review.",
+            nss.join(", ")
         ),
         GateVerdict::OpenFindings(open) => {
             use std::fmt::Write as _;
@@ -169,6 +227,17 @@ pub(crate) struct Recorded {
 /// Recording moves `in_progress` to `needs_review` and is the **only** author of that
 /// transition (design D38.6). Any other status is left alone.
 ///
+/// The whole branch is recorded in **one transaction**, and each task's status is re-read
+/// *inside* it. Deciding the transition from a snapshot taken before the loop, then writing
+/// it per-task, could resurrect a task that landed in between — `set_status` is a plain
+/// `UPDATE` with no CAS, and `needs_review` is non-terminal, so a re-blocked dependent and a
+/// re-offered staging branch would follow. One transaction also means a Ctrl-C halfway
+/// through cannot leave half the branch tagged and half refusing to land as never reviewed.
+///
+/// `review=` is **added**, not set: a second run's findings do not retire the first run's
+/// still-open must-fix items (the gate unions every recorded namespace). `reviewed=` is set,
+/// since there is only one current HEAD.
+///
 /// # Errors
 /// Returns an error if the database cannot be read or written.
 pub(crate) fn record(
@@ -178,44 +247,46 @@ pub(crate) fn record(
     sha: Option<&str>,
     findings_ns: &str,
 ) -> Result<Vec<Recorded>> {
-    let tasks = crate::repo_tasks(db, repo_key)?;
-    let mut out = Vec::new();
-    for t in tasks {
-        if !crate::facet_values(&t.tags, crate::FACET_BRANCH)
-            .iter()
-            .any(|b| b == branch)
-        {
-            continue;
-        }
-        let id = t.meta.id;
-        let status = t.meta.status.clone().unwrap_or_default();
-        let moved = status == "in_progress";
-        let (sha_owned, ns_owned) = (sha.unwrap_or("unknown").to_owned(), findings_ns.to_owned());
-        db.write_txn("cli", move |conn, meta| {
-            crate::set_facet(conn, meta, id, FACET_REVIEWED, &sha_owned)?;
-            crate::set_facet(conn, meta, id, FACET_REVIEW, &ns_owned)?;
-            if moved {
-                task::set_status(conn, meta, id, TaskStatus::NeedsReview)?;
-            }
-            Ok(())
+    let on_branch: Vec<(ItemId, String)> = crate::repo::repo_tasks(db, repo_key)?
+        .into_iter()
+        .filter(|t| {
+            crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH)
+                .iter()
+                .any(|b| b == branch)
         })
-        .with_context(|| format!("recording the review on {}", t.meta.uid))?;
-        out.push(Recorded {
-            uid: t.meta.uid.clone(),
-            moved_to_review: moved,
-        });
+        .map(|t| (t.meta.id, t.meta.uid.clone()))
+        .collect();
+    if on_branch.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(out)
-}
 
-/// Record a `--no-review` waiver on `id`.
-///
-/// # Errors
-/// Returns an error if the write fails.
-pub(crate) fn waive(db: &Db, id: ItemId, sha: &str) -> Result<()> {
-    let sha = sha.to_owned();
-    db.write_txn("cli", move |conn, meta| {
-        crate::set_facet(conn, meta, id, FACET_REVIEW_WAIVED, &sha)
-    })?;
-    Ok(())
+    let (sha_owned, ns_owned) = (sha.unwrap_or("unknown").to_owned(), findings_ns.to_owned());
+    let ids: Vec<ItemId> = on_branch.iter().map(|(id, _)| *id).collect();
+    let moved_ids = db
+        .write_txn("cli", move |conn, meta| {
+            let mut moved = Vec::new();
+            for id in &ids {
+                crate::repo::set_facet(conn, meta, *id, FACET_REVIEWED, &sha_owned)?;
+                // Additive: `review=` accumulates, so an earlier run's open findings keep
+                // gating. `set_facet` here would silently un-gate them.
+                tag::apply(conn, meta, *id, FACET_REVIEW, &ns_owned)?;
+                // Re-read inside the transaction: the status may have changed since the
+                // caller's snapshot, and only `in_progress` may become `needs_review`.
+                let current = item::get(conn, *id)?.and_then(|m| m.status);
+                if current.as_deref() == Some("in_progress") {
+                    task::set_status(conn, meta, *id, TaskStatus::NeedsReview)?;
+                    moved.push(*id);
+                }
+            }
+            Ok(moved)
+        })
+        .with_context(|| format!("recording the review of {branch}"))?;
+
+    Ok(on_branch
+        .into_iter()
+        .map(|(id, uid)| Recorded {
+            uid,
+            moved_to_review: moved_ids.contains(&id),
+        })
+        .collect())
 }

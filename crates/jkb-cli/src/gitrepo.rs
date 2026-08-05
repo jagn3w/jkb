@@ -272,6 +272,30 @@ pub fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
     .is_some())
 }
 
+/// Every local branch name, in one `git` call.
+///
+/// [`has_branch`] is one subprocess per question; a caller checking N branches pays N of
+/// them. Each spawn measured ~11ms here, and the In Flight view re-asks on every database
+/// write, so the batch form is what keeps a redraw from costing a second.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed at all.
+pub fn local_branches(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
+    let Some(text) = git(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )?
+    else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Create branch `branch` at `start` if it does not already exist. Returns whether it was
 /// created.
 ///

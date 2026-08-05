@@ -380,6 +380,22 @@ impl SyncMode {
             Self::Bidirectional => "bidirectional",
         }
     }
+
+    /// The inverse of [`Self::as_str`], for reading a stored value back.
+    ///
+    /// It lives beside `as_str` (as [`TaskStatus::from_manual_str`] does) so the two spellings
+    /// cannot drift: hand-written parse sites in other crates were catch-alls, so adding a
+    /// variant compiled fine and silently reset a mount to the default on the very path added
+    /// to stop silent resets.
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "import" => Some(Self::Import),
+            "export" => Some(Self::Export),
+            "bidirectional" => Some(Self::Bidirectional),
+            _ => None,
+        }
+    }
 }
 
 impl ConflictPolicy {
@@ -391,6 +407,42 @@ impl ConflictPolicy {
             Self::KbWins => "kb_wins",
             Self::Manual => "manual",
         }
+    }
+
+    /// The inverse of [`Self::as_str`], for reading a stored value back. See
+    /// [`SyncMode::from_db_str`] for why this belongs here rather than at each call site.
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "disk_wins" => Some(Self::DiskWins),
+            "kb_wins" => Some(Self::KbWins),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod round_trip {
+    use super::{ConflictPolicy, SyncMode};
+
+    /// Every variant must survive `as_str` -> `from_db_str`. This is the test that fails when
+    /// someone adds a variant and forgets the parse arm — the catch-all parse sites this
+    /// replaced could not fail, they just silently mapped the new value to the default.
+    #[test]
+    fn db_strings_round_trip() {
+        for m in [SyncMode::Import, SyncMode::Export, SyncMode::Bidirectional] {
+            assert_eq!(SyncMode::from_db_str(m.as_str()), Some(m));
+        }
+        for p in [
+            ConflictPolicy::DiskWins,
+            ConflictPolicy::KbWins,
+            ConflictPolicy::Manual,
+        ] {
+            assert_eq!(ConflictPolicy::from_db_str(p.as_str()), Some(p));
+        }
+        assert_eq!(SyncMode::from_db_str("nope"), None);
+        assert_eq!(ConflictPolicy::from_db_str("nope"), None);
     }
 }
 

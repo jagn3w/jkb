@@ -218,7 +218,10 @@ fn both_changed_disk_wins_imports_the_disk_copy() {
     kb_edit(&db, &uri, "kb loses");
 
     let report = sync(&db, "docs/repo").unwrap();
-    assert_eq!(report.count(Outcome::Imported), 1);
+    // A policy resolution is reported apart from an ordinary import: it threw the KB side
+    // away, and that must never look like a routine sync.
+    assert_eq!(report.count(Outcome::ResolvedFromDisk), 1);
+    assert_eq!(report.resolved().len(), 1);
     assert_eq!(content_for(&db, &uri).as_deref(), Some("disk wins"));
 }
 
@@ -1370,4 +1373,130 @@ fn a_single_path_event_still_sees_the_sibling_it_would_collide_with() {
     let report = sync_paths(&db, "docs/change", std::slice::from_ref(&notes)).unwrap();
     assert_eq!(report.count(Outcome::Collided), 1);
     assert_eq!(fs::read_to_string(&notes).unwrap(), notes_body);
+}
+
+/// Narrowing the mount must CLEAR a collision, not preserve it forever.
+///
+/// The first guard dropped bound siblings only by `starts_with(dir)`, applying neither glob,
+/// so once two `tasks` files in a directory were bound NO configuration could clear the
+/// collision and the survivor stayed refused with no CLI escape. The original test narrowed a
+/// mount where neither file had ever been bound, which is why it passed.
+///
+/// `--exclude` is the remedy rather than a narrowed `--include`, because `discover`
+/// deliberately keeps syncing an already-bound file whatever `include` says.
+#[test]
+fn narrowing_the_mount_clears_a_collision_between_already_bound_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let design = dir.path().join("design.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+    let design_body = "# Design\n\nProse belonging to design.md alone.\n";
+    fs::write(&design, design_body).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    // Mount as `document` first, so BOTH files legitimately bind — the pre-existing state a
+    // `tasks` mount then inherits.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 2);
+
+    // Switch it to `tasks`: now the two bound siblings share a namespace and both are refused.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(
+        sync(&db, "docs/change").unwrap().count(Outcome::Collided),
+        2
+    );
+
+    // The printed remedy must actually work on the bound state.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        Some("**/design.md"),
+        ConflictPolicy::Manual,
+    );
+    let report = sync(&db, "docs/change").unwrap();
+    assert_eq!(
+        report.count(Outcome::Collided),
+        0,
+        "excluding the sibling must clear it: {:?}",
+        report.collided()
+    );
+    // tasks.md syncs again — whatever the direction, the point is that it is no longer
+    // refused and its tasks are back in the KB.
+    // The survivor syncs again rather than being refused, and neither file lost content.
+    assert!(fs::read_to_string(&tasks).unwrap().contains("ship it"));
+    assert_eq!(
+        fs::read_to_string(&design).unwrap(),
+        design_body,
+        "the excluded sibling is never written"
+    );
+}
+
+/// A refused collision is journalled `needs_attention`, so `jkb doctor` and the watcher can
+/// see a mount that has silently stopped syncing. Quarantine — the sibling failure mode —
+/// already did this; collision did not, so a previously-synced file kept its stale `ok`.
+#[test]
+fn a_collision_is_journalled_so_doctor_can_see_it() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("tasks.md"), "## Plan\n\n- [ ] a !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    // It syncs cleanly first — the point is a file that WAS good and silently stops.
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 1);
+    assert!(db
+        .read(jkb_core::sync_state::needs_attention)
+        .unwrap()
+        .is_empty());
+
+    // A sibling appears beside it; now neither can sync.
+    fs::write(dir.path().join("notes.md"), "# Notes\n").unwrap();
+    assert_eq!(
+        sync(&db, "docs/change").unwrap().count(Outcome::Collided),
+        2
+    );
+
+    let flagged = db.read(jkb_core::sync_state::needs_attention).unwrap();
+    assert_eq!(
+        flagged.len(),
+        1,
+        "the previously-good file must stop reading as ok: {flagged:?}"
+    );
+    assert!(
+        flagged.iter().all(|s| s
+            .parse_error
+            .as_deref()
+            .is_some_and(|e| e.contains("namespace"))),
+        "the journal must say why: {flagged:?}"
+    );
 }

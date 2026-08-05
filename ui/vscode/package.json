@@ -92,7 +92,7 @@
       },
       {
         "command": "jkb.inflight.land",
-        "title": "jkb: Land this task",
+        "title": "jkb: Land this task (In Flight)",
         "icon": "$(git-merge)"
       },
       {
