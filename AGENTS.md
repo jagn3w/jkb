@@ -59,7 +59,8 @@ run — starts the same one.
 - `jkb task land <uid>` — rebase the session onto its target branch, run the repo's gate, and
   on green mark the task done and clean the session up. Landing is serial, so a red gate
   means *your* branch broke the integrated result.
-- `jkb task abandon <uid>` — drop the session and reopen the task (the branch is kept).
+- `jkb task abandon <uid>` — drop the session; the task reopens unless it already finished
+  or another live worker holds its claim (the branch is kept).
 - `jkb task sessions` — what is in flight, with uncommitted work and commits ahead.
 - `jkb task gate ["<cmd>"]` — the command that verifies a landing here (remembered per repo).
 - `jkb staging ls [--all]` — the staging branches in this repo and what is landing on each:

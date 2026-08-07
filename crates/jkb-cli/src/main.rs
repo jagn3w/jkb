@@ -150,7 +150,12 @@ enum Command {
         txn: Option<i64>,
     },
     /// Embed content-bearing items not yet in the vector index (needs the embedder).
-    Index,
+    Index {
+        /// Remove derived-index rows whose item is gone, instead of embedding. Needs no
+        /// embedder, so it works offline.
+        #[arg(long)]
+        sweep: bool,
+    },
     /// Health checks, integrity, and backup.
     Doctor {
         /// Also write a checkpointed backup to this path.
@@ -812,8 +817,9 @@ enum TaskCmd {
         #[command(subcommand)]
         cmd: TaskReviewCmd,
     },
-    /// Drop a session without landing it: release the claim, reopen the task, remove the
-    /// worktree. The branch is kept unless you ask for it to go.
+    /// Drop a session without landing it: remove the worktree, and release the claim and
+    /// reopen the task unless it has already finished or someone else has claimed it. The
+    /// branch is kept unless you ask for it to go.
     Abandon {
         /// The task uid.
         uid: String,
@@ -1070,7 +1076,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Task { cmd } => cmd_task(&db, cmd, global, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
-        Command::Index => cmd_index(&db),
+        Command::Index { sweep } => cmd_index(&db, sweep),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Ls {
@@ -1681,7 +1687,7 @@ fn contained_children(
         let Some(meta) = item::get(conn, id)? else {
             continue;
         };
-        if !all && matches!(meta.status.as_deref(), Some("done" | "cancelled")) {
+        if !all && jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref()) {
             continue;
         }
         let subtasks = subtask_counts.get(&id).copied();
@@ -1782,7 +1788,7 @@ fn list_children(
                 };
                 // Hide any terminal-status item (done/cancelled) unless `all` — like
                 // ignored files, revealed only on explicit toggle.
-                let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
+                let terminal = jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref());
                 if !all && terminal {
                     continue;
                 }
@@ -2232,15 +2238,11 @@ fn cmd_tree(
 /// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
 fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
     let id = require_uid(db, uid)?;
-    // The sweep runs in the SAME transaction as the delete. Split across two, a concurrent
-    // writer on this global database can take the freed rowid in between — after which the
-    // sweep's `item_id NOT IN (SELECT id FROM items)` no longer matches, and the new item
-    // silently keeps the deleted one's embedding.
-    let removed = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        let removed = item::remove(conn, meta, id, force)?;
-        jkb_index::drop_orphan_vectors(conn)?;
-        Ok(removed)
-    })?;
+    // Deliberately no vector sweep. The deleted item's row in `vec_items_<dim>` outlives it —
+    // a `vec0` virtual table cannot carry a foreign key — but since D40 its id is never
+    // reissued, so nothing can inherit the embedding and the row is merely stale.
+    // `jkb index --sweep` collects it.
+    let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
     if json {
         println!(
             "{}",
@@ -3712,13 +3714,13 @@ fn cmd_sync(
 /// Reconcile one mount and print its summary.
 fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<()> {
     use jkb_sync::Outcome::{
-        Collided, Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined,
+        Adopted, Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined,
         ResolvedFromDisk, ResolvedFromKb, Skipped, UpToDate,
     };
     let report = jkb_sync::sync_with_policy(db, ns_path, conflict)?;
     println!(
         "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
-         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} collided",
+         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} adopted",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
@@ -3729,7 +3731,7 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
         report.count(Quarantined),
         report.count(UpToDate),
         report.count(Skipped),
-        report.count(Collided),
+        report.count(Adopted),
     );
     for path in report.conflicts() {
         println!("  conflict: {}", path.display());
@@ -3742,11 +3744,10 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
     }
-    // Each refusal with the engine's own reason. `Collided` has two causes with opposite
-    // remedies — a live sibling (exclude one) versus a namespace whose layout belongs to a
-    // departed file (edit this one) — so the reason is carried, not restated here.
-    for (path, reason) in report.refusals() {
-        println!("  REFUSED {}: {reason}", path.display());
+    // A one-time move out of the shared directory namespace (D39.3). Named per file because
+    // it re-homes that file's items, so `ns:` queries answer differently afterwards.
+    for path in report.adopted() {
+        println!("  adopted into its own namespace: {}", path.display());
     }
     Ok(())
 }
@@ -3773,7 +3774,10 @@ fn resolve_task_home(
 ) -> Result<()> {
     if had_explicit {
         if flags.backlog {
-            anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
+            anyhow::bail!(
+                "--backlog conflicts with an explicit placement (`--home`, or a `+<ns>` in the \
+                 task line)"
+            );
         }
     } else if flags.backlog {
         let root = task::DEFAULT_ROOT;
@@ -3929,7 +3933,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             if !subs.is_empty() && !json {
                 let open = subs
                     .iter()
-                    .filter(|t| !matches!(t.status.as_deref(), Some("done" | "cancelled")))
+                    .filter(|t| !jkb_types::TaskStatus::is_terminal_str(t.status.as_deref()))
                     .count();
                 println!("\nsubtasks ({open} open of {}):", subs.len());
                 for t in &subs {
@@ -4150,13 +4154,23 @@ fn cmd_task_start(
         );
     }
 
-    // Trunk's tip right now is this branch's base (see repo::FACET_BASE).
-    let base = gitrepo::rev(
-        &cwd,
-        &gitrepo::trunk(&cwd)?.unwrap_or_else(|| "HEAD".to_owned()),
-    )?;
-
     let id = resolve_task_uid(db, uid)?;
+    // `base=` records where this branch *began*, and only the command that cut it knows that.
+    // `task work` writes the tip of the branch it hangs the session off (`onto`); this writes
+    // trunk's tip. Both are right for their own case and they are different commits, so now
+    // that the facet is single-valued (D36.6), a `task start` run inside an existing session
+    // silently rewrote the session's base to trunk — and `work_is_in` uses `base=` precisely
+    // to tell "cut from the target with nothing on it yet" from "landed", so it started
+    // crediting empty branches as reviewed. An existing base is left alone.
+    let base = if repo::facet_one(&repo::task_tags(db, id)?, repo::FACET_BASE).is_some() {
+        None
+    } else {
+        gitrepo::rev(
+            &cwd,
+            &gitrepo::trunk(&cwd)?.unwrap_or_else(|| "HEAD".to_owned()),
+        )?
+    };
+
     let owner = owner.unwrap_or_else(owner::self_owner);
     let (o, b, r, base_sha) = (owner.clone(), branch.clone(), repo.clone(), base.clone());
     // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
@@ -4690,13 +4704,18 @@ fn land_preflight(
         !repo::facet_values(tags, repo::FACET_BRANCH).is_empty(),
         "{uid} has no session — run `jkb task work {uid}` first"
     );
-    let sess = session_for(ctx, tags)?.with_context(|| {
-        format!(
-            "no session worktree for {} — it may already have landed, or been removed",
-            repo::facet_values(tags, repo::FACET_BRANCH).join(", ")
-        )
-    })?;
-    let branch = sess.branch.clone();
+    // A missing worktree is NOT bailed on here. `land_blocker` below already judges it, and
+    // judges it better — it distinguishes a swarm task being built elsewhere from an abandoned
+    // checkout, and tells the first not to run `jkb task work` (which would cut a second branch
+    // and detach it from its group). A bail here made that arm unreachable from the one command
+    // it is the authority for, so the In Flight row and `land` explained the same task
+    // differently.
+    let sess = session_for(ctx, tags)?;
+    let branch = sess
+        .as_ref()
+        .map(|s| s.branch.clone())
+        .or_else(|| repo::facet_one(tags, repo::FACET_BRANCH).cloned())
+        .context("this task records no branch")?;
     let onto = repo::facet_one(tags, repo::FACET_ONTO)
         .cloned()
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
@@ -4714,12 +4733,16 @@ fn land_preflight(
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
         staging::target_dirty_reason(&worktrees, &ctx.root, &onto, &mut dirty_cache)?;
+    let dirty = match &sess {
+        Some(s) => gitrepo::is_dirty(&s.worktree)?,
+        None => false,
+    };
     if let Some(reason) = staging::land_blocker(&staging::LandFacts {
         state,
-        worktree: Some(&sess.worktree),
-        dirty: gitrepo::is_dirty(&sess.worktree)?,
+        worktree: sess.as_ref().map(|s| s.worktree.as_path()),
+        dirty,
         commits: ahead,
-        branch_exists: true,
+        branch_exists: gitrepo::has_branch(&ctx.root, &branch)?,
         target_dirty: target_dirty.as_deref(),
         // The review is enforced a moment later by `review::enforce`, which renders the same
         // verdict at length and is where `--no-review` records a waiver instead of refusing.
@@ -4727,6 +4750,9 @@ fn land_preflight(
     }) {
         anyhow::bail!("{uid} cannot land. {reason}");
     }
+    // Unreachable: `land_blocker` refuses `worktree: None` above. Written as an error rather
+    // than an `expect` so the no-panic rule holds even if that arm is ever weakened.
+    let sess = sess.context("this task has no session worktree")?;
     Ok(Preflight {
         sess,
         branch,
@@ -4922,11 +4948,24 @@ fn settle_landing(
     // returned as an error: the session HAS been disposed of by this point, so bailing left
     // the claim held on a worktree that no longer exists — freed only by `doctor --fix` — and
     // said nothing about what had just been removed.
+    let session_dir = sess.worktree.clone();
     let kept_status = db.write_txn("cli", move |conn, meta| {
-        // The claim goes either way: it names a session this command has just destroyed.
-        claim::clear(conn, meta, id)?;
+        // ONLY the claim naming the session this command just destroyed. Read here, inside the
+        // transaction, for the same reason the status below is: `land` ran a gate that can take
+        // minutes, and an unconditional clear freed a claim taken during it by a worker this
+        // command never looked at — the pattern `clear_if` exists for.
+        if let Some(owner) = claim::claimed(conn)?
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| c.owner)
+        {
+            if owner::session_worktree(&owner).is_some_and(|w| session::same_path(&w, &session_dir))
+            {
+                claim::clear_if(conn, meta, id, &owner)?;
+            }
+        }
         let current = item::get(conn, id)?.and_then(|m| m.status);
-        if matches!(current.as_deref(), Some("done" | "cancelled")) {
+        if jkb_types::TaskStatus::is_terminal_str(current.as_deref()) {
             return Ok(current);
         }
         task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
@@ -4940,21 +4979,29 @@ fn settle_landing(
         );
     }
 
+    // Reported from what actually happened, never from what was intended. Two claims here were
+    // simply false: `"{uid} is done"` after a status this transaction deliberately left as
+    // `cancelled`, and "removed session and its branch" in the arm that only ran
+    // `git worktree prune` because somebody else had already removed the directory.
+    let status = kept_status.as_deref().unwrap_or("done");
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "uid": landed.uid, "landed": true, "branch": landed.branch, "onto": landed.onto,
                 "commits": landed.ahead, "gate": landed.gate, "gate_source": landed.gate_source,
-                "session_removed": cleaned,
+                "session_removed": cleaned, "status": status,
+                "branch_deleted": cleaned && !disposed_already,
             })
         );
     } else {
         println!(
-            "landed: {} → {} ({} commit(s)); {} is done",
+            "landed: {} → {} ({} commit(s)); {} is {status}",
             landed.branch, landed.onto, landed.ahead, landed.uid
         );
-        if cleaned {
+        if cleaned && disposed_already {
+            println!("  session was already gone; pruned its registration");
+        } else if cleaned {
             println!("  removed session {} and its branch", sess.name);
         }
     }
@@ -4974,9 +5021,18 @@ fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
         return Ok(dir);
     }
     let base = session::base_worktree(&ctx.root);
-    if base_branch(ctx)?.is_some() {
-        // It exists and holds some other branch — if it held `onto`, the lookup above would
-        // have found it. Reuse it: it is a cache, and switching keeps its build artifacts.
+    // Whether git knows a worktree there — NOT whether it has a branch. A **detached**
+    // `.jkb/base` has no branch, so the branch test sent it to the "exists but git does not
+    // know it" bail below and refused every landing, while `staging::land_dir_in` matched the
+    // same directory by path and reported the task landable. `switch_to` attaches it either
+    // way, so a detached base is an ordinary reusable cache.
+    let base_registered = gitrepo::worktrees(&ctx.root)?
+        .iter()
+        .any(|w| session::same_path(&w.path, &base));
+    if base_registered {
+        // It exists and holds some other branch (or none) — if it held `onto`, the lookup
+        // above would have found it. Reuse it: it is a cache, and switching keeps its
+        // build artifacts.
         anyhow::ensure!(
             !gitrepo::is_dirty(&base)?,
             "{} has uncommitted changes — it is jkb's own scratch checkout, so commit or \
@@ -5101,12 +5157,21 @@ fn cmd_task_abandon(
         // freed a task the next SCHEDULER pass had just handed to an implementer, and then
         // reopened it, which is how two builders end up on one task.
         if let Some(prev) = &observed {
-            claim::clear_if(conn, meta, id, prev)?;
+            if !claim::clear_if(conn, meta, id, prev)? {
+                // The claim changed hands while the worktrees were being removed. Whoever
+                // holds it now was never judged by this command, so reopening the task and
+                // clearing `onto=` would take work off a live worker — the same reasoning
+                // that makes the clear itself a CAS. Report what is true and change nothing.
+                let current = item::get(conn, id)?
+                    .and_then(|m| m.status)
+                    .unwrap_or_default();
+                return Ok((false, current));
+            }
         }
         let current = item::get(conn, id)?
             .and_then(|m| m.status)
             .unwrap_or_default();
-        if matches!(current.as_str(), "done" | "cancelled") {
+        if jkb_types::TaskStatus::is_terminal_str(Some(current.as_str())) {
             return Ok((false, current));
         }
         repo::clear_facet(conn, meta, id, repo::FACET_ONTO)?;
@@ -5256,6 +5321,25 @@ fn report_sessions(db: &Db) {
     }
 }
 
+/// Mark `id` done, unless it finished on its own since the caller last looked. Returns whether
+/// the status was written.
+///
+/// The status is re-read **inside** the transaction. `close-merged` snapshots every candidate
+/// up front and then runs several git subprocesses per task, and it runs from a post-merge
+/// hook over all of them at once — long enough for a `jkb task set --status cancelled` to land
+/// in between and be silently overwritten with `done`. Same reasoning as `settle_landing` and
+/// `review::record`.
+fn close_if_still_open(db: &Db, id: ItemId) -> Result<bool> {
+    Ok(db.write_txn("cli", move |conn, meta| {
+        let current = item::get(conn, id)?.and_then(|m| m.status);
+        if jkb_types::TaskStatus::is_terminal_str(current.as_deref()) {
+            return Ok(false);
+        }
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
+        Ok(true)
+    })?)
+}
+
 /// `task close-merged` — close tasks whose branch has landed (design D34.4).
 /// The uid, status and location facets `close-merged` needs for one task.
 type CloseMergedRow = (String, Option<String>, Option<String>, Option<String>);
@@ -5323,7 +5407,7 @@ fn cmd_task_close_merged(
     for id in ids {
         let (uid, status, branch, base) = close_merged_row(db, id)?;
         let Some(branch) = branch else { continue };
-        if matches!(status.as_deref(), Some("done" | "cancelled")) {
+        if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
             continue;
         }
 
@@ -5348,12 +5432,12 @@ fn cmd_task_close_merged(
                 // A merged branch is evidence, not proof: a task with unfinished subtasks
                 // did not finish, whatever landed (design D34.4).
                 if db.read(move |conn| task::subtasks_all_terminal(conn, id))? {
-                    if !dry_run {
-                        db.write_txn("cli", move |conn, meta| {
-                            task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
-                        })?;
+                    let wrote = dry_run || close_if_still_open(db, id)?;
+                    if wrote {
+                        closed.push((uid, branch));
+                    } else {
+                        blocked.push((uid, format!("{branch} (finished while checking)")));
                     }
-                    closed.push((uid, branch));
                 } else {
                     blocked.push((uid, branch));
                 }
@@ -5664,35 +5748,43 @@ fn cmd_view(db: &Db, cmd: ViewCmd, json: bool) -> Result<()> {
 }
 
 fn cmd_undo(db: &Db, txn: Option<i64>) -> Result<()> {
-    // Undo and its vector sweep are ONE transaction, so no concurrent writer can take a
-    // freed rowid between the delete and the sweep and inherit the deleted item's embedding.
-    let (n, dropped) = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        let n = match txn {
-            Some(txn) => undo::undo(conn, meta, txn),
-            None => undo::undo_last(conn, meta),
-        }?;
-        Ok((n, jkb_index::drop_orphan_vectors(conn)?))
+    // No vector sweep: see `cmd_item_rm`. Undoing an ingest leaves the chunks' vector rows
+    // behind, and since D40 that is inert rather than the permanent corruption it once was.
+    let n = db.write_txn("cli", move |conn, meta| match txn {
+        Some(txn) => undo::undo(conn, meta, txn),
+        None => undo::undo_last(conn, meta),
     })?;
     println!("reverted {n} change(s)");
-    if dropped > 0 {
-        println!("  dropped {dropped} orphaned vector row(s)");
-    }
     Ok(())
 }
 
-/// Delete vector rows whose item is gone, returning how many went.
+/// Remove stale derived-index rows, returning what went.
 ///
-/// The repair verb — `jkb doctor --fix` — for a database that already carries orphans. The
-/// delete paths themselves sweep **inside their own transaction** (`item rm`, `undo`) rather
-/// than calling this, because a second transaction leaves a window in which another writer
-/// can take the freed rowid and inherit the dead embedding.
-fn sweep_orphan_vectors(db: &Db) -> Result<usize> {
-    db.write_txn_with::<usize, anyhow::Error, _>("cli", |conn, _meta| {
-        Ok(jkb_index::drop_orphan_vectors(conn)?)
-    })
+/// The **one** cleanup, called from `jkb index --sweep` and `jkb doctor --fix`. Nothing sweeps
+/// implicitly any more: before D40 every path that deleted an item had to sweep in its own
+/// transaction or a new item inherited a dead embedding, and that obligation was discovered
+/// one missed call site at a time over four review passes. `AUTOINCREMENT` removed the hazard,
+/// which turns cleanup from an invariant every writer must uphold into housekeeping one verb
+/// can do whenever it is convenient.
+fn sweep_stale(db: &Db) -> Result<jkb_index::StaleRows> {
+    db.write_txn_with::<_, anyhow::Error, _>("cli", |conn, _meta| Ok(jkb_index::sweep_stale(conn)?))
 }
 
-fn cmd_index(db: &Db) -> Result<()> {
+fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
+    // The on-demand half of the derived-index hygiene pair (design D40). `AUTOINCREMENT`
+    // makes a leftover vector row harmless — its id is never reissued, so nothing can inherit
+    // its embedding — but not absent, and an index that only grows is worth being able to
+    // clean without running the whole of `doctor`. Deliberately its own flag rather than
+    // something `index` always does: embedding needs a live embedder and this must not.
+    if sweep {
+        let removed = sweep_stale(db)?;
+        if removed.is_empty() {
+            println!("index: no stale rows");
+        } else {
+            println!("index: removed {} stale vector row(s)", removed.vectors);
+        }
+        return Ok(());
+    }
     // Embed every content-bearing item not yet in the vector index (D21): this covers
     // items created by file sync, not just the ingest pipeline. Needs a live embedder.
     let pipeline = Pipeline::new(embedder()?);
@@ -6006,14 +6098,14 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Report — and with `--fix`, sweep — vector rows whose item is gone.
+/// Report — and with `--fix`, sweep — derived-index rows whose item is gone.
 ///
-/// The vec table is a virtual table with no foreign key to `items`, so a delete that bypassed
-/// a sweep leaves a row whose `item_id` (the rowid) will be handed to the next item created,
-/// which then inherits the deleted item's embedding and reads as already-indexed. Reported
-/// here so a database that already has them has a way back.
+/// A `vec0` virtual table cannot carry a foreign key to `items`, so a deleted item leaves its
+/// vector behind. Since D40 (`items.id AUTOINCREMENT`) that row is **stale, not dangerous** —
+/// the freed id is never reissued, so no new item can inherit its embedding — which is why
+/// this reads as housekeeping rather than corruption, and why nothing sweeps implicitly.
 fn report_vector_index(db: &Db, fix: bool) -> Result<()> {
-    // What counts as one of our vector tables, and what counts as an orphan in it, are
+    // What counts as one of our derived-index tables, and what counts as stale in one, are
     // `jkb-index`'s to say — the CLI asks. It used to carry its own copy of both queries,
     // including the `vec0` shadow-table filter that is the non-obvious part, so `doctor`'s
     // report and `doctor --fix`'s delete were two statements that had to be kept in step.
@@ -6023,18 +6115,20 @@ fn report_vector_index(db: &Db, fix: bool) -> Result<()> {
         println!("vector index: no vector table yet");
     } else if fix {
         println!(
-            "vector index: dropped {} orphaned row(s)",
-            sweep_orphan_vectors(db)?
+            "vector index: removed {} stale row(s)",
+            sweep_stale(db)?.vectors
         );
     } else {
-        let orphans = db.read_with::<i64, anyhow::Error, _>(|conn| {
-            Ok(jkb_index::count_orphan_vectors(conn)?)
-        })?;
-        if orphans == 0 {
+        let stale =
+            db.read_with::<_, anyhow::Error, _>(|conn| Ok(jkb_index::count_stale(conn)?))?;
+        if stale.is_empty() {
             println!("vector index: ok");
         } else {
-            println!("vector index: {orphans} row(s) whose item is gone");
-            println!("  run `jkb doctor --fix` to drop them");
+            println!(
+                "vector index: {} stale row(s) whose item is gone",
+                stale.vectors
+            );
+            println!("  run `jkb index --sweep` (or `jkb doctor --fix`) to remove them");
         }
     }
 

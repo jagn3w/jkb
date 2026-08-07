@@ -87,6 +87,19 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
 pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result<()> {
+    // Read the row BEFORE writing, so the changelog carries something `undo` can restore.
+    // Without it a sync transaction was half-invertible: `undo` deleted the items and left
+    // `last_synced_hash` describing bytes that no longer had any, after which the next
+    // reconcile read "KB changed, disk did not" and exported an item-less render over the
+    // file. Same rule `mount::create` and `containment::contain` follow.
+    let before = get(conn, w.uri)?.map(|row| {
+        json!({
+            "status": row.status,
+            "serializer": row.serializer,
+            "last_synced_hash": row.last_synced_hash,
+            "base_blob_hash": row.base_blob_hash,
+        })
+    });
     conn.prepare_cached(
         "INSERT INTO sync_state
              (uri, serializer, status, last_synced_hash, base_blob_hash,
@@ -120,7 +133,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
         "update",
         "sync_state",
         w.uri,
-        None,
+        before.as_ref(),
         Some(&json!({
             "status": w.status,
             "serializer": w.serializer,

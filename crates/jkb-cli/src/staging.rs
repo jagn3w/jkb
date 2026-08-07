@@ -65,6 +65,8 @@ impl State {
     pub(crate) fn from_status(status: &str) -> Self {
         match status {
             "needs_review" => Self::Review,
+            // Split rather than collapsed to one terminal arm: `landed` and `dropped` are
+            // opposite outcomes, and reporting them as one says a dropped task shipped.
             "done" => Self::Landed,
             "cancelled" => Self::Dropped,
             _ => Self::Implementing,
@@ -73,9 +75,10 @@ impl State {
 
     /// Whether the pipeline is finished with this task, whichever way it ended.
     ///
-    /// The one spelling. It was written three times — a `matches!` on the two terminal
-    /// statuses, a `matches!` on the two terminal states, and this enum — so the question
-    /// "is this task still live" had three answers that had to be kept in step.
+    /// The `State`-level counterpart of `jkb_types::TaskStatus::is_terminal_str`, which is the
+    /// authority over the raw strings. Kept separate because it answers a different question —
+    /// `State` folds a session's existence in beside the status — but the two must agree on
+    /// which statuses end a task, so this is derived from `from_status`, never re-listed.
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Landed | Self::Dropped)
     }
@@ -414,9 +417,14 @@ fn land_dir_in(
         return Some(w.path.clone());
     }
     // No checkout of its own: the graft reuses `.jkb/base`, whatever branch that currently
-    // holds. A dirty one refuses the landing — which is why the row must consider it too, and
-    // did not: it asked only about a checkout of `onto` itself and reported "Landable" for
-    // every task whose target had none.
+    // holds — or none, if it is detached. A dirty one refuses the landing, which is why the
+    // row must consider it too, and did not: it asked only about a checkout of `onto` itself
+    // and reported "Landable" for every task whose target had none.
+    //
+    // Matched by **path**, exactly as `main::land_dir_for` decides whether to reuse it. Those
+    // two must agree on what counts as a usable base or the row and the command describe
+    // different landings; they diverged once on a detached base, where the command required a
+    // branch and refused while the row matched by path and promised.
     let base = session::base_worktree(root);
     worktrees
         .iter()

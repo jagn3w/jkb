@@ -22,16 +22,20 @@ use crate::{IndexItem, Indexer, Result};
 /// Delete vector rows whose item no longer exists, across **every** `vec_items_<dim>` table.
 ///
 /// The vec tables are derived indexes (D9) but cannot carry a foreign key — they are virtual
-/// tables, so `ON DELETE CASCADE` is not available to them — which means a deleted item
-/// leaves its vector behind. That is not merely stale: `item_id` IS the rowid, `SQLite` hands a
-/// freed rowid to the next item created, and the orphan then collides with it. Concretely,
-/// `jkb ingest` -> `jkb undo` -> `jkb ingest` failed on the second ingest and on every ingest
-/// into that database afterwards, while a vector search for the deleted text returned the new
-/// document's chunks.
+/// tables, so `ON DELETE CASCADE` is not available to them — which means a deleted item leaves
+/// its vector behind.
 ///
-/// A free function taking only a connection, because the caller that needs it — `jkb undo` —
-/// has no embedder and must work offline; and it sweeps every dimension's table, because a
-/// database whose embedding model changed has more than one.
+/// That used to be a **collision**, not just litter: `item_id` IS the rowid, and while
+/// `items.id` was a plain rowid alias `SQLite` handed a freed rowid to the next item created,
+/// which then inherited the dead embedding. `jkb ingest` -> `jkb undo` -> `jkb ingest` failed
+/// on the second ingest and on every ingest into that database afterwards, while a vector
+/// search for the deleted text returned the new document's chunks. Since D40 (`AUTOINCREMENT`)
+/// the id is never reissued, so this is housekeeping — called explicitly by `jkb index --sweep`
+/// and `jkb doctor --fix`, never implicitly by whichever path happened to delete.
+///
+/// A free function taking only a connection, because its callers have no embedder and must work
+/// offline; and it sweeps every dimension's table, because a database whose embedding model
+/// changed has more than one.
 ///
 /// # Errors
 /// Returns an error if a statement fails.
@@ -68,6 +72,61 @@ pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
             .query_row([], |row| row.get::<_, i64>(0))?;
     }
     Ok(total)
+}
+
+/// Rows in a derived index whose source item no longer exists.
+///
+/// Indexes are derived and rebuildable (D9), but the vector tables are `vec0` **virtual**
+/// tables and cannot carry a foreign key, so nothing deletes their rows for them. Since D40
+/// (`items.id AUTOINCREMENT`) a leftover row is no longer *dangerous* — the freed id is never
+/// reissued, so no new item can inherit its embedding — but it is still dead weight in an
+/// index that grows monotonically, so it is worth finding and removing on demand.
+///
+/// A struct rather than a bare count because the set of derived indexes is open: FTS is
+/// trigger-maintained today and a second vector backend is plausible, and a caller that
+/// pattern-matches on fields gets a compile error when one is added rather than a silently
+/// unreported total.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StaleRows {
+    /// Rows across every `vec_items_<dim>` table whose item is gone.
+    pub vectors: usize,
+}
+
+impl StaleRows {
+    /// Every stale row, across all derived indexes.
+    #[must_use]
+    pub fn total(self) -> usize {
+        self.vectors
+    }
+
+    /// Whether the derived indexes are clean.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Find stale derived-index rows without changing anything.
+///
+/// The detect half of the pair; [`sweep_stale`] is the clean half and uses the same
+/// predicates, so a report can never describe a different set from what a sweep would remove.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn count_stale(conn: &Connection) -> Result<StaleRows> {
+    Ok(StaleRows {
+        vectors: usize::try_from(count_orphan_vectors(conn)?).unwrap_or(usize::MAX),
+    })
+}
+
+/// Remove stale derived-index rows, returning what was removed.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn sweep_stale(conn: &Connection) -> Result<StaleRows> {
+    Ok(StaleRows {
+        vectors: drop_orphan_vectors(conn)?,
+    })
 }
 
 /// Every `vec_items_<dim>` table in this database — one per embedding dimension the store has
@@ -226,30 +285,6 @@ impl VectorIndexer {
         ))?
         .execute(params![id.get(), bytes])?;
         Ok(())
-    }
-
-    /// Delete vector rows whose item no longer exists, returning how many went.
-    ///
-    /// The vec table is a **derived** index (D9) but has no foreign key to `items` — it is a
-    /// virtual table, so `ON DELETE CASCADE` is not available — which means a deleted item
-    /// leaves its vector behind. That is not merely stale: `item_id` is the rowid, `SQLite`
-    /// hands a freed rowid to the next inserted item, and the orphan then collides with it.
-    /// Concretely, `jkb ingest` + `jkb undo` + `jkb ingest` failed on the second ingest and
-    /// every ingest after it, while a vector search for the deleted text returned the *new*
-    /// document's chunks.
-    ///
-    /// # Errors
-    /// Returns an error if the statement fails.
-    pub fn drop_orphans(&self, conn: &Connection) -> Result<usize> {
-        if !self.table_exists(conn)? {
-            return Ok(0);
-        }
-        Ok(conn
-            .prepare_cached(&format!(
-                "DELETE FROM {} WHERE item_id NOT IN (SELECT id FROM items)",
-                self.table
-            ))?
-            .execute([])?)
     }
 
     /// The stored vectors for `ids`, as an `item_id -> embedding` map. Ids with no vector

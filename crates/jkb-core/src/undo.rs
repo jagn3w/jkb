@@ -33,6 +33,8 @@ enum Inverse {
     MountConfig,
     /// Restore a containment row's previous container and position.
     ContainmentRow,
+    /// Restore a sync journal row's previous state, or remove one this transaction created.
+    SyncStateRow,
     /// Delete the inserted row by `rowid`.
     DeleteRow,
 }
@@ -50,6 +52,13 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
     ("update", Some("edges"), Inverse::EdgeWeight),
     ("update", Some("mounts"), Inverse::MountConfig),
     ("update", Some("containment"), Inverse::ContainmentRow),
+    // A sync transaction deletes items AND advances the file's journal. With no inverse here
+    // the journal survived the undo, so `last_synced_hash` still described bytes whose items
+    // were gone — and the next reconcile saw "KB changed, disk did not" and exported an
+    // item-less render over the file, silently emptying it. `undo_last` could select such a
+    // transaction (it inserts items), so this was reachable by a bare `jkb undo` with the
+    // watcher running.
+    ("update", Some("sync_state"), Inverse::SyncStateRow),
     // Any table on `UNDOABLE_TABLES`; an insert into anything else is an error, not a skip.
     // The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so a
     // table-specific `insert` inverse placed after it would never be reached.
@@ -149,6 +158,9 @@ fn invert_entry(
         // create` doubles as the update command, so without this the generic insert
         // inverse would `DELETE FROM mounts` and destroy a mount that existed before the
         // transaction, leaving its `file://` bindings with nothing to sync them.
+        Inverse::SyncStateRow => {
+            rows += revert_sync_state(conn, entity_id, snapshot("sync journal before-state")?)?;
+        }
         Inverse::MountConfig => {
             if let Some(snap) = snapshot("mount before-state")? {
                 let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -199,6 +211,39 @@ fn invert_entry(
         }
     }
     Ok(rows)
+}
+
+/// Put one sync journal row back the way it was, or remove one the transaction created.
+///
+/// `entity_id` is the file **uri**, not a rowid: `sync_state` is keyed on `uri`, so the generic
+/// delete-by-rowid inverse would address the wrong row entirely.
+///
+/// Restoring the hashes is the point. Without an inverse here, undoing a sync deleted the
+/// items and left `last_synced_hash` describing bytes that no longer had any — after which the
+/// next reconcile read "KB changed, disk did not" and exported an item-less render over the
+/// file, silently emptying it.
+fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) -> Result<usize> {
+    let Some(snap) = before else {
+        // No before-state means this transaction created the row: remove it, so the file reads
+        // as never synced rather than as synced to bytes that are gone.
+        return Ok(conn
+            .prepare_cached("DELETE FROM sync_state WHERE uri = ?1")?
+            .execute(params![entity_id])?);
+    };
+    let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
+    Ok(conn
+        .prepare_cached(
+            "UPDATE sync_state
+                SET status = ?2, serializer = ?3, last_synced_hash = ?4, base_blob_hash = ?5
+              WHERE uri = ?1",
+        )?
+        .execute(params![
+            entity_id,
+            field("status"),
+            field("serializer"),
+            field("last_synced_hash"),
+            field("base_blob_hash"),
+        ])?)
 }
 
 /// Revert transaction `txn_id` by deleting the rows it inserted (most recent
@@ -449,6 +494,12 @@ pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
     // is worse than none — but it rolls back without writing an `undo` marker, so selecting
     // such a transaction wedges `jkb undo` on it permanently, every run, forever. Selecting
     // an older one instead at least keeps undo working and leaves the entry in the log.
+    //
+    // Written as an uncorrelated `NOT IN` over transaction ids, NOT a correlated `NOT EXISTS`
+    // on `c.txn_id`. The correlated form is re-evaluated per changelog **row** rather than per
+    // transaction, and since no caller actually logs an unlisted insert it never
+    // short-circuits — measured at ~6x on a database dominated by one large ingest (12.4s →
+    // 71.8s). This subquery is materialized once.
     let unlisted = vec!["?"; UNDOABLE_TABLES.len()].join(", ");
     args.extend(
         UNDOABLE_TABLES
@@ -459,10 +510,9 @@ pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
     let sql = format!(
         "SELECT MAX(txn_id) FROM changelog c
          WHERE ({})
-           AND NOT EXISTS (
-               SELECT 1 FROM changelog b
-               WHERE b.txn_id = c.txn_id
-                 AND b.op = 'insert' AND b.entity_type NOT IN ({unlisted})
+           AND c.txn_id NOT IN (
+               SELECT txn_id FROM changelog
+               WHERE op = 'insert' AND entity_type NOT IN ({unlisted})
            )
            AND c.txn_id < ?
            AND NOT EXISTS (

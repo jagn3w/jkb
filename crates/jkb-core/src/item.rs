@@ -816,10 +816,40 @@ pub fn set_content(
 
 #[cfg(test)]
 mod tests {
-    use super::{grep, upsert, NewItem};
+    use super::{grep, remove, upsert, NewItem};
     use crate::{ns, placement, Db};
     use jkb_types::PlacementRole;
     use proptest::prelude::*;
+
+    /// An id freed by a delete must never be handed to a later item (design D40).
+    ///
+    /// `items.id` is a rowid alias, and `SQLite` reissues the largest freed rowid — so before
+    /// `AUTOINCREMENT` a new item inherited a deleted item's row in every derived index that
+    /// cannot carry a foreign key. Concretely, it inherited its **embedding**: vector search
+    /// returned the new item for the deleted item's text, and `index_pending` considered it
+    /// already indexed, so it could never be re-embedded.
+    ///
+    /// This is the invariant, not the four call-site sweeps that preceded it. If the V010
+    /// migration is ever reverted or a rebuild of `items` drops the `AUTOINCREMENT`, this
+    /// fails immediately rather than surfacing as a wrong search result months later.
+    #[test]
+    fn a_deleted_items_id_is_never_reused() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .write_txn("t", |conn, meta| upsert(conn, meta, &note("gone", None)))
+            .unwrap();
+        db.write_txn("t", move |conn, meta| remove(conn, meta, first, true))
+            .unwrap();
+        let second = db
+            .write_txn("t", |conn, meta| upsert(conn, meta, &note("fresh", None)))
+            .unwrap();
+        assert!(
+            second.get() > first.get(),
+            "id {} was reissued after {} was deleted — a new item would inherit its vector",
+            second.get(),
+            first.get()
+        );
+    }
 
     fn note(uid: &str, hash: Option<&str>) -> NewItem {
         NewItem {

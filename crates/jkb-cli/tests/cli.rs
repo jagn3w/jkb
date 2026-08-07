@@ -2745,9 +2745,15 @@ fn re_running_mount_create_preserves_unnamed_properties() {
         .stdout(predicate::str::contains("include=(none)"));
 }
 
-/// Two `tasks` files in one directory are refused by `jkb sync`, with the fix named.
+/// Two `tasks` files in one directory both sync, each keeping its own content (design D39.4).
+///
+/// This used to be **refused**, because a file's namespace was derived from its containing
+/// directory and both files shared the `layout` that decides document order. Since D39.1 the
+/// filename is part of the namespace, so the ambiguity cannot arise and there is nothing to
+/// refuse. The assertion that design.md keeps its own bytes is the one that matters: that is
+/// the collapse, checked at the CLI boundary.
 #[test]
-fn sync_refuses_two_tasks_files_in_one_directory() {
+fn sync_keeps_two_tasks_files_in_one_directory_apart() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let backing = dir.path().join("backing");
@@ -2768,9 +2774,16 @@ fn sync_refuses_two_tasks_files_in_one_directory() {
         .args(["sync", "docs/m"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("2 collided"))
-        .stdout(predicate::str::contains("REFUSED"));
+        .stdout(predicate::str::contains("2 created"));
 
-    // Refusing means refusing: neither file was rewritten.
-    assert_eq!(std::fs::read_to_string(&design).unwrap(), design_body);
+    // design.md keeps its own prose — it must never be handed tasks.md's document.
+    let after = std::fs::read_to_string(&design).unwrap();
+    assert!(
+        after.contains("Prose belonging to design.md alone."),
+        "design.md lost its own content: {after}"
+    );
+    assert!(
+        !after.contains("do it"),
+        "design.md was given tasks.md's items: {after}"
+    );
 }

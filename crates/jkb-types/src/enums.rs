@@ -305,6 +305,20 @@ impl TaskStatus {
         matches!(self, Self::Done | Self::Cancelled)
     }
 
+    /// Whether a raw `items.status` string is terminal.
+    ///
+    /// The string-level spelling of [`TaskStatus::is_terminal`], for the callers that read a
+    /// status straight out of the database. `matches!(s, "done" | "cancelled")` was written by
+    /// hand in five places, including the two guards that stop a landing and an abandon from
+    /// reopening finished work — which are exactly the places where getting the set wrong is
+    /// most expensive, and the places least likely to be revisited when the set changes.
+    #[must_use]
+    pub fn is_terminal_str(status: Option<&str>) -> bool {
+        status
+            .and_then(Self::from_manual_str)
+            .is_some_and(Self::is_terminal)
+    }
+
     /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents.
     /// True for exactly the **terminal** statuses (`done`/`cancelled`) — the terminal
     /// set (design D27.7). A `needs_review` dependency deliberately does **not** unblock:

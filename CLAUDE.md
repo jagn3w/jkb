@@ -875,15 +875,67 @@ Three guards, each closing a different link:
   precisely the write that dropped the glob. The mount no longer has to be edited to get a
   sync moving.
 
-**Still true, and deliberately not fixed here:** a `tasks` mount can hold at most one synced
-file per directory. Making a file's namespace include its own name would re-home every synced
-item, so it is a migration and a design pass, not a bug fix — tracked in the backlog.
+**Superseded.** "A `tasks` mount can hold at most one synced file per directory" was true when
+this was written and is no longer: D39 below makes the filename part of the namespace, which is
+the migration and design pass this paragraph deferred. `Outcome::Collided` and the whole
+ownership guard are gone. The two defects above — `namespace_for` dropping the filename, and
+`mount create` being a full-row replace — are both closed, the first at the root.
 
 **Recovery, for next time.** `blobs` is content-addressed and never garbage-collected, and
 file sync stores the bytes of every version it settles — so the store is a complete history of
 every synced file. `jkb blob ls --contains "<a line you remember>"` finds the version, `jkb
 blob cat <hash>` writes it out. That is how all 62 files were recovered here; the originals
 were the import cohort, distinguishable from the damaged exports by still having headers.
+
+## A synced file owns its own namespace (D39) — the collapse, fixed at the root
+
+The `Collided` refusal above was a guard around a modelling error, and the error is now fixed:
+**`namespace_for` includes the filename**, so one namespace holds exactly one file. Design in
+`openspec/changes/jkb-sync-file-namespaces/`.
+
+- **The root cause was one dropped path segment.** A file's namespace came from its containing
+  *directory*, so every file there shared the `layout` that `render` treats as the sole
+  authority on document order — one layout describing two documents, last writer wins, and the
+  next export of the other file wrote its sibling's headers and prose over itself.
+- **Seven guards over eight review passes** tried to keep answering *whose layout is this?* —
+  `layout_uri`, `LayoutOwner`, `unclaimed_legacy`, `foreign_layout`, `refuse_foreign`,
+  `colliding_paths`, `shares_namespace_with_other_bound_file`. Every one was a **proxy for
+  authorship** (did it sync cleanly, is a sibling still bound, is there a journal row) and every
+  one was satisfied by the recovery step the refusal itself recommended: deleting the sibling.
+  On a legacy database the two files are indistinguishable claimants, so no proxy can work. All
+  of it is **deleted** — a guard that cannot fire is a second model of the world, not defence in
+  depth.
+- **The filename keeps its extension.** `tasks` reads better, but `tasks.md` beside `tasks.txt`
+  would collide again — the same defect, rarer, therefore worse.
+- **Adoption is per file, inside `reconcile`** (`adopt_legacy_namespace`), not a global
+  migration: at that moment `binding::synced_uris_for_file` answers *which items are mine*
+  authoritatively, which is **positive evidence** rather than a proxy. It runs only when every
+  `file://`-bound item in the directory namespace is bound to this file, so a deleted sibling's
+  leftovers — still bound to its path — correctly block it. A directory genuinely holding two
+  files' items is left alone and reported. Idempotent, and reported as `Outcome::Adopted`.
+- **A directory may now hold many synced files.** That is the user-visible gain, and why this
+  was worth a re-home rather than an eighth guard.
+
+## An item id is never reused (D40)
+
+`items.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` (migration `V010`). Design in
+`openspec/changes/jkb-item-id-stability/`.
+
+- **The hazard was rowid reuse.** `vec_items_<dim>` is a `vec0` virtual table and cannot carry a
+  foreign key, so a deleted item left its vector behind — keyed on an id SQLite then handed to
+  the next item created, which **inherited the dead embedding**, read as already-indexed to
+  `index_pending`, and made ingest fail on a UNIQUE collision forever after.
+- **It was fixed four times, once per call site** (`undo`, `item rm`, ingest's re-capture arm,
+  ingest's fresh-capture arm) across review passes 5–8. Each fix was correct and incomplete,
+  because the enforcement was procedural: every present and future deleter had to remember.
+  Prefer an invariant the **schema** enforces over one every caller must uphold.
+- **All four in-transaction sweeps are removed.** A stale row is now inert, so cleanup is
+  housekeeping: `jkb_index::count_stale` / `sweep_stale`, surfaced as **`jkb index --sweep`**
+  and `jkb doctor [--fix]`. Removing them is the point — it deletes the question *which call
+  sites sweep?*, which is what produced four passes of findings.
+- Pinned by `item::tests::a_deleted_items_id_is_never_reused` (verified to fail without the
+  migration). **Note:** `V010` rebuilds `items`, so an older branch's binary cannot open a
+  database this one has migrated — the usual shared-`jkb.db` divergence.
 
 ## Sync: prose is not an item (the `memory/sync-export-wins` fix)
 

@@ -379,6 +379,12 @@ pub(crate) struct Recording {
 /// `BranchMissing` **is** covered: a branch that is gone was deleted by `land`, which happens
 /// only after its commits reached the target.
 ///
+/// **Every** recorded `branch=` is probed, and all of them must be covered. `set_location_facets`
+/// makes the facet single-valued *going forward*, but it exists because `task work` followed by
+/// `task start` used to leave two — and `tasks_by_branch` indexes every value for that same
+/// reason. Probing only the first meant a stale, deleted branch answered `BranchMissing`,
+/// stamped `reviewed=`, and opened the gate for a live sibling branch the review never saw.
+///
 /// Memoized per `(work branch, base)`: `is_merged` is about four git spawns, and a swarm group
 /// puts the same `branch=` on every task in it.
 fn work_is_in(
@@ -388,25 +394,33 @@ fn work_is_in(
     covered: &mut BTreeMap<(String, Option<String>), bool>,
 ) -> Result<bool> {
     let branches = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
-    let Some(work) = branches.first() else {
+    if branches.is_empty() {
         return Ok(false);
-    };
-    let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
-    let key = (work.clone(), base.clone());
-    if let Some(known) = covered.get(&key) {
-        return Ok(*known);
     }
-    let (state, _) = crate::gitrepo::is_merged(
-        repo_root,
-        work,
-        branch,
-        base.as_deref(),
-        crate::gitrepo::Prefer::Local,
-    )?;
-    let answer = matches!(
-        state,
-        crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
-    );
-    covered.insert(key, answer);
-    Ok(answer)
+    let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
+    for work in branches {
+        let key = (work.clone(), base.clone());
+        if let Some(known) = covered.get(&key) {
+            if *known {
+                continue;
+            }
+            return Ok(false);
+        }
+        let (state, _) = crate::gitrepo::is_merged(
+            repo_root,
+            work,
+            branch,
+            base.as_deref(),
+            crate::gitrepo::Prefer::Local,
+        )?;
+        let answer = matches!(
+            state,
+            crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
+        );
+        covered.insert(key, answer);
+        if !answer {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

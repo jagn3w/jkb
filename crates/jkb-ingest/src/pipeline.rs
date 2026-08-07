@@ -240,13 +240,13 @@ impl Pipeline {
                     for id in ids {
                         item::remove(conn, meta, id, true)?;
                     }
-                    // In the SAME transaction as the removals: `item_id` is the rowid, and the
-                    // fresh chunks below are about to be handed those very ids. Left behind,
-                    // each new chunk would inherit the deleted chunk's embedding and — because
-                    // `pending_rows_sql` tests membership in the vec table — read as already
-                    // indexed, so `jkb index` would never correct it and `doctor` would see
-                    // nothing wrong, the rows being attached to live items.
-                    jkb_index::drop_orphan_vectors(conn)?;
+                    // No vector sweep here. It used to be required — `item_id` is the rowid,
+                    // and the fresh chunks below were about to be handed those very ids, so a
+                    // leftover row made a new chunk inherit a dead embedding. Since D40
+                    // (`items.id AUTOINCREMENT`) a freed id is never reissued, so the leftover
+                    // rows are inert and are collected by `jkb index --sweep`. This sweep was
+                    // added, correctly, one call site at a time across four review passes —
+                    // which is the evidence that per-call-site cleanup was the wrong shape.
                     None
                 }
                 None => None,

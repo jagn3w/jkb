@@ -48,7 +48,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
     // Reconcile drift accumulated while not watching.
-    report_refusals(mount_ns, &engine::sync(db, mount_ns)?);
+    engine::sync(db, mount_ns)?;
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(debounce) {
@@ -59,17 +59,12 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 while let Ok(next) = rx.recv_timeout(debounce) {
                     rescan |= collect(next, &mut paths);
                 }
-                let report = if rescan {
+                if rescan {
                     // Fell behind (watcher error / dropped events): re-scan everything.
-                    Some(engine::sync(db, mount_ns)?)
-                } else if paths.is_empty() {
-                    None
-                } else {
+                    engine::sync(db, mount_ns)?;
+                } else if !paths.is_empty() {
                     let paths: Vec<PathBuf> = paths.into_iter().collect();
-                    Some(engine::sync_paths(db, mount_ns, &paths)?)
-                };
-                if let Some(report) = report {
-                    report_refusals(mount_ns, &report);
+                    engine::sync_paths(db, mount_ns, &paths)?;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {} // idle tick — re-check the stop flag
@@ -77,51 +72,6 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
         }
     }
     Ok(())
-}
-
-/// Say, on stderr, which files this reconcile refused — **or silently resolved against**.
-///
-/// The watcher used to discard every `SyncReport`, so a refusal it could not journal was
-/// invisible on every surface at once. A collision between files that have never synced
-/// writes no journal row on purpose — inventing one would give a file a base-less entry that
-/// `reconcile` then reads as "both sides changed" — so `jkb doctor`, which reads the journal,
-/// says the mount is healthy while none of its files is syncing. The report is the only
-/// remaining place that fact exists; printing it is what makes it observable.
-///
-/// stderr, because this is a long-running service whose stdout is a log file: a refusal is a
-/// diagnostic, not output.
-fn report_refusals(mount_ns: &str, report: &engine::SyncReport) {
-    // A `disk_wins`/`kb_wins` resolution DISCARDS one side's edits. The one-shot CLI prints
-    // it per file precisely so that is visible when it happens; under the installed watcher
-    // service the report was dropped, and `jkb doctor` cannot help — a resolution settles the
-    // journal to `ok`, so `needs_attention` returns nothing. Every surface was silent about
-    // the one outcome that throws work away.
-    for (path, how) in report.resolved() {
-        eprintln!("jkb sync [{mount_ns}]: RESOLVED {} — {how}", path.display());
-    }
-    // The engine's own reason, not a restatement: `Collided` covers both "a live sibling
-    // shares this namespace" (exclude one) and "the namespace's layout belongs to a file that
-    // is gone" (edit this one), and a fixed string told half of them to exclude a file that
-    // does not exist.
-    for (path, reason) in report.refusals() {
-        eprintln!(
-            "jkb sync [{mount_ns}]: REFUSED {} — {reason}",
-            path.display()
-        );
-    }
-    for path in report.quarantined() {
-        eprintln!(
-            "jkb sync [{mount_ns}]: needs attention (parse failed) {}",
-            path.display()
-        );
-    }
-    for path in report.conflicts() {
-        eprintln!(
-            "jkb sync [{mount_ns}]: CONFLICT {} — both sides changed the same item and the \
-             policy is `manual`; nothing was written",
-            path.display()
-        );
-    }
 }
 
 /// Watch **every** configured mount concurrently (one thread each), reconciling each

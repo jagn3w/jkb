@@ -280,18 +280,24 @@ fn fts_rebuild_and_integrity_check_pass() {
     .unwrap();
 }
 
-/// A vector row must not outlive its item, and re-embedding an id must replace rather than
-/// collide.
+/// A deleted item's vector must be sweepable, re-embedding an id must replace rather than
+/// collide, and — since D40 — a new item must **not** be able to land on a dead vector's id.
 ///
 /// The vec table is a virtual table, so it can carry no foreign key and nothing cascades. Its
-/// `item_id` is the rowid, so `SQLite` hands a deleted item's id to the next item created —
-/// after which the leftover row **collides** with the new one. Observed end to end: `jkb
-/// ingest` → `jkb undo` → `jkb ingest` failed with `UNIQUE constraint failed` and kept
-/// failing for every later ingest into that database, while a vector search for the deleted
-/// text returned the new document's chunks. `INSERT OR REPLACE` did not save it: vec0 ignores
-/// the conflict clause.
+/// `item_id` is the rowid, and while `items.id` was a plain rowid alias `SQLite` handed a
+/// deleted item's id to the next item created, after which the leftover row **collided** with
+/// it. Observed end to end: `jkb ingest` → `jkb undo` → `jkb ingest` failed with `UNIQUE
+/// constraint failed` and kept failing for every later ingest into that database, while a
+/// vector search for the deleted text returned the new document's chunks. `INSERT OR REPLACE`
+/// did not save it: vec0 ignores the conflict clause.
+///
+/// `AUTOINCREMENT` (V010) removed the reuse, so the last assertion is now the inverse of what
+/// this test originally pinned: the successor gets a **fresh** id and the stale row cannot be
+/// adopted. The sweep is still asserted, because a monotonically growing index still wants
+/// collecting — it is just housekeeping now rather than the thing standing between the store
+/// and corruption.
 #[test]
-fn a_deleted_items_vector_is_swept_and_a_reused_id_re_embeds() {
+fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
     let db = open_db();
     let embedder = FakeEmbedder::arc("fake", 16);
 
@@ -331,14 +337,16 @@ fn a_deleted_items_vector_is_swept_and_a_reused_id_re_embeds() {
         .unwrap();
     assert_eq!(dropped, 1, "the orphaned vector row goes with its item");
 
-    // A new item takes the freed rowid; embedding it must now succeed.
+    // The successor must NOT take the freed id — that is what makes a missed sweep harmless.
     db.write_txn("test", {
         let embedder = embedder.clone();
         move |conn, meta| {
             let new_id = add_item(conn, meta, "n:successor", "successor content");
-            assert_eq!(
-                new_id, id,
-                "SQLite reuses the freed rowid — the whole hazard"
+            assert!(
+                new_id.get() > id.get(),
+                "id {} was reissued after {} was deleted — a stale vector row could be adopted",
+                new_id.get(),
+                id.get()
             );
             VectorIndexer::new(embedder.clone())
                 .upsert_vector(conn, new_id, &embedder.embed("successor content").unwrap())
