@@ -97,28 +97,77 @@ pub enum PlacementRole {
     Reference,
 }
 
-/// Direction(s) in which a bound file and the KB are kept in sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncMode {
-    /// Disk is authoritative; changes flow disk -> KB.
-    Import,
-    /// KB is authoritative; changes flow KB -> disk.
-    Export,
-    /// Both directions, with conflict detection.
-    Bidirectional,
+/// Declare a database-facing enum **once**: the variant list, `ALL`, `as_str` and
+/// `from_db_str` are all generated from the same lines, so they cannot be one variant apart.
+///
+/// They were three hand-written lists, and every safeguard over them was escapable. A
+/// hand-written `ALL` could simply omit a variant; a test that walked it then proved nothing;
+/// and the `match` meant to force the issue only forced its *pattern* to be extended, which
+/// left the count and `ALL` untouched and the suite green. Meanwhile a missing `from_db_str`
+/// arm is not cosmetic: `cmd_mount_create` reads a stored value with
+/// `from_db_str(..).unwrap_or(default)`, so an unparseable one silently rewrites the mount —
+/// the exact silent reset this pair of functions exists to prevent.
+macro_rules! db_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident => $text:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order. Generated with the enum, so it is
+            /// complete by construction rather than by review.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
+
+            /// The `snake_case` string stored in the database (matches the serde form).
+            #[must_use]
+            pub fn as_str(self) -> &'static str {
+                match self { $( Self::$variant => $text, )+ }
+            }
+
+            /// The inverse of [`Self::as_str`], for reading a stored value back.
+            ///
+            /// It lives beside `as_str` (as [`TaskStatus::from_manual_str`] does) so the two
+            /// spellings cannot drift: hand-written parse sites in other crates were
+            /// catch-alls, so adding a variant compiled fine and silently reset a mount to
+            /// the default on the very path added to stop silent resets.
+            #[must_use]
+            pub fn from_db_str(s: &str) -> Option<Self> {
+                match s { $( $text => Some(Self::$variant), )+ _ => None }
+            }
+        }
+    };
 }
 
-/// What to do when both sides of a bidirectional binding changed since last sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConflictPolicy {
-    /// Take the on-disk version.
-    DiskWins,
-    /// Take the KB version.
-    KbWins,
-    /// Overwrite neither; report the conflict.
-    Manual,
+db_enum! {
+    /// Direction(s) in which a bound file and the KB are kept in sync.
+    pub enum SyncMode {
+        /// Disk is authoritative; changes flow disk -> KB.
+        Import => "import",
+        /// KB is authoritative; changes flow KB -> disk.
+        Export => "export",
+        /// Both directions, with conflict detection.
+        Bidirectional => "bidirectional",
+    }
+}
+
+db_enum! {
+    /// What to do when both sides of a bidirectional binding changed since last sync.
+    pub enum ConflictPolicy {
+        /// Take the on-disk version.
+        DiskWins => "disk_wins",
+        /// Take the KB version.
+        KbWins => "kb_wins",
+        /// Overwrite neither; report the conflict.
+        Manual => "manual",
+    }
 }
 
 /// The lifecycle state of a task.
@@ -370,76 +419,22 @@ impl EdgeType {
     }
 }
 
-impl SyncMode {
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Import => "import",
-            Self::Export => "export",
-            Self::Bidirectional => "bidirectional",
-        }
-    }
-
-    /// The inverse of [`Self::as_str`], for reading a stored value back.
-    ///
-    /// It lives beside `as_str` (as [`TaskStatus::from_manual_str`] does) so the two spellings
-    /// cannot drift: hand-written parse sites in other crates were catch-alls, so adding a
-    /// variant compiled fine and silently reset a mount to the default on the very path added
-    /// to stop silent resets.
-    #[must_use]
-    pub fn from_db_str(s: &str) -> Option<Self> {
-        match s {
-            "import" => Some(Self::Import),
-            "export" => Some(Self::Export),
-            "bidirectional" => Some(Self::Bidirectional),
-            _ => None,
-        }
-    }
-}
-
-impl ConflictPolicy {
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DiskWins => "disk_wins",
-            Self::KbWins => "kb_wins",
-            Self::Manual => "manual",
-        }
-    }
-
-    /// The inverse of [`Self::as_str`], for reading a stored value back. See
-    /// [`SyncMode::from_db_str`] for why this belongs here rather than at each call site.
-    #[must_use]
-    pub fn from_db_str(s: &str) -> Option<Self> {
-        match s {
-            "disk_wins" => Some(Self::DiskWins),
-            "kb_wins" => Some(Self::KbWins),
-            "manual" => Some(Self::Manual),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod round_trip {
     use super::{ConflictPolicy, SyncMode};
 
-    /// Every variant must survive `as_str` -> `from_db_str`. This is the test that fails when
-    /// someone adds a variant and forgets the parse arm — the catch-all parse sites this
-    /// replaced could not fail, they just silently mapped the new value to the default.
+    /// Every variant must survive `as_str` -> `from_db_str`.
+    ///
+    /// `ALL`, `as_str` and `from_db_str` are now generated together by `db_enum!`, so this
+    /// can no longer fail by omission — it is the check that the *generated* pair really is
+    /// a round trip, and the guard against a duplicated or mistyped stored string.
     #[test]
     fn db_strings_round_trip() {
-        for m in [SyncMode::Import, SyncMode::Export, SyncMode::Bidirectional] {
-            assert_eq!(SyncMode::from_db_str(m.as_str()), Some(m));
+        for m in SyncMode::ALL {
+            assert_eq!(SyncMode::from_db_str(m.as_str()), Some(*m));
         }
-        for p in [
-            ConflictPolicy::DiskWins,
-            ConflictPolicy::KbWins,
-            ConflictPolicy::Manual,
-        ] {
-            assert_eq!(ConflictPolicy::from_db_str(p.as_str()), Some(p));
+        for p in ConflictPolicy::ALL {
+            assert_eq!(ConflictPolicy::from_db_str(p.as_str()), Some(*p));
         }
         assert_eq!(SyncMode::from_db_str("nope"), None);
         assert_eq!(ConflictPolicy::from_db_str("nope"), None);

@@ -72,10 +72,35 @@ impl DisplayItem {
     }
 }
 
+/// The first non-blank line of `content`, trimmed and untruncated.
+///
+/// The **one** copy of this derivation. There were four, at three different truncation
+/// lengths, over content that carries checkbox and quick-add syntax (`- [ ] … !p1 ^id`) for
+/// every finding and every serializer-imported task — so the first change to it, such as
+/// stripping the trailing `^id`, had to be made in four places with nothing forcing the
+/// fourth, after which a staging row, a gate refusal and `jkb task show` would disagree
+/// about one task's name. Truncation is deliberately left to each caller: a listing, a
+/// staging row and a refusal message have genuinely different widths.
+pub(crate) fn first_nonblank(content: &str) -> &str {
+    content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+/// An item's display title: its first non-blank line, falling back to the uid for an item
+/// with no body. Untruncated — see [`first_nonblank`].
+pub(crate) fn title_of(meta: &jkb_core::item::ItemMeta) -> String {
+    match meta.content.as_deref().map(first_nonblank) {
+        Some(line) if !line.is_empty() => line.to_owned(),
+        _ => meta.uid.clone(),
+    }
+}
+
 /// A one-line snippet: the first non-empty line, trimmed to ~80 chars.
 fn snippet(content: &str) -> String {
-    let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let line = line.trim();
+    let line = first_nonblank(content);
     let mut out: String = line.chars().take(80).collect();
     if line.chars().count() > 80 {
         out.push('…');

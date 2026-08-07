@@ -17,6 +17,7 @@ pub mod claim;
 pub mod containment;
 pub mod dsl;
 pub mod edge;
+pub mod ingestion;
 pub mod investigation;
 pub mod item;
 pub mod mount;

@@ -79,6 +79,56 @@ pub(crate) fn set_facet(
     tag::apply(conn, meta, id, facet, value)
 }
 
+/// Remove every value of a facet, leaving the task carrying none.
+pub(crate) fn clear_facet(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    facet: &str,
+) -> jkb_core::Result<()> {
+    for (f, v) in tag::applications(conn, id)? {
+        if f == facet {
+            tag::remove(conn, meta, id, &f, &v)?;
+        }
+    }
+    Ok(())
+}
+
+/// Where a task is being worked. Every field is single-valued by nature: a second `branch=`
+/// is a contradiction, not extra information (design D36.6).
+#[derive(Default)]
+pub(crate) struct Location<'a> {
+    pub(crate) branch: Option<&'a str>,
+    pub(crate) repo: Option<&'a str>,
+    pub(crate) base: Option<&'a str>,
+    pub(crate) onto: Option<&'a str>,
+}
+
+/// Record where a task is being worked — the **one** writer of the location facets.
+///
+/// They had two: `task work` set them, `task start` added them with `tag::apply`. A task that
+/// saw both — which the guide encourages, since `start` tags from the ambient repo — ended up
+/// carrying two `branch=` values, and every reader that collapses the multi-map to one
+/// (`close-merged`'s merge probe, the staging rows) then picked whichever came first.
+pub(crate) fn set_location_facets(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    loc: &Location<'_>,
+) -> jkb_core::Result<()> {
+    for (facet, value) in [
+        (FACET_BRANCH, loc.branch),
+        (FACET_REPO, loc.repo),
+        (FACET_BASE, loc.base),
+        (FACET_ONTO, loc.onto),
+    ] {
+        if let Some(value) = value {
+            set_facet(conn, meta, id, facet, value)?;
+        }
+    }
+    Ok(())
+}
+
 /// What the session commands need to know about the repo they are running in.
 pub(crate) struct RepoCtx {
     /// The **main** copy's root — where `.jkb/` lives, even when invoked from inside a
@@ -133,6 +183,27 @@ pub(crate) fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String
     Ok(out)
 }
 
+/// Every task tagged `repo=<repo_key>`, as a **typed** query.
+///
+/// Built rather than parsed from `format!("kind:task tag:repo={key}")`: the key is a
+/// directory basename, so a repo cloned into `~/dev/my project` produced `tag:repo=my` plus
+/// a bare FTS term, which matches nothing. Every staging surface then reported empty — no
+/// staging branches, no batch to join, no task recording the branch a review ran on — while
+/// the tags themselves were stored correctly and nothing errored. Same reasoning as
+/// `review::findings_in`, which was fixed for the namespace and left here.
+pub(crate) fn tasks_in_repo(repo_key: &str) -> jkb_core::query::Query {
+    use jkb_core::query::{CmpOp, Query, TagPred};
+    Query {
+        kind: Some("task".to_owned()),
+        tags: vec![TagPred {
+            facet: FACET_REPO.to_owned(),
+            op: CmpOp::Eq,
+            value: repo_key.to_owned(),
+        }],
+        ..Query::default()
+    }
+}
+
 /// One of this repo's tasks with everything the session and staging reads need.
 pub(crate) struct RepoTask {
     pub(crate) meta: jkb_core::item::ItemMeta,
@@ -150,13 +221,7 @@ impl RepoTask {
 
     /// The first line of the task's body — what a human calls the task.
     pub(crate) fn title(&self) -> String {
-        self.meta
-            .content
-            .as_deref()
-            .and_then(|c| c.lines().find(|l| !l.trim().is_empty()))
-            .unwrap_or(&self.meta.uid)
-            .trim()
-            .to_owned()
+        crate::output::title_of(&self.meta)
     }
 }
 
@@ -167,7 +232,7 @@ impl RepoTask {
 /// task ever worked in this repo. That is fine for `task sessions` at three sessions and not
 /// fine for a view that redraws on every database write (design D38.2).
 pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
-    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo_key}"))?;
+    let query = tasks_in_repo(repo_key);
     Ok(db.read(move |conn| {
         let ids = query.evaluate(conn)?;
         let metas = item::get_many(conn, &ids)?;

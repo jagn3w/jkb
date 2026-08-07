@@ -645,6 +645,15 @@ enum TaskCmd {
         /// that get worked. Defaults the new task's home to the parent's.
         #[arg(long)]
         under: Option<String>,
+        /// Home the task in this namespace, taken **verbatim**.
+        ///
+        /// The quick-add `+<ns>` form is re-tokenized on whitespace along with the rest of
+        /// the line, so a namespace containing a space (which `ns::normalize` permits, and
+        /// which a synced directory named `my change` produces) creates a different, wrong
+        /// namespace and swallows the remainder into the title. Pass the path here when it
+        /// comes from a picker rather than from a person typing.
+        #[arg(long)]
+        home: Option<String>,
     },
     /// List the ready frontier (optionally scoped/filtered by DSL terms).
     Next {
@@ -1642,22 +1651,12 @@ impl Child {
 
 /// A short label for an item: its first non-empty content line (≤80 chars), else its uid.
 fn item_label(meta: &item::ItemMeta) -> String {
-    let line = meta
-        .content
-        .as_deref()
-        .unwrap_or("")
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.is_empty() {
-        return meta.uid.clone();
-    }
-    let mut s: String = line.chars().take(80).collect();
-    if line.chars().count() > 80 {
-        s.push('…');
-    }
-    s
+    // The derivation is `output::title_of` — the one copy. Only the width is this function's
+    // own, which is the split that helper's doc describes: a tree row, a staging row and a
+    // gate refusal have different widths but must agree on what the task is *called*. This
+    // was the fourth surviving copy, and the one that names tasks in the explorer tree.
+    let title = output::title_of(meta);
+    truncate(&title, 80)
 }
 
 /// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
@@ -2233,7 +2232,15 @@ fn cmd_tree(
 /// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
 fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
     let id = require_uid(db, uid)?;
-    let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
+    // The sweep runs in the SAME transaction as the delete. Split across two, a concurrent
+    // writer on this global database can take the freed rowid in between — after which the
+    // sweep's `item_id NOT IN (SELECT id FROM items)` no longer matches, and the new item
+    // silently keeps the deleted one's embedding.
+    let removed = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
+        let removed = item::remove(conn, meta, id, force)?;
+        jkb_index::drop_orphan_vectors(conn)?;
+        Ok(removed)
+    })?;
     if json {
         println!(
             "{}",
@@ -3735,25 +3742,11 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
     }
-    // Not a conflict to resolve: two files cannot share one namespace, so the mount's globs
-    // have to select one per directory. Say so, because the fix is configuration, not a merge.
-    for path in report.collided() {
-        println!(
-            "  REFUSED (another synced file shares its namespace): {}",
-            path.display()
-        );
-    }
-    if report.count(Collided) > 0 {
-        println!(
-            "  this serializer keeps a file's sections and order on its directory's \
-             namespace, so one directory can hold at most one synced file."
-        );
-        // `--exclude`, not `--include`: an already-bound file keeps syncing even when a
-        // narrowed include no longer selects it, so only exclusion drops a bound sibling.
-        println!(
-            "  exclude the sibling, e.g. `jkb mount create <ns> <dir> --exclude '**/design.md'` \
-             (a narrowed --include does not drop a file that is already bound)"
-        );
+    // Each refusal with the engine's own reason. `Collided` has two causes with opposite
+    // remedies — a live sibling (exclude one) versus a namespace whose layout belongs to a
+    // departed file (edit this one) — so the reason is carried, not restated here.
+    for (path, reason) in report.refusals() {
+        println!("  REFUSED {}: {reason}", path.display());
     }
     Ok(())
 }
@@ -3764,6 +3757,9 @@ struct AddFlags {
     backlog: bool,
     sync: bool,
     managed: bool,
+    /// An explicit home namespace, taken verbatim rather than lexed out of the quick-add
+    /// line — see the `--home` flag.
+    home: Option<String>,
 }
 
 /// Derive a task's home namespace from `--backlog` and the ambient repo (design D26),
@@ -3841,6 +3837,13 @@ fn cmd_task_add(
     let uid = task::mint_uid(&qa.title);
     let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
 
+    // `--home` wins over a `+<ns>` in the line: it is the unambiguous form, and it is the
+    // only one that can carry a path containing whitespace.
+    if let Some(home) = &flags.home {
+        spec.home.clone_from(home);
+        had_explicit_placement = true;
+    }
+
     // A subtask defaults to living beside its parent: splitting a task should not scatter
     // the pieces across namespaces, and `--under` is the only signal about where it belongs.
     let parent = match under {
@@ -3891,6 +3894,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             sync,
             managed,
             under,
+            home,
         } => cmd_task_add(
             db,
             &text,
@@ -3898,6 +3902,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
                 backlog,
                 sync,
                 managed,
+                home,
             },
             under.as_deref(),
             json,
@@ -4120,10 +4125,19 @@ fn cmd_task_start(
             "not on a branch here (detached HEAD?) — pass --branch, or run inside a git repo",
         )?,
     };
+    // Through the MAIN copy, never `key(&cwd)`: inside a `jkb task work` session that is the
+    // session's own directory, so the key came out as the session name — and now that these
+    // facets are *set* rather than added, that replaced the real `repo=` instead of sitting
+    // beside it. Every `repo=`-keyed surface (`staging ls`, In Flight, `task sessions`,
+    // `batch_onto`, `task review record`) then stopped seeing the task, and `review record`
+    // matching nothing is indistinguishable from a review that was never run.
     let repo = match repo {
         Some(r) => r,
-        None => gitrepo::key(&cwd)?
-            .context("not inside a git repo — pass --repo, or run this from the repo")?,
+        None => {
+            repo::repo_ctx()
+                .context("not inside a git repo — pass --repo, or run this from the repo")?
+                .key
+        }
     };
     // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
     // anything merged, since trunk is trivially "merged into" itself.
@@ -4145,13 +4159,57 @@ fn cmd_task_start(
     let id = resolve_task_uid(db, uid)?;
     let owner = owner.unwrap_or_else(owner::self_owner);
     let (o, b, r, base_sha) = (owner.clone(), branch.clone(), repo.clone(), base.clone());
-    db.write_txn("cli", move |conn, meta| {
-        claim::claim(conn, meta, id, &o)?;
-        tag::apply(conn, meta, id, repo::FACET_BRANCH, &b)?;
-        tag::apply(conn, meta, id, repo::FACET_REPO, &r)?;
-        if let Some(sha) = &base_sha {
-            tag::apply(conn, meta, id, repo::FACET_BASE, sha)?;
+    // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
+    // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
+    // answer as a refusal meant `task start` refused its own second run under a new pid, and
+    // refused after `task work` — the very sequence the facet writing below exists for, since
+    // a session claims as `session:<pid>:<worktree>`.
+    let held = current_claim(db, id)?;
+    let mut keep_claim = false;
+    if let Some(prev) = &held {
+        if prev != &owner && owner::is_alive(prev) {
+            // A live session for this task that we are standing **inside** keeps its claim:
+            // replacing a `session:` owner with this one-second process's `host:pid` would
+            // make the task read as dead to `doctor --fix` the moment it exits, freeing a
+            // session someone is working in (D36.6). Any other live owner is someone else.
+            let inside =
+                owner::session_worktree(prev).is_some_and(|w| session::is_within(&cwd, &w));
+            anyhow::ensure!(
+                inside,
+                "{uid} is already claimed by {prev}, which is still alive — nothing was \
+                 changed. Finish or abandon that work, or use `jkb task release {uid} \
+                 --owner {prev}` if you are sure it is gone."
+            );
+            keep_claim = true;
         }
+    }
+    let displaced = held.clone();
+    db.write_txn("cli", move |conn, meta| {
+        // The CAS answer is checked rather than discarded: losing it means someone claimed the
+        // task between the probe and here, and reporting "started" while writing this session's
+        // branch onto their task is exactly the confusion the liveness guard above prevents.
+        if !keep_claim && !swap_claim(conn, meta, id, displaced.as_deref(), &o)? {
+            return Err(jkb_types::Error::Validation(
+                "the task was claimed by someone else while this command was checking — \
+                 nothing was changed; run it again"
+                    .to_owned(),
+            )
+            .into());
+        }
+        // Through the one location-facet writer, exactly as `task work` does. These were
+        // additive here, so `task work` followed by `task start` — which the guide encourages
+        // — left the task carrying two `branch=` values for one worktree.
+        repo::set_location_facets(
+            conn,
+            meta,
+            id,
+            &repo::Location {
+                branch: Some(&b),
+                repo: Some(&r),
+                base: base_sha.as_deref(),
+                ..repo::Location::default()
+            },
+        )?;
         Ok(())
     })?;
     if json {
@@ -4341,13 +4399,17 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     let base = gitrepo::rev(&ctx.root, &onto)?;
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
     db.write_txn("cli", move |conn, meta| {
-        repo::set_facet(conn, meta, id, repo::FACET_BRANCH, &b)?;
-        repo::set_facet(conn, meta, id, repo::FACET_REPO, &r)?;
-        repo::set_facet(conn, meta, id, repo::FACET_ONTO, &o)?;
-        if let Some(sha) = &base {
-            repo::set_facet(conn, meta, id, repo::FACET_BASE, sha)?;
-        }
-        Ok(())
+        repo::set_location_facets(
+            conn,
+            meta,
+            id,
+            &repo::Location {
+                branch: Some(&b),
+                repo: Some(&r),
+                onto: Some(&o),
+                base: base.as_deref(),
+            },
+        )
     })?;
 
     if json {
@@ -4493,7 +4555,13 @@ fn batch_is_spent(ctx: &repo::RepoCtx, branch: &str) -> Result<bool> {
     let Some(trunk) = &ctx.trunk else {
         return Ok(false);
     };
-    Ok(gitrepo::is_merged(&ctx.root, branch, trunk, None)?.0 == gitrepo::MergeState::Merged)
+    // The **local** branch: this asks whether the batch here has anything left to give,
+    // and a local ref that has had another task landed onto it is not spent, whatever its
+    // pushed copy did.
+    Ok(
+        gitrepo::is_merged(&ctx.root, branch, trunk, None, gitrepo::Prefer::Local)?.0
+            == gitrepo::MergeState::Merged,
+    )
 }
 
 /// Remove `.jkb/base`, freeing the branch it holds. It is only ever a checkout cache; `land`
@@ -4506,14 +4574,54 @@ fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
     Ok(())
 }
 
-/// Take the session's claim, taking over from this session's own previous process (a resume)
-/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
-fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -> Result<()> {
-    let held = db
+/// Who holds `id` right now, or `None` if it is free.
+///
+/// The read half of every claim takeover: the owner string this returns is the one the caller
+/// judges (liveness, same-session, same-worktree) and the one [`swap_claim`] must later CAS
+/// against, so the two always talk about the same claim.
+fn current_claim(db: &Db, id: ItemId) -> Result<Option<String>> {
+    Ok(db
         .read(claim::claimed)?
         .into_iter()
         .find(|c| c.id == id)
-        .map(|c| c.owner);
+        .map(|c| c.owner))
+}
+
+/// Move the claim on `id` to `owner`, atomically against `displaced` — the **exact** owner
+/// [`current_claim`] returned and the caller judged. `Ok(false)` means the claim changed hands
+/// in between and nothing was written; every caller turns that into "run it again".
+///
+/// Clearing first is what lets a resumed session re-take its own claim under a new pid: the CAS
+/// in [`claim::claim`] accepts only a free task or a byte-identical owner. Clearing only the
+/// *judged* owner is what stops it from throwing away a claim it never looked at — the liveness
+/// probe forks `ps` outside the transaction, and a `jkb task work` landing in that window would
+/// otherwise lose its fresh claim to a decision taken about a different, dead owner.
+///
+/// The one rendering of that dance. It was written twice, and the copies had already drifted:
+/// one checked the CAS answer and one did not, so half the callers could report success while
+/// writing this session's branch onto somebody else's task.
+///
+/// # Errors
+/// Returns an error if either claim write fails.
+fn swap_claim(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    displaced: Option<&str>,
+    owner: &str,
+) -> jkb_core::Result<bool> {
+    if let Some(prev) = displaced {
+        if !claim::clear_if(conn, meta, id, prev)? {
+            return Ok(false);
+        }
+    }
+    claim::claim(conn, meta, id, owner)
+}
+
+/// Take the session's claim, taking over from this session's own previous process (a resume)
+/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
+fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -> Result<()> {
+    let held = current_claim(db, id)?;
     if let Some(prev) = &held {
         let same_session =
             owner::session_worktree(prev).is_some_and(|w| session::same_path(&w, worktree));
@@ -4528,16 +4636,15 @@ fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -
             );
         }
     }
-    let (o, had) = (owner.to_owned(), held.is_some());
+    let (o, displaced) = (owner.to_owned(), held.clone());
     let ok = db.write_txn("cli", move |conn, meta| {
-        // Clearing first is what lets a resumed session re-take its own claim under a new
-        // pid: the CAS in `claim` only accepts a free task or the identical owner string.
-        if had {
-            claim::clear(conn, meta, id)?;
-        }
-        claim::claim(conn, meta, id, &o)
+        swap_claim(conn, meta, id, displaced.as_deref(), &o)
     })?;
-    anyhow::ensure!(ok, "could not claim {uid}");
+    anyhow::ensure!(
+        ok,
+        "{uid} was claimed by someone else while this command was checking — nothing was \
+         changed; run it again"
+    );
     Ok(())
 }
 
@@ -4548,6 +4655,84 @@ struct LandFlags {
     no_gate: bool,
     keep_worktree: bool,
     no_review: bool,
+}
+
+/// What `land` needs from the task and its session once every precondition has held.
+struct Preflight {
+    sess: session::Session,
+    branch: String,
+    onto: String,
+    ahead: usize,
+}
+
+/// Everything `land` checks before the review gate: it must be landable *at all*, and nothing
+/// here has moved a branch, so a refusal leaves the repo exactly as it was.
+///
+/// These are the same conditions `staging::land_blocker` reports per row (design D38.8) —
+/// this is the authority, and the row renders the verdict this side computes rather than
+/// re-deriving it from a projection that cannot express half of them.
+fn land_preflight(
+    db: &Db,
+    ctx: &repo::RepoCtx,
+    uid: &str,
+    id: ItemId,
+    tags: &BTreeMap<String, Vec<String>>,
+) -> Result<Preflight> {
+    // The task's own pipeline state, mapped by the one function that does that — so the
+    // terminal arm of `land_blocker` below is the arm that actually fires here, rather than a
+    // second bail beside it saying the same thing in its own words.
+    let state = staging::State::from_status(
+        &db.read(move |conn| item::get(conn, id))?
+            .and_then(|m| m.status)
+            .unwrap_or_default(),
+    );
+    anyhow::ensure!(
+        !repo::facet_values(tags, repo::FACET_BRANCH).is_empty(),
+        "{uid} has no session — run `jkb task work {uid}` first"
+    );
+    let sess = session_for(ctx, tags)?.with_context(|| {
+        format!(
+            "no session worktree for {} — it may already have landed, or been removed",
+            repo::facet_values(tags, repo::FACET_BRANCH).join(", ")
+        )
+    })?;
+    let branch = sess.branch.clone();
+    let onto = repo::facet_one(tags, repo::FACET_ONTO)
+        .cloned()
+        .context("this session records no land target — re-run `jkb task work` with --onto")?;
+    anyhow::ensure!(
+        gitrepo::has_branch(&ctx.root, &onto)?,
+        "the land target {onto} no longer exists"
+    );
+    // Everything from here is `staging::land_blocker` — the ONE derivation of "may this
+    // land", which the In Flight row renders verbatim. It was restated per surface twice, and
+    // each time a row claimed "Landable" for a task this command then refused: the uncommitted
+    // session, the empty branch, the dirty target checkout, the review gate. Assembling the
+    // facts is this side's job; judging them is not.
+    let ahead = gitrepo::ahead_count(&ctx.root, &onto, &branch)?;
+    let worktrees = gitrepo::worktrees(&ctx.root)?;
+    let mut dirty_cache = BTreeMap::new();
+    let target_dirty =
+        staging::target_dirty_reason(&worktrees, &ctx.root, &onto, &mut dirty_cache)?;
+    if let Some(reason) = staging::land_blocker(&staging::LandFacts {
+        state,
+        worktree: Some(&sess.worktree),
+        dirty: gitrepo::is_dirty(&sess.worktree)?,
+        commits: ahead,
+        branch_exists: true,
+        target_dirty: target_dirty.as_deref(),
+        // The review is enforced a moment later by `review::enforce`, which renders the same
+        // verdict at length and is where `--no-review` records a waiver instead of refusing.
+        verdict: None,
+    }) {
+        anyhow::bail!("{uid} cannot land. {reason}");
+    }
+    Ok(Preflight {
+        sess,
+        branch,
+        onto,
+        ahead,
+    })
 }
 
 fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
@@ -4561,35 +4746,12 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
     let ctx = repo::repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
     let tags = repo::task_tags(db, id)?;
-    anyhow::ensure!(
-        !repo::facet_values(&tags, repo::FACET_BRANCH).is_empty(),
-        "{uid} has no session — run `jkb task work {uid}` first"
-    );
-    let sess = session_for(&ctx, &tags)?.with_context(|| {
-        format!(
-            "no session worktree for {} — it may already have landed, or been removed",
-            repo::facet_values(&tags, repo::FACET_BRANCH).join(", ")
-        )
-    })?;
-    let branch = sess.branch.clone();
-    let onto = repo::facet_one(&tags, repo::FACET_ONTO)
-        .cloned()
-        .context("this session records no land target — re-run `jkb task work` with --onto")?;
-    anyhow::ensure!(
-        gitrepo::has_branch(&ctx.root, &onto)?,
-        "the land target {onto} no longer exists"
-    );
-
-    anyhow::ensure!(
-        !gitrepo::is_dirty(&sess.worktree)?,
-        "{} has uncommitted changes — commit them in the session before landing",
-        sess.worktree.display()
-    );
-    let ahead = gitrepo::ahead_count(&ctx.root, &onto, &branch)?;
-    anyhow::ensure!(
-        ahead > 0,
-        "{branch} has no commits that {onto} does not — nothing to land"
-    );
+    let Preflight {
+        sess,
+        branch,
+        onto,
+        ahead,
+    } = land_preflight(db, &ctx, uid, id, &tags)?;
 
     // The review gate (design D38.5), before the graft: a refusal must not have moved a
     // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
@@ -4686,29 +4848,96 @@ fn settle_landing(
     landed: Landed<'_>,
     json: bool,
 ) -> Result<()> {
-    // Landed: the task is done, the claim is free, and the session branch is a duplicate of
-    // commits now in `onto`. The waiver is recorded here, in the same transaction, because it
-    // describes a landing that has now definitely happened.
-    let waiver = landed.waiver.map(str::to_owned);
-    db.write_txn("cli", move |conn, meta| {
-        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
-        claim::clear(conn, meta, id)?;
-        if let Some(sha) = &waiver {
-            repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, sha)?;
-        }
-        Ok(())
-    })?;
+    // The waiver first, in its own transaction, because it describes something that has
+    // **already** happened: the commits are on the target before this function is called.
+    // Written together with the status below, it was lost every time the dirty-session guard
+    // bailed — the override had landed, and nothing anywhere recorded that the review gate was
+    // skipped, which is precisely the state `--no-review` records a facet to avoid (D38.5). It
+    // is also recorded for a task somebody finished during the gate: the waived landing is what
+    // it describes, not the status.
+    if let Some(sha) = landed.waiver {
+        let sha = sha.to_owned();
+        db.write_txn("cli", move |conn, meta| {
+            repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, &sha)
+        })?;
+    }
+
+    // Is the session still there at all? `git status` in a directory that no longer exists
+    // exits non-zero, and `gitrepo::git` maps that to `Ok(None)` — so `is_dirty` answers
+    // "clean" for a vanished worktree and the disposal below then fails on it. A concurrent
+    // `jkb task abandon` removes exactly this directory, so the case is real, and "gone" is
+    // the one state where disposal has nothing left to do.
+    let disposed_already = !sess.worktree.exists();
+
+    // The session was verified clean in `land_preflight`, but that was before a graft and a
+    // gate build that can run for minutes — long enough for the agent sitting in the session
+    // to write a file. Every disposal below is destructive (`reset --hard`, `worktree
+    // remove`), so the check is taken **again**, here, against the state we are about to
+    // discard. The landing itself already happened and is not undone by this; the session is
+    // simply kept, with its work, for the person to deal with.
+    anyhow::ensure!(
+        disposed_already || !gitrepo::is_dirty(&sess.worktree)?,
+        "{branch} landed on {onto} — the commits are there — but {} has uncommitted changes \
+         written since the landing began, so the session is kept exactly as it is rather than \
+         reset over them. Deal with them, then close the task with \
+         `jkb task set {uid} --status done` and drop the session with \
+         `jkb task abandon {uid} --force`.",
+        sess.worktree.display(),
+        branch = landed.branch,
+        onto = landed.onto,
+        uid = landed.uid,
+    );
+
+    // Dispose of the session FIRST, because it is the fallible half. `worktree_remove` without
+    // `--force` is refused by git on a dirty tree, and doing it after the status write left
+    // the task marked `done` with its claim freed and its worktree still there — a state both
+    // escape hatches then refuse ("is done — there is nothing to land", "abandoning it would
+    // reopen finished work"), recoverable only by hand-editing the status.
     let mut cleaned = false;
-    if landed.keep_worktree {
+    if disposed_already {
+        // Somebody removed it while the gate ran. Nothing to dispose of, and prune the
+        // registration so git stops listing a worktree whose directory is gone.
+        let _ = gitrepo::prune_worktrees(&ctx.root);
+        cleaned = true;
+    } else if landed.keep_worktree {
         // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
         // commits. Left there, the kept session reads as N commits ahead of a target that
         // already contains its work, and a second `land` re-runs the whole graft. Move it to
-        // what actually landed; the worktree is verified clean above, so nothing is lost.
+        // what actually landed; the worktree is verified clean just above, so nothing is lost.
         gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
     } else {
         gitrepo::worktree_remove(&ctx.root, &sess.worktree, false)?;
         gitrepo::delete_branch(&ctx.root, landed.branch, true)?;
         cleaned = true;
+    }
+
+    // Landed: the task is done, the claim is free, and the session branch is a duplicate of
+    // commits now in `onto`.
+    //
+    // The status is re-read **inside** the transaction: `land_preflight` checked it before a
+    // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
+    // land (`LandLock` only excludes a second land). Writing `Done` over a cancellation made
+    // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
+    // Whether the status was left as somebody else set it during the gate. Reported, not
+    // returned as an error: the session HAS been disposed of by this point, so bailing left
+    // the claim held on a worktree that no longer exists — freed only by `doctor --fix` — and
+    // said nothing about what had just been removed.
+    let kept_status = db.write_txn("cli", move |conn, meta| {
+        // The claim goes either way: it names a session this command has just destroyed.
+        claim::clear(conn, meta, id)?;
+        let current = item::get(conn, id)?.and_then(|m| m.status);
+        if matches!(current.as_deref(), Some("done" | "cancelled")) {
+            return Ok(current);
+        }
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
+        Ok(None)
+    })?;
+    if let Some(status) = &kept_status {
+        eprintln!(
+            "note: {} became {status} while the gate was running, so its status was left \
+             alone. Its commits are on {}, and its session has been disposed of.",
+            landed.uid, landed.onto
+        );
     }
 
     if json {
@@ -4788,6 +5017,18 @@ fn cmd_task_abandon(
 ) -> Result<()> {
     let ctx = repo::repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
+    // Abandon does two separable things: it **disposes of the session**, and it **reopens the
+    // task**. Only the second is wrong for a terminal task — a landed one is already merged
+    // and a cancelled one was deliberately dropped, so putting either back on the ready
+    // frontier (still tagged with its branch, re-dispatchable to the swarm) is the harm.
+    //
+    // Refusing outright was the first fix, and it stranded the session instead: `task set
+    // --status cancelled` leaves the worktree, branch and claim in place, no other verb
+    // removes them, and the workaround the refusal suggested — reopen, then abandon — caused
+    // exactly the reopening it was guarding against. So the cleanup runs and the status is
+    // left alone. The decision is taken inside the transaction below, against the status as
+    // it is *then* — not against a snapshot from before a worktree removal that can take
+    // long enough for a concurrent land to finish.
     let tags = repo::task_tags(db, id)?;
     let sess = session_for(&ctx, &tags)?;
     // Prefer the branch that actually has a worktree; fall back to the recorded one so a
@@ -4803,18 +5044,22 @@ fn cmd_task_abandon(
     // actively building is one right-click away — and `claim::clear` has no owner CAS, so it
     // would free a live claim and let the next SCHEDULER pass dispatch a second builder while
     // the first keeps going. Refuse a claim this session does not hold unless forced.
-    let held = db
-        .read(claim::claimed)?
-        .into_iter()
-        .find(|c| c.id == id)
-        .map(|c| c.owner);
+    let held = current_claim(db, id)?;
     if let Some(owner) = &held {
         let mine = sess.as_ref().is_some_and(|s| {
             owner::session_worktree(owner).is_some_and(|w| session::same_path(&w, &s.worktree))
         });
-        if !mine && !force {
+        // **Liveness**, the same rule `task work` and `task start` follow (D27.1/D36.6) —
+        // not owner-string identity. Judging by name refused a claim left behind by a crashed
+        // implementer or a session whose worktree was deleted by hand, so the one command that
+        // exists to clean a session up was blocked by the wreckage it was there to remove, and
+        // pointed the user at `jkb task release` for an owner that provably no longer exists.
+        // What must be protected is work someone is *still doing*.
+        if !mine && owner::is_alive(owner) && !force {
             anyhow::bail!(
-                "{uid} is claimed by {owner}, not by a session here — abandoning it would                  free a claim someone else is working under. Use `jkb task release {uid}                  --owner {owner}` if you are sure it is dead, or pass --force."
+                "{uid} is claimed by {owner}, which is still alive — abandoning it would free \
+                 a claim someone is working under. Finish or abandon that work, use `jkb task \
+                 release {uid} --owner {owner}` if you are sure it is gone, or pass --force."
             );
         }
     }
@@ -4832,22 +5077,57 @@ fn cmd_task_abandon(
     if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
     }
-    // Release and reopen: the task is available again, and its claim is gone with the
-    // worktree that held it.
-    db.write_txn("cli", move |conn, meta| {
-        claim::clear(conn, meta, id)?;
+    // Release, and reopen unless the task is already finished.
+    //
+    // `onto=` is cleared **only** when the task is reopened, which is exactly when it stops
+    // being true: an abandoned task is no longer landing on that batch, and leaving the facet
+    // made it keep rendering as live `implementing` work — which in turn kept its staging
+    // branch classified unmerged and offered as a land target long after the batch was spent
+    // (D36.3). For a task that stays `done` or `cancelled` the facet is history: it records
+    // which batch the work went to (or was dropped from), and the In Flight view reads it.
+    //
+    // The status is re-read inside the transaction, so a task that finished while this
+    // command was removing a worktree is not reopened by a decision taken before that.
+    // Reported from what the transaction actually did, not from the snapshot taken before the
+    // worktree removal: a task that finished while this command was running was correctly
+    // left alone, and then announced as "open again" with `"reopened": true`, which the
+    // extension believes.
+    let observed = held.clone();
+    let (reopened, final_status) = db.write_txn("cli", move |conn, meta| {
+        // Only the claim judged above, and nothing at all when there was none. `held` was read
+        // before two git subprocesses (`worktree remove`, `delete-branch`) — a far wider window
+        // than the `ps` fork that motivated `clear_if` — so a claim taken in the meantime
+        // belongs to a worker whose claim this command never looked at. An unconditional clear
+        // freed a task the next SCHEDULER pass had just handed to an implementer, and then
+        // reopened it, which is how two builders end up on one task.
+        if let Some(prev) = &observed {
+            claim::clear_if(conn, meta, id, prev)?;
+        }
+        let current = item::get(conn, id)?
+            .and_then(|m| m.status)
+            .unwrap_or_default();
+        if matches!(current.as_str(), "done" | "cancelled") {
+            return Ok((false, current));
+        }
+        repo::clear_facet(conn, meta, id, repo::FACET_ONTO)?;
         task::set_status(conn, meta, id, jkb_types::TaskStatus::Open)?;
-        Ok(())
+        Ok((true, "open".to_owned()))
     })?;
 
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "uid": uid, "abandoned": true, "branch": branch,
+                "uid": uid, "abandoned": true, "branch": branch, "reopened": reopened,
+                "status": final_status,
                 "worktree_removed": sess.is_some(), "branch_deleted": delete_branch,
             })
         );
+    } else if !reopened {
+        println!("abandoned the session for {uid}; it stays {final_status}");
+        if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
+            println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
+        }
     } else {
         println!("abandoned {uid}; it is open again");
         if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
@@ -5011,10 +5291,15 @@ fn cmd_task_close_merged(
     json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    // The main copy's key, for the same reason `task start` uses it: run from a session
+    // worktree, `key(&cwd)` is the session's name and this silently matches no tasks at all.
     let repo = match repo {
         Some(r) => r,
-        None => gitrepo::key(&cwd)?
-            .context("not inside a git repo — pass --repo, or run this from the repo")?,
+        None => {
+            repo::repo_ctx()
+                .context("not inside a git repo — pass --repo, or run this from the repo")?
+                .key
+        }
     };
     let trunk_ref = match trunk {
         Some(t) => t,
@@ -5024,8 +5309,10 @@ fn cmd_task_close_merged(
         )?,
     };
 
-    // Every open task tagged for this repo that names a branch.
-    let query = jkb_core::query::parse(&format!("kind:task tag:{}={repo}", repo::FACET_REPO))?;
+    // Every open task tagged for this repo that names a branch. Typed, not interpolated into
+    // the DSL: `--repo` is user-typed and a value with whitespace would re-tokenize into a
+    // different query that matches nothing, closing no task and reporting no error.
+    let query = repo::tasks_in_repo(&repo);
     let ids = db.read(move |conn| query.evaluate(conn))?;
 
     let mut closed = Vec::new();
@@ -5040,7 +5327,15 @@ fn cmd_task_close_merged(
             continue;
         }
 
-        let (state, fell_back) = gitrepo::is_merged(&cwd, &branch, &trunk_ref, base.as_deref())?;
+        // The remote copy answers "did this work ship?" — after a merged PR the local branch
+        // is usually stale or already deleted (design D34.2).
+        let (state, fell_back) = gitrepo::is_merged(
+            &cwd,
+            &branch,
+            &trunk_ref,
+            base.as_deref(),
+            gitrepo::Prefer::Remote,
+        )?;
         if fell_back && !warned_fallback {
             warned_fallback = true;
             eprintln!(
@@ -5369,12 +5664,32 @@ fn cmd_view(db: &Db, cmd: ViewCmd, json: bool) -> Result<()> {
 }
 
 fn cmd_undo(db: &Db, txn: Option<i64>) -> Result<()> {
-    let n = db.write_txn("cli", move |conn, meta| match txn {
-        Some(txn) => undo::undo(conn, meta, txn),
-        None => undo::undo_last(conn, meta),
+    // Undo and its vector sweep are ONE transaction, so no concurrent writer can take a
+    // freed rowid between the delete and the sweep and inherit the deleted item's embedding.
+    let (n, dropped) = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
+        let n = match txn {
+            Some(txn) => undo::undo(conn, meta, txn),
+            None => undo::undo_last(conn, meta),
+        }?;
+        Ok((n, jkb_index::drop_orphan_vectors(conn)?))
     })?;
     println!("reverted {n} change(s)");
+    if dropped > 0 {
+        println!("  dropped {dropped} orphaned vector row(s)");
+    }
     Ok(())
+}
+
+/// Delete vector rows whose item is gone, returning how many went.
+///
+/// The repair verb — `jkb doctor --fix` — for a database that already carries orphans. The
+/// delete paths themselves sweep **inside their own transaction** (`item rm`, `undo`) rather
+/// than calling this, because a second transaction leaves a window in which another writer
+/// can take the freed rowid and inherit the dead embedding.
+fn sweep_orphan_vectors(db: &Db) -> Result<usize> {
+    db.write_txn_with::<usize, anyhow::Error, _>("cli", |conn, _meta| {
+        Ok(jkb_index::drop_orphan_vectors(conn)?)
+    })
 }
 
 fn cmd_index(db: &Db) -> Result<()> {
@@ -5477,6 +5792,8 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         }
     }
 
+    report_vector_index(db, fix)?;
+
     // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on
     // purpose — the half-written branch is still there — so a session is never reported as
     // orphaned. Doctor lists every one, because nothing observable distinguishes a session
@@ -5511,9 +5828,10 @@ fn output_line(item: &output::DisplayItem) -> String {
     format!("{}{ns}{snip}", item.uid)
 }
 
+/// The first line of a body, for a one-line report. The derivation is `output::first_nonblank`
+/// (the one copy); only the width is this function's own.
 fn first_line(content: &str) -> String {
-    let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    line.trim().chars().take(100).collect()
+    truncate(output::first_nonblank(content), 100)
 }
 
 /// `jkb staging ls` — the staging branches in this repo and what is landing on each.
@@ -5543,9 +5861,11 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
                         "dirty": t.dirty,
                         "commits": t.commits,
                         "reviewed": t.reviewed,
-                        "review_ns": t.review_ns,
+                        "review_nss": t.review_nss,
                         "review_waived": t.review_waived,
                         "open_must_fix": t.open_must_fix,
+                        "review_ok": t.review_ok,
+                        "land_blocked": t.land_blocked,
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -5577,7 +5897,11 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
             }
             if t.open_must_fix > 0 {
                 notes.push(format!("{} must-fix open", t.open_must_fix));
-            } else if t.reviewed.is_some() {
+            } else if t.reviewed.is_some() && t.review_ok {
+                // "reviewed" only when the gate would actually pass on it. A review whose
+                // findings never reached the KB leaves `reviewed=` on the task and is refused
+                // by the gate, so printing "reviewed" told a terminal user the opposite of
+                // what `jkb task land` was about to do.
                 notes.push("reviewed".to_owned());
             }
             if t.review_waived.is_some() {
@@ -5585,6 +5909,12 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
             }
             println!("    {}  [{}]", truncate(&t.title, 60), notes.join(" · "));
             println!("      {}", t.uid);
+            // The verdict itself, not just its symptoms: this is the same string the In
+            // Flight tooltip shows, and without it the terminal listing was the one surface
+            // that could not say why a landing would be refused.
+            if let Some(reason) = &t.land_blocked {
+                println!("      cannot land: {reason}");
+            }
         }
     }
     Ok(())
@@ -5623,7 +5953,10 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
          was not quarantined (`jkb doctor`)."
     );
 
-    let recorded = review::record(db, &ctx.key, &branch, sha.as_deref(), &findings)?;
+    let review::Recording {
+        recorded,
+        skipped_unlanded,
+    } = review::record(db, &ctx.root, &ctx.key, &branch, sha.as_deref(), &findings)?;
 
     if json {
         println!(
@@ -5635,6 +5968,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
                 "tasks": recorded.iter().map(|r| serde_json::json!({
                     "uid": r.uid, "moved_to_review": r.moved_to_review,
                 })).collect::<Vec<_>>(),
+                "skipped_unlanded": skipped_unlanded,
             })
         );
         return Ok(());
@@ -5643,20 +5977,67 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
         // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and
         // not an error (design D38.4).
         println!("no task records branch={branch} — nothing to tag (review still filed)");
-        return Ok(());
+    } else {
+        println!(
+            "recorded review of {branch}@{} -> {findings}",
+            sha.as_deref().unwrap_or("unknown")
+        );
+        for r in &recorded {
+            let moved = if r.moved_to_review {
+                " (now needs_review)"
+            } else {
+                ""
+            };
+            println!("  {}{moved}", r.uid);
+        }
     }
-    println!(
-        "recorded review of {branch}@{} -> {findings}",
-        sha.as_deref().unwrap_or("unknown")
-    );
-    for r in &recorded {
-        let moved = if r.moved_to_review {
-            " (now needs_review)"
+    // Said out loud, because a task landing on this branch whose work is not in it yet has
+    // NOT been reviewed, and silence would read as "everything was tagged".
+    if !skipped_unlanded.is_empty() {
+        println!(
+            "not tagged — landing on {branch} but not merged into it yet, so this review did \
+             not see them:"
+        );
+        for uid in &skipped_unlanded {
+            println!("  {uid}");
+        }
+        println!("  review each in its own session (`/review-log` there), or land first.");
+    }
+    Ok(())
+}
+
+/// Report — and with `--fix`, sweep — vector rows whose item is gone.
+///
+/// The vec table is a virtual table with no foreign key to `items`, so a delete that bypassed
+/// a sweep leaves a row whose `item_id` (the rowid) will be handed to the next item created,
+/// which then inherits the deleted item's embedding and reads as already-indexed. Reported
+/// here so a database that already has them has a way back.
+fn report_vector_index(db: &Db, fix: bool) -> Result<()> {
+    // What counts as one of our vector tables, and what counts as an orphan in it, are
+    // `jkb-index`'s to say — the CLI asks. It used to carry its own copy of both queries,
+    // including the `vec0` shadow-table filter that is the non-obvious part, so `doctor`'s
+    // report and `doctor --fix`'s delete were two statements that had to be kept in step.
+    let tables =
+        db.read_with::<Vec<String>, anyhow::Error, _>(|conn| Ok(jkb_index::vector_tables(conn)?))?;
+    if tables.is_empty() {
+        println!("vector index: no vector table yet");
+    } else if fix {
+        println!(
+            "vector index: dropped {} orphaned row(s)",
+            sweep_orphan_vectors(db)?
+        );
+    } else {
+        let orphans = db.read_with::<i64, anyhow::Error, _>(|conn| {
+            Ok(jkb_index::count_orphan_vectors(conn)?)
+        })?;
+        if orphans == 0 {
+            println!("vector index: ok");
         } else {
-            ""
-        };
-        println!("  {}{moved}", r.uid);
+            println!("vector index: {orphans} row(s) whose item is gone");
+            println!("  run `jkb doctor --fix` to drop them");
+        }
     }
+
     Ok(())
 }
 

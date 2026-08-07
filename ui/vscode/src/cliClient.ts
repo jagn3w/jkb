@@ -93,11 +93,17 @@ export class CliJkbClient implements JkbClient {
    *
    * `home` places it in a namespace; `under` makes it a subtask of a task, inheriting that
    * task's home.
+   *
+   * The home goes through `--home`, never as a `+<ns>` token appended to the line: quick-add
+   * re-tokenizes on whitespace, so a namespace containing a space — which a synced directory
+   * named `my change` produces — would silently create a different namespace and swallow the
+   * rest of the path into the title. The path here comes from a clicked tree node, not from
+   * someone typing, so there is nothing to lex.
    */
   async addTask(text: string, opts: { home?: string; under?: string }): Promise<CreatedTask> {
     const args = ["--global", "task", "add", text];
     if (opts.under) args.push("--under", opts.under);
-    else if (opts.home) args.push(`+${opts.home}`);
+    else if (opts.home) args.push("--home", opts.home);
     return this.json<CreatedTask>(args);
   }
 

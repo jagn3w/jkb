@@ -342,7 +342,12 @@ fn landing_a_session_with_no_commits_says_so() {
         .args(["task", "land", &uid, "--no-gate", "--no-review"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("nothing to land"));
+        // The refusal comes from `staging::land_blocker` — the same string the In Flight row
+        // renders, which is the point: the row cannot say "Landable" about a task refused
+        // here, because there is only one sentence and both surfaces read it.
+        .stderr(predicate::str::contains(
+            "It has no commits that the staging branch does not",
+        ));
 }
 
 /// Abandoning returns the task to the frontier and takes the checkout with it — but keeps
@@ -747,7 +752,7 @@ fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
     assert_eq!(f.status_of(&uid), "needs_review");
     let t = &f.staging(&[])[0]["tasks"][0];
     assert_eq!(t["state"].as_str().unwrap(), "review");
-    assert_eq!(t["review_ns"].as_str().unwrap(), "reviews/run-1");
+    assert_eq!(t["review_nss"][0].as_str().unwrap(), "reviews/run-1");
     let first_sha = t["reviewed"].as_str().unwrap().to_owned();
 
     // Recording again replaces the SHA rather than accumulating a second one: a task with two
@@ -766,7 +771,10 @@ fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
         .success();
     let t = &f.staging(&[])[0]["tasks"][0];
     assert_ne!(t["reviewed"].as_str().unwrap(), first_sha);
-    assert_eq!(t["review_ns"].as_str().unwrap(), "reviews/run-2");
+    // Both runs are reported: the gate unions them, so a surface that showed only one could
+    // open a clean namespace while the count came from the other.
+    assert_eq!(t["review_nss"][0].as_str().unwrap(), "reviews/run-1");
+    assert_eq!(t["review_nss"][1].as_str().unwrap(), "reviews/run-2");
     // Both runs still gate: re-recording must not retire the first run's open must-fix
     // findings, or fixing one finding and re-reviewing would silently un-block the rest.
     assert_eq!(t["open_must_fix"], 2);
@@ -1011,16 +1019,18 @@ fn a_failed_land_records_no_waiver() {
     assert!(t["reviewed"].is_null());
 }
 
-/// Abandoning must not free a claim this session does not hold. The swarm's tasks now appear
-/// in the same views, so another implementer's live work is one right-click away.
+/// Abandoning must not free a claim this session does not hold **and that is still alive**.
+/// The swarm's tasks now appear in the same views, so another implementer's live work is one
+/// right-click away — but a claim left behind by one that crashed must not block the cleanup.
 #[test]
 fn abandon_refuses_a_claim_held_by_someone_else() {
     let f = Fixture::new();
     let uid = f.add_task("someone elses task");
-    // A claim held by an owner that is not a session here — what a swarm implementer looks
-    // like from this process's point of view.
+    // A live owner that is not a session here — what a running swarm implementer looks like
+    // from this process's point of view. This test's own pid is, definitionally, alive.
+    let live = format!("swarm:{}", std::process::id());
     f.jkb()
-        .args(["--global", "task", "claim", &uid, "--owner", "swarm:12345"])
+        .args(["--global", "task", "claim", &uid, "--owner", &live])
         .assert()
         .success();
     f.jkb()
@@ -1039,7 +1049,7 @@ fn abandon_refuses_a_claim_held_by_someone_else() {
         .args(["task", "abandon", &uid])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("claimed by swarm:12345"));
+        .stderr(predicate::str::contains(format!("claimed by {live}")));
     assert_eq!(f.status_of(&uid), "in_progress");
 
     // --force is the deliberate override.
@@ -1048,4 +1058,214 @@ fn abandon_refuses_a_claim_held_by_someone_else() {
         .assert()
         .success();
     assert_eq!(f.status_of(&uid), "open");
+}
+
+/// ...but a claim whose owner is **gone** must not block the one command that cleans a
+/// session up. Judging by owner-string identity refused every claim this process did not
+/// hold, so the wreckage of a crashed implementer blocked the verb that exists to remove it,
+/// and pointed the user at `jkb task release` for an owner that provably no longer exists.
+#[test]
+fn abandon_frees_a_dead_owners_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("a crashed implementers task");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "claim",
+            &uid,
+            "--owner",
+            "swarm:4294967290",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "branch=swarm/gone"])
+        .assert()
+        .success();
+
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert_eq!(f.status_of(&uid), "open");
+}
+
+/// A finished task must not be **reopened** by either verb that could.
+///
+/// `land` removes the worktree and marks the task done, but the row stays in the In Flight
+/// view — where one click on "Abandon this session" ran `task abandon`, which found no
+/// session, skipped every removal step, and set the status straight back to `open`. Work
+/// already on the staging branch was then on the ready frontier again, still tagged with its
+/// branch and re-dispatchable to the swarm, with nothing saying so. Landing a *cancelled*
+/// task is the mirror image: the graft succeeds and `settle_landing` marks
+/// deliberately-dropped work `done`.
+///
+/// Note what is NOT refused: abandoning a terminal task still disposes of its session.
+/// Refusing that outright was the first version of this guard, and it stranded the worktree
+/// of every cancelled task — nothing else removes one — while the escape it suggested
+/// (reopen, then abandon) performed exactly the reopening it existed to prevent.
+#[test]
+fn a_terminal_task_is_not_reopened_by_abandoning_or_landed_again() {
+    let f = Fixture::new();
+    let landed = f.add_task("already landed task");
+    let s = f.work(&landed);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    f.jkb()
+        .args(["task", "land", &landed, "--no-gate", "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&landed), "done");
+
+    f.jkb()
+        .args(["task", "abandon", &landed])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("it stays done"));
+    assert_eq!(f.status_of(&landed), "done", "still done");
+
+    // The In Flight row says the same thing, from the CLI's own verdict.
+    let branches = f.staging(&["--all"]);
+    let row = branches[0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["uid"] == serde_json::json!(landed))
+        .unwrap()
+        .clone();
+    assert_eq!(row["state"], serde_json::json!("landed"));
+    assert!(
+        row["land_blocked"]
+            .as_str()
+            .unwrap()
+            .contains("nothing left to land"),
+        "the row must carry the CLI's refusal: {row}"
+    );
+
+    // And the cancelled half: a dropped task is not landable either.
+    let dropped = f.add_task("cancelled task");
+    let s = f.work(&dropped);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "b.txt",
+        "b",
+        "b",
+    );
+    f.jkb()
+        .args(["--global", "task", "set", &dropped, "--status", "cancelled"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &dropped, "--no-gate", "--no-review"])
+        .assert()
+        .failure()
+        // From `land_blocker`'s terminal arm — the same sentence the In Flight row shows,
+        // rather than a second one written beside it in `land_preflight`.
+        .stderr(predicate::str::contains(
+            "It was cancelled, so it will not be landing",
+        ));
+    assert_eq!(f.status_of(&dropped), "cancelled");
+}
+
+/// Abandoning takes the task off the staging branch it was going to land on.
+///
+/// Leaving `onto=` behind kept the abandoned task rendering as live `implementing` work —
+/// indistinguishable from the session just destroyed — and, worse, kept `has_live_work` true
+/// for its branch, so a spent batch stayed listed and stayed on offer as a land target long
+/// after everything on it had merged (the failure D36.3 exists to prevent).
+#[test]
+fn abandoning_takes_the_task_off_its_staging_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("abandoned staged task");
+    let s = f.work(&uid);
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "c.txt",
+        "c",
+        "c",
+    );
+    assert_eq!(f.staging(&[])[0]["branch"], serde_json::json!(onto));
+
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+
+    let rows = f.staging(&["--all"]);
+    assert!(
+        rows.as_array().unwrap().is_empty(),
+        "an abandoned task is not on a staging branch any more: {rows}"
+    );
+}
+
+/// Abandoning a **cancelled** task must dispose of its session — nothing else will.
+///
+/// Cancelling removes neither worktree, branch nor claim, and `land` refuses a terminal task,
+/// so refusing here too left the checkout in place with no verb able to remove it. The task's
+/// status is the one thing abandon must not touch.
+#[test]
+fn abandoning_a_cancelled_task_removes_its_session_and_leaves_it_cancelled() {
+    let f = Fixture::new();
+    let uid = f.add_task("cancelled but checked out");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "a.txt", "a", "a");
+    f.jkb()
+        .args(["--global", "task", "set", &uid, "--status", "cancelled"])
+        .assert()
+        .success();
+    assert!(wt.exists(), "cancelling leaves the checkout behind");
+
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("it stays cancelled"));
+
+    assert!(!wt.exists(), "the session is gone");
+    assert_eq!(
+        f.status_of(&uid),
+        "cancelled",
+        "and the task was NOT put back on the frontier"
+    );
+}
+
+/// A landing that cannot dispose of its session must not have marked the task done first.
+///
+/// The status write and `claim::clear` used to run before `worktree_remove`, which git
+/// refuses on a dirty tree — leaving the task `done` with its claim freed and its worktree
+/// still there, a state `land` ("is done — there is nothing to land") and `abandon` both
+/// then declined to touch. Writing during the gate is the ordinary case here: the session
+/// holds a live agent.
+#[test]
+fn a_session_dirtied_during_the_gate_keeps_its_work_and_its_task() {
+    let f = Fixture::new();
+    let uid = f.add_task("dirtied during the gate");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "a.txt", "a", "a");
+
+    // The gate writes into the session while it runs — exactly what an agent left working in
+    // it would do. It still passes, so the landing itself succeeds.
+    let gate = format!(
+        "sh -c 'printf mid-gate > {}/scratch.txt'",
+        wt.to_str().unwrap()
+    );
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "uncommitted changes written since",
+        ));
+
+    assert!(
+        wt.join("scratch.txt").exists(),
+        "the work written during the gate survives"
+    );
+    assert_ne!(
+        f.status_of(&uid),
+        "done",
+        "and the task is not left done with a worktree nothing can remove"
+    );
 }

@@ -25,6 +25,7 @@ pub(crate) const FACET_REVIEW: &str = "review";
 pub(crate) const FACET_REVIEW_WAIVED: &str = "review-waived";
 
 /// A must-fix finding that is neither `done` nor `cancelled`.
+#[derive(Clone)]
 pub(crate) struct OpenFinding {
     pub(crate) uid: String,
     pub(crate) title: String,
@@ -70,13 +71,7 @@ pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
             }
             out.open_must_fix.push(OpenFinding {
                 uid: m.uid.clone(),
-                title: m
-                    .content
-                    .as_deref()
-                    .and_then(|c| c.lines().find(|l| !l.trim().is_empty()))
-                    .unwrap_or(&m.uid)
-                    .trim()
-                    .to_owned(),
+                title: crate::output::title_of(m),
             });
         }
         Ok(out)
@@ -84,20 +79,12 @@ pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
 }
 
 /// What a review's namespaces actually contain.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Findings {
     /// Every finding item found, whatever its priority or status. Zero here means the
     /// namespace resolved to nothing — **not** that the review was clean.
     pub(crate) total: usize,
     pub(crate) open_must_fix: Vec<OpenFinding>,
-}
-
-/// The open must-fix findings for one namespace — the count a staging row shows.
-///
-/// # Errors
-/// Returns an error if the read fails.
-pub(crate) fn open_must_fix(db: &Db, review_nss: &[String]) -> Result<Vec<OpenFinding>> {
-    Ok(findings_in(db, review_nss)?.open_must_fix)
 }
 
 /// Why a task may not land, if it may not.
@@ -115,6 +102,33 @@ pub(crate) enum GateVerdict {
     OpenFindings(Vec<OpenFinding>),
 }
 
+impl GateVerdict {
+    /// One line, for a listing row: why the gate would refuse, or `None` if it would pass.
+    ///
+    /// The long form — with the remedy for each case — is [`enforce`]'s refusal, which is what
+    /// someone running `jkb task land` reads. Both spellings come from the same verdict, so a
+    /// row cannot report a different rule than the command applies.
+    pub(crate) fn short(&self) -> Option<String> {
+        match self {
+            Self::Passed => None,
+            Self::NeverReviewed => Some(
+                "No review has been recorded. Run /review-log in the session, or land with \
+                 --no-review."
+                    .to_owned(),
+            ),
+            Self::NoFindingsRecorded(nss) => Some(format!(
+                "Its review ({}) holds no findings at all, so they never reached the KB — this \
+                 is not a clean review. Re-run /review-log.",
+                nss.join(", ")
+            )),
+            Self::OpenFindings(open) => Some(format!(
+                "Its review left {} open must-fix finding(s). Fix or cancel each one, then land.",
+                open.len()
+            )),
+        }
+    }
+}
+
 /// Decide whether `tags` permit a landing (design D38.5).
 ///
 /// Concerns and nits do not block. A gate everything trips is a gate nobody keeps: a previous
@@ -127,21 +141,35 @@ pub(crate) enum GateVerdict {
 /// # Errors
 /// Returns an error if the findings cannot be read.
 pub(crate) fn gate(db: &Db, tags: &BTreeMap<String, Vec<String>>) -> Result<GateVerdict> {
-    if crate::repo::facet_one(tags, FACET_REVIEWED).is_none() {
-        return Ok(GateVerdict::NeverReviewed);
-    }
     let nss = crate::repo::facet_values(tags, FACET_REVIEW).to_vec();
-    if nss.is_empty() {
-        return Ok(GateVerdict::NoFindingsRecorded(nss));
+    Ok(gate_with(&findings_in(db, &nss)?, tags, &nss))
+}
+
+/// The gate's decision, given findings already read.
+///
+/// Split from [`gate`] so a caller holding the findings — `staging::collect`, which reads one
+/// namespace set once for a whole branch rather than once per row — applies the same rule
+/// without a second query. The rule itself lives here and nowhere else.
+///
+/// `nss` is the namespace set `found` was read from, and is passed rather than re-derived
+/// from `tags`: the two can disagree, and the caller that substitutes an empty `Findings`
+/// (for a row it does not intend to gate) would otherwise be told its intact review "holds no
+/// findings at all — re-run /review-log". Taking both means the mismatch cannot be expressed.
+pub(crate) fn gate_with(
+    found: &Findings,
+    tags: &BTreeMap<String, Vec<String>>,
+    nss: &[String],
+) -> GateVerdict {
+    if crate::repo::facet_one(tags, FACET_REVIEWED).is_none() {
+        return GateVerdict::NeverReviewed;
     }
-    let found = findings_in(db, &nss)?;
-    if found.total == 0 {
-        return Ok(GateVerdict::NoFindingsRecorded(nss));
+    if nss.is_empty() || found.total == 0 {
+        return GateVerdict::NoFindingsRecorded(nss.to_vec());
     }
     if found.open_must_fix.is_empty() {
-        Ok(GateVerdict::Passed)
+        GateVerdict::Passed
     } else {
-        Ok(GateVerdict::OpenFindings(found.open_must_fix))
+        GateVerdict::OpenFindings(found.open_must_fix.clone())
     }
 }
 
@@ -217,8 +245,9 @@ pub(crate) struct Recorded {
 /// Record that a review ran against `branch` at `sha`, producing findings under `findings_ns`.
 ///
 /// Keyed by **branch**, because that is what a review knows: it reviewed a range on a branch,
-/// not a task. The task is found through the existing `branch=` index, and a staging-wide
-/// review tags every task on it.
+/// not a task. Tasks are found through `branch=` (a session's own branch) **and** `onto=` (the
+/// staging branch a batch lands on), so reviewing either level tags the work it covers — a
+/// staging-branch review is the D38 flow, and its tasks share only `onto=`.
 ///
 /// A branch no task claims (trunk, an ad-hoc range) matches nothing and returns an empty list
 /// — a note for the caller to print, not an error, because reviewing an arbitrary range is a
@@ -242,22 +271,48 @@ pub(crate) struct Recorded {
 /// Returns an error if the database cannot be read or written.
 pub(crate) fn record(
     db: &Db,
+    repo_root: &std::path::Path,
     repo_key: &str,
     branch: &str,
     sha: Option<&str>,
     findings_ns: &str,
-) -> Result<Vec<Recorded>> {
-    let on_branch: Vec<(ItemId, String)> = crate::repo::repo_tasks(db, repo_key)?
-        .into_iter()
-        .filter(|t| {
-            crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH)
+) -> Result<Recording> {
+    // Matched on `branch=` — the task's own work is what was reviewed — **or** on `onto=`
+    // *when that work is already in the reviewed branch*. A review of a staging branch is the
+    // D38 flow, and its tasks share only `onto=<staging>`; matching `branch=` alone tagged
+    // nothing and left the whole batch refused as never reviewed.
+    //
+    // The containment test is what keeps the gate from failing open. `onto=` says a task
+    // *intends* to land on this branch, not that it has: a task still being built in its own
+    // session has commits the reviewed branch has never seen, and crediting it would let
+    // `jkb task land` graft never-reviewed work — the one direction a safety check must not
+    // fail (see `GateVerdict::NoFindingsRecorded`).
+    let mut skipped_unlanded = Vec::new();
+    let mut on_branch: Vec<(ItemId, String)> = Vec::new();
+    // One merge probe per distinct (work branch, base): a swarm group puts the same `branch=`
+    // on every task in it, and each probe is about four git spawns.
+    let mut covered: BTreeMap<(String, Option<String>), bool> = BTreeMap::new();
+    for t in crate::repo::repo_tasks(db, repo_key)? {
+        let names = |facet: &str| {
+            crate::repo::facet_values(&t.tags, facet)
                 .iter()
                 .any(|b| b == branch)
-        })
-        .map(|t| (t.meta.id, t.meta.uid.clone()))
-        .collect();
+        };
+        if names(crate::repo::FACET_BRANCH) {
+            on_branch.push((t.meta.id, t.meta.uid.clone()));
+        } else if names(crate::repo::FACET_ONTO) {
+            if work_is_in(repo_root, &t, branch, &mut covered)? {
+                on_branch.push((t.meta.id, t.meta.uid.clone()));
+            } else {
+                skipped_unlanded.push(t.meta.uid.clone());
+            }
+        }
+    }
     if on_branch.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Recording {
+            recorded: Vec::new(),
+            skipped_unlanded,
+        });
     }
 
     let (sha_owned, ns_owned) = (sha.unwrap_or("unknown").to_owned(), findings_ns.to_owned());
@@ -282,11 +337,76 @@ pub(crate) fn record(
         })
         .with_context(|| format!("recording the review of {branch}"))?;
 
-    Ok(on_branch
-        .into_iter()
-        .map(|(id, uid)| Recorded {
-            uid,
-            moved_to_review: moved_ids.contains(&id),
-        })
-        .collect())
+    Ok(Recording {
+        recorded: on_branch
+            .into_iter()
+            .map(|(id, uid)| Recorded {
+                uid,
+                moved_to_review: moved_ids.contains(&id),
+            })
+            .collect(),
+        skipped_unlanded,
+    })
+}
+
+/// What a `review record` did, and what it deliberately did not do.
+pub(crate) struct Recording {
+    pub(crate) recorded: Vec<Recorded>,
+    /// Tasks landing on this branch whose own work is not in it yet, so the review cannot
+    /// have covered them. Reported, because silence here reads as "everything was tagged".
+    pub(crate) skipped_unlanded: Vec<String>,
+}
+
+/// Whether this task's own work is already contained in `branch` — i.e. whether a review of
+/// `branch` can have seen it.
+///
+/// `is_merged` asks "would re-merging change anything", which is the right question however
+/// the work got there: a session `land` fast-forwards and the swarm's merge queue rebases, and
+/// neither preserves the original shas (D34.2).
+///
+/// Both degenerate answers are **not covered**, because this decides whether to open the land
+/// gate and it must fail closed:
+///
+/// - **No `branch=` at all.** `/task-swarm` writes `onto=` at claim and `branch=` only once an
+///   implementer has one, so a task mid-claim has intent and no work. Returning "covered"
+///   there stamped `reviewed=` on a task that had not been written yet.
+/// - **`NothingToMerge`.** A branch cut from the target with nothing committed on it re-merges
+///   to the target's own tree, so on content alone it reads `Merged`. `base=` exists precisely
+///   to separate that from "contributed nothing because it landed" (D34.2), so it is passed
+///   here; without it, `jkb task work` followed by a staging review credited a session that
+///   had no commits.
+///
+/// `BranchMissing` **is** covered: a branch that is gone was deleted by `land`, which happens
+/// only after its commits reached the target.
+///
+/// Memoized per `(work branch, base)`: `is_merged` is about four git spawns, and a swarm group
+/// puts the same `branch=` on every task in it.
+fn work_is_in(
+    repo_root: &std::path::Path,
+    t: &crate::repo::RepoTask,
+    branch: &str,
+    covered: &mut BTreeMap<(String, Option<String>), bool>,
+) -> Result<bool> {
+    let branches = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
+    let Some(work) = branches.first() else {
+        return Ok(false);
+    };
+    let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
+    let key = (work.clone(), base.clone());
+    if let Some(known) = covered.get(&key) {
+        return Ok(*known);
+    }
+    let (state, _) = crate::gitrepo::is_merged(
+        repo_root,
+        work,
+        branch,
+        base.as_deref(),
+        crate::gitrepo::Prefer::Local,
+    )?;
+    let answer = matches!(
+        state,
+        crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
+    );
+    covered.insert(key, answer);
+    Ok(answer)
 }

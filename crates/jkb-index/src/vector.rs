@@ -19,6 +19,77 @@ use jkb_types::{CatalogIdentity, Embedder, Error as TypesError, ItemId};
 
 use crate::{IndexItem, Indexer, Result};
 
+/// Delete vector rows whose item no longer exists, across **every** `vec_items_<dim>` table.
+///
+/// The vec tables are derived indexes (D9) but cannot carry a foreign key — they are virtual
+/// tables, so `ON DELETE CASCADE` is not available to them — which means a deleted item
+/// leaves its vector behind. That is not merely stale: `item_id` IS the rowid, `SQLite` hands a
+/// freed rowid to the next item created, and the orphan then collides with it. Concretely,
+/// `jkb ingest` -> `jkb undo` -> `jkb ingest` failed on the second ingest and on every ingest
+/// into that database afterwards, while a vector search for the deleted text returned the new
+/// document's chunks.
+///
+/// A free function taking only a connection, because the caller that needs it — `jkb undo` —
+/// has no embedder and must work offline; and it sweeps every dimension's table, because a
+/// database whose embedding model changed has more than one.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
+    let mut dropped = 0;
+    for table in vector_tables(conn)? {
+        // The name comes from `sqlite_master`, filtered to our own prefix — never from input.
+        dropped += conn
+            .prepare_cached(&format!(
+                "DELETE FROM {table} WHERE item_id NOT IN (SELECT id FROM items)"
+            ))?
+            .execute([])?;
+    }
+    Ok(dropped)
+}
+
+/// How many orphaned vector rows exist, without deleting any.
+///
+/// The read-only half of [`drop_orphan_vectors`] — the same predicate, minus the delete — so
+/// `jkb doctor` can report what `jkb doctor --fix` would remove and stay read-only. It lives
+/// here beside the delete because the two must agree on what counts as an orphan and on which
+/// tables are ours; the CLI previously carried its own copy of both queries, including the
+/// `vec0` shadow-table filter that is the non-obvious part.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
+    let mut total = 0;
+    for table in vector_tables(conn)? {
+        total += conn
+            .prepare_cached(&format!(
+                "SELECT count(*) FROM {table} WHERE item_id NOT IN (SELECT id FROM items)"
+            ))?
+            .query_row([], |row| row.get::<_, i64>(0))?;
+    }
+    Ok(total)
+}
+
+/// Every `vec_items_<dim>` table in this database — one per embedding dimension the store has
+/// ever used, so a database whose model changed has more than one.
+///
+/// `USING vec0` is what distinguishes the virtual table from the shadow tables vec0 creates
+/// beside it (`..._info`, `..._chunks`, `..._rowids`), which share the name prefix, have no
+/// `item_id` column, and must never be written to directly.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn vector_tables(conn: &Connection) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'table' AND name LIKE 'vec_items_%' AND sql LIKE '%vec0%'
+           ORDER BY name",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Registers the statically-linked `sqlite-vec` extension so every `SQLite`
 /// connection opened *afterwards* in this process gains the `vec0` virtual table
 /// and vector functions.
@@ -142,13 +213,43 @@ impl VectorIndexer {
             .into());
         }
         let bytes = embedding_to_bytes(embedding);
-        // `item_id` is the rowid, so INSERT OR REPLACE is an upsert keyed on it.
+        // Delete then insert, rather than `INSERT OR REPLACE`: vec0 is a virtual table and
+        // does **not** honour the conflict clause, so re-inserting an existing `item_id`
+        // raises `UNIQUE constraint failed` instead of replacing. The comment here used to
+        // claim otherwise, and the failure only surfaced when an id was reused — a rowid
+        // freed by `undo` and handed to the next ingest, which then failed permanently.
+        conn.prepare_cached(&format!("DELETE FROM {} WHERE item_id = ?1", self.table))?
+            .execute([id.get()])?;
         conn.prepare_cached(&format!(
-            "INSERT OR REPLACE INTO {} (item_id, embedding) VALUES (?1, ?2)",
+            "INSERT INTO {} (item_id, embedding) VALUES (?1, ?2)",
             self.table
         ))?
         .execute(params![id.get(), bytes])?;
         Ok(())
+    }
+
+    /// Delete vector rows whose item no longer exists, returning how many went.
+    ///
+    /// The vec table is a **derived** index (D9) but has no foreign key to `items` — it is a
+    /// virtual table, so `ON DELETE CASCADE` is not available — which means a deleted item
+    /// leaves its vector behind. That is not merely stale: `item_id` is the rowid, `SQLite`
+    /// hands a freed rowid to the next inserted item, and the orphan then collides with it.
+    /// Concretely, `jkb ingest` + `jkb undo` + `jkb ingest` failed on the second ingest and
+    /// every ingest after it, while a vector search for the deleted text returned the *new*
+    /// document's chunks.
+    ///
+    /// # Errors
+    /// Returns an error if the statement fails.
+    pub fn drop_orphans(&self, conn: &Connection) -> Result<usize> {
+        if !self.table_exists(conn)? {
+            return Ok(0);
+        }
+        Ok(conn
+            .prepare_cached(&format!(
+                "DELETE FROM {} WHERE item_id NOT IN (SELECT id FROM items)",
+                self.table
+            ))?
+            .execute([])?)
     }
 
     /// The stored vectors for `ids`, as an `item_id -> embedding` map. Ids with no vector

@@ -167,27 +167,27 @@
         },
         {
           "command": "jkb.inflight.openSession",
-          "when": "view == jkb.inflight && viewItem == stagingTask",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
           "group": "inline"
         },
         {
           "command": "jkb.inflight.openSession",
-          "when": "view == jkb.inflight && viewItem == stagingTask",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
           "group": "flight@1"
         },
         {
           "command": "jkb.inflight.land",
-          "when": "view == jkb.inflight && viewItem == stagingTask",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
           "group": "flight@2"
         },
         {
           "command": "jkb.inflight.openFindings",
-          "when": "view == jkb.inflight && viewItem == stagingTask",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
           "group": "flight@3"
         },
         {
           "command": "jkb.inflight.abandon",
-          "when": "view == jkb.inflight && viewItem == stagingTask",
+          "when": "view == jkb.inflight && viewItem == stagingTaskSession",
           "group": "flight@4"
         }
       ]

@@ -26,7 +26,9 @@ use jkb_types::ItemId;
 
 pub use error::{Error, Result};
 pub use fts::FtsIndexer;
-pub use vector::{register, VectorIndexer};
+pub use vector::{
+    count_orphan_vectors, drop_orphan_vectors, register, vector_tables, VectorIndexer,
+};
 
 /// The item fields an [`Indexer`] needs to (re)index a single item.
 ///

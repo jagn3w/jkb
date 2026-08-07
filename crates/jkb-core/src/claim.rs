@@ -135,6 +135,35 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
     Ok(true)
 }
 
+/// Clear a claim **only** when it is still held by `expected_owner`, returning whether it was.
+///
+/// The compare-and-set half of a takeover. Whether an owner may be displaced is decided by
+/// probing it (`owner::is_alive`, which forks `ps`) or by removing its worktree — work that
+/// happens outside the write transaction, so between reading the owner and clearing it
+/// somebody else can claim the task. A bare [`clear`] would then discard a claim nobody
+/// examined, which is how a live session's claim gets replaced by a process about to exit and
+/// its task freed by the next `doctor --fix`. Naming the owner you judged makes that
+/// impossible.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn clear_if(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    expected_owner: &str,
+) -> Result<bool> {
+    let before = read_before(conn, item)?;
+    if before
+        .as_ref()
+        .and_then(|b| b.claimant_id.as_deref())
+        .is_none_or(|owner| owner != expected_owner)
+    {
+        return Ok(false);
+    }
+    clear(conn, meta, item)
+}
+
 /// Clear `item`'s claim regardless of who holds it, returning whether one was cleared.
 ///
 /// [`release`] is owner-scoped on purpose — one agent must not drop another's claim while
@@ -142,6 +171,8 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
 /// live*, where the holder is irrelevant because there is nothing left to hand out. Called
 /// from `task::set_status` when a task reaches a terminal status, so a completed task never
 /// keeps a claim that `doctor` would later report as orphaned.
+///
+/// Prefer [`clear_if`] whenever the decision to clear was taken outside this transaction.
 ///
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.

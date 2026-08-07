@@ -5,6 +5,8 @@
 //! (for three-way merge), and any unresolved `conflict` / `needs_attention` status
 //! with a parse error. Surfaced read-only as the `_sys/sync` view.
 
+use std::path::Path;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
@@ -157,6 +159,65 @@ pub fn needs_attention(conn: &Connection) -> Result<Vec<SyncState>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Clear a file's non-`ok` status, keeping everything else the row holds.
+///
+/// Returns whether a row was actually settled. The hashes and the base blob are preserved
+/// deliberately: they are the three-way base, and dropping them would turn a later
+/// re-appearance of the file into a spurious conflict instead of a clean reconcile.
+///
+/// The one verb for "this flag no longer describes anything" — a file the mount stopped
+/// syncing, a refused ghost whose file the user deleted. Both callers had a hand-written copy
+/// of this write, each restating the full [`SyncStateWrite`] field list, so a new field would
+/// have had to be threaded through two places that nothing linked.
+///
+/// # Errors
+/// Returns an error if the read or the write fails.
+pub fn settle(conn: &Connection, meta: &WriteMeta, uri: &str) -> Result<bool> {
+    let Some(row) = get(conn, uri)? else {
+        return Ok(false);
+    };
+    if row.status == "ok" {
+        return Ok(false);
+    }
+    upsert(
+        conn,
+        meta,
+        &SyncStateWrite {
+            uri,
+            serializer: &row.serializer,
+            status: "ok",
+            last_synced_hash: row.last_synced_hash.as_deref(),
+            base_blob_hash: row.base_blob_hash.as_deref(),
+            parse_error: None,
+            quarantine_blob_hash: row.quarantine_blob_hash.as_deref(),
+        },
+    )?;
+    Ok(true)
+}
+
+/// Every flagged row whose uri names a file under `dir`.
+///
+/// Driven off the **journal**, not off bindings: a file that failed to parse on its very
+/// first sync has a `needs_attention` row and no bindings at all, so a bindings-driven sweep
+/// could never reach it — and once that file was deleted, nothing could clear the flag.
+///
+/// Compared as **paths**, not as strings. `str::starts_with` made `/repos/openspec` match
+/// `/repos/openspec-archive/tasks.md`, so syncing one mount reached into a differently-named
+/// one and cleared its flags — and a cleared flag is indistinguishable from a fixed file.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn flagged_under(conn: &Connection, dir: &Path) -> Result<Vec<SyncState>> {
+    Ok(needs_attention(conn)?
+        .into_iter()
+        .filter(|s| {
+            s.uri
+                .strip_prefix("file://")
+                .is_some_and(|p| Path::new(p).starts_with(dir))
+        })
+        .collect())
 }
 
 #[cfg(test)]

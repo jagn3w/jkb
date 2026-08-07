@@ -1500,3 +1500,359 @@ fn a_collision_is_journalled_so_doctor_can_see_it() {
         "the journal must say why: {flagged:?}"
     );
 }
+
+/// Deleting one of two colliding files must unwedge the other by itself.
+///
+/// `discover` yields a bound file whether or not it still exists on disk, so counting bound
+/// siblings without asking the filesystem kept the group at size two forever: both paths
+/// stayed refused, and the only escape was an `--exclude` glob naming a file that was no
+/// longer there. The deleted path is still not written — `missing_file` would *export* it,
+/// putting the shared layout into a second file — but it stops holding its live sibling
+/// hostage, and it settles instead of being re-flagged for a human to fix something that is
+/// already gone.
+#[test]
+fn deleting_one_of_two_colliding_files_lets_the_other_sync_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let design = dir.path().join("design.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+    fs::write(&design, "# Design\n\nProse.\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    // Bind both as `document` first, so each really is a synced file before they collide.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 2);
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(
+        sync(&db, "docs/change").unwrap().count(Outcome::Collided),
+        2
+    );
+
+    // Delete the sibling — the plainest possible remedy.
+    fs::remove_file(&design).unwrap();
+    let report = sync(&db, "docs/change").unwrap();
+    assert!(
+        !report.collided().iter().any(|p| *p == tasks),
+        "the surviving file must sync again: {:?}",
+        report.results
+    );
+    assert!(
+        fs::read_to_string(&tasks).unwrap().contains("ship it"),
+        "the survivor keeps its content"
+    );
+    assert!(
+        !design.exists(),
+        "the deleted file is neither read nor written, so the deletion sticks"
+    );
+
+    // And nothing is left flagged: the user's remedy was performed, so `jkb doctor` must not
+    // keep naming a file that no longer exists.
+    let flagged = db.read(jkb_core::sync_state::needs_attention).unwrap();
+    assert!(flagged.is_empty(), "nothing left to fix, got {flagged:?}");
+
+    // It stays that way. Releasing the ghost instead would re-create it from the KB
+    // (`missing_file` exports a bound path with no file) and collide again on the next run.
+    let again = sync(&db, "docs/change").unwrap();
+    assert_eq!(again.count(Outcome::Collided), 0);
+    assert!(!design.exists());
+}
+
+/// A released survivor must render from **its own** document, not from the layout its
+/// vanished sibling left on the shared namespace.
+///
+/// `namespace_for` drops the filename, so both files' layout and `##` headers land on one
+/// namespace and whichever synced last owns it. Releasing `tasks.md` once `design.md` was
+/// deleted therefore assembled a KB document out of design.md's layout and headers, found it
+/// differed from tasks.md's base, and **exported it over tasks.md** — turning the file into
+/// `## Design` plus design's prose plus the task. That is the collapse `Collided` exists to
+/// prevent, reached through the remedy for a collision.
+#[test]
+fn a_released_survivor_is_not_overwritten_with_its_siblings_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let design = dir.path().join("design.md");
+    let tasks_body = "## Plan\n\nPlan prose only.\n\n- [ ] ship it !p1\n";
+    fs::write(&tasks, tasks_body).unwrap();
+    fs::write(&design, "## Design\n\nDesign prose only.\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    // One at a time, so each really owns the namespace in turn — design.md last, which is
+    // what makes the stored layout describe the *other* file. The second mount has to
+    // EXCLUDE tasks.md, not merely stop including it: `accepts_bound` deliberately keeps
+    // syncing a file that is already bound, whatever `include` says.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/tasks.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 1);
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        Some("**/tasks.md"),
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 1);
+
+    // Now let both in: they collide, and neither is touched.
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(
+        sync(&db, "docs/change").unwrap().count(Outcome::Collided),
+        2
+    );
+
+    // Delete the sibling. tasks.md is released — and must come back as ITSELF.
+    fs::remove_file(&design).unwrap();
+    sync(&db, "docs/change").unwrap();
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("## Plan") && after.contains("Plan prose only."),
+        "the survivor keeps its own header and prose, got:\n{after}"
+    );
+    assert!(
+        !after.contains("## Design") && !after.contains("Design prose only."),
+        "the survivor must not be rendered from its sibling's layout, got:\n{after}"
+    );
+    assert!(after.contains("ship it"));
+
+    // And it settles: a second run changes nothing further.
+    let before = after;
+    sync(&db, "docs/change").unwrap();
+    assert_eq!(fs::read_to_string(&tasks).unwrap(), before);
+}
+
+/// Excluding the sibling is the documented remedy, so it must also clear the `needs_attention`
+/// that the collision wrote **on the excluded file's own row**. Nothing revisits a file the
+/// mount no longer selects, so the row outlived the problem and `jkb doctor` reported a
+/// resolved collision indefinitely with no command able to clear it.
+///
+/// Both files are given a successful sync before they collide, so both carry journal rows.
+/// The first version of this test created the sibling *after* the first sync, so its very
+/// first reconcile was the refusal — and `journal_collision` deliberately does nothing for a
+/// file that has never synced. The only flagged row was the survivor's, cleared by its own
+/// ordinary reconcile, so the test passed with `settle_out_of_scope` deleted entirely.
+#[test]
+fn excluding_a_collided_sibling_clears_its_needs_attention() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let notes = dir.path().join("notes.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] a !p1\n").unwrap();
+    fs::write(&notes, "# Notes\n\nProse.\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 2);
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(
+        sync(&db, "docs/change").unwrap().count(Outcome::Collided),
+        2
+    );
+    let notes_uri = format!("file://{}", notes.display());
+    assert!(
+        db.read(jkb_core::sync_state::needs_attention)
+            .unwrap()
+            .iter()
+            .any(|s| s.uri == notes_uri),
+        "the excluded-to-be file must be flagged first, or this test proves nothing"
+    );
+
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        Some("**/notes.md"),
+        ConflictPolicy::Manual,
+    );
+    let report = sync(&db, "docs/change").unwrap();
+    assert_eq!(report.count(Outcome::Collided), 0);
+    let flagged = db.read(jkb_core::sync_state::needs_attention).unwrap();
+    assert!(
+        !flagged.iter().any(|s| s.uri == notes_uri),
+        "the excluded file's own row must be settled: {flagged:?}"
+    );
+    assert!(
+        flagged.is_empty(),
+        "and nothing else is left flagged: {flagged:?}"
+    );
+}
+
+/// A database written before `layout_uri` existed must keep syncing.
+///
+/// The ownership stamp is new, so every namespace that had ever imported a `tasks` file
+/// carried a layout with nobody's name on it. Reading that as a foreign claim — which it is,
+/// in the sense that this build cannot prove otherwise — refused the file, and both escapes
+/// the refusal named were behind a "has disk changed?" test that a settled file never passes.
+/// Every `tasks.md` in every existing database would have gone `needs_attention` on its first
+/// sync after the upgrade and stayed there. A sole claimant takes the namespace over instead.
+#[test]
+fn a_legacy_namespace_with_no_recorded_owner_is_claimed_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\nProse.\n\n- [ ] ship it !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 1);
+
+    // Rewind to the pre-upgrade shape: a layout with no `layout_uri`.
+    db.write_txn("t", |c, m| {
+        let ns = jkb_core::ns::get(c, "docs/change").unwrap().unwrap();
+        let mut md = jkb_core::ns::get_metadata(c, ns)?.unwrap();
+        md.as_object_mut().unwrap().remove("layout_uri");
+        jkb_core::ns::set_metadata(c, m, ns, &md)
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/change").unwrap();
+    assert_eq!(
+        report.count(Outcome::Collided),
+        0,
+        "a legacy namespace must not be refused: {:?}",
+        report.results
+    );
+    assert!(
+        db.read(jkb_core::sync_state::needs_attention)
+            .unwrap()
+            .is_empty(),
+        "and must not be flagged for a human to fix"
+    );
+    assert!(
+        fs::read_to_string(&tasks).unwrap().contains("## Plan")
+            && fs::read_to_string(&tasks).unwrap().contains("Prose."),
+        "the file keeps its own header and prose"
+    );
+
+    // Ownership is stamped, so the next sync is an ordinary no-op.
+    let again = sync(&db, "docs/change").unwrap();
+    assert_eq!(again.count(Outcome::Collided), 0);
+    assert_eq!(again.count(Outcome::UpToDate), 1);
+}
+
+/// Upgrading a legacy namespace must not throw the KB side away.
+///
+/// The first version of the ownership guard routed an unclaimed namespace down the
+/// import-only path, so a task closed in the KB and not yet exported was silently reverted by
+/// the very next sync — and a task *added* in the KB was cancelled and detached, because
+/// `apply_doc` cancels what the file does not name. The KB side is intact and assemblable
+/// here; only the *ownership stamp* is missing, so stamping it and running the ordinary
+/// three-way is both sufficient and non-destructive.
+#[test]
+fn upgrading_a_legacy_namespace_keeps_an_unexported_kb_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(
+        &tasks,
+        "## Plan
+
+- [ ] ship it !p1
+",
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/change",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/change").unwrap().count(Outcome::Created), 1);
+
+    // Close the task in the KB — the ordinary `jkb task set --status done` — without syncing.
+    let id = db
+        .read(|c| {
+            let ids = jkb_core::query::parse("kind:task").unwrap().evaluate(c)?;
+            Ok(ids[0])
+        })
+        .unwrap();
+    db.write_txn("t", move |c, m| {
+        jkb_core::task::set_status(c, m, id, jkb_types::TaskStatus::Done)
+    })
+    .unwrap();
+
+    // Rewind to the pre-upgrade shape, then sync.
+    db.write_txn("t", |c, m| {
+        let ns = jkb_core::ns::get(c, "docs/change").unwrap().unwrap();
+        let mut md = jkb_core::ns::get_metadata(c, ns)?.unwrap();
+        md.as_object_mut().unwrap().remove("layout_uri");
+        jkb_core::ns::set_metadata(c, m, ns, &md)
+    })
+    .unwrap();
+    sync(&db, "docs/change").unwrap();
+
+    assert!(
+        fs::read_to_string(&tasks).unwrap().contains("- [x]"),
+        "the KB-side completion must reach the file, not be overwritten by it: {}",
+        fs::read_to_string(&tasks).unwrap()
+    );
+}

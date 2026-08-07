@@ -222,6 +222,18 @@ pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> 
         .map(|w| w.path))
 }
 
+/// Drop git's registrations for worktrees whose directories are gone (`git worktree prune`).
+///
+/// Needed when something outside this process removed a session directory — `git worktree
+/// list` keeps reporting it, and its branch stays locked to a checkout that is not there.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn prune_worktrees(dir: &Path) -> Result<()> {
+    git_must(dir, &["worktree", "prune"])?;
+    Ok(())
+}
+
 /// Add a worktree at `path` checked out to `branch`, creating that branch from `start` when
 /// it does not exist yet.
 ///
@@ -437,6 +449,22 @@ pub enum MergeState {
     NothingToMerge,
 }
 
+/// Which ref [`is_merged`] should ask about when a branch exists both locally and on the
+/// remote. They can disagree, and which answer is right depends on the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefer {
+    /// The remote-tracking copy, falling back to the local branch. Right for "did this work
+    /// ship?": after a merged PR the local branch is often stale or gone, while
+    /// `origin/<branch>` reflects what was actually merged.
+    Remote,
+    /// The local branch, falling back to the remote copy. Right for "is this branch spent?":
+    /// a staging branch whose pushed copy merged, but which has since had another task landed
+    /// onto it locally, still has commits to give. Asking `origin/` there reported it merged,
+    /// hid it from the listing, and sent the next `task work` off to cut a fresh branch while
+    /// the landed work sat invisible on the old one.
+    Local,
+}
+
 /// Whether `branch` is already merged into `trunk_ref` in the repo at `dir`.
 ///
 /// Uses `git merge-tree --write-tree`, which answers "would merging this change anything?"
@@ -450,6 +478,9 @@ pub enum MergeState {
 /// `merge-tree --write-tree`. That fallback misses squash merges, so the caller is told
 /// (via `fell_back`) rather than being handed a confident wrong answer.
 ///
+/// `prefer` picks which ref answers the question when both a local branch and its
+/// remote-tracking copy exist — see [`Prefer`].
+///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn is_merged(
@@ -457,13 +488,15 @@ pub fn is_merged(
     branch: &str,
     trunk_ref: &str,
     base: Option<&str>,
+    prefer: Prefer,
 ) -> Result<(MergeState, bool)> {
     if !exists(dir, trunk_ref)? {
         return Ok((MergeState::NoTrunk, false));
     }
-    // Prefer the remote-tracking branch: after a merged PR the local branch is often stale
-    // or gone, while `origin/<branch>` reflects what was actually merged.
-    let candidates = [format!("origin/{branch}"), branch.to_owned()];
+    let candidates = match prefer {
+        Prefer::Remote => [format!("origin/{branch}"), branch.to_owned()],
+        Prefer::Local => [branch.to_owned(), format!("origin/{branch}")],
+    };
     let Some(reference) = candidates
         .iter()
         .find(|r| exists(dir, r).unwrap_or(false))
@@ -531,7 +564,7 @@ fn supports_merge_tree(dir: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_branch, is_merged, key, trunk, MergeState};
+    use super::{current_branch, is_merged, key, trunk, MergeState, Prefer};
     use std::path::Path;
     use std::process::Command;
 
@@ -595,7 +628,7 @@ mod tests {
         fixture(dir);
 
         for branch in ["mergecommit", "squash", "rebase"] {
-            let (state, fell_back) = is_merged(dir, branch, "main", None).unwrap();
+            let (state, fell_back) = is_merged(dir, branch, "main", None, Prefer::Remote).unwrap();
             assert_eq!(state, MergeState::Merged, "{branch} should read as merged");
             assert!(
                 !fell_back,
@@ -604,12 +637,16 @@ mod tests {
         }
         // The control must NOT read as merged, or the whole thing closes everything.
         assert_eq!(
-            is_merged(dir, "unmerged", "main", None).unwrap().0,
+            is_merged(dir, "unmerged", "main", None, Prefer::Remote)
+                .unwrap()
+                .0,
             MergeState::Unmerged
         );
         // A branch that never existed is distinguished from one that is simply unmerged.
         assert_eq!(
-            is_merged(dir, "no-such-branch", "main", None).unwrap().0,
+            is_merged(dir, "no-such-branch", "main", None, Prefer::Remote)
+                .unwrap()
+                .0,
             MergeState::BranchMissing
         );
         // A freshly-cut branch with no commits contributes nothing to trunk, but because
@@ -628,7 +665,7 @@ mod tests {
         };
         run(&["branch", "just-created", "main"]);
         assert_eq!(
-            is_merged(dir, "just-created", "main", Some("main"))
+            is_merged(dir, "just-created", "main", Some("main"), Prefer::Remote)
                 .unwrap()
                 .0,
             MergeState::NothingToMerge
@@ -637,13 +674,85 @@ mod tests {
         // as merged, because its tip has moved off the base it started from. Refs alone
         // cannot separate these two; the recorded base can.
         assert_eq!(
-            is_merged(dir, "rebase", "main", Some("main~1")).unwrap().0,
+            is_merged(dir, "rebase", "main", Some("main~1"), Prefer::Remote)
+                .unwrap()
+                .0,
             MergeState::Merged
         );
         // A trunk that does not exist must not read as "nothing merged".
         assert_eq!(
-            is_merged(dir, "squash", "no-such-trunk", None).unwrap().0,
+            is_merged(dir, "squash", "no-such-trunk", None, Prefer::Remote)
+                .unwrap()
+                .0,
             MergeState::NoTrunk
+        );
+    }
+
+    /// `Prefer` is the whole point of the parameter, so it needs a repo where the two refs
+    /// actually disagree — a branch whose **pushed** copy merged and whose **local** copy has
+    /// since moved on. That is a staging branch mid-batch: the PR landed, then another task
+    /// was landed onto it locally.
+    ///
+    /// Asking `origin/<branch>` there reported it merged, which hid it from `staging ls` and
+    /// marked it spent, so the next `task work` cut a fresh branch while the locally-landed
+    /// work sat invisible on the old one. Every other test here runs against a fixture with
+    /// no remote at all, where both orders resolve to the same ref and the parameter could be
+    /// deleted without failing anything.
+    #[test]
+    fn prefer_local_sees_work_the_pushed_copy_does_not_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let run = |at: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}: {ok:?}");
+        };
+        run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
+        run(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+
+        // A staging branch with one task's work on it, pushed and squash-merged to trunk.
+        run(&dir, &["checkout", "-q", "-b", "batch", "main"]);
+        std::fs::write(dir.join("first.txt"), "first").unwrap();
+        run(&dir, &["add", "-A"]);
+        run(&dir, &["commit", "-qm", "first task"]);
+        run(&dir, &["push", "-q", "origin", "batch"]);
+        run(&dir, &["checkout", "-q", "main"]);
+        run(&dir, &["merge", "-q", "--squash", "batch"]);
+        run(&dir, &["commit", "-qm", "batch (#7)"]);
+
+        // A second task lands onto the LOCAL branch afterwards; nothing is pushed again.
+        run(&dir, &["checkout", "-q", "batch"]);
+        std::fs::write(dir.join("second.txt"), "second").unwrap();
+        run(&dir, &["add", "-A"]);
+        run(&dir, &["commit", "-qm", "second task"]);
+        run(&dir, &["checkout", "-q", "main"]);
+
+        assert_eq!(
+            is_merged(&dir, "batch", "main", None, Prefer::Remote)
+                .unwrap()
+                .0,
+            MergeState::Merged,
+            "the pushed copy really did merge — which is why `close-merged` asks it"
+        );
+        assert_eq!(
+            is_merged(&dir, "batch", "main", None, Prefer::Local)
+                .unwrap()
+                .0,
+            MergeState::Unmerged,
+            "but the local branch still has a commit trunk does not, so the batch is live"
         );
     }
 

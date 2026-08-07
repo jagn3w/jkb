@@ -174,6 +174,15 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     canonical(a) == canonical(b)
 }
 
+/// Whether `inner` is `outer` or lives beneath it, comparing canonical paths.
+///
+/// Canonical because a session worktree under `/var/...` is reached as `/private/var/...` on
+/// macOS, so a raw `starts_with` answers "no" for a directory you are standing in.
+#[must_use]
+pub fn is_within(inner: &Path, outer: &Path) -> bool {
+    canonical(inner).starts_with(canonical(outer))
+}
+
 fn canonical(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }

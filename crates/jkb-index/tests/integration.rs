@@ -279,3 +279,72 @@ fn fts_rebuild_and_integrity_check_pass() {
     })
     .unwrap();
 }
+
+/// A vector row must not outlive its item, and re-embedding an id must replace rather than
+/// collide.
+///
+/// The vec table is a virtual table, so it can carry no foreign key and nothing cascades. Its
+/// `item_id` is the rowid, so `SQLite` hands a deleted item's id to the next item created —
+/// after which the leftover row **collides** with the new one. Observed end to end: `jkb
+/// ingest` → `jkb undo` → `jkb ingest` failed with `UNIQUE constraint failed` and kept
+/// failing for every later ingest into that database, while a vector search for the deleted
+/// text returned the new document's chunks. `INSERT OR REPLACE` did not save it: vec0 ignores
+/// the conflict clause.
+#[test]
+fn a_deleted_items_vector_is_swept_and_a_reused_id_re_embeds() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+
+    let id = db
+        .write_txn("test", {
+            let embedder = embedder.clone();
+            move |conn, meta| {
+                let vector = VectorIndexer::new(embedder.clone());
+                vector.ensure_ready(conn).unwrap();
+                let id = add_item(conn, meta, "n:doomed", "doomed content");
+                vector
+                    .upsert_vector(conn, id, &embedder.embed("doomed content").unwrap())
+                    .unwrap();
+                Ok(id)
+            }
+        })
+        .unwrap();
+
+    // Re-embedding the SAME id must replace, not raise `UNIQUE constraint failed`.
+    db.write_txn("test", {
+        let embedder = embedder.clone();
+        move |conn, _meta| {
+            VectorIndexer::new(embedder.clone())
+                .upsert_vector(conn, id, &embedder.embed("second pass").unwrap())
+                .unwrap();
+            Ok(())
+        }
+    })
+    .unwrap();
+
+    // Delete the item the way `undo` does — straight out of `items` — then sweep.
+    let dropped = db
+        .write_txn("test", move |conn, _meta| {
+            conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
+            Ok(jkb_index::drop_orphan_vectors(conn).unwrap())
+        })
+        .unwrap();
+    assert_eq!(dropped, 1, "the orphaned vector row goes with its item");
+
+    // A new item takes the freed rowid; embedding it must now succeed.
+    db.write_txn("test", {
+        let embedder = embedder.clone();
+        move |conn, meta| {
+            let new_id = add_item(conn, meta, "n:successor", "successor content");
+            assert_eq!(
+                new_id, id,
+                "SQLite reuses the freed rowid — the whole hazard"
+            );
+            VectorIndexer::new(embedder.clone())
+                .upsert_vector(conn, new_id, &embedder.embed("successor content").unwrap())
+                .unwrap();
+            Ok(())
+        }
+    })
+    .unwrap();
+}

@@ -8,22 +8,33 @@ actionable task in a per-run folder mounted into the KB. Do these steps in order
 
 Arguments given: `$ARGUMENTS`
 
-## 1. Create the review folder
+## 1. Resolve the repo, then create the review folder
 
-Run exactly this (from the repo root) and use the printed path as `REVIEW_DIR`:
+**Resolve everything against the MAIN working copy**, not against wherever you are standing.
+A `jkb task work` session is a git *worktree*, so inside one `git rev-parse --show-toplevel`
+returns the session directory — which would put the findings under `repos/<session-name>/`, a
+repo key nothing else uses, inside a directory `jkb task land` deletes when the session lands.
+`--git-common-dir` is the same rule `gitrepo::main_root` uses, and it is correct in the main
+copy too.
+
+Run exactly this and use the printed values as `REVIEW_DIR`, `repo` and `branch`:
 
 ```sh
-mkdir -p .codereviews
-b=$(git rev-parse --abbrev-ref HEAD | tr '/' '-')
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+repo=$(basename "$main")
+branch=$(git rev-parse --abbrev-ref HEAD)          # the branch under review — this checkout's
+b=$(printf '%s' "$branch" | tr '/' '-')
 d=$(date +%Y%m%d-%H%M%S)
-n=$(( $(ls -d .codereviews/*-"$b"-* 2>/dev/null | wc -l | tr -d ' ') + 1 ))
-dir=".codereviews/$d-$b-$n"
+n=$(( $(ls -d "$main"/.codereviews/*-"$b"-* 2>/dev/null | wc -l | tr -d ' ') + 1 ))
+dir="$main/.codereviews/$d-$b-$n"
 mkdir -p "$dir"
-echo "$dir"
+echo "REVIEW_DIR=$dir  repo=$repo  branch=$branch"
 ```
 
 The folder name is `<datetime>-<branch>-<reviewNumber>`, where `reviewNumber` is the count of
-prior reviews for this branch plus one.
+prior reviews for this branch plus one. `branch` is this checkout's — the session branch when
+you are in a session — and is what step 5 records the review against; `repo` and `REVIEW_DIR`
+belong to the main copy, which outlives the session.
 
 ## 2. Run the reviewer
 
@@ -89,8 +100,10 @@ Each review gets its **own per-folder mount**: the `tasks` serializer maps `##` 
 namespaces under the mount, so one shared `.codereviews` mount would merge every review's
 `## Must-fix` into a single namespace.
 
+`repo` is the main copy's key from step 1 — never `basename $(git rev-parse --show-toplevel)`,
+which in a session is the session's name.
+
 ```sh
-repo=$(basename "$(git rev-parse --show-toplevel)")
 folder=$(basename "$REVIEW_DIR")
 ns="repos/$repo/codereviews/$folder"
 jkb mount create "$ns" "$REVIEW_DIR" --serializer tasks
@@ -110,10 +123,13 @@ The findings now exist, so point the branch's tasks at them (design D38.4). This
 `jkb task land` require a review instead of trusting that one happened:
 
 ```sh
-jkb task review record --findings "$ns"
+jkb task review record --branch "$branch" --findings "$ns"
 ```
 
-It defaults to the current branch and its HEAD, tags every task carrying that `branch=` with
+Pass `--branch` explicitly, using step 1's value. It defaults to the branch checked out where
+it runs, which is right in a session and wrong anywhere else — run from the main copy that
+default is the *staging* branch, which no task records, so it matches nothing and every task
+then fails `land` as never reviewed. It tags every task carrying that `branch=` with
 `reviewed=<sha>` and `review=<ns>`, and moves `in_progress` tasks to `needs_review`. A branch
 no task claims — trunk, an ad-hoc range — matches nothing and says so; that is a note, not a
 failure, because reviewing an arbitrary range is a legitimate thing to do.

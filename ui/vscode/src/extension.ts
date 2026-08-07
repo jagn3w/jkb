@@ -445,9 +445,24 @@ function landFromFlight(client: CliJkbClient, node?: FlightNode): void {
 async function abandonFromFlight(client: CliJkbClient, node?: FlightNode): Promise<void> {
   if (node?.kind !== "task") return;
   const t = node.task;
+  // There must be something to abandon: a recorded branch is enough, since the CLI cleans up
+  // a session whose checkout is already gone. The menu is scoped the same way (see
+  // `contextValue` in inflight.ts); this covers the palette, which is scoped by nothing.
+  if (!t.branch) {
+    vscode.window.showWarningMessage(`jkb: ${t.title} has no session to abandon.`);
+    return;
+  }
   const warn = t.dirty ? " It has uncommitted changes, which will be lost." : "";
+  // A finished task keeps its status: abandoning disposes of the checkout, and putting
+  // already-merged or deliberately-cancelled work back on the ready frontier is the one
+  // thing it must not do. Say which is about to happen, because they are different acts.
+  const outcome =
+    t.state === "landed" || t.state === "dropped"
+      ? `The task stays ${t.status}.`
+      : "The task returns to open.";
+  const what = t.worktree ? "session" : "session record";
   const ok = await vscode.window.showWarningMessage(
-    `Abandon the session for "${t.title}"?${warn} The task returns to open.`,
+    `Abandon the ${what} for "${t.title}"?${warn} ${outcome}`,
     { modal: true },
     "Abandon",
   );
@@ -461,15 +476,114 @@ async function abandonFromFlight(client: CliJkbClient, node?: FlightNode): Promi
   terminal.sendText(client.terminalCommand(args));
 }
 
-/** Open the task's review findings in the explorer's details panel. */
+/**
+ * Open one of the task's review findings.
+ *
+ * The findings themselves are the point: this used to open the generic namespace panel for
+ * one guessed `review=` namespace, which shows a child count, a kind breakdown and a rename
+ * box — no titles, nothing clickable, and a rename that would break the `review=` facet the
+ * land gate resolves. It also picked whichever namespace sorted last while the blocking
+ * count came from the union of all of them, so the panel could open the clean one.
+ */
 async function openFindings(client: CliJkbClient, node?: FlightNode): Promise<void> {
   if (node?.kind !== "task") return;
-  const ns = node.task.review_ns;
-  if (!ns) {
+  const nss = node.task.review_nss;
+  if (nss.length === 0) {
     vscode.window.showInformationMessage(
       "jkb: no review recorded for this task yet — run /review-log in its session.",
     );
     return;
   }
-  DetailsPanel.show(client, { kind: "namespace", path: ns }, () => {});
+  // Every recorded review, not one of them: which namespace a finding is in is not something
+  // the reader should have to guess at, and open must-fix findings sort to the top anyway.
+  let findings: FindingPick[];
+  try {
+    findings = (await Promise.all(nss.map((ns) => findingsUnder(client, ns)))).flat();
+  } catch (e) {
+    // Said as what it is — the read failed — rather than as a conclusion about the review.
+    vscode.window.showErrorMessage(`jkb: could not read ${nss.join(", ")}: ${(e as Error).message}`);
+    return;
+  }
+  if (findings.length === 0) {
+    vscode.window.showWarningMessage(
+      `jkb: ${nss.join(", ")} holds no findings — they never reached the KB. Re-run /review-log.`,
+    );
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    findings.map((f) => ({
+      label: f.label,
+      description: f.detail,
+      uid: f.uid,
+      itemKind: f.itemKind,
+    })),
+    { title: `Review findings for ${node.task.title}`, matchOnDescription: true },
+  );
+  if (!picked) return;
+  DetailsPanel.show(client, { kind: "item", uid: picked.uid, itemKind: picked.itemKind }, () => {});
+}
+
+/** One finding, flattened out of the review namespace's severity sub-folders. */
+interface FindingPick {
+  readonly uid: string;
+  readonly itemKind: string;
+  readonly label: string;
+  readonly detail: string;
+  readonly open: boolean;
+  readonly priority: number;
+}
+
+/**
+ * Every finding item under a review namespace, must-fix and still-open first.
+ *
+ * `/review-log` writes one `## <Severity>` header per severity and the `tasks` serializer
+ * turns each into a sub-namespace, so the items live one level down — but a review with a
+ * single section puts them at the top level, and both are listed. Terminal findings are
+ * included (`includeTerminal`): a fixed finding is the useful half of the record when you
+ * are looking at why a landing was refused.
+ */
+async function findingsUnder(client: CliJkbClient, ns: string): Promise<FindingPick[]> {
+  const opts = { includeTerminal: true };
+  // Recursive, because the gate's own count is: `review::findings_in` scopes the whole
+  // subtree, so a review whose `tasks.md` grew a third heading level would put findings a
+  // level deeper than a fixed two-level walk reaches — and this panel would then report that
+  // the findings never arrived while `jkb task land` refused on the ones it could not see.
+  // Depth is bounded (four, well past any review layout) so a cycle cannot hang the UI.
+  // A failed read is NOT an empty review. Swallowing the error reported a broken CLI or an
+  // unreadable database as "the findings never reached the KB — re-run /review-log", which is
+  // advice for a different problem entirely; the top-level read is therefore allowed to throw
+  // and the caller says what actually happened. Failures deeper in the walk are tolerated —
+  // one unreadable sub-namespace should not hide the findings that did load.
+  const walk = async (ref: NodeRef, depth: number, strict = false): Promise<readonly TreeChild[]> => {
+    const children = strict
+      ? await client.listChildren(ref, opts)
+      : await client.listChildren(ref, opts).catch(() => []);
+    if (depth === 0) return children;
+    const deeper = await Promise.all(
+      children
+        .filter((c) => c.ref.kind === "namespace")
+        .map((c) => walk(c.ref, depth - 1)),
+    );
+    return [...children, ...deeper.flat()];
+  };
+  const out: FindingPick[] = [];
+  for (const child of await walk({ kind: "namespace", path: ns }, 4, true)) {
+    if (child.ref.kind !== "item") continue;
+    const priority = child.priority ?? Number.MAX_SAFE_INTEGER;
+    out.push({
+      uid: child.ref.uid,
+      itemKind: child.ref.itemKind,
+      label: child.label,
+      detail: [child.status, child.priority != null ? `p${child.priority}` : null, ns]
+        .filter(Boolean)
+        .join(" · "),
+      open: child.status !== "done" && child.status !== "cancelled",
+      priority,
+    });
+  }
+  // Open before closed, must-fix before the rest — the reader is here because something is
+  // holding a landing, and that is exactly the open `!p1` findings.
+  return out.sort(
+    (a, b) => Number(b.open) - Number(a.open) || a.priority - b.priority,
+  );
 }

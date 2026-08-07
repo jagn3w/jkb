@@ -82,6 +82,16 @@ pub struct FileResult {
     pub path: PathBuf,
     /// What happened.
     pub outcome: Outcome,
+    /// Why, when the outcome alone does not say — a refusal's reason, as written to the
+    /// journal.
+    ///
+    /// One `Outcome::Collided` has two causes with opposite remedies: a live sibling sharing
+    /// the namespace (exclude one) and a namespace whose layout belongs to a file that has
+    /// gone (edit this one). Four places spelled that reason out — the two journal writers
+    /// and the two report printers — and the printers each hard-coded the sibling story, so a
+    /// file refused for the *other* reason was told to exclude a file that does not exist.
+    /// The engine computes the reason once, for the journal; the printers render it.
+    pub reason: Option<String>,
 }
 
 /// The outcome of a one-shot [`sync`] over a mount.
@@ -135,6 +145,23 @@ impl SyncReport {
     #[must_use]
     pub fn collided(&self) -> Vec<&Path> {
         self.paths_with(Outcome::Collided)
+    }
+
+    /// Every refused file with the engine's own explanation — the string it wrote to the
+    /// journal. One `Collided` has two causes with opposite remedies, so a printer that
+    /// restates the rule gets one of them wrong.
+    #[must_use]
+    pub fn refusals(&self) -> Vec<(&Path, &str)> {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Collided)
+            .map(|r| {
+                (
+                    r.path.as_path(),
+                    r.reason.as_deref().unwrap_or("refused; see `jkb doctor`"),
+                )
+            })
+            .collect()
     }
 
     fn paths_with(&self, outcome: Outcome) -> Vec<&Path> {
@@ -207,8 +234,72 @@ pub fn sync_with_policy(
     }
 
     let filter = Filter::build(&read_globs(db, mount_ns)?)?;
+    settle_out_of_scope(db, &ctx, &filter)?;
     let paths = discover(db, &ctx, &filter)?;
     reconcile_all(db, &ctx, &filter, paths)
+}
+
+/// Clear the flag on any file under this mount that it no longer syncs.
+///
+/// Driven off the **journal**, not off bindings. A file that failed to parse on its first
+/// sync has a `needs_attention` row and no bindings at all — `apply_doc` never ran — so a
+/// bindings-driven sweep could not see it, and once the user deleted the unparseable file
+/// nothing could ever clear the flag: `jkb doctor` reported a parse failure for a file that
+/// did not exist, forever. That is the stuck state this function exists to close.
+///
+/// A row is settled when the mount no longer selects the file **and** there is nothing left
+/// on disk or in the KB for it — an excluded file, a deleted one, or both. The row is settled
+/// rather than deleted so its base survives if the file comes back.
+///
+/// Only the full [`sync`] does this: a watch-driven `sync_paths` sees a few event paths and
+/// cannot tell "out of scope" from "not in this batch".
+fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
+    let dir = ctx.dir.clone();
+    let flagged = db.read(move |conn| sync_state::flagged_under(conn, &dir))?;
+    if flagged.is_empty() {
+        return Ok(0);
+    }
+    let bound = bound_paths(db, ctx)?;
+    let stale: Vec<String> = flagged
+        .into_iter()
+        .filter(|row| {
+            let Some(path) = row.uri.strip_prefix("file://").map(PathBuf::from) else {
+                return false;
+            };
+            // Two ways this mount is finished with a file, and only these two:
+            //   - the globs no longer select it, or
+            //   - it is gone from disk AND nothing in the KB is bound to it, so `discover`
+            //     will never yield it again and no reconcile will ever revisit its row.
+            // Anything else is still syncing, and its own reconcile owns the flag.
+            //
+            // Which "the globs no longer select it" means depends on whether the file is
+            // bound, exactly as `discover` decides: `accepts_bound` ignores `include`, because
+            // narrowing it must not orphan a file the KB already syncs — but an *unbound*
+            // file has nothing to orphan, and that is the case this sweep exists for (a first
+            // parse failure quarantines before `apply_doc` runs, so it has no bindings at
+            // all). Using `accepts_bound` for it left a narrowed `--include` unable to clear
+            // the very row it was narrowed to escape.
+            let in_scope = if bound.contains(&path) {
+                filter.accepts_bound(&ctx.dir, &path)
+            } else {
+                filter.accepts(&ctx.dir, &path)
+            };
+            !in_scope || (!path.exists() && !bound.contains(&path))
+        })
+        .map(|row| row.uri)
+        .collect();
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    db.write_txn_with::<usize, Error, _>("sync", move |conn, meta| {
+        let mut cleared = 0;
+        for uri in &stale {
+            if sync_state::settle(conn, meta, uri)? {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    })
 }
 
 /// Reconcile only the given `paths` (e.g. the paths named by filesystem-watch events),
@@ -243,6 +334,26 @@ fn reconcile_all(db: &Db, ctx: &Ctx, filter: &Filter, paths: Vec<PathBuf>) -> Re
         // report entirely, so without this the only signal of a mount that stopped working
         // was noticing the KB and the file had drifted.
         if colliding.contains(&path) {
+            // A refused path with no file on disk is a **ghost**: a binding whose file the
+            // user deleted, kept out only because exporting it would write the namespace's
+            // shared layout into a second file. There is nothing for anyone to fix, so it
+            // must not be reported as a collision on every run — flagging it left
+            // `jkb doctor` naming a nonexistent file forever, remediable only by an
+            // `--exclude` glob for a file that is not there, which is the absurdity this
+            // guard's own doc cites. Settle its journal and say `Skipped`, which is what it
+            // was: nothing was read and nothing was written.
+            if !path.exists() {
+                let p = path.clone();
+                db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
+                    settle_ghost(conn, meta, &p)
+                })?;
+                results.push(FileResult {
+                    path,
+                    outcome: Outcome::Skipped,
+                    reason: None,
+                });
+                continue;
+            }
             let ctx = ctx.clone();
             let p = path.clone();
             let others: Vec<String> = colliding
@@ -250,38 +361,99 @@ fn reconcile_all(db: &Db, ctx: &Ctx, filter: &Filter, paths: Vec<PathBuf>) -> Re
                 .filter(|o| **o != path && namespace_for(&ctx, o) == namespace_for(&ctx, &path))
                 .map(|o| o.display().to_string())
                 .collect();
-            db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
+            let reason = db.write_txn_with::<String, Error, _>("sync", move |conn, meta| {
                 journal_collision(conn, meta, &ctx, &p, &others)
             })?;
             results.push(FileResult {
                 path,
                 outcome: Outcome::Collided,
+                reason: Some(reason),
             });
             continue;
         }
         let ctx = ctx.clone();
         let p = path.clone();
+        // Cloned into the writer-thread closure alongside `ctx`, for the same reason: the
+        // closure outlives this frame. Two compiled globs, cloned once per file.
+        let filter = filter.clone();
         let outcome = db.write_txn_with::<Outcome, Error, _>("sync", move |conn, meta| {
-            reconcile(conn, meta, &ctx, &p)
+            reconcile(conn, meta, &ctx, &filter, &p)
         })?;
-        results.push(FileResult { path, outcome });
+        results.push(FileResult {
+            reason: outcome_reason(db, &path)?,
+            path,
+            outcome,
+        });
     }
     // Any tasks just imported from `repos/<repo>/…/tasks.md` get a `tasks/…` mirror so
     // `tasks/**` stays the complete task index. Only run when a file actually changed —
     // a pure-no-op reconcile must not open a write txn, or the watcher would re-fire on
     // its own commit and spin (the file-watch feedback loop).
-    let imported = results.iter().any(|r| {
-        matches!(
-            r.outcome,
-            Outcome::Created | Outcome::Imported | Outcome::Merged
-        )
-    });
+    let imported = results.iter().any(|r| brought_items_in(r.outcome));
     if imported {
         db.write_txn_with::<usize, Error, _>("sync", |conn, meta| {
             Ok(task::ensure_all_mirrors(conn, meta)?)
         })?;
     }
     Ok(SyncReport { results })
+}
+
+/// Whether this outcome may have brought items **in** from disk, so the `tasks/**` mirrors
+/// need re-deriving.
+///
+/// Written as "everything that is not one of these", so a new import-shaped variant counts by
+/// default and only a deliberate addition to the list opts out. The allowlist spelling failed
+/// exactly once, and silently: splitting `disk_wins` out of `Imported` into
+/// `ResolvedFromDisk` — for the good reason that a policy resolution throws work away and
+/// should not read as an ordinary import — dropped it from here, so a conflict-resolved task
+/// was homed under `repos/<repo>/…` with no `tasks/<repo>` mirror, and `jkb task next`, which
+/// scopes to `tasks/<repo>/**`, never saw it.
+fn brought_items_in(outcome: Outcome) -> bool {
+    match outcome {
+        // Nothing was read from disk, or nothing changed at all.
+        Outcome::UpToDate
+        | Outcome::Skipped
+        | Outcome::Conflict
+        | Outcome::Collided
+        | Outcome::Quarantined
+        // KB → disk: the items were already in the KB, and already mirrored.
+        | Outcome::Exported
+        | Outcome::ResolvedFromKb
+        | Outcome::Normalized => false,
+        Outcome::Created | Outcome::Imported | Outcome::Merged | Outcome::ResolvedFromDisk => true,
+    }
+}
+
+#[cfg(test)]
+mod mirror_predicate {
+    use super::{brought_items_in, Outcome};
+
+    /// The `match` is exhaustive, so adding an outcome stops this compiling until someone
+    /// decides which side it falls on — which is the whole point: the previous shape was an
+    /// allowlist a new variant could simply miss.
+    #[test]
+    fn every_outcome_that_reads_from_disk_triggers_the_mirror_pass() {
+        for o in [
+            Outcome::Created,
+            Outcome::Imported,
+            Outcome::Merged,
+            Outcome::ResolvedFromDisk,
+        ] {
+            assert!(brought_items_in(o), "{o:?} imports items");
+        }
+        for o in [
+            Outcome::Exported,
+            Outcome::ResolvedFromKb,
+            Outcome::Normalized,
+            Outcome::UpToDate,
+            Outcome::Skipped,
+            Outcome::Conflict,
+            Outcome::Quarantined,
+            Outcome::Collided,
+        ] {
+            assert!(!brought_items_in(o), "{o:?} does not import items");
+        }
+    }
 }
 
 /// The absolute backing directory of the mount at `mount_ns` (for the watcher).
@@ -362,6 +534,7 @@ fn read_globs(db: &Db, mount_ns: &str) -> Result<(Option<String>, Option<String>
 }
 
 /// The mount's compiled include/exclude globs.
+#[derive(Clone)]
 struct Filter {
     include: Option<GlobMatcher>,
     exclude: Option<GlobMatcher>,
@@ -417,20 +590,37 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
         }
     }
 
-    let mount_ns = ctx.mount_ns.clone();
-    let bound = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
-    for uri in bound {
-        let Some(raw) = uri.strip_prefix("file://") else {
-            continue;
-        };
-        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
-        let path = PathBuf::from(bare);
+    for path in bound_paths(db, ctx)? {
         if filter.accepts_bound(&ctx.dir, &path) {
             set.insert(path);
         }
     }
 
     Ok(set.into_iter().collect())
+}
+
+/// Every **file** the KB already syncs under this mount, deduplicated.
+///
+/// The one place binding uris are turned into paths. There were three verbatim copies — here,
+/// in `colliding_paths` and in `settle_out_of_scope` — each running its own read and its own
+/// `strip_prefix`/`split_once` parsing, so whoever adds percent-encoding or a second fragment
+/// form would have to find all three, and a miss in `colliding_paths` is the difference
+/// between refusing a collision and collapsing two files onto one namespace.
+///
+/// Deduplicated per file, not per binding: the `tasks` serializer binds one uri per checkbox
+/// line, so a file with 262 tasks yielded 262 identical paths to whatever came next.
+fn bound_paths(db: &Db, ctx: &Ctx) -> Result<BTreeSet<PathBuf>> {
+    let mount_ns = ctx.mount_ns.clone();
+    let uris = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
+    let mut out = BTreeSet::new();
+    for uri in uris {
+        let Some(raw) = uri.strip_prefix("file://") else {
+            continue;
+        };
+        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
+        out.insert(PathBuf::from(bare));
+    }
+    Ok(out)
 }
 
 /// The paths that must not be reconciled because another file maps to the same namespace.
@@ -461,15 +651,8 @@ fn colliding_paths(
     }
     // Every file the KB already syncs under this mount, so a one-path watch event still sees
     // the sibling it would collide with.
-    let mount_ns = ctx.mount_ns.clone();
-    let bound = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
     let mut known: BTreeSet<PathBuf> = paths.iter().cloned().collect();
-    for uri in bound {
-        let Some(raw) = uri.strip_prefix("file://") else {
-            continue;
-        };
-        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
-        let path = PathBuf::from(bare);
+    for path in bound_paths(db, ctx)? {
         // Filtered exactly as `discover` filters a bound file, so this set is "what this
         // mount syncs" and nothing else. Previously only `starts_with(dir)` applied, so an
         // *excluded* sibling still counted as a collision and the mount could not be
@@ -496,11 +679,44 @@ fn colliding_paths(
     let requested: BTreeSet<&PathBuf> = paths.iter().collect();
     let mut out = BTreeSet::new();
     for group in by_ns.into_values() {
-        if group.len() > 1 {
-            out.extend(group.into_iter().filter(|p| requested.contains(p)));
+        if group.len() < 2 {
+            continue;
         }
+        // A file that is **gone from disk** is not competing for the namespace, so it must
+        // not keep its surviving sibling refused: deleting one of two colliding files used to
+        // leave the group at size two forever, with no escape but an `--exclude` glob naming
+        // a file that no longer exists.
+        //
+        // It is still refused *itself*, though. `missing_file` treats a bound path with no
+        // file as one to **export** (that is how a KB-created binding gets written, and how a
+        // deleted file is restored from the KB), and exporting it here would render the
+        // shared namespace's layout into a second file — precisely the collapse this guard
+        // exists to prevent. So exactly one survivor is released, and only when exactly one
+        // path in the group is real; two live files remain ambiguous, and two ghosts would
+        // both be written from the same layout.
+        let live: Vec<&PathBuf> = group.iter().filter(|p| p.exists()).collect();
+        let survivor = if live.len() == 1 {
+            Some(live[0].clone())
+        } else {
+            None
+        };
+        out.extend(
+            group
+                .into_iter()
+                .filter(|p| Some(p) != survivor.as_ref() && requested.contains(p)),
+        );
     }
     Ok(out)
+}
+
+/// Clear the flag on a refused **ghost** — a bound path whose file is gone.
+///
+/// One call to `sync_state::settle`, which is where "clear a flag, keep the base" lives; this
+/// and `settle_out_of_scope` were two copies of that write, each restating the whole field
+/// list with nothing linking them.
+fn settle_ghost(conn: &Connection, meta: &WriteMeta, path: &Path) -> Result<()> {
+    sync_state::settle(conn, meta, &file_uri(path))?;
+    Ok(())
 }
 
 /// Journal a refused collision as `needs_attention`, preserving whatever the file last
@@ -516,22 +732,26 @@ fn journal_collision(
     ctx: &Ctx,
     path: &Path,
     siblings: &[String],
-) -> Result<()> {
+) -> Result<String> {
     let bare_uri = file_uri(path);
     // ONLY a file that has synced before is journalled. The harm this addresses is a
     // previously-good file going stale at `status='ok'` while it silently stops syncing;
     // a file that never synced has no stale row to correct, and inventing one would give it
     // a journal entry with no base — which `reconcile` then reads as "both sides changed",
     // turning what should be a first import into a three-way merge.
-    let Some(journal) = sync_state::get(conn, &bare_uri)? else {
-        return Ok(());
-    };
-    let journal = Some(journal);
+    let journal = sync_state::get(conn, &bare_uri)?;
+    // The remedy named here is `--exclude`, matching the stdout hint and `colliding_paths`'
+    // own comment: a narrowed `include` does NOT clear a collision between files that are
+    // already bound, because `accepts_bound` deliberately keeps syncing them (narrowing must
+    // not silently orphan bound files). This message is the copy a user actually sees — it is
+    // what `jkb doctor` prints, and the only signal at all under `sync --watch` — so telling
+    // them to narrow `include` sent them to the one knob that cannot work.
     let msg = if siblings.is_empty() {
         format!(
             "another synced file shares this file's namespace ({}); the `{}` serializer keeps \
              a file's sections and document order there, so one directory can hold at most \
-             one synced file. Narrow the mount's include glob.",
+             one synced file. Exclude the other file: `jkb mount create <ns> <dir> --exclude \
+             '<glob>'`.",
             namespace_for(ctx, path),
             ctx.serializer,
         )
@@ -539,7 +759,7 @@ fn journal_collision(
         format!(
             "shares its namespace ({}) with {}; the `{}` serializer keeps a file's sections \
              and document order there, so one directory can hold at most one synced file. \
-             Narrow the mount's include glob.",
+             Exclude the other file: `jkb mount create <ns> <dir> --exclude '<glob>'`.",
             namespace_for(ctx, path),
             siblings.join(", "),
             ctx.serializer,
@@ -550,20 +770,33 @@ fn journal_collision(
     let quar = journal
         .as_ref()
         .and_then(|j| j.quarantine_blob_hash.clone());
-    sync_state::upsert(
-        conn,
-        meta,
-        &sync_state::SyncStateWrite {
-            uri: &bare_uri,
-            serializer: &ctx.serializer,
-            status: "needs_attention",
-            last_synced_hash: last.as_deref(),
-            base_blob_hash: base.as_deref(),
-            parse_error: Some(&msg),
-            quarantine_blob_hash: quar.as_deref(),
-        },
-    )?;
-    Ok(())
+    // Only a file that has synced before gets a row (see above); the reason is returned
+    // either way, because the *report* must explain a refusal even when the journal cannot.
+    if journal.is_some() {
+        sync_state::upsert(
+            conn,
+            meta,
+            &sync_state::SyncStateWrite {
+                uri: &bare_uri,
+                serializer: &ctx.serializer,
+                status: "needs_attention",
+                last_synced_hash: last.as_deref(),
+                base_blob_hash: base.as_deref(),
+                parse_error: Some(&msg),
+                quarantine_blob_hash: quar.as_deref(),
+            },
+        )?;
+    }
+    Ok(msg)
+}
+
+/// The journal's explanation for `path`, when it has one — the reason a reconcile refused.
+fn outcome_reason(db: &Db, path: &Path) -> Result<Option<String>> {
+    let uri = file_uri(path);
+    Ok(db
+        .read(move |conn| sync_state::get(conn, &uri))?
+        .filter(|j| j.status != "ok")
+        .and_then(|j| j.parse_error))
 }
 
 /// Reconcile a single file within the current transaction.
@@ -572,7 +805,13 @@ fn journal_collision(
 // helpers than it saves; the stages that carry real logic (`decide_direction`, `missing_file`)
 // are already extracted and separately testable.
 #[allow(clippy::too_many_lines)]
-fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Result<Outcome> {
+fn reconcile(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    filter: &Filter,
+    path: &Path,
+) -> Result<Outcome> {
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
     let journal = sync_state::get(conn, &bare_uri)?;
@@ -602,6 +841,55 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
     } else {
         None
     };
+
+    // Whose document does the shared namespace describe? If some other file's, the KB side
+    // for THIS file cannot be assembled: `assemble_kb_doc` would take that file's layout and
+    // section headers (they live on the namespace, which drops the filename) and hand them to
+    // `render`, which treats the layout as the sole authority on document order. Exporting
+    // that writes the sibling's headers and prose over this file — the collapse `Collided`
+    // exists to prevent, reached the moment the sibling stops syncing and this file is
+    // released. So the KB side is treated as unknown and only the **import** direction is
+    // allowed: disk is intact (a refusal never wrote it), and importing re-establishes the
+    // layout and sections under this file's name, taking ownership.
+    //
+    // Only for serializers that keep document structure on the namespace; `document` shares a
+    // directory safely and consults no layout.
+    // A namespace whose layout nobody has claimed, on a file that last synced cleanly, is not
+    // a dispute — it is a database written before `layout_uri` existed. Stamp ownership and
+    // carry on through the ordinary three-way path.
+    //
+    // Routing it through `foreign_layout` instead was import-only, which silently reverted a
+    // KB-side edit not yet exported (a task closed with `jkb task set --status done`, and
+    // worse a task *added* in the KB, which `apply_doc` then cancelled), and it sat before
+    // `missing_file`, so a bound file deleted from disk could no longer be written back from
+    // the KB — v1 behaviour, refused with advice ("edit the file") impossible to follow for a
+    // file that is not there.
+    let owner = layout_owner(conn, ctx, path)?;
+    // Sole claimancy is the whole test. Requiring `status == "ok"` as well meant a legacy file
+    // sitting at `conflict` — a `manual` mount where both sides had changed, which is a
+    // *normal* resting state — failed the claim and fell into the import-only path, cancelling
+    // and detaching KB-side items without the conflict policy ever being consulted. Its layout
+    // was perfectly recoverable; it just had no owner stamp. Stamping and continuing puts the
+    // file back on the ordinary three-way path, where `conflict_policy` still decides.
+    let unclaimed_legacy = owner == LayoutOwner::Unknown
+        && journal.is_some()
+        && !shares_namespace_with_other_bound_file(conn, ctx, filter, path, &bare_uri)?;
+    if serializer.requires_exclusive_namespace() && unclaimed_legacy {
+        claim_layout(conn, meta, ctx, path, &bare_uri)?;
+    } else if serializer.requires_exclusive_namespace() && owner.is_foreign_to(&bare_uri) {
+        return foreign_layout(
+            conn,
+            meta,
+            ctx,
+            filter,
+            path,
+            &bare_uri,
+            &ser_name,
+            serializer.as_ref(),
+            disk.as_ref(),
+            journal.as_ref(),
+        );
+    }
 
     // Assemble the KB side and render it, so we can hash it against the base.
     let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri)?;
@@ -717,6 +1005,171 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
             &base_doc.unwrap_or_default(),
         ),
     }
+}
+
+/// Reconcile a file whose namespace's document belongs to some other file.
+///
+/// The KB side is unassemblable here — `assemble_kb_doc` would hand this file the *other*
+/// file's layout and headers — so the question is only whether this file may take the
+/// namespace over.
+///
+/// **It may, whenever it is the sole claimant.** No other bound file mapping to this
+/// namespace means the layout belongs to a file that has left (deleted, or excluded by the
+/// remedy the refusal itself prints) or to a database written before `layout_uri` existed —
+/// and in both cases the file on disk is intact, because a refusal never writes. Importing it
+/// re-establishes the layout and sections under this file's name and stamps ownership.
+///
+/// Refusing instead was a wedge with no way out: `layout_uri` is new, so *every* namespace
+/// that had ever imported a `tasks` file read as foreign, and the escapes the message named
+/// (edit the file, `--conflict disk-wins`) were both behind a `disk_changed` test a settled
+/// file never passes. Every `tasks.md` in a pre-existing database would have gone
+/// `needs_attention` on its first sync and stayed there.
+#[allow(clippy::too_many_arguments)]
+fn foreign_layout(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    filter: &Filter,
+    path: &Path,
+    bare_uri: &str,
+    ser_name: &str,
+    serializer: &dyn SyncSerializer,
+    disk: Option<&(Vec<u8>, SyncDoc)>,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<Outcome> {
+    // A second bound file really does map here: this is an ordinary collision, and neither
+    // file may write. (`colliding_paths` normally refuses both before reconcile is reached;
+    // this is the same rule, enforced where the decision is actually made.)
+    if shares_namespace_with_other_bound_file(conn, ctx, filter, path, bare_uri)? {
+        return refuse_foreign(conn, meta, ctx, path, bare_uri, ser_name, journal);
+    }
+    // Nothing to take ownership *with*: no file on disk, or a mount that cannot import. The
+    // alternative — `missing_file`'s export — would render the departed file's layout into
+    // this path, which is the collapse this guard exists to prevent.
+    let Some((disk_bytes, disk_doc)) = disk else {
+        return refuse_foreign(conn, meta, ctx, path, bare_uri, ser_name, journal);
+    };
+    if !ctx.imports() {
+        return refuse_foreign(conn, meta, ctx, path, bare_uri, ser_name, journal);
+    }
+    // What the import costs, reported honestly. Nothing is *discarded* unless disk moved
+    // since the last sync — the settled case, which is the whole legacy population, only
+    // rewrites metadata this file already owned in substance. When disk did move, the KB side
+    // may have moved too and cannot be assembled to find out, so it is reported as a
+    // resolution ("disk won, KB edits discarded") rather than as a quiet import. Even under
+    // `manual` this proceeds: the KB's copy of this document is not reconstructible, so the
+    // choice is between the file on disk and a permanent refusal, and `apply_doc` cancels and
+    // detaches rather than deletes (D25), so nothing becomes unrecoverable.
+    let disk_changed = match journal.and_then(|j| j.last_synced_hash.as_deref()) {
+        Some(base) => hash(disk_bytes) != base,
+        None => true,
+    };
+    let outcome = match (journal.is_none(), disk_changed) {
+        (true, _) => Outcome::Created,
+        (false, true) => Outcome::ResolvedFromDisk,
+        (false, false) => Outcome::Imported,
+    };
+    finish_import(
+        conn, meta, ctx, path, bare_uri, ser_name, serializer, disk_doc, disk_bytes, outcome,
+    )
+}
+
+/// Stamp `layout_uri` on this file's namespace without otherwise touching the document.
+///
+/// The upgrade path for a namespace written before ownership was recorded: it says "the
+/// layout stored here is this file's", which is true of any sole claimant whose last sync
+/// settled cleanly, and it is all the ordinary reconcile needs to be safe.
+fn claim_layout(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    bare_uri: &str,
+) -> Result<()> {
+    let file_ns = ns::ensure(conn, &namespace_for(ctx, path))?;
+    let mut metadata = ns::get_metadata(conn, file_ns)?
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(LAYOUT_URI_KEY.to_owned(), json!(bare_uri));
+    }
+    ns::set_metadata(conn, meta, file_ns, &metadata)?;
+    Ok(())
+}
+
+/// Whether another file this mount **still syncs** maps to the same namespace as `path`.
+///
+/// The test for "is this file the sole claimant of its namespace", and each of its three
+/// conditions rules out a wedge that the first version had:
+///
+/// - **bound** — it is a file of this mount, not any passing file in the directory;
+/// - **still selected by the globs** — an `--exclude`d sibling has been told to stop syncing,
+///   and if it still counted, applying the refusal's own printed remedy would leave the
+///   survivor refused forever;
+/// - **still on disk** — a bound file the user deleted is a ghost being reconciled away, and
+///   counting it made deletion (the other printed remedy) fail the same way.
+///
+/// The same "live file" rule `colliding_paths` applies, enforced where ownership is decided.
+fn shares_namespace_with_other_bound_file(
+    conn: &Connection,
+    ctx: &Ctx,
+    filter: &Filter,
+    path: &Path,
+    bare_uri: &str,
+) -> Result<bool> {
+    let ns = namespace_for(ctx, path);
+    for uri in binding::synced_uris_under(conn, &ctx.mount_ns)? {
+        let Some(raw) = uri.strip_prefix("file://") else {
+            continue;
+        };
+        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
+        if format!("file://{bare}") == bare_uri {
+            continue;
+        }
+        let other = Path::new(bare);
+        if filter.accepts_bound(&ctx.dir, other)
+            && other.exists()
+            && namespace_for(ctx, other) == ns
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Journal a file this mount cannot safely touch because its namespace belongs to another
+/// file, and report it as [`Outcome::Collided`] — which is what it is.
+fn refuse_foreign(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    bare_uri: &str,
+    ser_name: &str,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<Outcome> {
+    let msg = format!(
+        "this file's namespace ({}) holds another file's document layout, so rendering this \
+         file from the KB would write that document over it, and its own structure cannot be \
+         rebuilt from the KB. Only the file on disk can restore it — so this syncs again as \
+         soon as the other file stops sharing the namespace: delete it, or exclude it with \
+         `jkb mount create <ns> <dir> --exclude '<glob>'`.",
+        namespace_for(ctx, path),
+    );
+    sync_state::upsert(
+        conn,
+        meta,
+        &sync_state::SyncStateWrite {
+            uri: bare_uri,
+            serializer: ser_name,
+            status: "needs_attention",
+            last_synced_hash: journal.and_then(|j| j.last_synced_hash.as_deref()),
+            base_blob_hash: journal.and_then(|j| j.base_blob_hash.as_deref()),
+            parse_error: Some(&msg),
+            quarantine_blob_hash: journal.and_then(|j| j.quarantine_blob_hash.as_deref()),
+        },
+    )?;
+    Ok(Outcome::Collided)
 }
 
 /// Nothing can be imported (the file is gone, or the mount is export-only). If the KB still
@@ -1039,6 +1492,11 @@ fn apply_doc(
     bare_uri: &str,
     doc: &SyncDoc,
 ) -> Result<Vec<ItemId>> {
+    // Whether THIS file's serializer owns the namespace's layout — the per-file binding
+    // override decides that, not the mount's default (`resolve_serializer`).
+    let exclusive = resolve_serializer(conn, ctx, bare_uri)?
+        .1
+        .requires_exclusive_namespace();
     let file_ns_path = namespace_for(ctx, path);
     let file_ns = ns::ensure(conn, &file_ns_path)?;
 
@@ -1057,7 +1515,7 @@ fn apply_doc(
         )?;
         section_ns.insert(s.path.clone(), id);
     }
-    set_layout(conn, meta, file_ns, doc)?;
+    set_layout(conn, meta, file_ns, doc, bare_uri, exclusive)?;
     // A section the file no longer declares must stop being a section. Its namespace can
     // legitimately survive — it may still hold cancelled tasks, which are deliberate history
     // — but leaving `header_line` on it makes `assemble_kb_doc` re-emit a `##` header the
@@ -1112,6 +1570,13 @@ fn apply_doc(
 
 /// The metadata key holding a file's block order (and its prose, inline).
 const LAYOUT_KEY: &str = "layout";
+/// The metadata key naming **which file** the stored layout describes.
+///
+/// [`namespace_for`] drops the filename, so a directory's files share one namespace and one
+/// `layout`. Without this, nothing in the store could say whose it was — the exact gap the
+/// `Collided` refusal cites — so the moment a second file was allowed to sync there it
+/// rendered from its sibling's layout and overwrote its own headers and prose with them.
+const LAYOUT_URI_KEY: &str = "layout_uri";
 
 /// Serialize a document's layout for storage on the file's namespace.
 fn layout_json(doc: &SyncDoc) -> serde_json::Value {
@@ -1134,15 +1599,85 @@ fn set_layout(
     meta: &WriteMeta,
     file_ns: NamespaceId,
     doc: &SyncDoc,
+    bare_uri: &str,
+    exclusive: bool,
 ) -> Result<()> {
     let mut metadata = ns::get_metadata(conn, file_ns)?
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| json!({}));
     if let Some(map) = metadata.as_object_mut() {
         map.insert(LAYOUT_KEY.to_owned(), layout_json(doc));
+        // Stamped with the writer, so a later reader can tell its own layout from a
+        // sibling's — see `LAYOUT_URI_KEY` — but ONLY by a serializer that owns a namespace's
+        // layout. `document` shares a directory safely and consults no layout, so each of
+        // several document files would overwrite the stamp in turn; a per-file `tasks`
+        // override inside a `document` mount then read the last document's uri as a foreign
+        // claim on a namespace nobody was disputing.
+        if exclusive {
+            map.insert(LAYOUT_URI_KEY.to_owned(), json!(bare_uri));
+        } else {
+            map.remove(LAYOUT_URI_KEY);
+        }
     }
     ns::set_metadata(conn, meta, file_ns, &metadata)?;
     Ok(())
+}
+
+/// Who the shared namespace's layout and section headers belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LayoutOwner {
+    /// No layout stored at all: the namespace describes no document, so nobody is displaced.
+    Unclaimed,
+    /// A layout stamped with the file that wrote it.
+    File(String),
+    /// A layout with **no** `layout_uri` — written before that key existed.
+    ///
+    /// Read as a foreign claim, not as unclaimed. On every database that synced before this
+    /// change the stored layout belongs to *some* file and nothing records which, so treating
+    /// it as free left the guard inert exactly where the damage happens: two files collide, so
+    /// neither ever stamps ownership, and the first one released renders from whatever blocks
+    /// the other left behind. Unknown resolves itself — the next successful import stamps the
+    /// key — so this costs one import-only pass per legacy directory.
+    Unknown,
+}
+
+impl LayoutOwner {
+    /// Whether the namespace's document belongs to someone other than `bare_uri`.
+    fn is_foreign_to(&self, bare_uri: &str) -> bool {
+        match self {
+            Self::Unclaimed => false,
+            Self::File(owner) => owner != bare_uri,
+            Self::Unknown => true,
+        }
+    }
+}
+
+/// Who the layout on `path`'s namespace belongs to (see [`LayoutOwner`]).
+fn layout_owner(conn: &Connection, ctx: &Ctx, path: &Path) -> Result<LayoutOwner> {
+    let Some(file_ns) = ns::get(conn, &namespace_for(ctx, path))? else {
+        return Ok(LayoutOwner::Unclaimed);
+    };
+    let Some(md) = ns::get_metadata(conn, file_ns)? else {
+        return Ok(LayoutOwner::Unclaimed);
+    };
+    if let Some(uri) = md
+        .get(LAYOUT_URI_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|uri| !uri.is_empty())
+    {
+        return Ok(LayoutOwner::File(uri.to_owned()));
+    }
+    // A layout with no owner recorded. An *empty* layout describes nothing, so it displaces
+    // no one; a populated one belongs to a file this build cannot name.
+    let has_layout = md
+        .get(LAYOUT_KEY)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| !blocks.is_empty());
+    Ok(if has_layout {
+        LayoutOwner::Unknown
+    } else {
+        LayoutOwner::Unclaimed
+    })
 }
 
 /// Read a stored layout back out of a namespace's metadata.

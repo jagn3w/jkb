@@ -1,6 +1,8 @@
 //! Undo: revert a transaction by inverting its changelog entries.
 //!
-//! Two inversions are implemented. **Inserts** are reversed by deleting the affected row by
+//! The inversions are listed once, in [`INVERSES`]: `undo` dispatches on that list and
+//! `undo_last` generates its eligibility predicate from it, so a new inverse cannot reach one
+//! and not the other. **Inserts** are reversed by deleting the affected row by
 //! `rowid` (the common "oops, undo that" case for creates). An **item delete** is reversed by
 //! restoring it from the complete snapshot `item::remove` recorded in `before` — the item row
 //! plus the placements, tag applications, edges, and binding that `ON DELETE CASCADE` took
@@ -11,13 +13,56 @@
 //! Inverting the remaining column updates (item status, priority, …) is still future work.
 //! The row's `rowid` is stored as the changelog `entity_id` and `entity_type` is the table name.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
 
 use jkb_types::Error as TypeError;
 
 use crate::store::WriteMeta;
-use crate::{changelog, Result};
+use crate::{changelog, Error, Result};
+
+/// One inversion [`undo`] knows how to perform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Inverse {
+    /// Put an item back from the snapshot `item::remove` recorded.
+    ItemSnapshot,
+    /// Restore an edge's previous weight.
+    EdgeWeight,
+    /// Restore a mount's previous configuration.
+    MountConfig,
+    /// Restore a containment row's previous container and position.
+    ContainmentRow,
+    /// Delete the inserted row by `rowid`.
+    DeleteRow,
+}
+
+/// **The** list of inversions this module implements, as data: `(op, entity_type, inverse)`,
+/// where a `None` entity type matches any table.
+///
+/// [`undo`] dispatches on it and [`undo_last`] builds its eligibility predicate from it, so
+/// the two cannot disagree about what is invertible. They did once: the `update`+`mounts`
+/// inverse was added to `undo` alone, and a bare `jkb undo` — which is the only form any
+/// surface offers, since nothing prints txn ids — walked straight past a mount edit and
+/// reverted an older transaction, deleting the mount it had been asked to restore.
+const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
+    ("delete", Some("items"), Inverse::ItemSnapshot),
+    ("update", Some("edges"), Inverse::EdgeWeight),
+    ("update", Some("mounts"), Inverse::MountConfig),
+    ("update", Some("containment"), Inverse::ContainmentRow),
+    // Any table on `UNDOABLE_TABLES`; an insert into anything else is an error, not a skip.
+    // The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so a
+    // table-specific `insert` inverse placed after it would never be reached.
+    ("insert", None, Inverse::DeleteRow),
+];
+
+/// The inversion for a changelog entry, or `None` if this module cannot reverse it.
+fn inverse_for(op: &str, table: &str) -> Option<Inverse> {
+    INVERSES
+        .iter()
+        .find(|(o, t, _)| *o == op && t.is_none_or(|t| t == table))
+        .map(|(_, _, inv)| *inv)
+}
 
 /// Tables whose inserts `undo` may reverse. This allowlist guards the table-name
 /// interpolation below (the name comes from our own code, never user input, but
@@ -33,7 +78,128 @@ const UNDOABLE_TABLES: &[&str] = &[
     "mounts",
     "blobs",
     "ingestions",
+    // Every `jkb ingest` writes one per chunk and every `task add --under` writes one, so
+    // omitting it made a bare `jkb undo` die on the most common transaction shape there is —
+    // and, because a failed undo records no `undo` marker, re-select the same transaction
+    // forever. `child_item_id` is an `INTEGER PRIMARY KEY`, hence the rowid, so the generic
+    // delete-by-rowid inverse addresses the right row.
+    "containment",
 ];
+
+/// Invert one changelog entry, returning how many rows it changed.
+///
+/// `Ok(0)` covers the deliberate skips: an op this module has no inverse for (a claim, a
+/// status update) is passed over rather than failing the undo.
+///
+/// # Errors
+/// Returns a validation error for an insert into a table outside [`UNDOABLE_TABLES`] — a
+/// half-undone transaction is worse than none — or for an unreadable snapshot.
+fn invert_entry(
+    conn: &Connection,
+    op: &str,
+    table: &str,
+    entity_id: &str,
+    before: Option<&str>,
+) -> Result<usize> {
+    let mut rows = 0;
+    // Dispatch through `INVERSES` — the same list `undo_last` selects transactions with.
+    let Some(inverse) = inverse_for(op, table) else {
+        return Ok(0);
+    };
+    // A `match`, not an if-chain with a fall-through: the fall-through was
+    // `DELETE FROM <table>`, so a future `Inverse` variant added to the enum and the table
+    // but not to the dispatch compiled clean and deleted the row it was meant to restore
+    // — the same shape as the mount bug above. Adding a variant now stops this compiling.
+    let rowid = || -> Result<i64> {
+        entity_id
+            .parse::<i64>()
+            .map_err(|_| TypeError::Validation(format!("bad entity id '{entity_id}'")).into())
+    };
+    let snapshot = |what: &str| -> Result<Option<Value>> {
+        before
+            .map(|b| {
+                serde_json::from_str(b).map_err(|e| {
+                    Error::from(TypeError::Validation(format!(
+                        "unreadable {what} in changelog: {e}"
+                    )))
+                })
+            })
+            .transpose()
+    };
+    match inverse {
+        // An item delete is inverted by putting the snapshot back (see `restore_item`).
+        Inverse::ItemSnapshot => {
+            if let Some(snap) = snapshot("item snapshot")? {
+                rows += restore_item(conn, &snap)?;
+            }
+        }
+        // An edge weight update is inverted by putting the previous weight back. Without
+        // this the edge would keep whatever weight the undone transaction gave it.
+        Inverse::EdgeWeight => {
+            if let Some(snap) = snapshot("edge before-state")? {
+                rows += conn
+                    .prepare_cached("UPDATE edges SET weight = ?2 WHERE rowid = ?1")?
+                    .execute(params![
+                        rowid()?,
+                        snap.get("weight").and_then(Value::as_f64)
+                    ])?;
+            }
+        }
+        // A mount edit is inverted by putting the previous configuration back. `jkb mount
+        // create` doubles as the update command, so without this the generic insert
+        // inverse would `DELETE FROM mounts` and destroy a mount that existed before the
+        // transaction, leaving its `file://` bindings with nothing to sync them.
+        Inverse::MountConfig => {
+            if let Some(snap) = snapshot("mount before-state")? {
+                let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
+                rows += conn
+                    .prepare_cached(
+                        "UPDATE mounts
+                            SET backing_uri = ?2, sync_mode = ?3, serializer = ?4,
+                                include_glob = ?5, exclude_glob = ?6, conflict_policy = ?7
+                          WHERE namespace_id = ?1",
+                    )?
+                    .execute(params![
+                        rowid()?,
+                        field("backing_uri"),
+                        field("sync_mode"),
+                        field("serializer"),
+                        field("include_glob"),
+                        field("exclude_glob"),
+                        field("conflict_policy"),
+                    ])?;
+            }
+        }
+        // Re-parenting is an update, not an insert (`containment::contain` upserts on the
+        // child), so the generic inverse would delete a row that existed beforehand and
+        // un-parent the item instead of putting its previous container back.
+        Inverse::ContainmentRow => {
+            if let Some(snap) = snapshot("containment before-state")? {
+                rows += conn
+                    .prepare_cached(
+                        "UPDATE containment SET parent_item_id = ?2, position = ?3
+                          WHERE child_item_id = ?1",
+                    )?
+                    .execute(params![
+                        rowid()?,
+                        snap.get("parent_item_id").and_then(Value::as_i64),
+                        snap.get("position").and_then(Value::as_i64).unwrap_or(0),
+                    ])?;
+            }
+        }
+        Inverse::DeleteRow => {
+            if !UNDOABLE_TABLES.contains(&table) {
+                return Err(
+                    TypeError::Validation(format!("cannot undo unknown table '{table}'")).into(),
+                );
+            }
+            rows += conn
+                .prepare_cached(&format!("DELETE FROM {table} WHERE rowid = ?1"))?
+                .execute([rowid()?])?;
+        }
+    }
+    Ok(rows)
+}
 
 /// Revert transaction `txn_id` by deleting the rows it inserted (most recent
 /// first). Returns the number of rows removed and records an `undo` marker.
@@ -59,81 +225,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
 
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
-        // An item delete is inverted by putting the snapshot back (see `restore_item`).
-        if op == "delete" && table == "items" {
-            if let Some(before) = before {
-                let snapshot: Value = serde_json::from_str(&before).map_err(|e| {
-                    TypeError::Validation(format!("unreadable item snapshot in changelog: {e}"))
-                })?;
-                reverted += restore_item(conn, &snapshot)?;
-            }
-            continue;
-        }
-        // An edge weight update is inverted by putting the previous weight back. Without
-        // this the edge would keep whatever weight the undone transaction gave it.
-        if op == "update" && table == "edges" {
-            if let Some(before) = before {
-                let snapshot: Value = serde_json::from_str(&before).map_err(|e| {
-                    TypeError::Validation(format!("unreadable edge before-state: {e}"))
-                })?;
-                let rowid: i64 = entity_id
-                    .parse()
-                    .map_err(|_| TypeError::Validation(format!("bad entity id '{entity_id}'")))?;
-                reverted += conn
-                    .prepare_cached("UPDATE edges SET weight = ?2 WHERE rowid = ?1")?
-                    .execute(params![
-                        rowid,
-                        snapshot.get("weight").and_then(Value::as_f64)
-                    ])?;
-            }
-            continue;
-        }
-        // A mount edit is inverted by putting the previous configuration back. `jkb mount
-        // create` doubles as the update command, so without this the generic insert inverse
-        // would `DELETE FROM mounts` and destroy a mount that existed before the transaction,
-        // leaving its `file://` bindings with nothing to sync them.
-        if op == "update" && table == "mounts" {
-            if let Some(before) = before {
-                let snap: Value = serde_json::from_str(&before).map_err(|e| {
-                    TypeError::Validation(format!("unreadable mount before-state: {e}"))
-                })?;
-                let ns_id: i64 = entity_id
-                    .parse()
-                    .map_err(|_| TypeError::Validation(format!("bad entity id '{entity_id}'")))?;
-                let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
-                reverted += conn
-                    .prepare_cached(
-                        "UPDATE mounts
-                            SET backing_uri = ?2, sync_mode = ?3, serializer = ?4,
-                                include_glob = ?5, exclude_glob = ?6, conflict_policy = ?7
-                          WHERE namespace_id = ?1",
-                    )?
-                    .execute(params![
-                        ns_id,
-                        field("backing_uri"),
-                        field("sync_mode"),
-                        field("serializer"),
-                        field("include_glob"),
-                        field("exclude_glob"),
-                        field("conflict_policy"),
-                    ])?;
-            }
-            continue;
-        }
-        if op != "insert" {
-            continue;
-        }
-        if !UNDOABLE_TABLES.contains(&table.as_str()) {
-            return Err(
-                TypeError::Validation(format!("cannot undo unknown table '{table}'")).into(),
-            );
-        }
-        let rowid: i64 = entity_id
-            .parse()
-            .map_err(|_| TypeError::Validation(format!("bad entity id '{entity_id}'")))?;
-        reverted += conn
-            .prepare_cached(&format!("DELETE FROM {table} WHERE rowid = ?1"))?
-            .execute([rowid])?;
+        reverted += invert_entry(conn, &op, &table, &entity_id, before.as_deref())?;
     }
 
     changelog::append(
@@ -262,6 +354,34 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
                 edge.get("created_at").and_then(Value::as_str),
             ])?;
     }
+    // Containment, both directions. `child_item_id` is the PRIMARY KEY, so re-inserting the
+    // row that named this item's container is one statement; the rows for the items it
+    // contained are one each. `OR IGNORE` plus the `EXISTS` guard skips a row whose other
+    // endpoint is gone, exactly as the edges above do.
+    if let Some(c) = snapshot.get("contained_by").filter(|c| !c.is_null()) {
+        restored += conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO containment (child_item_id, parent_item_id, position)
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM items WHERE id = ?2)",
+            )?
+            .execute(params![
+                id,
+                c.get("parent_item_id").and_then(Value::as_i64),
+                c.get("position").and_then(Value::as_i64).unwrap_or(0),
+            ])?;
+    }
+    for c in rows("contains") {
+        restored += conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO containment (child_item_id, parent_item_id, position)
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM items WHERE id = ?1)",
+            )?
+            .execute(params![
+                c.get("child_item_id").and_then(Value::as_i64),
+                id,
+                c.get("position").and_then(Value::as_i64).unwrap_or(0),
+            ])?;
+    }
     if let Some(binding) = snapshot.get("binding").filter(|b| !b.is_null()) {
         restored += conn
             .prepare_cached(
@@ -284,28 +404,76 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
 /// Undo the most recent **invertible** transaction that has not already been undone, and
 /// return the number of rows it changed (0 if there is nothing to undo).
 ///
-/// Invertible means the transaction contains an `insert`, an item `delete` (which carries a
-/// restorable snapshot), or an edge weight `update`. A transaction with none of those — the
-/// delete-only one `jkb item rm` produces, say — must still count: otherwise `jkb undo` would
-/// skip straight past it and revert somebody's unrelated earlier work while the deleted item
-/// stayed gone.
+/// Invertible means the transaction contains an entry [`INVERSES`] covers — an `insert` into
+/// an [`UNDOABLE_TABLES`] table, an item `delete` (which carries a restorable snapshot), an
+/// edge weight `update`, a mount config `update`, a containment `update` — **and** no insert
+/// into a table outside that list, which [`undo`] refuses rather than half-inverting.
+///
+/// The predicate is **generated** from those two lists rather than written out a second time.
+/// Both halves have drifted before: the mount inverse reached `undo` alone, so a bare
+/// `jkb undo` walked past a mount edit and reverted an older transaction; and `containment`
+/// reached the schema without reaching `UNDOABLE_TABLES`, so undo died on every transaction
+/// an `ingest` or a `task add --under` produced.
+///
+/// A transaction with none of those — the delete-only one `jkb item rm` produces, say — must
+/// still count: otherwise `jkb undo` would skip straight past it and revert somebody's
+/// unrelated earlier work while the deleted item stayed gone.
 ///
 /// # Errors
 /// Propagates any error from [`undo`].
 pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
+    // Placeholders come from the const lists; every op and table name is *bound*, not
+    // interpolated, so this stays a parameterized query.
+    let mut clauses = Vec::with_capacity(INVERSES.len());
+    let mut args: Vec<SqlValue> = Vec::new();
+    for (op, table, _) in INVERSES {
+        args.push(SqlValue::Text((*op).to_owned()));
+        if let Some(t) = table {
+            clauses.push("(c.op = ? AND c.entity_type = ?)".to_owned());
+            args.push(SqlValue::Text((*t).to_owned()));
+        } else {
+            // An insert is only invertible for a table on `UNDOABLE_TABLES` — otherwise
+            // `undo` errors. That list is therefore part of this predicate too, or the two
+            // halves of "invertible" disagree again.
+            let holes = vec!["?"; UNDOABLE_TABLES.len()].join(", ");
+            clauses.push(format!("(c.op = ? AND c.entity_type IN ({holes}))"));
+            args.extend(
+                UNDOABLE_TABLES
+                    .iter()
+                    .map(|t| SqlValue::Text((*t).to_owned())),
+            );
+        }
+    }
+    // …and a transaction containing ANY insert into an unlisted table is skipped whole,
+    // because `undo` would abort on it. The abort is deliberate — a half-undone transaction
+    // is worse than none — but it rolls back without writing an `undo` marker, so selecting
+    // such a transaction wedges `jkb undo` on it permanently, every run, forever. Selecting
+    // an older one instead at least keeps undo working and leaves the entry in the log.
+    let unlisted = vec!["?"; UNDOABLE_TABLES.len()].join(", ");
+    args.extend(
+        UNDOABLE_TABLES
+            .iter()
+            .map(|t| SqlValue::Text((*t).to_owned())),
+    );
+    args.push(SqlValue::Integer(meta.txn_id));
+    let sql = format!(
+        "SELECT MAX(txn_id) FROM changelog c
+         WHERE ({})
+           AND NOT EXISTS (
+               SELECT 1 FROM changelog b
+               WHERE b.txn_id = c.txn_id
+                 AND b.op = 'insert' AND b.entity_type NOT IN ({unlisted})
+           )
+           AND c.txn_id < ?
+           AND NOT EXISTS (
+               SELECT 1 FROM changelog u
+               WHERE u.op = 'undo' AND u.entity_id = CAST(c.txn_id AS TEXT)
+           )",
+        clauses.join(" OR ")
+    );
     let target: Option<i64> = conn
-        .prepare_cached(
-            "SELECT MAX(txn_id) FROM changelog c
-             WHERE (c.op = 'insert'
-                    OR (c.op = 'delete' AND c.entity_type = 'items')
-                    OR (c.op = 'update' AND c.entity_type = 'edges'))
-               AND c.txn_id < ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM changelog u
-                   WHERE u.op = 'undo' AND u.entity_id = CAST(c.txn_id AS TEXT)
-               )",
-        )?
-        .query_row([meta.txn_id], |row| row.get(0))
+        .prepare_cached(&sql)?
+        .query_row(params_from_iter(args), |row| row.get(0))
         .optional()?
         .flatten();
 
@@ -602,5 +770,176 @@ mod tests {
                 .is_some(),
             "and must not have reverted the unrelated earlier insert"
         );
+    }
+
+    /// A bare `jkb undo` must survive the most common transaction shape in the system.
+    ///
+    /// Every `jkb ingest` writes a `containment` row per chunk and every `task add --under`
+    /// writes one, but `containment` was not on `UNDOABLE_TABLES` — so `undo` aborted with
+    /// "cannot undo unknown table", and because an aborted undo rolls back without writing an
+    /// `undo` marker, the very next `jkb undo` selected the same transaction and died again,
+    /// permanently.
+    #[test]
+    fn undo_last_handles_a_transaction_that_contains_an_item() {
+        use crate::{containment, item};
+
+        let db = Db::open_in_memory().unwrap();
+        let parent = db
+            .write_txn("t", |c, m| upsert(c, m, &note("parent")))
+            .unwrap();
+        // One transaction that both creates the child and files it under its container.
+        let child = db
+            .write_txn("t", move |c, m| {
+                let child = upsert(c, m, &note("child"))?;
+                containment::contain(c, m, child, parent, 0)?;
+                Ok(child)
+            })
+            .unwrap();
+        assert_eq!(
+            db.read(move |c| containment::children(c, parent)).unwrap(),
+            vec![child]
+        );
+
+        assert!(db.write_txn("t", undo_last).unwrap() > 0);
+        assert!(
+            db.read(|c| item::id_for_uid(c, "child")).unwrap().is_none(),
+            "the child and its containment row go together"
+        );
+        assert!(db
+            .read(move |c| containment::children(c, parent))
+            .unwrap()
+            .is_empty());
+        // And undo can still advance: the parent's own transaction is next, not the same one.
+        assert_eq!(db.write_txn("t", undo_last).unwrap(), 1);
+        assert!(db
+            .read(|c| item::id_for_uid(c, "parent"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// Re-parenting is an upsert, so undoing it must put the previous container back — not
+    /// delete the row and leave the item contained by nothing.
+    #[test]
+    fn undoing_a_re_parent_restores_the_previous_container() {
+        use crate::containment;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, kid) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                let kid = upsert(c, m, &note("kid"))?;
+                containment::contain(c, m, kid, a, 0)?;
+                Ok((a, b, kid))
+            })
+            .unwrap();
+        // A separate transaction that only moves it.
+        db.write_txn("t", move |c, m| containment::contain(c, m, kid, b, 3))
+            .unwrap();
+        assert_eq!(
+            db.read(move |c| containment::parent(c, kid)).unwrap(),
+            Some(b)
+        );
+
+        db.write_txn("t", undo_last).unwrap();
+        assert_eq!(
+            db.read(move |c| containment::parent(c, kid)).unwrap(),
+            Some(a),
+            "the previous container is restored, not removed"
+        );
+    }
+
+    /// Undoing an item delete must restore its **containment** rows, not only the
+    /// `parent_of` edge. `SUBTASK_CLAUSE` — the anti-join that holds a parent off the ready
+    /// frontier — reads `containment`, so restoring the edge alone put the parent back as a
+    /// pickable task with a live open child, and a restored document's chunks were
+    /// unreachable from `jkb ls <doc>`.
+    #[test]
+    fn undoing_a_delete_restores_containment_both_ways() {
+        use crate::{containment, item};
+
+        let db = Db::open_in_memory().unwrap();
+        let (parent, kid, grandkid) = db
+            .write_txn("t", |c, m| {
+                let parent = upsert(c, m, &note("parent"))?;
+                let kid = upsert(c, m, &note("kid"))?;
+                let grandkid = upsert(c, m, &note("grandkid"))?;
+                containment::contain(c, m, kid, parent, 0)?;
+                containment::contain(c, m, grandkid, kid, 0)?;
+                Ok((parent, kid, grandkid))
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| item::remove(c, m, kid, true))
+            .unwrap();
+        db.write_txn("t", undo_last).unwrap();
+
+        let restored = db
+            .read(|c| item::id_for_uid(c, "kid"))
+            .unwrap()
+            .expect("the item is back");
+        assert_eq!(
+            db.read(move |c| containment::parent(c, restored)).unwrap(),
+            Some(parent),
+            "it is contained by its parent again"
+        );
+        assert_eq!(
+            db.read(move |c| containment::children(c, restored))
+                .unwrap(),
+            vec![grandkid],
+            "and it contains its own child again"
+        );
+    }
+
+    /// The bare `jkb undo` — the only form any surface offers — must reverse a mount **edit**.
+    /// `undo(txn)` grew that inverse while `undo_last`'s eligibility predicate did not, so the
+    /// mount transaction was invisible to it: `MAX(txn_id)` landed on the earlier *create* and
+    /// took the generic insert inverse, deleting the mount instead of restoring its config.
+    #[test]
+    fn undo_last_reverses_a_mount_edit_rather_than_deleting_the_mount() {
+        use crate::{mount, ns};
+        use jkb_types::{ConflictPolicy, SyncMode};
+
+        let db = Db::open_in_memory().unwrap();
+        let ns_id = db
+            .write_txn("t", |c, _m| ns::ensure(c, "repos/x/docs"))
+            .unwrap();
+        db.write_txn("t", move |c, m| {
+            mount::create(
+                c,
+                m,
+                ns_id,
+                "file:///tmp/x",
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/tasks.md"),
+                None,
+                ConflictPolicy::Manual,
+            )
+        })
+        .unwrap();
+        // A second `mount create` is the update command: it only changes the policy.
+        db.write_txn("t", move |c, m| {
+            mount::create(
+                c,
+                m,
+                ns_id,
+                "file:///tmp/x",
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/tasks.md"),
+                None,
+                ConflictPolicy::DiskWins,
+            )
+        })
+        .unwrap();
+
+        db.write_txn("t", undo_last).unwrap();
+        let mount = db
+            .read(move |c| mount::get(c, ns_id))
+            .unwrap()
+            .expect("the mount must survive: the edit is what was undone, not the mount");
+        assert_eq!(mount.conflict_policy, ConflictPolicy::Manual.as_str());
+        assert_eq!(mount.include_glob.as_deref(), Some("**/tasks.md"));
     }
 }

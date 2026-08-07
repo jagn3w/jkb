@@ -455,13 +455,54 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
         })
         .optional()?;
 
+    let (contained_by, contains) = containment_snapshot(conn, id)?;
+
     Ok(json!({
         "item": row,
         "placements": placements,
         "tags": tags,
         "edges": edges,
         "binding": binding,
+        "contained_by": contained_by,
+        "contains": contains,
     }))
+}
+
+/// The containment rows a delete takes with the item, both directions: the row saying which
+/// item contains this one, and the rows saying which items it contains.
+///
+/// Restoring only the `parent_of` edge put a parent task back with its subtask edge intact
+/// but no containment row — and `SUBTASK_CLAUSE`, the anti-join that holds a parent off the
+/// ready frontier, reads `containment`, not the edge. So the parent came back pickable with a
+/// live open child, and a restored document's chunks were unreachable from `jkb ls <doc>`.
+fn containment_snapshot(
+    conn: &Connection,
+    id: i64,
+) -> Result<(Option<serde_json::Value>, Vec<serde_json::Value>)> {
+    let contained_by = conn
+        .prepare_cached(
+            "SELECT parent_item_id, position FROM containment WHERE child_item_id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "parent_item_id": r.get::<_, i64>(0)?,
+                "position": r.get::<_, i64>(1)?,
+            }))
+        })
+        .optional()?;
+    let contains = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT child_item_id, position FROM containment WHERE parent_item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "child_item_id": r.get::<_, i64>(0)?,
+                "position": r.get::<_, i64>(1)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok((contained_by, contains))
 }
 
 /// Whether `item` carries investigation **memory** that a delete would destroy: a tombstone

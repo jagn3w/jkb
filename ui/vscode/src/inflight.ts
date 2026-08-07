@@ -92,7 +92,14 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
     const item = new vscode.TreeItem(t.title, vscode.TreeItemCollapsibleState.None);
     item.description = formatTaskSummary(t);
     item.iconPath = new vscode.ThemeIcon(stateIcon(t));
-    item.contextValue = "stagingTask";
+    // Abandon is offered for any row that records a **branch**, because that is exactly what
+    // `jkb task abandon` can act on: it falls back to the recorded `branch=` so a session
+    // whose checkout was deleted by hand can still be cleaned up in the KB — clearing the
+    // claim, dropping `onto=`, optionally deleting the branch. Keying this on the worktree
+    // removed the only route to that path; keying it on *state* was wrong in both directions,
+    // offering the action on a landed row whose worktree `land` had already removed and
+    // hiding it on a cancelled row whose worktree nothing else will ever clean up.
+    item.contextValue = t.branch ? "stagingTaskSession" : "stagingTask";
     const blocker = landBlocker(t);
     item.tooltip = new vscode.MarkdownString(
       [
@@ -100,7 +107,9 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
         "",
         `- state: **${t.state}** (status \`${t.status}\`)`,
         t.branch ? `- branch: \`${t.branch}\` → \`${node.onto}\`` : "- no session branch",
-        t.review_ns ? `- review: \`${t.review_ns}\`` : "- not reviewed",
+        t.review_nss.length
+          ? `- review: ${t.review_nss.map((ns) => `\`${ns}\``).join(", ")}`
+          : "- not reviewed",
         "",
         blocker ? `**Not landable.** ${blocker}` : "**Landable** — `jkb task land`.",
       ].join("\n"),

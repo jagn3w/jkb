@@ -47,6 +47,16 @@ pub fn contain(
             jkb_types::Error::Validation(format!("item {child} cannot contain itself")).into(),
         );
     }
+    // This is an upsert, so whether it is an insert has to be established BEFORE writing.
+    // Logging a re-parent as an `insert` made `undo` take the generic delete-by-rowid inverse
+    // and remove a row that existed before the transaction, un-parenting the item rather than
+    // restoring its previous container — the same bug `mount::create` had to fix.
+    let before: Option<(i64, i64)> = conn
+        .prepare_cached(
+            "SELECT parent_item_id, position FROM containment WHERE child_item_id = ?1",
+        )?
+        .query_row([child.get()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
     conn.prepare_cached(
         "INSERT INTO containment (child_item_id, parent_item_id, position)
          VALUES (?1, ?2, ?3)
@@ -55,13 +65,16 @@ pub fn contain(
              position = excluded.position",
     )?
     .execute(params![child.get(), parent.get(), position])?;
+    let before_json = before.map(
+        |(p, pos)| json!({ "child_item_id": child.get(), "parent_item_id": p, "position": pos }),
+    );
     changelog::append(
         conn,
         meta,
-        "insert",
+        if before.is_some() { "update" } else { "insert" },
         "containment",
         &child.get().to_string(),
-        None,
+        before_json.as_ref(),
         Some(&json!({
             "child_item_id": child.get(),
             "parent_item_id": parent.get(),

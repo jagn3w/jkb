@@ -19,10 +19,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 
 use jkb_core::item::NewItem;
-use jkb_core::{edge, item, ns, placement, Db};
+use jkb_core::{edge, ingestion, item, ns, placement, Db};
 use jkb_index::VectorIndexer;
 use jkb_types::{EdgeType, Embedder, ItemId, PlacementRole};
 
@@ -213,16 +213,44 @@ impl Pipeline {
         let pipeline_version = self.version;
 
         db.write_txn_with::<Capture, Error, _>("ingest", move |conn, meta| {
-            let status: Option<String> = conn
-                .prepare_cached(
-                    "SELECT status FROM ingestions
-                     WHERE source_hash = ?1 AND pipeline_version = ?2
-                       AND strategy = ?3 AND embedder_model = ?4",
-                )?
-                .query_row(params![hash, pipeline_version, strategy, model], |r| {
-                    r.get(0)
-                })
-                .optional()?;
+            let key = ingestion::Key {
+                source_hash: &hash,
+                pipeline_version,
+                strategy: &strategy,
+                embedder_model: &model,
+            };
+            // The marker is **evidence**, not proof: it says a capture happened, not that its
+            // items are still there. `jkb undo` used to be the only way they could go and it
+            // now takes the marker with them — but `jkb item rm <document>` reaches the same
+            // state, and every resume then failed with an opaque "Query returned no rows"
+            // that no CLI verb could clear, because nothing deletes an ingestion row. A marker
+            // whose document is gone is treated as absent, and this capture starts fresh.
+            let status = match ingestion::status(conn, key)? {
+                Some(recorded) if item::id_for_uid(conn, &format!("b3:{hash}"))?.is_some() => {
+                    Some(recorded)
+                }
+                Some(_) => {
+                    // The document is gone but its CHUNKS may not be: `item rm <document>`
+                    // cascades containment and edges, not the chunk items themselves. A fresh
+                    // capture would then re-insert uid `b3:<hash>:0` and die on
+                    // `UNIQUE constraint failed: items.uid` — swapping one permanent failure
+                    // for another. Clear the fragments here, inside the same transaction, so
+                    // "starts fresh" is true.
+                    let ids = surviving_fragments(conn, &hash)?;
+                    for id in ids {
+                        item::remove(conn, meta, id, true)?;
+                    }
+                    // In the SAME transaction as the removals: `item_id` is the rowid, and the
+                    // fresh chunks below are about to be handed those very ids. Left behind,
+                    // each new chunk would inherit the deleted chunk's embedding and — because
+                    // `pending_rows_sql` tests membership in the vec table — read as already
+                    // indexed, so `jkb index` would never correct it and `doctor` would see
+                    // nothing wrong, the rows being attached to live items.
+                    jkb_index::drop_orphan_vectors(conn)?;
+                    None
+                }
+                None => None,
+            };
 
             match status.as_deref() {
                 Some("complete") => Ok(Capture::Complete {
@@ -285,19 +313,13 @@ impl Pipeline {
                         items.push((chunk_id, chunk.clone()));
                     }
 
-                    conn.prepare_cached(
-                        "INSERT INTO ingestions
-                             (source_hash, pipeline_version, strategy, embedder_model,
-                              stage, status, blob_hash, started_at)
-                         VALUES (?1, ?2, ?3, ?4, 'embed', 'captured', ?1,
-                              strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                    )?
-                    .execute(params![
-                        hash,
-                        pipeline_version,
-                        strategy,
-                        model
-                    ])?;
+                    // Through the core repo, so the marker is CHANGELOGGED and `undo` takes
+                    // it in the same transaction as the items it describes. Written directly
+                    // here it had no changelog entry, so an undo deleted the document and its
+                    // chunks while the marker survived — after which every `jkb ingest` of
+                    // that file resumed into a document that no longer existed, with no CLI
+                    // verb able to clear the row.
+                    ingestion::record_capture(conn, meta, key)?;
 
                     let chunk_count = chunks.len();
                     Ok(Capture::Pending {
@@ -350,14 +372,15 @@ impl Pipeline {
             for (id, embedding) in &embeddings {
                 vector.upsert_vector(conn, *id, embedding)?;
             }
-            conn.prepare_cached(
-                "UPDATE ingestions
-                    SET status = 'complete',
-                        completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                  WHERE source_hash = ?1 AND pipeline_version = ?2
-                    AND strategy = ?3 AND embedder_model = ?4",
-            )?
-            .execute(params![hash, pipeline_version, strategy, model])?;
+            ingestion::mark_complete(
+                conn,
+                ingestion::Key {
+                    source_hash: &hash,
+                    pipeline_version,
+                    strategy: &strategy,
+                    embedder_model: &model,
+                },
+            )?;
             Ok(())
         })
     }
@@ -618,6 +641,22 @@ fn document_id(conn: &Connection, hash: &str) -> Result<ItemId> {
         .prepare_cached("SELECT id FROM items WHERE uid = ?1")?
         .query_row([format!("b3:{hash}")], |r| r.get(0))?;
     Ok(ItemId::new(id))
+}
+
+/// Items left over from a previous ingestion of `hash` — its chunks, and the document if it
+/// is somehow still there — so a re-capture can start from nothing.
+fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT id FROM items WHERE uid = ?1 OR uid LIKE ?2 ORDER BY id DESC")?;
+    let rows = stmt.query_map(
+        rusqlite::params![format!("b3:{hash}"), format!("b3:{hash}:%")],
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(ItemId::new)
+        .collect())
 }
 
 /// The number of chunk items for `hash` (uid `b3:<hash>:<idx>`).

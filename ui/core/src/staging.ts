@@ -21,11 +21,26 @@ export interface StagedTask {
   readonly commits: number;
   /** The branch HEAD a review ran against. */
   readonly reviewed: string | null;
-  /** The namespace holding that review's findings. */
-  readonly review_ns: string | null;
+  /**
+   * **Every** namespace holding findings recorded for this task. All of them, because the
+   * land gate unions them: offering only one means opening a clean namespace while the
+   * blocking count came from another.
+   */
+  readonly review_nss: readonly string[];
   /** A recorded `--no-review` override. */
   readonly review_waived: string | null;
   readonly open_must_fix: number;
+  /**
+   * Whether the **review** half of the land gate passes: a review is recorded and its
+   * findings are in the KB with nothing must-fix outstanding. Separate from
+   * {@link StagedTask.land_blocked}, which also covers session and git preconditions.
+   */
+  readonly review_ok: boolean;
+  /**
+   * Why `jkb task land` would refuse this task, computed by the CLI, or `null` if it would
+   * go ahead. Rendered, never re-derived — see {@link landBlocker}.
+   */
+  readonly land_blocked: string | null;
 }
 
 /** One staging branch and the tasks landing on it. */
@@ -57,7 +72,11 @@ export function formatTaskSummary(t: StagedTask): string {
   if (t.commits > 0) parts.push(plural(t.commits, "commit"));
   if (t.dirty) parts.push("uncommitted");
   if (t.open_must_fix > 0) parts.push(`${t.open_must_fix} must-fix open`);
-  else if (t.reviewed) parts.push("reviewed");
+  // Keyed on the REVIEW verdict, not on `land_blocked`. A `reviewed=` sha whose findings never
+  // reached the KB must not read as reviewed — but `land_blocked` also fires for uncommitted
+  // changes, no commits, a dirty target and a finished task, and using it here dropped the
+  // label from properly reviewed rows for reasons that have nothing to do with the review.
+  else if (t.reviewed && t.review_ok) parts.push("reviewed");
   if (t.review_waived) parts.push("review waived");
   return parts.join(" · ");
 }
@@ -65,25 +84,15 @@ export function formatTaskSummary(t: StagedTask): string {
 /**
  * Why this task cannot land right now, or `null` when it can.
  *
- * Terminal states get a reason too rather than reading as landable — `null` means "go ahead",
- * and a landed or cancelled task is the one thing that must never be offered a landing.
+ * This **renders** the CLI's verdict; it does not compute one. The previous version restated
+ * the rule here, and a projection of a row cannot express two of `jkb task land`'s
+ * preconditions — whether a session worktree still exists, and whether the recorded review
+ * namespace holds any findings at all — so a row read "Landable" for tasks the CLI refused
+ * outright (every abandoned session, and every swarm task in the view). The rule lives in
+ * `staging::land_blocker` beside `land_preflight`, which is the code that enforces it.
  */
 export function landBlocker(t: StagedTask): string | null {
-  if (t.state === "landed") return "It has already landed on this branch.";
-  if (t.state === "dropped") return "It was cancelled, so it will not be landing.";
-  if (t.dirty) return "It has uncommitted changes — commit them in the session first.";
-  if (t.commits === 0) return "It has no commits that the staging branch does not.";
-  if (t.open_must_fix > 0) {
-    return `Its review left ${plural(t.open_must_fix, "must-fix finding")} open. Fix or cancel each one, then land.`;
-  }
-  // Mirrors the CLI predicate exactly: `reviewed=` present, nothing must-fix outstanding. A
-  // past `review-waived=` is deliberately NOT a pass — the CLI's gate does not consult it, so
-  // accepting it here made the row read "Landable" for a task `jkb task land` then refused.
-  // A waiver covers the landing it was granted for, not the next one.
-  if (!t.reviewed) {
-    return "No review has been recorded. Run /review-log in the session, or land with --no-review.";
-  }
-  return null;
+  return t.land_blocked ?? null;
 }
 
 function plural(n: number, noun: string): string {
