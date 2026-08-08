@@ -66,7 +66,12 @@ pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
         for id in ids {
             let Some(m) = metas.get(&id) else { continue };
             let status = m.status.as_deref().unwrap_or("open");
-            if status == "done" || status == "cancelled" || m.priority.unwrap_or(i64::MAX) > 1 {
+            // Through the one spelling of the terminal set. This is the filter that decides
+            // whether a must-fix still blocks a landing, so a divergent copy here is the most
+            // expensive place to have one.
+            if jkb_types::TaskStatus::is_terminal_str(Some(status))
+                || m.priority.unwrap_or(i64::MAX) > 1
+            {
                 continue;
             }
             out.open_must_fix.push(OpenFinding {
@@ -299,7 +304,17 @@ pub(crate) fn record(
                 .any(|b| b == branch)
         };
         if names(crate::repo::FACET_BRANCH) {
-            on_branch.push((t.meta.id, t.meta.uid.clone()));
+            // A task may record more than one `branch=` (the legacy shape `work_is_in`'s own
+            // docstring cites). Matching ANY of them credited the whole task: a review of
+            // `feature/x` opened the land gate for a live `task/…` session branch it never saw,
+            // which is precisely the harm the `onto=` arm below probes for. So the other
+            // branches must be accounted for too — either they ARE the reviewed branch, or their
+            // work is already in it.
+            if work_is_in(repo_root, &t, branch, &mut covered)? {
+                on_branch.push((t.meta.id, t.meta.uid.clone()));
+            } else {
+                skipped_unlanded.push(t.meta.uid.clone());
+            }
         } else if names(crate::repo::FACET_ONTO) {
             if work_is_in(repo_root, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));

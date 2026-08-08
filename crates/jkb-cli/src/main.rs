@@ -3731,13 +3731,14 @@ fn cmd_sync(
 /// Reconcile one mount and print its summary.
 fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<()> {
     use jkb_sync::Outcome::{
-        Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Refused,
+        Conflict, Created, Exported, Failed, Imported, Merged, Normalized, Quarantined, Refused,
         ResolvedFromDisk, ResolvedFromKb, Skipped, UpToDate,
     };
     let report = jkb_sync::sync_with_policy(db, ns_path, conflict)?;
     println!(
         "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
-         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} refused",
+         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} refused, \
+         {} failed",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
@@ -3749,6 +3750,7 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
         report.count(UpToDate),
         report.count(Skipped),
         report.count(Refused),
+        report.count(Failed),
     );
     for path in report.conflicts() {
         println!("  conflict: {}", path.display());
@@ -3764,6 +3766,9 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     // A refusal wrote nothing, so it must be visible or the file silently stops syncing.
     for (path, reason) in report.refused() {
         println!("  REFUSED {}: {reason}", path.display());
+    }
+    for (path, err) in report.failed() {
+        println!("  FAILED {}: {err}", path.display());
     }
     Ok(())
 }
@@ -4361,7 +4366,7 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
         .and_then(|m| m.status);
     if let Some(status) = status.as_deref() {
         anyhow::ensure!(
-            !matches!(status, "done" | "cancelled"),
+            !jkb_types::TaskStatus::is_terminal_str(Some(status)),
             "{uid} is already {status} — there is nothing to work"
         );
     }
@@ -5531,7 +5536,7 @@ fn cmd_task_close_merged(
         println!("{verb} {uid} ({branch} merged)");
     }
     for (uid, branch) in &blocked {
-        println!("held  {uid} ({branch})");
+        println!("held  {uid} ({branch}) — see the reason above, or `jkb task show {uid}`");
     }
     if closed.is_empty() && blocked.is_empty() {
         println!(

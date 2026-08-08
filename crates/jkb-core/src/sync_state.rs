@@ -109,11 +109,13 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
             "serializer": row.serializer,
             "last_synced_hash": row.last_synced_hash,
             "base_blob_hash": row.base_blob_hash,
-            // The document goes in the snapshot with the hashes. Undoing a sync must rewind
-            // structure and hashes TOGETHER: leaving the structure forward while the hashes go
-            // back is a KB that disagrees with its own base, which is the state every export bug
-            // in this subsystem grew out of.
+            // EVERY restorable column, not a hand-picked subset. Structure and hashes must
+            // rewind together — leaving one forward is a KB that disagrees with its own base —
+            // and `parse_error`/`quarantine_blob_hash` had already fallen out of the earlier
+            // list, so undo restored `needs_attention` with no message explaining it.
             "document": row.document,
+            "parse_error": row.parse_error,
+            "quarantine_blob_hash": row.quarantine_blob_hash,
         })
     });
     conn.prepare_cached(

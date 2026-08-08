@@ -150,9 +150,14 @@ mod high_water_tests {
         // `ON DELETE CASCADE` children.
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
 
-        // 1. Migrate to V010 exactly — the state every existing database is in.
+        // 1. Migrate to V009 — BEFORE the AUTOINCREMENT rebuild. This ordering is the whole
+        //    fixture: V010 reseeds `sqlite_sequence` from the *surviving* maximum, so the ids
+        //    have to already exist and already be deleted when it runs. Populating after V010
+        //    instead sets the sequence via the explicit-id inserts themselves and masks the bug
+        //    entirely — which is exactly what an earlier version of this test did, leaving the
+        //    only regression pin for an id-reuse corruption passing against a no-op migration.
         embedded::migrations::runner()
-            .set_target(Target::Version(10))
+            .set_target(Target::Version(9))
             .run(&mut conn)
             .unwrap();
 
@@ -174,20 +179,28 @@ mod high_water_tests {
         conn.execute("DELETE FROM items WHERE id IN (4, 5)", [])
             .unwrap();
 
-        // Reproduce V010's own damage: it seeded from the *surviving* max and left two rows.
-        let rows: i64 = conn
+        // 3. Now V010 runs on that database and does its damage: it reseeds the counter to the
+        //    surviving maximum (3) and leaves a duplicate row behind.
+        embedded::migrations::runner()
+            .set_target(Target::Version(10))
+            .run(&mut conn)
+            .unwrap();
+        let seq_after_v010: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_sequence WHERE name = 'items'",
+                "SELECT seq FROM sqlite_sequence WHERE name = 'items' LIMIT 1",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(rows >= 1, "V010 seeded sqlite_sequence");
+        assert_eq!(
+            seq_after_v010, 3,
+            "the fixture must actually reproduce V010's damage, or this test pins nothing"
+        );
 
-        // 3. Apply V011.
+        // 4. Apply V011.
         embedded::migrations::runner().run(&mut conn).unwrap();
 
-        // 4. The HARM first, so a regression reports the thing that matters rather than a
+        // 5. The HARM first, so a regression reports the thing that matters rather than a
         //    bookkeeping detail: a new item must not land on 4 or 5.
         conn.execute(
             "INSERT INTO items (uid, kind) VALUES ('fresh', 'chunk')",

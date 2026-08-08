@@ -249,8 +249,20 @@ fn failed_import_does_not_corrupt_sync_state() {
 
     // Corrupt the file with invalid UTF-8: the document serializer's parse fails, so
     // the import transaction rolls back.
+    //
+    // The failure is REPORTED, not propagated. It used to come back as `Err` from `sync`, which
+    // meant one unreadable file — a PNG dropped into a `document` mount — returned an error out
+    // of the watcher thread for that mount, after which `watch_all` blocked joining the others
+    // forever, launchd never restarted the still-live process, and the mount silently stopped
+    // syncing for good.
     fs::write(&file, [0xff, 0xfe, 0x00]).unwrap();
-    assert!(sync(&db, "docs/repo").is_err());
+    let report = sync(&db, "docs/repo").expect("one bad file must not end the run");
+    assert_eq!(report.count(Outcome::Failed), 1);
+    assert!(
+        report.failed()[0].1.contains("UTF-8"),
+        "the reason must survive to the report: {:?}",
+        report.failed()
+    );
 
     // The item content and last_synced_hash still reflect the previous good sync.
     assert_eq!(content_for(&db, &uri).as_deref(), Some("valid text"));
@@ -1613,5 +1625,94 @@ fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
     assert!(
         after.contains("[x] shared"),
         "the KB side won, as kb_wins means: {after}"
+    );
+}
+
+/// Following the refusal's own advice must not destroy the data the refusal protected.
+///
+/// The refusal says "edit the file". That edit makes both sides differ, which routes the file
+/// into the **merge** arm — which had no item guard at all, so `apply_doc` cancelled the item and
+/// `write_file` dropped its line. The tool's instructions were the exploit.
+#[test]
+fn editing_a_refused_file_does_not_delete_the_protected_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // Break one item's primary placement, as `jkb undo` after a re-home does.
+    db.write_txn("t", |conn, _m| {
+        let victim: i64 = conn.query_row(
+            "SELECT i.id FROM items i JOIN bindings b ON b.item_id = i.id
+              WHERE i.content LIKE '%keep me%'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM placements WHERE item_id = ?1 AND role = 'primary'",
+            [victim],
+        )?;
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%and me%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Refused), 1);
+
+    // Now do exactly what the refusal tells the user to do: edit the file.
+    let current = fs::read_to_string(&tasks).unwrap();
+    fs::write(&tasks, format!("{current}- [ ] newly added !p3\n")).unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("keep me"),
+        "editing a refused file must not delete the line the refusal protected: {after}"
+    );
+}
+
+/// A section the file stops declaring must stop being a section (`retire_undeclared_sections`).
+///
+/// Asserted on the **marker**, not the render: since D45 nothing renders from namespaces, so a
+/// render-based assertion passes even when retirement has become a no-op — which is exactly what
+/// re-keying it from `header_line` to `sync_section` risked.
+#[test]
+fn a_section_the_file_drops_stops_being_a_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Keep\n\n- [ ] a !p1\n\n## Drop\n\n- [ ] b !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    let marked = |ns: &str| -> bool {
+        let ns = ns.to_owned();
+        db.read(move |conn| {
+            let Some(id) = ns::get(conn, &ns)? else {
+                return Ok(false);
+            };
+            Ok(ns::get_metadata(conn, id)?
+                .and_then(|m| m.get("sync_section").cloned())
+                .is_some())
+        })
+        .unwrap()
+    };
+    assert!(marked("docs/plan/tasks.md/keep"));
+    assert!(marked("docs/plan/tasks.md/drop"));
+
+    // The file stops declaring `## Drop`.
+    fs::write(&tasks, "## Keep\n\n- [ ] a !p1\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    assert!(marked("docs/plan/tasks.md/keep"), "the kept section stays");
+    assert!(
+        !marked("docs/plan/tasks.md/drop"),
+        "the dropped section must lose its marker, or retirement has silently become a no-op"
     );
 }

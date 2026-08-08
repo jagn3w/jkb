@@ -69,6 +69,9 @@ pub enum Outcome {
     /// nothing was written (design D45.5). Journalled `needs_attention`; recovery is any edit
     /// to the file, which imports normally.
     Refused,
+    /// Reconciling this file errored. Reported rather than propagated, so one bad file cannot
+    /// end the run — or, under the watcher, silently kill a mount's thread for good.
+    Failed,
 }
 
 /// The result of reconciling one file.
@@ -134,6 +137,21 @@ impl SyncReport {
 
     /// Files an export refused, because it would have deleted lines for still-bound items
     /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
+    /// Files whose reconcile errored, with the error text.
+    #[must_use]
+    pub fn failed(&self) -> Vec<(&Path, &str)> {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Failed)
+            .map(|r| {
+                (
+                    r.path.as_path(),
+                    r.reason.as_deref().unwrap_or("unknown error"),
+                )
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn refused(&self) -> Vec<(&Path, &str)> {
         self.results
@@ -312,13 +330,22 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
     for path in paths {
         let ctx = ctx.clone();
         let p = path.clone();
+        // A per-file failure is a RESULT, not a run-ending error. `reconcile_all` used to
+        // propagate with `?`, so a single unreadable file — a PNG dropped into a `document`
+        // mount, whose serializer does not quarantine — returned `Err` out of the watcher
+        // thread. `watch_all` then blocked joining the other threads until stop, launchd never
+        // restarted the still-alive process, and that mount silently stopped syncing forever.
         let outcome = db.write_txn_with::<Outcome, Error, _>("sync", move |conn, meta| {
             reconcile(conn, meta, &ctx, &p)
-        })?;
+        });
+        let (outcome, reason) = match outcome {
+            Ok(o) => (o, outcome_reason(db, &path)?),
+            Err(e) => (Outcome::Failed, Some(e.to_string())),
+        };
         results.push(FileResult {
-            reason: outcome_reason(db, &path)?,
             path,
             outcome,
+            reason,
         });
     }
     // Any tasks just imported from `repos/<repo>/…/tasks.md` get a `tasks/…` mirror so
@@ -353,6 +380,7 @@ fn brought_items_in(outcome: Outcome) -> bool {
         | Outcome::Quarantined
         // Nothing was written at all.
         | Outcome::Refused
+        | Outcome::Failed
         // KB → disk: the items were already in the KB, and already mirrored.
         | Outcome::Exported
         | Outcome::ResolvedFromKb
@@ -387,6 +415,7 @@ mod mirror_predicate {
             Outcome::Conflict,
             Outcome::Quarantined,
             Outcome::Refused,
+            Outcome::Failed,
         ] {
             assert!(!brought_items_in(o), "{o:?} does not import items");
         }
@@ -917,15 +946,7 @@ fn finish_export(
     // The guard lives HERE, not at the call site, because two other callers reach this function
     // — `missing_file` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
-    let dropped = dropped_items(conn, bare_uri, serializer, journal)?;
-    if !dropped.is_empty() {
-        let reason = format!(
-            "{} item(s) bound to this file are missing from the assembled document ({}), so \
-             exporting would delete their lines. Nothing was written. Edit the file to re-import \
-             it, or run `jkb doctor`.",
-            dropped.len(),
-            dropped.join(", ")
-        );
+    if let Some(reason) = export_blocker(conn, path, bare_uri, serializer, journal)? {
         flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
         return Ok(Outcome::Refused);
     }
@@ -946,6 +967,48 @@ fn finish_export(
         document.as_deref(),
     )?;
     Ok(Outcome::Exported)
+}
+
+/// Why this file must not be written from the KB side, or `None` if it may be.
+///
+/// Two conditions, both of which pass-10 review found the first version missing:
+///
+/// 1. **Items would vanish.** See [`dropped_items`].
+/// 2. **The structure is unknown while the file has content.** `dropped_items` alone returns
+///    "nothing dropped" when there is no base document, which made the guard *vacuous* on the
+///    `missing_file` path: a file that exists on disk but has never been imported has no journal
+///    document, so `assemble_kb_doc` yields no layout and no sections, and the export wrote a
+///    headerless, prose-free dump over it. "No base" means unconstrained only when there is also
+///    nothing on disk to lose.
+fn export_blocker(
+    conn: &Connection,
+    path: &Path,
+    bare_uri: &str,
+    serializer: &dyn SyncSerializer,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<Option<String>> {
+    let dropped = dropped_items(conn, bare_uri, serializer, journal)?;
+    if !dropped.is_empty() {
+        return Ok(Some(format!(
+            "{} item(s) bound to this file are missing from the assembled document ({}). \
+             Exporting would delete their lines, so nothing was written. Their placements are \
+             gone — `jkb undo` after a re-home does this. Restore them, or delete the lines from \
+             the file if the items are meant to go.",
+            dropped.len(),
+            dropped.join(", ")
+        )));
+    }
+    let structure_known = journal.and_then(|j| j.document.as_deref()).is_some();
+    let disk_has_content = std::fs::read(path).is_ok_and(|b| !b.trim_ascii().is_empty());
+    if !structure_known && disk_has_content {
+        return Ok(Some(
+            "this file has content on disk but no recorded structure, so exporting would write \
+             a headerless, prose-free render over it. Nothing was written. Sync it once from \
+             disk (an import) before exporting."
+                .to_owned(),
+        ));
+    }
+    Ok(None)
 }
 
 /// Items the base declared, whose binding still exists, that `assemble_kb_doc` would silently
@@ -1091,6 +1154,18 @@ fn three_way_resolve(
 ) -> Result<Outcome> {
     match three_way(base_doc, disk_doc, kb_doc) {
         ThreeWay::Merged(merged) => {
+            // The merge writes the file AND cancels items the merged doc lacks, so it reaches
+            // the same harm `finish_export` guards. It was left ungated on the reasoning that a
+            // merge incorporates disk-side *structure* by design — true, and irrelevant: this
+            // check is about **items**, which is exactly the distinction D45.5 draws.
+            //
+            // It mattered because the refusal's own advice is "edit the file", and that edit is
+            // what routes a refused file into this arm. Following the tool's instructions
+            // deleted the line the refusal had just protected.
+            if let Some(reason) = export_blocker(conn, path, bare_uri, serializer, journal)? {
+                flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
+                return Ok(Outcome::Refused);
+            }
             let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
             let rendered = serializer.render(&merged)?;
             if ctx.exports() {
@@ -1285,12 +1360,18 @@ fn apply_doc(
         // find it later. `header_line` is kept **only** as a human label in the tree — since D45
         // the authority for both the header text and the block order is the journal row, and
         // nothing reads these back to decide what the document looks like.
-        ns::set_metadata(
-            conn,
-            meta,
-            id,
-            &json!({ "header_line": s.header_line, "sync_section": true }),
-        )?;
+        //
+        // MERGED, not replaced: `ns::set_metadata` writes the whole object, so assigning a fresh
+        // one silently dropped every other key the namespace carried — `type` among them, which
+        // is the namespace-contract mechanism (D33).
+        let mut md = ns::get_metadata(conn, id)?
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        if let Some(map) = md.as_object_mut() {
+            map.insert("header_line".to_owned(), json!(s.header_line));
+            map.insert("sync_section".to_owned(), json!(true));
+        }
+        ns::set_metadata(conn, meta, id, &md)?;
         section_ns.insert(s.path.clone(), id);
     }
     // A section the file no longer declares must stop being a section. Its namespace can
@@ -2114,13 +2195,17 @@ fn local_of(bare_uri: &str, uri: &str) -> String {
 /// The mirror namespace for a file: the mount namespace, the file's parent directories, and
 /// **the filename itself** as the final segment (design D39.1).
 ///
-/// One namespace, one file — the invariant everything else here rests on. A serializer that
-/// keeps document structure on the namespace (`tasks` stores the whole `layout` there) needs
-/// that structure to describe exactly one document. While this dropped the filename, every
-/// file in a directory shared one namespace and therefore one layout, so whichever synced last
-/// owned it and the next export of any sibling rendered from the wrong one — writing that
-/// sibling's headers and prose over itself. That is the `openspec` collapse: 62 of 63 files
-/// left byte-identical to a neighbour.
+/// One namespace, one file. Since D45 a file's structure lives on its **journal row**, not here,
+/// so this no longer decides what a document looks like — but it still bounds
+/// `retire_undeclared_sections`, which walks a namespace subtree: without the filename segment
+/// that subtree is the whole directory, so importing one file retires a neighbouring file's
+/// sections (and at the mount root, the whole mount's).
+///
+/// It was introduced for a stronger reason that no longer applies: every file in a directory
+/// shared one namespace and therefore one `layout`, so whichever synced last owned it and the
+/// next export of any sibling rendered from the wrong one. That is the `openspec` collapse —
+/// 62 of 63 files left byte-identical to a neighbour — and D45 removed its cause rather than
+/// its symptom.
 ///
 /// It cost seven guards across eight review passes to keep answering *whose layout is this?*,
 /// and each answer was a proxy — did it sync cleanly, is a sibling bound, is there a journal

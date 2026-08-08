@@ -476,3 +476,66 @@ fn a_deleted_items_text_does_not_retrieve_its_successor() {
         "a deleted item must not be returned at all"
     );
 }
+
+/// An f32 slice as the little-endian blob `vec0` stores (mirrors `embedding_to_bytes`).
+fn embedding_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// `knn_live` must filter dead ids AND report exhaustion honestly (D42.3).
+///
+/// Nothing exercised this before, which is why a bug in the exhaustion flag shipped: the harm
+/// test relies on the GC trigger, so `filter_live` was never reached. This one plants orphans
+/// directly, so it fails if the filter is removed.
+#[test]
+fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let probe = embedder.embed("probe text").unwrap();
+
+    db.write_txn("test", {
+        let embedder = embedder.clone();
+        let probe = probe.clone();
+        move |conn, meta| {
+            let vector = VectorIndexer::new(embedder.clone());
+            vector.ensure_ready(conn).unwrap();
+            // Six live items with vectors...
+            for i in 0..6 {
+                let id = add_item(conn, meta, &format!("n:live{i}"), "probe text");
+                vector.upsert_vector(conn, id, &probe).unwrap();
+            }
+            // ...and six orphan rows on ids no item has (what a pre-trigger store carries).
+            for fake in 9000..9006 {
+                conn.execute(
+                    "INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![fake, embedding_bytes(&probe)],
+                )?;
+            }
+            Ok(())
+        }
+    })
+    .unwrap();
+
+    let (hits, exhausted) = db
+        .read({
+            let embedder = embedder.clone();
+            let probe = probe.clone();
+            move |conn| {
+                Ok(VectorIndexer::new(embedder.clone())
+                    .knn_live(conn, &probe, 4)
+                    .unwrap())
+            }
+        })
+        .unwrap();
+
+    assert_eq!(hits.len(), 4, "four live hits, orphans filtered out");
+    assert!(
+        hits.iter().all(|(id, _)| id.get() < 9000),
+        "no orphan id may be returned: {hits:?}"
+    );
+    assert!(
+        !exhausted,
+        "two live rows were withheld by the truncation, so the index is NOT exhausted — \
+         `vector_ranked` reads this flag to decide whether to keep growing"
+    );
+}

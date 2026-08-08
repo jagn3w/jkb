@@ -398,9 +398,15 @@ impl VectorIndexer {
             let index_exhausted = raw.len() < fetch;
             let live = Self::filter_live(conn, raw)?;
             if live.len() >= k || index_exhausted || fetch >= VEC0_K_MAX {
+                // `index_exhausted` must mean "the caller has seen every live row", not merely
+                // "the table had no more rows to give". Truncating a full page withholds live
+                // neighbours, and `vector_ranked` reads this flag to decide whether to grow its
+                // own over-fetch — so reporting exhaustion after a truncation made a scoped
+                // search stop early and return fewer, often zero, in-scope hits.
                 let mut live = live;
+                let truncated = live.len() > k;
                 live.truncate(k);
-                return Ok((live, index_exhausted));
+                return Ok((live, index_exhausted && !truncated));
             }
             fetch = (fetch * 2).min(VEC0_K_MAX);
         }

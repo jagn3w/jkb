@@ -117,6 +117,11 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 /// A launchd agent plist running the all-mounts watcher, kept alive across restarts.
 fn launchd_plist(exe: &Path, db: &Path) -> String {
     let exe = xml_escape(&exe.to_string_lossy());
+    // Logs live beside the database, which is the one directory we already know exists and is
+    // the user's. `sync --watch`'s reports are the only record of a destructive resolution.
+    let log_dir = db.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let log_out = xml_escape(&log_dir.join("sync.log").to_string_lossy());
+    let log_err = xml_escape(&log_dir.join("sync.log").to_string_lossy());
     let db = xml_escape(&db.to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -137,6 +142,14 @@ fn launchd_plist(exe: &Path, db: &Path) -> String {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- launchd sends a job's stdio to /dev/null unless told otherwise, so without these the
+         watcher's reporting is a no-op on the platform this is developed on: a `kb_wins`
+         resolution discards one side's edits, settles the journal `ok`, and leaves no trace on
+         any surface — `jkb doctor` included. -->
+    <key>StandardOutPath</key>
+    <string>{log_out}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_err}</string>
 </dict>
 </plist>
 "#
@@ -188,6 +201,10 @@ mod tests {
         assert!(plist.contains("<string>--watch</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+        // Without these launchd discards the watcher's output, which is where a destructive
+        // `kb_wins` resolution is reported — and nowhere else.
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("sync.log"));
     }
 
     #[test]

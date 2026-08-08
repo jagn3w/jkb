@@ -950,12 +950,11 @@ The `Collided` refusal above was a guard around a modelling error, and the error
   depth.
 - **The filename keeps its extension.** `tasks` reads better, but `tasks.md` beside `tasks.txt`
   would collide again — the same defect, rarer, therefore worse.
-- **Adoption is per file, inside `reconcile`** (`adopt_legacy_namespace`), not a global
-  migration: at that moment `binding::synced_uris_for_file` answers *which items are mine*
-  authoritatively, which is **positive evidence** rather than a proxy. It runs only when every
-  `file://`-bound item in the directory namespace is bound to this file, so a deleted sibling's
-  leftovers — still bound to its path — correctly block it. A directory genuinely holding two
-  files' items is left alone and reported. Idempotent, and reported as `Outcome::Adopted`.
+- **Adoption is gone** (it was `adopt_legacy_namespace` + `Outcome::Adopted`). Its ownership gate
+  was vacuous — it inspected only items placed *directly* in the directory namespace, and a
+  sectioned file has none there — and both of pass 9's sync must-fixes were in it. D45 deletes it:
+  with structure on the journal row there is nothing to adopt, and a legacy row is populated from
+  the file's own base blob.
 - **A directory may now hold many synced files.** That is the user-visible gain, and why this
   was worth a re-home rather than an eighth guard.
 

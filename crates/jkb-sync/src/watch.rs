@@ -85,6 +85,9 @@ fn report_notable(mount_ns: &str, report: &engine::SyncReport) {
     for (path, how) in report.resolved() {
         eprintln!("sync {mount_ns}: RESOLVED {} — {how}", path.display());
     }
+    for (path, err) in report.failed() {
+        eprintln!("sync {mount_ns}: FAILED {}: {err}", path.display());
+    }
     for (path, reason) in report.refused() {
         eprintln!("sync {mount_ns}: REFUSED {}: {reason}", path.display());
     }
