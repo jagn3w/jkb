@@ -48,7 +48,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
     // Reconcile drift accumulated while not watching.
-    report_notable(mount_ns, &engine::sync(db, mount_ns)?);
+    run_pass(mount_ns, || engine::sync(db, mount_ns));
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(debounce) {
@@ -61,10 +61,10 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 }
                 if rescan {
                     // Fell behind (watcher error / dropped events): re-scan everything.
-                    report_notable(mount_ns, &engine::sync(db, mount_ns)?);
+                    run_pass(mount_ns, || engine::sync(db, mount_ns));
                 } else if !paths.is_empty() {
                     let paths: Vec<PathBuf> = paths.into_iter().collect();
-                    report_notable(mount_ns, &engine::sync_paths(db, mount_ns, &paths)?);
+                    run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {} // idle tick — re-check the stop flag
@@ -72,6 +72,24 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
         }
     }
     Ok(())
+}
+
+/// Run one reconcile pass, reporting whatever happens. **Never returns an error.**
+///
+/// The watcher's unit of failure is a pass, not the thread. Making the per-file reconcile
+/// non-fatal was not enough: `outcome_reason`, `settle_out_of_scope` and the trailing
+/// `ensure_all_mirrors` transaction still propagate out of `sync`/`sync_paths`, and a single
+/// `Err` here used to exit this mount's thread for good — `watch_all` does not set `stop`, so the
+/// process stayed alive joining the others, launchd never restarted it, and that mount silently
+/// stopped syncing.
+fn run_pass<F>(mount_ns: &str, pass: F)
+where
+    F: FnOnce() -> crate::Result<engine::SyncReport>,
+{
+    match pass() {
+        Ok(report) => report_notable(mount_ns, &report),
+        Err(e) => eprintln!("sync {mount_ns}: pass failed: {e}"),
+    }
 }
 
 /// Say anything a person would want to know about a reconcile, on stderr.

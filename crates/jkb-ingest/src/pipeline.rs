@@ -548,11 +548,12 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 fn pending_rows_sql(conn: &Connection, table: &str) -> rusqlite::Result<String> {
     Ok(if table_exists(conn, table)? {
         format!(
-            // The join restricts "indexed" to vector rows whose item still exists. It does
-            // **not** protect against id *reuse* — under reuse the row names a live item, so the
-            // join succeeds and the item still reads as indexed. Only the high-water mark
-            // (`V011`) prevents that; this is the weaker, orthogonal guarantee that a row left
-            // behind by a pre-trigger delete cannot exclude an unrelated item.
+            // The join is belt-and-braces, and provably cannot change this result set: an
+            // orphan's `item_id` matches no live item, so `NOT IN` already excludes it, and
+            // under id *reuse* the row names a live item so the join succeeds and the item still
+            // reads as indexed. Only the high-water mark (`V011`) prevents reuse. It is kept
+            // because it states the intent — "indexed" means a vector for an item that exists —
+            // where a bare `NOT IN` leaves that to the reader.
             "SELECT id, content, kind FROM items
              WHERE content IS NOT NULL
                AND id NOT IN (SELECT v.item_id FROM {table} v

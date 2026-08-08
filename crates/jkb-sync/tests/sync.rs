@@ -1674,6 +1674,34 @@ fn editing_a_refused_file_does_not_delete_the_protected_line() {
         after.contains("keep me"),
         "editing a refused file must not delete the line the refusal protected: {after}"
     );
+
+    // …and the refusal must actually be CLEARABLE. Asserting only the first edit was the gap:
+    // the guard judged expectation from the base, so the item stayed "expected" no matter what
+    // the file said, every later reconcile refused again, and the edit above was never imported.
+    // Deleting the offending line is the remedy the message prints, so it has to work.
+    let text = fs::read_to_string(&tasks).unwrap();
+    let mut without = String::new();
+    for line in text.lines().filter(|l| !l.contains("keep me")) {
+        without.push_str(line);
+        without.push('\n');
+    }
+    fs::write(&tasks, &without).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Refused),
+        0,
+        "deleting the line must clear the refusal — the printed remedy has to take effect"
+    );
+    let healed = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        healed.contains("newly added"),
+        "the edit made while refused must finally import: {healed}"
+    );
+    assert!(
+        !healed.contains("keep me"),
+        "the deliberately removed item stays removed: {healed}"
+    );
 }
 
 /// A section the file stops declaring must stop being a section (`retire_undeclared_sections`).

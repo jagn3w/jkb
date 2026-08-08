@@ -303,14 +303,22 @@ pub(crate) fn record(
                 .iter()
                 .any(|b| b == branch)
         };
+        // Both arms ask the same question — "is every branch of this task accounted for in the
+        // reviewed one?" — and differ only in which facet made the task a candidate. Kept
+        // separate because the reasons differ and are worth reading; the bodies are one call.
         if names(crate::repo::FACET_BRANCH) {
-            // A task may record more than one `branch=` (the legacy shape `work_is_in`'s own
-            // docstring cites). Matching ANY of them credited the whole task: a review of
-            // `feature/x` opened the land gate for a live `task/…` session branch it never saw,
-            // which is precisely the harm the `onto=` arm below probes for. So the other
-            // branches must be accounted for too — either they ARE the reviewed branch, or their
-            // work is already in it.
-            if work_is_in(repo_root, &t, branch, &mut covered)? {
+            // The reviewed branch is covered **by definition** — the review just read it — so it
+            // is excluded from the probe. Probing it against itself asks `is_merged(b, b)`, and
+            // a session branch with no commits yet answers `NothingToMerge`, which is not in the
+            // covered set: the task was skipped, no `reviewed=` was written, and `task land`
+            // then refused the branch `/review-log` had just called landable, leaving
+            // `--no-review` as the remedy at hand. That normalises the override D38.5 exists to
+            // prevent.
+            //
+            // The task's OTHER branches are still probed, which is the point of the check: a
+            // task carrying a second, live session branch must not be credited by a review that
+            // never saw it.
+            if others_are_covered(repo_root, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
@@ -372,6 +380,57 @@ pub(crate) struct Recording {
     pub(crate) skipped_unlanded: Vec<String>,
 }
 
+/// Whether `work`'s commits are already contained in `branch`, memoized per `(work, base)`:
+/// `is_merged` is about four git spawns and a swarm group puts one branch on every task in it.
+///
+/// `BranchMissing` counts as contained — a branch that is gone was deleted by `land`, which only
+/// happens once its commits reached the target.
+fn branch_is_in(
+    repo_root: &std::path::Path,
+    work: &str,
+    branch: &str,
+    base: Option<&str>,
+    covered: &mut BTreeMap<(String, Option<String>), bool>,
+) -> Result<bool> {
+    let key = (work.to_owned(), base.map(str::to_owned));
+    if let Some(known) = covered.get(&key) {
+        return Ok(*known);
+    }
+    let (state, _) =
+        crate::gitrepo::is_merged(repo_root, work, branch, base, crate::gitrepo::Prefer::Local)?;
+    let answer = matches!(
+        state,
+        crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
+    );
+    covered.insert(key, answer);
+    Ok(answer)
+}
+
+/// Whether every `branch=` this task records **other than the reviewed one** is already
+/// contained in the reviewed branch.
+///
+/// Split out from [`work_is_in`] because the two callers ask different questions. On the `onto=`
+/// arm the task's branch is a sub-branch and containment is the whole question. On the `branch=`
+/// arm the reviewed branch is the task's own, so probing it against itself is not just redundant
+/// — it answers `NothingToMerge` for a session that has not committed yet, and skips the task.
+fn others_are_covered(
+    repo_root: &std::path::Path,
+    t: &crate::repo::RepoTask,
+    branch: &str,
+    covered: &mut BTreeMap<(String, Option<String>), bool>,
+) -> Result<bool> {
+    let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
+    for work in crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH) {
+        if work == branch {
+            continue;
+        }
+        if !branch_is_in(repo_root, work, branch, base.as_deref(), covered)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether this task's own work is already contained in `branch` — i.e. whether a review of
 /// `branch` can have seen it.
 ///
@@ -414,26 +473,7 @@ fn work_is_in(
     }
     let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
     for work in branches {
-        let key = (work.clone(), base.clone());
-        if let Some(known) = covered.get(&key) {
-            if *known {
-                continue;
-            }
-            return Ok(false);
-        }
-        let (state, _) = crate::gitrepo::is_merged(
-            repo_root,
-            work,
-            branch,
-            base.as_deref(),
-            crate::gitrepo::Prefer::Local,
-        )?;
-        let answer = matches!(
-            state,
-            crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
-        );
-        covered.insert(key, answer);
-        if !answer {
+        if !branch_is_in(repo_root, work, branch, base.as_deref(), covered)? {
             return Ok(false);
         }
     }

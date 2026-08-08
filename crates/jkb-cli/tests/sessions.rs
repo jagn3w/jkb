@@ -1269,3 +1269,39 @@ fn a_session_dirtied_during_the_gate_keeps_its_work_and_its_task() {
         "and the task is not left done with a worktree nothing can remove"
     );
 }
+
+/// A review of a session that has not committed yet must still record (design D38.4).
+///
+/// `jkb task work` creates the branch at the sha it records as `base=`, so the branch's tip and
+/// its base are the same commit. Probing that branch for containment *against itself* answers
+/// `NothingToMerge`, which is not "covered" — so the task was skipped, no `reviewed=` was
+/// written, and `jkb task land` refused the branch `/review-log` had just called landable,
+/// leaving `--no-review` as the remedy at hand. Reviewing a dirty working tree is the documented
+/// common case, and every other test here commits first, so nothing covered it.
+#[test]
+fn a_review_of_an_uncommitted_session_still_records() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed before committing");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+
+    // Deliberately NO commit: the session is exactly as `task work` left it.
+    f.add_finding("reviews/early", "found while the tree was dirty");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/early"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now needs_review"));
+
+    assert_eq!(
+        f.status_of(&uid),
+        "needs_review",
+        "the task's own branch is covered by definition — it must not be skipped"
+    );
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert!(
+        t["reviewed"].as_str().is_some(),
+        "reviewed= must be recorded, or `task land` refuses and --no-review becomes the habit"
+    );
+}

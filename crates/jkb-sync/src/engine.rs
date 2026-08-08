@@ -66,8 +66,13 @@ pub enum Outcome {
     /// recover them.
     ResolvedFromKb,
     /// Exporting would have deleted lines for items that are still bound to this file, so
-    /// nothing was written (design D45.5). Journalled `needs_attention`; recovery is any edit
-    /// to the file, which imports normally.
+    /// nothing was written (design D45.5). Journalled `needs_attention`.
+    ///
+    /// Recovery is **deleting the offending lines from the file** — an item absent from disk is
+    /// one the user removed, so it stops being expected and `apply_doc` detaches it. Restoring
+    /// the item's primary placement in the KB clears it too. An earlier version judged
+    /// expectation from the *base* instead of from disk, which made the refusal unclearable
+    /// from the file: the remedy it printed could never take effect.
     Refused,
     /// Reconciling this file errored. Reported rather than propagated, so one bad file cannot
     /// end the run — or, under the watcher, silently kill a mount's thread for good.
@@ -137,7 +142,8 @@ impl SyncReport {
 
     /// Files an export refused, because it would have deleted lines for still-bound items
     /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
-    /// Files whose reconcile errored, with the error text.
+    /// Files whose reconcile **errored**, with the error text. Distinct from [`SyncReport::refused`]:
+    /// a refusal is a deliberate decision not to write; a failure is something going wrong.
     #[must_use]
     pub fn failed(&self) -> Vec<(&Path, &str)> {
         self.results
@@ -328,6 +334,7 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
 fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
+        let ser_name = ctx.serializer.clone();
         let ctx = ctx.clone();
         let p = path.clone();
         // A per-file failure is a RESULT, not a run-ending error. `reconcile_all` used to
@@ -340,7 +347,37 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         });
         let (outcome, reason) = match outcome {
             Ok(o) => (o, outcome_reason(db, &path)?),
-            Err(e) => (Outcome::Failed, Some(e.to_string())),
+            Err(e) => {
+                // Flag the journal in its OWN transaction: the reconcile's rolled back, so
+                // without this the row keeps `status='ok'` and the failure is invisible to
+                // `jkb doctor` — leaving one stderr line under the watcher as its only trace.
+                let (p2, msg) = (path.clone(), e.to_string());
+                let ser = ser_name.clone();
+                let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
+                    let uri = file_uri(&p2);
+                    let prev = sync_state::get(conn, &uri)?;
+                    sync_state::upsert(
+                        conn,
+                        meta,
+                        &sync_state::SyncStateWrite {
+                            uri: &uri,
+                            serializer: &ser,
+                            status: "needs_attention",
+                            last_synced_hash: prev
+                                .as_ref()
+                                .and_then(|j| j.last_synced_hash.as_deref()),
+                            base_blob_hash: prev.as_ref().and_then(|j| j.base_blob_hash.as_deref()),
+                            parse_error: Some(&msg),
+                            quarantine_blob_hash: prev
+                                .as_ref()
+                                .and_then(|j| j.quarantine_blob_hash.as_deref()),
+                            document: prev.as_ref().and_then(|j| j.document.as_deref()),
+                        },
+                    )?;
+                    Ok(())
+                });
+                (Outcome::Failed, Some(e.to_string()))
+            }
         };
         results.push(FileResult {
             path,
@@ -770,6 +807,7 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
             &kb_bytes,
             serializer.as_ref(),
             journal.as_ref(),
+            Some(&disk_doc),
         ),
         (true, true) => three_way_resolve(
             conn,
@@ -807,8 +845,9 @@ fn missing_file(
     journal: Option<&sync_state::SyncState>,
 ) -> Result<Outcome> {
     if ctx.exports() && kb_has_items {
+        // No disk document — the file is gone — so expectation falls back to the base.
         return finish_export(
-            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal,
+            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal, None,
         );
     }
     Ok(Outcome::Skipped)
@@ -938,6 +977,7 @@ fn finish_export(
     kb_bytes: &[u8],
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
+    expected: Option<&SyncDoc>,
 ) -> Result<Outcome> {
     if !ctx.exports() {
         return Ok(Outcome::Skipped);
@@ -946,7 +986,8 @@ fn finish_export(
     // The guard lives HERE, not at the call site, because two other callers reach this function
     // — `missing_file` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
-    if let Some(reason) = export_blocker(conn, path, bare_uri, serializer, journal)? {
+    if let Some(reason) = export_blocker(conn, ctx, path, bare_uri, serializer, journal, expected)?
+    {
         flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
         return Ok(Outcome::Refused);
     }
@@ -982,12 +1023,14 @@ fn finish_export(
 ///    nothing on disk to lose.
 fn export_blocker(
     conn: &Connection,
+    ctx: &Ctx,
     path: &Path,
     bare_uri: &str,
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
+    expected: Option<&SyncDoc>,
 ) -> Result<Option<String>> {
-    let dropped = dropped_items(conn, bare_uri, serializer, journal)?;
+    let dropped = dropped_items(conn, bare_uri, serializer, journal, expected)?;
     if !dropped.is_empty() {
         return Ok(Some(format!(
             "{} item(s) bound to this file are missing from the assembled document ({}). \
@@ -998,9 +1041,12 @@ fn export_blocker(
             dropped.join(", ")
         )));
     }
+    // Only for a mount that can import. On an export-only mount the file is a projection of the
+    // KB and there is no import to recover through, so refusing would wedge it on every run
+    // while telling the user to perform an operation the mount's mode forbids.
     let structure_known = journal.and_then(|j| j.document.as_deref()).is_some();
     let disk_has_content = std::fs::read(path).is_ok_and(|b| !b.trim_ascii().is_empty());
-    if !structure_known && disk_has_content {
+    if ctx.imports() && !structure_known && disk_has_content {
         return Ok(Some(
             "this file has content on disk but no recorded structure, so exporting would write \
              a headerless, prose-free render over it. Nothing was written. Sync it once from \
@@ -1028,13 +1074,30 @@ fn dropped_items(
     bare_uri: &str,
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
+    expected: Option<&SyncDoc>,
 ) -> Result<Vec<String>> {
-    // No base means nothing was ever declared, so nothing can have been dropped.
-    let Some(base) = load_base_doc(conn, journal, serializer)? else {
-        return Ok(Vec::new());
+    // What the file is EXPECTED to contain: the disk document when we have one, and only the
+    // base when the file is gone.
+    //
+    // Judging from the base alone made a refusal unclearable, which is the wedge this was
+    // written to avoid: the message says "delete the line", the user deletes it, and every later
+    // reconcile re-read the *base* — where the item still is — and refused again, so the edit
+    // was never imported. An item absent from disk is one the user removed; `apply_doc` detaches
+    // it, which is correct and is not a drop.
+    let owned;
+    let expected = match expected {
+        Some(doc) => doc,
+        None => match load_base_doc(conn, journal, serializer)? {
+            Some(doc) => {
+                owned = doc;
+                &owned
+            }
+            // Never synced and no disk document: nothing was ever declared, nothing can be lost.
+            None => return Ok(Vec::new()),
+        },
     };
     let bound = existing_by_local(conn, bare_uri)?;
-    let declared: Vec<(String, ItemId)> = base
+    let declared: Vec<(String, ItemId)> = expected
         .items
         .iter()
         .filter_map(|it| bound.get(&it.local_id).map(|id| (it.local_id.clone(), *id)))
@@ -1162,7 +1225,15 @@ fn three_way_resolve(
             // It mattered because the refusal's own advice is "edit the file", and that edit is
             // what routes a refused file into this arm. Following the tool's instructions
             // deleted the line the refusal had just protected.
-            if let Some(reason) = export_blocker(conn, path, bare_uri, serializer, journal)? {
+            if let Some(reason) = export_blocker(
+                conn,
+                ctx,
+                path,
+                bare_uri,
+                serializer,
+                journal,
+                Some(disk_doc),
+            )? {
                 flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
                 return Ok(Outcome::Refused);
             }
@@ -1202,7 +1273,16 @@ fn three_way_resolve(
                 // which is recoverable from the archive.
                 blob::store(conn, &blob::hash_bytes(disk_bytes), disk_bytes, None)?;
                 if finish_export(
-                    conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal,
+                    conn,
+                    meta,
+                    ctx,
+                    path,
+                    bare_uri,
+                    ser_name,
+                    kb_bytes,
+                    serializer,
+                    journal,
+                    Some(disk_doc),
                 )? == Outcome::Refused
                 {
                     return Ok(Outcome::Refused);

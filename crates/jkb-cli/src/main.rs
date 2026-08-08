@@ -3767,9 +3767,19 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for (path, reason) in report.refused() {
         println!("  REFUSED {}: {reason}", path.display());
     }
-    for (path, err) in report.failed() {
+    let failures = report.failed();
+    for (path, err) in &failures {
         println!("  FAILED {}: {err}", path.display());
     }
+    // A file that could not be reconciled must not leave a zero exit. `/review-log` runs
+    // `jkb mount create … && jkb sync "$ns"` under a shell that stops on error, and before this
+    // a total failure to import let the run proceed to record a review over zero findings —
+    // which reads as a clean review and opens the land gate.
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} file(s) failed to reconcile; see the FAILED lines above",
+        failures.len()
+    );
     Ok(())
 }
 
@@ -5536,7 +5546,7 @@ fn cmd_task_close_merged(
         println!("{verb} {uid} ({branch} merged)");
     }
     for (uid, branch) in &blocked {
-        println!("held  {uid} ({branch}) — see the reason above, or `jkb task show {uid}`");
+        println!("held  {uid} ({branch}) — `jkb task show {uid}` says why (usually open subtasks)");
     }
     if closed.is_empty() && blocked.is_empty() {
         println!(
