@@ -1529,9 +1529,26 @@ fn cmd_search(
         println!("(no results)");
         return Ok(());
     }
+    // Resolved BY ID, never by position — the JSON branch above already does this. `fetch_items`
+    // drops rows it cannot find, so zipping made one missing item print nothing at all (and exit
+    // 0), and a gap mid-list mislabelled every hit after it (design D42.4). Never pair two lists
+    // by index when one of them can be shorter.
     let ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
-    let items = output::fetch_items(db, &ids)?;
-    for (hit, item) in hits.iter().zip(items.iter()) {
+    let by_id: std::collections::HashMap<i64, output::DisplayItem> = output::fetch_items(db, &ids)?
+        .into_iter()
+        .map(|i| (i.id, i))
+        .collect();
+    for hit in &hits {
+        let Some(item) = by_id.get(&hit.item.get()) else {
+            // A hit whose item is gone should be unreachable now that `knn_live` filters them,
+            // so say so rather than skipping silently — a search that quietly drops results is
+            // the failure this fix exists to remove.
+            eprintln!(
+                "warning: search hit {} has no item row; run `jkb index --sweep`",
+                hit.item.get()
+            );
+            continue;
+        };
         println!(
             "[{} {:.3}] {}",
             hit.route.as_str(),

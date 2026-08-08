@@ -84,8 +84,8 @@ mod tests {
         // V004 sync journal, V005 task claims, V006 items.status CHECK,
         // V007 memory core (items.resolution + edges.weight),
         // V008 reserved namespace types, V009 placement containment,
-        // V010 items.id AUTOINCREMENT.
-        assert_eq!(user_version, 10);
+        // V010 items.id AUTOINCREMENT, V011 the id high-water mark V010 lost.
+        assert_eq!(user_version, 11);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -157,7 +157,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 10);
+        assert_eq!(user_version, 11);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

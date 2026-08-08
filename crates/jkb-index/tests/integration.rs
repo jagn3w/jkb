@@ -328,14 +328,25 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
     })
     .unwrap();
 
-    // Delete the item the way `undo` does — straight out of `items` — then sweep.
+    // Delete the item the way `undo` does — straight out of `items`, touching no jkb code.
+    // The GC trigger (D42.2) removes the vector, so the sweep afterwards finds NOTHING to do:
+    // that is the whole point of moving the obligation into the schema.
     let dropped = db
         .write_txn("test", move |conn, _meta| {
             conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
+            let remaining: i64 =
+                conn.query_row("SELECT count(*) FROM vec_items_16", [], |r| r.get(0))?;
+            assert_eq!(
+                remaining, 0,
+                "the trigger must remove the vector with its item, without jkb's help"
+            );
             Ok(jkb_index::drop_orphan_vectors(conn).unwrap())
         })
         .unwrap();
-    assert_eq!(dropped, 1, "the orphaned vector row goes with its item");
+    assert_eq!(
+        dropped, 0,
+        "nothing left for the sweep — it is repair for pre-trigger rows, not the guarantee"
+    );
 
     // The successor must NOT take the freed id — that is what makes a missed sweep harmless.
     db.write_txn("test", {
@@ -355,4 +366,113 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
         }
     })
     .unwrap();
+}
+
+/// D42.2 probe: can a `DELETE` trigger on `items` remove the row from a `vec0` **virtual**
+/// table? The whole schema-enforced-invariant argument rests on this, and a trigger
+/// referencing a virtual table is not obviously legal — so it is tested, not assumed.
+#[test]
+fn a_delete_trigger_can_reach_a_vec0_virtual_table() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let id = db
+        .write_txn("test", {
+            let embedder = embedder.clone();
+            move |conn, meta| {
+                let vector = VectorIndexer::new(embedder.clone());
+                vector.ensure_ready(conn).unwrap();
+                let id = add_item(conn, meta, "n:trig", "body");
+                vector
+                    .upsert_vector(conn, id, &embedder.embed("body").unwrap())
+                    .unwrap();
+                // No trigger created here: `ensure_ready` above installs it (D42.2). This test
+                // exists to prove a trigger can reach a vec0 **virtual** table at all, which is
+                // the assumption the whole schema-enforced argument rests on.
+                Ok(id)
+            }
+        })
+        .unwrap();
+
+    let before: i64 = db
+        .read(|conn| Ok(conn.query_row("SELECT count(*) FROM vec_items_16", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(before, 1, "the vector was written");
+
+    db.write_txn("test", move |conn, _m| {
+        conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
+        Ok(())
+    })
+    .expect("DELETE on items with the trigger present");
+
+    let after: i64 = db
+        .read(|conn| Ok(conn.query_row("SELECT count(*) FROM vec_items_16", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(after, 0, "the trigger must have removed the orphan");
+}
+
+/// A search must never return an item for a *deleted* item's text (design D42.5).
+///
+/// Every other vector test here asserts a count or non-emptiness, and all of them stay green
+/// while retrieval returns the wrong row — which is exactly the shape of the bug that shipped:
+/// a reused id pointed a live item at a dead embedding, so the count was right and the answer
+/// was wrong. This asserts the harm.
+#[test]
+fn a_deleted_items_text_does_not_retrieve_its_successor() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let doomed_vec = embedder.embed("the doomed document about badgers").unwrap();
+
+    let doomed = db
+        .write_txn("test", {
+            let embedder = embedder.clone();
+            let v = doomed_vec.clone();
+            move |conn, meta| {
+                let vector = VectorIndexer::new(embedder.clone());
+                vector.ensure_ready(conn).unwrap();
+                let id = add_item(conn, meta, "n:doomed", "the doomed document about badgers");
+                vector.upsert_vector(conn, id, &v).unwrap();
+                Ok(id)
+            }
+        })
+        .unwrap();
+
+    // Delete it the way `undo` does — straight out of `items`.
+    db.write_txn("test", move |conn, _m| {
+        conn.execute("DELETE FROM items WHERE id = ?1", [doomed.get()])?;
+        Ok(())
+    })
+    .unwrap();
+
+    // A successor, with unrelated content and NO vector of its own.
+    let successor = db
+        .write_txn("test", |conn, meta| {
+            Ok(add_item(
+                conn,
+                meta,
+                "n:successor",
+                "unrelated content about tax law",
+            ))
+        })
+        .unwrap();
+
+    // Query with the DELETED item's own embedding: the strongest possible pull toward its row.
+    let hits = db
+        .read({
+            let embedder = embedder.clone();
+            move |conn| {
+                Ok(VectorIndexer::new(embedder.clone())
+                    .knn(conn, &doomed_vec, 10)
+                    .unwrap())
+            }
+        })
+        .unwrap();
+
+    assert!(
+        !hits.iter().any(|(id, _)| *id == successor),
+        "the successor was returned for the deleted item's text — it inherited a dead embedding"
+    );
+    assert!(
+        !hits.iter().any(|(id, _)| *id == doomed),
+        "a deleted item must not be returned at all"
+    );
 }

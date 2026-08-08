@@ -548,8 +548,15 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 fn pending_rows_sql(conn: &Connection, table: &str) -> rusqlite::Result<String> {
     Ok(if table_exists(conn, table)? {
         format!(
+            // Joined to `items`, so a vector row whose id has been REUSED cannot make the new
+            // item read as already-indexed (design D42.3). Before the join, `V010`'s broken seed
+            // handed a freed id to a fresh chunk, whose orphaned vector then excluded it from
+            // this query permanently — it could never be embedded, and `doctor` saw nothing
+            // wrong because the row pointed at a live item.
             "SELECT id, content, kind FROM items
-             WHERE content IS NOT NULL AND id NOT IN (SELECT item_id FROM {table})"
+             WHERE content IS NOT NULL
+               AND id NOT IN (SELECT v.item_id FROM {table} v
+                              JOIN items i ON i.id = v.item_id)"
         )
     } else {
         "SELECT id, content, kind FROM items WHERE content IS NOT NULL".to_owned()

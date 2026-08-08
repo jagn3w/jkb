@@ -230,6 +230,31 @@ impl VectorIndexer {
             dim = self.dim
         ))?;
 
+        // A deleted item takes its vector with it, enforced by the **schema** (design D42.2).
+        //
+        // A vec0 table is virtual, so it can carry no foreign key and `ON DELETE CASCADE` is not
+        // available to it. That obligation was previously procedural — every path that deleted an
+        // item had to sweep — and it was discovered one missed call site at a time across four
+        // review passes (`undo`, `item rm`, and both of ingest's capture arms), because readers
+        // and deleters both outgrow any list of them.
+        //
+        // A trigger lives in the database file rather than in a process, so unlike the
+        // `ItemDeleteHook` seam D40 rejected it fires for every connection, every process, and
+        // every call site written in future — including ones that never link `jkb-index`. It is
+        // created here, beside the table it protects, because only this module knows the table's
+        // name (D9) and that the extension is loaded.
+        //
+        // Cost, accepted and tested: a connection that has NOT registered `sqlite-vec` cannot
+        // resolve the virtual table, so deleting an item there fails. Every binary in this
+        // workspace opens with `Db::open_with(&[jkb_index::register])`, and the trigger only
+        // exists in databases that have a vec table, which only this module creates.
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {table}_gc AFTER DELETE ON items BEGIN
+                 DELETE FROM {table} WHERE item_id = old.id;
+             END;",
+            table = self.table
+        ))?;
+
         let existing: Option<(String, i64)> = conn
             .prepare_cached("SELECT model, dim FROM embeddings_meta WHERE table_name = ?1")?
             .query_row([&self.table], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -335,6 +360,74 @@ impl VectorIndexer {
     /// Returns [`crate::Error`] if `query`'s length is not the table dim, or a
     /// statement fails.
     pub fn knn(&self, conn: &Connection, query: &[f32], k: usize) -> Result<Vec<(ItemId, f32)>> {
+        Ok(self.knn_live(conn, query, k)?.0)
+    }
+
+    /// KNN, with the neighbours whose item no longer exists removed — and a flag saying whether
+    /// the **index itself** ran out (design D42.3).
+    ///
+    /// The GC trigger stops new orphans, but a database that predates it still holds rows whose
+    /// item is gone, and `vec0` has no foreign key to notice. Returned unfiltered, those rows
+    /// displace real hits and reach the caller as ids that resolve to nothing — which is how
+    /// `jkb search` came to print nothing at all and exit 0.
+    ///
+    /// Filtered in **Rust, after the query**, never as a SQL join: `sqlite-vec` requires a
+    /// `LIMIT`/`k` constraint and rejects `ORDER BY` on anything but `distance`, and with `items`
+    /// chosen as the outer loop a join would re-run the KNN once per item row.
+    ///
+    /// The second return value distinguishes "the index has no more rows" from "live rows ran out
+    /// inside our budget". `jkb-search`'s growth loop tests `hits.len() < fetch` to decide it is
+    /// exhausted; once filtering happens in here that test is wrong, and the loop would stop
+    /// growing and return too few hits.
+    ///
+    /// # Errors
+    /// Returns an error if the query is the wrong length or a statement fails.
+    pub fn knn_live(
+        &self,
+        conn: &Connection,
+        query: &[f32],
+        k: usize,
+    ) -> Result<(Vec<(ItemId, f32)>, bool)> {
+        // `sqlite-vec` hard-errors above this (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111), so a
+        // caller that already over-fetches must not be multiplied into a raw extension error on
+        // the flagship read.
+        const VEC0_K_MAX: usize = 4096;
+        let mut fetch = k.min(VEC0_K_MAX);
+        loop {
+            let raw = self.knn_raw(conn, query, fetch)?;
+            let index_exhausted = raw.len() < fetch;
+            let live = Self::filter_live(conn, raw)?;
+            if live.len() >= k || index_exhausted || fetch >= VEC0_K_MAX {
+                let mut live = live;
+                live.truncate(k);
+                return Ok((live, index_exhausted));
+            }
+            fetch = (fetch * 2).min(VEC0_K_MAX);
+        }
+    }
+
+    /// Drop neighbours whose item row is gone, preserving distance order.
+    fn filter_live(conn: &Connection, hits: Vec<(ItemId, f32)>) -> Result<Vec<(ItemId, f32)>> {
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let placeholders = vec!["?"; hits.len()].join(", ");
+        let live: std::collections::HashSet<i64> = conn
+            .prepare(&format!(
+                "SELECT id FROM items WHERE id IN ({placeholders})"
+            ))?
+            .query_map(
+                params_from_iter(hits.iter().map(|(id, _)| Value::Integer(id.get()))),
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(hits
+            .into_iter()
+            .filter(|(id, _)| live.contains(&id.get()))
+            .collect())
+    }
+
+    fn knn_raw(&self, conn: &Connection, query: &[f32], k: usize) -> Result<Vec<(ItemId, f32)>> {
         if query.len() != self.dim {
             return Err(TypesError::Validation(format!(
                 "query length {} does not match vec table dim {}",
