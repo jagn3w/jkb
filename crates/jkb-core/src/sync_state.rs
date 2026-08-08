@@ -30,6 +30,14 @@ pub struct SyncState {
     pub parse_error: Option<String>,
     /// `blobs.hash` of the failing bytes stashed on quarantine.
     pub quarantine_blob_hash: Option<String>,
+    /// The file's **document structure** as JSON — its block order and its section headers
+    /// (design D45.2). `None` means not yet populated; the sync engine fills it once from the
+    /// file's own base blob.
+    ///
+    /// This lives here, keyed one-per-file, rather than in `namespaces.metadata`, because the
+    /// namespace tree is shared and user-mutable while a file's structure is private to that
+    /// file. Two files sharing one namespace is what collapsed 62 of 63 markdown files.
+    pub document: Option<String>,
     /// Timestamp of the last journal write.
     pub updated_at: String,
 }
@@ -52,6 +60,8 @@ pub struct SyncStateWrite<'a> {
     pub parse_error: Option<&'a str>,
     /// `blobs.hash` of the failing bytes stashed on quarantine.
     pub quarantine_blob_hash: Option<&'a str>,
+    /// The file's document structure as JSON (see [`SyncState::document`]).
+    pub document: Option<&'a str>,
 }
 
 /// Fetch the journal row for `uri`, if one exists.
@@ -62,7 +72,7 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
     let state = conn
         .prepare_cached(
             "SELECT uri, serializer, status, last_synced_hash, base_blob_hash,
-                    parse_error, quarantine_blob_hash, updated_at
+                    parse_error, quarantine_blob_hash, document, updated_at
              FROM sync_state WHERE uri = ?1",
         )?
         .query_row([uri], |row| {
@@ -74,7 +84,8 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
                 base_blob_hash: row.get(4)?,
                 parse_error: row.get(5)?,
                 quarantine_blob_hash: row.get(6)?,
-                updated_at: row.get(7)?,
+                document: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })
         .optional()?;
@@ -98,19 +109,25 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
             "serializer": row.serializer,
             "last_synced_hash": row.last_synced_hash,
             "base_blob_hash": row.base_blob_hash,
+            // The document goes in the snapshot with the hashes. Undoing a sync must rewind
+            // structure and hashes TOGETHER: leaving the structure forward while the hashes go
+            // back is a KB that disagrees with its own base, which is the state every export bug
+            // in this subsystem grew out of.
+            "document": row.document,
         })
     });
     conn.prepare_cached(
         "INSERT INTO sync_state
              (uri, serializer, status, last_synced_hash, base_blob_hash,
-              parse_error, quarantine_blob_hash, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+              parse_error, quarantine_blob_hash, document, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(uri) DO UPDATE SET
              serializer = excluded.serializer, status = excluded.status,
              last_synced_hash = excluded.last_synced_hash,
              base_blob_hash = excluded.base_blob_hash,
              parse_error = excluded.parse_error,
              quarantine_blob_hash = excluded.quarantine_blob_hash,
+             document = excluded.document,
              updated_at = excluded.updated_at",
     )?
     .execute(params![
@@ -121,6 +138,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
         w.base_blob_hash,
         w.parse_error,
         w.quarantine_blob_hash,
+        w.document,
     ])?;
     // `base_blob_hash` is recorded here on purpose: the blob it names is the exact bytes of
     // this file at this sync, and blobs are never deleted. Journalling the hash turns the
@@ -139,6 +157,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
             "serializer": w.serializer,
             "base_blob_hash": w.base_blob_hash,
             "last_synced_hash": w.last_synced_hash,
+            "document": w.document,
         })),
     )?;
     Ok(())
@@ -152,7 +171,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
 pub fn needs_attention(conn: &Connection) -> Result<Vec<SyncState>> {
     let mut stmt = conn.prepare_cached(
         "SELECT uri, serializer, status, last_synced_hash, base_blob_hash,
-                parse_error, quarantine_blob_hash, updated_at
+                parse_error, quarantine_blob_hash, document, updated_at
          FROM sync_state WHERE status != 'ok' ORDER BY uri",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -164,7 +183,8 @@ pub fn needs_attention(conn: &Connection) -> Result<Vec<SyncState>> {
             base_blob_hash: row.get(4)?,
             parse_error: row.get(5)?,
             quarantine_blob_hash: row.get(6)?,
-            updated_at: row.get(7)?,
+            document: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     })?;
     let mut out = Vec::new();
@@ -205,6 +225,7 @@ pub fn settle(conn: &Connection, meta: &WriteMeta, uri: &str) -> Result<bool> {
             base_blob_hash: row.base_blob_hash.as_deref(),
             parse_error: None,
             quarantine_blob_hash: row.quarantine_blob_hash.as_deref(),
+            document: row.document.as_deref(),
         },
     )?;
     Ok(true)
@@ -253,6 +274,7 @@ mod tests {
                     base_blob_hash: Some("b1"),
                     parse_error: None,
                     quarantine_blob_hash: None,
+                    document: None,
                 },
             )?;
             upsert(
@@ -266,6 +288,7 @@ mod tests {
                     base_blob_hash: Some("b2"),
                     parse_error: Some("bad token on line 3"),
                     quarantine_blob_hash: Some("q2"),
+                    document: None,
                 },
             )
         })
@@ -310,6 +333,7 @@ mod tests {
                         base_blob_hash: Some(hash),
                         parse_error: None,
                         quarantine_blob_hash: None,
+                        document: None,
                     },
                 )
             })

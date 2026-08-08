@@ -1163,6 +1163,7 @@ fn a_renderer_change_is_not_mistaken_for_a_content_change() {
                     base_blob_hash: Some(&hash),
                     parse_error: None,
                     quarantine_blob_hash: None,
+                    document: None,
                 },
             )
         }
@@ -1249,6 +1250,7 @@ fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
                     base_blob_hash: Some(&hash),
                     parse_error: None,
                     quarantine_blob_hash: None,
+                    document: None,
                 },
             )
         }
@@ -1363,102 +1365,253 @@ fn deleting_a_sibling_never_overwrites_the_survivor() {
     );
 }
 
-/// A KB written before D39 — items and layout in the *directory* namespace — is adopted into
-/// the file's own namespace on the next sync, once, and reports it (design D39.3).
+/// A legacy journal row — structure still in the namespace tree, `document` NULL — is populated
+/// once from the file's own base blob, and the run after that is an ordinary no-op (D45.6).
 #[test]
-fn a_legacy_directory_namespace_is_adopted_into_the_files_own() {
+fn a_legacy_journal_row_is_populated_once_from_its_own_base() {
     let dir = tempfile::tempdir().unwrap();
     let tasks = dir.path().join("tasks.md");
-    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+    fs::write(&tasks, "## Plan\n\nSome prose.\n\n- [ ] ship it !p1\n").unwrap();
 
     let db = Db::open_in_memory().unwrap();
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
     sync(&db, "docs/plan").unwrap();
+    let settled = fs::read_to_string(&tasks).unwrap();
 
-    // Rewind to the pre-D39 shape: move the file's document back up to the directory
-    // namespace, exactly where the old `namespace_for` put it.
-    db.write_txn("t", |conn, meta| {
-        let file_ns = ns::get(conn, "docs/plan/tasks.md")?.expect("file namespace");
-        let md = ns::get_metadata(conn, file_ns)?.expect("layout");
-        let dir_ns = ns::ensure(conn, "docs/plan")?;
-        ns::set_metadata(conn, meta, dir_ns, &md)?;
-        ns::set_metadata(conn, meta, file_ns, &serde_json::json!({}))?;
-        for id in jkb_core::placement::items_directly_in(conn, file_ns)? {
-            jkb_core::placement::set_primary(conn, meta, id, dir_ns, 0)?;
-        }
-        ns::move_subtree(conn, meta, "docs/plan/tasks.md/plan", "docs/plan/plan")?;
+    // Rewind to the pre-D45 shape: the journal knows the hashes but not the structure.
+    db.write_txn("t", |conn, _m| {
+        conn.execute("UPDATE sync_state SET document = NULL", [])?;
         Ok(())
     })
     .unwrap();
 
+    // The file must be untouched, and the structure must come back.
     let report = sync(&db, "docs/plan").unwrap();
-    assert_eq!(report.count(Outcome::Adopted), 1, "the move is reported");
     assert_eq!(
-        report.adopted().len(),
-        1,
-        "and the moved file is named, not just counted"
+        report.count(Outcome::Refused),
+        0,
+        "a legacy row must repopulate, not refuse"
+    );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        settled,
+        "populating structure must not rewrite the file"
     );
 
-    // The document survived the move intact — this is the whole risk of a re-home.
-    let text = fs::read_to_string(&tasks).unwrap();
-    assert!(
-        text.starts_with("## Plan\n\n- [ ] ship it !p1 ^ship-it-"),
-        "the document must survive the move: {text}"
-    );
-    assert!(
-        db.read(|conn| ns::get(conn, "docs/plan/tasks.md/plan"))
-            .unwrap()
-            .is_some(),
-        "the section moved down with its file"
-    );
+    let doc: Option<String> = db
+        .read(|conn| Ok(conn.query_row("SELECT document FROM sync_state", [], |r| r.get(0))?))
+        .unwrap();
+    let doc = doc.expect("document populated");
+    assert!(doc.contains("Some prose."), "prose recovered: {doc}");
+    assert!(doc.contains("## Plan"), "header recovered: {doc}");
 
-    // Idempotent: the run after an adoption is an ordinary no-op.
-    let again = sync(&db, "docs/plan").unwrap();
-    assert_eq!(again.count(Outcome::Adopted), 0);
-    assert_eq!(again.count(Outcome::UpToDate), 1);
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
 }
 
-/// A legacy namespace holding **two** files' items is left exactly as it is.
+/// Renaming a file's namespace must not let the next sync strip the file (D45.4).
 ///
-/// The safety condition is positive evidence — every `file://`-bound item here is bound to
-/// *this* file — not the absence of a rival. Every earlier guard used a proxy for the rival's
-/// absence, and every one of them was satisfied by deleting the rival, which is precisely the
-/// recovery step that then destroyed the survivor.
+/// `jkb ns mv` — and one click of the VS Code Rename button — used to make the structure
+/// unreachable, after which the export arm wrote a structureless render over the file. Structure
+/// now lives on the journal row, keyed by the file's uri, so the namespace tree cannot reach it.
 #[test]
-fn a_legacy_namespace_shared_by_two_files_is_not_adopted() {
+fn renaming_a_files_namespace_does_not_strip_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let tasks = dir.path().join("tasks.md");
-    let design = dir.path().join("design.md");
-    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
-    fs::write(&design, "## Design\n\n- [ ] decide the shape !p2\n").unwrap();
+    fs::write(
+        &tasks,
+        "## Plan\n\nProse that must survive.\n\n- [ ] ship it !p1\n",
+    )
+    .unwrap();
 
     let db = Db::open_in_memory().unwrap();
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
     sync(&db, "docs/plan").unwrap();
+    let before = fs::read_to_string(&tasks).unwrap();
 
-    // Rewind BOTH files into the one directory namespace — the genuinely ambiguous state.
+    // Move the file's whole namespace out from under it, the way `jkb ns mv` does.
     db.write_txn("t", |conn, meta| {
-        let dir_ns = ns::ensure(conn, "docs/plan")?;
-        let mut md = None;
-        for name in ["tasks.md", "design.md"] {
-            let file_ns = ns::get(conn, &format!("docs/plan/{name}"))?.expect("file namespace");
-            if md.is_none() {
-                md = ns::get_metadata(conn, file_ns)?;
-            }
-            for id in jkb_core::placement::items_directly_in(conn, file_ns)? {
-                jkb_core::placement::set_primary(conn, meta, id, dir_ns, 0)?;
-            }
-            ns::set_metadata(conn, meta, file_ns, &serde_json::json!({}))?;
-        }
-        ns::set_metadata(conn, meta, dir_ns, &md.expect("a layout"))?;
+        ns::move_subtree(conn, meta, "docs/plan/tasks.md", "docs/elsewhere")?;
+        Ok(())
+    })
+    .unwrap();
+
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        before,
+        "the file must be byte-identical after its namespace was renamed away"
+    );
+}
+
+/// An export must refuse rather than delete the lines of items that are still bound (D45.5).
+///
+/// `assemble_kb_doc` skips a bound item with no primary placement, and the export arm then
+/// writes that render over the file — so `jkb undo` after a re-home silently deletes task lines.
+#[test]
+fn an_export_refuses_when_a_bound_items_line_would_vanish() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let before = fs::read_to_string(&tasks).unwrap();
+
+    // Strip one bound item's primary placement — exactly what `jkb undo` after a re-home leaves
+    // behind — and make a KB-side change so an export is attempted.
+    db.write_txn("t", |conn, _m| {
+        let victim: i64 = conn.query_row(
+            "SELECT i.id FROM items i JOIN bindings b ON b.item_id = i.id
+              WHERE i.content LIKE '%keep me%'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM placements WHERE item_id = ?1 AND role = 'primary'",
+            [victim],
+        )?;
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%and me%'",
+            [],
+        )?;
         Ok(())
     })
     .unwrap();
 
     let report = sync(&db, "docs/plan").unwrap();
     assert_eq!(
-        report.count(Outcome::Adopted),
+        report.count(Outcome::Refused),
+        1,
+        "the export must refuse, not silently drop a line"
+    );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        before,
+        "a refusal writes nothing at all"
+    );
+    let (_, reason) = report.refused()[0];
+    assert!(
+        reason.contains("missing from the assembled document"),
+        "the refusal must say why: {reason}"
+    );
+}
+
+/// A legitimate KB-only edit still exports — the guard must not block the ordinary path.
+#[test]
+fn a_kb_only_status_change_still_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    db.write_txn("t", |conn, _m| {
+        conn.execute("UPDATE items SET status = 'done' WHERE kind = 'task'", [])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Exported),
+        1,
+        "the ordinary path works"
+    );
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("- [x]"),
+        "the status reached the file: {after}"
+    );
+    assert!(after.contains("## Plan"), "structure survived: {after}");
+}
+
+/// `jkb undo` after a sync must rewind structure and hashes **together** (D45.2).
+///
+/// The document now lives on the journal row beside the hashes, so restoring one without the
+/// other would undo a sync into a KB that disagrees with its own base — the state every export
+/// bug in this subsystem grew out of.
+#[test]
+fn undoing_a_sync_rewinds_structure_with_the_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## One\n\n- [ ] first !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    let read_row = || -> (Option<String>, Option<String>) {
+        db.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT document, last_synced_hash FROM sync_state",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .unwrap_or((None, None)))
+        })
+        .unwrap()
+    };
+    let (doc_v1, hash_v1) = read_row();
+    assert!(doc_v1.as_ref().is_some_and(|d| d.contains("## One")));
+
+    // A second sync with different structure.
+    fs::write(&tasks, "## Two\n\nNew prose.\n\n- [ ] first !p1\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    let (doc_v2, hash_v2) = read_row();
+    assert_ne!(doc_v1, doc_v2, "structure moved on");
+    assert_ne!(hash_v1, hash_v2);
+
+    db.write_txn("t", jkb_core::undo::undo_last).unwrap();
+
+    let (doc_after, hash_after) = read_row();
+    assert_eq!(
+        (doc_after, hash_after),
+        (doc_v1, hash_v1),
+        "structure and hashes must rewind together, not one without the other"
+    );
+}
+
+/// `kb_wins` writes the KB side over a disk that changed structurally — a path the export
+/// property does NOT cover (D45.4), so it is asserted on bytes rather than assumed.
+#[test]
+fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] shared !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::KbWins);
+    sync(&db, "docs/plan").unwrap();
+
+    // Both sides change: the disk gains a section, the KB closes the task.
+    fs::write(
+        &tasks,
+        "## Plan\n\n## Extra\n\n- [ ] shared !p1\n- [ ] disk only !p2\n",
+    )
+    .unwrap();
+    db.write_txn("t", |conn, _m| {
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%shared%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Refused),
         0,
-        "an ambiguous directory must not be guessed at"
+        "a legitimate kb_wins resolution must not be refused"
+    );
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("[x] shared"),
+        "the KB side won, as kb_wins means: {after}"
     );
 }

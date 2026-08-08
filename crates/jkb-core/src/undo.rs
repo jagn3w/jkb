@@ -234,7 +234,8 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
     Ok(conn
         .prepare_cached(
             "UPDATE sync_state
-                SET status = ?2, serializer = ?3, last_synced_hash = ?4, base_blob_hash = ?5
+                SET status = ?2, serializer = ?3, last_synced_hash = ?4, base_blob_hash = ?5,
+                    document = ?6
               WHERE uri = ?1",
         )?
         .execute(params![
@@ -243,6 +244,10 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
             field("serializer"),
             field("last_synced_hash"),
             field("base_blob_hash"),
+            // Structure rewinds WITH the hashes. Since D45 the document lives on this row, so
+            // restoring the hashes and leaving the structure forward would undo a sync into a KB
+            // that disagrees with its own base — the state every export bug here grew out of.
+            field("document"),
         ])?)
 }
 

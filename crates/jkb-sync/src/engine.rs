@@ -65,9 +65,10 @@ pub enum Outcome {
     /// overwritten. The losing bytes are blobbed first, so `jkb blob ls --contains` can still
     /// recover them.
     ResolvedFromKb,
-    /// A file synced under the pre-D39 rule — its items and layout were in the *directory*
-    /// namespace — was moved into its own namespace. One-time, per file, and idempotent.
-    Adopted,
+    /// Exporting would have deleted lines for items that are still bound to this file, so
+    /// nothing was written (design D45.5). Journalled `needs_attention`; recovery is any edit
+    /// to the file, which imports normally.
+    Refused,
 }
 
 /// The result of reconciling one file.
@@ -131,10 +132,20 @@ impl SyncReport {
             .collect()
     }
 
-    /// The paths moved out of a shared directory namespace into their own (design D39.3).
+    /// Files an export refused, because it would have deleted lines for still-bound items
+    /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
     #[must_use]
-    pub fn adopted(&self) -> Vec<&Path> {
-        self.paths_with(Outcome::Adopted)
+    pub fn refused(&self) -> Vec<(&Path, &str)> {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Refused)
+            .map(|r| {
+                (
+                    r.path.as_path(),
+                    r.reason.as_deref().unwrap_or("refused; see `jkb doctor`"),
+                )
+            })
+            .collect()
     }
 
     fn paths_with(&self, outcome: Outcome) -> Vec<&Path> {
@@ -340,17 +351,13 @@ fn brought_items_in(outcome: Outcome) -> bool {
         | Outcome::Skipped
         | Outcome::Conflict
         | Outcome::Quarantined
+        // Nothing was written at all.
+        | Outcome::Refused
         // KB → disk: the items were already in the KB, and already mirrored.
         | Outcome::Exported
         | Outcome::ResolvedFromKb
         | Outcome::Normalized => false,
-        // `Adopted` moved items between namespaces, so their `tasks/**` mirrors point at the
-        // old home and must be re-derived — the same reason an import needs it.
-        Outcome::Created
-        | Outcome::Imported
-        | Outcome::Merged
-        | Outcome::ResolvedFromDisk
-        | Outcome::Adopted => true,
+        Outcome::Created | Outcome::Imported | Outcome::Merged | Outcome::ResolvedFromDisk => true,
     }
 }
 
@@ -368,7 +375,6 @@ mod mirror_predicate {
             Outcome::Imported,
             Outcome::Merged,
             Outcome::ResolvedFromDisk,
-            Outcome::Adopted,
         ] {
             assert!(brought_items_in(o), "{o:?} imports items");
         }
@@ -380,6 +386,7 @@ mod mirror_predicate {
             Outcome::Skipped,
             Outcome::Conflict,
             Outcome::Quarantined,
+            Outcome::Refused,
         ] {
             assert!(!brought_items_in(o), "{o:?} does not import items");
         }
@@ -572,6 +579,14 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
     let journal = sync_state::get(conn, &bare_uri)?;
+    // A row written before D45 has its structure in the namespace tree, not here. Populate it
+    // ONCE, from the file's own base blob (or the file on disk) — both are per-file by
+    // construction, unlike the pre-D39 directory namespace, which is shared by every file in the
+    // directory and whose ambiguity is what seven earlier guards failed to resolve.
+    //
+    // Placed before the quarantine early-return below, or a file that fails to parse would never
+    // be populated at all.
+    let journal = populate_document(conn, meta, &bare_uri, serializer.as_ref(), path, journal)?;
     let base_hash = journal.as_ref().and_then(|j| j.last_synced_hash.clone());
 
     // Parse the disk side (if the file exists). A quarantining serializer turns a parse
@@ -599,13 +614,8 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
         None
     };
 
-    // A database written before D39 has this file's items and layout in the *directory*
-    // namespace. Move them down into the file's own namespace before anything is assembled;
-    // one-time, idempotent, and reported so the move is never silent.
-    let adopted = adopt_legacy_namespace(conn, meta, ctx, path, &bare_uri)?;
-
     // Assemble the KB side and render it, so we can hash it against the base.
-    let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri)?;
+    let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
     let kb_bytes = serializer.render(&kb_doc)?;
     let kb_hash = hash(&kb_bytes);
     let kb_has_items = !kb_doc.items.is_empty();
@@ -620,6 +630,8 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
             &ser_name,
             &kb_bytes,
             kb_has_items,
+            serializer.as_ref(),
+            journal.as_ref(),
         );
     };
 
@@ -650,6 +662,8 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
             &ser_name,
             &kb_bytes,
             kb_has_items,
+            serializer.as_ref(),
+            journal.as_ref(),
         );
     }
 
@@ -680,22 +694,30 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
                 if kb_bytes != disk_bytes {
                     write_file(path, &kb_bytes)?;
                 }
-                mark_ok(conn, meta, &bare_uri, &ser_name, &kb_hash, &kb_bytes)?;
+                mark_ok(
+                    conn,
+                    meta,
+                    &bare_uri,
+                    &ser_name,
+                    &kb_hash,
+                    &kb_bytes,
+                    journal.as_ref().and_then(|j| j.document.as_deref()),
+                )?;
                 return Ok(Outcome::Normalized);
             }
             if was_flagged {
                 // A previously quarantined/conflicted file is now clean again.
-                mark_ok(conn, meta, &bare_uri, &ser_name, &kb_hash, &kb_bytes)?;
+                mark_ok(
+                    conn,
+                    meta,
+                    &bare_uri,
+                    &ser_name,
+                    &kb_hash,
+                    &kb_bytes,
+                    journal.as_ref().and_then(|j| j.document.as_deref()),
+                )?;
             }
-            // An adoption that changed nothing else is still worth saying: the file's items
-            // moved namespace, so a `tasks/**` query answers differently afterwards. Reporting
-            // it as `UpToDate` would make the one run that re-homed a document indistinguishable
-            // from the hundreds that did nothing.
-            Ok(if adopted {
-                Outcome::Adopted
-            } else {
-                Outcome::UpToDate
-            })
+            Ok(Outcome::UpToDate)
         }
         (true, false) => finish_import(
             conn,
@@ -709,7 +731,17 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
             &disk_bytes,
             Outcome::Imported,
         ),
-        (false, true) => finish_export(conn, meta, ctx, path, &bare_uri, &ser_name, &kb_bytes),
+        (false, true) => finish_export(
+            conn,
+            meta,
+            ctx,
+            path,
+            &bare_uri,
+            &ser_name,
+            &kb_bytes,
+            serializer.as_ref(),
+            journal.as_ref(),
+        ),
         (true, true) => three_way_resolve(
             conn,
             meta,
@@ -742,9 +774,13 @@ fn missing_file(
     ser_name: &str,
     kb_bytes: &[u8],
     kb_has_items: bool,
+    serializer: &dyn SyncSerializer,
+    journal: Option<&sync_state::SyncState>,
 ) -> Result<Outcome> {
     if ctx.exports() && kb_has_items {
-        return finish_export(conn, meta, ctx, path, bare_uri, ser_name, kb_bytes);
+        return finish_export(
+            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal,
+        );
     }
     Ok(Outcome::Skipped)
 }
@@ -847,7 +883,17 @@ fn finish_import(
     if rendered != disk_bytes {
         write_file(path, &rendered)?;
     }
-    settle(conn, meta, bare_uri, ser_name, &rendered, &resolved)?;
+    // An import is one of the two ways a file's structure legitimately changes, so this is
+    // where the journal learns it (D45.4).
+    settle(
+        conn,
+        meta,
+        bare_uri,
+        ser_name,
+        &rendered,
+        &resolved,
+        Some(&document_json(doc)),
+    )?;
     Ok(outcome)
 }
 
@@ -861,14 +907,168 @@ fn finish_export(
     bare_uri: &str,
     ser_name: &str,
     kb_bytes: &[u8],
+    serializer: &dyn SyncSerializer,
+    journal: Option<&sync_state::SyncState>,
 ) -> Result<Outcome> {
     if !ctx.exports() {
         return Ok(Outcome::Skipped);
     }
+
+    // The guard lives HERE, not at the call site, because two other callers reach this function
+    // — `missing_file` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
+    // arm would let both past (design D45.5).
+    let dropped = dropped_items(conn, bare_uri, serializer, journal)?;
+    if !dropped.is_empty() {
+        let reason = format!(
+            "{} item(s) bound to this file are missing from the assembled document ({}), so \
+             exporting would delete their lines. Nothing was written. Edit the file to re-import \
+             it, or run `jkb doctor`.",
+            dropped.len(),
+            dropped.join(", ")
+        );
+        flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
+        return Ok(Outcome::Refused);
+    }
+
     write_file(path, kb_bytes)?;
     let resolved = current_bindings(conn, bare_uri)?;
-    settle(conn, meta, bare_uri, ser_name, kb_bytes, &resolved)?;
+    // An export CARRIES the structure forward rather than authoring it: `apply_doc` is the only
+    // writer of a file's structure, and an export does not call it. That is the property the
+    // whole model buys (D45.4).
+    let document = journal.and_then(|j| j.document.clone());
+    settle(
+        conn,
+        meta,
+        bare_uri,
+        ser_name,
+        kb_bytes,
+        &resolved,
+        document.as_deref(),
+    )?;
     Ok(Outcome::Exported)
+}
+
+/// Items the base declared, whose binding still exists, that `assemble_kb_doc` would silently
+/// drop — the `local_id`s whose lines an export is about to delete.
+///
+/// `assemble_kb_doc` skips any bound item with no row **or no primary placement**
+/// (engine.rs, `build_sync_item`'s guard), and the export arm then writes that render over the
+/// file. It is reachable through a documented verb: `placement::set_primary` logs the old
+/// primary's removal as `op="delete"` on `placements`, which has no inverse, while the
+/// replacement is an invertible `insert` — so `jkb undo` after any re-home leaves the item with
+/// no primary placement at all.
+///
+/// Deliberately NOT a constraint on KB-owned state: an item deleted in the KB loses its binding
+/// and is legitimately absent.
+fn dropped_items(
+    conn: &Connection,
+    bare_uri: &str,
+    serializer: &dyn SyncSerializer,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<Vec<String>> {
+    // No base means nothing was ever declared, so nothing can have been dropped.
+    let Some(base) = load_base_doc(conn, journal, serializer)? else {
+        return Ok(Vec::new());
+    };
+    let bound = existing_by_local(conn, bare_uri)?;
+    let declared: Vec<(String, ItemId)> = base
+        .items
+        .iter()
+        .filter_map(|it| bound.get(&it.local_id).map(|id| (it.local_id.clone(), *id)))
+        .collect();
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<ItemId> = declared.iter().map(|(_, id)| *id).collect();
+    let rows = item_rows_for(conn, &ids)?;
+    let placements = primary_placements_for(conn, &ids)?;
+    Ok(declared
+        .into_iter()
+        .filter(|(_, id)| !rows.contains_key(id) || !placements.contains_key(id))
+        .map(|(local, _)| local)
+        .collect())
+}
+
+/// Fill in a journal row's `document` if it predates D45, returning the row as it now stands.
+///
+/// Sources, in order, both per-file: the base blob (the exact bytes this file last synced), then
+/// the file on disk. Deliberately **not** the namespace metadata — the post-D39 file namespace
+/// does not exist on a legacy store, and the pre-D39 directory namespace is shared, so reading it
+/// is the `openspec` collapse restated as a migration.
+///
+/// A row with no base and no readable file is left alone: it has never synced, so there is no
+/// structure to recover and the export path treats it as unconstrained.
+fn populate_document(
+    conn: &Connection,
+    meta: &WriteMeta,
+    bare_uri: &str,
+    serializer: &dyn SyncSerializer,
+    path: &Path,
+    journal: Option<sync_state::SyncState>,
+) -> Result<Option<sync_state::SyncState>> {
+    let Some(row) = journal else {
+        return Ok(None);
+    };
+    if row.document.is_some() {
+        return Ok(Some(row));
+    }
+    let recovered = match load_base_doc(conn, Some(&row), serializer) {
+        Ok(Some(doc)) => Some(doc),
+        // A base that will not parse is not a reason to abort the whole run; fall through to the
+        // file, and if that fails too the export guard refuses rather than writing.
+        Ok(None) | Err(_) => match std::fs::read(path) {
+            Ok(bytes) => serializer.parse(&bytes).ok(),
+            Err(_) => None,
+        },
+    };
+    let Some(doc) = recovered else {
+        return Ok(Some(row));
+    };
+    let document = document_json(&doc);
+    sync_state::upsert(
+        conn,
+        meta,
+        &sync_state::SyncStateWrite {
+            uri: bare_uri,
+            serializer: &row.serializer,
+            status: &row.status,
+            last_synced_hash: row.last_synced_hash.as_deref(),
+            base_blob_hash: row.base_blob_hash.as_deref(),
+            parse_error: row.parse_error.as_deref(),
+            quarantine_blob_hash: row.quarantine_blob_hash.as_deref(),
+            document: Some(&document),
+        },
+    )?;
+    Ok(Some(sync_state::SyncState {
+        document: Some(document),
+        ..row
+    }))
+}
+
+/// Journal a refusal: nothing was written, and `jkb doctor` must be able to say why.
+fn flag_refused(
+    conn: &Connection,
+    meta: &WriteMeta,
+    bare_uri: &str,
+    ser_name: &str,
+    reason: &str,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<()> {
+    sync_state::upsert(
+        conn,
+        meta,
+        &sync_state::SyncStateWrite {
+            uri: bare_uri,
+            serializer: ser_name,
+            status: "needs_attention",
+            last_synced_hash: journal.and_then(|j| j.last_synced_hash.as_deref()),
+            base_blob_hash: journal.and_then(|j| j.base_blob_hash.as_deref()),
+            parse_error: Some(reason),
+            quarantine_blob_hash: journal.and_then(|j| j.quarantine_blob_hash.as_deref()),
+            document: journal.and_then(|j| j.document.as_deref()),
+        },
+    )?;
+    Ok(())
 }
 
 /// Both sides changed: attempt a three-way merge of disjoint edits, else resolve by the
@@ -896,7 +1096,15 @@ fn three_way_resolve(
             if ctx.exports() {
                 write_file(path, &rendered)?;
             }
-            settle(conn, meta, bare_uri, ser_name, &rendered, &resolved)?;
+            settle(
+                conn,
+                meta,
+                bare_uri,
+                ser_name,
+                &rendered,
+                &resolved,
+                Some(&document_json(&merged)),
+            )?;
             Ok(Outcome::Merged)
         }
         ThreeWay::Conflict => match ctx.conflict_policy.as_str() {
@@ -918,7 +1126,12 @@ fn three_way_resolve(
                 // resolution discards is gone for good — unlike every other sync outcome,
                 // which is recoverable from the archive.
                 blob::store(conn, &blob::hash_bytes(disk_bytes), disk_bytes, None)?;
-                finish_export(conn, meta, ctx, path, bare_uri, ser_name, kb_bytes)?;
+                if finish_export(
+                    conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal,
+                )? == Outcome::Refused
+                {
+                    return Ok(Outcome::Refused);
+                }
                 Ok(Outcome::ResolvedFromKb)
             }
             _ => {
@@ -936,6 +1149,9 @@ fn three_way_resolve(
                         base_blob_hash: base.as_deref(),
                         parse_error: None,
                         quarantine_blob_hash: None,
+                        // manual overwrites neither side, so neither side's structure is
+                        // adopted; the journal keeps what it had.
+                        document: journal.and_then(|j| j.document.as_deref()),
                     },
                 )?;
                 Ok(Outcome::Conflict)
@@ -970,6 +1186,9 @@ fn quarantine(
             base_blob_hash: base.as_deref(),
             parse_error: Some(&err.to_string()),
             quarantine_blob_hash: Some(&qhash),
+            // A quarantine keeps the last-good structure exactly as it keeps the last-good
+            // hashes: the file failed to parse, so nothing was learned about its shape.
+            document: journal.and_then(|j| j.document.as_deref()),
         },
     )?;
     Ok(Outcome::Quarantined)
@@ -984,6 +1203,7 @@ fn settle(
     ser_name: &str,
     base_bytes: &[u8],
     items: &[ItemId],
+    document: Option<&str>,
 ) -> Result<()> {
     let base_hash = blob::hash_bytes(base_bytes);
     blob::store(conn, &base_hash, base_bytes, None)?;
@@ -1001,6 +1221,7 @@ fn settle(
             base_blob_hash: Some(&base_hash),
             parse_error: None,
             quarantine_blob_hash: None,
+            document,
         },
     )?;
     Ok(())
@@ -1015,6 +1236,7 @@ fn mark_ok(
     ser_name: &str,
     hash: &str,
     bytes: &[u8],
+    document: Option<&str>,
 ) -> Result<()> {
     blob::store(conn, hash, bytes, None)?;
     sync_state::upsert(
@@ -1028,6 +1250,7 @@ fn mark_ok(
             base_blob_hash: Some(hash),
             parse_error: None,
             quarantine_blob_hash: None,
+            document,
         },
     )?;
     Ok(())
@@ -1058,6 +1281,10 @@ fn apply_doc(
     for s in &doc.sections {
         let full = format!("{file_ns_path}/{}", s.path);
         let id = ns::ensure(conn, &full)?;
+        // `sync_section` marks a namespace as this file's, so `retire_undeclared_sections` can
+        // find it later. `header_line` is kept **only** as a human label in the tree — since D45
+        // the authority for both the header text and the block order is the journal row, and
+        // nothing reads these back to decide what the document looks like.
         ns::set_metadata(
             conn,
             meta,
@@ -1066,7 +1293,6 @@ fn apply_doc(
         )?;
         section_ns.insert(s.path.clone(), id);
     }
-    set_layout(conn, meta, file_ns, doc)?;
     // A section the file no longer declares must stop being a section. Its namespace can
     // legitimately survive — it may still hold cancelled tasks, which are deliberate history
     // — but leaving `header_line` on it makes `assemble_kb_doc` re-emit a `##` header the
@@ -1119,8 +1345,48 @@ fn apply_doc(
     Ok(resolved.into_values().collect())
 }
 
-/// The metadata key holding a file's block order (and its prose, inline).
-const LAYOUT_KEY: &str = "layout";
+/// A file's document **structure** — block order and section headers — as the JSON stored on its
+/// journal row (design D45.2).
+///
+/// This is the whole of what used to live in `namespaces.metadata`, moved somewhere keyed
+/// one-per-file. Items are deliberately absent: they are KB-owned and come from bindings.
+fn document_json(doc: &SyncDoc) -> String {
+    json!({
+        "layout": layout_json(doc),
+        "sections": doc
+            .sections
+            .iter()
+            .map(|s| json!({ "path": s.path, "header_line": s.header_line }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// Read a stored structure back. A row with no document, or unreadable JSON, yields an empty
+/// structure — which the export guard (D45.5) turns into a refusal rather than a stripped file.
+fn read_document(stored: Option<&str>) -> (Vec<SyncBlock>, Vec<SyncSection>) {
+    let Some(value) = stored.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let layout = value.get("layout").map_or_else(Vec::new, read_layout_value);
+    let sections = value
+        .get("sections")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let text = |k: &str| s.get(k).and_then(serde_json::Value::as_str);
+                    Some(SyncSection {
+                        path: text("path")?.to_owned(),
+                        header_line: text("header_line")?.to_owned(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (layout, sections)
+}
+
 /// Serialize a document's layout for storage on the file's namespace.
 fn layout_json(doc: &SyncDoc) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = doc
@@ -1135,167 +1401,9 @@ fn layout_json(doc: &SyncDoc) -> serde_json::Value {
     serde_json::Value::Array(blocks)
 }
 
-/// Store the document's layout on the file's own namespace, **merging** into whatever
-/// metadata it already carries (that namespace may be a mount's, with its own keys).
-///
-/// No ownership stamp: since D39.1 a namespace has exactly one file, so the layout it carries
-/// is that file's and there is nobody to tell apart.
-fn set_layout(
-    conn: &Connection,
-    meta: &WriteMeta,
-    file_ns: NamespaceId,
-    doc: &SyncDoc,
-) -> Result<()> {
-    let mut metadata = ns::get_metadata(conn, file_ns)?
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    if let Some(map) = metadata.as_object_mut() {
-        map.insert(LAYOUT_KEY.to_owned(), layout_json(doc));
-    }
-    ns::set_metadata(conn, meta, file_ns, &metadata)?;
-    Ok(())
-}
-
-/// Move a file's document out of the shared **directory** namespace and into its own
-/// (design D39.3).
-///
-/// Returns whether anything moved. Idempotent: a file namespace already carrying a layout is
-/// the post-move state, so this runs at most once per file and is a cheap metadata read on
-/// every sync afterwards.
-///
-/// **The safety condition is positive evidence, not a proxy.** Adoption happens only when
-/// every `file://`-bound item placed directly in the directory namespace is bound to *this*
-/// file — which `bindings` answers authoritatively, because a binding names the file it came
-/// from. Seven earlier guards asked instead whether some *other* file looked absent (did it
-/// sync cleanly, is a sibling still bound, is there a journal row), and every one of them was
-/// satisfied by the recovery procedure the collision refusal itself recommended: deleting the
-/// sibling. A deleted sibling's items are still bound to its path, so they fail this test,
-/// which is the whole difference.
-///
-/// A directory holding two files' items is therefore left exactly as it is. That database is
-/// the collided state, nothing here can tell the two documents apart, and doing nothing is the
-/// only correct answer — the file still syncs, it just keeps using the shared namespace until
-/// the ambiguity is resolved by hand.
-fn adopt_legacy_namespace(
-    conn: &Connection,
-    meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
-) -> Result<bool> {
-    let file_ns_path = namespace_for(ctx, path);
-    // The pre-D39 namespace is this one's parent: the file's containing directory.
-    let Some((legacy_ns_path, _)) = file_ns_path.rsplit_once('/') else {
-        return Ok(false);
-    };
-    // Never walk out above the mount. A file directly in the mount directory has the mount's
-    // own namespace as its legacy namespace, which is legitimate and is the boundary.
-    if !legacy_ns_path.starts_with(&ctx.mount_ns) {
-        return Ok(false);
-    }
-
-    // Already adopted (or born after D39): the file namespace holds the document.
-    if let Some(id) = ns::get(conn, &file_ns_path)? {
-        if ns::get_metadata(conn, id)?.is_some_and(|md| !read_layout(&md).is_empty()) {
-            return Ok(false);
-        }
-    }
-    let Some(dir_ns) = ns::get(conn, legacy_ns_path)? else {
-        return Ok(false);
-    };
-    let Some(mut dir_metadata) = ns::get_metadata(conn, dir_ns)? else {
-        return Ok(false);
-    };
-    let layout = read_layout(&dir_metadata);
-    if layout.is_empty() {
-        return Ok(false);
-    }
-    if !legacy_items_are_all_ours(conn, dir_ns, bare_uri)? {
-        return Ok(false);
-    }
-
-    // Sections move first, while their paths are still relative to the legacy namespace.
-    // `ns::move_subtree` keeps namespace **ids** stable, so every placement and edge pointing
-    // into a section follows it for free; only items placed directly in the legacy namespace
-    // are re-placed below.
-    let file_ns = ns::ensure(conn, &file_ns_path)?;
-    for block in &layout {
-        let SyncBlock::Section(section) = block else {
-            continue;
-        };
-        let from = format!("{legacy_ns_path}/{section}");
-        let to = format!("{file_ns_path}/{section}");
-        if ns::get(conn, &from)?.is_some() && ns::get(conn, &to)?.is_none() {
-            ns::move_subtree(conn, meta, &from, &to)?;
-        }
-    }
-
-    // The document's own metadata moves whole, and is removed from the directory namespace so
-    // the two can never both claim to describe a file.
-    let mut file_md = ns::get_metadata(conn, file_ns)?
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    if let (Some(from), Some(to)) = (dir_metadata.as_object_mut(), file_md.as_object_mut()) {
-        for key in DOCUMENT_METADATA_KEYS {
-            if let Some(value) = from.remove(*key) {
-                to.insert((*key).to_owned(), value);
-            }
-        }
-    }
-    ns::set_metadata(conn, meta, file_ns, &file_md)?;
-    ns::set_metadata(conn, meta, dir_ns, &dir_metadata)?;
-
-    // Finally the items placed directly in the directory namespace.
-    for item_id in placement::items_directly_in(conn, dir_ns)? {
-        if binding_is_ours(conn, item_id, bare_uri)? {
-            placement::set_primary(conn, meta, item_id, file_ns, 0)?;
-        }
-    }
-    Ok(true)
-}
-
-/// The `namespaces.metadata` keys that describe a *document* rather than a namespace, and so
-/// move with the file in [`adopt_legacy_namespace`].
-const DOCUMENT_METADATA_KEYS: &[&str] = &["layout", "header_line", "position", "sync_section"];
-
-/// Whether every `file://`-bound item placed directly in `ns_id` came from `bare_uri`.
-///
-/// Items with no binding, or a `managed:` one, are ignored: they were never claimed by a file,
-/// so they say nothing about which file owns the namespace's document.
-fn legacy_items_are_all_ours(
-    conn: &Connection,
-    ns_id: NamespaceId,
-    bare_uri: &str,
-) -> Result<bool> {
-    for item_id in placement::items_directly_in(conn, ns_id)? {
-        let Some(b) = binding::get(conn, item_id)? else {
-            continue;
-        };
-        if b.uri.starts_with("file://") && !uri_belongs_to(&b.uri, bare_uri) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Whether `item`'s binding names `bare_uri`'s file.
-fn binding_is_ours(conn: &Connection, item: ItemId, bare_uri: &str) -> Result<bool> {
-    Ok(binding::get(conn, item)?.is_some_and(|b| uri_belongs_to(&b.uri, bare_uri)))
-}
-
-/// Whether a binding uri addresses `bare_uri`'s file — the file itself, or a `#fragment` of
-/// it. Compared against `<bare_uri>#` rather than by prefix, so `…/tasks.md` does not swallow
-/// `…/tasks.md.bak`.
-fn uri_belongs_to(uri: &str, bare_uri: &str) -> bool {
-    uri == bare_uri || uri.starts_with(&format!("{bare_uri}#"))
-}
-
-/// Read a stored layout back out of a namespace's metadata.
-fn read_layout(metadata: &serde_json::Value) -> Vec<SyncBlock> {
-    let Some(blocks) = metadata
-        .get(LAYOUT_KEY)
-        .and_then(serde_json::Value::as_array)
-    else {
+/// Decode a layout array (the shape [`layout_json`] produces).
+fn read_layout_value(value: &serde_json::Value) -> Vec<SyncBlock> {
+    let Some(blocks) = value.as_array() else {
         return Vec::new();
     };
     blocks
@@ -1341,11 +1449,16 @@ fn retire_undeclared_sections(
         let Some(map) = metadata.as_object_mut() else {
             continue;
         };
-        if map.remove("header_line").is_none() {
+        // Keyed on `sync_section`, NOT on `header_line`. Since D45 the header text is a label
+        // rather than the authority, and a `header_line` key alone would be gone from every
+        // namespace the moment the structure moved — so this function would `continue` on every
+        // iteration and retire nothing, forever, and invisibly, because nothing renders from
+        // namespaces any more for a render test to catch.
+        if map.remove("sync_section").is_none() {
             continue; // not a section to begin with
         }
         map.remove("position");
-        map.remove("sync_section");
+        map.remove("header_line");
         map.remove("prose");
         ns::set_metadata(conn, meta, ns_id, &metadata)?;
     }
@@ -1509,34 +1622,24 @@ fn reconcile_edges(
 /// Build a [`SyncDoc`] from the current KB state of a file: its section namespaces and
 /// the items bound under it. The inverse of [`apply_doc`], so `render(assemble_kb_doc)`
 /// reproduces the last-synced base when the KB is unchanged.
-fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) -> Result<SyncDoc> {
+fn assemble_kb_doc(
+    conn: &Connection,
+    ctx: &Ctx,
+    path: &Path,
+    bare_uri: &str,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<SyncDoc> {
     let file_ns_path = namespace_for(ctx, path);
     let mut doc = SyncDoc::default();
 
-    // The file namespace carries the document's layout — its block order and its prose.
-    // Sections are the descendant namespaces still carrying `header_line`: one the file
-    // stopped declaring was retired by `retire_undeclared_sections` and must not re-emit its
-    // header.
-    if let Some(file_ns) = ns::get(conn, &file_ns_path)? {
-        if let Some(md) = ns::get_metadata(conn, file_ns)? {
-            doc.layout = read_layout(&md);
-        }
-        for (ns_id, ns_path) in ns::subtree(conn, &file_ns_path)? {
-            if ns_path == file_ns_path {
-                continue;
-            }
-            let Some(md) = ns::get_metadata(conn, ns_id)? else {
-                continue;
-            };
-            let Some(header) = md.get("header_line").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            doc.sections.push(SyncSection {
-                path: relative(&file_ns_path, &ns_path),
-                header_line: header.to_owned(),
-            });
-        }
-    }
+    // **Structure comes from the file's own journal row** (design D45.2), not from the namespace
+    // tree. The tree is shared, globally addressable and user-mutable — `jkb ns mv`, the VS Code
+    // Rename button and `jkb ns rm` all reach it — while a file's structure is private to that
+    // file and has to round-trip exactly. Reading it from a row keyed `uri PRIMARY KEY` is what
+    // makes "two files share one layout" unrepresentable rather than merely guarded against.
+    let (layout, sections) = read_document(journal.and_then(|j| j.document.as_deref()));
+    doc.layout = layout;
+    doc.sections = sections;
 
     // Items: everything bound to this file. Resolve every binding in one query, then
     // build both directions of the id map (uris stay ordered for a stable round-trip).
@@ -1588,16 +1691,6 @@ fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) ->
         }
     }
 
-    // A KB written before the layout model has none stored. Rebuild it from the legacy
-    // positional data (section `metadata.position`, item `placements.position`, and any
-    // `metadata.prose` from the intermediate model) so the assembled document still matches
-    // the file. Without this the render comes out empty-ordered, the KB looks changed, and
-    // sync exports that garbage over every file it manages — which is exactly what happened.
-    // The next import replaces it with a real layout.
-    if doc.layout.is_empty() {
-        doc.layout = legacy_layout(conn, ctx, path, &doc)?;
-    }
-
     // An item's SECTION comes from the layout — the section header it sits under in the file
     // — not from the namespace it happens to be placed in. The layout is authoritative for
     // document structure, so the two must not be allowed to disagree: when they did, a
@@ -1606,75 +1699,6 @@ fn assemble_kb_doc(conn: &Connection, ctx: &Ctx, path: &Path, bare_uri: &str) ->
     // does not move it between sections in its file; editing the file does.
     apply_layout_sections(&mut doc);
     Ok(doc)
-}
-
-/// Reconstruct a layout for a KB that predates the layout model, from the ordinals it does
-/// have: each section's `namespaces.metadata.position`, each item's `placements.position`,
-/// and any prose stored under the intermediate `metadata.prose` key. Interleaving them by
-/// ordinal is precisely the old (fragile) ordering — which is correct *here*, because the
-/// goal is to reproduce what that KB last rendered, not to improve on it.
-fn legacy_layout(
-    conn: &Connection,
-    ctx: &Ctx,
-    path: &Path,
-    doc: &SyncDoc,
-) -> Result<Vec<SyncBlock>> {
-    let file_ns_path = namespace_for(ctx, path);
-    let mut blocks: Vec<(i64, SyncBlock)> = Vec::new();
-
-    if let Some(file_ns) = ns::get(conn, &file_ns_path)? {
-        collect_legacy_prose(conn, file_ns, &mut blocks)?;
-        for (ns_id, ns_path) in ns::subtree(conn, &file_ns_path)? {
-            if ns_path == file_ns_path {
-                continue;
-            }
-            let Some(md) = ns::get_metadata(conn, ns_id)? else {
-                continue;
-            };
-            if md.get("header_line").is_none() {
-                continue;
-            }
-            let position = md
-                .get("position")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            blocks.push((
-                position,
-                SyncBlock::Section(relative(&file_ns_path, &ns_path)),
-            ));
-            collect_legacy_prose(conn, ns_id, &mut blocks)?;
-        }
-    }
-    for item in &doc.items {
-        blocks.push((item.position, SyncBlock::Item(item.local_id.clone())));
-    }
-    blocks.sort_by_key(|(p, _)| *p);
-    Ok(blocks.into_iter().map(|(_, b)| b).collect())
-}
-
-/// Pull any intermediate-model `metadata.prose` entries off a namespace into `blocks`.
-fn collect_legacy_prose(
-    conn: &Connection,
-    ns_id: NamespaceId,
-    blocks: &mut Vec<(i64, SyncBlock)>,
-) -> Result<()> {
-    let Some(md) = ns::get_metadata(conn, ns_id)? else {
-        return Ok(());
-    };
-    let Some(entries) = md.get("prose").and_then(serde_json::Value::as_array) else {
-        return Ok(());
-    };
-    for entry in entries {
-        let Some(content) = entry.get("content").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let position = entry
-            .get("position")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-        blocks.push((position, SyncBlock::Prose(content.to_owned())));
-    }
-    Ok(())
 }
 
 /// Set each item's `section` from its position in the layout (the nearest preceding section

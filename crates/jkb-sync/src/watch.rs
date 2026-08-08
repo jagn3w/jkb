@@ -48,7 +48,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
     // Reconcile drift accumulated while not watching.
-    engine::sync(db, mount_ns)?;
+    report_notable(mount_ns, &engine::sync(db, mount_ns)?);
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(debounce) {
@@ -61,10 +61,10 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 }
                 if rescan {
                     // Fell behind (watcher error / dropped events): re-scan everything.
-                    engine::sync(db, mount_ns)?;
+                    report_notable(mount_ns, &engine::sync(db, mount_ns)?);
                 } else if !paths.is_empty() {
                     let paths: Vec<PathBuf> = paths.into_iter().collect();
-                    engine::sync_paths(db, mount_ns, &paths)?;
+                    report_notable(mount_ns, &engine::sync_paths(db, mount_ns, &paths)?);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {} // idle tick — re-check the stop flag
@@ -72,6 +72,31 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
         }
     }
     Ok(())
+}
+
+/// Say anything a person would want to know about a reconcile, on stderr.
+///
+/// The watcher is how `jkb` runs in practice — `jkb service install` puts it under
+/// launchd/systemd — and it had **no** output at all: not one `print` or `eprint` in the file.
+/// The sharpest case is `resolved()`. A `disk_wins`/`kb_wins` resolution throws one side's edits
+/// away and then settles the journal `ok`, so it is invisible to `jkb doctor` too: without this,
+/// a destructive resolution left no trace on any surface in the system.
+fn report_notable(mount_ns: &str, report: &engine::SyncReport) {
+    for (path, how) in report.resolved() {
+        eprintln!("sync {mount_ns}: RESOLVED {} — {how}", path.display());
+    }
+    for (path, reason) in report.refused() {
+        eprintln!("sync {mount_ns}: REFUSED {}: {reason}", path.display());
+    }
+    for path in report.conflicts() {
+        eprintln!("sync {mount_ns}: conflict {}", path.display());
+    }
+    for path in report.quarantined() {
+        eprintln!(
+            "sync {mount_ns}: needs attention (parse failed) {}",
+            path.display()
+        );
+    }
 }
 
 /// Watch **every** configured mount concurrently (one thread each), reconciling each

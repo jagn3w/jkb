@@ -887,6 +887,49 @@ every synced file. `jkb blob ls --contains "<a line you remember>"` finds the ve
 blob cat <hash>` writes it out. That is how all 62 files were recovered here; the originals
 were the import cohort, distinguishable from the damaged exports by still having headers.
 
+## A file's document lives on its journal row, not in the namespace tree (D45)
+
+The root fix for a class of data loss that produced a must-fix in eight of nine review passes.
+Design in `openspec/changes/jkb-staging-pr/`.
+
+- **One sentence covers every incident**: *an unverified KB render reached `write_file`.* The
+  openspec collapse, prose orphaning, layout ownership (seven guards), `retire_undeclared_sections`
+  retiring a neighbour's sections, `jkb ns mv` destroying a document — six **causes**, one
+  mechanism. D39 removed a cause; D41 tried to check the output. Neither touched *why* the render
+  can be wrong.
+- **The cause is storage.** A file's structure — its `##` headers, their order, its prose — sat in
+  `namespaces.metadata`: a shared, globally addressable, **user-mutable** hierarchy. A file's
+  structure is private to that file and must round-trip exactly. `jkb ns mv` and the VS Code
+  Rename button reach it; `namespace_for` then recomputes the path from the *file*, the layout is
+  unreachable, and the export arm writes a structureless render over your file.
+- **It moves to `sync_state.document`** (migration `V012`), keyed `uri TEXT PRIMARY KEY` — at most
+  one row per file, so two files sharing one structure is **unrepresentable**. `reconcile` already
+  loads that row first, so reading structure from it is free, and `decide_direction`'s byte fast
+  path and `Outcome::Normalized` both survive (deriving it from the base blob instead would have
+  cost a load + parse per file per sync and given up both).
+- **The property this buys:** `apply_doc` is the only writer of a file's structure, and the
+  `(false, true)` export arm does not call it — so **an export can change item lines but not
+  structure.** Two paths escape that (`missing_file`, and `kb_wins`, which incorporates disk
+  changes by design), which is what the guard below is for.
+- **Being a migration is load-bearing.** Refinery verifies every applied migration before running
+  any, so a binary older than this one fails at `Db::open` rather than silently reading namespace
+  metadata nothing refreshes any more and exporting from it. That ruled out a dual-write.
+- **One guard survives**, and it is a *different* harm: `assemble_kb_doc` skips a bound item with
+  no primary placement, so `jkb undo` after a re-home (`placement::set_primary`'s delete has no
+  inverse) silently deletes its line. `finish_export` now refuses — `Outcome::Refused`, journalled
+  `needs_attention`, nothing written — and recovery is any edit to the file, which imports
+  normally.
+- **Section namespaces are now derived**, kept for browsing and `ns:` scoping, authoritative for
+  nothing. `retire_undeclared_sections` is **re-keyed on `sync_section`**: it was gated on
+  `header_line`, which no longer decides anything, so leaving it would have made it a silent
+  permanent no-op — invisible, because nothing renders from namespaces for a render test to catch.
+- **Deleted, not guarded:** `adopt_legacy_namespace` and its vacuous ownership gate (the source of
+  both pass-9 sync must-fixes), `set_layout`, `read_layout`, `legacy_layout`, `collect_legacy_prose`.
+- **Still open, filed not fixed:** the import direction is unvalidated (`parse_text` is lenient, so
+  a truncated file imports cleanly and cancels every task below the cut) — now the largest
+  remaining data-loss path; `ns mv`/`ns rm` are unguarded on synced namespaces; a first-sight
+  export can overwrite an unimported file; `finish_export` does not blob the losing bytes.
+
 ## A synced file owns its own namespace (D39) — the collapse, fixed at the root
 
 The `Collided` refusal above was a guard around a modelling error, and the error is now fixed:

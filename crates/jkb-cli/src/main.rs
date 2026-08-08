@@ -3731,13 +3731,13 @@ fn cmd_sync(
 /// Reconcile one mount and print its summary.
 fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<()> {
     use jkb_sync::Outcome::{
-        Adopted, Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined,
+        Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Refused,
         ResolvedFromDisk, ResolvedFromKb, Skipped, UpToDate,
     };
     let report = jkb_sync::sync_with_policy(db, ns_path, conflict)?;
     println!(
         "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
-         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} adopted",
+         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} refused",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
@@ -3748,7 +3748,7 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
         report.count(Quarantined),
         report.count(UpToDate),
         report.count(Skipped),
-        report.count(Adopted),
+        report.count(Refused),
     );
     for path in report.conflicts() {
         println!("  conflict: {}", path.display());
@@ -3761,10 +3761,9 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
     }
-    // A one-time move out of the shared directory namespace (D39.3). Named per file because
-    // it re-homes that file's items, so `ns:` queries answer differently afterwards.
-    for path in report.adopted() {
-        println!("  adopted into its own namespace: {}", path.display());
+    // A refusal wrote nothing, so it must be visible or the file silently stops syncing.
+    for (path, reason) in report.refused() {
+        println!("  REFUSED {}: {reason}", path.display());
     }
     Ok(())
 }
@@ -4965,22 +4964,16 @@ fn settle_landing(
     // returned as an error: the session HAS been disposed of by this point, so bailing left
     // the claim held on a worktree that no longer exists — freed only by `doctor --fix` — and
     // said nothing about what had just been removed.
-    let session_dir = sess.worktree.clone();
     let kept_status = db.write_txn("cli", move |conn, meta| {
-        // ONLY the claim naming the session this command just destroyed. Read here, inside the
-        // transaction, for the same reason the status below is: `land` ran a gate that can take
-        // minutes, and an unconditional clear freed a claim taken during it by a worker this
-        // command never looked at — the pattern `clear_if` exists for.
-        if let Some(owner) = claim::claimed(conn)?
-            .into_iter()
-            .find(|c| c.id == id)
-            .map(|c| c.owner)
-        {
-            if owner::session_worktree(&owner).is_some_and(|w| session::same_path(&w, &session_dir))
-            {
-                claim::clear_if(conn, meta, id, &owner)?;
-            }
-        }
+        // No claim CAS here. `task::set_status` clears the claim unconditionally on a terminal
+        // status (task.rs:446) and `claim::clear` has no owner predicate, so an owner-scoped
+        // clear a few lines above it decided nothing on the path that matters — and a guard that
+        // does nothing is worse than none, because it reads as protection.
+        //
+        // Two things this deliberately leaves OPEN rather than pretending to solve: on the
+        // early-return below (the task is already terminal) `set_status` never runs, so nothing
+        // clears the claim there; and `land_preflight` never checks who holds the claim, so
+        // `jkb task land` can still free a live non-session claim through that same transition.
         let current = item::get(conn, id)?.and_then(|m| m.status);
         if jkb_types::TaskStatus::is_terminal_str(current.as_deref()) {
             return Ok(current);
@@ -5173,6 +5166,17 @@ fn cmd_task_abandon(
         // belongs to a worker whose claim this command never looked at. An unconditional clear
         // freed a task the next SCHEDULER pass had just handed to an implementer, and then
         // reopened it, which is how two builders end up on one task.
+        // Also covers the case the guard above missed: no claim was observed before the git
+        // subprocesses, but one exists now. `set_status(Open)` is non-terminal so `task.rs:446`
+        // does not fire and the new owner's claim survives either way — the harm is a cleared
+        // `onto=` and a `"reopened": true` that is not true, rather than two builders on one
+        // task, since `ready` requires `claimant_id IS NULL`.
+        if observed.is_none() && claim::claimed(conn)?.iter().any(|c| c.id == id) {
+            let current = item::get(conn, id)?
+                .and_then(|m| m.status)
+                .unwrap_or_default();
+            return Ok((false, current));
+        }
         if let Some(prev) = &observed {
             if !claim::clear_if(conn, meta, id, prev)? {
                 // The claim changed hands while the worktrees were being removed. Whoever
@@ -5357,9 +5361,41 @@ fn close_if_still_open(db: &Db, id: ItemId) -> Result<bool> {
     })?)
 }
 
+/// The merge state of a task, given **every** branch it records: anything short of `Merged`
+/// wins, so one unmerged branch holds the task whatever order they come back in.
+///
+/// Taking one branch — the lexicographically smallest, as `tag::applications` orders them — meant
+/// a task with `a-merged` and `z-live` closed while `z-live` was still in flight.
+fn merged_state_of_all(
+    cwd: &Path,
+    branches: &[String],
+    trunk_ref: &str,
+    base: Option<&str>,
+    warned_fallback: &mut bool,
+) -> Result<gitrepo::MergeState> {
+    let mut state = gitrepo::MergeState::Merged;
+    for b in branches {
+        // The remote copy answers "did this work ship?" — after a merged PR the local branch is
+        // usually stale or already deleted (design D34.2).
+        let (s, fell_back) = gitrepo::is_merged(cwd, b, trunk_ref, base, gitrepo::Prefer::Remote)?;
+        if fell_back && !*warned_fallback {
+            *warned_fallback = true;
+            eprintln!(
+                "warning: this git lacks `merge-tree --write-tree` (needs 2.38+), so \
+                 squash-merged branches will read as unmerged"
+            );
+        }
+        if !matches!(s, gitrepo::MergeState::Merged) {
+            return Ok(s);
+        }
+        state = s;
+    }
+    Ok(state)
+}
+
 /// `task close-merged` — close tasks whose branch has landed (design D34.4).
 /// The uid, status and location facets `close-merged` needs for one task.
-type CloseMergedRow = (String, Option<String>, Option<String>, Option<String>);
+type CloseMergedRow = (String, Option<String>, Vec<String>, Option<String>);
 
 /// Read one task's uid, status, `branch=` and `base=` in a single database round-trip.
 fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
@@ -5372,14 +5408,17 @@ fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
                     .find(|(f, _)| f == facet)
                     .map(|(_, v)| v.clone())
             };
-            Ok(meta.map(|m| {
-                (
-                    m.uid,
-                    m.status,
-                    of(repo::FACET_BRANCH),
-                    of(repo::FACET_BASE),
-                )
-            }))
+            // EVERY `branch=` value, not one of them. The previous reader took
+            // `tags.iter().find(...)`, and `tag::applications` is `ORDER BY facet, value`, so it
+            // silently picked the lexicographically smallest branch: with `a-merged` and
+            // `z-live` recorded, the task closed while `z-live` was still in flight. This is the
+            // same shortcut pass 8 fixed in `review::work_is_in`, one file away.
+            let branches: Vec<String> = tags
+                .iter()
+                .filter(|(f, _)| f == repo::FACET_BRANCH)
+                .map(|(_, v)| v.clone())
+                .collect();
+            Ok(meta.map(|m| (m.uid, m.status, branches, of(repo::FACET_BASE))))
         })?
         .unwrap_or_default())
 }
@@ -5422,28 +5461,19 @@ fn cmd_task_close_merged(
     let mut warned_fallback = false;
 
     for id in ids {
-        let (uid, status, branch, base) = close_merged_row(db, id)?;
-        let Some(branch) = branch else { continue };
-        if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
+        let (uid, status, branches, base) = close_merged_row(db, id)?;
+        if branches.is_empty() || jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
             continue;
         }
+        let branch = branches.join(", ");
 
-        // The remote copy answers "did this work ship?" — after a merged PR the local branch
-        // is usually stale or already deleted (design D34.2).
-        let (state, fell_back) = gitrepo::is_merged(
+        let state = merged_state_of_all(
             &cwd,
-            &branch,
+            &branches,
             &trunk_ref,
             base.as_deref(),
-            gitrepo::Prefer::Remote,
+            &mut warned_fallback,
         )?;
-        if fell_back && !warned_fallback {
-            warned_fallback = true;
-            eprintln!(
-                "warning: this git lacks `merge-tree --write-tree` (needs 2.38+), so \
-                 squash-merged branches will read as unmerged"
-            );
-        }
         match state {
             gitrepo::MergeState::Merged => {
                 // A merged branch is evidence, not proof: a task with unfinished subtasks
@@ -5462,8 +5492,17 @@ fn cmd_task_close_merged(
             gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
                 pending.push((uid, branch));
             }
-            // A missing branch is ambiguous — merged-and-deleted, or a typo. Never closed.
-            gitrepo::MergeState::BranchMissing => blocked.push((uid, format!("{branch} (gone)"))),
+            // A missing branch is ambiguous — merged-and-deleted, or a typo — so it HOLDS.
+            //
+            // Decided explicitly, because the two readers of this state disagree on purpose:
+            // `review::work_is_in` counts `BranchMissing` as *covered*, this counts it as
+            // *blocked*. Auto-closing on ambiguity is the one thing this verb must not do; the
+            // cost is that a stale recorded branch holds the task, so the message names the way
+            // out rather than leaving the user to find it.
+            gitrepo::MergeState::BranchMissing => blocked.push((
+                uid,
+                format!("{branch} (gone — `jkb task tag rm <uid> branch=<name>` if it is stale)"),
+            )),
             gitrepo::MergeState::NoTrunk => {
                 anyhow::bail!("trunk `{trunk_ref}` does not resolve in this repo")
             }
@@ -5492,7 +5531,7 @@ fn cmd_task_close_merged(
         println!("{verb} {uid} ({branch} merged)");
     }
     for (uid, branch) in &blocked {
-        println!("held  {uid} ({branch}) — subtasks still open, or branch gone");
+        println!("held  {uid} ({branch})");
     }
     if closed.is_empty() && blocked.is_empty() {
         println!(
