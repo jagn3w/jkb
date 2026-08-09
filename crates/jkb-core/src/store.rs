@@ -203,7 +203,18 @@ impl Db {
     {
         let actor = actor.into();
         self.submit(move |conn| -> std::result::Result<T, E> {
-            let tx = conn.transaction().map_err(Error::from)?;
+            // IMMEDIATE, not the default deferred. A deferred transaction whose first
+            // statement is a read takes a WAL read snapshot and only upgrades on its first
+            // write — and if another process committed in between, SQLite returns
+            // `SQLITE_BUSY_SNAPSHOT`, for which it does **not** invoke the busy handler, so
+            // `busy_timeout` never applies. Every machine `scripts/setup.sh` sets up runs a
+            // `jkb sync --watch` service alongside interactive commands, so that race is
+            // ordinary here — and since the sync engine now journals a failed reconcile as
+            // `needs_attention`, losing it recorded transient contention as a durable per-file
+            // defect. Taking the write lock up front makes contention wait instead.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(Error::from)?;
             let txn_id: i64 = tx
                 .query_row(
                     "SELECT COALESCE(MAX(txn_id), 0) + 1 FROM changelog",

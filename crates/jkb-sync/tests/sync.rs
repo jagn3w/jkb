@@ -1693,14 +1693,29 @@ fn editing_a_refused_file_does_not_delete_the_protected_line() {
         0,
         "deleting the line must clear the refusal — the printed remedy has to take effect"
     );
-    let healed = fs::read_to_string(&tasks).unwrap();
-    assert!(
-        healed.contains("newly added"),
-        "the edit made while refused must finally import: {healed}"
+    // Asserted against the KB, not against the bytes this test just wrote — re-reading the file
+    // would pass identically if the engine had done nothing at all.
+    let (added, detached): (i64, i64) = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT
+                   (SELECT count(*) FROM items i JOIN bindings b ON b.item_id = i.id
+                     WHERE i.content LIKE '%newly added%' AND b.uri LIKE 'file://%'),
+                   (SELECT count(*) FROM items i JOIN bindings b ON b.item_id = i.id
+                     WHERE i.content LIKE '%keep me%' AND b.uri = 'managed:')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        added, 1,
+        "the edit made while refused must finally IMPORT — bound as a real item, not just \
+         present in bytes the test wrote"
     );
-    assert!(
-        !healed.contains("keep me"),
-        "the deliberately removed item stays removed: {healed}"
+    assert_eq!(
+        detached, 1,
+        "the item the user deleted must be detached to `managed:` by apply_doc"
     );
 }
 

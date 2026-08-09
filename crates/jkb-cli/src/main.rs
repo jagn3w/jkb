@@ -3703,8 +3703,9 @@ fn cmd_sync(
         return Ok(());
     }
 
+    let mut failed = 0usize;
     if let Some(ns) = ns_path {
-        report_sync(db, ns, conflict)?;
+        failed += report_sync(db, ns, conflict)?;
     } else {
         // `--conflict` is a per-run override for unwedging ONE stuck file. Applied across
         // every mount it silently resolves every conflict in the KB the same way, and
@@ -3722,14 +3723,19 @@ fn cmd_sync(
             println!("no mounts configured");
         }
         for ns in paths {
-            report_sync(db, &ns, conflict)?;
+            failed += report_sync(db, &ns, conflict)?;
         }
     }
+    // Every mount has been reconciled by now; only the exit code is left to decide.
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} file(s) failed to reconcile; see the FAILED lines above"
+    );
     Ok(())
 }
 
 /// Reconcile one mount and print its summary.
-fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<()> {
+fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<usize> {
     use jkb_sync::Outcome::{
         Conflict, Created, Exported, Failed, Imported, Merged, Normalized, Quarantined, Refused,
         ResolvedFromDisk, ResolvedFromKb, Skipped, UpToDate,
@@ -3771,16 +3777,13 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for (path, err) in &failures {
         println!("  FAILED {}: {err}", path.display());
     }
-    // A file that could not be reconciled must not leave a zero exit. `/review-log` runs
-    // `jkb mount create … && jkb sync "$ns"` under a shell that stops on error, and before this
-    // a total failure to import let the run proceed to record a review over zero findings —
-    // which reads as a clean review and opens the land gate.
-    anyhow::ensure!(
-        failures.is_empty(),
-        "{} file(s) failed to reconcile; see the FAILED lines above",
-        failures.len()
-    );
-    Ok(())
+    // COUNTED, not raised. A failed file must not leave a zero exit — `/review-log` chains
+    // `jkb mount create … && jkb sync "$ns"`, and a silent zero let a run record a review over
+    // zero imported findings — but raising here aborted the all-mounts loop, so one bad file in
+    // the first mount silently skipped every mount after it. That is exactly what `reconcile_all`
+    // forbids one level down ("a per-file failure is a RESULT, not a run-ending error"),
+    // reinstated at mount granularity. The caller reconciles everything, then decides.
+    Ok(failures.len())
 }
 
 /// The `--backlog`/`--sync`/`--managed` flags of `task add`, grouped so the helper

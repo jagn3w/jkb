@@ -142,8 +142,9 @@ impl SyncReport {
 
     /// Files an export refused, because it would have deleted lines for still-bound items
     /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
-    /// Files whose reconcile **errored**, with the error text. Distinct from [`SyncReport::refused`]:
-    /// a refusal is a deliberate decision not to write; a failure is something going wrong.
+    /// Files whose reconcile **errored**, with the error text. Distinct from
+    /// [`SyncReport::refused`]: a refusal is a deliberate decision not to write; a failure is
+    /// something going wrong.
     #[must_use]
     pub fn failed(&self) -> Vec<(&Path, &str)> {
         self.results
@@ -356,25 +357,7 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
                 let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
                     let uri = file_uri(&p2);
                     let prev = sync_state::get(conn, &uri)?;
-                    sync_state::upsert(
-                        conn,
-                        meta,
-                        &sync_state::SyncStateWrite {
-                            uri: &uri,
-                            serializer: &ser,
-                            status: "needs_attention",
-                            last_synced_hash: prev
-                                .as_ref()
-                                .and_then(|j| j.last_synced_hash.as_deref()),
-                            base_blob_hash: prev.as_ref().and_then(|j| j.base_blob_hash.as_deref()),
-                            parse_error: Some(&msg),
-                            quarantine_blob_hash: prev
-                                .as_ref()
-                                .and_then(|j| j.quarantine_blob_hash.as_deref()),
-                            document: prev.as_ref().and_then(|j| j.document.as_deref()),
-                        },
-                    )?;
-                    Ok(())
+                    flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
                 });
                 (Outcome::Failed, Some(e.to_string()))
             }
@@ -992,6 +975,16 @@ fn finish_export(
         return Ok(Outcome::Refused);
     }
 
+    // Blob whatever is about to be overwritten. `three_way_resolve`'s `kb_wins` arm already did
+    // this; `finish_export` did not — so a first-sight export over an existing, never-imported
+    // file (an export-only mount, where the structure guard deliberately does not fire) replaced
+    // hand-written content that no blob held, and `jkb blob ls --contains` could not recover it.
+    // Cheap, content-addressed, and never collected: the archive is the whole recovery story.
+    if let Ok(previous) = std::fs::read(path) {
+        if !previous.is_empty() && previous != kb_bytes {
+            blob::store(conn, &blob::hash_bytes(&previous), &previous, None)?;
+        }
+    }
     write_file(path, kb_bytes)?;
     let resolved = current_bindings(conn, bare_uri)?;
     // An export CARRIES the structure forward rather than authoring it: `apply_doc` is the only
@@ -1028,15 +1021,23 @@ fn export_blocker(
     bare_uri: &str,
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
-    expected: Option<&SyncDoc>,
+    disk_doc: Option<&SyncDoc>,
 ) -> Result<Option<String>> {
-    let dropped = dropped_items(conn, bare_uri, serializer, journal, expected)?;
+    let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
     if !dropped.is_empty() {
+        // The remedy depends on whether there is a file to edit. Naming the on-disk fix for a
+        // file that is gone is advice nobody can follow.
+        let remedy = if path.exists() {
+            "Restore their primary placements (`jkb task place <uid> <ns> --home`), or delete \
+             their lines from the file if the items are meant to go."
+        } else {
+            "This file is gone from disk, so restore their primary placements \
+             (`jkb task place <uid> <ns> --home`) — there is no line to delete."
+        };
         return Ok(Some(format!(
             "{} item(s) bound to this file are missing from the assembled document ({}). \
              Exporting would delete their lines, so nothing was written. Their placements are \
-             gone — `jkb undo` after a re-home does this. Restore them, or delete the lines from \
-             the file if the items are meant to go.",
+             gone — `jkb undo` after a re-home does this. {remedy}",
             dropped.len(),
             dropped.join(", ")
         )));
@@ -1074,7 +1075,7 @@ fn dropped_items(
     bare_uri: &str,
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
-    expected: Option<&SyncDoc>,
+    disk_doc: Option<&SyncDoc>,
 ) -> Result<Vec<String>> {
     // What the file is EXPECTED to contain: the disk document when we have one, and only the
     // base when the file is gone.
@@ -1085,7 +1086,7 @@ fn dropped_items(
     // was never imported. An item absent from disk is one the user removed; `apply_doc` detaches
     // it, which is correct and is not a drop.
     let owned;
-    let expected = match expected {
+    let expected = match disk_doc {
         Some(doc) => doc,
         None => match load_base_doc(conn, journal, serializer)? {
             Some(doc) => {
@@ -1173,6 +1174,23 @@ fn populate_document(
 
 /// Journal a refusal: nothing was written, and `jkb doctor` must be able to say why.
 fn flag_refused(
+    conn: &Connection,
+    meta: &WriteMeta,
+    bare_uri: &str,
+    ser_name: &str,
+    reason: &str,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<()> {
+    flag_needs_attention(conn, meta, bare_uri, ser_name, reason, journal)
+}
+
+/// Mark a file `needs_attention` with `reason`, carrying every other journal field forward.
+///
+/// The ONE spelling of this write. It restates the full [`sync_state::SyncStateWrite`] field
+/// list, and that list has already been got wrong once — an earlier version of the undo snapshot
+/// dropped `parse_error` and `quarantine_blob_hash` — so a second hand-written copy is a second
+/// chance to drop a field.
+fn flag_needs_attention(
     conn: &Connection,
     meta: &WriteMeta,
     bare_uri: &str,

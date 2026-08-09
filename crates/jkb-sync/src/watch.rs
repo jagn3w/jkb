@@ -34,7 +34,9 @@ use crate::{engine, Error, Result};
 /// at which `stop` is checked while idle.
 ///
 /// # Errors
-/// Returns an error if the watcher cannot be created/armed, or a reconcile fails.
+/// Returns an error if the watcher cannot be created/armed. A **reconcile failure is reported,
+/// not returned** (see `run_pass`) — the loop has to outlive one bad pass, or a mount stops
+/// syncing for the life of the service.
 pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>) -> Result<()> {
     let dir = engine::backing_dir(db, mount_ns)?;
 
@@ -48,23 +50,24 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
     // Reconcile drift accumulated while not watching.
-    run_pass(mount_ns, || engine::sync(db, mount_ns));
+    let mut force_rescan = run_pass(mount_ns, || engine::sync(db, mount_ns));
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(debounce) {
             Ok(first) => {
                 let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-                let mut rescan = collect(first, &mut paths);
+                let mut rescan = force_rescan | collect(first, &mut paths);
+                force_rescan = false;
                 // Coalesce: keep draining until the filesystem is quiet for `debounce`.
                 while let Ok(next) = rx.recv_timeout(debounce) {
                     rescan |= collect(next, &mut paths);
                 }
                 if rescan {
                     // Fell behind (watcher error / dropped events): re-scan everything.
-                    run_pass(mount_ns, || engine::sync(db, mount_ns));
+                    force_rescan = run_pass(mount_ns, || engine::sync(db, mount_ns));
                 } else if !paths.is_empty() {
                     let paths: Vec<PathBuf> = paths.into_iter().collect();
-                    run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
+                    force_rescan = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {} // idle tick — re-check the stop flag
@@ -82,13 +85,24 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
 /// `Err` here used to exit this mount's thread for good — `watch_all` does not set `stop`, so the
 /// process stayed alive joining the others, launchd never restarted it, and that mount silently
 /// stopped syncing.
-fn run_pass<F>(mount_ns: &str, pass: F)
+fn run_pass<F>(mount_ns: &str, pass: F) -> bool
 where
     F: FnOnce() -> crate::Result<engine::SyncReport>,
 {
     match pass() {
-        Ok(report) => report_notable(mount_ns, &report),
-        Err(e) => eprintln!("sync {mount_ns}: pass failed: {e}"),
+        Ok(report) => {
+            report_notable(mount_ns, &report);
+            false
+        }
+        Err(e) => {
+            // A pass can fail AFTER per-file transactions have committed — the trailing
+            // `ensure_all_mirrors` is its own transaction — so the batch's remaining paths and
+            // the mirror derivation are lost while the files read as settled. Returning `true`
+            // makes the next tick a full re-scan, so the work is picked up rather than waiting
+            // for someone to touch those files again.
+            eprintln!("sync {mount_ns}: pass failed ({e}); re-scanning on the next event");
+            true
+        }
     }
 }
 
@@ -126,8 +140,8 @@ fn report_notable(mount_ns: &str, report: &engine::SyncReport) {
 /// if several fail, the first error is returned.
 ///
 /// # Errors
-/// Returns the first watcher/reconcile error, or a validation error if a watch thread
-/// panics.
+/// Returns the first watcher **startup** error, or a validation error if a watch thread panics.
+/// Reconcile failures never reach here; each thread reports its own as it goes.
 pub fn watch_all(db: &Db, debounce: Duration, stop: &Arc<AtomicBool>) -> Result<()> {
     let paths = db.read(mount::all_paths)?;
     if paths.is_empty() {
@@ -139,7 +153,16 @@ pub fn watch_all(db: &Db, debounce: Duration, stop: &Arc<AtomicBool>) -> Result<
         let db = db.clone();
         let stop = Arc::clone(stop);
         handles.push(std::thread::spawn(move || {
-            watch(&db, &path, debounce, &stop)
+            let outcome = watch(&db, &path, debounce, &stop);
+            if let Err(e) = &outcome {
+                // Reported HERE, not at join time. A startup failure — a mount whose backing
+                // directory has been moved or deleted — happens before the first pass, and
+                // `watch_all` blocks joining the other threads until `stop`, which under
+                // launchd is never. So without this the mount is simply never watched, prints
+                // nothing, journals nothing, and `jkb doctor` says `sync journal: ok`.
+                eprintln!("sync {path}: watcher stopped: {e}");
+            }
+            outcome
         }));
     }
 
