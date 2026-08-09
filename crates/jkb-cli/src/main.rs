@@ -3730,6 +3730,8 @@ fn cmd_sync(
             match report_sync(db, &ns, conflict) {
                 Ok(n) => failed += n,
                 Err(e) => {
+                    // A whole mount, counted as one — the closing line says "file(s) or
+                    // mount(s)" rather than pretending to know how many files were behind it.
                     println!("sync {ns}: FAILED: {e:#}");
                     failed += 1;
                 }
@@ -3739,7 +3741,7 @@ fn cmd_sync(
     // Every mount has been reconciled by now; only the exit code is left to decide.
     anyhow::ensure!(
         failed == 0,
-        "{failed} file(s) failed to reconcile or could not be parsed; see the lines above"
+        "{failed} file(s) or mount(s) need attention; see the lines above"
     );
     Ok(())
 }
@@ -3787,12 +3789,26 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for (path, err) in &failures {
         println!("  FAILED {}: {err}", path.display());
     }
-    // Quarantines count toward the exit code too. `/review-log` chains
-    // `jkb mount create … && jkb sync "$ns"`, and the `tasks` serializer *quarantines* a parse
-    // failure rather than erroring — so counting only `Failed` let a findings file that would
-    // not parse exit 0, after which the run recorded a review over zero imported findings and
-    // opened the land gate. On a first sync there are not even last-good items to fall back on.
-    let unhealthy = failures.len() + report.quarantined().len();
+    // "Unhealthy" is asked of the ONE authority that already answers it: the journal. Listing
+    // outcomes by hand meant two definitions that disagreed — the exit code counted `Failed` and
+    // `Quarantined` while `jkb doctor` reads `sync_state.status`, so a file left completely
+    // unsynced by a `Conflict` or `Refused` exited 0 and was simultaneously reported as needing
+    // attention. `/review-log` chains `jkb mount create … && jkb sync "$ns"`, so a zero there
+    // let a run record a review over nothing.
+    //
+    // Counted from this mount's own files, so one mount's stuck file does not make another
+    // mount's summary look bad.
+    let paths: std::collections::HashSet<String> = report
+        .results
+        .iter()
+        .map(|r| format!("file://{}", r.path.to_string_lossy()))
+        .collect();
+    let unhealthy = db.read(move |conn| {
+        Ok(jkb_core::sync_state::needs_attention(conn)?
+            .into_iter()
+            .filter(|s| paths.contains(&s.uri))
+            .count())
+    })?;
     // COUNTED, not raised. A failed file must not leave a zero exit — `/review-log` chains
     // `jkb mount create … && jkb sync "$ns"`, and a silent zero let a run record a review over
     // zero imported findings — but raising here aborted the all-mounts loop, so one bad file in

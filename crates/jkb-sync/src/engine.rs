@@ -347,7 +347,25 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // while the file stayed overwritten — losing exactly the bytes it existed to keep.
         // Content-addressed and `INSERT OR IGNORE`, so a settled file costs one hash and one
         // no-op insert.
-        archive_current_bytes(db, &path);
+        // A failed archive STOPS this file. Dropping the error meant the guarantee degraded to
+        // best-effort exactly when the database is contended — the reconcile went on to
+        // overwrite bytes that were in no blob, with nothing printed and nothing journalled.
+        // Leaving the file alone is strictly better: nothing is lost, and the next pass retries.
+        if let Err(e) = archive_current_bytes(db, &path) {
+            let reason = format!("could not archive the current bytes before syncing: {e}");
+            let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
+            let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
+                let uri = file_uri(&p2);
+                let prev = sync_state::get(conn, &uri)?;
+                flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
+            });
+            results.push(FileResult {
+                path,
+                outcome: Outcome::Failed,
+                reason: Some(reason),
+            });
+            continue;
+        }
         let ser_name = ctx.serializer.clone();
         let ctx = ctx.clone();
         let p = path.clone();
@@ -399,17 +417,19 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
 /// Best-effort by design: an unreadable file has nothing to archive, and a failure here must not
 /// stop the reconcile — the archive is a safety net, not a precondition. It is committed
 /// separately so it survives a rollback of the reconcile that follows.
-fn archive_current_bytes(db: &Db, path: &Path) {
+fn archive_current_bytes(db: &Db, path: &Path) -> Result<()> {
+    // Nothing to archive is not a failure: a file that does not exist yet, or is empty, has no
+    // bytes to lose. Only a failed *write* is, and that is what the caller acts on.
     let Ok(bytes) = std::fs::read(path) else {
-        return;
+        return Ok(());
     };
     if bytes.is_empty() {
-        return;
+        return Ok(());
     }
-    let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, _meta| {
+    db.write_txn_with::<(), Error, _>("sync", move |conn, _meta| {
         blob::store(conn, &blob::hash_bytes(&bytes), &bytes, None)?;
         Ok(())
-    });
+    })
 }
 
 /// Whether this outcome may have brought items **in** from disk, so the `tasks/**` mirrors
@@ -1046,13 +1066,12 @@ fn export_blocker(
 ) -> Result<Option<String>> {
     let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
     if !dropped.is_empty() {
-        // Name the items by their real uid, not their `local_id`. A file-backed item's uid IS
-        // its binding uri, so printing the bare local id gave a `jkb task place <uid>` line that
-        // fails as typed — and in the file-is-gone branch that was the only remedy offered.
-        let uids: Vec<String> = dropped
-            .iter()
-            .map(|local| item_uri(bare_uri, local))
-            .collect();
+        // Name the items by their real uid, LOOKED UP rather than derived. A sync-created item's
+        // uid happens to be its binding uri, but one created by `jkb task add --sync` keeps its
+        // `task:<slug>` uid and is merely *bound* to the file — so deriving the uri produced a
+        // `jkb task place <uid>` line that fails as typed for exactly those tasks, and in the
+        // file-is-gone branch that was the only remedy on offer.
+        let uids = uids_of(conn, bare_uri, &dropped)?;
         // The remedy depends on whether there is a file to edit. Naming the on-disk fix for a
         // file that is gone is advice nobody can follow.
         let remedy = if path.exists() {
@@ -1084,6 +1103,20 @@ fn export_blocker(
         ));
     }
     Ok(None)
+}
+
+/// The real `items.uid` for each `local_id`, falling back to the binding uri if the row is gone.
+fn uids_of(conn: &Connection, bare_uri: &str, locals: &[String]) -> Result<Vec<String>> {
+    let bound = existing_by_local(conn, bare_uri)?;
+    let mut out = Vec::with_capacity(locals.len());
+    for local in locals {
+        let uid = match bound.get(local) {
+            Some(id) => item::get(conn, *id)?.map(|m| m.uid),
+            None => None,
+        };
+        out.push(uid.unwrap_or_else(|| item_uri(bare_uri, local)));
+    }
+    Ok(out)
 }
 
 /// Items the base declared, whose binding still exists, that `assemble_kb_doc` would silently

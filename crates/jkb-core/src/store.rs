@@ -230,17 +230,21 @@ impl Db {
         })?
     }
 
-    /// Checkpoint the WAL (`TRUNCATE`) and copy the database file to `dest`
+    /// Write a consistent copy of the database to `dest`, replacing it if it exists
     /// (design D8/D23). Runs on the writer thread, so no write is in flight during
     /// the copy and the destination reflects all committed state.
     ///
     /// # Errors
-    /// Returns an error for an in-memory database, or if the copy fails.
+    /// Returns an error for an in-memory database, if the vacuum fails, or if the finished
+    /// backup cannot be renamed over `dest`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
-        let _src = self.path.clone().ok_or_else(|| {
-            jkb_types::Error::Validation("cannot back up an in-memory database".to_owned())
-        })?;
-        let dest = dest.as_ref().to_string_lossy().into_owned();
+        if self.path.is_none() {
+            return Err(jkb_types::Error::Validation(
+                "cannot back up an in-memory database".to_owned(),
+            )
+            .into());
+        }
+        let dest = dest.as_ref().to_path_buf();
         self.submit(move |conn| -> Result<()> {
             // `VACUUM INTO`, not checkpoint-then-copy.
             //
@@ -255,7 +259,25 @@ impl Db {
             // `VACUUM INTO` writes a complete, consistent database in one statement, reads
             // through the WAL rather than depending on it being drained, and errors instead of
             // half-succeeding.
-            conn.execute("VACUUM INTO ?1", [&dest])?;
+            // `VACUUM INTO` refuses a destination that already exists, and `jkb doctor --backup
+            // ~/.jkb/backup.db` — a fixed path, which is what the flag invites and what any cron
+            // or pre-migration script uses — must keep working on the second run. `fs::copy`
+            // overwrote, so inheriting the no-clobber rule would break every backup after the
+            // first. Vacuum to a sibling temp file and rename over the destination: the rename is
+            // atomic, so a failure part-way leaves the previous backup intact rather than a
+            // truncated one.
+            let tmp = dest.with_extension(format!(
+                "{}.tmp",
+                dest.extension()
+                    .map_or(String::new(), |e| e.to_string_lossy().into_owned())
+            ));
+            let _ = std::fs::remove_file(&tmp);
+            let tmp_sql = tmp.to_string_lossy().into_owned();
+            conn.execute("VACUUM INTO ?1", [&tmp_sql])
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                })?;
+            std::fs::rename(&tmp, &dest)?;
             Ok(())
         })?
     }
@@ -265,6 +287,46 @@ impl Db {
 mod tests {
     use super::Db;
     use crate::item::{upsert, NewItem};
+
+    /// A backup to the same path twice must work — `jkb doctor --backup ~/.jkb/backup.db` is a
+    /// fixed path, which is what the flag invites and what any cron or pre-migration script
+    /// uses. `VACUUM INTO` refuses an existing destination, so inheriting its no-clobber rule
+    /// would have broken every backup after the first.
+    #[test]
+    fn backup_overwrites_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("jkb.db")).unwrap();
+        db.write_txn("t", |conn, meta| {
+            upsert(
+                conn,
+                meta,
+                &NewItem {
+                    uid: "n:1".to_owned(),
+                    kind: "note".to_owned(),
+                    content: Some("body".to_owned()),
+                    content_hash: None,
+                    mime: None,
+                },
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let dest = dir.path().join("backup.db");
+        db.backup(&dest).expect("first backup");
+        db.backup(&dest).expect("second backup to the same path");
+
+        // The backup is a real, readable database carrying the row.
+        let restored = Db::open(&dest).unwrap();
+        let n: i64 = restored
+            .read(|conn| Ok(conn.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1, "the backup must contain the committed row");
+        assert!(
+            !dir.path().join("backup.db.tmp").exists(),
+            "the temp file must not survive a successful backup"
+        );
+    }
 
     #[test]
     fn concurrent_writers_never_hit_sqlite_busy() {

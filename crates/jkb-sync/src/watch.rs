@@ -56,7 +56,13 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     let mut retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
     // Retries are spaced so a deterministically-failing pass does not re-run on every debounce
     // tick; file events are never delayed by it.
-    let retry_after = debounce.saturating_mul(RETRY_TICKS);
+    // Spacing is measured from when a pass FINISHES, not when it starts: a pass slower than the
+    // interval would otherwise have already "waited" by the time it returned, collapsing the
+    // spacing to zero and running back-to-back full syncs on the single writer thread. And it
+    // backs off, so a permanently failing mount (its namespace deleted, say) does not log and
+    // re-run forever at a fixed rate.
+    let base_retry = debounce.saturating_mul(RETRY_TICKS);
+    let mut retry_after = base_retry;
     let mut last_retry = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
@@ -87,11 +93,17 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
 
         match work {
             Some(Work::Full) => {
-                last_retry = Instant::now();
                 retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
+                last_retry = Instant::now();
+                retry_after = if retry_owed {
+                    (retry_after * 2).min(MAX_RETRY)
+                } else {
+                    base_retry
+                };
             }
             Some(Work::Paths(paths)) => {
                 retry_owed = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
+                last_retry = Instant::now();
             }
             None => {}
         }
@@ -101,6 +113,9 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
 
 /// How many debounce intervals to wait before retrying a failed pass.
 const RETRY_TICKS: u32 = 10;
+/// Ceiling for the backoff, so a permanently failing mount settles at one attempt a minute
+/// rather than filling an unrotated log.
+const MAX_RETRY: Duration = Duration::from_mins(1);
 
 /// What one iteration of the watch loop owes.
 enum Work {
@@ -125,7 +140,12 @@ where
     match pass() {
         Ok(report) => {
             report_notable(mount_ns, &report);
-            false
+            // A per-file failure owes a retry just as much as a pass-level one — and since the
+            // previous commit made per-file failure the COMMON shape (a lost write-lock race is
+            // recorded rather than raised), returning `false` here meant the failure mode that
+            // actually happens was the one never retried.
+            let owed = !report.failed().is_empty();
+            owed
         }
         Err(e) => {
             // A pass can fail AFTER per-file transactions have committed — the trailing
