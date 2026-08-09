@@ -3723,13 +3723,23 @@ fn cmd_sync(
             println!("no mounts configured");
         }
         for ns in paths {
-            failed += report_sync(db, &ns, conflict)?;
+            // No `?`. The loop is total by construction: a mount that fails is reported and
+            // counted, and every later mount still reconciles. Pass 12 moved the raise out of
+            // `report_sync` and left the `?` here, so the abort it was fixing simply moved up
+            // one level — the whole point is that no single mount can end the run.
+            match report_sync(db, &ns, conflict) {
+                Ok(n) => failed += n,
+                Err(e) => {
+                    println!("sync {ns}: FAILED: {e:#}");
+                    failed += 1;
+                }
+            }
         }
     }
     // Every mount has been reconciled by now; only the exit code is left to decide.
     anyhow::ensure!(
         failed == 0,
-        "{failed} file(s) failed to reconcile; see the FAILED lines above"
+        "{failed} file(s) failed to reconcile or could not be parsed; see the lines above"
     );
     Ok(())
 }
@@ -3777,13 +3787,19 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for (path, err) in &failures {
         println!("  FAILED {}: {err}", path.display());
     }
+    // Quarantines count toward the exit code too. `/review-log` chains
+    // `jkb mount create … && jkb sync "$ns"`, and the `tasks` serializer *quarantines* a parse
+    // failure rather than erroring — so counting only `Failed` let a findings file that would
+    // not parse exit 0, after which the run recorded a review over zero imported findings and
+    // opened the land gate. On a first sync there are not even last-good items to fall back on.
+    let unhealthy = failures.len() + report.quarantined().len();
     // COUNTED, not raised. A failed file must not leave a zero exit — `/review-log` chains
     // `jkb mount create … && jkb sync "$ns"`, and a silent zero let a run record a review over
     // zero imported findings — but raising here aborted the all-mounts loop, so one bad file in
     // the first mount silently skipped every mount after it. That is exactly what `reconcile_all`
     // forbids one level down ("a per-file failure is a RESULT, not a run-ending error"),
     // reinstated at mount granularity. The caller reconciles everything, then decides.
-    Ok(failures.len())
+    Ok(unhealthy)
 }
 
 /// The `--backlog`/`--sync`/`--managed` flags of `task add`, grouped so the helper

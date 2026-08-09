@@ -335,6 +335,19 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
 fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
+        // ARCHIVE FIRST, in its own committed transaction, before the reconcile that may
+        // overwrite the file (design D25's recovery story: "blobs are content-addressed and
+        // never garbage-collected… the store is a complete history of every synced file").
+        //
+        // Placed here rather than at a `write_file` call site for two reasons the previous
+        // hand-placed version got wrong. There are FOUR sites that overwrite a synced file
+        // (`Normalized`, `finish_import`, `finish_export`, the merge arm) and only one carried
+        // the rule, so three could destroy bytes no blob held. And the one that did carry it
+        // ran inside the reconcile's transaction, so a later failure rolled the archive back
+        // while the file stayed overwritten — losing exactly the bytes it existed to keep.
+        // Content-addressed and `INSERT OR IGNORE`, so a settled file costs one hash and one
+        // no-op insert.
+        archive_current_bytes(db, &path);
         let ser_name = ctx.serializer.clone();
         let ctx = ctx.clone();
         let p = path.clone();
@@ -379,6 +392,24 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         })?;
     }
     Ok(SyncReport { results })
+}
+
+/// Store the file's current bytes in the blob archive, in their own transaction.
+///
+/// Best-effort by design: an unreadable file has nothing to archive, and a failure here must not
+/// stop the reconcile — the archive is a safety net, not a precondition. It is committed
+/// separately so it survives a rollback of the reconcile that follows.
+fn archive_current_bytes(db: &Db, path: &Path) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, _meta| {
+        blob::store(conn, &blob::hash_bytes(&bytes), &bytes, None)?;
+        Ok(())
+    });
 }
 
 /// Whether this outcome may have brought items **in** from disk, so the `tasks/**` mirrors
@@ -975,16 +1006,6 @@ fn finish_export(
         return Ok(Outcome::Refused);
     }
 
-    // Blob whatever is about to be overwritten. `three_way_resolve`'s `kb_wins` arm already did
-    // this; `finish_export` did not — so a first-sight export over an existing, never-imported
-    // file (an export-only mount, where the structure guard deliberately does not fire) replaced
-    // hand-written content that no blob held, and `jkb blob ls --contains` could not recover it.
-    // Cheap, content-addressed, and never collected: the archive is the whole recovery story.
-    if let Ok(previous) = std::fs::read(path) {
-        if !previous.is_empty() && previous != kb_bytes {
-            blob::store(conn, &blob::hash_bytes(&previous), &previous, None)?;
-        }
-    }
     write_file(path, kb_bytes)?;
     let resolved = current_bindings(conn, bare_uri)?;
     // An export CARRIES the structure forward rather than authoring it: `apply_doc` is the only
@@ -1025,6 +1046,13 @@ fn export_blocker(
 ) -> Result<Option<String>> {
     let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
     if !dropped.is_empty() {
+        // Name the items by their real uid, not their `local_id`. A file-backed item's uid IS
+        // its binding uri, so printing the bare local id gave a `jkb task place <uid>` line that
+        // fails as typed — and in the file-is-gone branch that was the only remedy offered.
+        let uids: Vec<String> = dropped
+            .iter()
+            .map(|local| item_uri(bare_uri, local))
+            .collect();
         // The remedy depends on whether there is a file to edit. Naming the on-disk fix for a
         // file that is gone is advice nobody can follow.
         let remedy = if path.exists() {
@@ -1038,8 +1066,8 @@ fn export_blocker(
             "{} item(s) bound to this file are missing from the assembled document ({}). \
              Exporting would delete their lines, so nothing was written. Their placements are \
              gone — `jkb undo` after a re-home does this. {remedy}",
-            dropped.len(),
-            dropped.join(", ")
+            uids.len(),
+            uids.join(", ")
         )));
     }
     // Only for a mount that can import. On an export-only mount the file is a projection of the
@@ -1285,11 +1313,6 @@ fn three_way_resolve(
                 Outcome::ResolvedFromDisk,
             ),
             "kb_wins" => {
-                // Blob the bytes about to be overwritten BEFORE overwriting them. `settle`
-                // stores only the winning render, so without this the disk side a `kb_wins`
-                // resolution discards is gone for good — unlike every other sync outcome,
-                // which is recoverable from the archive.
-                blob::store(conn, &blob::hash_bytes(disk_bytes), disk_bytes, None)?;
                 if finish_export(
                     conn,
                     meta,

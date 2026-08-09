@@ -1759,3 +1759,46 @@ fn a_section_the_file_drops_stops_being_a_section() {
         "the dropped section must lose its marker, or retirement has silently become a no-op"
     );
 }
+
+/// Whatever a sync overwrites is recoverable from the blob archive (design D25).
+///
+/// Asserted on the **merge** path, which never carried the rule: it was hand-placed at one of
+/// four `write_file` sites, so three could destroy bytes no blob held — and the one that had it
+/// archived inside the reconcile's own transaction, where a later failure rolled the archive
+/// back while the file stayed overwritten. The archive now happens once per reconcile, in its
+/// own committed transaction, before anything can write.
+#[test]
+fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] first !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::KbWins);
+    sync(&db, "docs/plan").unwrap();
+
+    // Both sides change, so the reconcile rewrites the file.
+    let settled = fs::read_to_string(&tasks).unwrap();
+    let doomed = settled.replace("## Plan\n", "## Plan\n\nProse the user typed.\n");
+    fs::write(&tasks, &doomed).unwrap();
+    db.write_txn("t", |conn, _m| {
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%first%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    // Whatever happened to the file, the bytes that were on disk beforehand are in the archive.
+    let hash = jkb_core::blob::hash_bytes(doomed.as_bytes());
+    let recovered = db
+        .read(move |conn| jkb_core::blob::load(conn, &hash))
+        .unwrap();
+    assert_eq!(
+        recovered.as_deref(),
+        Some(doomed.as_bytes()),
+        "the pre-sync bytes must be recoverable — `jkb blob ls --contains` is the whole story"
+    );
+}

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{Event, RecursiveMode, Watcher};
 
@@ -49,32 +49,65 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     // relevance filtering happens in `sync_paths` against the mount's include/exclude.
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
-    // Reconcile drift accumulated while not watching.
-    let mut force_rescan = run_pass(mount_ns, || engine::sync(db, mount_ns));
+    // A failed pass owes a retry. Held in ONE place and consumed in ONE place, because the
+    // previous shape set the flag in the event arm and read it only there — so a mount whose
+    // pass failed and then saw no file activity waited forever for someone to touch a file,
+    // which is exactly what the flag exists to avoid.
+    let mut retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
+    // Retries are spaced so a deterministically-failing pass does not re-run on every debounce
+    // tick; file events are never delayed by it.
+    let retry_after = debounce.saturating_mul(RETRY_TICKS);
+    let mut last_retry = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        match rx.recv_timeout(debounce) {
+        // What this iteration owes: a full re-scan, or a targeted pass over these paths.
+        let work = match rx.recv_timeout(debounce) {
             Ok(first) => {
                 let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-                let mut rescan = force_rescan | collect(first, &mut paths);
-                force_rescan = false;
+                let mut rescan = collect(first, &mut paths);
                 // Coalesce: keep draining until the filesystem is quiet for `debounce`.
                 while let Ok(next) = rx.recv_timeout(debounce) {
                     rescan |= collect(next, &mut paths);
                 }
-                if rescan {
-                    // Fell behind (watcher error / dropped events): re-scan everything.
-                    force_rescan = run_pass(mount_ns, || engine::sync(db, mount_ns));
-                } else if !paths.is_empty() {
-                    let paths: Vec<PathBuf> = paths.into_iter().collect();
-                    force_rescan = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
+                if rescan || retry_owed {
+                    Some(Work::Full)
+                } else if paths.is_empty() {
+                    None
+                } else {
+                    Some(Work::Paths(paths.into_iter().collect()))
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {} // idle tick — re-check the stop flag
+            // An idle tick still settles a debt. Without this the retry only ever fired if a
+            // file happened to change, which is the one condition a failed pass cannot rely on.
+            Err(RecvTimeoutError::Timeout) => {
+                (retry_owed && last_retry.elapsed() >= retry_after).then_some(Work::Full)
+            }
             Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        match work {
+            Some(Work::Full) => {
+                last_retry = Instant::now();
+                retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
+            }
+            Some(Work::Paths(paths)) => {
+                retry_owed = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
+            }
+            None => {}
         }
     }
     Ok(())
+}
+
+/// How many debounce intervals to wait before retrying a failed pass.
+const RETRY_TICKS: u32 = 10;
+
+/// What one iteration of the watch loop owes.
+enum Work {
+    /// Re-scan the whole mount: events were dropped, or a previous pass failed.
+    Full,
+    /// Reconcile exactly these paths.
+    Paths(Vec<PathBuf>),
 }
 
 /// Run one reconcile pass, reporting whatever happens. **Never returns an error.**

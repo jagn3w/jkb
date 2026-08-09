@@ -235,16 +235,27 @@ impl Db {
     /// the copy and the destination reflects all committed state.
     ///
     /// # Errors
-    /// Returns an error for an in-memory database, or if the checkpoint or copy
-    /// fails.
+    /// Returns an error for an in-memory database, or if the copy fails.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
-        let src = self.path.clone().ok_or_else(|| {
+        let _src = self.path.clone().ok_or_else(|| {
             jkb_types::Error::Validation("cannot back up an in-memory database".to_owned())
         })?;
-        let dest = dest.as_ref().to_path_buf();
+        let dest = dest.as_ref().to_string_lossy().into_owned();
         self.submit(move |conn| -> Result<()> {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-            std::fs::copy(&src, &dest)?;
+            // `VACUUM INTO`, not checkpoint-then-copy.
+            //
+            // The old form ran `PRAGMA wal_checkpoint(TRUNCATE)` and then `fs::copy`d the main
+            // database file alone. A checkpoint reports failure as a **row** with `busy = 1`
+            // rather than an error, and `execute_batch` steps past rows — so a busy checkpoint
+            // was silently ignored and the copy omitted every WAL frame not yet transferred.
+            // The result opens cleanly and is missing recent commits, which is the worst
+            // possible shape for a backup. Taking the write lock up front (IMMEDIATE) widened
+            // that window, since a peer now holds it for a whole transaction.
+            //
+            // `VACUUM INTO` writes a complete, consistent database in one statement, reads
+            // through the WAL rather than depending on it being drained, and errors instead of
+            // half-succeeding.
+            conn.execute("VACUUM INTO ?1", [&dest])?;
             Ok(())
         })?
     }
