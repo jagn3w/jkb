@@ -16,8 +16,8 @@ mod serializers;
 mod watch;
 
 pub use engine::{
-    backing_dir, sync, sync_paths, sync_with_policy, tasks_mount_file, FileResult, Outcome,
-    SyncReport,
+    backing_dir, file_uri, sync, sync_paths, sync_with_policy, tasks_mount_file, FileResult,
+    Outcome, SyncReport,
 };
 pub use error::{Error, Result};
 pub use serializers::{

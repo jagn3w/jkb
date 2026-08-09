@@ -414,14 +414,25 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
 
 /// Store the file's current bytes in the blob archive, in their own transaction.
 ///
-/// Best-effort by design: an unreadable file has nothing to archive, and a failure here must not
-/// stop the reconcile — the archive is a safety net, not a precondition. It is committed
-/// separately so it survives a rollback of the reconcile that follows.
+/// A **precondition**, not a safety net: if this fails the caller skips the file rather than
+/// overwriting bytes no blob holds. The previous doc said the opposite — "a failure here must
+/// not stop the reconcile" — which is the instruction that produced the `let _ =` a review had
+/// to remove, so it is corrected rather than left to mislead the next reader.
+///
+/// Committed separately so it survives a rollback of the reconcile that follows.
+///
+/// # Errors
+/// Returns an error if the file cannot be read (other than not existing) or the blob write
+/// fails. A missing or empty file is `Ok`: there is nothing to lose.
 fn archive_current_bytes(db: &Db, path: &Path) -> Result<()> {
-    // Nothing to archive is not a failure: a file that does not exist yet, or is empty, has no
-    // bytes to lose. Only a failed *write* is, and that is what the caller acts on.
-    let Ok(bytes) = std::fs::read(path) else {
-        return Ok(());
+    // A file that is not there has nothing to lose. Anything ELSE that stops us reading it —
+    // permissions, an I/O error — is a failure, because the reconcile is about to overwrite
+    // bytes we could not copy. Swallowing every `fs::read` error put the hole back one layer
+    // below where the caller just closed it.
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
     };
     if bytes.is_empty() {
         return Ok(());
@@ -2399,7 +2410,13 @@ fn rel_str(dir: &Path, path: &Path) -> String {
 }
 
 /// A `file://<absolute path>` uri.
-fn file_uri(path: &Path) -> String {
+/// The journal/binding key for a file: `file://<absolute path>`.
+///
+/// Public because the CLI needs to match journal rows against reconciled paths, and a
+/// hand-rebuilt copy over there made the sync exit code depend on a string convention with no
+/// owner. One spelling, exported.
+#[must_use]
+pub fn file_uri(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 

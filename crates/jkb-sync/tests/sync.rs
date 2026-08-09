@@ -1802,3 +1802,56 @@ fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
         "the pre-sync bytes must be recoverable — `jkb blob ls --contains` is the whole story"
     );
 }
+
+/// A file whose bytes cannot be archived is left alone, not overwritten (design D25).
+///
+/// This is the branch the previous commit existed to add and did not pin — the regression it
+/// keeps taking is `let _ = archive_current_bytes(...)`, which silently downgrades the
+/// "every overwrite is recoverable" guarantee to best-effort exactly when the database is
+/// contended. Forced here by making the file unreadable, which is the same class as a failed
+/// archive write: bytes we cannot copy must not be destroyed.
+#[cfg(unix)]
+#[test]
+fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::KbWins);
+    sync(&db, "docs/plan").unwrap();
+    let before = fs::read_to_string(&tasks).unwrap();
+
+    // A KB-side change, so the next reconcile wants to write the file…
+    db.write_txn("t", |conn, _m| {
+        conn.execute("UPDATE items SET status = 'done' WHERE kind = 'task'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    // …and the bytes become unreadable, so they cannot be archived first.
+    fs::set_permissions(&tasks, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    fs::set_permissions(&tasks, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        report.count(Outcome::Failed),
+        1,
+        "an unarchivable file must be reported as failed, not silently written"
+    );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        before,
+        "the file must be untouched when its bytes could not be archived"
+    );
+    let flagged = db.read(jkb_core::sync_state::needs_attention).unwrap();
+    assert!(
+        flagged.iter().any(|s| s
+            .parse_error
+            .as_deref()
+            .is_some_and(|e| e.contains("archive"))),
+        "and the journal must say why: {flagged:?}"
+    );
+}

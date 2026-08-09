@@ -158,7 +158,7 @@ enum Command {
     },
     /// Health checks, integrity, and backup.
     Doctor {
-        /// Also write a checkpointed backup to this path.
+        /// Write a consistent copy of the database to this path first (replaced if it exists).
         #[arg(long)]
         backup: Option<PathBuf>,
         /// Apply repairs: clear claims whose owner process no longer exists.
@@ -3798,17 +3798,27 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     //
     // Counted from this mount's own files, so one mount's stuck file does not make another
     // mount's summary look bad.
+    // Keyed with `jkb-sync`'s own spelling. Hand-rebuilding `file://{path}` here made the exit
+    // code depend on a cross-crate string convention with no owner — and a third copy in this
+    // file already canonicalizes, so the spellings had already diverged.
     let paths: std::collections::HashSet<String> = report
         .results
         .iter()
-        .map(|r| format!("file://{}", r.path.to_string_lossy()))
+        .map(|r| jkb_sync::file_uri(&r.path))
         .collect();
-    let unhealthy = db.read(move |conn| {
+    let flagged = db.read(move |conn| {
         Ok(jkb_core::sync_state::needs_attention(conn)?
             .into_iter()
             .filter(|s| paths.contains(&s.uri))
             .count())
     })?;
+    // The UNION, not the replacement. The journal is the better authority — it is what
+    // `jkb doctor` reads, so the two can no longer disagree — but flagging a failure is itself a
+    // database write, and the failures that matter most (disk full, a lost write-lock race) are
+    // exactly the ones that cannot perform it. Counting only journal rows meant those printed
+    // FAILED and still exited 0. A per-file failure must never need a successful write to be
+    // visible.
+    let unhealthy = flagged.max(failures.len() + report.quarantined().len());
     // COUNTED, not raised. A failed file must not leave a zero exit — `/review-log` chains
     // `jkb mount create … && jkb sync "$ns"`, and a silent zero let a run record a review over
     // zero imported findings — but raising here aborted the all-mounts loop, so one bad file in

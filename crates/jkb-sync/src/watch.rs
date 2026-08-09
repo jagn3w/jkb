@@ -53,7 +53,9 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     // previous shape set the flag in the event arm and read it only there — so a mount whose
     // pass failed and then saw no file activity waited forever for someone to touch a file,
     // which is exactly what the flag exists to avoid.
-    let mut retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
+    // The files that failed last pass, so a deterministic failure stops owing retries.
+    let mut last_failures: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut retry_owed = run_pass(mount_ns, &mut last_failures, || engine::sync(db, mount_ns));
     // Retries are spaced so a deterministically-failing pass does not re-run on every debounce
     // tick; file events are never delayed by it.
     // Spacing is measured from when a pass FINISHES, not when it starts: a pass slower than the
@@ -93,7 +95,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
 
         match work {
             Some(Work::Full) => {
-                retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
+                retry_owed = run_pass(mount_ns, &mut last_failures, || engine::sync(db, mount_ns));
                 last_retry = Instant::now();
                 retry_after = if retry_owed {
                     (retry_after * 2).min(MAX_RETRY)
@@ -102,7 +104,9 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 };
             }
             Some(Work::Paths(paths)) => {
-                retry_owed = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
+                retry_owed = run_pass(mount_ns, &mut last_failures, || {
+                    engine::sync_paths(db, mount_ns, &paths)
+                });
                 last_retry = Instant::now();
             }
             None => {}
@@ -133,19 +137,31 @@ enum Work {
 /// `Err` here used to exit this mount's thread for good — `watch_all` does not set `stop`, so the
 /// process stayed alive joining the others, launchd never restarted it, and that mount silently
 /// stopped syncing.
-fn run_pass<F>(mount_ns: &str, pass: F) -> bool
+fn run_pass<F>(mount_ns: &str, last_failures: &mut BTreeSet<PathBuf>, pass: F) -> bool
 where
     F: FnOnce() -> crate::Result<engine::SyncReport>,
 {
     match pass() {
         Ok(report) => {
             report_notable(mount_ns, &report);
-            // A per-file failure owes a retry just as much as a pass-level one — and since the
-            // previous commit made per-file failure the COMMON shape (a lost write-lock race is
-            // recorded rather than raised), returning `false` here meant the failure mode that
-            // actually happens was the one never retried.
-            let owed = !report.failed().is_empty();
-            owed
+            // A per-file failure owes a retry just as much as a pass-level one — since a lost
+            // write-lock race is recorded rather than raised, returning `false` here meant the
+            // failure mode that actually happens was the one never retried.
+            //
+            // But only while the set of failing files is still CHANGING. A deterministically
+            // unreadable file — a PNG caught by a `document` mount's glob — fails identically
+            // forever, and owing a retry for it made every debounced event take the full-mount
+            // path and re-walk the whole mount on the single writer thread, permanently. Once
+            // the failures repeat exactly, the debt is settled: they are reported, journalled,
+            // and waiting on a human, not on another attempt.
+            let failing: BTreeSet<PathBuf> = report
+                .failed()
+                .into_iter()
+                .map(|(p, _)| p.to_owned())
+                .collect();
+            let changed = failing != *last_failures;
+            *last_failures = failing;
+            changed && !last_failures.is_empty()
         }
         Err(e) => {
             // A pass can fail AFTER per-file transactions have committed — the trailing
@@ -154,6 +170,9 @@ where
             // makes the next tick a full re-scan, so the work is picked up rather than waiting
             // for someone to touch those files again.
             eprintln!("sync {mount_ns}: pass failed ({e}); re-scanning on the next event");
+            // A pass-level error tells us nothing about which files are healthy, so the memo is
+            // left alone rather than cleared — clearing it would make the next identical
+            // per-file failure look like new information.
             true
         }
     }

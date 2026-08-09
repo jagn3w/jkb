@@ -238,13 +238,41 @@ impl Db {
     /// Returns an error for an in-memory database, if the vacuum fails, or if the finished
     /// backup cannot be renamed over `dest`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
-        if self.path.is_none() {
+        let Some(src) = self.path.clone() else {
             return Err(jkb_types::Error::Validation(
                 "cannot back up an in-memory database".to_owned(),
             )
             .into());
-        }
+        };
         let dest = dest.as_ref().to_path_buf();
+
+        // Refuse to write over the live database, its `-wal`/`-shm` siblings included.
+        //
+        // `VACUUM INTO` refused any destination that already existed, which incidentally made
+        // `jkb doctor --backup ~/.jkb/jkb.db` — one tab-completion away — impossible. Replacing
+        // it with temp-and-rename so repeat backups work dropped that guarantee: the rename
+        // would replace the open database file while this process's connection still held the
+        // old inode, sending later commits to an unlinked file and leaving a foreign `-wal`
+        // beside the new one, while printing "backup written" and exiting 0.
+        //
+        // Replacing a mechanism means inheriting the preconditions it was quietly enforcing.
+        //
+        // Both sides are resolved the same way — canonicalized when the file exists, raw
+        // otherwise — because comparing a canonicalized path against a raw one passes for
+        // exactly the case this refuses.
+        let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let dest_resolved = resolve(&dest);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut guarded = src.clone().into_os_string();
+            guarded.push(suffix);
+            if dest_resolved == resolve(Path::new(&guarded)) {
+                return Err(jkb_types::Error::Validation(format!(
+                    "refusing to back up over the live database at {} — pick another destination",
+                    dest.display()
+                ))
+                .into());
+            }
+        }
         self.submit(move |conn| -> Result<()> {
             // `VACUUM INTO`, not checkpoint-then-copy.
             //
@@ -266,19 +294,33 @@ impl Db {
             // first. Vacuum to a sibling temp file and rename over the destination: the rename is
             // atomic, so a failure part-way leaves the previous backup intact rather than a
             // truncated one.
-            let tmp = dest.with_extension(format!(
-                "{}.tmp",
-                dest.extension()
-                    .map_or(String::new(), |e| e.to_string_lossy().into_owned())
+            // Unique per attempt, and still a sibling so the rename stays on one filesystem.
+            // A fixed name let two concurrent backups to the same destination unlink each
+            // other's in-flight vacuum and publish a half-written file over the previous good
+            // one. Built by APPENDING rather than `with_extension`, which replaces an extension
+            // and would mangle `backup.db.2026-08-09`.
+            let mut tmp = dest.clone().into_os_string();
+            tmp.push(format!(
+                ".{}.{}.tmp",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
             ));
-            let _ = std::fs::remove_file(&tmp);
+            let tmp = PathBuf::from(tmp);
             let tmp_sql = tmp.to_string_lossy().into_owned();
-            conn.execute("VACUUM INTO ?1", [&tmp_sql])
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_file(&tmp);
-                })?;
-            std::fs::rename(&tmp, &dest)?;
-            Ok(())
+            // Cleaned up on EVERY failure path, the rename included: a failed rename (a
+            // destination that is a directory, say) otherwise strands a full-size copy of the
+            // database at the temp path forever.
+            let result = conn
+                .execute("VACUUM INTO ?1", [&tmp_sql])
+                .map_err(crate::Error::from)
+                .and_then(|_| std::fs::rename(&tmp, &dest).map_err(crate::Error::from));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            result
         })?
     }
 }
@@ -326,6 +368,25 @@ mod tests {
             !dir.path().join("backup.db.tmp").exists(),
             "the temp file must not survive a successful backup"
         );
+    }
+
+    /// Backing up ONTO the live database must be refused. `VACUUM INTO` used to make this
+    /// impossible by refusing any existing destination; temp-and-rename removed that, so the
+    /// precondition has to be stated rather than inherited.
+    #[test]
+    fn backup_refuses_to_overwrite_the_live_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jkb.db");
+        let db = Db::open(&path).unwrap();
+        for dest in [path.clone(), dir.path().join("jkb.db-wal")] {
+            let err = db.backup(&dest).unwrap_err().to_string();
+            assert!(
+                err.contains("live database"),
+                "must refuse {}: {err}",
+                dest.display()
+            );
+        }
+        assert!(path.exists(), "the database must still be there");
     }
 
     #[test]
