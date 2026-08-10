@@ -539,3 +539,158 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
          `vector_ranked` reads this flag to decide whether to keep growing"
     );
 }
+
+/// The **repair** half of index hygiene: `count_stale` finds orphan vector rows and
+/// `sweep_stale` removes them, returning what it removed.
+///
+/// Every existing assertion about the sweep is `assert_eq!(dropped, 0)` — correct, because the
+/// GC trigger has already removed the row by then, but it means the sweep's return value is
+/// never exercised and `count_stale`/`sweep_stale`/`StaleRows` (the `jkb index --sweep` and
+/// `jkb doctor --fix` surface) had no test at all. The whole capability could stop working with
+/// the suite green.
+///
+/// A legacy database is simulated the only way it arises: a vector row whose item is gone,
+/// which is exactly what every database written before the trigger existed contains.
+#[test]
+fn the_sweep_finds_and_removes_orphan_vector_rows() {
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let db = Db::open_in_memory_with(&[jkb_index::register]).unwrap();
+
+    let indexer = VectorIndexer::new(embedder.clone());
+    let embedder_in = embedder.clone();
+    db.write_txn("test", move |conn, meta| {
+        let embedder = embedder_in;
+        indexer.ensure_ready(conn).unwrap();
+        let id = add_item(conn, meta, "n:live", "live content");
+        indexer
+            .upsert_vector(conn, id, &embedder.embed("live content").unwrap())
+            .unwrap();
+
+        // An orphan of the kind a pre-trigger database holds: a vector whose item never
+        // existed. Written directly because no supported path can create one any more — which
+        // is the point of the trigger, and why the repair path needs its own test.
+        let orphan = [0.5f32; 16];
+        let bytes: Vec<u8> = orphan.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT INTO vec_items_16 (item_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![9_999_999_i64, bytes],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Detect reports it without changing anything...
+    let before = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert_eq!(before.vectors, 1, "count_stale did not see the orphan row");
+    assert!(!before.is_empty());
+
+    let still_there = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert_eq!(
+        still_there.vectors, 1,
+        "count_stale removed a row — it is the detect half and must not mutate"
+    );
+
+    // ...and the sweep removes exactly it, reporting what it removed.
+    let swept = db
+        .write_txn("test", |conn, _meta| {
+            Ok(jkb_index::sweep_stale(conn).unwrap())
+        })
+        .unwrap();
+    assert_eq!(
+        swept.vectors, 1,
+        "sweep_stale did not report the row it removed"
+    );
+
+    let after = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert!(after.is_empty(), "the orphan survived the sweep");
+
+    // The live item's vector is untouched — a sweep that took real rows would be far worse
+    // than one that took none.
+    let live: i64 = db
+        .read(|conn| Ok(conn.query_row("SELECT count(*) FROM vec_items_16", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(live, 1, "the sweep removed a live item's vector");
+}
+
+/// Repairing a legacy database must also install the guard that stops it recurring.
+///
+/// `jkb index --sweep` and `jkb doctor --fix` exist to clean derived-index rows, and a database
+/// holding orphans is by definition one written before the GC trigger. The trigger was created
+/// only by `ensure_ready`, which needs a live embedder to know its table name — so the two
+/// commands whose whole job is hygiene repaired today's rows and left the database generating
+/// more.
+#[test]
+fn a_repair_installs_the_trigger_on_a_legacy_database() {
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let db = Db::open_in_memory_with(&[jkb_index::register]).unwrap();
+
+    let id = db
+        .write_txn("test", {
+            let embedder = embedder.clone();
+            move |conn, meta| {
+                let vector = VectorIndexer::new(embedder.clone());
+                vector.ensure_ready(conn).unwrap();
+                // Drop the trigger to make this a pre-D42.2 database.
+                conn.execute_batch("DROP TRIGGER IF EXISTS vec_items_16_gc;")?;
+                let id = add_item(conn, meta, "n:legacy", "legacy content");
+                vector
+                    .upsert_vector(conn, id, &embedder.embed("legacy content").unwrap())
+                    .unwrap();
+                Ok(id)
+            }
+        })
+        .unwrap();
+
+    // Deleting an item leaves its vector behind, exactly as a legacy database does.
+    db.write_txn("test", move |conn, _meta| {
+        conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
+        Ok(())
+    })
+    .unwrap();
+    let stale = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert_eq!(
+        stale.vectors, 1,
+        "setup: the legacy delete should orphan a row"
+    );
+
+    // Repair.
+    db.write_txn("test", |conn, _meta| {
+        Ok(jkb_index::sweep_stale(conn).unwrap())
+    })
+    .unwrap();
+
+    // The harm: a second delete after the repair must NOT orphan another row.
+    let id2 = db
+        .write_txn("test", {
+            let embedder = embedder.clone();
+            move |conn, meta| {
+                let id2 = add_item(conn, meta, "n:after", "after content");
+                VectorIndexer::new(embedder.clone())
+                    .upsert_vector(conn, id2, &embedder.embed("after content").unwrap())
+                    .unwrap();
+                Ok(id2)
+            }
+        })
+        .unwrap();
+    db.write_txn("test", move |conn, _meta| {
+        conn.execute("DELETE FROM items WHERE id = ?1", [id2.get()])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let after = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "the repair did not install the trigger, so the database is still orphaning rows"
+    );
+}

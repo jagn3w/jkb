@@ -124,9 +124,37 @@ pub fn count_stale(conn: &Connection) -> Result<StaleRows> {
 /// # Errors
 /// Returns an error if a statement fails.
 pub fn sweep_stale(conn: &Connection) -> Result<StaleRows> {
+    // Install the guard while we are here. A database with orphan rows is BY DEFINITION one
+    // written before the trigger existed, so repairing it without installing the trigger fixes
+    // today's rows and leaves it generating more — and these two commands (`jkb index --sweep`,
+    // `jkb doctor --fix`) are the ones whose whole purpose is index hygiene. The trigger was
+    // created only by `ensure_ready`, which needs a live embedder to know its table name;
+    // `vector_tables` needs no embedder and finds every table, so repair can reach it.
+    for table in vector_tables(conn)? {
+        ensure_gc_trigger(conn, &table)?;
+    }
     Ok(StaleRows {
         vectors: drop_orphan_vectors(conn)?,
     })
+}
+
+/// Create the delete-GC trigger for one `vec_items_<dim>` table, if it is not already there.
+///
+/// A trigger lives in the database file rather than in a process, so it fires for every
+/// connection, every process, and every call site written in future — including ones that never
+/// link `jkb-index`. That is why the obligation lives here instead of in each deleter (D42.2).
+///
+/// # Errors
+/// Returns an error if the statement fails.
+fn ensure_gc_trigger(conn: &Connection, table: &str) -> Result<()> {
+    // `table` comes from `sqlite_master` filtered to our own prefix, or from a `VectorIndexer`'s
+    // own dim — never from input.
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS {table}_gc AFTER DELETE ON items BEGIN
+             DELETE FROM {table} WHERE item_id = old.id;
+         END;"
+    ))?;
+    Ok(())
 }
 
 /// Every `vec_items_<dim>` table in this database — one per embedding dimension the store has
@@ -248,12 +276,7 @@ impl VectorIndexer {
         // resolve the virtual table, so deleting an item there fails. Every binary in this
         // workspace opens with `Db::open_with(&[jkb_index::register])`, and the trigger only
         // exists in databases that have a vec table, which only this module creates.
-        conn.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS {table}_gc AFTER DELETE ON items BEGIN
-                 DELETE FROM {table} WHERE item_id = old.id;
-             END;",
-            table = self.table
-        ))?;
+        ensure_gc_trigger(conn, &self.table)?;
 
         let existing: Option<(String, i64)> = conn
             .prepare_cached("SELECT model, dim FROM embeddings_meta WHERE table_name = ?1")?
