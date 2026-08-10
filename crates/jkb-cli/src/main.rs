@@ -1217,6 +1217,36 @@ fn cmd_blob_cat(db: &Db, hash: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a path the way the sync journal's uris were built: canonicalized.
+///
+/// `canonicalize` needs the file to exist, which is precisely what `jkb history` is often asked
+/// about, and plain absolutisation resolves no symlinks — so on macOS a deleted file under
+/// `/tmp` or `/var` produced a uri the journal never wrote. Canonicalizing the deepest ancestor
+/// that DOES exist (normally the parent) and rejoining the rest gets both: the symlinks are
+/// resolved and the missing leaf is preserved.
+fn resolve_for_journal(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut rest = Vec::new();
+    let mut cur = abs.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_owned());
+        }
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    abs
+}
+
 /// `jkb history <path>` — every synced version of a file, newest first.
 fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
     // Accept a bare path or a `file://` uri, and canonicalize so a relative path matches the
@@ -1234,10 +1264,7 @@ fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
         // fall back to plain absolutisation when it is not, which is the case `jkb history`
         // exists for. Using only one of the two fails half the time: `canonicalize` alone left a
         // *relative* uri for a deleted file, and `absolute` alone misses the symlink.
-        let abs = std::fs::canonicalize(path)
-            .or_else(|_| std::path::absolute(path))
-            .unwrap_or_else(|_| std::path::PathBuf::from(path));
-        jkb_sync::file_uri(&abs)
+        jkb_sync::file_uri(&resolve_for_journal(std::path::Path::new(path)))
     };
 
     let versions = db.read({

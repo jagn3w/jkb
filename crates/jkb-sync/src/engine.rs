@@ -482,6 +482,59 @@ fn brought_items_in(outcome: Outcome) -> bool {
 }
 
 #[cfg(test)]
+mod write_seam {
+    use super::write_file;
+
+    /// The write seam refuses when the file is no longer what the pass reconciled.
+    ///
+    /// `reconcile` decides direction from bytes read by `archive_current_bytes`, which commits
+    /// its own transaction and then queues behind the writer thread — so under load the snapshot
+    /// can be seconds stale, and a save landing in that window used to be overwritten with only
+    /// the older bytes archived. Driven directly here because the window is inside one `sync`
+    /// call and cannot be opened deterministically from outside it.
+    #[test]
+    fn refuses_when_the_file_changed_since_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.md");
+        std::fs::write(&path, b"v2").unwrap();
+
+        // The pass read "v1"; the file now says "v2".
+        let err = write_file(&path, b"render", Some(b"v1")).unwrap_err();
+        assert!(
+            err.to_string().contains("changed on disk"),
+            "must refuse a stale write: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"v2",
+            "and must not have written anything"
+        );
+
+        // Matching snapshot: the write goes ahead.
+        write_file(&path, b"render", Some(b"v2")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"render");
+    }
+
+    /// A file that was ABSENT when the pass began, and exists now, is the one overwrite that
+    /// would be recoverable from nothing — the archive stored no bytes for it.
+    #[test]
+    fn refuses_when_an_absent_file_has_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored.md");
+        std::fs::write(&path, b"git restored me").unwrap();
+
+        let err = write_file(&path, b"render", None).unwrap_err();
+        assert!(err.to_string().contains("changed on disk"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"git restored me");
+
+        // Still absent: writing it is the ordinary create.
+        let fresh = dir.path().join("new.md");
+        write_file(&fresh, b"render", None).unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"render");
+    }
+}
+
+#[cfg(test)]
 mod mirror_predicate {
     use super::{brought_items_in, Outcome};
 
@@ -821,7 +874,7 @@ fn reconcile(
                 // `(false, false)` means), so writing `kb_bytes` cannot change the document —
                 // only its formatting.
                 if kb_bytes != disk_bytes {
-                    write_file(path, &kb_bytes)?;
+                    write_file(path, &kb_bytes, Some(&disk_bytes))?;
                 }
                 mark_ok(
                     conn,
@@ -871,6 +924,7 @@ fn reconcile(
             serializer.as_ref(),
             journal.as_ref(),
             Some(&disk_doc),
+            Some(&disk_bytes),
         ),
         (true, true) => three_way_resolve(
             conn,
@@ -910,7 +964,7 @@ fn missing_file(
     if ctx.exports() && kb_has_items {
         // No disk document — the file is gone — so expectation falls back to the base.
         return finish_export(
-            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal, None,
+            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal, None, None,
         );
     }
     Ok(Outcome::Skipped)
@@ -1012,7 +1066,7 @@ fn finish_import(
     let rendered = serializer.render(doc)?;
     // Persist identity / normalization back to disk (the rendered form is authoritative).
     if rendered != disk_bytes {
-        write_file(path, &rendered)?;
+        write_file(path, &rendered, Some(disk_bytes))?;
     }
     // An import is one of the two ways a file's structure legitimately changes, so this is
     // where the journal learns it (D45.4).
@@ -1041,6 +1095,9 @@ fn finish_export(
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
     expected: Option<&SyncDoc>,
+    // What this pass read from disk, re-validated at the write seam. `None` means the file was
+    // absent when the pass began, so nothing was preserved for it.
+    snapshot: Option<&[u8]>,
 ) -> Result<Outcome> {
     if !ctx.exports() {
         return Ok(Outcome::Skipped);
@@ -1055,7 +1112,7 @@ fn finish_export(
         return Ok(Outcome::Refused);
     }
 
-    write_file(path, kb_bytes)?;
+    write_file(path, kb_bytes, snapshot)?;
     let resolved = current_bindings(conn, bare_uri)?;
     // An export CARRIES the structure forward rather than authoring it: `apply_doc` is the only
     // writer of a file's structure, and an export does not call it. That is the property the
@@ -1348,7 +1405,7 @@ fn three_way_resolve(
             let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
             let rendered = serializer.render(&merged)?;
             if ctx.exports() {
-                write_file(path, &rendered)?;
+                write_file(path, &rendered, Some(disk_bytes))?;
             }
             settle(
                 conn,
@@ -1386,6 +1443,7 @@ fn three_way_resolve(
                     serializer,
                     journal,
                     Some(disk_doc),
+                    Some(disk_bytes),
                 )? == Outcome::Refused
                 {
                     return Ok(Outcome::Refused);
@@ -2444,7 +2502,33 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 /// Write `bytes` to `path`, creating parent directories as needed.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> {
+    // REFUSE to write if the file is no longer what this pass reconciled.
+    //
+    // `reconcile` decides direction from bytes read by `archive_current_bytes`, which commits
+    // its own transaction and then queues behind the writer thread — seconds under load. A save
+    // landing in that window used to be caught because the old code re-read the file inside the
+    // reconcile transaction; passing one snapshot down closed a double-read race and opened a
+    // wider one. So the snapshot is re-validated here, at the single seam every write goes
+    // through, immediately before the bytes hit the disk.
+    //
+    // The two cases are deliberately asymmetric. `Some(bytes)` means those bytes are in the
+    // blob archive, so a mismatch costs a retry. `None` means the file was ABSENT when this pass
+    // started and nothing was preserved — so a file that has appeared since (a `git restore`,
+    // an editor writing late) is the one overwrite that would be recoverable from nothing.
+    let current = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if current.as_deref() != snapshot {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "{} changed on disk while it was being synced; nothing was written. It will be \
+             reconciled on the next pass.",
+            path.display()
+        ))));
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

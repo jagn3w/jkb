@@ -76,7 +76,12 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 while let Ok(next) = rx.recv_timeout(debounce) {
                     rescan |= collect(next, &mut paths);
                 }
-                if rescan || retry_owed {
+                // A dropped-event rescan is immediate; a RETRY waits for the backoff. Without
+                // the interval here `retry_owed` latched on any deterministically-failing file
+                // — a PNG caught by a `document` glob — and turned every debounced save into a
+                // whole-mount re-walk on the single writer thread, forever. The debt stays owed
+                // either way; the idle arm settles it.
+                if rescan || (retry_owed && last_retry.elapsed() >= retry_after) {
                     Some(Work::Full)
                 } else if paths.is_empty() {
                     None

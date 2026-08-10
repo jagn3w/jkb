@@ -308,7 +308,27 @@ impl Db {
             let mut tmp = dest.clone().into_os_string();
             tmp.push(".tmp");
             let tmp = PathBuf::from(tmp);
-            let _ = std::fs::remove_file(&tmp);
+            // CLAIMED, not just unlinked. Unlinking first let a second backup to the same
+            // destination start its own vacuum at the same path while ours was still being
+            // written — and whichever finished first renamed the OTHER's half-written file over
+            // the previous good backup, reporting success. That is the shape this function's own
+            // comment calls worst for a backup: it opens cleanly and is wrong. `create_new`
+            // fails instead, and a leftover from a crashed run is reclaimed explicitly.
+            if tmp.exists() {
+                std::fs::remove_file(&tmp)?;
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| {
+                    jkb_types::Error::Validation(format!(
+                        "another backup to {} is already running ({e})",
+                        dest.display()
+                    ))
+                })?;
+            // `VACUUM INTO` needs to create the file itself, so hand it an empty claimed path.
+            std::fs::remove_file(&tmp)?;
             let tmp_sql = tmp.to_string_lossy().into_owned();
             // Cleaned up on every failure path, the rename included.
             let result = conn

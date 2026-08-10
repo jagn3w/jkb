@@ -1965,6 +1965,57 @@ fn a_conjecture_investigation_seeds_its_predicate_and_gates_reopening() {
         .stdout(predicate::str::contains(route));
 }
 
+/// `--backup` is taken BEFORE `--fix` repairs anything, so the safety copy holds pre-repair
+/// state. Taken last it held the opposite of what its name and help promise, and no test
+/// combined the two flags — so reverting the ordering left the whole suite green.
+#[test]
+fn doctor_backup_captures_state_before_fix_repairs_it() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["--global", "task", "add", "orphaned work"])
+        .assert()
+        .success();
+    let uid = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let uid: serde_json::Value = serde_json::from_slice(&uid.stdout).unwrap();
+    let uid = uid[0]["uid"].as_str().unwrap().to_owned();
+    // A claim whose owner is provably gone, which `--fix` reclaims.
+    jkb(&db)
+        .args([
+            "--global",
+            "task",
+            "claim",
+            &uid,
+            "--owner",
+            "host:4294967290",
+        ])
+        .assert()
+        .success();
+
+    let backup = dir.path().join("pre-fix.db");
+    jkb(&db)
+        .args(["doctor", "--backup", backup.to_str().unwrap(), "--fix"])
+        .assert()
+        .success();
+
+    // `doctor` reports orphaned claims, so ask each database. Live: repaired. Backup: not yet.
+    let live = jkb(&db).args(["doctor"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&live.stdout).contains("4294967290"),
+        "--fix must have reclaimed the live claim: {}",
+        String::from_utf8_lossy(&live.stdout)
+    );
+    let copied = jkb(&backup).args(["doctor"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&copied.stdout).contains("4294967290"),
+        "the backup must predate the repair: {}",
+        String::from_utf8_lossy(&copied.stdout)
+    );
+}
+
 /// `jkb history` works for a file that has been DELETED, given a relative path.
 ///
 /// This is the recovery path the archive exists to serve, and it was broken: `canonicalize`
