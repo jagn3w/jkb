@@ -11,9 +11,12 @@ Arguments given: `$ARGUMENTS`
 
 ## 0. Self-review first
 
-The reviewer costs roughly 16 agents, 3M tokens and an hour per run, so it must be spent on what
-is hard to spot rather than on what a checklist catches. Run the seven-point self-review in
-`/review-log` step 0 over your own diff first, then `./scripts/check.sh`. Say what it caught.
+The reviewer costs a dozen or more agents and millions of tokens per run, so it has to be spent
+on what is hard to spot rather than on what a careful reading catches. Read your own diff first
+and check the seven points in `/review-log` step 0 — edits landed, comments match the code, new
+branches reachable, the same rule honoured at its other call sites, the changed path covered by a
+test, new parameters supplied everywhere, and the thing actually run. Then run the repo's verify
+command, and say what the self-review caught.
 
 ## 1. Resolve what to review
 

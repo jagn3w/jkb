@@ -1928,3 +1928,78 @@ fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
         Some("authored in the kb")
     );
 }
+
+/// Read one task's status by uid.
+fn kb_status(db: &Db, uid: &str) -> Option<String> {
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &uid)? else {
+            return Ok(None);
+        };
+        Ok(item::get(conn, id)?.and_then(|m| m.status))
+    })
+    .unwrap()
+}
+
+/// An export-only mount must never take item edits FROM disk — not even inside a three-way
+/// merge, where the disk and KB edits touch different tasks and so merge cleanly.
+///
+/// `finish_import` carried the `ctx.imports()` check and the `Merged` arm did not, so a hand
+/// edit deleting a line cancelled and detached the KB task behind it: the merged document
+/// simply lacked that item, and applying it to the KB is what cancels a removed task. The
+/// mount's whole contract is that the KB is authoritative and the file is an output.
+#[test]
+fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    // Import once, so the KB holds the tasks and the file is settled.
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        task_count(&db),
+        3,
+        "setup: the three tasks should have imported"
+    );
+
+    // From here the mount is export-only: the KB is authoritative, the file is an output.
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Export,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+
+    // Both sides change, on DIFFERENT items — which is exactly what merges cleanly and so
+    // reaches the `Merged` arm rather than a conflict.
+    let edited = TASKS_MD.replace("- [ ] Fix flaky test !p1 needs:^setup ^fix\n", "");
+    assert_ne!(edited, TASKS_MD, "setup: the disk edit must remove a line");
+    fs::write(&file, &edited).unwrap();
+    kb_set_status(&db, &format!("{uri}#ship"), "in_progress");
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the export-only reconcile failed: {:?}",
+        report.failed()
+    );
+
+    // The harm: the task behind the deleted line must still be open.
+    assert_eq!(
+        kb_status(&db, &format!("{uri}#fix")).as_deref(),
+        Some("open"),
+        "a hand edit to the file cancelled a KB task on a mount that does not import"
+    );
+    // And the KB is written back over the file, so the line returns.
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("^fix"),
+        "the export-only mount did not rewrite the file from the KB"
+    );
+}

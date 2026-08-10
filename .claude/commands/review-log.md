@@ -10,31 +10,33 @@ Arguments given: `$ARGUMENTS`
 
 ## 0. Self-review first — the workflow is expensive
 
-One run is roughly **16 agents, 3M tokens and an hour**. Spend it on what is hard to spot:
-feature-level gaps, cross-file contradictions, reasoning that needs a whole subsystem in view.
-Do not spend it on defects a checklist catches. `staging-workflow` took 19 passes, and a large
-share of the findings were self-inflicted and self-catchable.
+One run is roughly a dozen or more agents and millions of tokens. Spend it on what is hard to
+spot: feature-level gaps, cross-file contradictions, reasoning that needs a whole subsystem in
+view. Do not spend it on defects a careful reading catches — those cost a full extra pass to
+find, plus another to review the fix.
 
-So before launching the reviewer, pass over your own diff (`git diff <range>`) and check:
+So before launching the reviewer, read your own diff (`git diff <range>`) and check:
 
-1. **Did every edit land?** Re-read each file you changed and verify against the re-read, not
-   against what you believe you wrote. Four edits on `staging-workflow` silently never applied,
-   and the commit messages described the behaviour they were supposed to have.
-2. **Does each comment match the code beside it?** Any comment asserting a guarantee — re-read
-   the path and confirm it holds. Shipped wrong at least three times.
-3. **Can each guard actually fire?** Name a concrete input that triggers it. If you cannot, it is
-   inert: a `create_new` claim unlinked one line later, a blocker gated on the one condition
-   that is false where it was needed, an ownership gate over an always-empty set.
-4. **Who else does this?** `grep` for every other call site of the rule before fixing the one you
-   are looking at. Largest single class — 8 of 13 findings in one pass. A rule each caller must
-   remember belongs in the callee, a type, or the schema.
-5. **Does any test exercise this mode at all?** `SyncMode::Export` had none, which is why an
-   export-only mount could never write its first file.
-6. **Added a parameter to a long argument list?** Check every call site passes the right value.
-7. **Run it.** Execute the command path you changed rather than reasoning about it.
+1. **Did every edit actually land?** Verify against a re-read of the file, not against what you
+   believe you wrote. An edit that silently failed leaves a commit message describing behaviour
+   the code does not have.
+2. **Does each comment and doc match the code beside it?** Anything asserting a guarantee — trace
+   the path and confirm it holds. Stale or aspirational comments mislead the next reader and the
+   reviewer both.
+3. **Is every new branch and check reachable?** Name a concrete input that exercises it. If you
+   cannot, it is dead code wearing the costume of a safeguard.
+4. **Who else implements this rule?** Before fixing at the site you are looking at, search for the
+   other places that must obey the same rule. **A rule every call site has to remember is itself
+   the defect** — prefer moving it into the callee, a type, or the schema, so no site can forget.
+5. **Does any test exercise the path you changed?** A mode with no coverage is where defects live
+   longest. If you added a regression test, revert the fix and confirm it fails on the assertion
+   it is named for.
+6. **Did you add a parameter, field, or variant?** Check every construction and call site supplies
+   the right value — same-typed neighbours swap silently.
+7. **Did you run it?** Execute the path you changed rather than reasoning about it.
 
-Then run `./scripts/check.sh`. Say in the report what this pass caught — a review that finds
-only subtle things is the goal, and a run that surfaces a stale comment was money wasted.
+Then run the repo's own verify command (its CI config or contributor docs name it). Say in the
+report what this pass caught: a review that surfaces only subtle things is the goal.
 
 ## 1. Resolve the repo, then create the review folder
 
