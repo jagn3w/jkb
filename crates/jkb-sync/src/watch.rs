@@ -54,8 +54,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     // pass failed and then saw no file activity waited forever for someone to touch a file,
     // which is exactly what the flag exists to avoid.
     // The files that failed last pass, so a deterministic failure stops owing retries.
-    let mut last_failures: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut retry_owed = run_pass(mount_ns, &mut last_failures, || engine::sync(db, mount_ns));
+    let mut retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
     // Retries are spaced so a deterministically-failing pass does not re-run on every debounce
     // tick; file events are never delayed by it.
     // Spacing is measured from when a pass FINISHES, not when it starts: a pass slower than the
@@ -95,7 +94,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
 
         match work {
             Some(Work::Full) => {
-                retry_owed = run_pass(mount_ns, &mut last_failures, || engine::sync(db, mount_ns));
+                retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
                 last_retry = Instant::now();
                 retry_after = if retry_owed {
                     (retry_after * 2).min(MAX_RETRY)
@@ -104,9 +103,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 };
             }
             Some(Work::Paths(paths)) => {
-                retry_owed = run_pass(mount_ns, &mut last_failures, || {
-                    engine::sync_paths(db, mount_ns, &paths)
-                });
+                retry_owed = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
                 last_retry = Instant::now();
             }
             None => {}
@@ -137,7 +134,7 @@ enum Work {
 /// `Err` here used to exit this mount's thread for good — `watch_all` does not set `stop`, so the
 /// process stayed alive joining the others, launchd never restarted it, and that mount silently
 /// stopped syncing.
-fn run_pass<F>(mount_ns: &str, last_failures: &mut BTreeSet<PathBuf>, pass: F) -> bool
+fn run_pass<F>(mount_ns: &str, pass: F) -> bool
 where
     F: FnOnce() -> crate::Result<engine::SyncReport>,
 {
@@ -148,20 +145,13 @@ where
             // write-lock race is recorded rather than raised, returning `false` here meant the
             // failure mode that actually happens was the one never retried.
             //
-            // But only while the set of failing files is still CHANGING. A deterministically
-            // unreadable file — a PNG caught by a `document` mount's glob — fails identically
-            // forever, and owing a retry for it made every debounced event take the full-mount
-            // path and re-walk the whole mount on the single writer thread, permanently. Once
-            // the failures repeat exactly, the debt is settled: they are reported, journalled,
-            // and waiting on a human, not on another attempt.
-            let failing: BTreeSet<PathBuf> = report
-                .failed()
-                .into_iter()
-                .map(|(p, _)| p.to_owned())
-                .collect();
-            let changed = failing != *last_failures;
-            *last_failures = failing;
-            changed && !last_failures.is_empty()
+            // The debt is never *abandoned*. An earlier version dropped it once the failing set
+            // repeated, to stop a deterministically-unreadable file forcing a full re-walk on
+            // every event — but that also gave up on transient contention after two attempts,
+            // which is the case the retry exists for. The cost it was avoiding is handled by the
+            // backoff instead: the caller escalates to a full pass only once the interval has
+            // elapsed.
+            !report.failed().is_empty()
         }
         Err(e) => {
             // A pass can fail AFTER per-file transactions have committed — the trailing

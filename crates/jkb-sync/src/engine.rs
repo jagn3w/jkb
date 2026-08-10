@@ -351,21 +351,24 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // best-effort exactly when the database is contended — the reconcile went on to
         // overwrite bytes that were in no blob, with nothing printed and nothing journalled.
         // Leaving the file alone is strictly better: nothing is lost, and the next pass retries.
-        if let Err(e) = archive_current_bytes(db, &path) {
-            let reason = format!("could not archive the current bytes before syncing: {e}");
-            let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
-            let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
-                let uri = file_uri(&p2);
-                let prev = sync_state::get(conn, &uri)?;
-                flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-            });
-            results.push(FileResult {
-                path,
-                outcome: Outcome::Failed,
-                reason: Some(reason),
-            });
-            continue;
-        }
+        let archived = match archive_current_bytes(db, &path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = format!("could not archive the current bytes before syncing: {e}");
+                let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
+                let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
+                    let uri = file_uri(&p2);
+                    let prev = sync_state::get(conn, &uri)?;
+                    flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
+                });
+                results.push(FileResult {
+                    path,
+                    outcome: Outcome::Failed,
+                    reason: Some(reason),
+                });
+                continue;
+            }
+        };
         let ser_name = ctx.serializer.clone();
         let ctx = ctx.clone();
         let p = path.clone();
@@ -375,7 +378,7 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // thread. `watch_all` then blocked joining the other threads until stop, launchd never
         // restarted the still-alive process, and that mount silently stopped syncing forever.
         let outcome = db.write_txn_with::<Outcome, Error, _>("sync", move |conn, meta| {
-            reconcile(conn, meta, &ctx, &p)
+            reconcile(conn, meta, &ctx, &p, archived)
         });
         let (outcome, reason) = match outcome {
             Ok(o) => (o, outcome_reason(db, &path)?),
@@ -421,26 +424,33 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
 ///
 /// Committed separately so it survives a rollback of the reconcile that follows.
 ///
+/// Returns the bytes it archived, so the caller reconciles **those exact bytes** rather than
+/// reading the file a second time. Two reads meant a save landing between them was overwritten
+/// with only the older version archived, and the window widened when the archive moved into its
+/// own transaction.
+///
 /// # Errors
 /// Returns an error if the file cannot be read (other than not existing) or the blob write
-/// fails. A missing or empty file is `Ok`: there is nothing to lose.
-fn archive_current_bytes(db: &Db, path: &Path) -> Result<()> {
+/// fails. A missing file is `Ok(None)`: there is nothing to lose.
+fn archive_current_bytes(db: &Db, path: &Path) -> Result<Option<Vec<u8>>> {
     // A file that is not there has nothing to lose. Anything ELSE that stops us reading it —
     // permissions, an I/O error — is a failure, because the reconcile is about to overwrite
     // bytes we could not copy. Swallowing every `fs::read` error put the hole back one layer
     // below where the caller just closed it.
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     if bytes.is_empty() {
-        return Ok(());
+        return Ok(Some(bytes));
     }
+    let stored = bytes.clone();
     db.write_txn_with::<(), Error, _>("sync", move |conn, _meta| {
-        blob::store(conn, &blob::hash_bytes(&bytes), &bytes, None)?;
+        blob::store(conn, &blob::hash_bytes(&stored), &stored, None)?;
         Ok(())
-    })
+    })?;
+    Ok(Some(bytes))
 }
 
 /// Whether this outcome may have brought items **in** from disk, so the `tasks/**` mirrors
@@ -686,7 +696,16 @@ fn outcome_reason(db: &Db, path: &Path) -> Result<Option<String>> {
 // helpers than it saves; the stages that carry real logic (`decide_direction`, `missing_file`)
 // are already extracted and separately testable.
 #[allow(clippy::too_many_lines)]
-fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Result<Outcome> {
+fn reconcile(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    // The bytes the archive already read and stored, so the version reconciled is exactly the
+    // version preserved. Reading the file again here left a window in which a save could land
+    // between the two reads and be overwritten with only the older bytes archived.
+    disk_bytes: Option<Vec<u8>>,
+) -> Result<Outcome> {
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
     let journal = sync_state::get(conn, &bare_uri)?;
@@ -702,8 +721,7 @@ fn reconcile(conn: &Connection, meta: &WriteMeta, ctx: &Ctx, path: &Path) -> Res
 
     // Parse the disk side (if the file exists). A quarantining serializer turns a parse
     // failure into a journal flag instead of a hard error, protecting last-good items.
-    let disk = if path.exists() {
-        let bytes = std::fs::read(path)?;
+    let disk = if let Some(bytes) = disk_bytes {
         match serializer.parse(&bytes) {
             Ok(doc) => Some((bytes, doc)),
             Err(e) => {

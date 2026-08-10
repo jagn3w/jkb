@@ -1965,6 +1965,36 @@ fn a_conjecture_investigation_seeds_its_predicate_and_gates_reopening() {
         .stdout(predicate::str::contains(route));
 }
 
+/// `jkb history` works for a file that has been DELETED, given a relative path.
+///
+/// This is the recovery path the archive exists to serve, and it was broken: `canonicalize`
+/// fails once the file is gone, which left a *relative* uri matching no journal row, so the
+/// command reported "no recorded history" and blamed the build version instead.
+#[test]
+fn history_finds_a_deleted_file_by_relative_path() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let backing = dir.path().join("backing");
+    std::fs::create_dir_all(&backing).unwrap();
+    std::fs::write(backing.join("tasks.md"), "## Plan\n\n- [ ] one !p1\n").unwrap();
+
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--serializer", "tasks"])
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "docs/m"]).assert().success();
+    std::fs::remove_file(backing.join("tasks.md")).unwrap();
+
+    // Relative, for a file that no longer exists.
+    jkb(&db)
+        .current_dir(&backing)
+        .args(["history", "tasks.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("jkb blob cat"));
+}
+
 /// The blob archive is the recovery path when a sync has already written a wrong version
 /// over a file: every settled version's bytes are stored and never deleted, so you can find
 /// the one carrying a line you remember and read it back.

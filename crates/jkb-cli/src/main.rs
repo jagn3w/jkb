@@ -1224,11 +1224,20 @@ fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
     let uri = if path.starts_with("file://") {
         path.to_owned()
     } else {
+        // Absolutised WITHOUT requiring the file to exist, then keyed with `jkb-sync`'s own
+        // spelling. `canonicalize` fails for a deleted file, which left a relative uri that
+        // matched no journal row — so `jkb history <deleted file>` reported "no recorded
+        // history" and blamed the build version, on exactly the recovery path the archive
+        // exists to serve.
+        // Canonicalize when the file is there — the journal's uris come from a canonicalized
+        // mount directory, so on macOS `/var/...` must become `/private/var/...` to match — and
+        // fall back to plain absolutisation when it is not, which is the case `jkb history`
+        // exists for. Using only one of the two fails half the time: `canonicalize` alone left a
+        // *relative* uri for a deleted file, and `absolute` alone misses the symlink.
         let abs = std::fs::canonicalize(path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(path))
-            .to_string_lossy()
-            .into_owned();
-        format!("file://{abs}")
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        jkb_sync::file_uri(&abs)
     };
 
     let versions = db.read({
@@ -5930,6 +5939,15 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
 }
 
 fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Result<()> {
+    // FIRST, before any diagnostic and before `--fix` mutates anything. `--backup` is the
+    // safety copy you take *before* a repair; taken at the end it held post-repair state, so
+    // `jkb doctor --backup ~/pre-fix.db --fix` produced a file that was the opposite of what its
+    // name and its help said.
+    if let Some(dest) = backup {
+        db.backup(dest)?;
+        println!("backup written to {}", dest.display());
+    }
+
     // Embedder health.
     let embed_status = match embedder().and_then(|e| e.health_check().map_err(Into::into)) {
         Ok(()) => "ok".to_owned(),
@@ -6014,10 +6032,6 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         None => println!("db location: ok ({})", db_path.display()),
     }
 
-    if let Some(dest) = backup {
-        db.backup(dest)?;
-        println!("backup written to {}", dest.display());
-    }
     Ok(())
 }
 

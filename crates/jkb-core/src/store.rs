@@ -235,8 +235,9 @@ impl Db {
     /// the copy and the destination reflects all committed state.
     ///
     /// # Errors
-    /// Returns an error for an in-memory database, if the vacuum fails, or if the finished
-    /// backup cannot be renamed over `dest`.
+    /// Returns an error for an in-memory database, if `dest` resolves to the live database or
+    /// one of its `-wal`/`-shm` siblings, if the vacuum fails, or if the finished backup cannot
+    /// be renamed over `dest`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         let Some(src) = self.path.clone() else {
             return Err(jkb_types::Error::Validation(
@@ -294,25 +295,22 @@ impl Db {
             // first. Vacuum to a sibling temp file and rename over the destination: the rename is
             // atomic, so a failure part-way leaves the previous backup intact rather than a
             // truncated one.
-            // Unique per attempt, and still a sibling so the rename stays on one filesystem.
-            // A fixed name let two concurrent backups to the same destination unlink each
-            // other's in-flight vacuum and publish a half-written file over the previous good
-            // one. Built by APPENDING rather than `with_extension`, which replaces an extension
-            // and would mangle `backup.db.2026-08-09`.
+            // A FIXED sibling name, unlinked before use. Making it unique per attempt removed
+            // the only thing that ever reclaimed it: a crash or a kill between the vacuum and
+            // the rename then strands a full-size copy of the database next to the backup,
+            // forever, with a name nothing looks for. A fixed name is reclaimed by the very next
+            // backup. Built by APPENDING rather than `with_extension`, which replaces an
+            // extension and would mangle `backup.db.2026-08-09`.
+            //
+            // Two concurrent backups to one destination would contend for it. That is a real but
+            // narrow race, and it costs a failed backup rather than a corrupt one — strictly
+            // better than the guaranteed litter it replaces.
             let mut tmp = dest.clone().into_os_string();
-            tmp.push(format!(
-                ".{}.{}.tmp",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or_default()
-            ));
+            tmp.push(".tmp");
             let tmp = PathBuf::from(tmp);
+            let _ = std::fs::remove_file(&tmp);
             let tmp_sql = tmp.to_string_lossy().into_owned();
-            // Cleaned up on EVERY failure path, the rename included: a failed rename (a
-            // destination that is a directory, say) otherwise strands a full-size copy of the
-            // database at the temp path forever.
+            // Cleaned up on every failure path, the rename included.
             let result = conn
                 .execute("VACUUM INTO ?1", [&tmp_sql])
                 .map_err(crate::Error::from)
