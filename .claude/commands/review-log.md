@@ -8,6 +8,34 @@ actionable task in a per-run folder mounted into the KB. Do these steps in order
 
 Arguments given: `$ARGUMENTS`
 
+## 0. Self-review first — the workflow is expensive
+
+One run is roughly **16 agents, 3M tokens and an hour**. Spend it on what is hard to spot:
+feature-level gaps, cross-file contradictions, reasoning that needs a whole subsystem in view.
+Do not spend it on defects a checklist catches. `staging-workflow` took 19 passes, and a large
+share of the findings were self-inflicted and self-catchable.
+
+So before launching the reviewer, pass over your own diff (`git diff <range>`) and check:
+
+1. **Did every edit land?** Re-read each file you changed and verify against the re-read, not
+   against what you believe you wrote. Four edits on `staging-workflow` silently never applied,
+   and the commit messages described the behaviour they were supposed to have.
+2. **Does each comment match the code beside it?** Any comment asserting a guarantee — re-read
+   the path and confirm it holds. Shipped wrong at least three times.
+3. **Can each guard actually fire?** Name a concrete input that triggers it. If you cannot, it is
+   inert: a `create_new` claim unlinked one line later, a blocker gated on the one condition
+   that is false where it was needed, an ownership gate over an always-empty set.
+4. **Who else does this?** `grep` for every other call site of the rule before fixing the one you
+   are looking at. Largest single class — 8 of 13 findings in one pass. A rule each caller must
+   remember belongs in the callee, a type, or the schema.
+5. **Does any test exercise this mode at all?** `SyncMode::Export` had none, which is why an
+   export-only mount could never write its first file.
+6. **Added a parameter to a long argument list?** Check every call site passes the right value.
+7. **Run it.** Execute the command path you changed rather than reasoning about it.
+
+Then run `./scripts/check.sh`. Say in the report what this pass caught — a review that finds
+only subtle things is the goal, and a run that surfaces a stale comment was money wasted.
+
 ## 1. Resolve the repo, then create the review folder
 
 **Resolve everything against the MAIN working copy**, not against wherever you are standing.

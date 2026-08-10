@@ -9,6 +9,12 @@ when absent.
 
 Arguments given: `$ARGUMENTS`
 
+## 0. Self-review first
+
+The reviewer costs roughly 16 agents, 3M tokens and an hour per run, so it must be spent on what
+is hard to spot rather than on what a checklist catches. Run the seven-point self-review in
+`/review-log` step 0 over your own diff first, then `./scripts/check.sh`. Say what it caught.
+
 ## 1. Resolve what to review
 
 - **Range**: an argument that looks like a git range or ref (`main...HEAD`, `HEAD~3..`,
