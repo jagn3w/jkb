@@ -165,9 +165,9 @@ where
             // makes the next tick a full re-scan, so the work is picked up rather than waiting
             // for someone to touch those files again.
             eprintln!("sync {mount_ns}: pass failed ({e}); re-scanning on the next event");
-            // A pass-level error tells us nothing about which files are healthy, so the memo is
-            // left alone rather than cleared — clearing it would make the next identical
-            // per-file failure look like new information.
+            // A pass-level error says nothing about which files are healthy, so the debt is
+            // owed unconditionally. The caller decides *when* to settle it: a dropped-event
+            // rescan runs immediately, a retry waits for the backoff.
             true
         }
     }

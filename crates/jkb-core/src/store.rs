@@ -376,6 +376,19 @@ mod tests {
         db.backup(&dest).expect("first backup");
         db.backup(&dest).expect("second backup to the same path");
 
+        // A leftover temp file from a crashed run must be RECLAIMED, which is the whole reason
+        // the name is fixed rather than unique per attempt: a unique name is litter nothing ever
+        // looks for again. Asserting only that the temp is absent after a success left that
+        // property untested — reverting to unique names kept the suite green.
+        let stale = dir.path().join("backup.db.tmp");
+        std::fs::write(&stale, b"leftover from a killed backup").unwrap();
+        db.backup(&dest)
+            .expect("a stale temp file must not block a backup");
+        assert!(
+            !stale.exists(),
+            "the stale temp file must have been reclaimed, not left beside the backup"
+        );
+
         // The backup is a real, readable database carrying the row.
         let restored = Db::open(&dest).unwrap();
         let n: i64 = restored
