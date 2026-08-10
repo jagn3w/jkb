@@ -18,6 +18,9 @@ branches reachable, the same rule honoured at its other call sites, the changed 
 test, new parameters supplied everywhere, and the thing actually run. Then run the repo's verify
 command, and say what the self-review caught.
 
+Reach **high confidence in every part** of the change first: whatever you are unsure of is the
+thing to test, and naming a gap in the report does not substitute for closing it.
+
 ## 1. Resolve what to review
 
 - **Range**: an argument that looks like a git range or ref (`main...HEAD`, `HEAD~3..`,

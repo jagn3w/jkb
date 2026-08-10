@@ -307,11 +307,19 @@ impl Db {
             // file the shared path risked, and there is no lock to go stale and block every
             // future backup after a crash.
             //
-            // The cost is litter: a process killed between the vacuum and the rename strands a
-            // full-size file that no later backup reclaims (the fixed name was reclaimed by the
-            // next run). It is named `<dest>.<pid>.<n>.tmp` so it is recognizable and removable,
-            // and that is the right trade — stray disk is visible and fixable, a backup that
-            // opens cleanly and holds the wrong bytes is not.
+            // The cost, stated precisely so it is not mistaken for a smaller one: a process
+            // killed between the vacuum and the rename strands a full-size copy of the database,
+            // and no later backup reclaims it — the fixed name was reclaimed by the next run.
+            // Every other failure path cleans up (pinned by `a_failed_backup_cleans_up_its_temp
+            // _file`), so the litter is bounded to SIGKILL and power loss, once per such event.
+            //
+            // It is deliberately not reclaimed. Every rule for deleting somebody else's temp
+            // file is a liveness test — is that pid alive, is that file old enough — and the
+            // fixed-name design already showed where that leads: its reclaim deleted a
+            // *concurrent* backup's live file, which is the corruption this exists to prevent.
+            // An age rule fails the same way on a slow vacuum over a large database. Naming it
+            // `<dest>.<pid>.<n>.tmp` makes a stray recognizable and safe for a human to remove,
+            // which is the most that can be done without guessing about another process.
             //
             // The pid alone is not enough: `Db` clones cheaply, so two threads of one process
             // can back up at once. An in-process counter separates those.
@@ -349,6 +357,106 @@ mod tests {
     /// fixed path, which is what the flag invites and what any cron or pre-migration script
     /// uses. `VACUUM INTO` refuses an existing destination, so inheriting its no-clobber rule
     /// would have broken every backup after the first.
+    /// Two backups to the SAME destination at once, which is the scenario the unique temp name
+    /// exists for. One `Db` cannot exercise it — `backup` runs on the writer thread, so two
+    /// calls through one handle serialize — so this opens two handles, as two processes would
+    /// (a cron backup meeting a manual one).
+    ///
+    /// The previous design vacuumed both to one shared `<dest>.tmp`, and whichever finished
+    /// first renamed the OTHER's half-written file over the destination and reported success.
+    /// The `create_new` claim meant to stop that was inert: `VACUUM INTO` insists on creating
+    /// its own file, so the claim was unlinked one line after being taken. With a unique name
+    /// per attempt each writes its own complete database and the later rename simply wins, so
+    /// the destination is always a whole database, never a torn one.
+    #[test]
+    fn two_concurrent_backups_each_leave_a_whole_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("jkb.db");
+        let db = Db::open(&src).unwrap();
+        db.write_txn("t", |conn, meta| {
+            upsert(
+                conn,
+                meta,
+                &NewItem {
+                    uid: "a".to_owned(),
+                    kind: "note".to_owned(),
+                    content: Some("hi".to_owned()),
+                    content_hash: None,
+                    mime: None,
+                },
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let dest = dir.path().join("backup.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                // A separate handle, hence a separate writer thread and connection.
+                let db = Db::open(&src).unwrap();
+                let dest = dest.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.backup(&dest)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("a concurrent backup failed");
+        }
+
+        // Whoever won, the destination is a complete, readable database carrying the row.
+        let restored = Db::open(&dest).unwrap();
+        let n: i64 = restored
+            .read(|conn| Ok(conn.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1, "the surviving backup is not a whole database");
+        assert!(strays(dir.path()).is_empty(), "temp files were left behind");
+    }
+
+    /// A backup that fails after the vacuum must not strand its temp file. Renaming onto an
+    /// existing directory is the failure the OS supplies for free; the point is the cleanup
+    /// path, which is what bounds the litter to hard kills.
+    #[test]
+    fn a_failed_backup_cleans_up_its_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("jkb.db");
+        let db = Db::open(&src).unwrap();
+
+        // A directory cannot be replaced by a rename, so the vacuum succeeds and the rename does
+        // not — exercising the arm between them.
+        let dest = dir.path().join("backup.db");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("occupant"), b"x").unwrap();
+
+        assert!(
+            db.backup(&dest).is_err(),
+            "backing up onto a directory should fail"
+        );
+        assert!(
+            strays(dir.path()).is_empty(),
+            "a failed backup stranded its temp file: {:?}",
+            strays(dir.path())
+        );
+    }
+
+    /// Every `<dest>.<pid>.<n>.tmp` sibling in `dir`. Litter is bounded to hard kills, so any
+    /// stray after a completed call is a cleanup bug.
+    fn strays(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().to_string_lossy().into_owned();
+                let is_temp = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("tmp"));
+                (name.starts_with("backup.db.") && is_temp).then_some(name)
+            })
+            .collect()
+    }
+
     #[test]
     fn backup_overwrites_an_existing_destination() {
         let dir = tempfile::tempdir().unwrap();

@@ -148,11 +148,13 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   at the edges (ollama HTTP, file-watching, MCP).
 - **Indexes are derived** — anything in an index must be rebuildable from the VFS.
 - **Tests:** unit + integration + `proptest` for load-bearing invariants.
-- **Self-review before the reviewer.** `/review` and `/review-log` cost ~16 agents, ~3M tokens
-  and an hour per run. Run step 0 of `/review-log` — did every edit land, does each comment match
-  its code, can each guard fire, who else implements this rule, does any test cover this mode,
-  does every call site pass the new argument, did you actually run it — then `./scripts/check.sh`,
-  and only then launch the workflow. `staging-workflow` needed 19 passes, and a large share of
+- **Self-review before the reviewer, and reach high confidence first.** `/review` and
+  `/review-log` cost ~16 agents, ~3M tokens and an hour per run. Run step 0 of `/review-log` — did
+  every edit land, does each comment match its code, can each guard fire, who else implements this
+  rule, does any test cover this mode, does every call site pass the new argument, did you
+  actually run it — then `./scripts/check.sh`, and only then launch the workflow. **Anything short
+  of high confidence is a blocker, not a disclosure**: what you are unsure of is exactly what to
+  test, and the reviewer's budget must not be spent rediscovering a gap you could already name. `staging-workflow` needed 19 passes, and a large share of
   the findings were self-catchable. **A rule every call site must remember is the defect** — the
   four vector sweeps, the seven layout guards, the retry debt, the write-seam snapshot were all
   one shape. Put it in the callee, a type, or the schema instead.

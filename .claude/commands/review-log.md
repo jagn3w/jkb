@@ -15,6 +15,12 @@ spot: feature-level gaps, cross-file contradictions, reasoning that needs a whol
 view. Do not spend it on defects a careful reading catches — those cost a full extra pass to
 find, plus another to review the fix.
 
+**Reach high confidence in every part of the change before launching.** Naming a shaky area in
+the report is not a substitute for resolving it — if you can already name the gap, the reviewer's
+budget should not be spent rediscovering it. Whatever you are unsure of is precisely the thing to
+test: write the test, run the path, or document the bound. Reasoning about a behaviour is not
+evidence of it, and a test you have not seen fail is not evidence either.
+
 So before launching the reviewer, read your own diff (`git diff <range>`) and check:
 
 1. **Did every edit actually land?** Verify against a re-read of the file, not against what you
@@ -35,8 +41,10 @@ So before launching the reviewer, read your own diff (`git diff <range>`) and ch
    the right value — same-typed neighbours swap silently.
 7. **Did you run it?** Execute the path you changed rather than reasoning about it.
 
-Then run the repo's own verify command (its CI config or contributor docs name it). Say in the
-report what this pass caught: a review that surfaces only subtle things is the goal.
+Then run the repo's own verify command (its CI config or contributor docs name it). List each
+part of the change with your confidence in it; anything short of high gets resolved before the
+reviewer runs, not disclosed alongside its findings. Say in the report what this pass caught: a
+review that surfaces only subtle things is the goal.
 
 ## 1. Resolve the repo, then create the review folder
 
