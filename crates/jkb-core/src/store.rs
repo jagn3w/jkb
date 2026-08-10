@@ -295,40 +295,37 @@ impl Db {
             // first. Vacuum to a sibling temp file and rename over the destination: the rename is
             // atomic, so a failure part-way leaves the previous backup intact rather than a
             // truncated one.
-            // A FIXED sibling name, unlinked before use. Making it unique per attempt removed
-            // the only thing that ever reclaimed it: a crash or a kill between the vacuum and
-            // the rename then strands a full-size copy of the database next to the backup,
-            // forever, with a name nothing looks for. A fixed name is reclaimed by the very next
-            // backup. Built by APPENDING rather than `with_extension`, which replaces an
-            // extension and would mangle `backup.db.2026-08-09`.
+            // The sibling name is UNIQUE per attempt, so two backups never write one file.
             //
-            // Two concurrent backups to one destination would contend for it. That is a real but
-            // narrow race, and it costs a failed backup rather than a corrupt one — strictly
-            // better than the guaranteed litter it replaces.
+            // A shared `<dest>.tmp` was tried first, guarded with `create_new` so a second
+            // backup would be refused. That guard was inert: `VACUUM INTO` insists on creating
+            // the file itself, so the claim had to be unlinked one line after it was taken, and
+            // the `exists()` reclaim above it deleted a *live* claim rather than a stale one —
+            // it excluded nothing in either direction. Exclusion was also the wrong goal.
+            // Concurrent backups writing separate temp files each produce a complete, valid
+            // database and the later rename simply wins; nobody can observe the half-written
+            // file the shared path risked, and there is no lock to go stale and block every
+            // future backup after a crash.
+            //
+            // The cost is litter: a process killed between the vacuum and the rename strands a
+            // full-size file that no later backup reclaims (the fixed name was reclaimed by the
+            // next run). It is named `<dest>.<pid>.<n>.tmp` so it is recognizable and removable,
+            // and that is the right trade — stray disk is visible and fixable, a backup that
+            // opens cleanly and holds the wrong bytes is not.
+            //
+            // The pid alone is not enough: `Db` clones cheaply, so two threads of one process
+            // can back up at once. An in-process counter separates those.
+            //
+            // APPENDED rather than `with_extension`, which replaces an extension and would
+            // mangle a dated destination like `backup.db.2026-08-09`.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let mut tmp = dest.clone().into_os_string();
-            tmp.push(".tmp");
+            tmp.push(format!(
+                ".{}.{}.tmp",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             let tmp = PathBuf::from(tmp);
-            // CLAIMED, not just unlinked. Unlinking first let a second backup to the same
-            // destination start its own vacuum at the same path while ours was still being
-            // written — and whichever finished first renamed the OTHER's half-written file over
-            // the previous good backup, reporting success. That is the shape this function's own
-            // comment calls worst for a backup: it opens cleanly and is wrong. `create_new`
-            // fails instead, and a leftover from a crashed run is reclaimed explicitly.
-            if tmp.exists() {
-                std::fs::remove_file(&tmp)?;
-            }
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| {
-                    jkb_types::Error::Validation(format!(
-                        "another backup to {} is already running ({e})",
-                        dest.display()
-                    ))
-                })?;
-            // `VACUUM INTO` needs to create the file itself, so hand it an empty claimed path.
-            std::fs::remove_file(&tmp)?;
             let tmp_sql = tmp.to_string_lossy().into_owned();
             // Cleaned up on every failure path, the rename included.
             let result = conn
@@ -376,17 +373,31 @@ mod tests {
         db.backup(&dest).expect("first backup");
         db.backup(&dest).expect("second backup to the same path");
 
-        // A leftover temp file from a crashed run must be RECLAIMED, which is the whole reason
-        // the name is fixed rather than unique per attempt: a unique name is litter nothing ever
-        // looks for again. Asserting only that the temp is absent after a success left that
-        // property untested — reverting to unique names kept the suite green.
-        let stale = dir.path().join("backup.db.tmp");
+        // A leftover temp file from a killed run must never BLOCK a backup. It is deliberately
+        // no longer reclaimed: temp names are unique per attempt, so nothing can safely delete
+        // one (the reclaim that a fixed name allowed was deleting a *concurrent* backup's live
+        // file, not a dead one). Litter is the accepted cost; a wedged backup is not.
+        let stale = dir.path().join("backup.db.31337.0.tmp");
         std::fs::write(&stale, b"leftover from a killed backup").unwrap();
         db.backup(&dest)
             .expect("a stale temp file must not block a backup");
+
+        // And a successful backup leaves no temp of its OWN behind — the property that actually
+        // bounds the litter to crashes.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().to_string_lossy().into_owned();
+                let is_temp = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("tmp"));
+                (name.starts_with("backup.db.") && is_temp && name != "backup.db.31337.0.tmp")
+                    .then_some(name)
+            })
+            .collect();
         assert!(
-            !stale.exists(),
-            "the stale temp file must have been reclaimed, not left beside the backup"
+            strays.is_empty(),
+            "a successful backup left its own temp file behind: {strays:?}"
         );
 
         // The backup is a real, readable database carrying the row.

@@ -49,22 +49,10 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     // relevance filtering happens in `sync_paths` against the mount's include/exclude.
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
-    // A failed pass owes a retry. Held in ONE place and consumed in ONE place, because the
-    // previous shape set the flag in the event arm and read it only there — so a mount whose
-    // pass failed and then saw no file activity waited forever for someone to touch a file,
-    // which is exactly what the flag exists to avoid.
-    // The files that failed last pass, so a deterministic failure stops owing retries.
-    let mut retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
-    // Retries are spaced so a deterministically-failing pass does not re-run on every debounce
-    // tick; file events are never delayed by it.
-    // Spacing is measured from when a pass FINISHES, not when it starts: a pass slower than the
-    // interval would otherwise have already "waited" by the time it returned, collapsing the
-    // spacing to zero and running back-to-back full syncs on the single writer thread. And it
-    // backs off, so a permanently failing mount (its namespace deleted, say) does not log and
-    // re-run forever at a fixed rate.
-    let base_retry = debounce.saturating_mul(RETRY_TICKS);
-    let mut retry_after = base_retry;
-    let mut last_retry = Instant::now();
+    let mut debt = RetryDebt::new(
+        run_pass(mount_ns, || engine::sync(db, mount_ns)),
+        debounce.saturating_mul(RETRY_TICKS),
+    );
 
     while !stop.load(Ordering::Relaxed) {
         // What this iteration owes: a full re-scan, or a targeted pass over these paths.
@@ -81,7 +69,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 // — a PNG caught by a `document` glob — and turned every debounced save into a
                 // whole-mount re-walk on the single writer thread, forever. The debt stays owed
                 // either way; the idle arm settles it.
-                if rescan || (retry_owed && last_retry.elapsed() >= retry_after) {
+                if rescan || debt.due() {
                     Some(Work::Full)
                 } else if paths.is_empty() {
                     None
@@ -91,30 +79,80 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
             }
             // An idle tick still settles a debt. Without this the retry only ever fired if a
             // file happened to change, which is the one condition a failed pass cannot rely on.
-            Err(RecvTimeoutError::Timeout) => {
-                (retry_owed && last_retry.elapsed() >= retry_after).then_some(Work::Full)
-            }
+            Err(RecvTimeoutError::Timeout) => debt.due().then_some(Work::Full),
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
         match work {
             Some(Work::Full) => {
-                retry_owed = run_pass(mount_ns, || engine::sync(db, mount_ns));
-                last_retry = Instant::now();
-                retry_after = if retry_owed {
-                    (retry_after * 2).min(MAX_RETRY)
-                } else {
-                    base_retry
-                };
+                debt.full_pass(run_pass(mount_ns, || engine::sync(db, mount_ns)));
             }
             Some(Work::Paths(paths)) => {
-                retry_owed = run_pass(mount_ns, || engine::sync_paths(db, mount_ns, &paths));
-                last_retry = Instant::now();
+                debt.targeted_pass(run_pass(mount_ns, || {
+                    engine::sync_paths(db, mount_ns, &paths)
+                }));
             }
             None => {}
         }
     }
     Ok(())
+}
+
+/// The retry a failed pass owes, plus the backoff that spaces retries out.
+///
+/// This is a type rather than three variables in `watch` because the two kinds of pass update it
+/// **asymmetrically**, and written inline that asymmetry is one character away from vanishing —
+/// and did vanish twice. A full pass re-examined every file, so its result *replaces* the debt.
+/// A targeted pass looked at a handful of event paths and knows nothing about the rest of the
+/// mount, so it can only ever *add* to it. Assigning there let one unrelated successful save
+/// discharge the debt of a failed full pass, which was then never retried at all — the exact
+/// failure the debt exists to prevent. `targeted_pass` has no way to express "replace".
+struct RetryDebt {
+    owed: bool,
+    /// The interval a fresh debt waits, before any backoff doubling.
+    base: Duration,
+    after: Duration,
+    /// When the last **full** pass finished. Measured from the finish, not the start: a pass
+    /// slower than the interval would otherwise have already "waited" by the time it returned,
+    /// collapsing the spacing to zero and running back-to-back full syncs on the writer thread.
+    last: Instant,
+}
+
+impl RetryDebt {
+    fn new(owed: bool, base: Duration) -> Self {
+        Self {
+            owed,
+            base,
+            after: base,
+            last: Instant::now(),
+        }
+    }
+
+    /// Is a retry both owed and due? A dropped-event rescan ignores this and runs immediately;
+    /// only the retry waits.
+    fn due(&self) -> bool {
+        self.owed && self.last.elapsed() >= self.after
+    }
+
+    /// A full pass's result is the whole truth about this mount, so it replaces the debt and
+    /// restarts the clock. The interval doubles while it keeps failing, so a permanently broken
+    /// mount — its namespace deleted, say — does not log and re-run forever at a fixed rate.
+    fn full_pass(&mut self, failed: bool) {
+        self.owed = failed;
+        self.last = Instant::now();
+        self.after = if failed {
+            (self.after * 2).min(MAX_RETRY)
+        } else {
+            self.base
+        };
+    }
+
+    /// A targeted pass can only add to the debt, and deliberately does **not** touch the clock:
+    /// the backoff measures quiet time between *full* passes, so a steady stream of ordinary
+    /// saves would otherwise hold a pending retry off forever.
+    fn targeted_pass(&mut self, failed: bool) {
+        self.owed |= failed;
+    }
 }
 
 /// How many debounce intervals to wait before retrying a failed pass.
@@ -265,5 +303,77 @@ fn collect(res: notify::Result<Event>, paths: &mut BTreeSet<PathBuf>) -> bool {
             false
         }
         Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetryDebt, MAX_RETRY};
+    use std::time::Duration;
+
+    const BASE: Duration = Duration::from_millis(100);
+
+    /// The regression this type exists for. A targeted pass sees only the paths a file event
+    /// named; a successful one is not evidence that the mount-wide failure a full pass recorded
+    /// has gone away. When the targeted arm assigned instead of OR-ing, any unrelated save
+    /// cleared the debt and the failed full pass was never retried — the watcher went quiet on a
+    /// broken mount, which is the one thing it must not do.
+    #[test]
+    fn a_successful_targeted_pass_does_not_discharge_a_full_passs_debt() {
+        let mut debt = RetryDebt::new(true, BASE);
+        debt.targeted_pass(false);
+        assert!(
+            debt.owed,
+            "a successful targeted pass discharged the retry owed by a failed full pass; \
+             that full pass will now never be retried"
+        );
+    }
+
+    /// The clock belongs to full passes. Stamping it here meant a steady stream of ordinary
+    /// saves kept pushing the deadline out, so a due retry never came due.
+    #[test]
+    fn a_targeted_pass_does_not_push_out_a_pending_retry() {
+        let mut debt = RetryDebt::new(true, BASE);
+        let deadline = debt.last;
+        debt.targeted_pass(true);
+        assert_eq!(
+            debt.last, deadline,
+            "a targeted pass moved the backoff clock, delaying a retry that was already owed"
+        );
+    }
+
+    /// The other half of the asymmetry: a full pass re-examined everything, so a clean one is
+    /// entitled to clear the debt and reset the backoff.
+    #[test]
+    fn a_full_pass_replaces_the_debt_in_both_directions() {
+        let mut debt = RetryDebt::new(false, BASE);
+        debt.full_pass(true);
+        assert!(debt.owed, "a failed full pass recorded no debt");
+        assert_eq!(debt.after, BASE * 2, "the retry interval did not back off");
+
+        debt.full_pass(false);
+        assert!(!debt.owed, "a clean full pass left the debt owed");
+        assert_eq!(
+            debt.after, BASE,
+            "the retry interval did not reset after a clean pass"
+        );
+    }
+
+    /// Backoff doubles but is capped, so a permanently broken mount settles at a slow retry
+    /// rather than growing an interval that overflows or effectively stops retrying.
+    #[test]
+    fn backoff_doubles_up_to_the_cap_and_stops() {
+        let mut debt = RetryDebt::new(false, BASE);
+        for _ in 0..100 {
+            debt.full_pass(true);
+        }
+        assert_eq!(debt.after, MAX_RETRY, "backoff did not settle at the cap");
+    }
+
+    /// A debt nothing owes is never due, however long the watcher idles.
+    #[test]
+    fn no_debt_is_never_due() {
+        let debt = RetryDebt::new(false, Duration::ZERO);
+        assert!(!debt.due(), "a mount with no failed pass asked for a retry");
     }
 }

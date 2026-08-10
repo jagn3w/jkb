@@ -1855,3 +1855,76 @@ fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
         "and the journal must say why: {flagged:?}"
     );
 }
+
+/// An export-only mount meeting a file that ALREADY EXISTS on disk, with no journal row yet.
+///
+/// This is the first sight of a file the mount will never import, so the KB is authoritative and
+/// the correct answer is to export over it. The engine routed this through the same helper as the
+/// genuinely-absent-file case, which told the write seam to expect no file at all — so the seam
+/// refused, reporting "changed on disk while it was being synced" about a file that had not
+/// changed at all. An export-only mount could therefore never write its first file, and said
+/// something false about why.
+#[test]
+fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("note.md");
+    fs::write(&file, "stale bytes on disk").unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/out",
+        dir.path(),
+        SyncMode::Export,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+
+    // A KB item bound to that path, created without ever importing the file.
+    let bound_uri = uri.clone();
+    db.write_txn("t", move |conn, meta| {
+        let ns_id = ns::ensure(conn, "docs/out")?;
+        let id = item::upsert(
+            conn,
+            meta,
+            &jkb_core::item::NewItem {
+                uid: "doc:note".to_owned(),
+                kind: "document".to_owned(),
+                content: Some("authored in the kb".to_owned()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        jkb_core::placement::place(conn, meta, id, ns_id, jkb_types::PlacementRole::Primary, 0)?;
+        binding::set(
+            conn,
+            meta,
+            id,
+            &bound_uri,
+            Some(SyncMode::Export),
+            Some("document"),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/out").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "an export-only mount refused its first export: {:?}",
+        report.failed()
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "authored in the kb",
+        "the KB side must overwrite a file this mount never imports"
+    );
+    // The disk side is never read back into the KB on an export-only mount.
+    assert_eq!(
+        content_for(&db, &uri).as_deref(),
+        Some("authored in the kb")
+    );
+}

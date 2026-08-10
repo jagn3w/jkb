@@ -746,7 +746,7 @@ fn outcome_reason(db: &Db, path: &Path) -> Result<Option<String>> {
 /// Reconcile a single file within the current transaction.
 // A linear pipeline — read disk, assemble KB, decide direction, act — ending in one arm per
 // direction. Splitting it further would mean threading the same seven parameters through more
-// helpers than it saves; the stages that carry real logic (`decide_direction`, `missing_file`)
+// helpers than it saves; the stages that carry real logic (`decide_direction`, `export_or_skip`)
 // are already extracted and separately testable.
 #[allow(clippy::too_many_lines)]
 fn reconcile(
@@ -803,7 +803,7 @@ fn reconcile(
     let kb_has_items = !kb_doc.items.is_empty();
 
     let Some((disk_bytes, disk_doc)) = disk else {
-        return missing_file(
+        return export_or_skip(
             conn,
             meta,
             ctx,
@@ -814,6 +814,7 @@ fn reconcile(
             kb_has_items,
             serializer.as_ref(),
             journal.as_ref(),
+            None,
         );
     };
 
@@ -835,7 +836,7 @@ fn reconcile(
                 Outcome::Created,
             );
         }
-        return missing_file(
+        return export_or_skip(
             conn,
             meta,
             ctx,
@@ -846,6 +847,7 @@ fn reconcile(
             kb_has_items,
             serializer.as_ref(),
             journal.as_ref(),
+            Some(&disk_bytes),
         );
     }
 
@@ -949,7 +951,16 @@ fn reconcile(
 /// deleted on disk and a KB-created binding not yet written (`task add --sync`). Otherwise
 /// there is nothing to reconcile.
 #[allow(clippy::too_many_arguments)]
-fn missing_file(
+/// There is no importable disk document for this file — either it is absent, or the mount does
+/// not import and has no journal row yet. Export the KB side if the mount exports, else skip.
+///
+/// `disk` is what the pass actually read: `None` when the file is absent, `Some(bytes)` when it
+/// exists but was not imported. It has to be threaded through as the export's snapshot, and
+/// getting that wrong is not cosmetic — this function was once named for the absent case alone
+/// and hardcoded `None`, so the export-only first sight of an EXISTING file told `write_file` to
+/// expect no file at all. The write seam then refused with "changed on disk while it was being
+/// synced": a failure where an export was correct, and a false account of why.
+fn export_or_skip(
     conn: &Connection,
     meta: &WriteMeta,
     ctx: &Ctx,
@@ -960,11 +971,12 @@ fn missing_file(
     kb_has_items: bool,
     serializer: &dyn SyncSerializer,
     journal: Option<&sync_state::SyncState>,
+    disk: Option<&[u8]>,
 ) -> Result<Outcome> {
     if ctx.exports() && kb_has_items {
-        // No disk document — the file is gone — so expectation falls back to the base.
+        // No disk document to compare against, so expectation falls back to the base.
         return finish_export(
-            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal, None, None,
+            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal, None, disk,
         );
     }
     Ok(Outcome::Skipped)
@@ -1104,7 +1116,7 @@ fn finish_export(
     }
 
     // The guard lives HERE, not at the call site, because two other callers reach this function
-    // — `missing_file` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
+    // — `export_or_skip` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
     if let Some(reason) = export_blocker(conn, ctx, path, bare_uri, serializer, journal, expected)?
     {
@@ -1137,7 +1149,7 @@ fn finish_export(
 /// 1. **Items would vanish.** See [`dropped_items`].
 /// 2. **The structure is unknown while the file has content.** `dropped_items` alone returns
 ///    "nothing dropped" when there is no base document, which made the guard *vacuous* on the
-///    `missing_file` path: a file that exists on disk but has never been imported has no journal
+///    `export_or_skip` path: a file that exists on disk but has never been imported has no journal
 ///    document, so `assemble_kb_doc` yields no layout and no sections, and the export wrote a
 ///    headerless, prose-free dump over it. "No base" means unconstrained only when there is also
 ///    nothing on disk to lose.
