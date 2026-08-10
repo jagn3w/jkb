@@ -116,10 +116,25 @@ pub(crate) fn set_location_facets(
     id: ItemId,
     loc: &Location<'_>,
 ) -> jkb_core::Result<()> {
+    // `base=` is qualified by the branch it was recorded for: `<branch>:<sha>`. A base is the
+    // trunk tip a PARTICULAR branch was cut from, so it is meaningless applied to any other —
+    // and it was being applied to all of them, which disabled the "freshly cut, nothing on it
+    // yet" guard for every branch but one and let an empty live branch read as merged.
+    // Git forbids `:` in a ref name, so splitting on the first one is unambiguous.
+    let qualified;
+    let base = match (loc.base, loc.branch) {
+        (Some(base), Some(branch)) => {
+            qualified = format!("{branch}:{base}");
+            Some(qualified.as_str())
+        }
+        // No branch to attribute it to: store it bare, and let `base_for_branch` decide whether
+        // it is safe to use.
+        (base, _) => base,
+    };
     for (facet, value) in [
         (FACET_BRANCH, loc.branch),
         (FACET_REPO, loc.repo),
-        (FACET_BASE, loc.base),
+        (FACET_BASE, base),
         (FACET_ONTO, loc.onto),
     ] {
         if let Some(value) = value {
@@ -127,6 +142,34 @@ pub(crate) fn set_location_facets(
         }
     }
     Ok(())
+}
+
+/// The base recorded for `branch` specifically, or `None` if this task records none for it.
+///
+/// `None` is the conservative answer and callers must treat it as such: without a base,
+/// `is_merged` cannot tell a rebase-merged branch from one just cut, and closing a task whose
+/// work is still in flight buries it. A missed auto-close costs one command (design D34.4).
+///
+/// A bare (unqualified) value is a pre-qualification record. It is honoured **only** when the
+/// task records exactly one branch — the case it was written for and the case it is correct
+/// for. With several branches there is no way to tell which one it describes, and guessing is
+/// what this function exists to stop.
+pub(crate) fn base_for_branch<'a>(
+    bases: &'a [String],
+    branch: &str,
+    branch_count: usize,
+) -> Option<&'a str> {
+    for v in bases {
+        if let Some((b, sha)) = v.split_once(':') {
+            if b == branch {
+                return Some(sha);
+            }
+        }
+    }
+    if branch_count == 1 {
+        return bases.iter().map(String::as_str).find(|v| !v.contains(':'));
+    }
+    None
 }
 
 /// What the session commands need to know about the repo they are running in.
@@ -251,4 +294,56 @@ pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
         }
         Ok(out)
     })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base_for_branch;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The regression. A task recording two branches has one base, cut for one of them. Lending
+    /// it to the other disabled `is_merged`'s "freshly cut, nothing on it yet" guard for that
+    /// branch, so an empty live session read as merged and `close-merged` marked the task done
+    /// while the work was still uncommitted.
+    #[test]
+    fn a_base_is_never_lent_to_a_branch_it_was_not_cut_for() {
+        let bases = v(&["task/a:abc123"]);
+        assert_eq!(base_for_branch(&bases, "task/a", 2), Some("abc123"));
+        assert_eq!(
+            base_for_branch(&bases, "task/b", 2),
+            None,
+            "task/b was handed task/a's base, which disables the empty-branch guard for it"
+        );
+    }
+
+    /// Each branch gets its own once both are recorded.
+    #[test]
+    fn each_branch_resolves_its_own_base() {
+        let bases = v(&["task/a:aaa", "task/b:bbb"]);
+        assert_eq!(base_for_branch(&bases, "task/a", 2), Some("aaa"));
+        assert_eq!(base_for_branch(&bases, "task/b", 2), Some("bbb"));
+    }
+
+    /// A pre-qualification record is honoured for the single-branch case it was written for —
+    /// otherwise every existing task would lose its guard on upgrade.
+    #[test]
+    fn a_bare_legacy_base_still_applies_to_a_lone_branch() {
+        let bases = v(&["deadbeef"]);
+        assert_eq!(base_for_branch(&bases, "task/a", 1), Some("deadbeef"));
+    }
+
+    /// But not when there are several branches: nothing says which one it describes, and
+    /// guessing is what closes a task whose work is still in flight.
+    #[test]
+    fn a_bare_legacy_base_is_refused_when_several_branches_exist() {
+        let bases = v(&["deadbeef"]);
+        assert_eq!(
+            base_for_branch(&bases, "task/a", 2),
+            None,
+            "an unattributable legacy base was applied to one of several branches"
+        );
+    }
 }

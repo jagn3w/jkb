@@ -419,12 +419,16 @@ fn others_are_covered(
     branch: &str,
     covered: &mut BTreeMap<(String, Option<String>), bool>,
 ) -> Result<bool> {
-    let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
-    for work in crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH) {
+    let bases = crate::repo::facet_values(&t.tags, crate::repo::FACET_BASE);
+    let works = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
+    for work in works {
         if work == branch {
             continue;
         }
-        if !branch_is_in(repo_root, work, branch, base.as_deref(), covered)? {
+        // Per branch: a base describes the one branch it was cut from, and lending it to a
+        // sibling disables the "nothing on it yet" guard for that sibling.
+        let base = crate::repo::base_for_branch(bases, work, works.len());
+        if !branch_is_in(repo_root, work, branch, base, covered)? {
             return Ok(false);
         }
     }
@@ -471,9 +475,10 @@ fn work_is_in(
     if branches.is_empty() {
         return Ok(false);
     }
-    let base = crate::repo::facet_one(&t.tags, crate::repo::FACET_BASE).cloned();
+    let bases = crate::repo::facet_values(&t.tags, crate::repo::FACET_BASE);
     for work in branches {
-        if !branch_is_in(repo_root, work, branch, base.as_deref(), covered)? {
+        let base = crate::repo::base_for_branch(bases, work, branches.len());
+        if !branch_is_in(repo_root, work, branch, base, covered)? {
             return Ok(false);
         }
     }

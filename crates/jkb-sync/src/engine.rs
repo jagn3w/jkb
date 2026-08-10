@@ -1394,6 +1394,25 @@ fn three_way_resolve(
 ) -> Result<Outcome> {
     match three_way(base_doc, disk_doc, kb_doc) {
         ThreeWay::Merged(merged) => {
+            // An export-only mount never takes item edits from disk, so there is nothing to
+            // merge INTO the KB — the KB is authoritative and the file is an output. Resolve it
+            // the way a KB-only change resolves: export over the file. Without this the arm fell
+            // through to `apply_doc` and cancelled the tasks whose lines the disk edit removed.
+            if !ctx.imports() {
+                return finish_export(
+                    conn,
+                    meta,
+                    ctx,
+                    path,
+                    bare_uri,
+                    ser_name,
+                    kb_bytes,
+                    serializer,
+                    journal,
+                    Some(disk_doc),
+                    Some(disk_bytes),
+                );
+            }
             // The merge writes the file AND cancels items the merged doc lacks, so it reaches
             // the same harm `finish_export` guards. It was left ungated on the reasoning that a
             // merge incorporates disk-side *structure* by design — true, and irrelevant: this
@@ -1591,6 +1610,14 @@ fn mark_ok(
 /// Apply `doc` to the KB (create/update items, place them under their section
 /// namespaces, reconcile tags and edges, cancel removed tasks). Two passes so edges
 /// resolve after every item exists. Returns the item ids the doc now maps to.
+///
+/// **This is the only path by which the disk side reaches the KB**, so the "does this mount
+/// import?" rule lives here rather than at each caller. `finish_import` had it and the
+/// three-way `Merged` arm did not, which let a hand edit to a file on an export-only mount
+/// cancel and detach the KB tasks whose lines it removed — silently, and in flat contradiction
+/// of the guarantee that mount makes. Two callers, one of them wrong, is the shape this
+/// codebase has repeatedly paid for; a caller that reaches here without checking is now a loud
+/// failure rather than a quiet deletion.
 fn apply_doc(
     conn: &Connection,
     meta: &WriteMeta,
@@ -1599,6 +1626,13 @@ fn apply_doc(
     bare_uri: &str,
     doc: &SyncDoc,
 ) -> Result<Vec<ItemId>> {
+    if !ctx.imports() {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "refusing to write the disk side of {} into the KB: this mount does not import. \
+             This is a bug in the caller — it should have resolved the file without importing.",
+            path.display()
+        ))));
+    }
     let file_ns_path = namespace_for(ctx, path);
     let file_ns = ns::ensure(conn, &file_ns_path)?;
 

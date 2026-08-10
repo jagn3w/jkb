@@ -5466,11 +5466,15 @@ fn merged_state_of_all(
     cwd: &Path,
     branches: &[String],
     trunk_ref: &str,
-    base: Option<&str>,
+    bases: &[String],
     warned_fallback: &mut bool,
 ) -> Result<gitrepo::MergeState> {
     let mut state = gitrepo::MergeState::Merged;
     for b in branches {
+        // The base belongs to ONE branch. Handing every branch the task's single recorded base
+        // disabled the "freshly cut, nothing on it yet" guard for all the others, so an empty
+        // live branch read as merged and its task closed mid-session.
+        let base = repo::base_for_branch(bases, b, branches.len());
         // The remote copy answers "did this work ship?" — after a merged PR the local branch is
         // usually stale or already deleted (design D34.2).
         let (s, fell_back) = gitrepo::is_merged(cwd, b, trunk_ref, base, gitrepo::Prefer::Remote)?;
@@ -5491,7 +5495,7 @@ fn merged_state_of_all(
 
 /// `task close-merged` — close tasks whose branch has landed (design D34.4).
 /// The uid, status and location facets `close-merged` needs for one task.
-type CloseMergedRow = (String, Option<String>, Vec<String>, Option<String>);
+type CloseMergedRow = (String, Option<String>, Vec<String>, Vec<String>);
 
 /// Read one task's uid, status, `branch=` and `base=` in a single database round-trip.
 fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
@@ -5499,11 +5503,6 @@ fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
         .read(move |conn| {
             let meta = item::get(conn, id)?;
             let tags = tag::applications(conn, id)?;
-            let of = |facet: &str| {
-                tags.iter()
-                    .find(|(f, _)| f == facet)
-                    .map(|(_, v)| v.clone())
-            };
             // EVERY `branch=` value, not one of them. The previous reader took
             // `tags.iter().find(...)`, and `tag::applications` is `ORDER BY facet, value`, so it
             // silently picked the lexicographically smallest branch: with `a-merged` and
@@ -5514,7 +5513,12 @@ fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
                 .filter(|(f, _)| f == repo::FACET_BRANCH)
                 .map(|(_, v)| v.clone())
                 .collect();
-            Ok(meta.map(|m| (m.uid, m.status, branches, of(repo::FACET_BASE))))
+            let bases: Vec<String> = tags
+                .iter()
+                .filter(|(f, _)| f == repo::FACET_BASE)
+                .map(|(_, v)| v.clone())
+                .collect();
+            Ok(meta.map(|m| (m.uid, m.status, branches, bases)))
         })?
         .unwrap_or_default())
 }
@@ -5557,19 +5561,13 @@ fn cmd_task_close_merged(
     let mut warned_fallback = false;
 
     for id in ids {
-        let (uid, status, branches, base) = close_merged_row(db, id)?;
+        let (uid, status, branches, bases) = close_merged_row(db, id)?;
         if branches.is_empty() || jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
             continue;
         }
         let branch = branches.join(", ");
 
-        let state = merged_state_of_all(
-            &cwd,
-            &branches,
-            &trunk_ref,
-            base.as_deref(),
-            &mut warned_fallback,
-        )?;
+        let state = merged_state_of_all(&cwd, &branches, &trunk_ref, &bases, &mut warned_fallback)?;
         match state {
             gitrepo::MergeState::Merged => {
                 // A merged branch is evidence, not proof: a task with unfinished subtasks
