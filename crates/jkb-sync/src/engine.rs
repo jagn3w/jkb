@@ -796,59 +796,37 @@ fn reconcile(
         None
     };
 
+    // Everything the reconcile helpers need about this file, bundled once. `snapshot` is the
+    // bytes read above — the single authoritative answer to "what did this pass see on disk",
+    // which the write seam re-checks before overwriting.
+    let f = FileCtx {
+        ctx,
+        path,
+        bare_uri: &bare_uri,
+        ser_name: &ser_name,
+        serializer: serializer.as_ref(),
+        journal: journal.as_ref(),
+        snapshot: disk.as_ref().map(|(bytes, _)| bytes.as_slice()),
+    };
+
     // Assemble the KB side and render it, so we can hash it against the base.
     let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
     let kb_bytes = serializer.render(&kb_doc)?;
     let kb_hash = hash(&kb_bytes);
     let kb_has_items = !kb_doc.items.is_empty();
 
-    let Some((disk_bytes, disk_doc)) = disk else {
-        return export_or_skip(
-            conn,
-            meta,
-            ctx,
-            path,
-            &bare_uri,
-            &ser_name,
-            &kb_bytes,
-            kb_has_items,
-            serializer.as_ref(),
-            journal.as_ref(),
-            None,
-        );
+    let Some((disk_bytes, disk_doc)) = disk.as_ref() else {
+        return export_or_skip(conn, meta, &f, &kb_bytes, kb_has_items);
     };
 
-    let disk_hash = hash(&disk_bytes);
+    let disk_hash = hash(disk_bytes);
 
     // First sight of this file (no journal row yet).
     if journal.is_none() {
         if ctx.imports() {
-            return finish_import(
-                conn,
-                meta,
-                ctx,
-                path,
-                &bare_uri,
-                &ser_name,
-                serializer.as_ref(),
-                &disk_doc,
-                &disk_bytes,
-                Outcome::Created,
-            );
+            return finish_import(conn, meta, &f, disk_doc, Outcome::Created);
         }
-        return export_or_skip(
-            conn,
-            meta,
-            ctx,
-            path,
-            &bare_uri,
-            &ser_name,
-            &kb_bytes,
-            kb_has_items,
-            serializer.as_ref(),
-            journal.as_ref(),
-            Some(&disk_bytes),
-        );
+        return export_or_skip(conn, meta, &f, &kb_bytes, kb_has_items);
     }
 
     let (disk_changed, kb_changed, base_doc) = decide_direction(
@@ -857,7 +835,7 @@ fn reconcile(
         journal.as_ref(),
         base_hash.as_deref(),
         Sides {
-            disk: (&disk_doc, &disk_hash),
+            disk: (disk_doc, &disk_hash),
             kb: (&kb_bytes, &kb_hash),
         },
     )?;
@@ -875,8 +853,8 @@ fn reconcile(
                 // The three renderings are equal here by construction (that is what
                 // `(false, false)` means), so writing `kb_bytes` cannot change the document —
                 // only its formatting.
-                if kb_bytes != disk_bytes {
-                    write_file(path, &kb_bytes, Some(&disk_bytes))?;
+                if kb_bytes != *disk_bytes {
+                    write_file(path, &kb_bytes, Some(disk_bytes))?;
                 }
                 mark_ok(
                     conn,
@@ -903,42 +881,13 @@ fn reconcile(
             }
             Ok(Outcome::UpToDate)
         }
-        (true, false) => finish_import(
-            conn,
-            meta,
-            ctx,
-            path,
-            &bare_uri,
-            &ser_name,
-            serializer.as_ref(),
-            &disk_doc,
-            &disk_bytes,
-            Outcome::Imported,
-        ),
-        (false, true) => finish_export(
-            conn,
-            meta,
-            ctx,
-            path,
-            &bare_uri,
-            &ser_name,
-            &kb_bytes,
-            serializer.as_ref(),
-            journal.as_ref(),
-            Some(&disk_doc),
-            Some(&disk_bytes),
-        ),
+        (true, false) => finish_import(conn, meta, &f, disk_doc, Outcome::Imported),
+        (false, true) => finish_export(conn, meta, &f, &kb_bytes, Some(disk_doc)),
         (true, true) => three_way_resolve(
             conn,
             meta,
-            ctx,
-            path,
-            &bare_uri,
-            &ser_name,
-            serializer.as_ref(),
-            journal.as_ref(),
-            &disk_doc,
-            &disk_bytes,
+            &f,
+            disk_doc,
             &kb_doc,
             &kb_bytes,
             &base_doc.unwrap_or_default(),
@@ -963,21 +912,23 @@ fn reconcile(
 fn export_or_skip(
     conn: &Connection,
     meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
-    ser_name: &str,
+    f: &FileCtx<'_>,
     kb_bytes: &[u8],
     kb_has_items: bool,
-    serializer: &dyn SyncSerializer,
-    journal: Option<&sync_state::SyncState>,
-    disk: Option<&[u8]>,
 ) -> Result<Outcome> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        ser_name,
+        serializer,
+        journal,
+        snapshot,
+    } = *f;
+    let _ = (path, bare_uri, ser_name, serializer, journal, snapshot);
     if ctx.exports() && kb_has_items {
         // No disk document to compare against, so expectation falls back to the base.
-        return finish_export(
-            conn, meta, ctx, path, bare_uri, ser_name, kb_bytes, serializer, journal, None, disk,
-        );
+        return finish_export(conn, meta, f, kb_bytes, None);
     }
     Ok(Outcome::Skipped)
 }
@@ -1062,15 +1013,21 @@ fn resolve_serializer(
 fn finish_import(
     conn: &Connection,
     meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
-    ser_name: &str,
-    serializer: &dyn SyncSerializer,
+    f: &FileCtx<'_>,
     doc: &SyncDoc,
-    disk_bytes: &[u8],
     outcome: Outcome,
 ) -> Result<Outcome> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        ser_name,
+        serializer,
+        journal,
+        snapshot,
+    } = *f;
+    let disk_bytes = snapshot.unwrap_or_default();
+    let _ = journal;
     if !ctx.imports() {
         return Ok(Outcome::Skipped);
     }
@@ -1078,7 +1035,10 @@ fn finish_import(
     let rendered = serializer.render(doc)?;
     // Persist identity / normalization back to disk (the rendered form is authoritative).
     if rendered != disk_bytes {
-        write_file(path, &rendered, Some(disk_bytes))?;
+        // `snapshot`, not `Some(disk_bytes)`: they differ exactly when the file was absent,
+        // where the first says "expect nothing there" and the second "expect an empty file".
+        // Constructing a snapshot at the call site is what this refactor exists to stop.
+        write_file(path, &rendered, snapshot)?;
     }
     // An import is one of the two ways a file's structure legitimately changes, so this is
     // where the journal learns it (D45.4).
@@ -1099,18 +1059,19 @@ fn finish_import(
 fn finish_export(
     conn: &Connection,
     meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
-    ser_name: &str,
+    f: &FileCtx<'_>,
     kb_bytes: &[u8],
-    serializer: &dyn SyncSerializer,
-    journal: Option<&sync_state::SyncState>,
     expected: Option<&SyncDoc>,
-    // What this pass read from disk, re-validated at the write seam. `None` means the file was
-    // absent when the pass began, so nothing was preserved for it.
-    snapshot: Option<&[u8]>,
 ) -> Result<Outcome> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        ser_name,
+        serializer: _,
+        journal,
+        snapshot,
+    } = *f;
     if !ctx.exports() {
         return Ok(Outcome::Skipped);
     }
@@ -1118,8 +1079,7 @@ fn finish_export(
     // The guard lives HERE, not at the call site, because two other callers reach this function
     // — `export_or_skip` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
-    if let Some(reason) = export_blocker(conn, ctx, path, bare_uri, serializer, journal, expected)?
-    {
+    if let Some(reason) = export_blocker(conn, f, expected)? {
         flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
         return Ok(Outcome::Refused);
     }
@@ -1155,13 +1115,19 @@ fn finish_export(
 ///    nothing on disk to lose.
 fn export_blocker(
     conn: &Connection,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
-    serializer: &dyn SyncSerializer,
-    journal: Option<&sync_state::SyncState>,
+    f: &FileCtx<'_>,
     disk_doc: Option<&SyncDoc>,
 ) -> Result<Option<String>> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        ser_name,
+        serializer,
+        journal,
+        snapshot,
+    } = *f;
+    let _ = (ser_name, snapshot);
     let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
     if !dropped.is_empty() {
         // Name the items by their real uid, LOOKED UP rather than derived. A sync-created item's
@@ -1380,18 +1346,21 @@ fn flag_needs_attention(
 fn three_way_resolve(
     conn: &Connection,
     meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
-    ser_name: &str,
-    serializer: &dyn SyncSerializer,
-    journal: Option<&sync_state::SyncState>,
+    f: &FileCtx<'_>,
     disk_doc: &SyncDoc,
-    disk_bytes: &[u8],
     kb_doc: &SyncDoc,
     kb_bytes: &[u8],
     base_doc: &SyncDoc,
 ) -> Result<Outcome> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        ser_name,
+        serializer,
+        journal,
+        snapshot,
+    } = *f;
     match three_way(base_doc, disk_doc, kb_doc) {
         ThreeWay::Merged(merged) => {
             // An export-only mount never takes item edits from disk, so there is nothing to
@@ -1399,19 +1368,7 @@ fn three_way_resolve(
             // the way a KB-only change resolves: export over the file. Without this the arm fell
             // through to `apply_doc` and cancelled the tasks whose lines the disk edit removed.
             if !ctx.imports() {
-                return finish_export(
-                    conn,
-                    meta,
-                    ctx,
-                    path,
-                    bare_uri,
-                    ser_name,
-                    kb_bytes,
-                    serializer,
-                    journal,
-                    Some(disk_doc),
-                    Some(disk_bytes),
-                );
+                return finish_export(conn, meta, f, kb_bytes, Some(disk_doc));
             }
             // The merge writes the file AND cancels items the merged doc lacks, so it reaches
             // the same harm `finish_export` guards. It was left ungated on the reasoning that a
@@ -1421,22 +1378,14 @@ fn three_way_resolve(
             // It mattered because the refusal's own advice is "edit the file", and that edit is
             // what routes a refused file into this arm. Following the tool's instructions
             // deleted the line the refusal had just protected.
-            if let Some(reason) = export_blocker(
-                conn,
-                ctx,
-                path,
-                bare_uri,
-                serializer,
-                journal,
-                Some(disk_doc),
-            )? {
+            if let Some(reason) = export_blocker(conn, f, Some(disk_doc))? {
                 flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
                 return Ok(Outcome::Refused);
             }
             let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
             let rendered = serializer.render(&merged)?;
             if ctx.exports() {
-                write_file(path, &rendered, Some(disk_bytes))?;
+                write_file(path, &rendered, snapshot)?;
             }
             settle(
                 conn,
@@ -1450,33 +1399,9 @@ fn three_way_resolve(
             Ok(Outcome::Merged)
         }
         ThreeWay::Conflict => match ctx.conflict_policy.as_str() {
-            "disk_wins" => finish_import(
-                conn,
-                meta,
-                ctx,
-                path,
-                bare_uri,
-                ser_name,
-                serializer,
-                disk_doc,
-                disk_bytes,
-                Outcome::ResolvedFromDisk,
-            ),
+            "disk_wins" => finish_import(conn, meta, f, disk_doc, Outcome::ResolvedFromDisk),
             "kb_wins" => {
-                if finish_export(
-                    conn,
-                    meta,
-                    ctx,
-                    path,
-                    bare_uri,
-                    ser_name,
-                    kb_bytes,
-                    serializer,
-                    journal,
-                    Some(disk_doc),
-                    Some(disk_bytes),
-                )? == Outcome::Refused
-                {
+                if finish_export(conn, meta, f, kb_bytes, Some(disk_doc))? == Outcome::Refused {
                     return Ok(Outcome::Refused);
                 }
                 Ok(Outcome::ResolvedFromKb)
@@ -1601,6 +1526,32 @@ fn mark_ok(
         },
     )?;
     Ok(())
+}
+
+/// Everything about the file being reconciled that does not change during the pass.
+///
+/// These six values were threaded as positional arguments through five helpers — ten to
+/// thirteen parameters each, six of them the same six every time, four of those `&str` or
+/// `Option<&...>` and so interchangeable without a type error. `snapshot` is the one that
+/// matters: it is the bytes this pass read from disk, which the write seam re-checks before
+/// overwriting, and passing the wrong one means writing over an edit that landed mid-pass.
+/// It had already been passed wrongly once — `export_or_skip` hardcoded `None` on a path
+/// reachable with the file present, so an export-only mount refused its own first write and
+/// blamed a disk change that never happened.
+///
+/// Bundling them makes that specific mistake unspellable: there is one snapshot, it belongs to
+/// the file, and no call site chooses it. `Copy`, so passing it costs a pointer and nothing
+/// reads as a move.
+#[derive(Clone, Copy)]
+struct FileCtx<'a> {
+    ctx: &'a Ctx,
+    path: &'a Path,
+    bare_uri: &'a str,
+    ser_name: &'a str,
+    serializer: &'a dyn SyncSerializer,
+    journal: Option<&'a sync_state::SyncState>,
+    /// What this pass read from disk: `None` when the file is absent.
+    snapshot: Option<&'a [u8]>,
 }
 
 // ---------------------------------------------------------------------------
