@@ -121,39 +121,104 @@ pub(crate) fn set_location_facets(
     // and it was being applied to all of them, which disabled the "freshly cut, nothing on it
     // yet" guard for every branch but one and let an empty live branch read as merged.
     // Git forbids `:` in a ref name, so splitting on the first one is unambiguous.
-    let qualified;
-    let base = match (loc.base, loc.branch) {
-        (Some(base), Some(branch)) => {
-            qualified = format!("{branch}:{base}");
-            Some(qualified.as_str())
-        }
-        // No branch to attribute it to: store it bare, and let `base_for_branch` decide whether
-        // it is safe to use.
-        (base, _) => base,
-    };
+    let base = loc.base;
     for (facet, value) in [
         (FACET_BRANCH, loc.branch),
         (FACET_REPO, loc.repo),
-        (FACET_BASE, base),
         (FACET_ONTO, loc.onto),
     ] {
         if let Some(value) = value {
             set_facet(conn, meta, id, facet, value)?;
         }
     }
+    // `base=` is the one location facet that is legitimately MULTI-valued: one per branch. It
+    // must not go through `set_facet`, which clears the facet's other values — that would delete
+    // the base recorded for a sibling branch, leaving every branch but the last written with
+    // none, which is exactly the state the per-branch lookup cannot serve.
+    if let Some(base) = base {
+        match loc.branch {
+            Some(branch) => set_qualified_facet(conn, meta, id, FACET_BASE, branch, base)?,
+            // Unattributable, so it can only be the single-branch fallback; one value at most.
+            None => set_facet(conn, meta, id, FACET_BASE, base)?,
+        }
+    }
     Ok(())
+}
+
+/// Set one value of a facet whose values are qualified `<key>:<value>`, replacing only the
+/// entry for `key` and leaving its siblings intact.
+///
+/// [`set_facet`] is wrong for these: it clears every other value, which for `base=` means
+/// recording one branch's base deletes another's. `tag::apply` alone is wrong too — it is
+/// additive, so re-recording the same branch's base would accumulate stale entries and the
+/// lookup would return whichever came first.
+fn set_qualified_facet(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    facet: &str,
+    key: &str,
+    value: &str,
+) -> jkb_core::Result<()> {
+    let qualified = format!("{key}:{value}");
+    let prefix = format!("{key}:");
+    for (f, v) in tag::applications(conn, id)? {
+        if f == facet && v != qualified && v.starts_with(&prefix) {
+            tag::remove(conn, meta, id, &f, &v)?;
+        }
+    }
+    tag::apply(conn, meta, id, facet, &qualified)
 }
 
 /// The base recorded for `branch` specifically, or `None` if this task records none for it.
 ///
-/// `None` is the conservative answer and callers must treat it as such: without a base,
-/// `is_merged` cannot tell a rebase-merged branch from one just cut, and closing a task whose
-/// work is still in flight buries it. A missed auto-close costs one command (design D34.4).
+/// `None` means "no base is recorded for this branch" — nothing more. It was documented here as
+/// "the conservative answer", which was exactly backwards: `is_merged` used to SKIP its
+/// freshly-cut guard when handed no base, so `None` was the permissive answer and an empty live
+/// branch read as merged. The safety now lives in `is_merged`, which refuses to call a branch
+/// merged when it has no base and carries no commits trunk lacks — the one place that knows what
+/// a base means, rather than a rule each of the three readers had to remember.
 ///
 /// A bare (unqualified) value is a pre-qualification record. It is honoured **only** when the
 /// task records exactly one branch — the case it was written for and the case it is correct
 /// for. With several branches there is no way to tell which one it describes, and guessing is
 /// what this function exists to stop.
+/// Does `branch` count as landed *for the purpose of acting on the task*?
+///
+/// The one place that turns a git fact into a decision, and the only thing the three readers —
+/// `close-merged`, `review::others_are_covered`, `review::work_is_in` — may ask.
+///
+/// [`gitrepo::is_merged`] answers a narrower, purely factual question: does this branch add
+/// anything to trunk? It deliberately falls through its freshly-cut guard when given no base,
+/// which keeps merge-commit and rebase detection working for a hand-tagged branch. That is right
+/// for a git query and wrong as a licence to act: `merge-tree` on a branch with no commits yields
+/// trunk's own tree, so an empty live session read as `Merged` and `close-merged` marked its task
+/// done with the work still uncommitted.
+///
+/// So the policy lives here. **No base recorded for this branch means we do not act.** Without
+/// one, "cut and not started" and "landed and cleaned up" are indistinguishable — that ambiguity
+/// is the entire reason `base=` exists — and of the two ways to be wrong, a missed auto-close
+/// costs one command while a wrong one buries work still in flight (design D34.4).
+///
+/// The cost, accepted: a branch tagged by hand with no `base=` no longer auto-closes. `jkb task
+/// start` and `jkb task work` both record one, so this only affects facets written by hand.
+///
+/// # Errors
+/// Returns an error if git cannot be run.
+pub(crate) fn landed_for_action(
+    cwd: &std::path::Path,
+    branch: &str,
+    trunk_ref: &str,
+    bases: &[String],
+    branch_count: usize,
+    prefer: crate::gitrepo::Prefer,
+) -> anyhow::Result<(crate::gitrepo::MergeState, bool)> {
+    let Some(base) = base_for_branch(bases, branch, branch_count) else {
+        return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
+    };
+    crate::gitrepo::is_merged(cwd, branch, trunk_ref, Some(base), prefer)
+}
+
 pub(crate) fn base_for_branch<'a>(
     bases: &'a [String],
     branch: &str,
@@ -298,10 +363,108 @@ pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
 
 #[cfg(test)]
 mod tests {
-    use super::base_for_branch;
+    use super::{base_for_branch, set_location_facets, task_tags, Location, FACET_BASE};
+    use jkb_core::{item::NewItem, Db};
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Two branches, each with its own base, written the way the CLI writes them.
+    ///
+    /// The earlier version of this test hand-built a two-base state, which no writer could
+    /// produce: `set_location_facets` wrote `base=` through `set_facet`, and that clears the
+    /// facet's other values — so recording a base for one branch deleted the other's, every
+    /// branch but the last fell to the single-branch fallback and got `None`, and the
+    /// qualification could have been deleted entirely with this test still green.
+    #[test]
+    fn each_branch_keeps_its_own_base_through_the_real_writer() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |conn, meta| {
+                let id = jkb_core::item::upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "task:t".to_owned(),
+                        kind: "task".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                set_location_facets(
+                    conn,
+                    meta,
+                    id,
+                    &Location {
+                        branch: Some("task/a"),
+                        base: Some("aaa"),
+                        ..Location::default()
+                    },
+                )?;
+                set_location_facets(
+                    conn,
+                    meta,
+                    id,
+                    &Location {
+                        branch: Some("task/b"),
+                        base: Some("bbb"),
+                        ..Location::default()
+                    },
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+
+        let tags = task_tags(&db, id).unwrap();
+        let bases = super::facet_values(&tags, FACET_BASE);
+        assert_eq!(
+            base_for_branch(bases, "task/a", 2),
+            Some("aaa"),
+            "recording task/b's base deleted task/a's"
+        );
+        assert_eq!(base_for_branch(bases, "task/b", 2), Some("bbb"));
+    }
+
+    /// Re-recording the same branch's base replaces it rather than accumulating, or the lookup
+    /// would return whichever stale entry came first.
+    #[test]
+    fn re_recording_one_branchs_base_replaces_it() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |conn, meta| {
+                let id = jkb_core::item::upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: "task:t".to_owned(),
+                        kind: "task".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                for base in ["old", "new"] {
+                    set_location_facets(
+                        conn,
+                        meta,
+                        id,
+                        &Location {
+                            branch: Some("task/a"),
+                            base: Some(base),
+                            ..Location::default()
+                        },
+                    )?;
+                }
+                Ok(id)
+            })
+            .unwrap();
+
+        let tags = task_tags(&db, id).unwrap();
+        let bases = super::facet_values(&tags, FACET_BASE);
+        assert_eq!(bases.len(), 1, "stale bases accumulated: {bases:?}");
+        assert_eq!(base_for_branch(bases, "task/a", 1), Some("new"));
     }
 
     /// The regression. A task recording two branches has one base, cut for one of them. Lending

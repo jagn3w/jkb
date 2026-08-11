@@ -4274,7 +4274,16 @@ fn cmd_task_start(
     // silently rewrote the session's base to trunk — and `work_is_in` uses `base=` precisely
     // to tell "cut from the target with nothing on it yet" from "landed", so it started
     // crediting empty branches as reviewed. An existing base is left alone.
-    let base = if repo::facet_one(&repo::task_tags(db, id)?, repo::FACET_BASE).is_some() {
+    // Ask whether THIS branch has a base, not whether the task has any: bases are qualified
+    // per branch, so a base recorded for a sibling says nothing about this one, and treating it
+    // as "already recorded" left the new branch with none at all.
+    let recorded = {
+        let tags = repo::task_tags(db, id)?;
+        let bases = repo::facet_values(&tags, repo::FACET_BASE).to_vec();
+        let branches = repo::facet_values(&tags, repo::FACET_BRANCH).to_vec();
+        repo::base_for_branch(&bases, &branch, branches.len()).is_some()
+    };
+    let base = if recorded {
         None
     } else {
         gitrepo::rev(
@@ -4522,7 +4531,17 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     // land target so `land` and a resumed `work` agree on it. These four facets are *set*,
     // not added: a second value would be a contradiction rather than extra information, and
     // is how a task ends up with two branches and one worktree.
-    let base = gitrepo::rev(&ctx.root, &onto)?;
+    // Only when the branch is actually created. A base records where a branch was CUT, so
+    // nothing running after the cut can re-derive it — and this line ran on every resume, so a
+    // session whose land target had moved got a base equal to the target's NEW tip. Its own tip
+    // then differed from its base, the empty-branch guard was skipped, and `close-merged` marked
+    // the task done with no work on it. This is the defect `cmd_task_start` above was fixed for;
+    // the more travelled path did not get the matching guard.
+    let base = if resumed {
+        None
+    } else {
+        gitrepo::rev(&ctx.root, &onto)?
+    };
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
     db.write_txn("cli", move |conn, meta| {
         repo::set_location_facets(
@@ -5471,13 +5490,18 @@ fn merged_state_of_all(
 ) -> Result<gitrepo::MergeState> {
     let mut state = gitrepo::MergeState::Merged;
     for b in branches {
-        // The base belongs to ONE branch. Handing every branch the task's single recorded base
-        // disabled the "freshly cut, nothing on it yet" guard for all the others, so an empty
-        // live branch read as merged and its task closed mid-session.
-        let base = repo::base_for_branch(bases, b, branches.len());
-        // The remote copy answers "did this work ship?" — after a merged PR the local branch is
-        // usually stale or already deleted (design D34.2).
-        let (s, fell_back) = gitrepo::is_merged(cwd, b, trunk_ref, base, gitrepo::Prefer::Remote)?;
+        // `landed_for_action`, not `is_merged`: closing a task is acting on the answer, so a
+        // branch with no recorded base must not count as landed. The remote copy answers "did
+        // this work ship?" — after a merged PR the local branch is usually stale or already
+        // deleted (design D34.2).
+        let (s, fell_back) = repo::landed_for_action(
+            cwd,
+            b,
+            trunk_ref,
+            bases,
+            branches.len(),
+            gitrepo::Prefer::Remote,
+        )?;
         if fell_back && !*warned_fallback {
             *warned_fallback = true;
             eprintln!(

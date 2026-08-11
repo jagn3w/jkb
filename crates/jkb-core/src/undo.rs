@@ -58,12 +58,29 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
     // item-less render over the file, silently emptying it. `undo_last` could select such a
     // transaction (it inserts items), so this was reachable by a bare `jkb undo` with the
     // watcher running.
+    // NOT selectable — see `SELECTS_A_TRANSACTION`. This inverse exists to accompany a sync
+    // transaction that also touched items; on its own the journal is bookkeeping, not work.
     ("update", Some("sync_state"), Inverse::SyncStateRow),
     // Any table on `UNDOABLE_TABLES`; an insert into anything else is an error, not a skip.
     // The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so a
     // table-specific `insert` inverse placed after it would never be reached.
     ("insert", None, Inverse::DeleteRow),
 ];
+
+/// Whether an entry of this kind may make its transaction the one a bare `jkb undo` picks.
+///
+/// Being invertible and being *the user's last change* are different questions, and conflating
+/// them is a bug: several sync transactions write nothing but the journal — a refusal flagging
+/// `needs_attention`, a re-settle, a legacy row being populated — and once `sync_state` joined
+/// the inverse list those became "the last invertible transaction". A user running `jkb undo`
+/// to take back a `task add` would silently rewind a journal flag instead, reporting "reverted
+/// 1 change(s)", leaving the task untouched and the refused file invisible to `jkb doctor`.
+///
+/// Keyed on the same tuples as `INVERSES` so the two cannot drift into disagreeing about a table
+/// neither list mentions.
+fn selects_a_transaction(op: &str, table: Option<&str>) -> bool {
+    !matches!((op, table), ("update", Some("sync_state")))
+}
 
 /// The inversion for a changelog entry, or `None` if this module cannot reverse it.
 fn inverse_for(op: &str, table: &str) -> Option<Inverse> {
@@ -224,10 +241,20 @@ fn invert_entry(
 /// file, silently emptying it.
 fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) -> Result<usize> {
     let Some(snap) = before else {
-        // No before-state means this transaction created the row: remove it, so the file reads
-        // as never synced rather than as synced to bytes that are gone.
+        // NO BEFORE-STATE, AND IT IS AMBIGUOUS. `sync_state` writes are always logged with op
+        // `update`, so an absent snapshot means either "this transaction created the row" or
+        // "this entry was written before the snapshot existed" — and every entry any older
+        // binary wrote is the second kind. Deleting on that reading destroys a journal row that
+        // may long predate the transaction being undone, taking `base_blob_hash` and the
+        // migrated `document` with it and making the file read as never synced.
+        //
+        // So clear only `last_synced_hash`, which is the field the undo actually invalidates:
+        // the items it describes have just been removed. The next reconcile then has no hash to
+        // trust and re-decides direction against the stored base, which is correct for both
+        // readings and self-healing for either. The base and the document survive, so nothing
+        // that cannot be rebuilt is lost.
         return Ok(conn
-            .prepare_cached("DELETE FROM sync_state WHERE uri = ?1")?
+            .prepare_cached("UPDATE sync_state SET last_synced_hash = NULL WHERE uri = ?1")?
             .execute(params![entity_id])?);
     };
     let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -481,6 +508,11 @@ pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
     let mut clauses = Vec::with_capacity(INVERSES.len());
     let mut args: Vec<SqlValue> = Vec::new();
     for (op, table, _) in INVERSES {
+        // An inverse says we CAN reverse this entry; it does not say the entry is worth
+        // selecting a transaction for. A journal-only write is bookkeeping, not the user's work.
+        if !selects_a_transaction(op, *table) {
+            continue;
+        }
         args.push(SqlValue::Text((*op).to_owned()));
         if let Some(t) = table {
             clauses.push("(c.op = ? AND c.entity_type = ?)".to_owned());
@@ -1000,5 +1032,42 @@ mod tests {
             .expect("the mount must survive: the edit is what was undone, not the mount");
         assert_eq!(mount.conflict_policy, ConflictPolicy::Manual.as_str());
         assert_eq!(mount.include_glob.as_deref(), Some("**/tasks.md"));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::selects_a_transaction;
+
+    /// A journal-only sync transaction must never be what a bare `jkb undo` picks.
+    ///
+    /// Several sync transactions write nothing but the journal — flagging `needs_attention`,
+    /// re-settling a stale base, populating a legacy row. Adding `sync_state` to the inverse
+    /// list made those eligible, so `jkb undo` meaning to take back a `task add` would rewind a
+    /// journal flag instead, report "reverted 1 change(s)", leave the task untouched, and make
+    /// the refused file invisible to `jkb doctor`.
+    #[test]
+    fn a_journal_only_transaction_is_not_the_last_undoable_change() {
+        assert!(
+            !selects_a_transaction("update", Some("sync_state")),
+            "a journal-only sync transaction can be selected by a bare `jkb undo`"
+        );
+    }
+
+    /// Everything else still selects — the exclusion is one tuple, not a new policy.
+    #[test]
+    fn real_work_still_selects_a_transaction() {
+        for (op, table) in [
+            ("insert", None),
+            ("delete", Some("items")),
+            ("update", Some("edges")),
+            ("update", Some("mounts")),
+            ("update", Some("containment")),
+        ] {
+            assert!(
+                selects_a_transaction(op, table),
+                "{op}/{table:?} stopped selecting a transaction"
+            );
+        }
     }
 }

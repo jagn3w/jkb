@@ -396,8 +396,19 @@ fn branch_is_in(
     if let Some(known) = covered.get(&key) {
         return Ok(*known);
     }
-    let (state, _) =
-        crate::gitrepo::is_merged(repo_root, work, branch, base, crate::gitrepo::Prefer::Local)?;
+    // `landed_for_action`, not `is_merged`: crediting a task as reviewed is acting on the
+    // answer, and a branch with no recorded base must not be credited — an empty live sibling
+    // otherwise reads as covered and `reviewed=<sha>` is stamped for work no review saw.
+    let (state, _) = crate::repo::landed_for_action(
+        repo_root,
+        work,
+        branch,
+        base.map(|b| vec![format!("{work}:{b}")])
+            .unwrap_or_default()
+            .as_slice(),
+        1,
+        crate::gitrepo::Prefer::Local,
+    )?;
     let answer = matches!(
         state,
         crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
