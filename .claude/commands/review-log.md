@@ -15,6 +15,13 @@ spot: feature-level gaps, cross-file contradictions, reasoning that needs a whol
 view. Do not spend it on defects a careful reading catches — those cost a full extra pass to
 find, plus another to review the fix.
 
+**Any doubt you can put into words is a test to write, not a line in the focus argument.** If you
+can name the question — "what does this do on the other kind of mount", "what happens when this
+field is empty" — you can answer it yourself, usually in minutes, and answering it is cheaper and
+more certain than a reviewer rediscovering it. The focus argument is for what you *cannot* check:
+a perspective you lack. Findings should surprise you; one that merely confirms a doubt you
+already held means the review was spent on work you owed it.
+
 **Reach high confidence in every part of the change before launching.** Naming a shaky area in
 the report is not a substitute for resolving it — if you can already name the gap, the reviewer's
 budget should not be spent rediscovering it. Whatever you are unsure of is precisely the thing to
