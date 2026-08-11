@@ -2003,3 +2003,45 @@ fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
         "the export-only mount did not rewrite the file from the KB"
     );
 }
+
+/// Undo, then sync, must never strip the file. This is the harm assertion the previous fix
+/// lacked: bytes on disk, not a journal field.
+///
+/// `jkb undo` of a sync removes the items. If the journal keeps describing them —
+/// `base_blob_hash` and `document` surviving while only `last_synced_hash` is cleared — the next
+/// reconcile finds the disk unchanged against that base and the KB now empty, takes the export
+/// arm, and writes an item-less render over the file. Undo is supposed to give work back.
+#[test]
+fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
+    assert_eq!(task_count(&db), 3, "setup: the tasks should have imported");
+
+    // Undo the sync the way a user reaching for `jkb undo` would: the trailing mirror
+    // transaction, then the reconcile itself. Not more — a third would start unwinding the mount
+    // and the test would be measuring something else.
+    for _ in 0..2 {
+        db.write_txn("cli", jkb_core::undo::undo_last)
+            .expect("undo should succeed");
+    }
+
+    // Whatever the undo did to the KB, the next reconcile must not damage the file.
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the reconcile after undo failed: {:?}",
+        report.failed()
+    );
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(
+        after.contains("Set up CI")
+            && after.contains("Fix flaky test")
+            && after.contains("Ship button"),
+        "syncing after an undo stripped task lines from the file:\n{after}"
+    );
+}

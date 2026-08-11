@@ -33,7 +33,7 @@ enum Inverse {
     MountConfig,
     /// Restore a containment row's previous container and position.
     ContainmentRow,
-    /// Restore a sync journal row's previous state, or remove one this transaction created.
+    /// Restore a sync journal row's previous state, or neutralize one whose transaction is being undone.
     SyncStateRow,
     /// Delete the inserted row by `rowid`.
     DeleteRow,
@@ -248,13 +248,26 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
         // may long predate the transaction being undone, taking `base_blob_hash` and the
         // migrated `document` with it and making the file read as never synced.
         //
-        // So clear only `last_synced_hash`, which is the field the undo actually invalidates:
-        // the items it describes have just been removed. The next reconcile then has no hash to
-        // trust and re-decides direction against the stored base, which is correct for both
-        // readings and self-healing for either. The base and the document survive, so nothing
-        // that cannot be rebuilt is lost.
+        // So clear the whole basis for the next direction decision — hash, base blob AND
+        // document — rather than deleting the row.
+        //
+        // Clearing only `last_synced_hash` was tried and is worse than either: `base_blob_hash`
+        // and `document` then still described the items this undo had just deleted, so the next
+        // reconcile loaded that base, found the disk unchanged against it and the KB now empty,
+        // and took the `(false, true)` EXPORT arm — writing an item-less render over the file and
+        // stripping every task line from it. Undo is supposed to give work back, not delete more.
+        //
+        // With all three cleared, `load_base_doc` returns `None`, the base reads as empty, and
+        // the disk side's items look like additions: an importing mount re-imports the file and
+        // heals itself, while an exporting one sees `kb_has_items == false` and skips. The blob
+        // itself is never deleted (`jkb blob ls` still finds it), so this loses a pointer, not
+        // content.
         return Ok(conn
-            .prepare_cached("UPDATE sync_state SET last_synced_hash = NULL WHERE uri = ?1")?
+            .prepare_cached(
+                "UPDATE sync_state
+                    SET last_synced_hash = NULL, base_blob_hash = NULL, document = NULL
+                  WHERE uri = ?1",
+            )?
             .execute(params![entity_id])?);
     };
     let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);

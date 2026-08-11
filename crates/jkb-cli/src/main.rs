@@ -4281,7 +4281,9 @@ fn cmd_task_start(
         let tags = repo::task_tags(db, id)?;
         let bases = repo::facet_values(&tags, repo::FACET_BASE).to_vec();
         let branches = repo::facet_values(&tags, repo::FACET_BRANCH).to_vec();
-        repo::base_for_branch(&bases, &branch, branches.len()).is_some()
+        let _ = &branches;
+        // The WRITER's question, so no legacy fallback: see `qualified_base_for`.
+        repo::qualified_base_for(&bases, &branch).is_some()
     };
     let base = if recorded {
         None
@@ -6227,6 +6229,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
     let review::Recording {
         recorded,
         skipped_unlanded,
+        skipped_no_base,
     } = review::record(db, &ctx.root, &ctx.key, &branch, sha.as_deref(), &findings)?;
 
     if json {
@@ -6240,14 +6243,21 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
                     "uid": r.uid, "moved_to_review": r.moved_to_review,
                 })).collect::<Vec<_>>(),
                 "skipped_unlanded": skipped_unlanded,
+                "skipped_no_base": skipped_no_base,
             })
         );
         return Ok(());
     }
     if recorded.is_empty() {
         // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and
-        // not an error (design D38.4).
-        println!("no task records branch={branch} — nothing to tag (review still filed)");
+        // not an error (design D38.4). But "no task records this branch" and "tasks record it
+        // and every one was skipped" are different facts, and printing the first while the
+        // skipped list appears directly beneath it contradicted the very next line.
+        if skipped_unlanded.is_empty() && skipped_no_base.is_empty() {
+            println!("no task records branch={branch} — nothing to tag (review still filed)");
+        } else {
+            println!("nothing tagged for branch={branch} — every matching task was skipped, below (review still filed)");
+        }
     } else {
         println!(
             "recorded review of {branch}@{} -> {findings}",
@@ -6264,6 +6274,15 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
     }
     // Said out loud, because a task landing on this branch whose work is not in it yet has
     // NOT been reviewed, and silence would read as "everything was tagged".
+    if !skipped_no_base.is_empty() {
+        println!(
+            "not tagged — no base= recorded for their work branch, so whether this review saw \
+             them cannot be decided (run `jkb task start`, or re-tag base=<branch>:<sha>):"
+        );
+        for uid in &skipped_no_base {
+            println!("  {uid}");
+        }
+    }
     if !skipped_unlanded.is_empty() {
         println!(
             "not tagged — landing on {branch} but not merged into it yet, so this review did \

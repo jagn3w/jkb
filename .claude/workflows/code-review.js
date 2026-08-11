@@ -69,6 +69,9 @@ const VERIFY_BATCH = 5
 
 const diffCmd = RANGE ? `git diff ${RANGE}` : 'git diff HEAD'
 const statCmd = RANGE ? `git diff --stat ${RANGE}` : 'git diff --stat HEAD'
+// The authoritative file list. The survey's is self-reported under a skim budget, so the
+// catch-all area checks its own coverage against git rather than against that.
+const nameOnlyCmd = RANGE ? `git diff --name-only ${RANGE}` : 'git diff --name-only HEAD'
 
 // ---------------------------------------------------------------------------
 // Schemas — structured returns, so the coordinator never parses prose.
@@ -512,7 +515,7 @@ function surveyPrompt() {
 
 2. FUNCTIONAL UNITS. Cluster the change into the coherent CAPABILITIES it delivers — things a user or caller would name, not files. A capability usually spans several files (a command, the function behind it, its tests). At most ${FEATURE_CAP}: merge the smallest rather than exceeding it, and prefer fewer larger units to slicing one capability in two. For each give a short name, its purpose in a sentence, the paths involved, and how a caller reaches it. A pure refactor delivering no new capability returns zero units.
 
-BUDGET — this step is a map, not a reading. Skim the diff for structure; do NOT open the changed files, do NOT chase callers, do NOT read design docs (another agent is doing that in parallel), and do NOT verify anything. Aim to finish in a handful of tool calls. Everything you leave undone, twelve reviewers will do properly with their own eyes.
+BUDGET — this step is a map, not a reading. Skim the diff for structure; do NOT open the changed files, do NOT chase callers, do NOT read design docs (another agent is doing that in parallel), and do NOT verify anything. Aim to finish in a handful of tool calls. Everything you leave undone, the reviewers will do properly with their own eyes.
 
 If the diff is empty, return an empty file list and say so in the summary.`
 }
@@ -550,7 +553,8 @@ you are confident and it is serious.`
 // TESTING DISCIPLINE behind each question is what makes the set worth keeping — each exists
 // because nothing else finds that class — so they are listed individually rather than blurred
 // into "look for bugs", which is what a reviewer defaults to when the questions are not named.
-function areaPrompt(scout, area) {
+function areaPrompt(scout, area, allAreas) {
+  const others = allAreas.filter((a) => a.name !== area.name)
   return `${preamble(scout, `the reviewer of one area of this change: "${area.name}"`)}
 
 THE AREA YOU OWN
@@ -559,6 +563,18 @@ THE AREA YOU OWN
 
 You are one of at most ${AREA_CAP} reviewers, each owning a different area. Review YOUR files
 and everything they reach; another reviewer owns the rest, so do not spend your budget there.
+${others.length ? `\nThe other reviewers own:\n${others.map((a) => `  ${a.name}: ${a.files.join(', ')}`).join('\n')}\n` : ''}${
+    area.catchAll
+      ? `\nYOU ARE ALSO THE CATCH-ALL. The file lists above came from a skim of the diff, under an
+explicit budget not to open anything — so they can be incomplete, and a file named in no area is
+a file NO reviewer opens, which reads exactly like a clean review of it. Before you start, run:
+
+  ${nameOnlyCmd}
+
+Anything git lists that appears in no area above is YOURS. Say in \`coverage\` which files that
+added, or that there were none — silence there is indistinguishable from not having checked.\n`
+      : ''
+  }
 
 Work through every question below against this area. They are separate questions on purpose —
 each is a different kind of assumption, and each has a testing discipline behind it that exists
@@ -937,9 +953,14 @@ if (FAN_OUT_LENSES) {
   }
 } else {
   const areas = buildAreas(scout)
+  // One area carries the catch-all duty, and it is the smallest: it has the most budget left to
+  // spend on whatever the survey missed. Exactly one, so an unlisted file has one owner rather
+  // than three or none.
+  const smallest = areas.reduce((a, b) => (a.files.length <= b.files.length ? a : b))
+  smallest.catchAll = true
   reviewers = areas.map((a) => ({
     label: `area:${a.name}`.slice(0, 40),
-    prompt: areaPrompt(scout, a),
+    prompt: areaPrompt(scout, a, areas),
     tag: `area:${a.name}`,
   }))
   log(`${areas.length} area reviewer(s): ${areas.map((a) => `${a.name} (${a.files.length} file(s))`).join(' · ')}`)

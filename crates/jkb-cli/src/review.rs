@@ -293,6 +293,12 @@ pub(crate) fn record(
     // `jkb task land` graft never-reviewed work — the one direction a safety check must not
     // fail (see `GateVerdict::NoFindingsRecorded`).
     let mut skipped_unlanded = Vec::new();
+    // Skipped for a DIFFERENT reason: the landing policy needs a `base=` for the work branch and
+    // none is recorded, so containment is undecidable. Reporting these as "not merged yet" was
+    // simply untrue — `/task-swarm` writes `onto=`/`branch=`/`repo=` and never `base=`, so every
+    // swarm task landed here and the command asserted something false about a branch that was
+    // fully contained.
+    let mut skipped_no_base = Vec::new();
     let mut on_branch: Vec<(ItemId, String)> = Vec::new();
     // One merge probe per distinct (work branch, base): a swarm group puts the same `branch=`
     // on every task in it, and each probe is about four git spawns.
@@ -320,12 +326,16 @@ pub(crate) fn record(
             // never saw it.
             if others_are_covered(repo_root, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
+            } else if !task_records_a_base(&t) {
+                skipped_no_base.push(t.meta.uid.clone());
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
             }
         } else if names(crate::repo::FACET_ONTO) {
             if work_is_in(repo_root, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
+            } else if !task_records_a_base(&t) {
+                skipped_no_base.push(t.meta.uid.clone());
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
             }
@@ -335,6 +345,7 @@ pub(crate) fn record(
         return Ok(Recording {
             recorded: Vec::new(),
             skipped_unlanded,
+            skipped_no_base,
         });
     }
 
@@ -369,6 +380,7 @@ pub(crate) fn record(
             })
             .collect(),
         skipped_unlanded,
+        skipped_no_base,
     })
 }
 
@@ -378,6 +390,9 @@ pub(crate) struct Recording {
     /// Tasks landing on this branch whose own work is not in it yet, so the review cannot
     /// have covered them. Reported, because silence here reads as "everything was tagged".
     pub(crate) skipped_unlanded: Vec<String>,
+    /// Skipped because no `base=` is recorded for the task's work branch, so whether that work
+    /// is contained in the reviewed branch cannot be decided. A different fact from "not merged".
+    pub(crate) skipped_no_base: Vec<String>,
 }
 
 /// Whether `work`'s commits are already contained in `branch`, memoized per `(work, base)`:
@@ -491,4 +506,10 @@ fn work_is_in(
         }
     }
     Ok(true)
+}
+
+/// Whether this task records any `base=` at all — the fact that decides whether a containment
+/// answer is "no" or "unknown".
+fn task_records_a_base(t: &crate::repo::RepoTask) -> bool {
+    !crate::repo::facet_values(&t.tags, crate::repo::FACET_BASE).is_empty()
 }

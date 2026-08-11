@@ -51,7 +51,10 @@ pub(crate) fn facet_values<'a>(
     tags.get(facet).map_or(&[], Vec::as_slice)
 }
 
-/// The single value of a facet that should only ever have one (`onto`, `repo`, `base`).
+/// The single value of a facet that should only ever have one (`onto`, `repo`).
+///
+/// **Not `base`.** It is per-branch multi-valued — one `<branch>:<sha>` per branch — so use
+/// [`base_for_branch`] to read it and [`qualified_base_for`] to ask whether one is recorded.
 pub(crate) fn facet_one<'a>(
     tags: &'a BTreeMap<String, Vec<String>>,
     facet: &str,
@@ -137,7 +140,17 @@ pub(crate) fn set_location_facets(
     // none, which is exactly the state the per-branch lookup cannot serve.
     if let Some(base) = base {
         match loc.branch {
-            Some(branch) => set_qualified_facet(conn, meta, id, FACET_BASE, branch, base)?,
+            Some(branch) => {
+                set_qualified_facet(conn, meta, id, FACET_BASE, branch, base)?;
+                // Drop any unqualified leftover. It names a branch nothing can identify, and
+                // `base_for_branch`'s single-branch fallback would otherwise hand it to whichever
+                // branch asked next — a base from one branch deciding another's fate.
+                for (f, v) in tag::applications(conn, id)? {
+                    if f == FACET_BASE && !v.contains(':') {
+                        tag::remove(conn, meta, id, &f, &v)?;
+                    }
+                }
+            }
             // Unattributable, so it can only be the single-branch fallback; one value at most.
             None => set_facet(conn, meta, id, FACET_BASE, base)?,
         }
@@ -242,6 +255,23 @@ pub(crate) fn landed_with_base(
         return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
     };
     crate::gitrepo::is_merged(cwd, branch, trunk_ref, Some(base), prefer)
+}
+
+/// The base recorded **for this branch specifically**, ignoring any unqualified legacy value.
+///
+/// This is the WRITER's question — "does this branch already have a base, or must I record one?"
+/// — and it must not accept the bare fallback [`base_for_branch`] allows. `branch=` is
+/// single-valued, so `branch_count` is 1 on essentially every real task, and the fallback
+/// therefore fired for a bare `base=` left over from before bases were qualified. `task start`
+/// read that as "already recorded", wrote no base for the new branch, and the stale value was
+/// then lent to it — closing the task as merged with nothing on the branch, which is the exact
+/// auto-close `base=` exists to prevent.
+///
+/// Readers keep [`base_for_branch`]: honouring a legacy value for a lone branch is right when
+/// answering "where was this cut", and wrong when deciding whether to write.
+pub(crate) fn qualified_base_for<'a>(bases: &'a [String], branch: &str) -> Option<&'a str> {
+    let prefix = format!("{branch}:");
+    bases.iter().find_map(|v| v.strip_prefix(&prefix))
 }
 
 pub(crate) fn base_for_branch<'a>(

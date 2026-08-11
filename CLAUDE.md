@@ -583,8 +583,14 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   tell a session you are sitting in from one you walked away from, and a flag built on that pid
   labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
   is observable — uncommitted work and commits ahead.
-- **Location facets are set, not added.** `branch=`/`repo=`/`onto=`/`base=` go through
-  `set_facet`, which clears the facet's other values first. `tag::apply` is additive, which is
+- **Location facets are set, not added — except `base=`.** `branch=`/`repo=`/`onto=` go through
+  `set_facet`, which clears the facet's other values first. **`base=` is per-branch
+  multi-valued**: it records where one particular branch was cut (`base=<branch>:<sha>`), so a
+  task with two branches legitimately has two, and putting it through `set_facet` deleted the
+  sibling's — leaving every branch but the last with none, which the landing policy then refuses
+  to act on. It goes through `set_qualified_facet`, which replaces only the entry whose
+  `<branch>:` prefix matches. Read it with `base_for_branch`; ask whether one is recorded with
+  `qualified_base_for`, which deliberately ignores the unqualified legacy fallback. `tag::apply` is additive, which is
   right for open-ended facets and wrong here: a second `branch=` is a contradiction, not extra
   information, and readers that collapse the multi-map pick one and mint a second session for a
   task that already has one. `task_tags` therefore returns **all** values per facet, and the
@@ -638,11 +644,14 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   the findings decide landing. Recording a review is the **only** author of that transition.
 - **`jkb task tag set`** is the sibling of `add`/`rm` that makes a value a facet's only one.
   `add` stays additive, honest to its name — an open-ended facet legitimately holds several
-  values. `set` is for `branch=`/`onto=`/`repo=`/`base=`, where a second value is a
+  values. `set` is for `branch=`/`onto=`/`repo=`, where a second value is a
   contradiction and a reader collapsing the multi-map picks one at random (D36.6). Load-bearing
-  because `/task-swarm` re-tags a group on every pass.
+  because `/task-swarm` re-tags a group on every pass. **Not for `base=`** — that one is
+  per-branch, and `tag set base=<sha>` replaces every per-branch record with one unattributable
+  value, after which landing and review-recording either lend the wrong base or stop acting.
 - **The swarm records where it is working.** `/task-swarm` sets `onto=<integration>`/`repo=`
-  at claim and `branch=` once the implementer has one, so `staging ls` shows swarm work and
+  at claim and `branch=` plus `base=<branch>:<sha>` once the implementer has one, so `staging ls`
+  shows swarm work and
   hand-driven work in one view rather than the half it was told about. `/review-log` calls
   `jkb task review record` after mounting its findings, and says whether the branch can land.
 - **Deliberately unchanged:** `scripts/merge-queue.sh`. The swarm already runs a fresh

@@ -276,9 +276,32 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 
 // Record the implementer's branch on every task in the group, so `jkb staging ls` can show
 // the sub-branch and its commits exactly as it does for a hand-driven session (D38.2).
+//
+// `base=` is recorded with it, and is not optional bookkeeping. Landing and review-recording
+// both refuse to act on a branch with no base, because without one an empty freshly-cut branch
+// and a landed one are indistinguishable. The swarm previously wrote `onto=`/`branch=`/`repo=`
+// and no base, so `jkb task review record` on the integration branch skipped every swarm task —
+// reporting them as "not merged into it yet" when they were fully contained in it.
+//
+// It is qualified `<branch>:<sha>` because a task may carry several branches and a base
+// describes exactly one of them. The sha is the integration branch's tip at the moment this
+// group's branch was cut from it, which is what the implementer step just did.
 function branchTagPrompt(group, branch) {
-  const cmds = group.tasks.map((t) => `${JKB}${DB} task tag set ${t.uid} branch=${branch}`).join(' && ')
-  return `Mechanical step — in the main copy at ${REPO}, record this group's working branch:
+  const cmds = group.tasks
+    .map(
+      (t) =>
+        `${JKB}${DB} task tag set ${t.uid} branch=${branch} && ` +
+        `${JKB}${DB} task tag set ${t.uid} base=${branch}:"$base"`,
+    )
+    .join(' && ')
+  return `Mechanical step — in the main copy at ${REPO}, record this group's working branch and
+the commit it was cut from:
+
+First capture the base — the integration branch's tip that ${branch} was cut from:
+
+  base=$(git -C ${REPO} rev-parse ${INTEGRATION})
+
+Then run:
 
 ${cmds}
 
