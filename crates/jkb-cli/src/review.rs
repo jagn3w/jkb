@@ -399,14 +399,11 @@ fn branch_is_in(
     // `landed_for_action`, not `is_merged`: crediting a task as reviewed is acting on the
     // answer, and a branch with no recorded base must not be credited — an empty live sibling
     // otherwise reads as covered and `reviewed=<sha>` is stamped for work no review saw.
-    let (state, _) = crate::repo::landed_for_action(
+    let (state, _) = crate::repo::landed_with_base(
         repo_root,
         work,
         branch,
-        base.map(|b| vec![format!("{work}:{b}")])
-            .unwrap_or_default()
-            .as_slice(),
-        1,
+        base,
         crate::gitrepo::Prefer::Local,
     )?;
     let answer = matches!(

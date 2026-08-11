@@ -213,7 +213,32 @@ pub(crate) fn landed_for_action(
     branch_count: usize,
     prefer: crate::gitrepo::Prefer,
 ) -> anyhow::Result<(crate::gitrepo::MergeState, bool)> {
-    let Some(base) = base_for_branch(bases, branch, branch_count) else {
+    landed_with_base(
+        cwd,
+        branch,
+        trunk_ref,
+        base_for_branch(bases, branch, branch_count),
+        prefer,
+    )
+}
+
+/// [`landed_for_action`] for a caller that has already resolved the base for this branch.
+///
+/// The policy — **no base, do not act** — lives here so both entry points share it. A caller
+/// holding a resolved base previously had to re-qualify it into a `<branch>:<sha>` string purely
+/// so the other entry point could take it apart again, which is the kind of round trip that
+/// invites someone to skip the helper and call `is_merged` directly.
+///
+/// # Errors
+/// Returns an error if git cannot be run.
+pub(crate) fn landed_with_base(
+    cwd: &std::path::Path,
+    branch: &str,
+    trunk_ref: &str,
+    base: Option<&str>,
+    prefer: crate::gitrepo::Prefer,
+) -> anyhow::Result<(crate::gitrepo::MergeState, bool)> {
+    let Some(base) = base else {
         return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
     };
     crate::gitrepo::is_merged(cwd, branch, trunk_ref, Some(base), prefer)
@@ -368,6 +393,30 @@ mod tests {
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The policy both entry points share: with no base recorded for this branch we do not act,
+    /// whatever git would say. `is_merged` deliberately falls through its freshly-cut guard when
+    /// given no base — right for a factual query, and a licence to close a live task if used as
+    /// one, since `merge-tree` on a branch with no commits yields trunk's own tree.
+    ///
+    /// Asserted without a git repo: reaching git at all would mean the refusal did not happen.
+    #[test]
+    fn no_recorded_base_means_do_not_act() {
+        let (state, fell_back) = super::landed_with_base(
+            std::path::Path::new("/nonexistent-so-git-would-fail"),
+            "task/a",
+            "main",
+            None,
+            crate::gitrepo::Prefer::Local,
+        )
+        .expect("a missing base must be answered without consulting git");
+        assert_eq!(
+            state,
+            crate::gitrepo::MergeState::NothingToMerge,
+            "a branch with no recorded base was treated as landed"
+        );
+        assert!(!fell_back);
     }
 
     /// Two branches, each with its own base, written the way the CLI writes them.
