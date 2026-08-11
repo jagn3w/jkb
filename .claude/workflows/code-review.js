@@ -1,7 +1,7 @@
 export const meta = {
   name: 'code-review',
   description:
-    'Reviews a diff along nine specialist lenses plus one holistic reviewer per functional unit, consolidates duplicates, and ranks the result. At effort "high" every finding is additionally put to three adversarial skeptics, batched by file, and survives on a majority. Returns structured findings, so a command can act on them.',
+    'Reviews a diff and returns ranked, structured findings. At the default effort "low", up to three reviewers split the change by feature area and each asks every lens question against one reading of its code. "medium" fans the lenses out instead — nine specialists plus one holistic reviewer per functional unit. "high" adds three adversarial skeptics per finding, batched by file, surviving on a majority.',
   whenToUse:
     'Called by /review (prints findings) and /review-log (writes them as jkb tasks). Works in any git repo; project conventions, design docs and review history are used when present and skipped when absent.',
   phases: [
@@ -18,24 +18,47 @@ export const meta = {
 const cfg = (typeof args === 'string' ? JSON.parse(args) : args) || {}
 const REPO = cfg.repo || '.'
 const RANGE = cfg.range || '' // e.g. "main...HEAD"; empty = working tree vs HEAD
-// Two tiers, not three (design D37.9). `low` files findings without verifying them at all;
-// `high` verifies them by vote. There is deliberately no middle: a single skeptic is neither
-// cheap nor a vote, and the measured per-finding kill rate (6%) did not pay for one.
-const EFFORT = cfg.effort === 'high' ? 'high' : 'low'
-if (cfg.effort && !['low', 'high'].includes(cfg.effort)) {
-  log(`NOTE: effort "${cfg.effort}" is not a tier; there is no medium — running "low" (unverified). Pass "high" to verify by vote.`)
+// Three tiers, and the axis is BREADTH OF FAN-OUT, not how hard anyone looks (design D37.10).
+//
+//   low     (default) up to 3 reviewers, split by feature area, each carrying every lens
+//           question in one prompt. Unverified.
+//   medium  the previous default: 9 lens reviewers (one question, whole diff) plus one holistic
+//           reviewer per functional unit. Unverified.
+//   high    medium, plus every finding put to three adversarial skeptics, batched by file.
+//
+// `low` is the default because `medium` was costing ~3M tokens and an hour per run, and the
+// reviewers overlapped heavily: nine agents each read the same diff, so the same file was loaded
+// nine times and near-duplicate findings then had to be merged back together. One agent holding
+// a whole feature area asks the same questions against one reading of the code. Reach for
+// `medium` when breadth matters more than cost — a large or unfamiliar change — and `high`
+// before merging something risky.
+const TIERS = ['low', 'medium', 'high']
+const EFFORT = TIERS.includes(cfg.effort) ? cfg.effort : 'low'
+if (cfg.effort && !TIERS.includes(cfg.effort)) {
+  log(`NOTE: effort "${cfg.effort}" is not a tier (${TIERS.join(' · ')}) — running "low".`)
 }
 const VERIFY = EFFORT === 'high'
+// Whether to fan out one agent per lens. `low` folds every lens into each area reviewer instead.
+const FAN_OUT_LENSES = EFFORT !== 'low'
+// How many area reviewers `low` runs. Three is a ceiling, not a target: a change touching one
+// area gets one reviewer, and splitting a small diff three ways would re-read it three times,
+// which is the cost this tier exists to remove.
+const AREA_CAP = 3
 const FOCUS = cfg.focus || '' // optional free-text steer from the user
 
-// Effort scales how much is looked at, not how hard: the nine lenses always all run, because a
-// lens skipped is a class of bug nobody looked for.
+// Effort scales how much is looked at, not how hard. Every lens question is asked at every
+// tier — a question skipped is a class of bug nobody looked for; what changes is whether each
+// gets its own agent and its own reading of the diff.
 const FEATURE_CAP = VERIFY ? 5 : 3
 // Findings each reviewer may report. Unbounded, twelve reviewers produced 69 raw findings on a
-// 2.8k-line diff. It bounds the reader's load at `low` and the verification bill at `high`, and
-// it improves what comes back: a reviewer forced to pick its five best reports its five best,
-// rather than padding with everything it noticed.
-const PER_REVIEWER_CAP = VERIFY ? 8 : 5
+// 2.8k-line diff. The cap bounds the reader's load and the verification bill, and it improves
+// what comes back: a reviewer forced to pick its five best reports its five best rather than
+// padding with everything it noticed.
+//
+// It scales with how much each reviewer OWNS, or the cap silently becomes the budget. A `low`
+// area reviewer asks ten questions across a whole area, so five would make it drop real
+// findings to fit — the failure this cap exists to avoid, inverted.
+const PER_REVIEWER_CAP = VERIFY ? 8 : FAN_OUT_LENSES ? 5 : 12
 // Hard ceiling on how many findings enter verification. Anything beyond it is still REPORTED,
 // marked unverified — dropping findings silently would make a budget look like a clean review.
 const VERIFY_CAP = 60
@@ -518,6 +541,67 @@ other questions — stay on yours; do not report a finding that belongs to anoth
 you are confident and it is serious.`
 }
 
+// The `low` tier's reviewer: one agent owning one area, asking EVERY lens question against a
+// single reading of its code (design D37.10).
+//
+// It is deliberately not a shortened review. The lens questions below are the same ones the nine
+// `medium` reviewers ask; what is removed is the nine separate readings of the same diff, and
+// the merge pass that had to put their near-duplicate findings back together. The distinct
+// TESTING DISCIPLINE behind each question is what makes the set worth keeping — each exists
+// because nothing else finds that class — so they are listed individually rather than blurred
+// into "look for bugs", which is what a reviewer defaults to when the questions are not named.
+function areaPrompt(scout, area) {
+  return `${preamble(scout, `the reviewer of one area of this change: "${area.name}"`)}
+
+THE AREA YOU OWN
+  name:  ${area.name}
+  files: ${area.files.join(', ')}
+
+You are one of at most ${AREA_CAP} reviewers, each owning a different area. Review YOUR files
+and everything they reach; another reviewer owns the rest, so do not spend your budget there.
+
+Work through every question below against this area. They are separate questions on purpose —
+each is a different kind of assumption, and each has a testing discipline behind it that exists
+because nothing else finds that class of defect. A question that finds nothing here is a fine
+outcome; skipping it silently is not, so say in \`coverage\` which ones you asked and what
+engaged them.
+
+  1. INPUT & BOUNDARY — *what values break this?* Every value crossing into the changed code:
+     arguments, file contents, env, config, database rows, network responses, filenames, user
+     text. What does the code assume that is not guaranteed? Empty, huge, absent, malformed,
+     hostile, wrong encoding, wrong type. (Injection lives here.)
+  2. STATE & TIME — *what happens the second time?* Re-run it, resume it, interrupt it halfway.
+     What is left behind, what is assumed fresh, what was already true? Partial writes, stale
+     caches, an operation that is not idempotent but is retried.
+  3. INFERENCE — *X is treated as evidence of Y — when do they come apart?* Find each place the
+     code concludes something from a proxy: this flag means that state, this id identifies that
+     thing, this success means that effect happened. Then find the case where the proxy holds
+     and the conclusion does not. (An authorization check believing a token lives here.)
+  4. CONTRACT & REACH — *who else touches this fact?* For every fact this change writes or
+     reads, find the OTHER places that write or read it, and check they still agree: two copies
+     of one rule, a second implementation, a caller not updated, a schema and a parser that
+     disagree. **A rule each call site must separately remember is itself a finding.**
+  5. CONCURRENCY & ORDER — two of these at once, or in the other order. Shared state, a check
+     separated from its use, a lock not held, an assumption that one writer exists.
+  6. FAILURE & BLAST RADIUS — inject a fault at each step: the disk is full, the network dies,
+     the process is killed between two writes. What is left half-done, what is reported, and is
+     the report true? An error swallowed or mislabelled belongs here.
+  7. SCALE & RESOURCES — the same code with a thousand times the data or the callers. Unbounded
+     growth, a query per row, something loaded whole that need not be.
+  8. INTENT — does it do what its name, docs, types, error messages and TESTS claim? Compare
+     each claim against behaviour. For a test: **would it fail if the change were reverted?**
+  9. STRUCTURE — is there a better way to factor this? Only report it if you can name what the
+     shape COSTS TODAY: the second place that had to change and did not, two live names for one
+     concept, an invariant with no choke point to enforce it. "This would be better" is a nit.
+  10. THE AREA AS A CAPABILITY — the questions above are horizontal; this one is vertical. Does
+     it ACTUALLY WORK when walked end to end with realistic data, not the happy path in a test?
+     Is it COMPLETE across its surfaces — the operation, its inverse, how you see its state, how
+     it appears in listings, the docs that mention it? Do its PARTS AGREE, or do two halves
+     assume different things about the same fact? Does it deliver what the change intended?
+
+Report only defects and structural costs. Do not summarize the area or praise it.`
+}
+
 function featurePrompt(scout, feature) {
   return `${preamble(scout, `a HOLISTIC reviewer of one capability: "${feature.name}"`)}
 
@@ -763,7 +847,11 @@ async function finish(survivors, rawCount, killed, reviewerCount, scout) {
 // Run
 // ---------------------------------------------------------------------------
 log(
-  `code review · ${RANGE || 'working tree'} · effort ${EFFORT} · ${LENSES.length + 1} lenses · ` +
+  `code review · ${RANGE || 'working tree'} · effort ${EFFORT} · ` +
+    (FAN_OUT_LENSES
+      ? `${LENSES.length + 1} lens reviewers + up to ${FEATURE_CAP} feature reviewers`
+      : `up to ${AREA_CAP} area reviewers, every lens question each`) +
+    ' · ' +
     (VERIFY ? `verified by vote (3 angles, batched by file)` : `unverified — findings filed as found`),
 )
 
@@ -795,19 +883,66 @@ log(
     ` · context: ${[scout.conventions && 'conventions', scout.design && 'design', scout.patterns && 'patterns'].filter(Boolean).join(', ') || 'none found'}`,
 )
 
-// FAN OUT. Eight lenses (horizontal: one question, whole diff) plus one holistic reviewer per
-// functional unit (vertical: one capability, end to end) — design D37.1.
+// Fold the scout's functional units into at most AREA_CAP areas, and guarantee every changed
+// file lands in exactly one of them.
+//
+// The completeness rule is the load-bearing part. The scout's units are derived from what the
+// change is FOR, so they need not cover every file it touches — and a file in no area is a file
+// no reviewer opens, which reads exactly like a clean review of it. Leftovers are therefore
+// assigned to the smallest area rather than dropped, and the count is logged.
+function buildAreas(scout) {
+  const units = scout.features.length
+    ? scout.features.map((f) => ({ name: f.name, files: (f.paths || []).filter((p) => scout.files.includes(p)) }))
+    : [{ name: 'the change', files: [...scout.files] }]
+
+  // Largest first, then greedily into the emptiest bucket: balances reading load without
+  // splitting a unit across two reviewers, which would put one capability in two heads.
+  const n = Math.min(AREA_CAP, Math.max(1, units.length))
+  const areas = Array.from({ length: n }, () => ({ names: [], files: [] }))
+  for (const u of [...units].sort((a, b) => b.files.length - a.files.length)) {
+    const target = areas.reduce((a, b) => (a.files.length <= b.files.length ? a : b))
+    target.names.push(u.name)
+    for (const f of u.files) if (!target.files.includes(f)) target.files.push(f)
+  }
+
+  const assigned = new Set(areas.flatMap((a) => a.files))
+  const orphans = scout.files.filter((f) => !assigned.has(f))
+  if (orphans.length) {
+    const target = areas.reduce((a, b) => (a.files.length <= b.files.length ? a : b))
+    target.files.push(...orphans)
+    log(`${orphans.length} changed file(s) belonged to no functional unit — assigned to "${target.names[0] || 'the change'}" so nothing goes unreviewed`)
+  }
+
+  return areas
+    .filter((a) => a.files.length)
+    .map((a) => ({ name: a.names.join(' + ') || 'the change', files: a.files }))
+}
+
 phase('Review')
-const reviewers = [
-  ...[...LENSES, STRUCTURE].map((l) => ({ label: `lens:${l.key}`, prompt: lensPrompt(scout, l), tag: l.key })),
-  ...scout.features.slice(0, FEATURE_CAP).map((f) => ({
-    label: `feature:${f.name}`.slice(0, 40),
-    prompt: featurePrompt(scout, f),
-    tag: `feature:${f.name}`,
-  })),
-]
-if (scout.features.length > FEATURE_CAP) {
-  log(`NOTE: ${scout.features.length - FEATURE_CAP} functional unit(s) beyond the cap of ${FEATURE_CAP} got no holistic reviewer`)
+// FAN OUT. At `low`, one reviewer per area, each asking every lens question against one reading
+// of its code. At `medium`/`high`, eight lenses horizontally (one question, whole diff) plus one
+// holistic reviewer per functional unit vertically — design D37.1/D37.10.
+let reviewers
+if (FAN_OUT_LENSES) {
+  reviewers = [
+    ...[...LENSES, STRUCTURE].map((l) => ({ label: `lens:${l.key}`, prompt: lensPrompt(scout, l), tag: l.key })),
+    ...scout.features.slice(0, FEATURE_CAP).map((f) => ({
+      label: `feature:${f.name}`.slice(0, 40),
+      prompt: featurePrompt(scout, f),
+      tag: `feature:${f.name}`,
+    })),
+  ]
+  if (scout.features.length > FEATURE_CAP) {
+    log(`NOTE: ${scout.features.length - FEATURE_CAP} functional unit(s) beyond the cap of ${FEATURE_CAP} got no holistic reviewer`)
+  }
+} else {
+  const areas = buildAreas(scout)
+  reviewers = areas.map((a) => ({
+    label: `area:${a.name}`.slice(0, 40),
+    prompt: areaPrompt(scout, a),
+    tag: `area:${a.name}`,
+  }))
+  log(`${areas.length} area reviewer(s): ${areas.map((a) => `${a.name} (${a.files.length} file(s))`).join(' · ')}`)
 }
 
 // A barrier here is deliberate and is the case that justifies one: deduplication needs the
@@ -891,7 +1026,7 @@ if (deduped.length > 3) {
 // not pay for three skeptics per finding up front (design D37.9).
 if (!VERIFY) {
   const filed = candidates.map((f) => ({ ...f, unverified: true }))
-  log(`${filed.length} finding(s) filed unverified (effort low — pass "high" to verify by vote)`)
+  log(`${filed.length} finding(s) filed unverified (effort ${EFFORT} — pass "high" to verify by vote)`)
   return await finish(filed, raw.length, 0, reviewers.length, scout)
 }
 

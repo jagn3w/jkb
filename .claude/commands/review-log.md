@@ -1,6 +1,6 @@
 ---
 description: Run this repo's code reviewer and log each finding as a task in .codereviews/<datetime>-<branch>-<N>/tasks.md, mounted into jkb
-argument-hint: "[range]  [low|high]  [-- anything to focus on]"
+argument-hint: "[range]  [low|medium|high]  [-- anything to focus on]"
 ---
 
 You are running a **logged code review**: run the reviewer, then persist every finding as an
@@ -85,10 +85,12 @@ It returns `{findings, raw, refuted, reviewers, verified, features, context, not
 carries `severity` (`must-fix` / `concern` / `nit`), `file`, `line`, `summary`, `scenario`,
 `fix`, `kind`, and possibly `unverified`.
 
-At the default `low` effort nothing is skeptic-checked — findings are filed as found, because
-only ~6% were ever refuted and discovering a false one while fixing it is cheaper than three
-skeptics per finding up front. Note that in the doc's header line so a reader knows what they
-are looking at; do not annotate every task with it.
+At the default `low` effort up to three reviewers split the change by feature area, each asking
+every lens question against one reading of its code, and nothing is skeptic-checked — findings
+are filed as found, because only ~6% were ever refuted and discovering a false one while fixing
+it is cheaper than three skeptics per finding up front. `medium` fans the lenses out to one agent
+each instead; `high` adds the skeptics. Note the tier and whether it was verified in the doc's
+header line so a reader knows what they are looking at; do not annotate every task with it.
 
 ## 3. Log the findings as tasks
 

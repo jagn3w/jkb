@@ -695,13 +695,26 @@ git repo, and project context is used when found and skipped when absent.
   not a ninth lens**: injection is `input`, authorization is `contract`, "this token proves that
   claim" is `inference`, and each of those three is told to cover its half; `/security-review`
   is the dedicated pass.
-- **Two tiers, and no middle (D37.9).** Measured, adversarial verification refuted **6% of
-  findings** while costing most of the run — so `low` is the **default** and files findings
+- **Verification is optional, and unverified is the default (D37.9).** Measured, adversarial
+  verification refuted **6% of findings** while costing most of the run — so findings are filed
   **unverified**: whoever picks one up is the verification, and discovering a false one while
   already in that code costs minutes. `high` adds the three-angle vote for before merging
-  something risky. There is deliberately no `medium`, because the natural middle — a single
-  skeptic — is neither cheap nor a vote, and verification's value lives in the disagreement
-  between angles.
+  something risky. There is no single-skeptic tier, because one skeptic is neither cheap nor a
+  vote, and verification's value lives in the disagreement between angles.
+- **Three tiers, and the axis is BREADTH OF FAN-OUT (D37.10).** Every lens question is asked at
+  every tier — a question skipped is a class of bug nobody looked for. What changes is whether
+  each question gets its own agent and its own reading of the diff. **`low` is the default**: up
+  to three reviewers, split by feature area, each asking all ten questions against **one** reading
+  of its code (~6 agents). `medium` is the old default — nine lens reviewers plus one holistic
+  reviewer per functional unit (~15 agents). `high` is `medium` plus skeptics. The old default
+  cost ~3M tokens and an hour per run, and its reviewers overlapped heavily: nine agents each
+  loaded the same file, then their near-duplicate findings had to be merged back together by a
+  consolidation pass that existed only because of the fan-out. Nine independent readings do catch
+  what one reader misses, which is why `medium` remains — it is a choice to spend, not the price
+  of admission. Two rules keep `low` honest: every changed file must land in exactly one area
+  (a file in no area is a file no reviewer opens, which reads exactly like a clean review of it),
+  and the per-reviewer finding cap **scales with what each reviewer owns**, or a cap meant to stop
+  padding silently becomes the budget.
 - **Skeptics are batched by file.** Loading the code around a finding is the expensive part;
   judging a second finding a few lines away is nearly free once it is in hand. So a skeptic gets
   every finding in one file, ordered by line, and returns a verdict on each — cost scales with
