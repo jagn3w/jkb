@@ -140,8 +140,6 @@ impl SyncReport {
             .collect()
     }
 
-    /// Files an export refused, because it would have deleted lines for still-bound items
-    /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
     /// Files whose reconcile **errored**, with the error text. Distinct from
     /// [`SyncReport::refused`]: a refusal is a deliberate decision not to write; a failure is
     /// something going wrong.
@@ -159,6 +157,8 @@ impl SyncReport {
             .collect()
     }
 
+    /// Files an export refused, because it would have deleted lines for still-bound items
+    /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
     #[must_use]
     pub fn refused(&self) -> Vec<(&Path, &str)> {
         self.results

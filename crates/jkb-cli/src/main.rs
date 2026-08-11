@@ -2291,10 +2291,11 @@ fn cmd_tree(
 /// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
 fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
     let id = require_uid(db, uid)?;
-    // Deliberately no vector sweep. The deleted item's row in `vec_items_<dim>` outlives it —
-    // a `vec0` virtual table cannot carry a foreign key — but since D40 its id is never
-    // reissued, so nothing can inherit the embedding and the row is merely stale.
-    // `jkb index --sweep` collects it.
+    // Deliberately no vector sweep, and none is needed: the `vec_items_<dim>_gc` trigger
+    // (D42.2) removes the vector with the item, in the same statement, for every connection and
+    // every caller. Two belts remain behind that brace — an id is never reissued (D40), so even
+    // a row that somehow survives cannot be inherited, and `jkb index --sweep` collects rows
+    // written before the trigger existed.
     let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
     if json {
         println!(
