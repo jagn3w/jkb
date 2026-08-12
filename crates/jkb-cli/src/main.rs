@@ -4680,9 +4680,10 @@ fn resolve_onto(
             "refusing to land on {branch}: it is this repo's trunk, and a task tagged with \
              it would read as merged the moment anything lands"
         );
-        // `create_branch` is itself remote-aware now, so an explicit `--onto` naming a batch that
-        // exists only on `origin/` checks that out instead of cutting an empty namesake from trunk.
-        gitrepo::create_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
+        // `ensure_branch`, not `create_branch`: the user has *named* an existing branch, so one
+        // that exists only on `origin/` must be checked out rather than replaced by an empty
+        // namesake cut from trunk.
+        gitrepo::ensure_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
         return Ok(branch.to_owned());
     }
     // A session that already has a target keeps it — counting the remote-tracking copy, or a
@@ -4705,6 +4706,9 @@ fn resolve_onto(
         }
     }
     // Cut the batch branch from trunk, named after this task — the first of the batch.
+    // `create_branch`, deliberately: this is cutting a NEW batch at a known start point, so a
+    // same-named branch left on the remote by an earlier, possibly already-merged batch must not
+    // be adopted in its place.
     gitrepo::create_branch(&ctx.root, session_name, &batch_start(ctx, cwd)?)?;
     Ok(session_name.to_owned())
 }

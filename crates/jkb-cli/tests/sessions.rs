@@ -1697,3 +1697,48 @@ fn a_remote_only_batch_branch_is_checked_out_not_re_cut() {
         "the checked-out batch is missing its own work"
     );
 }
+
+/// Cutting a *new* batch must not adopt a same-named branch left on the remote.
+///
+/// The mirror of `a_remote_only_batch_branch_is_checked_out_not_re_cut`, and the reason the two
+/// behaviours are separate functions rather than one remote-aware primitive. An explicit
+/// `--onto <batch>` names a branch that already exists, so its remote copy is the thing meant.
+/// The unnamed path is *creating* the first batch of a run at a known start point, and a stale
+/// namesake on the remote — an earlier batch of a similarly-titled task, quite possibly already
+/// merged — is not that branch. Adopting it would land the session onto merged work.
+#[test]
+fn a_fresh_batch_is_cut_from_trunk_not_adopted_from_a_stale_remote_namesake() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    // A stale batch of the same name the next task will mint, published and gone locally.
+    git(&f.repo, &["checkout", "-q", "-b", "stale-task"]);
+    commit_in(&f.repo, "stale.txt", "old batch\n", "old batch work");
+    git(&f.repo, &["push", "-q", "origin", "stale-task"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["branch", "-D", "stale-task"]);
+    let trunk = git(&f.repo, &["rev-parse", "main"]);
+
+    let uid = f.add_task("stale task");
+    let s = f.work(&uid);
+    assert_eq!(
+        s["onto"].as_str().unwrap(),
+        "stale-task",
+        "setup: the batch should be named after the task"
+    );
+    assert_eq!(
+        git(&f.repo, &["rev-parse", "stale-task"]),
+        trunk,
+        "a fresh batch adopted a stale remote namesake, so the session lands onto old work"
+    );
+    assert!(
+        !git(&f.repo, &["ls-tree", "-r", "--name-only", "stale-task"]).contains("stale.txt"),
+        "the fresh batch carries the stale remote batch's commits"
+    );
+}
