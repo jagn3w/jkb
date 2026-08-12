@@ -4393,18 +4393,24 @@ fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Res
         (None, Some(_)) => true,
         _ => false,
     };
-    let resolved = if let Some(resolved) = gitrepo::rev_commit(&cwd, sha)? {
+    // Resolution and refusal are gated on the SAME condition, deliberately. Gating only the
+    // refusal left the resolution running against whatever repo the cwd was in: standing in a
+    // sibling checkout where the value happened to resolve, that repo's full commit id was written
+    // as this task's cut point and printed as though verified. Rejecting a good sha was the nit
+    // being fixed; accepting a foreign one silently is worse than either.
+    let resolved = if checkable {
+        let Some(resolved) = gitrepo::rev_commit(&cwd, sha)? else {
+            anyhow::bail!(
+                "`{sha}` is not a revision this repo can resolve, so nothing was recorded — a cut \
+                 point git cannot resolve is treated as no cut point at all, and {branch} would \
+                 silently never auto-close. Pass a commit that exists here."
+            );
+        };
         resolved
     } else {
-        anyhow::ensure!(
-            !checkable,
-            "`{sha}` is not a revision this repo can resolve, so nothing was recorded — a cut \
-             point git cannot resolve is treated as no cut point at all, and {branch} would \
-             silently never auto-close. Pass a commit that exists here."
-        );
         eprintln!(
-            "warning: recorded `{sha}` unverified — this is not {}'s checkout, so nothing could \
-             resolve it. If it is wrong, {branch} will silently never auto-close.",
+            "warning: recorded `{sha}` unverified — this is not {}'s checkout, so nothing here \
+             could resolve it. If it is wrong, {branch} will silently never auto-close.",
             task_repo.as_deref().unwrap_or("the task's repo")
         );
         sha.to_owned()
@@ -5691,7 +5697,11 @@ fn cmd_task_close_merged(
                 let mut gone = Vec::new();
                 for b in &branches {
                     all_usable &= repo::base_is_usable(&cwd, base::resolve(&tags, b))?;
-                    if !gitrepo::has_branch(&cwd, b)? {
+                    // The same question `is_merged` asks, with the same `Prefer`. A bare
+                    // local-only check called a branch gone when it lived on the remote — the
+                    // ordinary state after a merged PR deletes the local copy — and then told the
+                    // user to delete the tag tracking work that was still in flight.
+                    if gitrepo::branch_ref(&cwd, b, gitrepo::Prefer::Remote)?.is_none() {
                         gone.push(b.clone());
                     }
                 }

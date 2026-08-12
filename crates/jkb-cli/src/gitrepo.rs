@@ -509,15 +509,7 @@ pub fn is_merged(
     if !exists(dir, trunk_ref)? {
         return Ok((MergeState::NoTrunk, false));
     }
-    let candidates = match prefer {
-        Prefer::Remote => [format!("origin/{branch}"), branch.to_owned()],
-        Prefer::Local => [branch.to_owned(), format!("origin/{branch}")],
-    };
-    let Some(reference) = candidates
-        .iter()
-        .find(|r| exists(dir, r).unwrap_or(false))
-        .cloned()
-    else {
+    let Some(reference) = branch_ref(dir, branch, prefer)? else {
         return Ok((MergeState::BranchMissing, false));
     };
 
@@ -570,6 +562,31 @@ pub fn is_merged(
         MergeState::Unmerged
     };
     Ok((state, false))
+}
+
+/// The ref that represents `branch` here — the local branch or its remote-tracking copy — or
+/// `None` if neither exists. `prefer` decides which is asked for first (see [`Prefer`]).
+///
+/// The **one** implementation of "does this branch exist, and under what name". [`is_merged`]
+/// resolves it to decide between `BranchMissing` and a real comparison; `close-merged` resolves it
+/// to decide whether to tell the user a branch is gone. A second spelling of that question got
+/// written as a bare `has_branch`, which only looks at `refs/heads/` — so a branch living solely
+/// on the remote, the ordinary state after a local branch is deleted post-merge or on a fresh
+/// clone, was reported "gone, remove the stale tag" while it still carried unmerged work.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<String>> {
+    let candidates = match prefer {
+        Prefer::Remote => [format!("origin/{branch}"), branch.to_owned()],
+        Prefer::Local => [branch.to_owned(), format!("origin/{branch}")],
+    };
+    for candidate in &candidates {
+        if exists(dir, candidate)? {
+            return Ok(Some(candidate.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether this git understands `merge-tree --write-tree` (2.38+). Probed by running it

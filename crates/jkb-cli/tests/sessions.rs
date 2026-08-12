@@ -1556,3 +1556,79 @@ fn close_merged_names_a_task_it_cannot_decide() {
         "an undecidable task must be reported, never closed"
     );
 }
+
+/// A branch that lives only on the remote is not gone.
+///
+/// `close-merged` asks with `Prefer::Remote` precisely because after a merged PR the local copy is
+/// usually deleted, so `origin/<branch>` is the honest answer to "did this ship". A bare
+/// `refs/heads/` probe therefore called a live branch gone and printed "remove the stale tag" —
+/// advice that deletes the only record of work still in flight.
+#[test]
+fn a_branch_that_exists_only_on_the_remote_is_not_reported_gone() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    // Work on a branch, publish it, then drop the local copy — the post-PR state.
+    git(&f.repo, &["checkout", "-q", "-b", "shipped"]);
+    commit_in(&f.repo, "s.txt", "shipped\n", "ship it");
+    git(&f.repo, &["push", "-q", "origin", "shipped"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["branch", "-D", "shipped"]);
+
+    let uid = f.add_task("remote-only branch task");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "shipped"])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "close-merged"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gone").not());
+}
+
+/// `jkb task base` must not resolve a revision against a repo that is not the task's.
+///
+/// The database is global across repos, so this command runs from anywhere. Resolving in whatever
+/// checkout happens to be current means a sha that exists *there* is recorded as this task's cut
+/// point and printed as though verified — a wrong commit id presented as a checked one, which is
+/// worse than the rejected-good-sha nit the check was added to fix.
+#[test]
+fn task_base_does_not_resolve_a_sha_against_a_foreign_repo() {
+    let f = Fixture::new();
+    let other = f.home.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(other.join("o.txt"), "other\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-qm", "other base"]);
+    let foreign = git(&other, &["rev-parse", "HEAD"]);
+
+    let uid = f.add_task("cross repo task");
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "repo=proj"])
+        .assert()
+        .success();
+
+    // Standing in the *other* repo, where `foreign` resolves and the task's repo is elsewhere.
+    let mut cmd = f.jkb();
+    cmd.current_dir(&other)
+        .args(["--global", "task", "base", &uid, "task/x", &foreign])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("unverified"));
+
+    // Recorded verbatim and flagged, never presented as a resolved commit in this repo.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=task/x:{foreign}")));
+}
