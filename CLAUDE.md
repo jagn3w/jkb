@@ -973,26 +973,39 @@ Design in `openspec/changes/jkb-staging-pr/`.
   inverse) silently deletes its line. `finish_export` now refuses — `Outcome::Refused`, journalled
   `needs_attention`, nothing written — and recovery is any edit to the file, which imports
   normally.
-- **The guard is now at the seam, and judges documents rather than the store (D45.5).** The two
-  routes D45 left open were each found and fixed *at the route* — pass 21 at `finish_export`'s
-  `(false, true)` arm, pass 22 at `three_way_resolve`'s `!ctx.imports()` arm. Both fixes were
-  correct and neither was the last, because a route is not a cause. `finish_export` now takes the
-  **`SyncDoc`** and renders it itself, so what the guard judged is necessarily what gets written;
-  and `export_blocker`'s first condition, `wholesale_loss`, compares **the document about to be
-  written against the document just parsed off disk** — refusing when the KB side contributes zero
-  items to a file that declares some. That matters because these incidents damage *the store*:
-  `jkb undo` of a sync deletes a file's items **and their bindings** together, so `dropped_items`,
-  which walks bindings, truthfully reports nothing dropped — there is nothing left to walk. One
-  condition covers undo, a half-applied migration, an emptied binding table, and the next thing
-  with that shape. It is deliberately *not* a general "fewer items than disk" rule: on an
-  export-only mount the file is a projection and hand-added lines are legitimately removed.
-- **The mount-mode axis is a test matrix, not a habit.** Two consecutive passes produced the same
-  shape of must-fix — "this arm behaves differently on an export-only mount and nothing tested
-  that axis". `no_mount_mode_and_stage_loses_a_task_line` runs {import, export, bidirectional} ×
-  {first sight, settled, disk-changed, kb-changed, both-changed, post-undo} and asserts the one
-  invariant D45 is about: a sync never deletes an item line the KB knows about. It asserts the
-  *harm*, not the outcomes — outcomes legitimately differ per mode, and pinning them would make it
-  a change-detector.
+- **`wholesale_loss` — one condition, judged on documents, decided above the direction dispatch
+  (D45.5).** The two routes D45 left open were each found and fixed *at the route* — pass 21 at
+  `finish_export`'s `(false, true)` arm, pass 22 at `three_way_resolve`'s `!ctx.imports()` arm.
+  Both fixes were correct and neither was the last, because a route is not a cause. The condition
+  is: **the KB contributes zero items to a file that declares some.** It compares two documents,
+  never the store, because the store is what these incidents damage — `jkb undo` of a sync deletes
+  a file's items **and their bindings** together, so `dropped_items`, which walks bindings,
+  truthfully reports nothing dropped; there is nothing left to walk. One condition covers undo,
+  `jkb item rm`, a half-applied migration, an emptied binding table, and the next thing with that
+  shape. Deliberately *not* a general "fewer items than disk" rule: on an export-only mount the
+  file is a projection and hand-added lines are legitimately removed.
+  - **Detecting it is not refusing it.** Pass 23: sited inside `export_blocker` the only available
+    answer was "refuse", and refusing is wrong on two of the three mount modes — it protected the
+    file and left the KB **permanently** empty, since a refusal never advances the base, so the
+    next sync re-entered the same arm forever and the message's own remedy ("edit the file") is
+    what routes it there. It now runs in `reconcile` **above the direction dispatch**, where it
+    dominates every arm, and the mount mode decides: a mount that can import **re-imports the
+    file** — the disk being the good copy is the condition's own premise — and only an export-only
+    mount, which cannot read the file back, refuses. Each arm below would otherwise have needed
+    its own gate, which is the shape this whole area keeps failing at.
+  - `finish_export` still takes the **`SyncDoc`** and renders it itself, so what was judged is
+    necessarily what gets written.
+- **The mount-mode axis is a test matrix, and it asserts BOTH sides.** Three consecutive passes
+  produced the same shape of must-fix — "this arm behaves differently on an export-only mount and
+  nothing tested that axis". `no_mount_mode_and_stage_loses_a_task_line` runs {import, export,
+  bidirectional} × {first sight, settled, disk-changed, kb-changed, both-changed, post-undo,
+  kb-emptied}. Its first version asserted only that the *file* keeps its lines and passed the very
+  bug it was written to catch: a refusal protects the file perfectly while leaving the KB empty.
+  So it also asserts that a mount which **can** import is never left holding nothing for a file
+  that declares work. `kb-emptied` is distinct from `post-undo` on purpose — undo also clears
+  `base_blob_hash`/`document`, and with no base the disk's items read as additions that a merge
+  keeps, so undo alone never produces an item-less merged document. It asserts the *harm*, not the
+  outcomes: those legitimately differ per mode, and pinning them would make it a change-detector.
 - **Section namespaces are now derived**, kept for browsing and `ns:` scoping, authoritative for
   nothing. `retire_undeclared_sections` is **re-keyed on `sync_section`**: it was gated on
   `header_line`, which no longer decides anything, so leaving it would have made it a silent

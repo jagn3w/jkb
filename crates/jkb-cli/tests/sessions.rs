@@ -1394,8 +1394,12 @@ fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
             .stderr(predicate::str::contains("jkb task base"));
     }
 
-    // The verb it points at records per branch, leaving siblings alone.
-    for (branch, sha) in [("task/x", "aaaaaaa"), ("task/y", "bbbbbbb")] {
+    // The verb it points at records per branch, leaving siblings alone. Real revisions: the verb
+    // refuses one this repo cannot resolve, because an unresolvable cut point is treated as none.
+    let first = git(&f.repo, &["rev-parse", "HEAD"]);
+    commit_in(&f.repo, "second.txt", "second\n", "second");
+    let second = git(&f.repo, &["rev-parse", "HEAD"]);
+    for (branch, sha) in [("task/x", &first), ("task/y", &second)] {
         f.jkb()
             .args(["--global", "task", "base", &uid, branch, sha])
             .assert()
@@ -1405,6 +1409,80 @@ fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains("base=task/x:aaaaaaa"))
-        .stdout(predicate::str::contains("base=task/y:bbbbbbb"));
+        .stdout(predicate::str::contains(format!("base=task/x:{first}")))
+        .stdout(predicate::str::contains(format!("base=task/y:{second}")));
+}
+
+/// A cut point git cannot resolve must not act as one, however it got into the store.
+///
+/// `is_merged` separates "freshly cut, nothing on it yet" from "landed" by comparing the branch
+/// tip against `rev-parse <base>`. When the base does not resolve, that comparison is false rather
+/// than unknown, so the guard is *skipped*: an empty branch falls through to `merge-tree`, gets
+/// trunk's own tree back, and reads as merged. A missing cut point refuses to act; a garbage one
+/// closed the task with the work never written.
+///
+/// The value is injected the way a user actually can — `#base=` in quick-add text, which reaches
+/// `tag::apply` without passing the `jkb task tag` refusal — and `task work` then adopts the bare
+/// value as this branch's cut point. So this covers the reservation's gap as well as the policy.
+#[test]
+fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
+    let f = Fixture::new();
+    let uid = f.add_task("bogus base task #base=deadbeefdeadbeef");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+
+    // The bare value was adopted for this branch — the state under test.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "base={branch}:deadbeefdeadbeef"
+        )));
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        git(&f.repo, &["rev-parse", "main"]),
+        "setup: the session branch must have no commits of its own"
+    );
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "an empty branch was closed as merged because its cut point did not resolve, so the \
+         freshly-cut guard was skipped instead of applied"
+    );
+}
+
+/// And the verb refuses to record one in the first place, so a typo is loud rather than a task
+/// that quietly stops auto-closing.
+#[test]
+fn task_base_refuses_a_revision_this_repo_cannot_resolve() {
+    let f = Fixture::new();
+    let uid = f.add_task("typo base task");
+
+    f.jkb()
+        .args(["--global", "task", "base", &uid, "task/x", "aaaaaaa"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "not a revision this repo can resolve",
+        ));
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base=").not());
+
+    // A real revision still records, resolved to its full id.
+    let head = git(&f.repo, &["rev-parse", "HEAD"]);
+    f.jkb()
+        .args(["--global", "task", "base", &uid, "task/x", "HEAD"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=task/x:{head}")));
 }

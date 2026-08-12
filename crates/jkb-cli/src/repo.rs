@@ -204,6 +204,21 @@ pub(crate) fn landed_with_base(
     let Some(base) = base else {
         return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
     };
+    // A cut point git cannot resolve is **worse than none**, so it is treated as none here.
+    //
+    // `is_merged` decides "freshly cut, nothing on it yet" by comparing the branch tip against
+    // `rev-parse <base>`. When the base does not resolve that right-hand side is `None`, the
+    // comparison is simply false, and the guard is skipped rather than applied — so an empty
+    // branch falls through to `merge-tree`, which yields trunk's own tree, and reads as merged.
+    // A missing base refuses to act; a garbage one closed the task.
+    //
+    // The check belongs at the policy layer, not in `is_merged`: that function answers a factual
+    // question and deliberately falls through when it has no usable base. Here is also where it
+    // catches every route a bad value can arrive by — a mistyped `jkb task base`, a `#base=`
+    // quick-add modifier, a hand-edited tag — rather than one of them.
+    if crate::gitrepo::rev(cwd, base)?.is_none() {
+        return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
+    }
     crate::gitrepo::is_merged(cwd, branch, trunk_ref, Some(base), prefer)
 }
 

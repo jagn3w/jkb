@@ -2075,6 +2075,12 @@ enum Stage {
     BothChanged,
     /// `jkb undo` of the import: the items and their bindings are gone, the file is not.
     PostUndo,
+    /// The file's items are deleted with the journal row **intact** — `jkb item rm`, a
+    /// half-applied migration, an emptied binding table. Distinct from `PostUndo`, which also
+    /// clears `base_blob_hash`/`document`: with no base the disk's items read as additions and a
+    /// merge keeps them, so undo alone never produces an item-less merged document. This stage
+    /// does, and it is the state `wholesale_loss` was written for.
+    KbEmptied,
 }
 
 /// The three ids `TASKS_MD` declares — the work the KB is holding on the file's behalf.
@@ -2094,7 +2100,7 @@ fn mount_mode(db: &Db, dir: &Path, mode: SyncMode) {
 }
 
 /// Drive one cell and return what the file looked like before and after the sync under test.
-fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, String) {
+fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, String, i64) {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
@@ -2146,6 +2152,19 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
     match stage {
         // `PostUndo` is applied above, before the mount mode changed.
         Stage::FirstSight | Stage::Settled | Stage::PostUndo => {}
+        Stage::KbEmptied => {
+            let bare = uri_for(&file);
+            db.write_txn("cli", move |conn, meta| {
+                for u in jkb_core::binding::synced_uris_for_file(conn, &bare)? {
+                    if let Some(id) = binding::item_for_uri(conn, &u)? {
+                        item::remove(conn, meta, id, true)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(task_count(&db), 0, "setup: the KB should hold no tasks now");
+        }
         Stage::DiskChanged => disk_edit(&file),
         Stage::KbChanged => kb_set_status(&db, &format!("{uri}#ship"), "in_progress"),
         Stage::BothChanged => {
@@ -2157,11 +2176,16 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
     let before = fs::read_to_string(&file).unwrap();
     let report = sync(&db, "docs/plan").unwrap();
     let after = fs::read_to_string(&file).unwrap();
-    (report, before, after)
+    (report, before, after, task_count(&db))
 }
 
-/// Every (mode, stage) cell: the sync completes, and the file still declares every task the KB
-/// was holding for it.
+/// Every (mode, stage) cell, asserted on **both** sides.
+///
+/// The file must keep every task the KB was holding for it — and, on a mount that can import,
+/// the KB must not be left empty for a file that still declares work. The first assertion alone
+/// is what this table had, and it is only half the invariant: a refusal protects the file
+/// perfectly while leaving the KB permanently empty, which reads as a pass. That is exactly the
+/// bug review pass 23 found, in a table written to cover this axis.
 #[test]
 fn no_mount_mode_and_stage_loses_a_task_line() {
     for mode in [SyncMode::Import, SyncMode::Export, SyncMode::Bidirectional] {
@@ -2172,8 +2196,9 @@ fn no_mount_mode_and_stage_loses_a_task_line() {
             Stage::KbChanged,
             Stage::BothChanged,
             Stage::PostUndo,
+            Stage::KbEmptied,
         ] {
-            let (report, before, after) = matrix_case(mode, stage);
+            let (report, before, after, tasks) = matrix_case(mode, stage);
             assert!(
                 report.failed().is_empty(),
                 "{mode:?}/{stage:?}: the reconcile errored: {:?}",
@@ -2191,6 +2216,17 @@ fn no_mount_mode_and_stage_loses_a_task_line() {
                     report.refused()
                 );
             }
+            // The KB side. An export-only mount is exempt by definition: it has no way to read
+            // the file back, so an emptied KB stays empty and the guard's job is only to stop
+            // that emptiness reaching the file.
+            if matches!(mode, SyncMode::Import | SyncMode::Bidirectional) {
+                assert!(
+                    tasks > 0,
+                    "{mode:?}/{stage:?}: a mount that can import left the KB with no tasks for a \
+                     file declaring three, so nothing can heal it. refused: {:?}",
+                    report.refused()
+                );
+            }
         }
     }
 }
@@ -2204,7 +2240,7 @@ fn no_mount_mode_and_stage_loses_a_task_line() {
 /// reaching `write_file`. It must be refused, not written.
 #[test]
 fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() {
-    let (report, before, after) = matrix_case(SyncMode::Export, Stage::PostUndo);
+    let (report, before, after, _) = matrix_case(SyncMode::Export, Stage::PostUndo);
     assert_eq!(
         after, before,
         "the export wrote over a file whose items the KB had lost"
@@ -2223,50 +2259,72 @@ fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() 
     );
 }
 
-/// The seam guard is not a `tasks`-serializer rule. A `document` mount is one item per file, so
-/// losing that item is the same wholesale loss — and it arrives by the same route, an export of a
-/// KB that no longer holds what the file declares.
+/// The wholesale-loss rule is not a `tasks`-serializer rule, and its two halves differ by mount
+/// mode. A `document` mount is one item per file, so losing that item is the same total loss.
 ///
-/// Worth its own case because every other test of this guard uses `tasks`, and "the check only
-/// ever ran on one serializer" is the shape of gap this whole pass exists to close.
+/// Worth its own case because every other test of this rule uses `tasks`, and "the check only ever
+/// ran on one serializer" is the shape of gap this pass exists to close.
 #[test]
-fn a_document_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("README.md");
-    fs::write(&file, "the good copy\n").unwrap();
-    let uri = uri_for(&file);
+fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
+    for mode in [SyncMode::Bidirectional, SyncMode::Export] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("README.md");
+        fs::write(&file, "the good copy\n").unwrap();
+        let uri = uri_for(&file);
 
-    let db = Db::open_in_memory().unwrap();
-    mount_dir(
-        &db,
-        "docs/repo",
-        dir.path(),
-        SyncMode::Bidirectional,
-        "document",
-        Some("**/*.md"),
-        None,
-        ConflictPolicy::Manual,
-    );
-    assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+        let db = Db::open_in_memory().unwrap();
+        let mount = |m| {
+            mount_dir(
+                &db,
+                "docs/repo",
+                dir.path(),
+                m,
+                "document",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            );
+        };
+        // Imported bidirectionally first: an export-only mount cannot seed itself.
+        mount(SyncMode::Bidirectional);
+        assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
 
-    // Delete the item the file is bound to — what an undo of the import leaves behind.
-    let target = uri.clone();
-    db.write_txn("cli", move |conn, meta| {
-        let id = binding::item_for_uri(conn, &target)?.expect("bound item");
-        item::remove(conn, meta, id, true).map(|_| ())
-    })
-    .unwrap();
+        // Delete the item the file is bound to — what `jkb item rm` leaves behind.
+        let target = uri.clone();
+        db.write_txn("cli", move |conn, meta| {
+            let id = binding::item_for_uri(conn, &target)?.expect("bound item");
+            item::remove(conn, meta, id, true).map(|_| ())
+        })
+        .unwrap();
+        mount(mode);
 
-    let report = sync(&db, "docs/repo").unwrap();
-    assert!(report.failed().is_empty(), "{:?}", report.failed());
-    assert_eq!(
-        fs::read_to_string(&file).unwrap(),
-        "the good copy\n",
-        "the export blanked a document whose KB item had been deleted"
-    );
-    assert_eq!(
-        report.refused().len(),
-        1,
-        "nothing told the user why the file stopped syncing: {report:?}"
-    );
+        let report = sync(&db, "docs/repo").unwrap();
+        assert!(
+            report.failed().is_empty(),
+            "{mode:?}: {:?}",
+            report.failed()
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "the good copy\n",
+            "{mode:?}: the export blanked a document whose KB item had been deleted"
+        );
+
+        match mode {
+            // It can read the file back, so it does — a refusal here would protect the file and
+            // leave the KB empty with no way out.
+            SyncMode::Bidirectional => assert_eq!(
+                content_for(&db, &uri).as_deref(),
+                Some("the good copy\n"),
+                "a mount that can import left the KB empty instead of re-reading the file"
+            ),
+            // It cannot, so it must refuse and say so.
+            SyncMode::Export => assert_eq!(
+                report.refused().len(),
+                1,
+                "nothing told the user why the file stopped syncing: {report:?}"
+            ),
+            SyncMode::Import => unreachable!(),
+        }
+    }
 }

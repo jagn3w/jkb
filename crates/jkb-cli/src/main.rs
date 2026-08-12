@@ -767,9 +767,6 @@ enum TaskCmd {
         #[arg(short = 'a', long)]
         all: bool,
     },
-    /// Start work: claim the task and record the branch and repo it is being done on, so
-    /// `jkb task close-merged` can close it once that branch lands. Both default from the
-    /// git repo in the current directory.
     /// Record the commit a branch was cut from, replacing only that branch's record.
     ///
     /// `task start` and `task work` record this themselves; this is for a branch created by
@@ -784,6 +781,9 @@ enum TaskCmd {
         /// The commit it was cut from (any git revision; resolved here).
         sha: String,
     },
+    /// Start work: claim the task and record the branch and repo it is being done on, so
+    /// `jkb task close-merged` can close it once that branch lands. Both default from the
+    /// git repo in the current directory.
     Start {
         /// The task uid.
         uid: String,
@@ -4375,7 +4375,22 @@ fn cmd_task_start(
 fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Result<()> {
     let id = resolve_task_uid(db, uid)?;
     let cwd = std::env::current_dir()?;
-    let resolved = gitrepo::rev(&cwd, sha)?.unwrap_or_else(|| sha.to_owned());
+    // Refuse a revision this repo cannot resolve rather than storing it verbatim. `landed_with_base`
+    // now treats an unresolvable cut point as no cut point, so a typo is no longer *dangerous* —
+    // but it is still silent, and a task that quietly stops auto-closing is a bad way to learn you
+    // fat-fingered a sha. Outside a git repo the literal is kept: there is nothing to resolve
+    // against and the record is still worth having.
+    let resolved = if let Some(resolved) = gitrepo::rev(&cwd, sha)? {
+        resolved
+    } else {
+        anyhow::ensure!(
+            gitrepo::root(&cwd)?.is_none(),
+            "`{sha}` is not a revision this repo can resolve, so nothing was recorded — a cut \
+             point git cannot resolve is treated as no cut point at all, and {branch} would \
+             silently never auto-close. Pass a commit that exists here."
+        );
+        sha.to_owned()
+    };
     let (b, s) = (branch.to_owned(), resolved.clone());
     db.write_txn("cli", move |conn, meta| base::write(conn, meta, id, &b, &s))?;
     if json {
@@ -5614,6 +5629,7 @@ fn cmd_task_close_merged(
     let mut closed = Vec::new();
     let mut blocked = Vec::new();
     let mut pending = Vec::new();
+    let mut undecidable = Vec::new();
     let mut warned_fallback = false;
 
     for id in ids {
@@ -5640,8 +5656,23 @@ fn cmd_task_close_merged(
                     blocked.push((uid, branch));
                 }
             }
-            gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
-                pending.push((uid, branch));
+            gitrepo::MergeState::Unmerged => pending.push((uid, branch)),
+            // Two different situations reach `NothingToMerge`, and only one of them is "still
+            // working on it". The other is *we declined to decide*, because the branch has no cut
+            // point we can use — never recorded, removed by `task tag rm`, dropped as an
+            // unattributable legacy value, or present but unresolvable in this repo. That task can
+            // never close, and reported as "in flight" it looks exactly like one that simply is.
+            // `BranchMissing` immediately below has named its own way out since D34; this did not.
+            gitrepo::MergeState::NothingToMerge => {
+                let usable = |b: &String| {
+                    base::resolve(&tags, b)
+                        .is_some_and(|sha| gitrepo::rev(&cwd, sha).ok().flatten().is_some())
+                };
+                if branches.iter().all(usable) {
+                    pending.push((uid, branch));
+                } else {
+                    undecidable.push((uid, branch));
+                }
             }
             // A missing branch is ambiguous — merged-and-deleted, or a typo — so it HOLDS.
             //
@@ -5660,34 +5691,77 @@ fn cmd_task_close_merged(
         }
     }
 
+    report_close_merged(
+        &CloseMergedReport {
+            repo: &repo,
+            trunk_ref: &trunk_ref,
+            dry_run,
+            closed: &closed,
+            blocked: &blocked,
+            pending: &pending,
+            undecidable: &undecidable,
+        },
+        json,
+    )
+}
+
+/// What one `close-merged` run decided, split by what the user can do about it.
+struct CloseMergedReport<'a> {
+    repo: &'a str,
+    trunk_ref: &'a str,
+    dry_run: bool,
+    /// Marked done (or would be, under `--dry-run`).
+    closed: &'a [(String, String)],
+    /// Merged, but something else holds them — usually open subtasks.
+    blocked: &'a [(String, String)],
+    /// Genuinely still in flight. Counted, not listed: this is the ordinary case and naming
+    /// every open task on every run buries the two buckets that need a decision.
+    pending: &'a [(String, String)],
+    /// We declined to decide, because there is no usable cut point. Listed **individually** even
+    /// though it is a form of "not closed": unlike `pending` it will never resolve on its own,
+    /// and it has a remedy the user cannot guess.
+    undecidable: &'a [(String, String)],
+}
+
+/// Print what a `close-merged` run decided.
+fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
+    let rows = |v: &[(String, String)]| {
+        v.iter()
+            .map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
+            .collect::<Vec<_>>()
+    };
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "repo": repo,
-                "trunk": trunk_ref,
-                "dry_run": dry_run,
-                "closed": closed.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
-                    .collect::<Vec<_>>(),
-                "blocked": blocked.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
-                    .collect::<Vec<_>>(),
-                "pending": pending.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
-                    .collect::<Vec<_>>(),
+                "repo": r.repo,
+                "trunk": r.trunk_ref,
+                "dry_run": r.dry_run,
+                "closed": rows(r.closed),
+                "blocked": rows(r.blocked),
+                "pending": rows(r.pending),
+                "undecidable": rows(r.undecidable),
             }))?
         );
         return Ok(());
     }
-    let verb = if dry_run { "would close" } else { "closed" };
-    for (uid, branch) in &closed {
+    let verb = if r.dry_run { "would close" } else { "closed" };
+    for (uid, branch) in r.closed {
         println!("{verb} {uid} ({branch} merged)");
     }
-    for (uid, branch) in &blocked {
+    for (uid, branch) in r.blocked {
         println!("held  {uid} ({branch}) — `jkb task show {uid}` says why (usually open subtasks)");
     }
-    if closed.is_empty() && blocked.is_empty() {
+    for (uid, branch) in r.undecidable {
+        println!(
+            "unknown {uid} ({branch}) — no usable cut point, so whether it landed cannot be \
+             decided: `jkb task base {uid} <branch> <sha>`"
+        );
+    }
+    if r.closed.is_empty() && r.blocked.is_empty() && r.undecidable.is_empty() {
         println!(
             "nothing to close ({} task(s) still in flight)",
-            pending.len()
+            r.pending.len()
         );
     }
     Ok(())

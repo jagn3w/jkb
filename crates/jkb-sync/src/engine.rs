@@ -157,8 +157,12 @@ impl SyncReport {
             .collect()
     }
 
-    /// Files an export refused, because it would have deleted lines for still-bound items
-    /// (design D45.5). Each carries the engine's own reason in [`FileResult::reason`].
+    /// Files an export refused because it would have deleted item lines (design D45.5). Each
+    /// carries the engine's own reason in [`FileResult::reason`], and the reason matters: the two
+    /// causes want opposite remedies. `dropped_items` fires when the items are **still bound** but
+    /// have lost their primary placement, and points at re-homing them; `wholesale_loss` fires
+    /// when the KB holds nothing for the file at all — bindings included — and points at reading
+    /// the file back in. Do not paraphrase this as one or the other.
     #[must_use]
     pub fn refused(&self) -> Vec<(&Path, &str)> {
         self.results
@@ -878,6 +882,31 @@ fn reconcile(
         return export_or_skip(conn, meta, &f, &kb_doc);
     }
 
+    // The KB contributes nothing to a file that still declares items. Whatever the direction
+    // machinery would conclude from the hashes, the disk is the good copy — that is this guard's
+    // own reasoning — so import it where the mount can, and refuse to write where it cannot.
+    //
+    // Decided **here, above the direction dispatch**, because every arm below gets it wrong on
+    // its own and each would need its own gate:
+    //
+    // - `(false, true)` exports, blanking the file; on an import-only mount it instead `Skipped`
+    //   and left the KB permanently empty while reporting nothing at all.
+    // - The three-way arm refused *before* `apply_doc`, so the refusal blocked the very import
+    //   that heals — and since a refusal never advances the base, the next sync re-entered the
+    //   same arm. Refused, refused, refused, while the message recommended an edit that could not
+    //   work because the edit is what routes the file into that arm.
+    //
+    // One condition above all of them replaces a gate in each, which is the whole point: the
+    // previous placement could only ever *refuse*, and refusing is the wrong answer on two of the
+    // three mount modes.
+    if let Some(reason) = wholesale_loss(&kb_doc, Some(disk_doc)) {
+        if ctx.imports() {
+            return finish_import(conn, meta, &f, disk_doc, Outcome::Imported);
+        }
+        flag_refused(conn, meta, &bare_uri, &ser_name, &reason, journal.as_ref())?;
+        return Ok(Outcome::Refused);
+    }
+
     let (disk_changed, kb_changed, base_doc) = decide_direction(
         conn,
         serializer.as_ref(),
@@ -1139,7 +1168,7 @@ fn finish_export(
     // The guard lives HERE, not at the call site, because two other callers reach this function
     // — `export_or_skip` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
-    if let Some(reason) = export_blocker(conn, f, kb_doc, expected)? {
+    if let Some(reason) = export_blocker(conn, f, expected)? {
         flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
         return Ok(Outcome::Refused);
     }
@@ -1165,27 +1194,27 @@ fn finish_export(
 
 /// Why this file must not be written from the KB side, or `None` if it may be.
 ///
-/// Three conditions. The first is the seam guard and subsumes the causes, the other two are
-/// narrower checks that predate it and still catch what it does not:
+/// Two conditions, both of which pass-10 review found the first version missing:
 ///
-/// 1. **The KB contributes nothing while the file declares something.** See [`wholesale_loss`].
-/// 2. **Items would vanish.** See [`dropped_items`].
-/// 3. **The structure is unknown while the file has content.** [`dropped_items`] alone returns
+/// 1. **Items would vanish.** See [`dropped_items`].
+/// 2. **The structure is unknown while the file has content.** [`dropped_items`] alone returns
 ///    "nothing dropped" when there is no base document, which made the guard *vacuous* on the
 ///    `export_or_skip` path: a file that exists on disk but has never been imported has no journal
 ///    document, so `assemble_kb_doc` yields no layout and no sections, and the export wrote a
 ///    headerless, prose-free dump over it. "No base" means unconstrained only when there is also
 ///    nothing on disk to lose.
 ///
-/// `kb_doc` is the document about to be rendered and written, and every check that can be
-/// expressed against it is — deliberately, because the state these bugs produce is *damage to the
-/// KB*, and a guard that consults the same damaged state to decide whether to trust it is not a
-/// guard. Conditions 2 and 3 still read the store, so they remain fallible in exactly that way;
-/// condition 1 does not, which is why it is first and why it is the one that must hold.
+/// The third — *the KB contributes nothing at all* — is [`wholesale_loss`], and it is deliberately
+/// **not** here. Here it could only refuse, and on a mount that can import, refusing is the wrong
+/// answer: it blocks the import that heals. It runs in [`reconcile`] above the direction dispatch
+/// instead, so it dominates every arm that reaches this function and cannot be reached from one.
+///
+/// Both conditions here read the store, and the store is what the incidents this guards against
+/// damage. That is the limitation `wholesale_loss` exists to cover, and the reason it judges
+/// documents rather than bindings.
 fn export_blocker(
     conn: &Connection,
     f: &FileCtx<'_>,
-    kb_doc: &SyncDoc,
     disk_doc: Option<&SyncDoc>,
 ) -> Result<Option<String>> {
     let FileCtx {
@@ -1198,9 +1227,6 @@ fn export_blocker(
         snapshot,
     } = *f;
     let _ = (ser_name, snapshot);
-    if let Some(reason) = wholesale_loss(kb_doc, disk_doc) {
-        return Ok(Some(reason));
-    }
     let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
     if !dropped.is_empty() {
         // Name the items by their real uid, LOOKED UP rather than derived. A sync-created item's
@@ -1250,12 +1276,18 @@ fn export_blocker(
 /// at `finish_export`'s `(false, true)` arm, pass 22 at `three_way_resolve`'s `!ctx.imports()` arm.
 /// Both fixes were correct and neither was the last one, because the routes are not the cause.
 ///
-/// This is the same question asked at the seam, and it is asked of the **two documents** — the one
-/// about to be written and the one just parsed off disk — rather than of the store. That matters
-/// because the store is what the incidents damage: `jkb undo` of a sync deletes the items *and*
-/// their bindings, so [`dropped_items`], which walks bindings, correctly reports that nothing was
-/// dropped. There is nothing left to drop. One condition covers undo, a half-applied migration, an
-/// emptied binding table, and whatever produces the same shape next.
+/// This is the same question asked of the **two documents** — the KB's and the one just parsed off
+/// disk — rather than of the store. That matters because the store is what the incidents damage:
+/// `jkb undo` of a sync deletes the items *and* their bindings, so [`dropped_items`], which walks
+/// bindings, correctly reports that nothing was dropped. There is nothing left to drop. One
+/// condition covers undo, `jkb item rm`, a half-applied migration, an emptied binding table, and
+/// whatever produces the same shape next.
+///
+/// **Detecting it is not the same as refusing it.** [`reconcile`] calls this above the direction
+/// dispatch and then decides by mount mode: a mount that can import re-imports the file, because
+/// the disk being the good copy is this function's own premise; only an export-only mount, which
+/// has no way to read the file back, refuses. Sited inside [`export_blocker`] the answer was
+/// always "refuse", which protected the file and left the KB permanently empty.
 ///
 /// **Not** a general "fewer items than the disk" rule. On an export-only mount the file is a
 /// projection and hand-added lines are legitimately removed; on any mount, deleting the last task
@@ -1277,13 +1309,14 @@ fn wholesale_loss(kb_doc: &SyncDoc, disk_doc: Option<&SyncDoc>) -> Option<String
     if declared == 0 {
         return None;
     }
+    // Written for the one caller that surfaces it: an export-only mount, which cannot heal
+    // itself. A mount that imports never sees this text, because it re-imports instead.
     Some(format!(
         "this file declares {declared} item(s) and the KB side of it has none, so exporting would \
-         delete every one of their lines. Nothing was written. The KB is the damaged side here — \
-         `jkb undo` of a sync removes a file's items and their bindings together — so the file on \
-         disk is still the good copy. Re-import it (on an export-only mount, `jkb mount create \
-         <ns> <dir> --mode bidirectional` then sync once), or if the items really were meant to \
-         go, delete the file."
+         delete every one of their lines. Nothing was written, and this mount cannot import, so \
+         it cannot recover on its own. The file on disk is still the good copy: re-read it with \
+         `jkb mount create <ns> <dir> --mode bidirectional` followed by `jkb sync <ns>`, or if \
+         the items really were meant to go, delete the file."
     ))
 }
 
@@ -1495,7 +1528,7 @@ fn three_way_resolve(
             // It mattered because the refusal's own advice is "edit the file", and that edit is
             // what routes a refused file into this arm. Following the tool's instructions
             // deleted the line the refusal had just protected.
-            if let Some(reason) = export_blocker(conn, f, &merged, Some(disk_doc))? {
+            if let Some(reason) = export_blocker(conn, f, Some(disk_doc))? {
                 flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
                 return Ok(Outcome::Refused);
             }
