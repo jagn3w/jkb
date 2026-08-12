@@ -4409,8 +4409,9 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
     // leave the branch with none — which both readers treat as "do not act".
     anyhow::ensure!(
         !base::is_reserved_facet(facet) || matches!(mode, TagMode::Rm),
-        "`{facet}` records where a *branch* was cut, so it cannot be written per task — a second \
-         value is another branch's record, and `tag set` would delete it. Use `{}` instead.",
+        "`{facet}` records where a *branch* was cut, not where a task is: `add` would leave a \
+         value naming no branch, and `set` would delete the records of the task's other \
+         branches. Use `{}` instead.",
         base::VERB
     );
     let (facet, value) = (facet.to_owned(), value.to_owned());

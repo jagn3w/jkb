@@ -482,6 +482,56 @@ fn brought_items_in(outcome: Outcome) -> bool {
 }
 
 #[cfg(test)]
+mod seam_guard {
+    use super::{wholesale_loss, SyncDoc, SyncItem};
+
+    fn doc(items: usize) -> SyncDoc {
+        SyncDoc {
+            items: (0..items)
+                .map(|i| SyncItem::new(format!("i{i}"), "task", "t"))
+                .collect(),
+            ..SyncDoc::default()
+        }
+    }
+
+    /// The harm: the KB has lost everything bound to a file that still declares work.
+    #[test]
+    fn an_empty_kb_side_may_not_overwrite_a_file_that_declares_items() {
+        let reason = wholesale_loss(&doc(0), Some(&doc(3)))
+            .expect("an item-less render over a populated file must be refused");
+        assert!(
+            reason.contains('3'),
+            "the reason must say how much: {reason}"
+        );
+    }
+
+    /// Deleting the last task in a file is an ordinary edit, and an export-only mount is
+    /// *supposed* to overwrite hand-added lines. Neither is wholesale loss, and refusing either
+    /// would wedge the mount on every run.
+    #[test]
+    fn an_ordinary_export_is_not_refused() {
+        assert!(
+            wholesale_loss(&doc(2), Some(&doc(3))).is_none(),
+            "fewer items is an edit"
+        );
+        assert!(
+            wholesale_loss(&doc(1), Some(&doc(0))).is_none(),
+            "the KB adding one is an export"
+        );
+        assert!(
+            wholesale_loss(&doc(0), Some(&doc(0))).is_none(),
+            "both empty loses nothing"
+        );
+    }
+
+    /// No disk document means the file is absent, so an export creates rather than destroys.
+    #[test]
+    fn an_absent_file_is_not_wholesale_loss() {
+        assert!(wholesale_loss(&doc(0), None).is_none());
+    }
+}
+
+#[cfg(test)]
 mod write_seam {
     use super::write_file;
 
@@ -923,9 +973,13 @@ fn export_or_skip(
         snapshot,
     } = *f;
     let _ = (path, bare_uri, ser_name, serializer, journal, snapshot);
-    // An empty KB side is nothing to write, not a refusal: a file that was never synced and has
-    // no items is simply not this mount's business yet. `wholesale_loss` covers the case where
-    // that emptiness would *destroy* something, and it reports it as `Refused` so it is visible.
+    // An empty KB side is nothing to WRITE, so there is nothing to refuse: this arm is reached
+    // only when the file is absent or has never been synced, and skipping destroys neither. The
+    // arms that would write an item-less render over a populated file — `(false, true)` and the
+    // three-way ones — all go through `finish_export`, where `wholesale_loss` refuses.
+    //
+    // Load-bearing, not merely an optimisation: without it an absent file with an empty KB side
+    // would be *created* empty by the export below.
     if ctx.exports() && !kb_doc.items.is_empty() {
         // No disk document to compare against, so expectation falls back to the base.
         return finish_export(conn, meta, f, kb_doc, None);
@@ -1144,7 +1198,7 @@ fn export_blocker(
         snapshot,
     } = *f;
     let _ = (ser_name, snapshot);
-    if let Some(reason) = wholesale_loss(conn, serializer, journal, kb_doc, disk_doc)? {
+    if let Some(reason) = wholesale_loss(kb_doc, disk_doc) {
         return Ok(Some(reason));
     }
     let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
@@ -1207,41 +1261,30 @@ fn export_blocker(
 /// projection and hand-added lines are legitimately removed; on any mount, deleting the last task
 /// in a file is an ordinary edit. The distinguishable case is *total* loss: a file that declares
 /// items against a KB side that declares none is not an edit anyone made.
-fn wholesale_loss(
-    conn: &Connection,
-    serializer: &dyn SyncSerializer,
-    journal: Option<&sync_state::SyncState>,
-    kb_doc: &SyncDoc,
-    disk_doc: Option<&SyncDoc>,
-) -> Result<Option<String>> {
+///
+/// **Pure, and reads nothing.** [`dropped_items`] falls back to the stored base when there is no
+/// disk document; this deliberately does not, for two reasons. It would be unreachable — the only
+/// caller that passes `None` is [`export_or_skip`], which returns `Skipped` unless the KB side has
+/// items, and this returns early in that case — and an unreachable check is a second model of the
+/// world rather than defence in depth. And a guard whose thesis is *do not trust the store* should
+/// not need the store to decide. `None` means the file is absent, so there is nothing on disk to
+/// lose either way.
+fn wholesale_loss(kb_doc: &SyncDoc, disk_doc: Option<&SyncDoc>) -> Option<String> {
     if !kb_doc.items.is_empty() {
-        return Ok(None);
+        return None;
     }
-    // What the file is expected to contain: the disk document when there is one, else the base —
-    // the same precedence [`dropped_items`] uses, because it is the same question.
-    let owned;
-    let expected = match disk_doc {
-        Some(doc) => doc,
-        None => match load_base_doc(conn, journal, serializer)? {
-            Some(doc) => {
-                owned = doc;
-                &owned
-            }
-            None => return Ok(None),
-        },
-    };
-    if expected.items.is_empty() {
-        return Ok(None);
+    let declared = disk_doc.map_or(0, |d| d.items.len());
+    if declared == 0 {
+        return None;
     }
-    Ok(Some(format!(
-        "this file declares {} item(s) and the KB side of it has none, so exporting would delete \
-         every one of their lines. Nothing was written. The KB is the damaged side here — `jkb \
-         undo` of a sync removes a file's items and their bindings together — so the file on disk \
-         is still the good copy. Re-import it (on an export-only mount, `jkb mount create <ns> \
-         <dir> --mode bidirectional` then sync once), or if the items really were meant to go, \
-         delete the file.",
-        expected.items.len()
-    )))
+    Some(format!(
+        "this file declares {declared} item(s) and the KB side of it has none, so exporting would \
+         delete every one of their lines. Nothing was written. The KB is the damaged side here — \
+         `jkb undo` of a sync removes a file's items and their bindings together — so the file on \
+         disk is still the good copy. Re-import it (on an export-only mount, `jkb mount create \
+         <ns> <dir> --mode bidirectional` then sync once), or if the items really were meant to \
+         go, delete the file."
+    ))
 }
 
 /// The real `items.uid` for each `local_id`, falling back to the binding uri if the row is gone.

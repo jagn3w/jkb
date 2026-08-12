@@ -2222,3 +2222,51 @@ fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() 
         refused[0].1
     );
 }
+
+/// The seam guard is not a `tasks`-serializer rule. A `document` mount is one item per file, so
+/// losing that item is the same wholesale loss — and it arrives by the same route, an export of a
+/// KB that no longer holds what the file declares.
+///
+/// Worth its own case because every other test of this guard uses `tasks`, and "the check only
+/// ever ran on one serializer" is the shape of gap this whole pass exists to close.
+#[test]
+fn a_document_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("README.md");
+    fs::write(&file, "the good copy\n").unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+
+    // Delete the item the file is bound to — what an undo of the import leaves behind.
+    let target = uri.clone();
+    db.write_txn("cli", move |conn, meta| {
+        let id = binding::item_for_uri(conn, &target)?.expect("bound item");
+        item::remove(conn, meta, id, true).map(|_| ())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/repo").unwrap();
+    assert!(report.failed().is_empty(), "{:?}", report.failed());
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "the good copy\n",
+        "the export blanked a document whose KB item had been deleted"
+    );
+    assert_eq!(
+        report.refused().len(),
+        1,
+        "nothing told the user why the file stopped syncing: {report:?}"
+    );
+}
