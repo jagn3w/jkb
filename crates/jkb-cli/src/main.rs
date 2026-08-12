@@ -5656,19 +5656,24 @@ fn cmd_task_close_merged(
                     blocked.push((uid, branch));
                 }
             }
-            gitrepo::MergeState::Unmerged => pending.push((uid, branch)),
-            // Two different situations reach `NothingToMerge`, and only one of them is "still
-            // working on it". The other is *we declined to decide*, because the branch has no cut
-            // point we can use — never recorded, removed by `task tag rm`, dropped as an
-            // unattributable legacy value, or present but unresolvable in this repo. That task can
-            // never close, and reported as "in flight" it looks exactly like one that simply is.
-            // `BranchMissing` immediately below has named its own way out since D34; this did not.
-            gitrepo::MergeState::NothingToMerge => {
-                let usable = |b: &String| {
-                    base::resolve(&tags, b)
-                        .is_some_and(|sha| gitrepo::rev(&cwd, sha).ok().flatten().is_some())
-                };
-                if branches.iter().all(usable) {
+            // Not merged — but "still working on it" and "we declined to decide" are different
+            // answers and only one of them has a remedy. A branch with no cut point we can use
+            // (never recorded, removed by `task tag rm`, dropped as an unattributable legacy
+            // value, or present but unresolvable here) can *never* close, and reported as "in
+            // flight" it looks exactly like one that simply is. `BranchMissing` below has named
+            // its own way out since D34; this did not.
+            //
+            // Asked of the **branches**, not of the collapsed state, so the label does not depend
+            // on which branch answered first. `merged_state_of_all` returns the first non-`Merged`
+            // state it meets and `tag::applications` orders by value, so a task with one unmerged
+            // branch and one unusable cut point would otherwise be labelled by whichever sorted
+            // lower. The decision to hold was never in doubt either way; the explanation was.
+            gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
+                let mut all_usable = true;
+                for b in &branches {
+                    all_usable &= repo::base_is_usable(&cwd, base::resolve(&tags, b))?;
+                }
+                if all_usable {
                     pending.push((uid, branch));
                 } else {
                     undecidable.push((uid, branch));

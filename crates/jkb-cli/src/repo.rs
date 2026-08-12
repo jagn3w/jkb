@@ -216,10 +216,28 @@ pub(crate) fn landed_with_base(
     // question and deliberately falls through when it has no usable base. Here is also where it
     // catches every route a bad value can arrive by — a mistyped `jkb task base`, a `#base=`
     // quick-add modifier, a hand-edited tag — rather than one of them.
-    if crate::gitrepo::rev(cwd, base)?.is_none() {
+    if !base_is_usable(cwd, Some(base))? {
         return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
     }
     crate::gitrepo::is_merged(cwd, branch, trunk_ref, Some(base), prefer)
+}
+
+/// Can this cut point actually be used to decide anything — is one recorded, and does git resolve
+/// it here?
+///
+/// The **one** implementation of that question. [`landed_with_base`] gates on it to decide whether
+/// to act, and `close-merged` asks it again to explain *why* it did not — reporting "no usable cut
+/// point" separately from "still in flight", since only the first has a remedy. Those two must
+/// agree: a second spelling drifts, and then the report explains a decision the policy did not
+/// make. The first version of that report had its own inline copy.
+///
+/// # Errors
+/// Returns an error if `git` cannot be run.
+pub(crate) fn base_is_usable(cwd: &std::path::Path, base: Option<&str>) -> anyhow::Result<bool> {
+    match base {
+        None => Ok(false),
+        Some(base) => Ok(crate::gitrepo::rev(cwd, base)?.is_some()),
+    }
 }
 
 /// What the session commands need to know about the repo they are running in.

@@ -1486,3 +1486,55 @@ fn task_base_refuses_a_revision_this_repo_cannot_resolve() {
         .success()
         .stdout(predicate::str::contains(format!("base=task/x:{head}")));
 }
+
+/// `close-merged` must say "no usable cut point" rather than "still in flight". They are
+/// different answers: one resolves itself when the work lands, the other never resolves and has a
+/// remedy the user cannot guess.
+///
+/// Pending tasks are counted, not listed, so folding this case in there meant the one place a
+/// user meets a missing cut point printed nothing about it at all.
+#[test]
+fn close_merged_names_a_task_it_cannot_decide() {
+    let f = Fixture::new();
+    let uid = f.add_task("undecidable task");
+    git(&f.repo, &["branch", "feature-x"]);
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature-x"])
+        .assert()
+        .success();
+
+    // With its cut point recorded the task is merely in flight, and nothing is printed for it.
+    f.jkb()
+        .args(["task", "close-merged"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("still in flight"))
+        .stdout(predicate::str::contains(&uid).not());
+
+    // Remove it, as `task tag rm` or an unattributable legacy value would.
+    let base = git(&f.repo, &["rev-parse", "HEAD"]);
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "rm",
+            &uid,
+            &format!("base=feature-x:{base}"),
+        ])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "close-merged"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&uid))
+        .stdout(predicate::str::contains("no usable cut point"))
+        .stdout(predicate::str::contains("jkb task base"));
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "an undecidable task must be reported, never closed"
+    );
+}

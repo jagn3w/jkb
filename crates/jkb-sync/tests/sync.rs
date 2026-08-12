@@ -2328,3 +2328,56 @@ fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
         }
     }
 }
+
+/// Wholesale loss overrides `conflict_policy`, including an explicit `kb_wins`, and that is a
+/// decision rather than an oversight — so it is pinned here.
+///
+/// `kb_wins` means "when both sides have edits, prefer the KB's". A KB holding *no items at all*
+/// for the file is not an edit anyone made — that premise is the whole basis of the rule — so
+/// there is no KB side to prefer. The previous behaviour also overrode `kb_wins` (it refused, and
+/// wrote nothing); this one at least recovers the work. Without a test the next reader finds
+/// `kb_wins` silently not honoured and has to guess whether that was meant.
+#[test]
+fn wholesale_loss_recovers_even_under_kb_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::KbWins,
+    );
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
+    assert_eq!(task_count(&db), 3, "setup");
+
+    let bare = uri_for(&file);
+    db.write_txn("cli", move |conn, meta| {
+        for u in jkb_core::binding::synced_uris_for_file(conn, &bare)? {
+            if let Some(id) = binding::item_for_uri(conn, &u)? {
+                item::remove(conn, meta, id, true)?;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(task_count(&db), 0, "setup: the KB now holds nothing");
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(report.failed().is_empty(), "{:?}", report.failed());
+    assert_eq!(
+        task_count(&db),
+        3,
+        "kb_wins was honoured over an empty KB, so the file's work was not recovered"
+    );
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("^setup"),
+        "the file lost its lines"
+    );
+}
