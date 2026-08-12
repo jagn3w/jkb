@@ -241,11 +241,11 @@ pub fn prune_worktrees(dir: &Path) -> Result<()> {
 /// Returns an error if `git` cannot be executed or refuses to create the worktree.
 pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
     let path_s = path.to_string_lossy().into_owned();
-    if has_branch(dir, branch)? {
-        git_must(dir, &["worktree", "add", &path_s, branch])?;
-    } else {
-        git_must(dir, &["worktree", "add", "-b", branch, &path_s, start])?;
-    }
+    // Through `create_branch`, so a branch that exists only on the remote is checked out rather
+    // than re-cut from `start` — the `-b` fallback had the same blind spot as every other bare
+    // `has_branch`, and here it would silently start a session over on top of published work.
+    create_branch(dir, branch, start)?;
+    git_must(dir, &["worktree", "add", &path_s, branch])?;
     Ok(())
 }
 
@@ -317,7 +317,17 @@ pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
     if has_branch(dir, branch)? {
         return Ok(false);
     }
-    git_must(dir, &["branch", branch, start])?;
+    // A branch that exists only as `origin/<branch>` is not a branch to *create* — it is one to
+    // check out. `git branch <name> <trunk>` succeeds there, because no local ref of that name
+    // exists, and the result carries none of the work the name refers to: a session pointed at a
+    // remote-only batch branch landed onto an empty same-named branch, `staging ls` reported it as
+    // the batch, and the push was rejected as non-fast-forward. `has_branch` is the right question
+    // for "would `git branch` fail"; it is the wrong one for "should I create this".
+    let start = match branch_ref(dir, branch, Prefer::Remote)? {
+        Some(remote) => remote,
+        None => start.to_owned(),
+    };
+    git_must(dir, &["branch", branch, &start])?;
     Ok(true)
 }
 

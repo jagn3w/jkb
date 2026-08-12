@@ -236,9 +236,16 @@ pub(crate) fn landed_with_base(
 pub(crate) fn base_is_usable(cwd: &std::path::Path, base: Option<&str>) -> anyhow::Result<bool> {
     match base {
         None => Ok(false),
-        // `rev_commit`, never `rev`: plain `rev-parse` parses rather than looks up, so it accepts
-        // any 40-character hex string and a fabricated sha read as a usable cut point — which is
-        // the precise failure this function was added to prevent.
+        // Two questions, and both must hold. **Form first**: a symbolic revision like `HEAD`
+        // resolves in every repository, to whatever that one is pointed at now, so a stored
+        // `HEAD` would pass the git check and mean something different every time it is read.
+        // Checked here, on the reader's side, so it holds however the value reached the store —
+        // `base::write` refuses to record one, but a legacy or hand-edited tag never passed it.
+        //
+        // **Then existence**, via `rev_commit` rather than `rev`: plain `rev-parse` parses rather
+        // than looks up, so it accepts any 40-character hex string and a fabricated sha read as a
+        // usable cut point.
+        Some(base) if !crate::base::is_object_id(base) => Ok(false),
         Some(base) => Ok(crate::gitrepo::rev_commit(cwd, base)?.is_some()),
     }
 }

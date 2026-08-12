@@ -4680,14 +4680,15 @@ fn resolve_onto(
             "refusing to land on {branch}: it is this repo's trunk, and a task tagged with \
              it would read as merged the moment anything lands"
         );
-        if !gitrepo::has_branch(&ctx.root, branch)? {
-            gitrepo::create_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
-        }
+        // `create_branch` is itself remote-aware now, so an explicit `--onto` naming a batch that
+        // exists only on `origin/` checks that out instead of cutting an empty namesake from trunk.
+        gitrepo::create_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
         return Ok(branch.to_owned());
     }
-    // A session that already has a target keeps it.
+    // A session that already has a target keeps it — counting the remote-tracking copy, or a
+    // batch whose local ref was pruned would silently retarget the session somewhere else.
     if let Some(branch) = repo::facet_one(tags, repo::FACET_ONTO) {
-        if gitrepo::has_branch(&ctx.root, branch)? {
+        if gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?.is_some() {
             return Ok(branch.clone());
         }
     }
@@ -4739,7 +4740,9 @@ fn batch_onto(db: &Db, ctx: &repo::RepoCtx) -> Result<Option<String>> {
         let Some(onto) = by_branch.get(&s.branch).and_then(|t| t.onto.clone()) else {
             continue;
         };
-        if !gitrepo::has_branch(&ctx.root, &onto)? {
+        // Remote-aware for the same reason: a live batch whose local ref is gone must still be
+        // joinable, or the next session cuts a second batch beside it.
+        if gitrepo::branch_ref(&ctx.root, &onto, gitrepo::Prefer::Local)?.is_none() {
             continue;
         }
         match &found {
@@ -5560,6 +5563,24 @@ fn close_if_still_open(db: &Db, id: ItemId) -> Result<bool> {
     })?)
 }
 
+/// Which of `branches` do not exist here at all — asked **per branch**, with the same `Prefer`
+/// `close-merged` uses everywhere else.
+///
+/// Both arms that report goneness call this. They each had their own loop for one commit, which is
+/// how one of them came to interpolate the joined branch list into the message and call a live
+/// branch gone alongside a deleted one. A local-only `refs/heads/` probe is also wrong here: a
+/// branch living solely on the remote is the ordinary state after a merged PR deletes the local
+/// copy.
+fn gone_branches(cwd: &Path, branches: &[String]) -> Result<Vec<String>> {
+    let mut gone = Vec::new();
+    for b in branches {
+        if gitrepo::branch_ref(cwd, b, gitrepo::Prefer::Remote)?.is_none() {
+            gone.push(b.clone());
+        }
+    }
+    Ok(gone)
+}
+
 /// The merge state of a task, given **every** branch it records: anything short of `Merged`
 /// wins, so one unmerged branch holds the task whatever order they come back in.
 ///
@@ -5636,6 +5657,18 @@ fn cmd_task_close_merged(
                 .key
         }
     };
+    // `--repo` selects which tasks to consider; every git question below is still asked of the
+    // repository we are standing in. Those must be the same place or the command probes one repo
+    // about another's branches — reporting live work as gone and advising its tag be deleted. It
+    // is a filter, not a redirect, so a mismatch is refused rather than guessed at.
+    if let Ok(here) = repo::repo_ctx() {
+        anyhow::ensure!(
+            here.key == repo,
+            "--repo {repo} does not match the repository here ({}), and the branches would be \
+             looked up in this one. Run it from {repo}'s checkout.",
+            here.key
+        );
+    }
     let trunk_ref = match trunk {
         Some(t) => t,
         None => gitrepo::trunk(&cwd)?.context(
@@ -5694,17 +5727,10 @@ fn cmd_task_close_merged(
             // lower. The decision to hold was never in doubt either way; the explanation was.
             gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
                 let mut all_usable = true;
-                let mut gone = Vec::new();
                 for b in &branches {
                     all_usable &= repo::base_is_usable(&cwd, base::resolve(&tags, b))?;
-                    // The same question `is_merged` asks, with the same `Prefer`. A bare
-                    // local-only check called a branch gone when it lived on the remote — the
-                    // ordinary state after a merged PR deletes the local copy — and then told the
-                    // user to delete the tag tracking work that was still in flight.
-                    if gitrepo::branch_ref(&cwd, b, gitrepo::Prefer::Remote)?.is_none() {
-                        gone.push(b.clone());
-                    }
                 }
+                let gone = gone_branches(&cwd, &branches)?;
                 // A vanished branch keeps its own message. Hoisting the base check above
                 // `is_merged` meant `landed_with_base` short-circuits before branch existence is
                 // ever probed, so a task that was BOTH gone and missing a cut point stopped
@@ -5731,9 +5757,18 @@ fn cmd_task_close_merged(
             // *blocked*. Auto-closing on ambiguity is the one thing this verb must not do; the
             // cost is that a stale recorded branch holds the task, so the message names the way
             // out rather than leaving the user to find it.
+            // Name only the branches that are actually missing. `merged_state_of_all` short-
+            // circuits on the first non-`Merged` state and `tag::applications` orders by value, so
+            // a task recording a deleted branch and a live one answered `BranchMissing` from the
+            // first and never probed the second — then printed both as gone, telling the user to
+            // delete the tag that is the only record of the work still in flight. Same per-branch
+            // question the arm above asks, for the same reason.
             gitrepo::MergeState::BranchMissing => blocked.push((
                 uid,
-                format!("{branch} (gone — `jkb task tag rm <uid> branch=<name>` if it is stale)"),
+                format!(
+                    "{} gone — `jkb task tag rm <uid> branch=<name>` if stale",
+                    gone_branches(&cwd, &branches)?.join(", ")
+                ),
             )),
             gitrepo::MergeState::NoTrunk => {
                 anyhow::bail!("trunk `{trunk_ref}` does not resolve in this repo")

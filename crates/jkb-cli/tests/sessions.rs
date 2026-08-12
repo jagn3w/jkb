@@ -1433,9 +1433,19 @@ fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
 /// thinking about it hid the entire defect.
 #[test]
 fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
+    // Three shapes, three different reasons the task must not close, and picking only one is how
+    // the first two versions of this test passed against real defects:
+    //
+    // - a short hex string: rejected by `rev-parse`, and never adopted, since it is not an
+    //   object id;
+    // - a full-length hex string: **accepted** by `rev-parse`, which parses rather than looks up,
+    //   so only a verifying resolution rejects it;
+    // - a symbolic revision: resolves in *every* repository, to something different in each, so
+    //   the write must refuse the form outright and the reader must not honour it.
     for fake in [
         "deadbeefdeadbeef",
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "HEAD",
     ] {
         a_cut_point_git_cannot_resolve_case(fake);
     }
@@ -1447,12 +1457,25 @@ fn a_cut_point_git_cannot_resolve_case(fake: &str) {
     let s = f.work(&uid);
     let branch = s["branch"].as_str().unwrap().to_owned();
 
-    // The bare value was adopted for this branch — the state under test.
-    f.jkb()
+    // Two rules, and which applies depends on the shape — asserting only one is what tied the
+    // earlier versions of this test to a single path.
+    //
+    // Object-id *form* is what the write refuses, so a value without it must never appear as a
+    // qualified cut point at all. One that has the form is legitimately adopted, and is stopped
+    // instead by the reader, which cannot resolve it. Either way the task must not close.
+    let object_id_form =
+        matches!(fake.len(), 40 | 64) && fake.chars().all(|c| c.is_ascii_hexdigit());
+    let recorded = predicate::str::contains(format!("base={branch}:{fake}"));
+    let show = f
+        .jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(format!("base={branch}:{fake}")));
+        .success();
+    if object_id_form {
+        show.stdout(recorded);
+    } else {
+        show.stdout(recorded.not());
+    }
     assert_eq!(
         git(&f.repo, &["rev-parse", &branch]),
         git(&f.repo, &["rev-parse", "main"]),
@@ -1631,4 +1654,46 @@ fn task_base_does_not_resolve_a_sha_against_a_foreign_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!("base=task/x:{foreign}")));
+}
+
+/// A batch branch that exists only on the remote must be checked out, never re-cut from trunk.
+///
+/// `git branch <name> <trunk>` succeeds when no *local* ref of that name exists, so a bare
+/// `refs/heads/` probe let a session point at an empty same-named branch carrying none of the
+/// batch's work — `staging ls` then reported it as the batch and the eventual push was rejected as
+/// non-fast-forward. The question "should I create this branch" has to count the remote.
+#[test]
+fn a_remote_only_batch_branch_is_checked_out_not_re_cut() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    // A batch with work on it, published, then pruned locally.
+    git(&f.repo, &["checkout", "-q", "-b", "batch/x"]);
+    commit_in(&f.repo, "batch.txt", "batch work\n", "batch work");
+    let batch_tip = git(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["push", "-q", "origin", "batch/x"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["branch", "-D", "batch/x"]);
+
+    let uid = f.add_task("joins the remote batch");
+    let s = f.work_onto(&uid, "batch/x");
+    assert_eq!(s["onto"].as_str().unwrap(), "batch/x");
+
+    // The local branch now carries the batch's commit, not a fresh cut from trunk.
+    assert_eq!(
+        git(&f.repo, &["rev-parse", "batch/x"]),
+        batch_tip,
+        "the remote-only batch was re-cut from trunk, so the session would land on a branch \
+         carrying none of the batch's work"
+    );
+    assert!(
+        git(&f.repo, &["ls-tree", "-r", "--name-only", "batch/x"]).contains("batch.txt"),
+        "the checked-out batch is missing its own work"
+    );
 }

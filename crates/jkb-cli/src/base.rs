@@ -55,6 +55,21 @@ pub(crate) fn is_reserved_facet(facet: &str) -> bool {
     facet == FACET
 }
 
+/// Whether `value` is a full object id — the only form a cut point may be **stored** in.
+///
+/// A cut point has to mean the same commit in every clone, and only a full object id does.
+/// Symbolic revisions resolve *everywhere* and to something different in each repository: storing
+/// the literal `HEAD` and re-resolving it later yields whatever that repo is pointed at now, which
+/// is precisely the unrelated commit that makes `is_merged` skip its freshly-cut guard and close a
+/// task whose work never landed. A *foreign* full sha is harmless by comparison — it simply does
+/// not resolve in the task's repo, so the readers decline to act. The dangerous values are the
+/// ones that always resolve.
+///
+/// 40 hex digits for sha-1, 64 for a sha-256 repository.
+pub(crate) fn is_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// The cut point recorded for `branch`, as a **reader** should resolve it.
 ///
 /// Two forms are accepted:
@@ -139,10 +154,14 @@ pub(crate) fn ensure_recorded(
     let others_exist = facet_values(tags, FACET_BRANCH)
         .iter()
         .any(|b| b.as_str() != branch);
+    // Only an object id may be adopted. A bare value that is not one arrived by a route that
+    // never validated it — `jkb task add "… #base=HEAD"` reaches `tag::apply` directly — and
+    // promoting it to this branch's qualified cut point would launder an unchecked string into the
+    // record every landing decision reads.
     let adopted = if others_exist {
         None
     } else {
-        bare.first().map(String::as_str)
+        bare.iter().map(String::as_str).find(|v| is_object_id(v))
     };
 
     if let Some(sha) = adopted.or(cut) {
@@ -170,6 +189,17 @@ pub(crate) fn write(
     branch: &str,
     sha: &str,
 ) -> jkb_core::Result<()> {
+    // The form check lives HERE rather than at the CLI verb, because the verb is not the only way
+    // in: `ensure_recorded` writes too, and a caller-side rule is one more thing every present and
+    // future writer has to remember — the failure this module exists to end.
+    if !is_object_id(sha) {
+        return Err(jkb_types::Error::Validation(format!(
+            "`{sha}` is not a full commit id, and a cut point must be one: a symbolic revision \
+             resolves to a different commit in every clone, so recording one silently closes the \
+             task against work it never named. Pass the full 40-character id."
+        ))
+        .into());
+    }
     let qualified = format!("{branch}:{sha}");
     let prefix = format!("{branch}:");
     for (f, v) in tag::applications(conn, id)? {
@@ -251,8 +281,14 @@ mod tests {
 
     #[test]
     fn a_qualified_base_resolves_for_its_own_branch() {
-        let t = tags(&[(FACET_BRANCH, "task/a"), (FACET, "task/a:aaa")]);
-        assert_eq!(resolve(&t, "task/a"), Some("aaa"));
+        let t = tags(&[
+            (FACET_BRANCH, "task/a"),
+            (FACET, "task/a:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ]);
+        assert_eq!(
+            resolve(&t, "task/a"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     /// The regression that closed a live task: lending one branch's cut point to another disables
@@ -262,9 +298,12 @@ mod tests {
         let t = tags(&[
             (FACET_BRANCH, "task/a"),
             (FACET_BRANCH, "task/b"),
-            (FACET, "task/a:aaa"),
+            (FACET, "task/a:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         ]);
-        assert_eq!(resolve(&t, "task/a"), Some("aaa"));
+        assert_eq!(
+            resolve(&t, "task/a"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(
             resolve(&t, "task/b"),
             None,
@@ -274,8 +313,14 @@ mod tests {
 
     #[test]
     fn a_bare_legacy_base_applies_to_a_lone_branch() {
-        let t = tags(&[(FACET_BRANCH, "task/a"), (FACET, "deadbeef")]);
-        assert_eq!(resolve(&t, "task/a"), Some("deadbeef"));
+        let t = tags(&[
+            (FACET_BRANCH, "task/a"),
+            (FACET, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+        ]);
+        assert_eq!(
+            resolve(&t, "task/a"),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        );
     }
 
     #[test]
@@ -283,7 +328,7 @@ mod tests {
         let t = tags(&[
             (FACET_BRANCH, "task/a"),
             (FACET_BRANCH, "task/b"),
-            (FACET, "deadbeef"),
+            (FACET, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
         ]);
         assert_eq!(
             resolve(&t, "task/a"),
@@ -298,8 +343,16 @@ mod tests {
     fn a_missing_base_is_recorded_from_the_cut() {
         let db = Db::open_in_memory().unwrap();
         let id = a_task(&db, &[(FACET_BRANCH, "task/a")]);
-        ensure(&db, id, "task/a", Some("aaa"));
-        assert_eq!(resolve(&task_tags(&db, id).unwrap(), "task/a"), Some("aaa"));
+        ensure(
+            &db,
+            id,
+            "task/a",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        assert_eq!(
+            resolve(&task_tags(&db, id).unwrap(), "task/a"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     /// The must-fix `task work` kept re-introducing: a later run must never recompute a cut point
@@ -307,11 +360,22 @@ mod tests {
     #[test]
     fn an_existing_base_is_never_overwritten() {
         let db = Db::open_in_memory().unwrap();
-        let id = a_task(&db, &[(FACET_BRANCH, "task/a"), (FACET, "task/a:original")]);
-        ensure(&db, id, "task/a", Some("todays-tip"));
+        let id = a_task(
+            &db,
+            &[
+                (FACET_BRANCH, "task/a"),
+                (FACET, "task/a:4444444444444444444444444444444444444444"),
+            ],
+        );
+        ensure(
+            &db,
+            id,
+            "task/a",
+            Some("2222222222222222222222222222222222222222"),
+        );
         assert_eq!(
             resolve(&task_tags(&db, id).unwrap(), "task/a"),
-            Some("original"),
+            Some("4444444444444444444444444444444444444444"),
             "a live branch's cut point was replaced with the land target's current tip"
         );
     }
@@ -326,13 +390,25 @@ mod tests {
             &[
                 (FACET_BRANCH, "task/a"),
                 (FACET_BRANCH, "task/b"),
-                (FACET, "task/a:aaa"),
+                (FACET, "task/a:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             ],
         );
-        ensure(&db, id, "task/b", Some("bbb"));
+        ensure(
+            &db,
+            id,
+            "task/b",
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
         let t = task_tags(&db, id).unwrap();
-        assert_eq!(resolve(&t, "task/a"), Some("aaa"), "task/a's base was lost");
-        assert_eq!(resolve(&t, "task/b"), Some("bbb"));
+        assert_eq!(
+            resolve(&t, "task/a"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "task/a's base was lost"
+        );
+        assert_eq!(
+            resolve(&t, "task/b"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 
     /// The pass-22 concern. A bare value is the branch's *real* cut point; the caller's `cut` is
@@ -340,12 +416,23 @@ mod tests {
     #[test]
     fn a_bare_legacy_base_is_adopted_rather_than_replaced() {
         let db = Db::open_in_memory().unwrap();
-        let id = a_task(&db, &[(FACET_BRANCH, "task/a"), (FACET, "real-cut-point")]);
-        ensure(&db, id, "task/a", Some("todays-tip"));
+        let id = a_task(
+            &db,
+            &[
+                (FACET_BRANCH, "task/a"),
+                (FACET, "1111111111111111111111111111111111111111"),
+            ],
+        );
+        ensure(
+            &db,
+            id,
+            "task/a",
+            Some("2222222222222222222222222222222222222222"),
+        );
         let t = task_tags(&db, id).unwrap();
         assert_eq!(
             resolve(&t, "task/a"),
-            Some("real-cut-point"),
+            Some("1111111111111111111111111111111111111111"),
             "the actual cut point was discarded in favour of today's tip"
         );
         assert_eq!(
@@ -365,12 +452,20 @@ mod tests {
             &[
                 (FACET_BRANCH, "task/a"),
                 (FACET_BRANCH, "task/b"),
-                (FACET, "unattributable"),
+                (FACET, "3333333333333333333333333333333333333333"),
             ],
         );
-        ensure(&db, id, "task/b", Some("bbb"));
+        ensure(
+            &db,
+            id,
+            "task/b",
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
         let t = task_tags(&db, id).unwrap();
-        assert_eq!(resolve(&t, "task/b"), Some("bbb"));
+        assert_eq!(
+            resolve(&t, "task/b"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
         assert_eq!(
             resolve(&t, "task/a"),
             None,
@@ -388,25 +483,76 @@ mod tests {
             &[
                 (FACET_BRANCH, "task/a"),
                 (FACET_BRANCH, "task/b"),
-                (FACET, "task/a:aaa"),
-                (FACET, "task/b:bbb"),
+                (FACET, "task/a:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                (FACET, "task/b:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             ],
         );
         db.write_txn("t", move |conn, meta| {
-            write(conn, meta, id, "task/b", "new")
+            write(
+                conn,
+                meta,
+                id,
+                "task/b",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            )
         })
         .unwrap();
         let t = task_tags(&db, id).unwrap();
         assert_eq!(
             resolve(&t, "task/a"),
-            Some("aaa"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "a sibling was clobbered"
         );
-        assert_eq!(resolve(&t, "task/b"), Some("new"));
+        assert_eq!(
+            resolve(&t, "task/b"),
+            Some("cccccccccccccccccccccccccccccccccccccccc")
+        );
         assert_eq!(
             super::facet_values(&t, FACET).len(),
             2,
             "a stale entry survived"
+        );
+    }
+
+    /// A symbolic revision must never be stored. It resolves in every clone, to whatever that
+    /// repository is pointed at now, so `is_merged` compares the branch tip against an unrelated
+    /// commit, skips its freshly-cut guard, and closes a task whose work never landed. A foreign
+    /// *object id* is harmless by comparison — it simply does not resolve, and the readers decline
+    /// to act — so form, not reachability, is what has to be refused at the write.
+    #[test]
+    fn a_symbolic_revision_is_never_stored_as_a_cut_point() {
+        let db = Db::open_in_memory().unwrap();
+        let id = a_task(&db, &[(FACET_BRANCH, "task/a")]);
+        for symbolic in ["HEAD", "main", "@", "origin/main", "1111111"] {
+            let sym = symbolic.to_owned();
+            let err = db
+                .write_txn("t", move |conn, meta| write(conn, meta, id, "task/a", &sym))
+                .expect_err("a symbolic revision must be refused, not recorded");
+            assert!(
+                err.to_string().contains("full commit id"),
+                "the refusal must say why: {err}"
+            );
+        }
+        assert_eq!(resolve(&task_tags(&db, id).unwrap(), "task/a"), None);
+    }
+
+    /// And it is not laundered in through adoption either — `jkb task add "… #base=HEAD"` reaches
+    /// `tag::apply` without passing any check, so the bare value must be dropped rather than
+    /// promoted to this branch's qualified cut point.
+    #[test]
+    fn a_bare_value_that_is_not_an_object_id_is_dropped_not_adopted() {
+        let db = Db::open_in_memory().unwrap();
+        let id = a_task(&db, &[(FACET_BRANCH, "task/a"), (FACET, "HEAD")]);
+        ensure(&db, id, "task/a", None);
+        let t = task_tags(&db, id).unwrap();
+        assert_eq!(
+            resolve(&t, "task/a"),
+            None,
+            "`HEAD` was adopted as a cut point"
+        );
+        assert!(
+            super::facet_values(&t, FACET).is_empty(),
+            "the unusable bare value was left where a later run could adopt it"
         );
     }
 
