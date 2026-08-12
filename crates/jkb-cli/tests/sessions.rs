@@ -1305,3 +1305,106 @@ fn a_review_of_an_uncommitted_session_still_records() {
         "reviewed= must be recorded, or `task land` refuses and --no-review becomes the habit"
     );
 }
+
+/// The cut point a branch was created with must survive the branch being re-worked.
+///
+/// `task work` used to decide whether to record one by asking `resumed`, which is worktree
+/// existence. `abandon` removes the worktree and keeps the branch, so re-working gives
+/// `resumed == false` while `worktree_add` merely re-attaches the branch that is already there —
+/// and the "cut point" then recorded was the land target's *current* tip, long past where the
+/// branch actually began. `is_merged` compares the branch tip against that value to tell "freshly
+/// cut, nothing on it yet" from "landed"; with the wrong value the guard is skipped and
+/// `close-merged` closes a task whose work is still in flight.
+///
+/// The question that answers this correctly is "is a cut point already recorded for this branch",
+/// and it now has one implementation for every writer.
+#[test]
+fn re_working_an_abandoned_branch_keeps_its_original_cut_point() {
+    let f = Fixture::new();
+    let empty = f.add_task("re-worked task");
+    let other = f.add_task("other task");
+
+    // Open the session under test first, so the batch branch is cut here and its recorded cut
+    // point is this branch's own tip.
+    let s = f.work(&empty);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let cut_point = git(&f.repo, &["rev-parse", &branch]);
+
+    // A sibling lands onto the same batch, so the land target moves on. This is the ordinary
+    // case, not a contrivance: a batch exists to collect several tasks.
+    let so = f.work(&other);
+    assert_eq!(so["onto"].as_str().unwrap(), onto, "setup: one batch");
+    commit_in(
+        Path::new(so["worktree"].as_str().unwrap()),
+        "o.txt",
+        "from other\n",
+        "add o",
+    );
+    f.jkb()
+        .args(["task", "land", &other, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    assert_ne!(
+        git(&f.repo, &["rev-parse", &onto]),
+        cut_point,
+        "setup: the land target must have moved for this to test anything"
+    );
+
+    // Abandon without committing, then re-work. The worktree is gone but the branch is not, so
+    // `worktree_add` re-attaches it and `resumed` — which this used to be gated on — is false.
+    f.jkb().args(["task", "abandon", &empty]).assert().success();
+    f.jkb().args(["task", "work", &empty]).assert().success();
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        cut_point,
+        "setup: the re-worked branch still has no commits of its own"
+    );
+
+    // The harm. A branch with nothing on it re-merges to trunk's own tree, so on content alone
+    // it reads as merged; the recorded cut point is the only thing that separates "not started"
+    // from "landed". Overwritten with the target's newer tip, the branch no longer sits on its
+    // base, the guard is skipped, and the task closes with the work never written.
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&empty),
+        "in_progress",
+        "an empty re-worked session was closed as merged: its cut point had been overwritten \
+         with the land target's current tip"
+    );
+}
+
+/// The cut point cannot be written through the generic tag command, which would delete the
+/// records belonging to the task's *other* branches.
+///
+/// This is not a style preference. The refusal replaced an error message that named
+/// `jkb task tag set base=<branch>:<sha>` as its own remedy, and `/task-swarm` was changed to run
+/// exactly that — so following the tool's advice destroyed the records the tool then refused to
+/// act without.
+#[test]
+fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
+    let f = Fixture::new();
+    let uid = f.add_task("hand-tagged task");
+
+    for mode in ["add", "set"] {
+        f.jkb()
+            .args(["--global", "task", "tag", mode, &uid, "base=task/x:abc"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("jkb task base"));
+    }
+
+    // The verb it points at records per branch, leaving siblings alone.
+    for (branch, sha) in [("task/x", "aaaaaaa"), ("task/y", "bbbbbbb")] {
+        f.jkb()
+            .args(["--global", "task", "base", &uid, branch, sha])
+            .assert()
+            .success();
+    }
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base=task/x:aaaaaaa"))
+        .stdout(predicate::str::contains("base=task/y:bbbbbbb"));
+}

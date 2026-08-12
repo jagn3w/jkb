@@ -2045,3 +2045,180 @@ fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
         "syncing after an undo stripped task lines from the file:\n{after}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The mount-mode matrix.
+//
+// Two consecutive review passes found the same shape of must-fix — "this arm behaves differently
+// on an export-only mount and nothing tested that axis" — at two different arms. Every reconcile
+// arm branches on `ctx.imports()` or `ctx.exports()` somewhere below it, and until this table the
+// suite exercised `bidirectional` almost exclusively, so the export-only and import-only halves of
+// each arm were reached by a handful of hand-written cases and no rule.
+//
+// The invariant asserted in every cell is the one D45 is about: **a sync must not delete an item
+// line the KB knows about.** Not an outcome — outcomes legitimately differ per mode, and pinning
+// them would make this a change-detector. What must never differ is that the file keeps the work.
+// ---------------------------------------------------------------------------------------------
+
+/// What has happened to the file and the KB by the time the sync under test runs.
+#[derive(Clone, Copy, Debug)]
+enum Stage {
+    /// No journal row: this mount has never seen the file.
+    FirstSight,
+    /// Imported once and untouched since.
+    Settled,
+    /// Only the file moved.
+    DiskChanged,
+    /// Only the KB moved.
+    KbChanged,
+    /// Both moved, on different items — the arm that merges rather than conflicts.
+    BothChanged,
+    /// `jkb undo` of the import: the items and their bindings are gone, the file is not.
+    PostUndo,
+}
+
+/// The three ids `TASKS_MD` declares — the work the KB is holding on the file's behalf.
+const MATRIX_IDS: [&str; 3] = ["^setup", "^fix", "^ship"];
+
+fn mount_mode(db: &Db, dir: &Path, mode: SyncMode) {
+    mount_dir(
+        db,
+        "docs/plan",
+        dir,
+        mode,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+}
+
+/// Drive one cell and return what the file looked like before and after the sync under test.
+fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    // Every stage but `FirstSight` needs the file already imported, which an export-only mount
+    // cannot do — so the setup import always runs bidirectional and the mode under test is
+    // applied afterwards. That is also how a real export-only mount comes to hold anything.
+    mount_mode(&db, dir.path(), SyncMode::Bidirectional);
+    if !matches!(stage, Stage::FirstSight) {
+        assert_eq!(
+            sync(&db, "docs/plan").unwrap().count(Outcome::Created),
+            1,
+            "setup: the import that seeds every non-first-sight stage"
+        );
+        assert_eq!(
+            task_count(&db),
+            3,
+            "setup: three tasks should have imported"
+        );
+    }
+    // Before the mode is applied, because `mount_dir` is itself a write transaction: undoing
+    // after it unwinds the mount re-creation instead of the sync, and the cell then quietly
+    // measures nothing. Not hypothetical — this test's first version did exactly that and
+    // reported `UpToDate` for a state that must be refused.
+    if matches!(stage, Stage::PostUndo) {
+        // The trailing mirror transaction, then the reconcile itself — exactly what a user
+        // reaching for `jkb undo` after a sync unwinds.
+        for _ in 0..2 {
+            db.write_txn("cli", jkb_core::undo::undo_last)
+                .expect("undo should succeed");
+        }
+        assert_eq!(
+            task_count(&db),
+            0,
+            "setup: the undo should have removed the imported tasks"
+        );
+    }
+    mount_mode(&db, dir.path(), mode);
+
+    let disk_edit = |file: &Path| {
+        let edited = format!(
+            "{}- [ ] Added by hand ^added\n",
+            fs::read_to_string(file).unwrap()
+        );
+        fs::write(file, edited).unwrap();
+    };
+    match stage {
+        // `PostUndo` is applied above, before the mount mode changed.
+        Stage::FirstSight | Stage::Settled | Stage::PostUndo => {}
+        Stage::DiskChanged => disk_edit(&file),
+        Stage::KbChanged => kb_set_status(&db, &format!("{uri}#ship"), "in_progress"),
+        Stage::BothChanged => {
+            disk_edit(&file);
+            kb_set_status(&db, &format!("{uri}#ship"), "in_progress");
+        }
+    }
+
+    let before = fs::read_to_string(&file).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    let after = fs::read_to_string(&file).unwrap();
+    (report, before, after)
+}
+
+/// Every (mode, stage) cell: the sync completes, and the file still declares every task the KB
+/// was holding for it.
+#[test]
+fn no_mount_mode_and_stage_loses_a_task_line() {
+    for mode in [SyncMode::Import, SyncMode::Export, SyncMode::Bidirectional] {
+        for stage in [
+            Stage::FirstSight,
+            Stage::Settled,
+            Stage::DiskChanged,
+            Stage::KbChanged,
+            Stage::BothChanged,
+            Stage::PostUndo,
+        ] {
+            let (report, before, after) = matrix_case(mode, stage);
+            assert!(
+                report.failed().is_empty(),
+                "{mode:?}/{stage:?}: the reconcile errored: {:?}",
+                report.failed()
+            );
+            for id in MATRIX_IDS {
+                assert!(
+                    before.contains(id),
+                    "{mode:?}/{stage:?}: setup lost {id} before the sync ran:\n{before}"
+                );
+                assert!(
+                    after.contains(id),
+                    "{mode:?}/{stage:?}: the sync deleted {id} from the file.\n\
+                     before:\n{before}\nafter:\n{after}\nrefused: {:?}",
+                    report.refused()
+                );
+            }
+        }
+    }
+}
+
+/// The post-undo cell, stated as its own harm rather than as one row of the table.
+///
+/// `jkb undo` of a sync deletes the items **and their bindings** together, so every guard that
+/// walks bindings to decide whether an export is safe reports "nothing would be dropped" — there
+/// is nothing left to walk. On an export-only mount the reconcile then takes the export arm with
+/// an item-less render and strips the file. This is the shape D45 names: an unverified KB render
+/// reaching `write_file`. It must be refused, not written.
+#[test]
+fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() {
+    let (report, before, after) = matrix_case(SyncMode::Export, Stage::PostUndo);
+    assert_eq!(
+        after, before,
+        "the export wrote over a file whose items the KB had lost"
+    );
+    let refused = report.refused();
+    assert_eq!(
+        refused.len(),
+        1,
+        "the export was not refused, so nothing told the user why the file stopped syncing: \
+         {report:?}"
+    );
+    assert!(
+        refused[0].1.contains("the KB side of it has none"),
+        "the refusal did not name the wholesale loss: {}",
+        refused[0].1
+    );
+}

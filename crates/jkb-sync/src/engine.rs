@@ -813,10 +813,9 @@ fn reconcile(
     let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
     let kb_bytes = serializer.render(&kb_doc)?;
     let kb_hash = hash(&kb_bytes);
-    let kb_has_items = !kb_doc.items.is_empty();
 
     let Some((disk_bytes, disk_doc)) = disk.as_ref() else {
-        return export_or_skip(conn, meta, &f, &kb_bytes, kb_has_items);
+        return export_or_skip(conn, meta, &f, &kb_doc);
     };
 
     let disk_hash = hash(disk_bytes);
@@ -826,7 +825,7 @@ fn reconcile(
         if ctx.imports() {
             return finish_import(conn, meta, &f, disk_doc, Outcome::Created);
         }
-        return export_or_skip(conn, meta, &f, &kb_bytes, kb_has_items);
+        return export_or_skip(conn, meta, &f, &kb_doc);
     }
 
     let (disk_changed, kb_changed, base_doc) = decide_direction(
@@ -882,14 +881,13 @@ fn reconcile(
             Ok(Outcome::UpToDate)
         }
         (true, false) => finish_import(conn, meta, &f, disk_doc, Outcome::Imported),
-        (false, true) => finish_export(conn, meta, &f, &kb_bytes, Some(disk_doc)),
+        (false, true) => finish_export(conn, meta, &f, &kb_doc, Some(disk_doc)),
         (true, true) => three_way_resolve(
             conn,
             meta,
             &f,
             disk_doc,
             &kb_doc,
-            &kb_bytes,
             &base_doc.unwrap_or_default(),
         ),
     }
@@ -913,8 +911,7 @@ fn export_or_skip(
     conn: &Connection,
     meta: &WriteMeta,
     f: &FileCtx<'_>,
-    kb_bytes: &[u8],
-    kb_has_items: bool,
+    kb_doc: &SyncDoc,
 ) -> Result<Outcome> {
     let FileCtx {
         ctx,
@@ -926,9 +923,12 @@ fn export_or_skip(
         snapshot,
     } = *f;
     let _ = (path, bare_uri, ser_name, serializer, journal, snapshot);
-    if ctx.exports() && kb_has_items {
+    // An empty KB side is nothing to write, not a refusal: a file that was never synced and has
+    // no items is simply not this mount's business yet. `wholesale_loss` covers the case where
+    // that emptiness would *destroy* something, and it reports it as `Refused` so it is visible.
+    if ctx.exports() && !kb_doc.items.is_empty() {
         // No disk document to compare against, so expectation falls back to the base.
-        return finish_export(conn, meta, f, kb_bytes, None);
+        return finish_export(conn, meta, f, kb_doc, None);
     }
     Ok(Outcome::Skipped)
 }
@@ -1054,13 +1054,19 @@ fn finish_import(
     Ok(outcome)
 }
 
-/// Export the rendered KB bytes to the file and record the base + journal.
+/// Export the KB side to the file and record the base + journal.
+///
+/// Takes the **document**, not the bytes, and renders it here. Every export therefore writes the
+/// render of the document the guard below just judged; there is no way for a caller to have
+/// judged one thing and written another. That was not hypothetical — the guard's whole job is to
+/// vet what reaches `write_file`, and it was reading live bindings while the bytes came from
+/// somewhere else entirely (design D45.5).
 #[allow(clippy::too_many_arguments)]
 fn finish_export(
     conn: &Connection,
     meta: &WriteMeta,
     f: &FileCtx<'_>,
-    kb_bytes: &[u8],
+    kb_doc: &SyncDoc,
     expected: Option<&SyncDoc>,
 ) -> Result<Outcome> {
     let FileCtx {
@@ -1068,7 +1074,7 @@ fn finish_export(
         path,
         bare_uri,
         ser_name,
-        serializer: _,
+        serializer,
         journal,
         snapshot,
     } = *f;
@@ -1079,11 +1085,12 @@ fn finish_export(
     // The guard lives HERE, not at the call site, because two other callers reach this function
     // — `export_or_skip` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
-    if let Some(reason) = export_blocker(conn, f, expected)? {
+    if let Some(reason) = export_blocker(conn, f, kb_doc, expected)? {
         flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
         return Ok(Outcome::Refused);
     }
 
+    let kb_bytes = &serializer.render(kb_doc)?;
     write_file(path, kb_bytes, snapshot)?;
     let resolved = current_bindings(conn, bare_uri)?;
     // An export CARRIES the structure forward rather than authoring it: `apply_doc` is the only
@@ -1104,18 +1111,27 @@ fn finish_export(
 
 /// Why this file must not be written from the KB side, or `None` if it may be.
 ///
-/// Two conditions, both of which pass-10 review found the first version missing:
+/// Three conditions. The first is the seam guard and subsumes the causes, the other two are
+/// narrower checks that predate it and still catch what it does not:
 ///
-/// 1. **Items would vanish.** See [`dropped_items`].
-/// 2. **The structure is unknown while the file has content.** `dropped_items` alone returns
+/// 1. **The KB contributes nothing while the file declares something.** See [`wholesale_loss`].
+/// 2. **Items would vanish.** See [`dropped_items`].
+/// 3. **The structure is unknown while the file has content.** [`dropped_items`] alone returns
 ///    "nothing dropped" when there is no base document, which made the guard *vacuous* on the
 ///    `export_or_skip` path: a file that exists on disk but has never been imported has no journal
 ///    document, so `assemble_kb_doc` yields no layout and no sections, and the export wrote a
 ///    headerless, prose-free dump over it. "No base" means unconstrained only when there is also
 ///    nothing on disk to lose.
+///
+/// `kb_doc` is the document about to be rendered and written, and every check that can be
+/// expressed against it is — deliberately, because the state these bugs produce is *damage to the
+/// KB*, and a guard that consults the same damaged state to decide whether to trust it is not a
+/// guard. Conditions 2 and 3 still read the store, so they remain fallible in exactly that way;
+/// condition 1 does not, which is why it is first and why it is the one that must hold.
 fn export_blocker(
     conn: &Connection,
     f: &FileCtx<'_>,
+    kb_doc: &SyncDoc,
     disk_doc: Option<&SyncDoc>,
 ) -> Result<Option<String>> {
     let FileCtx {
@@ -1128,6 +1144,9 @@ fn export_blocker(
         snapshot,
     } = *f;
     let _ = (ser_name, snapshot);
+    if let Some(reason) = wholesale_loss(conn, serializer, journal, kb_doc, disk_doc)? {
+        return Ok(Some(reason));
+    }
     let dropped = dropped_items(conn, bare_uri, serializer, journal, disk_doc)?;
     if !dropped.is_empty() {
         // Name the items by their real uid, LOOKED UP rather than derived. A sync-created item's
@@ -1167,6 +1186,62 @@ fn export_blocker(
         ));
     }
     Ok(None)
+}
+
+/// The seam guard: the export would delete **every** item line the file declares, because the
+/// document assembled from the KB has none at all.
+///
+/// D45 states the single mechanism behind every sync data-loss incident this project has had — *an
+/// unverified KB render reached `write_file`*. Each incident was then fixed at its route: pass 21
+/// at `finish_export`'s `(false, true)` arm, pass 22 at `three_way_resolve`'s `!ctx.imports()` arm.
+/// Both fixes were correct and neither was the last one, because the routes are not the cause.
+///
+/// This is the same question asked at the seam, and it is asked of the **two documents** — the one
+/// about to be written and the one just parsed off disk — rather than of the store. That matters
+/// because the store is what the incidents damage: `jkb undo` of a sync deletes the items *and*
+/// their bindings, so [`dropped_items`], which walks bindings, correctly reports that nothing was
+/// dropped. There is nothing left to drop. One condition covers undo, a half-applied migration, an
+/// emptied binding table, and whatever produces the same shape next.
+///
+/// **Not** a general "fewer items than the disk" rule. On an export-only mount the file is a
+/// projection and hand-added lines are legitimately removed; on any mount, deleting the last task
+/// in a file is an ordinary edit. The distinguishable case is *total* loss: a file that declares
+/// items against a KB side that declares none is not an edit anyone made.
+fn wholesale_loss(
+    conn: &Connection,
+    serializer: &dyn SyncSerializer,
+    journal: Option<&sync_state::SyncState>,
+    kb_doc: &SyncDoc,
+    disk_doc: Option<&SyncDoc>,
+) -> Result<Option<String>> {
+    if !kb_doc.items.is_empty() {
+        return Ok(None);
+    }
+    // What the file is expected to contain: the disk document when there is one, else the base —
+    // the same precedence [`dropped_items`] uses, because it is the same question.
+    let owned;
+    let expected = match disk_doc {
+        Some(doc) => doc,
+        None => match load_base_doc(conn, journal, serializer)? {
+            Some(doc) => {
+                owned = doc;
+                &owned
+            }
+            None => return Ok(None),
+        },
+    };
+    if expected.items.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "this file declares {} item(s) and the KB side of it has none, so exporting would delete \
+         every one of their lines. Nothing was written. The KB is the damaged side here — `jkb \
+         undo` of a sync removes a file's items and their bindings together — so the file on disk \
+         is still the good copy. Re-import it (on an export-only mount, `jkb mount create <ns> \
+         <dir> --mode bidirectional` then sync once), or if the items really were meant to go, \
+         delete the file.",
+        expected.items.len()
+    )))
 }
 
 /// The real `items.uid` for each `local_id`, falling back to the binding uri if the row is gone.
@@ -1349,7 +1424,6 @@ fn three_way_resolve(
     f: &FileCtx<'_>,
     disk_doc: &SyncDoc,
     kb_doc: &SyncDoc,
-    kb_bytes: &[u8],
     base_doc: &SyncDoc,
 ) -> Result<Outcome> {
     let FileCtx {
@@ -1368,7 +1442,7 @@ fn three_way_resolve(
             // the way a KB-only change resolves: export over the file. Without this the arm fell
             // through to `apply_doc` and cancelled the tasks whose lines the disk edit removed.
             if !ctx.imports() {
-                return finish_export(conn, meta, f, kb_bytes, Some(disk_doc));
+                return finish_export(conn, meta, f, kb_doc, Some(disk_doc));
             }
             // The merge writes the file AND cancels items the merged doc lacks, so it reaches
             // the same harm `finish_export` guards. It was left ungated on the reasoning that a
@@ -1378,7 +1452,7 @@ fn three_way_resolve(
             // It mattered because the refusal's own advice is "edit the file", and that edit is
             // what routes a refused file into this arm. Following the tool's instructions
             // deleted the line the refusal had just protected.
-            if let Some(reason) = export_blocker(conn, f, Some(disk_doc))? {
+            if let Some(reason) = export_blocker(conn, f, &merged, Some(disk_doc))? {
                 flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
                 return Ok(Outcome::Refused);
             }
@@ -1401,7 +1475,7 @@ fn three_way_resolve(
         ThreeWay::Conflict => match ctx.conflict_policy.as_str() {
             "disk_wins" => finish_import(conn, meta, f, disk_doc, Outcome::ResolvedFromDisk),
             "kb_wins" => {
-                if finish_export(conn, meta, f, kb_bytes, Some(disk_doc))? == Outcome::Refused {
+                if finish_export(conn, meta, f, kb_doc, Some(disk_doc))? == Outcome::Refused {
                     return Ok(Outcome::Refused);
                 }
                 Ok(Outcome::ResolvedFromKb)

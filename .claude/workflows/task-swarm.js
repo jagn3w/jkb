@@ -283,15 +283,17 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 // and no base, so `jkb task review record` on the integration branch skipped every swarm task —
 // reporting them as "not merged into it yet" when they were fully contained in it.
 //
-// It is qualified `<branch>:<sha>` because a task may carry several branches and a base
-// describes exactly one of them. The sha is the integration branch's tip at the moment this
-// group's branch was cut from it, which is what the implementer step just did.
+// It goes through `jkb task base`, never `task tag set base=`. A cut point is per-branch, and
+// `tag set` clears the facet's other values — so recording this group's base with it deleted the
+// base of every other branch the task carried. `task tag` refuses that facet outright now; this
+// is the verb it points at. The sha is the integration branch's tip at the moment this group's
+// branch was cut from it, which is what the implementer step just did.
 function branchTagPrompt(group, branch) {
   const cmds = group.tasks
     .map(
       (t) =>
         `${JKB}${DB} task tag set ${t.uid} branch=${branch} && ` +
-        `${JKB}${DB} task tag set ${t.uid} base=${branch}:"$base"`,
+        `${JKB}${DB} task base ${t.uid} ${branch} "$base"`,
     )
     .join(' && ')
   return `Mechanical step — in the main copy at ${REPO}, record this group's working branch and

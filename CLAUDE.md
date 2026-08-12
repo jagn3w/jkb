@@ -585,18 +585,38 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   tell a session you are sitting in from one you walked away from, and a flag built on that pid
   labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
   is observable — uncommitted work and commits ahead.
-- **Location facets are set, not added — except `base=`.** `branch=`/`repo=`/`onto=` go through
-  `set_facet`, which clears the facet's other values first. **`base=` is per-branch
-  multi-valued**: it records where one particular branch was cut (`base=<branch>:<sha>`), so a
-  task with two branches legitimately has two, and putting it through `set_facet` deleted the
-  sibling's — leaving every branch but the last with none, which the landing policy then refuses
-  to act on. It goes through `set_qualified_facet`, which replaces only the entry whose
-  `<branch>:` prefix matches. Read it with `base_for_branch`; ask whether one is recorded with
-  `qualified_base_for`, which deliberately ignores the unqualified legacy fallback. `tag::apply` is additive, which is
-  right for open-ended facets and wrong here: a second `branch=` is a contradiction, not extra
-  information, and readers that collapse the multi-map pick one and mint a second session for a
-  task that already has one. `task_tags` therefore returns **all** values per facet, and the
-  session lookup matches a task's recorded branches against the worktrees that actually exist.
+- **Location facets are set, not added.** `branch=`/`repo=`/`onto=` go through `set_facet`, which
+  clears the facet's other values first. `tag::apply` is additive, which is right for open-ended
+  facets and wrong here: a second `branch=` is a contradiction, not extra information, and readers
+  that collapse the multi-map pick one and mint a second session for a task that already has one.
+  `task_tags` therefore returns **all** values per facet, and the session lookup matches a task's
+  recorded branches against the worktrees that actually exist.
+- **The cut point is not a location facet — `jkb-cli/src/base.rs` owns it (D46).** "Branch X was
+  cut from commit Y" is a fact about a *branch*, but tags key on `(item, facet)`, so the branch
+  has to be encoded into the value (`base=<branch>:<sha>`). That encoding leaked to ~12 sites and
+  **four consecutive review passes each found a different one holding a different theory of it**.
+  None were reader bugs — given a correct record, `close-merged` and `review record` have always
+  agreed across all four states (no base / this branch / another branch only / legacy bare). They
+  were three *writers* answering **"is a cut point already recorded for this branch?"** from three
+  different proxies: `task work` from `resumed` (worktree existence — wrong after `abandon`, which
+  keeps the branch), `task start` from a check that discarded a legacy value and substituted
+  today's trunk tip, and `jkb task tag set base=` from nothing at all (`set_facet` clears the
+  facet's other values, i.e. **other branches' records** — and that command was the remedy the old
+  error message named *and* what `/task-swarm` ran).
+  - The fix is a choke point, not a fourth rule: `FACET` is **private** to `base.rs`, so no other
+    module can spell it, format `<branch>:<sha>`, or take one apart. The writer's question has one
+    implementation (`ensure_recorded`, which never overwrites and *adopts* an attributable legacy
+    value instead of replacing it), the reader's has one (`resolve`), and they sit adjacent so the
+    deliberate asymmetry between them is visible in one screen. `landed_for_action` resolves the
+    cut point itself from the task's tags rather than taking it as a parameter every caller had to
+    remember to derive per branch.
+  - **`jkb task base <uid> <branch> <sha>`** is the only writer a user or workflow can reach;
+    `jkb task tag add|set base=…` **refuses** and names it (`rm` still works — deleting a wrong
+    record leaves the branch with none, which both readers read as "do not act").
+  - **A git ref (`refs/jkb/base/<branch>`) was considered and rejected.** It would make per-branch
+    keying structural, but jkb runs inside other people's professional repositories and must not
+    decorate them with refs the user never asked for. Coordination stays in the store; git is for
+    branches and commits.
 - **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
   whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
   would wedge landing until the directory was deleted by hand), and it is removed once its batch
@@ -648,12 +668,12 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   `add` stays additive, honest to its name — an open-ended facet legitimately holds several
   values. `set` is for `branch=`/`onto=`/`repo=`, where a second value is a
   contradiction and a reader collapsing the multi-map picks one at random (D36.6). Load-bearing
-  because `/task-swarm` re-tags a group on every pass. **Not for `base=`** — that one is
-  per-branch, and `tag set base=<sha>` replaces every per-branch record with one unattributable
-  value, after which landing and review-recording either lend the wrong base or stop acting.
+  because `/task-swarm` re-tags a group on every pass. **It refuses `base=`** — that one is
+  per-branch, so replacing the facet's other values deletes another branch's record; see the
+  cut-point note in D36 above and use `jkb task base`.
 - **The swarm records where it is working.** `/task-swarm` sets `onto=<integration>`/`repo=`
-  at claim and `branch=` plus `base=<branch>:<sha>` once the implementer has one, so `staging ls`
-  shows swarm work and
+  at claim and `branch=` plus `jkb task base <uid> <branch> <sha>` once the implementer has one,
+  so `staging ls` shows swarm work and
   hand-driven work in one view rather than the half it was told about. `/review-log` calls
   `jkb task review record` after mounting its findings, and says whether the branch can land.
 - **Deliberately unchanged:** `scripts/merge-queue.sh`. The swarm already runs a fresh
@@ -953,6 +973,26 @@ Design in `openspec/changes/jkb-staging-pr/`.
   inverse) silently deletes its line. `finish_export` now refuses — `Outcome::Refused`, journalled
   `needs_attention`, nothing written — and recovery is any edit to the file, which imports
   normally.
+- **The guard is now at the seam, and judges documents rather than the store (D45.5).** The two
+  routes D45 left open were each found and fixed *at the route* — pass 21 at `finish_export`'s
+  `(false, true)` arm, pass 22 at `three_way_resolve`'s `!ctx.imports()` arm. Both fixes were
+  correct and neither was the last, because a route is not a cause. `finish_export` now takes the
+  **`SyncDoc`** and renders it itself, so what the guard judged is necessarily what gets written;
+  and `export_blocker`'s first condition, `wholesale_loss`, compares **the document about to be
+  written against the document just parsed off disk** — refusing when the KB side contributes zero
+  items to a file that declares some. That matters because these incidents damage *the store*:
+  `jkb undo` of a sync deletes a file's items **and their bindings** together, so `dropped_items`,
+  which walks bindings, truthfully reports nothing dropped — there is nothing left to walk. One
+  condition covers undo, a half-applied migration, an emptied binding table, and the next thing
+  with that shape. It is deliberately *not* a general "fewer items than disk" rule: on an
+  export-only mount the file is a projection and hand-added lines are legitimately removed.
+- **The mount-mode axis is a test matrix, not a habit.** Two consecutive passes produced the same
+  shape of must-fix — "this arm behaves differently on an export-only mount and nothing tested
+  that axis". `no_mount_mode_and_stage_loses_a_task_line` runs {import, export, bidirectional} ×
+  {first sight, settled, disk-changed, kb-changed, both-changed, post-undo} and asserts the one
+  invariant D45 is about: a sync never deletes an item line the KB knows about. It asserts the
+  *harm*, not the outcomes — outcomes legitimately differ per mode, and pinning them would make it
+  a change-detector.
 - **Section namespaces are now derived**, kept for browsing and `ns:` scoping, authoritative for
   nothing. `retire_undeclared_sections` is **re-keyed on `sync_section`**: it was gated on
   `header_line`, which no longer decides anything, so leaving it would have made it a silent

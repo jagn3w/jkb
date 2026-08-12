@@ -402,11 +402,16 @@ pub(crate) struct Recording {
 /// happens once its commits reached the target.
 fn branch_is_in(
     repo_root: &std::path::Path,
+    t: &crate::repo::RepoTask,
     work: &str,
     branch: &str,
-    base: Option<&str>,
     covered: &mut BTreeMap<(String, Option<String>), bool>,
 ) -> Result<bool> {
+    // Per branch, resolved by the one module that knows how a cut point is recorded: lending one
+    // branch's to a sibling disables the "nothing on it yet" guard for that sibling. Two tasks in
+    // the same repo can name the same branch with different cut points, so the memo is keyed on
+    // both.
+    let base = crate::base::resolve(&t.tags, work);
     let key = (work.to_owned(), base.map(str::to_owned));
     if let Some(known) = covered.get(&key) {
         return Ok(*known);
@@ -442,16 +447,12 @@ fn others_are_covered(
     branch: &str,
     covered: &mut BTreeMap<(String, Option<String>), bool>,
 ) -> Result<bool> {
-    let bases = crate::repo::facet_values(&t.tags, crate::repo::FACET_BASE);
     let works = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
     for work in works {
         if work == branch {
             continue;
         }
-        // Per branch: a base describes the one branch it was cut from, and lending it to a
-        // sibling disables the "nothing on it yet" guard for that sibling.
-        let base = crate::repo::base_for_branch(bases, work, works.len());
-        if !branch_is_in(repo_root, work, branch, base, covered)? {
+        if !branch_is_in(repo_root, t, work, branch, covered)? {
             return Ok(false);
         }
     }
@@ -498,18 +499,16 @@ fn work_is_in(
     if branches.is_empty() {
         return Ok(false);
     }
-    let bases = crate::repo::facet_values(&t.tags, crate::repo::FACET_BASE);
     for work in branches {
-        let base = crate::repo::base_for_branch(bases, work, branches.len());
-        if !branch_is_in(repo_root, work, branch, base, covered)? {
+        if !branch_is_in(repo_root, t, work, branch, covered)? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Whether this task records any `base=` at all — the fact that decides whether a containment
+/// Whether this task records any cut point at all — the fact that decides whether a containment
 /// answer is "no" or "unknown".
 fn task_records_a_base(t: &crate::repo::RepoTask) -> bool {
-    !crate::repo::facet_values(&t.tags, crate::repo::FACET_BASE).is_empty()
+    crate::base::any_recorded(&t.tags)
 }

@@ -258,10 +258,15 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
         // stripping every task line from it. Undo is supposed to give work back, not delete more.
         //
         // With all three cleared, `load_base_doc` returns `None`, the base reads as empty, and
-        // the disk side's items look like additions: an importing mount re-imports the file and
-        // heals itself, while an exporting one sees `kb_has_items == false` and skips. The blob
-        // itself is never deleted (`jkb blob ls` still finds it), so this loses a pointer, not
-        // content.
+        // the disk side's items look like additions. An importing mount re-imports the file and
+        // heals itself. An exporting one does **not** simply skip — that claim stood here and was
+        // wrong: with no base, both sides read as changed, so the reconcile takes the three-way
+        // arm rather than `export_or_skip`, and on an export-only mount that arm exports. What
+        // stops it is `wholesale_loss` at the export seam, which refuses any render that
+        // contributes no items to a file that declares some. Clearing these three fields is still
+        // right — it is what lets an importing mount heal — but it is not by itself the guard.
+        // The blob itself is never deleted (`jkb blob ls` still finds it), so this loses a
+        // pointer, not content.
         return Ok(conn
             .prepare_cached(
                 "UPDATE sync_state
