@@ -2081,6 +2081,12 @@ enum Stage {
     /// merge keeps them, so undo alone never produces an item-less merged document. This stage
     /// does, and it is the state `wholesale_loss` was written for.
     KbEmptied,
+    /// `KbEmptied`, and the file moved too. The cross matters because the emptiness check sits
+    /// *above* the direction dispatch: with the disk unchanged the reconcile would take the export
+    /// arm and with it changed the three-way arm, so covering only one leaves half the routes the
+    /// guard is supposed to pre-empt untested, and moving it back below the dispatch would fail
+    /// silently in the other half.
+    KbEmptiedAndDiskChanged,
 }
 
 /// The three ids `TASKS_MD` declares — the work the KB is holding on the file's behalf.
@@ -2127,6 +2133,19 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
     // after it unwinds the mount re-creation instead of the sync, and the cell then quietly
     // measures nothing. Not hypothetical — this test's first version did exactly that and
     // reported `UpToDate` for a state that must be refused.
+    if matches!(stage, Stage::KbEmptiedAndDiskChanged) {
+        // Before the mode changes, for the same reason `PostUndo` is: `mount_dir` is a write.
+        let bare = uri_for(&file);
+        db.write_txn("cli", move |conn, meta| {
+            for u in jkb_core::binding::synced_uris_for_file(conn, &bare)? {
+                if let Some(id) = binding::item_for_uri(conn, &u)? {
+                    item::remove(conn, meta, id, true)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
     if matches!(stage, Stage::PostUndo) {
         // The trailing mirror transaction, then the reconcile itself — exactly what a user
         // reaching for `jkb undo` after a sync unwinds.
@@ -2150,8 +2169,10 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
         fs::write(file, edited).unwrap();
     };
     match stage {
-        // `PostUndo` is applied above, before the mount mode changed.
+        // `PostUndo` and the KB half of `KbEmptiedAndDiskChanged` are applied above, before the
+        // mount mode changed.
         Stage::FirstSight | Stage::Settled | Stage::PostUndo => {}
+
         Stage::KbEmptied => {
             let bare = uri_for(&file);
             db.write_txn("cli", move |conn, meta| {
@@ -2165,7 +2186,7 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
             .unwrap();
             assert_eq!(task_count(&db), 0, "setup: the KB should hold no tasks now");
         }
-        Stage::DiskChanged => disk_edit(&file),
+        Stage::DiskChanged | Stage::KbEmptiedAndDiskChanged => disk_edit(&file),
         Stage::KbChanged => kb_set_status(&db, &format!("{uri}#ship"), "in_progress"),
         Stage::BothChanged => {
             disk_edit(&file);
@@ -2197,6 +2218,7 @@ fn no_mount_mode_and_stage_loses_a_task_line() {
             Stage::BothChanged,
             Stage::PostUndo,
             Stage::KbEmptied,
+            Stage::KbEmptiedAndDiskChanged,
         ] {
             let (report, before, after, tasks) = matrix_case(mode, stage);
             assert!(
@@ -2369,15 +2391,108 @@ fn wholesale_loss_recovers_even_under_kb_wins() {
     .unwrap();
     assert_eq!(task_count(&db), 0, "setup: the KB now holds nothing");
 
+    // The disk must move too, or the reconcile takes the export arm and `conflict_policy` is never
+    // read at all — the first version of this test asserted the same thing under every policy and
+    // merely duplicated the matrix's bidirectional/kb-emptied cell.
+    fs::write(&file, format!("{TASKS_MD}- [ ] added on disk ^added\n")).unwrap();
+
     let report = sync(&db, "docs/plan").unwrap();
     assert!(report.failed().is_empty(), "{:?}", report.failed());
     assert_eq!(
         task_count(&db),
-        3,
+        4,
         "kb_wins was honoured over an empty KB, so the file's work was not recovered"
     );
     assert!(
         fs::read_to_string(&file).unwrap().contains("^setup"),
         "the file lost its lines"
     );
+}
+
+/// An empty rendered document is not proof of an empty store, and the two want opposite handling.
+///
+/// `assemble_kb_doc` also omits an item that is still bound and has merely lost its primary
+/// placement — what `jkb undo` after a re-home leaves, which is D45's own motivating verb. A
+/// `document` mount is one item per file, so a single dropped placement makes the render empty and
+/// indistinguishable from "the KB lost everything". Treated as wholesale loss the file is imported
+/// over the surviving item, and `update_item` overwrites its content, status and priority from
+/// disk — destroying un-exported KB edits, where the previous behaviour wrote nothing at all.
+///
+/// The refusal must survive on **every** mount mode, because the remedy is KB-side
+/// (`jkb task place <uid> <ns> --home`) and works regardless of direction.
+#[test]
+fn a_bound_item_that_lost_its_placement_is_refused_not_re_imported() {
+    for mode in [SyncMode::Bidirectional, SyncMode::Import, SyncMode::Export] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("README.md");
+        fs::write(&file, "on disk\n").unwrap();
+        let uri = uri_for(&file);
+
+        let db = Db::open_in_memory().unwrap();
+        let mount = |m| {
+            mount_dir(
+                &db,
+                "docs/repo",
+                dir.path(),
+                m,
+                "document",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            );
+        };
+        mount(SyncMode::Bidirectional);
+        assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+
+        // A KB edit that has not been exported yet, then the placement is stripped.
+        kb_edit(&db, &uri, "the KB's newer text\n");
+        db.write_txn("t", |conn, _m| {
+            conn.execute("DELETE FROM placements WHERE role = 'primary'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        mount(mode);
+
+        let report = sync(&db, "docs/repo").unwrap();
+        assert!(
+            report.failed().is_empty(),
+            "{mode:?}: {:?}",
+            report.failed()
+        );
+        // The invariant, on every mode: the un-exported KB edit survives and the disk copy is
+        // untouched. Being *re-imported* is the harm — it would overwrite both.
+        assert_eq!(
+            content_for(&db, &uri).as_deref(),
+            Some("the KB's newer text\n"),
+            "{mode:?}: the un-exported KB edit was overwritten from disk"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "on disk\n",
+            "{mode:?}: the file was written despite the item having no placement"
+        );
+
+        match mode {
+            // An export is attempted and stopped, naming the KB-side remedy.
+            SyncMode::Bidirectional | SyncMode::Export => {
+                assert_eq!(
+                    report.count(Outcome::Refused),
+                    1,
+                    "{mode:?}: treated as wholesale loss instead of refused: {report:?}"
+                );
+                assert!(
+                    report.refused()[0].1.contains("jkb task place"),
+                    "{mode:?}: the refusal must name the re-home remedy, not re-import: {}",
+                    report.refused()[0].1
+                );
+            }
+            // Only the KB moved and this mount cannot export, so no write is attempted and there
+            // is nothing to refuse. Skipping is the whole of the correct behaviour here.
+            SyncMode::Import => assert_eq!(
+                report.count(Outcome::Skipped),
+                1,
+                "{mode:?}: expected no write to be attempted at all: {report:?}"
+            ),
+        }
+    }
 }

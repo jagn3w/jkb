@@ -1424,10 +1424,26 @@ fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
 /// The value is injected the way a user actually can — `#base=` in quick-add text, which reaches
 /// `tag::apply` without passing the `jkb task tag` refusal — and `task work` then adopts the bare
 /// value as this branch's cut point. So this covers the reservation's gap as well as the policy.
+///
+/// **Run at both lengths, and the 40-character one is the case that mattered.** `git rev-parse`
+/// is a parser, not a lookup: a full-length hex string is already a well-formed object name, so
+/// it exits 0 and echoes it back for an object the clone does not have. The first version of this
+/// test used a 16-character value, which `rev-parse` *does* reject, so it passed against a check
+/// that let every fabricated 40-character sha straight through — a constant chosen without
+/// thinking about it hid the entire defect.
 #[test]
 fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
+    for fake in [
+        "deadbeefdeadbeef",
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    ] {
+        a_cut_point_git_cannot_resolve_case(fake);
+    }
+}
+
+fn a_cut_point_git_cannot_resolve_case(fake: &str) {
     let f = Fixture::new();
-    let uid = f.add_task("bogus base task #base=deadbeefdeadbeef");
+    let uid = f.add_task(&format!("bogus base task #base={fake}"));
     let s = f.work(&uid);
     let branch = s["branch"].as_str().unwrap().to_owned();
 
@@ -1436,9 +1452,7 @@ fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!(
-            "base={branch}:deadbeefdeadbeef"
-        )));
+        .stdout(predicate::str::contains(format!("base={branch}:{fake}")));
     assert_eq!(
         git(&f.repo, &["rev-parse", &branch]),
         git(&f.repo, &["rev-parse", "main"]),
@@ -1449,7 +1463,7 @@ fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
     assert_eq!(
         f.status_of(&uid),
         "in_progress",
-        "an empty branch was closed as merged because its cut point did not resolve, so the \
+        "an empty branch was closed as merged: the cut point `{fake}` did not resolve, so the \
          freshly-cut guard was skipped instead of applied"
     );
 }
@@ -1461,13 +1475,17 @@ fn task_base_refuses_a_revision_this_repo_cannot_resolve() {
     let f = Fixture::new();
     let uid = f.add_task("typo base task");
 
-    f.jkb()
-        .args(["--global", "task", "base", &uid, "task/x", "aaaaaaa"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "not a revision this repo can resolve",
-        ));
+    // Both lengths: a 40-character hex string parses as a well-formed object name, so only a
+    // *verifying* resolution rejects one this repo does not have.
+    for fake in ["aaaaaaa", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"] {
+        f.jkb()
+            .args(["--global", "task", "base", &uid, "task/x", fake])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "not a revision this repo can resolve",
+            ));
+    }
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()

@@ -326,7 +326,7 @@ pub(crate) fn record(
             // never saw it.
             if others_are_covered(repo_root, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
-            } else if !task_records_a_base(&t) {
+            } else if !task_records_a_base(repo_root, &t)? {
                 skipped_no_base.push(t.meta.uid.clone());
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
@@ -334,7 +334,7 @@ pub(crate) fn record(
         } else if names(crate::repo::FACET_ONTO) {
             if work_is_in(repo_root, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
-            } else if !task_records_a_base(&t) {
+            } else if !task_records_a_base(repo_root, &t)? {
                 skipped_no_base.push(t.meta.uid.clone());
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
@@ -507,8 +507,23 @@ fn work_is_in(
     Ok(true)
 }
 
-/// Whether this task records any cut point at all — the fact that decides whether a containment
-/// answer is "no" or "unknown".
-fn task_records_a_base(t: &crate::repo::RepoTask) -> bool {
-    crate::base::any_recorded(&t.tags)
+/// Whether every branch this task records has a cut point this repo can actually use — the fact
+/// that decides whether a containment answer is "no" or "unknown".
+///
+/// Asks `repo::base_is_usable`, the same question `close-merged` asks, rather than "does a base
+/// tag exist". They come apart exactly where it matters: `landed_with_base` short-circuits on an
+/// unusable cut point without ever probing git, so a task whose work *is* merged was reported as
+/// "not merged into it yet" — a claim nothing had checked — and neither remedy offered could
+/// resolve it, while the `skipped_no_base` bucket that names the recording verb sat unused. Also
+/// per branch: a base recorded for a sibling says nothing about this one.
+///
+/// # Errors
+/// Returns an error if git cannot be run.
+fn task_records_a_base(repo_root: &std::path::Path, t: &crate::repo::RepoTask) -> Result<bool> {
+    for work in crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH) {
+        if !crate::repo::base_is_usable(repo_root, crate::base::resolve(&t.tags, work))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

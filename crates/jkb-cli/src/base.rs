@@ -85,12 +85,6 @@ pub(crate) fn resolve<'a>(
     None
 }
 
-/// Whether this task records any cut point at all — the fact that separates "this branch has not
-/// landed" from "we cannot tell", which the review report shows differently.
-pub(crate) fn any_recorded(tags: &BTreeMap<String, Vec<String>>) -> bool {
-    !facet_values(tags, FACET).is_empty()
-}
-
 /// Record the cut point for `branch` **if one is not already recorded for it** — the one writer.
 ///
 /// `cut` is where the caller believes the branch began, consulted only when nothing is on record:
@@ -188,7 +182,7 @@ pub(crate) fn write(
 
 #[cfg(test)]
 mod tests {
-    use super::{any_recorded, resolve, write, FACET};
+    use super::{resolve, write, FACET};
     use crate::repo::{task_tags, FACET_BRANCH};
     use jkb_core::{item::NewItem, tag, Db};
     use jkb_types::ItemId;
@@ -296,13 +290,6 @@ mod tests {
             None,
             "an unattributable legacy base was applied to one of several branches"
         );
-    }
-
-    #[test]
-    fn any_recorded_sees_both_forms_and_neither() {
-        assert!(!any_recorded(&tags(&[(FACET_BRANCH, "task/a")])));
-        assert!(any_recorded(&tags(&[(FACET, "deadbeef")])));
-        assert!(any_recorded(&tags(&[(FACET, "task/a:aaa")])));
     }
 
     // ---- the writer's four states ----
@@ -430,6 +417,6 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = a_task(&db, &[(FACET_BRANCH, "task/a")]);
         ensure(&db, id, "task/a", None);
-        assert!(!any_recorded(&task_tags(&db, id).unwrap()));
+        assert_eq!(resolve(&task_tags(&db, id).unwrap(), "task/a"), None);
     }
 }

@@ -416,8 +416,19 @@ pub fn reset_hard(dir: &Path, reference: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether `reference` resolves to a commit in `dir`.
-fn exists(dir: &Path, reference: &str) -> Result<bool> {
+/// The commit `reference` names, or `None` if this repo does not have one.
+///
+/// **Not [`rev`].** Plain `rev-parse` is a *parser*: handed a 40-character hex string it exits 0
+/// and echoes it back whether or not the object exists, because that is already a well-formed
+/// object name. So `rev` answers "is this spellable", and using it to mean "is this a commit I
+/// have" made a fabricated sha read as a real cut point — after which `is_merged`'s tip-vs-base
+/// comparison is merely *false* rather than unknown, its freshly-cut guard is skipped, and an
+/// empty branch closes as merged. `--verify --quiet` with `^{commit}` is the question that
+/// actually looks the object up, and it is the one every caller wanting existence must ask.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn rev_commit(dir: &Path, reference: &str) -> Result<Option<String>> {
     Ok(git(
         dir,
         &[
@@ -427,7 +438,12 @@ fn exists(dir: &Path, reference: &str) -> Result<bool> {
             &format!("{reference}^{{commit}}"),
         ],
     )?
-    .is_some_and(|s| !s.is_empty()))
+    .filter(|s| !s.is_empty()))
+}
+
+/// Whether `reference` resolves to a commit in `dir`.
+fn exists(dir: &Path, reference: &str) -> Result<bool> {
+    Ok(rev_commit(dir, reference)?.is_some())
 }
 
 /// Why [`is_merged`] answered the way it did — surfaced so a "not merged" that is really

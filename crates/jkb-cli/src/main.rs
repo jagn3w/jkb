@@ -4375,19 +4375,37 @@ fn cmd_task_start(
 fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Result<()> {
     let id = resolve_task_uid(db, uid)?;
     let cwd = std::env::current_dir()?;
-    // Refuse a revision this repo cannot resolve rather than storing it verbatim. `landed_with_base`
-    // now treats an unresolvable cut point as no cut point, so a typo is no longer *dangerous* —
-    // but it is still silent, and a task that quietly stops auto-closing is a bad way to learn you
-    // fat-fingered a sha. Outside a git repo the literal is kept: there is nothing to resolve
-    // against and the record is still worth having.
-    let resolved = if let Some(resolved) = gitrepo::rev(&cwd, sha)? {
+    // Refuse a revision that cannot be resolved rather than storing it verbatim. `landed_with_base`
+    // treats an unresolvable cut point as no cut point, so a typo is no longer *dangerous* — but it
+    // is still silent, and a task that quietly stops auto-closing is a bad way to learn you
+    // fat-fingered a sha.
+    //
+    // Only when we are standing in **the task's own repo**, though. The database is global across
+    // repos (D32), so this command is reachable from anywhere, and validating against whatever
+    // repo the cwd happens to be rejected a correct sha typed from a sibling checkout. Where the
+    // value cannot be checked the literal is kept and the fact that nothing verified it is said
+    // out loud, rather than implied by silence.
+    let task_repo = repo::task_tags(db, id)?;
+    let task_repo = repo::facet_one(&task_repo, repo::FACET_REPO).cloned();
+    let here = repo::repo_ctx().ok();
+    let checkable = match (&task_repo, &here) {
+        (Some(want), Some(ctx)) => *want == ctx.key,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let resolved = if let Some(resolved) = gitrepo::rev_commit(&cwd, sha)? {
         resolved
     } else {
         anyhow::ensure!(
-            gitrepo::root(&cwd)?.is_none(),
+            !checkable,
             "`{sha}` is not a revision this repo can resolve, so nothing was recorded — a cut \
              point git cannot resolve is treated as no cut point at all, and {branch} would \
              silently never auto-close. Pass a commit that exists here."
+        );
+        eprintln!(
+            "warning: recorded `{sha}` unverified — this is not {}'s checkout, so nothing could \
+             resolve it. If it is wrong, {branch} will silently never auto-close.",
+            task_repo.as_deref().unwrap_or("the task's repo")
         );
         sha.to_owned()
     };
@@ -5670,10 +5688,27 @@ fn cmd_task_close_merged(
             // lower. The decision to hold was never in doubt either way; the explanation was.
             gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
                 let mut all_usable = true;
+                let mut gone = Vec::new();
                 for b in &branches {
                     all_usable &= repo::base_is_usable(&cwd, base::resolve(&tags, b))?;
+                    if !gitrepo::has_branch(&cwd, b)? {
+                        gone.push(b.clone());
+                    }
                 }
-                if all_usable {
+                // A vanished branch keeps its own message. Hoisting the base check above
+                // `is_merged` meant `landed_with_base` short-circuits before branch existence is
+                // ever probed, so a task that was BOTH gone and missing a cut point stopped
+                // reporting `BranchMissing` and told the user to record a cut point — advice that
+                // changes nothing except which problem the next run names.
+                if !gone.is_empty() {
+                    blocked.push((
+                        uid,
+                        format!(
+                            "{} gone — `jkb task tag rm <uid> branch=<name>` if stale",
+                            gone.join(", ")
+                        ),
+                    ));
+                } else if all_usable {
                     pending.push((uid, branch));
                 } else {
                     undecidable.push((uid, branch));
@@ -5763,11 +5798,18 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
              decided: `jkb task base {uid} <branch> <sha>`"
         );
     }
-    if r.closed.is_empty() && r.blocked.is_empty() && r.undecidable.is_empty() {
-        println!(
-            "nothing to close ({} task(s) still in flight)",
-            r.pending.len()
-        );
+    // Independent of the other buckets. Gated on them, the count vanished in exactly the runs
+    // where something else printed — so a run showing two `unknown` lines silently stopped
+    // accounting for the tasks that are simply still being worked on.
+    if !r.pending.is_empty() {
+        println!("{} task(s) still in flight", r.pending.len());
+    }
+    if r.closed.is_empty()
+        && r.blocked.is_empty()
+        && r.undecidable.is_empty()
+        && r.pending.is_empty()
+    {
+        println!("nothing to close");
     }
     Ok(())
 }

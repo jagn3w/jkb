@@ -236,7 +236,10 @@ pub(crate) fn landed_with_base(
 pub(crate) fn base_is_usable(cwd: &std::path::Path, base: Option<&str>) -> anyhow::Result<bool> {
     match base {
         None => Ok(false),
-        Some(base) => Ok(crate::gitrepo::rev(cwd, base)?.is_some()),
+        // `rev_commit`, never `rev`: plain `rev-parse` parses rather than looks up, so it accepts
+        // any 40-character hex string and a fabricated sha read as a usable cut point — which is
+        // the precise failure this function was added to prevent.
+        Some(base) => Ok(crate::gitrepo::rev_commit(cwd, base)?.is_some()),
     }
 }
 

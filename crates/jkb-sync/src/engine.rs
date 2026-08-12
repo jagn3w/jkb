@@ -65,14 +65,21 @@ pub enum Outcome {
     /// overwritten. The losing bytes are blobbed first, so `jkb blob ls --contains` can still
     /// recover them.
     ResolvedFromKb,
-    /// Exporting would have deleted lines for items that are still bound to this file, so
-    /// nothing was written (design D45.5). Journalled `needs_attention`.
+    /// Exporting would have deleted item lines, so nothing was written (design D45.5).
+    /// Journalled `needs_attention`.
     ///
-    /// Recovery is **deleting the offending lines from the file** — an item absent from disk is
-    /// one the user removed, so it stops being expected and `apply_doc` detaches it. Restoring
-    /// the item's primary placement in the KB clears it too. An earlier version judged
-    /// expectation from the *base* instead of from disk, which made the refusal unclearable
-    /// from the file: the remedy it printed could never take effect.
+    /// **Two causes, and they want opposite remedies** — [`FileResult::reason`] carries which one,
+    /// and it must be read rather than assumed:
+    ///
+    /// - *Still bound, no primary placement* ([`dropped_items`]). Restore the placement
+    ///   (`jkb task place <uid> <ns> --home`), or delete those lines from the file if the items
+    ///   really are meant to go — an item absent from disk stops being expected and `apply_doc`
+    ///   detaches it. An earlier version judged expectation from the *base* rather than from disk,
+    ///   which made the refusal unclearable from the file.
+    /// - *Nothing bound at all* ([`wholesale_loss`], on an export-only mount, which cannot heal
+    ///   itself). Here the file is the only good copy, so deleting lines from it destroys the very
+    ///   thing being protected and does not clear the refusal — the count comes from disk, so it
+    ///   stays non-zero. Re-read the file instead.
     Refused,
     /// Reconciling this file errored. Reported rather than propagated, so one bad file cannot
     /// end the run — or, under the watcher, silently kill a mount's thread for good.
@@ -501,7 +508,7 @@ mod seam_guard {
     /// The harm: the KB has lost everything bound to a file that still declares work.
     #[test]
     fn an_empty_kb_side_may_not_overwrite_a_file_that_declares_items() {
-        let reason = wholesale_loss(&doc(0), Some(&doc(3)))
+        let reason = wholesale_loss(&doc(0), &doc(3))
             .expect("an item-less render over a populated file must be refused");
         assert!(
             reason.contains('3'),
@@ -515,23 +522,17 @@ mod seam_guard {
     #[test]
     fn an_ordinary_export_is_not_refused() {
         assert!(
-            wholesale_loss(&doc(2), Some(&doc(3))).is_none(),
+            wholesale_loss(&doc(2), &doc(3)).is_none(),
             "fewer items is an edit"
         );
         assert!(
-            wholesale_loss(&doc(1), Some(&doc(0))).is_none(),
+            wholesale_loss(&doc(1), &doc(0)).is_none(),
             "the KB adding one is an export"
         );
         assert!(
-            wholesale_loss(&doc(0), Some(&doc(0))).is_none(),
+            wholesale_loss(&doc(0), &doc(0)).is_none(),
             "both empty loses nothing"
         );
-    }
-
-    /// No disk document means the file is absent, so an export creates rather than destroys.
-    #[test]
-    fn an_absent_file_is_not_wholesale_loss() {
-        assert!(wholesale_loss(&doc(0), None).is_none());
     }
 }
 
@@ -899,12 +900,35 @@ fn reconcile(
     // One condition above all of them replaces a gate in each, which is the whole point: the
     // previous placement could only ever *refuse*, and refusing is the wrong answer on two of the
     // three mount modes.
-    if let Some(reason) = wholesale_loss(&kb_doc, Some(disk_doc)) {
-        if ctx.imports() {
-            return finish_import(conn, meta, &f, disk_doc, Outcome::Imported);
+    if let Some(reason) = wholesale_loss(&kb_doc, disk_doc) {
+        // ...but an empty *document* is not proof of an empty *store*. `assemble_kb_doc` also
+        // omits an item that is still bound and merely lost its primary placement, so a file whose
+        // items are ALL in that state renders empty and looks identical to one whose items are
+        // gone. A `document` mount is one item per file, so any single dropped placement gets
+        // there. The two need opposite handling and the difference is only visible in the store:
+        //
+        // - still bound → `jkb undo` after a re-home. The items and their edits are alive; the
+        //   remedy is one command (`jkb task place <uid> <ns> --home`) and importing over them
+        //   would overwrite content, status and priority from disk, destroying un-exported work.
+        //   Fall through, and `finish_export`'s `dropped_items` refuses with that remedy on every
+        //   mount mode — as it did before this guard was hoisted above the dispatch.
+        // - nothing bound → the items really are gone, and re-reading the file is the recovery.
+        //
+        // So the emptiness question is asked of the store as well as of the document.
+        let still_bound = dropped_items(
+            conn,
+            &bare_uri,
+            serializer.as_ref(),
+            journal.as_ref(),
+            Some(disk_doc),
+        )?;
+        if still_bound.is_empty() {
+            if ctx.imports() {
+                return finish_import(conn, meta, &f, disk_doc, Outcome::Imported);
+            }
+            flag_refused(conn, meta, &bare_uri, &ser_name, &reason, journal.as_ref())?;
+            return Ok(Outcome::Refused);
         }
-        flag_refused(conn, meta, &bare_uri, &ser_name, &reason, journal.as_ref())?;
-        return Ok(Outcome::Refused);
     }
 
     let (disk_changed, kb_changed, base_doc) = decide_direction(
@@ -1002,13 +1026,12 @@ fn export_or_skip(
         snapshot,
     } = *f;
     let _ = (path, bare_uri, ser_name, serializer, journal, snapshot);
-    // An empty KB side is nothing to WRITE, so there is nothing to refuse: this arm is reached
-    // only when the file is absent or has never been synced, and skipping destroys neither. The
-    // arms that would write an item-less render over a populated file — `(false, true)` and the
-    // three-way ones — all go through `finish_export`, where `wholesale_loss` refuses.
-    //
-    // Load-bearing, not merely an optimisation: without it an absent file with an empty KB side
-    // would be *created* empty by the export below.
+    // The emptiness test below is what makes THIS route wholesale-safe, and it is load-bearing
+    // rather than an optimisation. `wholesale_loss` sits above the direction dispatch in
+    // `reconcile`, which is *after* both of this function's call sites, so it does not cover them
+    // — and this arm is reached only when the file is absent or has never been synced, where an
+    // empty KB side is nothing to write rather than something to refuse. Without the test an
+    // absent file with an empty KB side would be *created* empty by the export below.
     if ctx.exports() && !kb_doc.items.is_empty() {
         // No disk document to compare against, so expectation falls back to the base.
         return finish_export(conn, meta, f, kb_doc, None);
@@ -1207,7 +1230,8 @@ fn finish_export(
 /// The third — *the KB contributes nothing at all* — is [`wholesale_loss`], and it is deliberately
 /// **not** here. Here it could only refuse, and on a mount that can import, refusing is the wrong
 /// answer: it blocks the import that heals. It runs in [`reconcile`] above the direction dispatch
-/// instead, so it dominates every arm that reaches this function and cannot be reached from one.
+/// instead. It covers the arms below that dispatch, **not** [`export_or_skip`], which runs earlier
+/// and carries its own emptiness test for that reason.
 ///
 /// Both conditions here read the store, and the store is what the incidents this guards against
 /// damage. That is the limitation `wholesale_loss` exists to cover, and the reason it judges
@@ -1295,17 +1319,17 @@ fn export_blocker(
 /// items against a KB side that declares none is not an edit anyone made.
 ///
 /// **Pure, and reads nothing.** [`dropped_items`] falls back to the stored base when there is no
-/// disk document; this deliberately does not, for two reasons. It would be unreachable — the only
-/// caller that passes `None` is [`export_or_skip`], which returns `Skipped` unless the KB side has
-/// items, and this returns early in that case — and an unreachable check is a second model of the
-/// world rather than defence in depth. And a guard whose thesis is *do not trust the store* should
-/// not need the store to decide. `None` means the file is absent, so there is nothing on disk to
-/// lose either way.
-fn wholesale_loss(kb_doc: &SyncDoc, disk_doc: Option<&SyncDoc>) -> Option<String> {
+/// disk document; this deliberately does not. A guard whose thesis is *do not trust the store*
+/// should not need the store to decide — and its one caller has a parsed disk document by
+/// construction, because a file that is absent or unparsed never reaches the dispatch this sits
+/// above. It took an `Option` while it lived at the export seam, where one caller had no disk
+/// document; after the move that argument could only ever be `Some`, so it is gone rather than
+/// left as an input no code path can produce.
+fn wholesale_loss(kb_doc: &SyncDoc, disk_doc: &SyncDoc) -> Option<String> {
     if !kb_doc.items.is_empty() {
         return None;
     }
-    let declared = disk_doc.map_or(0, |d| d.items.len());
+    let declared = disk_doc.items.len();
     if declared == 0 {
         return None;
     }
