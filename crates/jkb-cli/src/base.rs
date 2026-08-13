@@ -42,7 +42,7 @@ use jkb_core::{tag, WriteMeta};
 use jkb_types::ItemId;
 use rusqlite::Connection;
 
-use crate::repo::{facet_one, facet_values, FACET_BRANCH, FACET_ONTO};
+use crate::repo::{facet_values, FACET_BRANCH};
 
 /// The facet the cut point is stored under. **Private on purpose** — see the module docs.
 const FACET: &str = "base";
@@ -185,9 +185,20 @@ fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> boo
 /// then nothing is measured. A namesake branch in whatever checkout the cwd happens to be is not
 /// this task's branch, and recording its tip as a verified cut point is worse than recording none.
 ///
-/// `onto` is the land target the caller is about to write, for the case where it is not in the
-/// store yet — `jkb task work` records both in one transaction. Otherwise the task's own `onto=`
-/// is used, so a caller never has to know which.
+/// `onto` is the branch this one was cut from, **as the caller states it in this call** — never
+/// read back from the task's `onto=` facet, even though the caller is usually writing exactly that
+/// value beside it.
+///
+/// That distinction is the point. Which branch a task's work was cut from is something the caller
+/// knows *now*, in this moment; the stored facet is a record of some earlier moment, and a stale
+/// one is worse than none here. A task carrying `onto=` from a previous batch, given a new branch
+/// cut from trunk, would measure their merge-base — a commit well behind the new branch's tip — and
+/// an empty branch identical to trunk would then skip the freshly-cut guard and close as merged.
+/// Naming the parent branch is not the kind of judgement that went wrong four times; *computing a
+/// commit id* was, and callers still cannot do that.
+///
+/// With no `onto` the fallback is the branch's own tip, which is the pre-existing rule and errs
+/// towards holding (D34.4).
 ///
 /// # Errors
 /// Returns an error if a tag read or write fails.
@@ -203,10 +214,7 @@ pub(crate) fn ensure_recorded(
     let cut = match repo_root {
         // Guarded by the same predicate `record_if_absent` early-returns on, so the two cannot
         // disagree about when a measurement would be thrown away.
-        Some(root) if qualified(&tags, branch).is_none() => {
-            let onto = onto.or_else(|| facet_one(&tags, FACET_ONTO).map(String::as_str));
-            measure(root, branch, onto)?
-        }
+        Some(root) if qualified(&tags, branch).is_none() => measure(root, branch, onto)?,
         _ => None,
     };
     record_if_absent(conn, meta, id, &tags, branch, cut.as_deref())

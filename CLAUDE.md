@@ -100,7 +100,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **470 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **471 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -633,14 +633,21 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     answered `NothingToMerge`, `review record` bucketed every task of every group as unlanded, and
     the land gate refused all of them: **strictly worse than the bug it replaced**. A merge-base is
     the same commit whenever it is taken, so there is no longer a right moment to call the writer.
-    `onto=` supplies the target (the caller's, when it is writing one in the same transaction;
-    otherwise the task's own facet), and the tip remains the fallback when no target is known —
-    which is `jkb task start` on a branch you are simply standing on, and where a branch that
-    already had commits stays *held* rather than closing (D34.4's accepted cost).
-  - **So `/task-swarm` computes nothing: it runs `jkb task start --branch <group-branch>`.** One
-    command for `branch=`/`repo=`/the cut point, idempotent under the run's own claim, and no value
-    it could get wrong. Every previous fix here gave the swarm a *better value to compute*; the
-    defect was that it computed one at all.
+    The tip remains the fallback when no target is stated — `jkb task start` on a branch you are
+    simply standing on — and there a branch that already had commits stays *held* rather than
+    closing (D34.4's accepted cost).
+  - **The target is what the caller states in the call, never the task's stored `onto=`.** Which
+    branch this one was cut from is something the caller knows *now*; the facet records an earlier
+    moment. A task carrying `onto=` from a previous batch, given a new branch cut from trunk, would
+    measure their merge-base — well behind the new branch's tip — so an empty branch identical to
+    trunk skips the freshly-cut guard and closes as merged. Naming the parent branch is not the
+    kind of judgement that went wrong four times; **computing a commit id** was, and callers still
+    cannot do that.
+  - **So `/task-swarm` computes nothing: it runs `jkb task start --branch <group> --onto
+    <integration>`.** One command for `branch=`/`repo=`/`onto=`/the cut point, idempotent under the
+    run's own claim, and no value it could get wrong — it states the branch it *told the implementer
+    to branch off*, which it knows for certain. Every previous fix here gave the swarm a *better
+    value to compute*; the defect was that it computed one at all.
   - **Deleting a branch takes its cut point with it** (`base::forget`, called by
     `task abandon --delete-branch`). Abandoning frees the branch *name* while leaving the task live,
     so the next `task work` cuts a new branch under it — and the dead record still resolved, still

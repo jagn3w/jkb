@@ -2504,10 +2504,11 @@ fn a_group_branch_tagged_after_its_work(f: &Fixture) -> (String, String) {
         "setup: the branch must already carry work by the time it is tagged"
     );
 
-    // Tag. Exactly the command `/task-swarm` runs: it names the branch and supplies no cut point.
+    // Tag. Exactly the command `/task-swarm` runs: it names the branch and the branch that one was
+    // cut from, and supplies no commit id.
     f.jkb()
         .args(["task", "start", &uid, "--branch", "swarm-task/group"])
-        .args(["--owner", OWNER])
+        .args(["--onto", "integration", "--owner", OWNER])
         .assert()
         .success();
     (uid, cut)
@@ -2718,4 +2719,52 @@ fn task_start_does_not_measure_a_cut_point_in_a_foreign_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains("not proj's checkout"));
+}
+
+/// A cut point is measured against the parent the caller **states**, never one read back from the
+/// task's `onto=`.
+///
+/// Which branch this one was cut from is something the caller knows in the moment; the stored
+/// facet records some earlier moment, and a stale one is worse than none. A task carrying `onto=`
+/// from a previous batch, given a new branch cut from trunk, would measure their merge-base — a
+/// commit well behind the new branch's tip — and an empty branch identical to trunk would then
+/// skip the freshly-cut guard and close as merged with no work on it. That is the one direction
+/// D34.4 forbids, so the fallback with no stated parent is the branch's own tip, which holds.
+#[test]
+fn a_stale_land_target_is_not_used_to_measure_a_new_branchs_cut_point() {
+    let f = Fixture::new();
+
+    // A batch from an earlier round, which has diverged from trunk...
+    git(&f.repo, &["checkout", "-q", "-b", "stale-batch"]);
+    commit_in(&f.repo, "old.txt", "old\n", "an earlier batch");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    // ...and trunk has moved on since.
+    commit_in(&f.repo, "new.txt", "new\n", "trunk moves on");
+    let tip = git(&f.repo, &["rev-parse", "main"]);
+    git(&f.repo, &["branch", "feature", "main"]);
+
+    let uid = f.add_task("new work, old facet");
+    for tag in ["repo=proj", "onto=stale-batch"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "set", &uid, tag])
+            .assert()
+            .success();
+    }
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "an empty branch closed as merged: its cut point was measured against a batch it was \
+         never cut from, so the freshly-cut guard was skipped"
+    );
 }

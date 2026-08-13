@@ -142,10 +142,9 @@ pub(crate) fn set_location_facets(
         crate::gitrepo::valid_ref(name).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
     if let Some(branch) = loc.branch {
-        // `loc.onto` rather than the stored facet, because this transaction is about to write it:
-        // `jkb task work` records the land target and the branch together, and the cut point is
-        // where the branch diverged from that target. `ensure_recorded` falls back to the stored
-        // `onto=` when the caller is not supplying one.
+        // `loc.onto`, the caller's statement of what this branch was cut from — never the stored
+        // facet, which records an earlier moment and may name a batch this branch has nothing to
+        // do with. See `base::ensure_recorded`.
         crate::base::ensure_recorded(conn, meta, id, repo_root, branch, loc.onto)?;
     }
     for (facet, value) in [

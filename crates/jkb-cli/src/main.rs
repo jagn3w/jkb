@@ -790,6 +790,12 @@ enum TaskCmd {
         /// The branch (default: the current branch here).
         #[arg(long)]
         branch: Option<String>,
+        /// The branch this one was cut from and will land on. Recorded as `onto=`, and it is
+        /// what the cut point is measured against — without it only the branch's own tip can
+        /// be measured, which reads as "nothing has happened here" on a branch that already
+        /// has commits.
+        #[arg(long)]
+        onto: Option<String>,
         /// The repo key (default: the basename of this git repo's root).
         #[arg(long)]
         repo: Option<String>,
@@ -4192,9 +4198,20 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Start {
             uid,
             branch,
+            onto,
             repo,
             owner,
-        } => cmd_task_start(db, &uid, branch, repo, owner, json)?,
+        } => cmd_task_start(
+            db,
+            &uid,
+            StartWhere {
+                branch,
+                onto,
+                repo,
+                owner,
+            },
+            json,
+        )?,
         TaskCmd::Base { uid, branch, sha } => cmd_task_base(db, &uid, &branch, &sha, json)?,
         TaskCmd::CloseMerged {
             repo,
@@ -4246,19 +4263,27 @@ fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Where `task start` is being told the work is happening. Grouped so the signature stays under
+/// clap's and clippy's argument-count limits.
+struct StartWhere {
+    branch: Option<String>,
+    onto: Option<String>,
+    repo: Option<String>,
+    owner: Option<String>,
+}
+
 /// `task start` — claim the task and record where the work is happening.
 ///
 /// Claiming and tagging together is the point: "I am starting this" and "here is the branch
 /// that will finish it" are the same moment, and splitting them is how the tag ends up
 /// missing on exactly the tasks that needed it.
-fn cmd_task_start(
-    db: &Db,
-    uid: &str,
-    branch: Option<String>,
-    repo: Option<String>,
-    owner: Option<String>,
-    json: bool,
-) -> Result<()> {
+fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<()> {
+    let StartWhere {
+        branch,
+        onto,
+        repo,
+        owner,
+    } = where_;
     let cwd = std::env::current_dir()?;
     let branch = match branch {
         Some(b) => b,
@@ -4292,7 +4317,9 @@ fn cmd_task_start(
     // question and the only one that guessed.
     let measure_in = here.filter(|c| c.key == repo).map(|c| c.root);
     // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
-    // anything merged, since trunk is trivially "merged into" itself.
+    // anything merged, since trunk is trivially "merged into" itself. `--onto main` is refused
+    // for the sibling reason `task work` refuses it (D34.3): it would put trunk in the branch
+    // picker as a batch to land onto.
     if let Some(t) = gitrepo::trunk(&cwd)? {
         let trunk_name = t.rsplit('/').next().unwrap_or(&t);
         anyhow::ensure!(
@@ -4300,11 +4327,17 @@ fn cmd_task_start(
             "`{branch}` is this repo's trunk — start work on a feature branch, or the task \
              would auto-close immediately"
         );
+        anyhow::ensure!(
+            onto.as_deref() != Some(trunk_name),
+            "`{trunk_name}` is this repo's trunk, so it is not something to land onto — name \
+             the staging branch {branch} was cut from, or omit --onto"
+        );
     }
 
     let id = resolve_task_uid(db, uid)?;
     let owner = owner.unwrap_or_else(owner::self_owner);
     let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
+    let n = onto.clone();
     // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
     // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
     // answer as a refusal meant `task start` refused its own second run under a new pid, and
@@ -4354,16 +4387,50 @@ fn cmd_task_start(
             &repo::Location {
                 branch: Some(&b),
                 repo: Some(&r),
-                ..repo::Location::default()
+                onto: n.as_deref(),
             },
         )?;
         Ok(())
     })?;
-    // Reported on **both** paths. The human note below was added first and alone, which left a
-    // JSON consumer — the UI, a workflow — with no way to tell that no cut point was recorded and
-    // the task will therefore never auto-close. A fact worth saying out loud is worth saying to
-    // whoever is actually reading.
-    let recorded = base::recorded_for(db, id, &branch)?;
+    report_started(
+        db,
+        id,
+        &Started {
+            uid,
+            branch: &branch,
+            repo: &repo,
+            owner: &owner,
+            measured_here: measure_in.is_some(),
+        },
+        json,
+    )
+}
+
+/// What `task start` has just recorded, for reporting it.
+struct Started<'a> {
+    uid: &'a str,
+    branch: &'a str,
+    repo: &'a str,
+    owner: &'a str,
+    /// Whether a cut point could be measured at all here — which is a different fact from whether
+    /// one ended up recorded, and the two have different remedies.
+    measured_here: bool,
+}
+
+/// Report a `task start`, on **both** output paths.
+///
+/// The human note was added first and alone, which left a JSON consumer — the UI, a workflow —
+/// with no way to tell that no cut point was recorded and the task will therefore never
+/// auto-close. A fact worth saying out loud is worth saying to whoever is actually reading.
+fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()> {
+    let Started {
+        uid,
+        branch,
+        repo,
+        owner,
+        measured_here,
+    } = *s;
+    let recorded = base::recorded_for(db, id, branch)?;
     if json {
         println!(
             "{}",
@@ -4375,22 +4442,22 @@ fn cmd_task_start(
                 "base": recorded,
             })
         );
-    } else {
-        println!("started {uid} on {repo}@{branch} (owner {owner})");
-        // Say it when there is no cut point, rather than leaving it to be discovered by a
-        // `close-merged` that quietly declines to act. Both reasons are named, because they have
-        // different remedies: one is waited out, the other is run from somewhere else.
-        if recorded.is_none() {
-            let why = if measure_in.is_none() {
-                format!("this is not {repo}'s checkout, so nothing here could measure {branch}")
-            } else {
-                format!("{branch} does not exist here")
-            };
-            println!(
-                "  note: {why}, so no cut point was recorded and this task will not auto-close. \
-                 Run `jkb task base {uid} {branch} <sha>` from {repo} once it does."
-            );
-        }
+        return Ok(());
+    }
+    println!("started {uid} on {repo}@{branch} (owner {owner})");
+    // Say it when there is no cut point, rather than leaving it to be discovered by a
+    // `close-merged` that quietly declines to act. Both reasons are named, because they have
+    // different remedies: one is waited out, the other is run from somewhere else.
+    if recorded.is_none() {
+        let why = if measured_here {
+            format!("{branch} does not exist here")
+        } else {
+            format!("this is not {repo}'s checkout, so nothing here could measure {branch}")
+        };
+        println!(
+            "  note: {why}, so no cut point was recorded and this task will not auto-close. \
+             Run `jkb task base {uid} {branch} <sha>` from {repo} once it does."
+        );
     }
     Ok(())
 }
