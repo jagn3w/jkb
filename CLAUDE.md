@@ -585,6 +585,16 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   tell a session you are sitting in from one you walked away from, and a flag built on that pid
   labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
   is observable — uncommitted work and commits ahead.
+- **Branch existence counts the remote-tracking copy, and creating is not adopting.**
+  `gitrepo::branch_ref(dir, branch, prefer)` is the one answer to "does this branch exist, and
+  under what name" — `is_merged` and `close-merged` both ask it, because a branch living only on
+  `origin/` is the ordinary state after a merged PR deletes the local copy, and a bare
+  `refs/heads/` probe called that gone and advised deleting the tag tracking live work. The
+  create-side is deliberately **two** functions, chosen per caller: `ensure_branch` prefers an
+  existing remote copy (the caller is *referring to* a branch — an explicit `--onto <batch>`, a
+  session branch whose commits may be pushed), `create_branch` takes `start` literally (the caller
+  is *making* one, and a stale namesake on the remote must not be adopted in its place). Folding
+  both into the primitive made it ignore its own `start` argument.
 - **Location facets are set, not added.** `branch=`/`repo=`/`onto=` go through `set_facet`, which
   clears the facet's other values first. `tag::apply` is additive, which is right for open-ended
   facets and wrong here: a second `branch=` is a contradiction, not extra information, and readers
@@ -613,6 +623,25 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   - **`jkb task base <uid> <branch> <sha>`** is the only writer a user or workflow can reach;
     `jkb task tag add|set base=…` **refuses** and names it (`rm` still works — deleting a wrong
     record leaves the branch with none, which both readers read as "do not act").
+  - **Only a full object id may be stored, and the rule is about form rather than reachability.**
+    A symbolic revision (`HEAD`, `main`, `@`) is the dangerous value precisely because it resolves
+    in *every* clone, to something different in each: stored and re-resolved later it names an
+    unrelated commit, `is_merged` skips its freshly-cut guard, and a task with no work on it
+    closes. A *foreign* object id is harmless by comparison — it simply does not resolve, and both
+    readers decline to act. So `base::is_object_id` (40 hex, or 64 for a sha-256 repo) gates the
+    write in `base.rs`, **not** at the CLI verb, because the verb is not the only writer —
+    `jkb task add "… #base=HEAD"` reaches `tag::apply` directly — and it gates the read too, since
+    a value predating the check never passed the write.
+  - **`git rev-parse` is a parser, not a lookup.** Handed a 40-character hex string it exits 0 and
+    echoes it back for an object the repo does not have, so `gitrepo::rev` answers "is this
+    spellable". Anything asking "is this a commit I have" uses `gitrepo::rev_commit`
+    (`--verify --quiet <ref>^{commit}`), which `exists()` is expressed in terms of. Using the
+    parser as an existence check closed an empty branch as merged.
+  - **`jkb task base` validates only where it can.** The database is global across repos (D32), so
+    the command runs from anywhere; resolution and refusal are gated on the **same** condition —
+    standing in the task's own repo — because gating only the refusal let a sibling checkout's
+    commit id be recorded as verified. Elsewhere the value is kept verbatim and the fact that
+    nothing checked it is printed.
   - **A git ref (`refs/jkb/base/<branch>`) was considered and rejected.** It would make per-branch
     keying structural, but jkb runs inside other people's professional repositories and must not
     decorate them with refs the user never asked for. Coordination stays in the store; git is for
@@ -984,6 +1013,14 @@ Design in `openspec/changes/jkb-staging-pr/`.
   `jkb item rm`, a half-applied migration, an emptied binding table, and the next thing with that
   shape. Deliberately *not* a general "fewer items than disk" rule: on an export-only mount the
   file is a projection and hand-added lines are legitimately removed.
+  - **An empty rendered document is not proof of an empty store.** `assemble_kb_doc` also omits an
+    item that is still *bound* and has merely lost its primary placement — what `jkb undo` after a
+    re-home leaves, which is D45's own motivating verb — and a `document` mount is one item per
+    file, so a single dropped placement empties the render. So the condition asks the store too:
+    anything still bound means the `dropped_items` refusal and its one-command re-home remedy, on
+    every mount mode; nothing bound means the items really are gone and re-reading the file is the
+    recovery. Without that split the guard turned a refusal into a silent import that overwrote
+    content, status and priority from disk.
   - **Detecting it is not refusing it.** Pass 23: sited inside `export_blocker` the only available
     answer was "refuse", and refusing is wrong on two of the three mount modes — it protected the
     file and left the KB **permanently** empty, since a refusal never advances the base, so the
