@@ -4631,7 +4631,20 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     // recorded base, the empty-branch guard was skipped, and `close-merged` closed a task with no
     // work on it. The only question that answers this correctly is "is a cut point already
     // recorded for this branch", and it now has exactly one implementation.
-    let cut = gitrepo::rev(&ctx.root, &onto)?;
+    // Measured on the branch, not guessed from `onto` — and taken *after* the branch exists.
+    //
+    // A cut point is where this branch begins, and once the branch is there that is simply its
+    // tip: a session has no commits yet, so `rev(branch) == rev(onto)` for one freshly cut and the
+    // two forms agree. They come apart exactly when the branch was **not** cut here and now — left
+    // behind by a `task work` that failed after creating it, made by hand, or adopted from the
+    // remote by `ensure_branch`. There `onto` has since moved, so the guess records a commit the
+    // branch never sat on: the tip no longer equals the base, `is_merged` skips its freshly-cut
+    // guard, and an empty branch reads as merged and closes the task.
+    //
+    // Measuring is also fail-safe where guessing is not. On an adopted branch that *does* carry
+    // commits, base == tip means "nothing to merge" and the readers decline to act — a missed
+    // auto-close, which costs one command, rather than a false one, which buries work (D34.4).
+    let cut = gitrepo::rev_commit(&ctx.root, &branch)?;
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
     db.write_txn("cli", move |conn, meta| {
         repo::set_location_facets(

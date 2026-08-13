@@ -1775,3 +1775,49 @@ fn a_branch_name_cannot_smuggle_a_git_option() {
     assert!(after.contains("main"), "trunk was deleted: {after}");
     assert!(after.contains("victim"), "a branch was deleted: {after}");
 }
+
+/// The cut point must be measured on the branch, not guessed from the land target.
+///
+/// They agree for a freshly cut session — it has no commits, so its tip *is* the target's tip —
+/// and come apart whenever `task work` adopts a branch it did not just create: one left behind by
+/// a run that failed after creating it, one made by hand, or one adopted from the remote. The
+/// target has moved on since, so the guess records a commit the branch never sat on; the tip then
+/// differs from the base, `is_merged` skips its freshly-cut guard, and an empty branch closes the
+/// task as merged.
+#[test]
+fn the_cut_point_is_measured_on_the_branch_not_the_land_target() {
+    let f = Fixture::new();
+    let uid = f.add_task("stranded task");
+
+    // A batch, and a branch sitting on it — the state a failed `task work` leaves behind.
+    git(&f.repo, &["branch", "batch", "main"]);
+    git(&f.repo, &["branch", "task/stranded-task", "batch"]);
+    let branch_tip = git(&f.repo, &["rev-parse", "task/stranded-task"]);
+
+    // The batch moves on, as it does whenever a sibling task lands onto it.
+    git(&f.repo, &["checkout", "-q", "batch"]);
+    commit_in(&f.repo, "sibling.txt", "landed\n", "sibling landed");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    assert_ne!(git(&f.repo, &["rev-parse", "batch"]), branch_tip, "setup");
+
+    f.jkb()
+        .args(["task", "work", &uid, "--onto", "batch"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "base=task/stranded-task:{branch_tip}"
+        )));
+
+    // The branch carries nothing of its own, so the task must not close.
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "an empty adopted branch closed as merged: its cut point was taken from the land target, \
+         which had moved, so the freshly-cut guard was skipped"
+    );
+}
