@@ -277,36 +277,30 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 // Record the implementer's branch on every task in the group, so `jkb staging ls` can show
 // the sub-branch and its commits exactly as it does for a hand-driven session (D38.2).
 //
-// `base=` is recorded with it, and is not optional bookkeeping. Landing and review-recording
-// both refuse to act on a branch with no base, because without one an empty freshly-cut branch
-// and a landed one are indistinguishable. The swarm previously wrote `onto=`/`branch=`/`repo=`
-// and no base, so `jkb task review record` on the integration branch skipped every swarm task —
-// reporting them as "not merged into it yet" when they were fully contained in it.
+// The cut point is recorded with it, and is not optional bookkeeping: landing and review-recording
+// both refuse to act on a branch with no base, because without one an empty freshly-cut branch and
+// a landed one are indistinguishable. The swarm once wrote `onto=`/`branch=`/`repo=` and no base,
+// so `jkb task review record` on the integration branch skipped every swarm task, reporting them
+// as "not merged into it yet" while they were fully contained in it.
 //
-// It goes through `jkb task base`, never `task tag set base=`. A cut point is per-branch, and
-// `tag set` clears the facet's other values — so recording this group's base with it deleted the
-// base of every other branch the task carried. `task tag` refuses that facet outright now; this
-// is the verb it points at.
-//
-// The value is the GROUP BRANCH's own tip, not the integration branch's. The integration branch
-// moves under a pipelined run — the merge queue fast-forwards it while later groups are still
-// working — so recording its tip named a commit the group's branch never sat on, and a group whose
-// implementer produced no commits was then closed wholesale with nothing written. `task base`
-// resolves a symbolic revision, so naming the branch is enough.
+// This is `jkb task start`, and the swarm passes NO value for the cut point — that is the whole
+// point of the verb. Every previous attempt here had the swarm compute one, and each computed
+// value was wrong in its own way: the integration branch's tip named a commit the group's branch
+// never sat on (it moves under a pipelined run), and then the group branch's own tip made
+// `base == tip` permanently, so `is_merged` answered `NothingToMerge` and every task of every
+// group was blocked from landing. `task start` measures it instead — where this branch diverged
+// from the `onto=` recorded at claim — and refuses to overwrite one already recorded, so re-running
+// it on a retry is safe. It also sets `branch=`/`repo=`, which is why there is one command here
+// rather than two, and it is idempotent under this run's own claim.
 function branchTagPrompt(group, branch) {
   const cmds = group.tasks
-    .map(
-      (t) =>
-        `${JKB}${DB} task tag set ${t.uid} branch=${branch} && ` +
-        `${JKB}${DB} task base ${t.uid} ${branch} ${branch}`,
-    )
+    .map((t) => `${JKB}${DB} task start ${t.uid} --branch ${branch} --owner '${OWNER}'`)
     .join(' && ')
-  return `Mechanical step — in the main copy at ${REPO}, record this group's working branch and
-the commit it was cut from:
+  return `Mechanical step — record this group's working branch and the commit it was cut from.
 
-Run:
+Run EXACTLY this, in the main copy at ${REPO}:
 
-${cmds}
+cd ${REPO} && ${cmds}
 
 Return ok=true (detail = any that failed). Bookkeeping only — change no code, touch no git.`
 }

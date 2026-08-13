@@ -172,7 +172,12 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     // Counting remote-tracking copies, because `task work` and `task land` do: a batch whose
     // local ref was pruned is still live, and dropping it here hid the task from the picker and
     // from In Flight while both of those went on acting on it.
-    let existing = gitrepo::branches_including_remote(&ctx.root)?;
+    //
+    // The **resolved ref**, not membership. A remote-only branch's bare name resolves to nothing,
+    // so counting commits with it failed and read as zero: the row said "0 commits" and refused a
+    // landing the command performed — the row-versus-command divergence this single read exists to
+    // prevent, in the exact case remote-inclusive existence was added to support.
+    let existing = gitrepo::branch_refs(&ctx.root)?;
     let worktrees = gitrepo::worktrees(&ctx.root)?;
     let mut cache = Cache::default();
 
@@ -180,9 +185,9 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     for (branch, group) in by_onto {
         // A branch deleted by hand simply stops being a staging branch — the tags that named
         // it are stale bookkeeping, not evidence that it exists.
-        if !existing.contains(&branch) {
+        let Some(branch_ref) = existing.get(&branch).cloned() else {
             continue;
-        }
+        };
         // A branch that adds nothing to trunk is either **landed** or **freshly cut and still
         // empty** — refs alone cannot tell those apart, which is exactly the ambiguity D34.2
         // records. Live work is the tie-break: a batch with a non-terminal task on it is not
@@ -215,7 +220,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
             continue;
         }
         let ahead = match &ctx.trunk {
-            Some(trunk) => gitrepo::ahead_count(&ctx.root, trunk, &branch)?,
+            Some(trunk) => gitrepo::ahead_count(&ctx.root, trunk, &branch_ref)?,
             None => 0,
         };
 
@@ -224,7 +229,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         let target_dirty =
             target_dirty_reason(&worktrees, &ctx.root, &branch, &mut cache.target_dirty)?;
         let branch_ctx = BranchCtx {
-            onto: &branch,
+            onto_ref: &branch_ref,
             sessions: &sessions,
             existing: &existing,
             target_dirty: target_dirty.as_deref(),
@@ -263,7 +268,8 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 /// were already hoisted out of this loop (see `collect`); these two were left in it.
 #[derive(Default)]
 struct Cache {
-    /// Commits `.1` has that `.0` does not.
+    /// Commits `.1` has that `.0` does not. Keyed on the **resolved refs**, which is what
+    /// `ahead_count` takes — a bare branch name may not resolve at all.
     ahead: BTreeMap<(String, String), usize>,
     /// The findings of a set of review namespaces, keyed by that set.
     findings: BTreeMap<Vec<String>, std::rc::Rc<review::Findings>>,
@@ -272,12 +278,14 @@ struct Cache {
 }
 
 impl Cache {
-    fn ahead(&mut self, root: &std::path::Path, onto: &str, branch: &str) -> Result<usize> {
-        let key = (onto.to_owned(), branch.to_owned());
+    /// Both arguments are refs that resolve here (see `gitrepo::branch_refs`), never bare
+    /// branch names.
+    fn ahead(&mut self, root: &std::path::Path, onto_ref: &str, work_ref: &str) -> Result<usize> {
+        let key = (onto_ref.to_owned(), work_ref.to_owned());
         if let Some(n) = self.ahead.get(&key) {
             return Ok(*n);
         }
-        let n = gitrepo::ahead_count(root, onto, branch)?;
+        let n = gitrepo::ahead_count(root, onto_ref, work_ref)?;
         self.ahead.insert(key, n);
         Ok(n)
     }
@@ -296,9 +304,13 @@ impl Cache {
 /// that exist in git, and whether that branch's checkout is too dirty to land into. Resolved
 /// once per branch in [`collect`] and passed down, so no row repeats the work.
 struct BranchCtx<'a> {
-    onto: &'a str,
+    /// The ref that resolves to the staging branch here — its own name, or `origin/<onto>` when
+    /// only the remote-tracking copy exists. Every git question about it is asked with this, and
+    /// the plain name is kept out so no question can be asked with a name git cannot resolve.
+    onto_ref: &'a str,
     sessions: &'a [session::Session],
-    existing: &'a std::collections::BTreeSet<String>,
+    /// Branch name → the ref that resolves to it, for every branch this repo has.
+    existing: &'a BTreeMap<String, String>,
     target_dirty: Option<&'a str>,
 }
 
@@ -311,7 +323,7 @@ fn stage_task(
     cache: &mut Cache,
 ) -> Result<StagedTask> {
     let BranchCtx {
-        onto,
+        onto_ref,
         sessions,
         existing,
         target_dirty,
@@ -332,7 +344,7 @@ fn stage_task(
     let work_branch = sess.map(|s| s.branch.clone()).or_else(|| {
         branches
             .iter()
-            .find(|b| existing.contains(*b))
+            .find(|b| existing.contains_key(*b))
             .or_else(|| branches.first())
             .cloned()
     });
@@ -363,8 +375,12 @@ fn stage_task(
         Some(s) => gitrepo::is_dirty(&s.worktree)?,
         None => false,
     };
-    let commits = match &work_branch {
-        Some(b) if !terminal && existing.contains(b) => cache.ahead(&ctx.root, onto, b)?,
+    // Both operands are refs that resolve here, never bare names: `ahead_count` now refuses an
+    // unresolvable one rather than reporting the count as zero, and zero is what tells the row
+    // there is nothing to land.
+    let work_ref = work_branch.as_ref().and_then(|b| existing.get(b));
+    let commits = match work_ref {
+        Some(r) if !terminal => cache.ahead(&ctx.root, onto_ref, r)?,
         _ => 0,
     };
 
@@ -382,7 +398,7 @@ fn stage_task(
         worktree: worktree.as_deref(),
         dirty,
         commits,
-        branch_exists: work_branch.as_ref().is_some_and(|b| existing.contains(b)),
+        branch_exists: work_ref.is_some(),
         target_dirty,
         verdict: Some(&verdict),
     });

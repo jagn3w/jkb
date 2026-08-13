@@ -100,9 +100,9 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **342 tests** green (132 core = 104 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 9 index + 25 ingest + 7 search + 40 sync + 91 cli/e2e/sessions + 6 mcp; +2 `#[ignore]`:
-  live-ollama, live-URL); `clippy -D warnings` clean
+- **470 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+  external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
+  goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
   `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
@@ -620,9 +620,33 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     deliberate asymmetry between them is visible in one screen. `landed_for_action` resolves the
     cut point itself from the task's tags rather than taking it as a parameter every caller had to
     remember to derive per branch.
-  - **`jkb task base <uid> <branch> <sha>`** is the only writer a user or workflow can reach;
+  - **`jkb task base <uid> <branch> <sha>`** is the only writer a user reaches by hand;
     `jkb task tag add|set base=…` **refuses** and names it (`rm` still works — deleting a wrong
-    record leaves the branch with none, which both readers read as "do not act").
+    record leaves the branch with none, which both readers read as "do not act"). A *workflow*
+    should not reach it either — see the measurement rule below.
+  - **What is measured is the merge-base of the branch and its land target, not the branch's tip.**
+    The tip is only the cut point at one instant, the moment the branch is created, so the writer
+    had a hidden precondition: *call me before any work happens*. `/task-swarm` cannot — it can only
+    name a group's branch once an implementer has produced one — and each attempt to work around
+    that computed its own value. The integration branch's tip named a commit the group's branch
+    never sat on; then the group branch's own tip made `base == tip` permanently, so `is_merged`
+    answered `NothingToMerge`, `review record` bucketed every task of every group as unlanded, and
+    the land gate refused all of them: **strictly worse than the bug it replaced**. A merge-base is
+    the same commit whenever it is taken, so there is no longer a right moment to call the writer.
+    `onto=` supplies the target (the caller's, when it is writing one in the same transaction;
+    otherwise the task's own facet), and the tip remains the fallback when no target is known —
+    which is `jkb task start` on a branch you are simply standing on, and where a branch that
+    already had commits stays *held* rather than closing (D34.4's accepted cost).
+  - **So `/task-swarm` computes nothing: it runs `jkb task start --branch <group-branch>`.** One
+    command for `branch=`/`repo=`/the cut point, idempotent under the run's own claim, and no value
+    it could get wrong. Every previous fix here gave the swarm a *better value to compute*; the
+    defect was that it computed one at all.
+  - **Deleting a branch takes its cut point with it** (`base::forget`, called by
+    `task abandon --delete-branch`). Abandoning frees the branch *name* while leaving the task live,
+    so the next `task work` cuts a new branch under it — and the dead record still resolved, still
+    differed from the new tip, so the freshly-cut guard was skipped and `close-merged` closed a task
+    with nothing written on it. `forget` drops exactly what `resolve` would hand that branch,
+    legacy-attribution rule included, so it cannot leave behind the one value the reader will lend.
   - **Only a full object id may be stored, and the rule is about form rather than reachability.**
     A symbolic revision (`HEAD`, `main`, `@`) is the dangerous value precisely because it resolves
     in *every* clone, to something different in each: stored and re-resolved later it names an
@@ -651,6 +675,14 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   would wedge landing until the directory was deleted by hand), and it is removed once its batch
   has merged — otherwise it both attracts new sessions onto a dead branch and stops
   `git branch -d` from deleting it.
+- **The land lock is taken before the checks, not just before the graft** — which is what lets
+  "is the target checkout dirty?" be asked **once**, by `staging::target_dirty_reason`, the same
+  function the In Flight row renders. It used to be asked twice, in two wordings, on either side of
+  the lock; the second copy did not close the window it justified itself with (it has the same gap
+  to the graft) and, because both wordings shared a phrase, the test asserting on that phrase
+  stayed green with *either* one disabled. A redundant guard that reads as protection is worse than
+  none. `land_dir_for` keeps a dirty check of its own: that one guards the `git switch` it is about
+  to perform across branches, with its own remedy, and is not a second copy of the land rule.
 - `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
   algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
   directly and it must work in any repo.
@@ -674,6 +706,17 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   either landed *or* freshly cut and still empty, and refs cannot tell those apart — **live
   work is the tie-break**, or the branch cut by the very first `task work` is hidden from the
   picker that exists to offer it.
+- **"Does this branch exist" is answered with a ref, not a boolean** (`gitrepo::branch_refs`, one
+  `for-each-ref` over `refs/heads` + `refs/remotes/origin`, local winning). Counting the
+  remote-tracking copy admitted a pruned batch to the listing, and then every count was still taken
+  with its bare short name, which resolves to nothing: `rev-list` exited non-zero, the failure read
+  as **zero commits**, and the row refused a landing the command performed. Membership answers "may
+  I show this" but not "may I ask git about it", and the second question is the one every consumer
+  actually had. So `ahead_count` now **refuses** an operand it cannot resolve rather than returning
+  zero — zero is a load-bearing answer here ("nothing to land"), and a count that could not be
+  taken must not be spelled the same way. `land_preflight` asks `branch_ref` for the same reason:
+  it asked `has_branch` while the row asked remote-inclusively, so the one shared blocker printed
+  two opposite explanations of the same task.
 - **Review state is two facets on the task**: `reviewed=<sha>` and `review=<ns>`. It is the
   one fact here with nowhere authoritative to live — git does not know, and the reviewer is a
   Claude workflow the CLI cannot run, so the CLI can only *require a record*. It deliberately
@@ -700,9 +743,10 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   because `/task-swarm` re-tags a group on every pass. **It refuses `base=`** — that one is
   per-branch, so replacing the facet's other values deletes another branch's record; see the
   cut-point note in D36 above and use `jkb task base`.
-- **The swarm records where it is working.** `/task-swarm` sets `onto=<integration>`/`repo=`
-  at claim and `branch=` plus `jkb task base <uid> <branch> <sha>` once the implementer has one,
-  so `staging ls` shows swarm work and
+- **The swarm records where it is working.** `/task-swarm` sets `onto=<integration>`/`repo=` at
+  claim, and runs `jkb task start --branch <group-branch>` once the implementer has one — which
+  records `branch=`/`repo=` and *measures* the cut point, so the swarm supplies no value it could
+  get wrong (see the measurement rule under D46). `staging ls` then shows swarm work and
   hand-driven work in one view rather than the half it was told about. `/review-log` calls
   `jkb task review record` after mounting its findings, and says whether the branch can land.
 - **Deliberately unchanged:** `scripts/merge-queue.sh`. The swarm already runs a fresh

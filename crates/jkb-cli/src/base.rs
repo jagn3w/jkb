@@ -23,6 +23,12 @@
 //! asymmetry between them is visible in one screen, and [`FACET`] is **private**: no other module
 //! can spell the facet, format a `<branch>:<sha>` value, or take one apart.
 //!
+//! There are three more things anyone can want of a cut point, and each has one implementation
+//! here too: **measure** it ([`ensure_recorded`], which is why callers pass no value —
+//! `/task-swarm` computed its own three times and got a different wrong answer each time),
+//! **replace** one by hand ([`write`], reached as `jkb task base`), and **drop** one because the
+//! branch it describes is gone ([`forget`]).
+//!
 //! ## Why a git ref was rejected
 //!
 //! `refs/jkb/base/<branch>` would make per-branch keying structural and put the fact where
@@ -36,7 +42,7 @@ use jkb_core::{tag, WriteMeta};
 use jkb_types::ItemId;
 use rusqlite::Connection;
 
-use crate::repo::{facet_values, FACET_BRANCH};
+use crate::repo::{facet_one, facet_values, FACET_BRANCH, FACET_ONTO};
 
 /// The facet the cut point is stored under. **Private on purpose** — see the module docs.
 const FACET: &str = "base";
@@ -78,9 +84,9 @@ pub(crate) fn is_object_id(value: &str) -> bool {
 ///    never lent to a branch it was not cut for. Git forbids `:` in a ref name, so splitting on
 ///    the first one is unambiguous.
 /// 2. A bare `<sha>` — written before bases were qualified. Honoured **only** when the task
-///    records at most one branch, which is the case it was written for and the only case it can
-///    be attributed to. With several branches nothing says which one it describes, and guessing
-///    is what closes a task whose work is still in flight.
+///    records no branch other than this one ([`is_the_only_branch`]), which is the case it was
+///    written for and the only case it can be attributed to. With several branches nothing says
+///    which one it describes, and guessing is what closes a task whose work is still in flight.
 ///
 /// `None` means "no cut point is recorded for this branch" — nothing more. The decision of what
 /// to *do* with that lives in [`crate::repo::landed_with_base`], which refuses to act, so this
@@ -89,43 +95,78 @@ pub(crate) fn resolve<'a>(
     tags: &'a BTreeMap<String, Vec<String>>,
     branch: &str,
 ) -> Option<&'a str> {
-    let values = facet_values(tags, FACET);
-    let prefix = format!("{branch}:");
-    if let Some(sha) = values.iter().find_map(|v| v.strip_prefix(&prefix)) {
+    if let Some(sha) = qualified(tags, branch) {
         return Some(sha);
     }
-    if facet_values(tags, FACET_BRANCH).len() <= 1 {
-        return values.iter().map(String::as_str).find(|v| !v.contains(':'));
+    if is_the_only_branch(tags, branch) {
+        return facet_values(tags, FACET)
+            .iter()
+            .map(String::as_str)
+            .find(|v| !v.contains(':'));
     }
     None
 }
 
+/// The cut point recorded for `branch` in its **qualified** form, ignoring legacy values.
+///
+/// The writer's "is one already recorded for this branch?" and the reader's first arm are the same
+/// question, so they are the same function.
+fn qualified<'a>(tags: &'a BTreeMap<String, Vec<String>>, branch: &str) -> Option<&'a str> {
+    let prefix = format!("{branch}:");
+    facet_values(tags, FACET)
+        .iter()
+        .find_map(|v| v.strip_prefix(&prefix))
+}
+
+/// Whether `branch` is the only branch this task names — the sole condition under which an
+/// unqualified legacy value can be attributed to it.
+///
+/// Phrased as "no *other* branch" rather than "at most one branch recorded", which is what the
+/// reader used while the writer already asked it this way. They come apart when the branch being
+/// asked about is not one the task records at all, and there the count answered yes and lent the
+/// value out.
+fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> bool {
+    !facet_values(tags, FACET_BRANCH)
+        .iter()
+        .any(|b| b.as_str() != branch)
+}
+
 /// Record the cut point for `branch` **if one is not already recorded for it** — the one writer,
-/// and now the one **measurer**.
+/// and the one **measurer**.
 ///
 /// It used to take the value from the caller, and three callers grew three theories of what a cut
 /// point is: trunk's tip, then the merge-base with trunk, then the land target's tip. Each was
-/// wrong in a different situation, and the last one was wrong in this project's own primary flow —
-/// a task branch cut from a *staging* branch is ahead of its merge-base with trunk before any work
-/// happens, so the freshly-cut guard never fired and an empty task closed as merged.
+/// wrong in a different situation, and the last was wrong in this project's own primary flow — a
+/// task branch cut from a *staging* branch is ahead of its merge-base with trunk before any work
+/// happens, so the freshly-cut guard never fired and an empty task closed as merged. So there is
+/// nothing left to pass.
 ///
-/// So there is nothing left to pass. The value is the branch's **own tip, right now**, which is by
-/// construction the answer to the only question the readers ask of it: *has anything happened on
-/// this branch since we started tracking it?* An existing record always wins, because that
-/// question is about the moment tracking began and no later run can re-derive it.
+/// **What is measured** is where `branch` diverged from the branch it lands on — their merge-base
+/// ([`measure`]) — falling back to the branch's own tip when no land target is known.
 ///
-/// The failure mode is uniform and safe. A branch that already carried commits when tracking began
-/// records `base == tip`, so it reads as "nothing to merge" and is held rather than closed — a
-/// missed auto-close, which costs one command, never a false one, which buries work (D34.4).
+/// The merge-base is what makes the answer independent of *when* it is taken, and that is the
+/// point. The tip is only the cut point at one instant, the moment the branch is created; a writer
+/// that ran later recorded `base == tip` on a branch full of work, `is_merged` then answered
+/// `NothingToMerge` forever, and the task could neither be credited by a review nor land.
+/// `/task-swarm` hits exactly that — it can only name a group's branch *after* the implementer has
+/// committed on it. A merge-base taken at any point in the branch's life gives the same commit, so
+/// there is no longer a right moment to call this.
 ///
-/// This runs `git` inside the write transaction, which holds the writer thread for the length of
-/// one `rev-parse`. That is the price of the caller being unable to supply a value at all, and it
-/// is worth it: every defect this module has had was a caller computing the wrong one.
+/// An existing record still always wins: only the first observation can know a cut point a later
+/// rebase has moved past, and re-measuring is what overwrote real ones.
+///
+/// The failure mode stays safe in the direction D34.4 requires. With no land target and
+/// pre-existing commits, `base == tip` reads as "nothing to merge" and the task is *held* rather
+/// than closed — a missed auto-close costs one command; a false one buries work.
+///
+/// This runs `git` inside the write transaction, so it is skipped entirely when a cut point is
+/// already recorded for `branch`: the measurement would be discarded, and the writer thread is
+/// held for the length of it.
 ///
 /// A bare pre-qualification value is **adopted** (re-written as `<branch>:<sha>`) when this task
 /// records no branch other than `branch`, since then it can only have been cut for this one. That
-/// is strictly better than the previous behaviour of discarding it and substituting today's trunk
-/// tip: the bare value is the real cut point, and today's tip is not.
+/// is strictly better than discarding it and substituting a fresh measurement: the bare value is
+/// the real cut point, and anything measured now is a guess about the past.
 ///
 /// Any bare value that is *not* adopted is removed. Leaving it would put the task back in the
 /// single-branch case above the moment the branch facet is rewritten, and the reader would then
@@ -140,72 +181,115 @@ pub(crate) fn resolve<'a>(
 /// each have to remember — this whole module exists because that kind of remembering failed four
 /// times running.
 ///
+/// `repo_root` is `None` when the caller is **not standing in the task's own repository**, and
+/// then nothing is measured. A namesake branch in whatever checkout the cwd happens to be is not
+/// this task's branch, and recording its tip as a verified cut point is worse than recording none.
+///
+/// `onto` is the land target the caller is about to write, for the case where it is not in the
+/// store yet — `jkb task work` records both in one transaction. Otherwise the task's own `onto=`
+/// is used, so a caller never has to know which.
+///
 /// # Errors
 /// Returns an error if a tag read or write fails.
 pub(crate) fn ensure_recorded(
     conn: &Connection,
     meta: &WriteMeta,
     id: ItemId,
-    repo_root: &std::path::Path,
+    repo_root: Option<&std::path::Path>,
     branch: &str,
+    onto: Option<&str>,
 ) -> jkb_core::Result<()> {
-    record_if_absent(
-        conn,
-        meta,
-        id,
-        branch,
-        measure(repo_root, branch)?.as_deref(),
-    )
+    let tags = read_tags(conn, id)?;
+    let cut = match repo_root {
+        // Guarded by the same predicate `record_if_absent` early-returns on, so the two cannot
+        // disagree about when a measurement would be thrown away.
+        Some(root) if qualified(&tags, branch).is_none() => {
+            let onto = onto.or_else(|| facet_one(&tags, FACET_ONTO).map(String::as_str));
+            measure(root, branch, onto)?
+        }
+        _ => None,
+    };
+    record_if_absent(conn, meta, id, &tags, branch, cut.as_deref())
+}
+
+/// A task's facet tags as a multi-map, read inside a transaction.
+fn read_tags(conn: &Connection, id: ItemId) -> jkb_core::Result<BTreeMap<String, Vec<String>>> {
+    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (facet, value) in tag::applications(conn, id)? {
+        tags.entry(facet).or_default().push(value);
+    }
+    Ok(tags)
 }
 
 /// The decision half of [`ensure_recorded`]: given a candidate, decide whether to record it.
 ///
-/// Private, and split out only so the four adoption states can be unit-tested without a git repo.
+/// Private, and split out only so the adoption states can be unit-tested without a git repo.
 /// Callers outside this module reach [`ensure_recorded`], which measures — the candidate is not
 /// something any of them may choose.
 fn record_if_absent(
     conn: &Connection,
     meta: &WriteMeta,
     id: ItemId,
+    tags: &BTreeMap<String, Vec<String>>,
     branch: &str,
     cut: Option<&str>,
 ) -> jkb_core::Result<()> {
-    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (facet, value) in tag::applications(conn, id)? {
-        tags.entry(facet).or_default().push(value);
-    }
-    let tags = &tags;
-    let values = facet_values(tags, FACET);
-    let prefix = format!("{branch}:");
-    if values.iter().any(|v| v.starts_with(&prefix)) {
+    if qualified(tags, branch).is_some() {
         return Ok(());
     }
 
-    let bare: Vec<String> = values
+    let bare: Vec<String> = facet_values(tags, FACET)
         .iter()
         .filter(|v| !v.contains(':'))
         .cloned()
         .collect();
-    let others_exist = facet_values(tags, FACET_BRANCH)
-        .iter()
-        .any(|b| b.as_str() != branch);
     // Only an object id may be adopted. A bare value that is not one arrived by a route that
     // never validated it — `jkb task add "… #base=HEAD"` reaches `tag::apply` directly — and
     // promoting it to this branch's qualified cut point would launder an unchecked string into the
     // record every landing decision reads.
-    let adopted = if others_exist {
-        None
-    } else {
+    let adopted = if is_the_only_branch(tags, branch) {
         bare.iter().map(String::as_str).find(|v| is_object_id(v))
+    } else {
+        None
     };
 
     // An attributable pre-qualification value wins over the measurement: it is the real cut
-    // point, and a tip measured now is not.
+    // point, and anything measured now is a guess about the past.
     if let Some(sha) = adopted.or(cut) {
         write(conn, meta, id, branch, sha)?;
     }
     for stale in &bare {
         tag::remove(conn, meta, id, FACET, stale)?;
+    }
+    Ok(())
+}
+
+/// Drop every cut point [`resolve`] would hand `branch` — because the branch itself is gone.
+///
+/// `jkb task abandon --delete-branch` frees the branch *name* while leaving the task live, so the
+/// next `jkb task work` cuts a **new** branch under it. The old record still resolved and still
+/// differed from the new tip, so `is_merged` skipped its freshly-cut guard and `close-merged`
+/// marked the task done with nothing written on it.
+///
+/// Unqualified legacy values go too, but only when this is the task's sole branch — which is
+/// exactly when [`resolve`] would lend one to it. Removing them otherwise deletes a sibling's
+/// record.
+///
+/// # Errors
+/// Returns an error if a tag read or write fails.
+pub(crate) fn forget(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: ItemId,
+    branch: &str,
+) -> jkb_core::Result<()> {
+    let tags = read_tags(conn, id)?;
+    let lone = is_the_only_branch(&tags, branch);
+    let prefix = format!("{branch}:");
+    for value in facet_values(&tags, FACET) {
+        if value.starts_with(&prefix) || (lone && !value.contains(':')) {
+            tag::remove(conn, meta, id, FACET, value)?;
+        }
     }
     Ok(())
 }
@@ -227,18 +311,48 @@ pub(crate) fn recorded_for(
     Ok(resolve(&crate::repo::task_tags(db, id)?, branch).map(str::to_owned))
 }
 
-/// The branch's own tip, or `None` if this repo does not have the branch.
+/// Where `branch` diverged from `onto`, falling back to the branch's own tip.
 ///
-/// Resolved through `branch_ref` so a branch that exists only on the remote still answers, and
-/// through `rev_commit` so the result is a real commit rather than something `rev-parse` merely
-/// managed to parse. `None` records nothing, and both readers then decline to act.
-fn measure(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Option<String>> {
-    let resolved = crate::gitrepo::branch_ref(repo_root, branch, crate::gitrepo::Prefer::Local)
-        .and_then(|r| match r {
-            Some(reference) => crate::gitrepo::rev_commit(repo_root, &reference),
-            None => Ok(None),
-        });
-    resolved.map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
+/// The merge-base is the answer that does not depend on when it is asked. The tip is only the cut
+/// point at the instant the branch is created; taken later it says "nothing has happened here"
+/// about a branch full of work, which reads as `NothingToMerge` and holds the task forever. For a
+/// branch just cut from its target the two agree, so nothing about the hand-driven session path
+/// changes — what changes is that a writer no longer has to run at the right moment.
+///
+/// The fallback covers a task with no land target at all (`jkb task start` on a branch you are
+/// simply on) and one whose recorded target no longer resolves. Both keep the pre-existing rule,
+/// whose accepted cost is a missed auto-close rather than a false one (D34.4).
+///
+/// Refs resolve through `branch_ref` so a branch that exists only on the remote still answers, and
+/// the tip through `rev_commit` so the result is a real commit rather than something `rev-parse`
+/// merely managed to parse. `None` records nothing, and both readers then decline to act.
+fn measure(
+    repo_root: &std::path::Path,
+    branch: &str,
+    onto: Option<&str>,
+) -> jkb_core::Result<Option<String>> {
+    measure_git(repo_root, branch, onto)
+        .map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
+}
+
+/// [`measure`] in `anyhow`'s error type, so the git calls compose with `?`.
+fn measure_git(
+    repo_root: &std::path::Path,
+    branch: &str,
+    onto: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    use crate::gitrepo::{branch_ref, merge_base, rev_commit, Prefer};
+    let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
+        return Ok(None);
+    };
+    if let Some(onto) = onto {
+        if let Some(target) = branch_ref(repo_root, onto, Prefer::Local)? {
+            if let Some(cut) = merge_base(repo_root, &here, &target)? {
+                return Ok(Some(cut));
+            }
+        }
+    }
+    rev_commit(repo_root, &here)
 }
 
 /// Record the cut point for `branch`, replacing whatever this branch had — `jkb task base`.
@@ -280,7 +394,7 @@ pub(crate) fn write(
 
 #[cfg(test)]
 mod tests {
-    use super::{record_if_absent, resolve, write, FACET};
+    use super::{read_tags, record_if_absent, resolve, write, FACET};
     use crate::repo::{task_tags, FACET_BRANCH};
     use jkb_core::{item::NewItem, tag, Db};
     use jkb_types::ItemId;
@@ -326,9 +440,66 @@ mod tests {
     fn ensure(db: &Db, id: ItemId, branch: &str, cut: Option<&str>) {
         let (branch, cut) = (branch.to_owned(), cut.map(str::to_owned));
         db.write_txn("t", move |conn, meta| {
-            record_if_absent(conn, meta, id, &branch, cut.as_deref())
+            let tags = read_tags(conn, id)?;
+            record_if_absent(conn, meta, id, &tags, &branch, cut.as_deref())
         })
         .unwrap();
+    }
+
+    /// Deleting a branch takes its cut point with it. Left behind, the record survives into the
+    /// **next** branch to take that name — `jkb task work` after `abandon --delete-branch` cuts a
+    /// fresh one — where it still resolves, still differs from the new tip, and so disables the
+    /// freshly-cut guard that is all that stops an empty branch closing as merged.
+    #[test]
+    fn forgetting_a_branch_drops_the_cut_point_it_would_be_lent() {
+        let db = Db::open_in_memory().unwrap();
+        let id = a_task(
+            &db,
+            &[
+                (FACET_BRANCH, "task/a"),
+                (FACET_BRANCH, "task/b"),
+                (FACET, "task/a:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                (FACET, "task/b:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            ],
+        );
+        db.write_txn("t", move |conn, meta| {
+            super::forget(conn, meta, id, "task/a")
+        })
+        .unwrap();
+        let t = task_tags(&db, id).unwrap();
+        assert_eq!(
+            resolve(&t, "task/a"),
+            None,
+            "the deleted branch's record survived it"
+        );
+        assert_eq!(
+            resolve(&t, "task/b"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "a sibling branch's record was taken with it"
+        );
+    }
+
+    /// An unqualified legacy value goes too — but only when it is *this* branch the reader would
+    /// lend it to, which is the same attribution rule [`resolve`] applies. Otherwise a `forget`
+    /// leaves behind exactly the value that will be handed to the branch's replacement.
+    #[test]
+    fn forgetting_a_lone_branch_drops_an_unqualified_legacy_value() {
+        let db = Db::open_in_memory().unwrap();
+        let id = a_task(
+            &db,
+            &[
+                (FACET_BRANCH, "task/a"),
+                (FACET, "1111111111111111111111111111111111111111"),
+            ],
+        );
+        db.write_txn("t", move |conn, meta| {
+            super::forget(conn, meta, id, "task/a")
+        })
+        .unwrap();
+        assert!(
+            super::facet_values(&task_tags(&db, id).unwrap(), FACET).is_empty(),
+            "a legacy value the reader lends to this lone branch outlived the branch"
+        );
     }
 
     // ---- the reader's four states (see the module docs) ----

@@ -2003,6 +2003,12 @@ fn a_remote_only_land_target_is_materialised_for_both_work_and_land() {
 /// It is the one read behind the branch picker and In Flight (D38.2), so a local-only existence
 /// check made a live batch vanish from both while the two write commands went on acting on it —
 /// the surfaces disagreeing, which is the single thing that read exists to prevent.
+///
+/// Admitting the row was only half of it, and the half this test used to assert. The counts were
+/// still taken with the bare branch name, which a remote-only branch does not resolve to, so
+/// `rev-list` exited non-zero and the failure read as **zero commits**: the row said "0 commit(s)
+/// vs trunk" and told the task it had nothing to land, while the command landed it. A row that is
+/// present but wrong is worse than one that is missing, so the contents are asserted too.
 #[test]
 fn staging_ls_counts_a_batch_that_exists_only_on_the_remote() {
     let f = Fixture::new();
@@ -2013,6 +2019,13 @@ fn staging_ls_counts_a_batch_that_exists_only_on_the_remote() {
         &["remote", "add", "origin", origin.to_str().unwrap()],
     );
     git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    // A batch with a task's worth of work already landed on it, so its own commit count is not
+    // trivially zero and a failure to measure it is visible.
+    git(&f.repo, &["branch", "batch", "main"]);
+    git(&f.repo, &["checkout", "-q", "batch"]);
+    commit_in(&f.repo, "landed.txt", "landed\n", "an earlier task landed");
+    git(&f.repo, &["checkout", "-q", "main"]);
 
     let uid = f.add_task("on a pruned batch");
     let s = f.work_onto(&uid, "batch");
@@ -2032,6 +2045,28 @@ fn staging_ls_counts_a_batch_that_exists_only_on_the_remote() {
          both use, while work and land still act on it: {rows}"
     );
     assert_eq!(rows[0]["branch"], serde_json::json!("batch"));
+    assert_eq!(
+        rows[0]["ahead"], 1,
+        "the batch's commits were counted with a name git cannot resolve, so the failure read \
+         as zero: {rows}"
+    );
+    let task = &rows[0]["tasks"][0];
+    assert_eq!(
+        task["commits"], 1,
+        "the task's own commits were counted the same wrong way: {rows}"
+    );
+    // And therefore the row does not refuse a landing the command performs.
+    assert!(
+        !task["land_blocked"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no commits"),
+        "the row said the task has nothing to land while its branch is a commit ahead: {rows}"
+    );
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
 }
 
 /// A repo whose trunk cannot be discovered must still open a session when `--onto` names a branch
@@ -2314,10 +2349,14 @@ fn a_review_of_one_branch_does_not_credit_a_tasks_other_live_branch() {
 /// sibling test covers a dirty *session*; the target is the one whose changes a rollback actually
 /// reaches.
 ///
-/// This covers the refusal in `cmd_task_land`. `staging::target_dirty_reason` is a *second*,
-/// independently worded answer to the same question, feeding the listing row rather than the
-/// command — the two are covered separately below, because a mutation of either leaves the other
-/// intact and the reader would never know which one had stopped working.
+/// There is one rule — `staging::target_dirty_reason` — and this exercises it through the
+/// command; the test below exercises it through the row. `cmd_task_land` used to carry a second,
+/// independently worded copy on the far side of the land lock, and because both wordings shared
+/// the phrase this test asserted on, disabling *either* left it green: two implementations of one
+/// rule and neither of them covered. The lock is now taken before the checks instead, which is
+/// what actually closes the window the second copy was excusing its existence with.
+///
+/// So the assertion is on wording only that one function produces.
 #[test]
 fn a_dirty_land_target_refuses_the_landing_and_keeps_its_changes() {
     let f = Fixture::new();
@@ -2357,6 +2396,9 @@ fn a_dirty_land_target_refuses_the_landing_and_keeps_its_changes() {
         .args(["task", "land", &b, "--gate", "true", "--no-review"])
         .assert()
         .failure()
+        // The phrase belongs to `staging::target_dirty_reason` and to nothing else, so this
+        // fails if that rule stops firing rather than being caught by a second copy of it.
+        .stderr(predicate::str::contains("the checkout a land onto"))
         .stderr(predicate::str::contains("uncommitted changes"));
 
     assert_eq!(
@@ -2371,12 +2413,12 @@ fn a_dirty_land_target_refuses_the_landing_and_keeps_its_changes() {
     );
 }
 
-/// And the listing says so too, from its own check.
+/// And the listing says so too — the same rule, reached the other way.
 ///
-/// `staging ls` renders `land_blocker`, which asks `staging::target_dirty_reason` — a separate
-/// implementation from the refusal in `cmd_task_land`, with its own wording. Mutating it to
-/// "never dirty" killed nothing: the row went on promising a landing the command would refuse,
-/// which is the row-versus-command divergence the single read exists to prevent (D38.2).
+/// `staging ls` renders `land_blocker`, which asks `staging::target_dirty_reason`. The row and the
+/// command share that one function precisely so they cannot disagree, and this is the half that
+/// pins the row: without it the row went on promising a landing the command refuses, which is the
+/// divergence the single read exists to prevent (D38.2).
 #[test]
 fn the_listing_reports_a_dirty_land_target_as_a_blocker() {
     let f = Fixture::new();
@@ -2417,4 +2459,263 @@ fn the_listing_reports_a_dirty_land_target_as_a_blocker() {
         blocked_for_b.contains("uncommitted changes"),
         "the row promised a landing the command refuses: {rows}"
     );
+}
+
+/// A branch tagged **after** its work is committed — the shape `/task-swarm` cannot avoid, since
+/// it can only name a group's branch once an implementer has produced one.
+///
+/// Drives the real sequence: claim (`onto=`, before any branch exists), implement, tag. Returns
+/// the task and the commit the branch was genuinely cut from.
+///
+/// The two tests below assert the write and the read **separately**, because a `#[test]` stops at
+/// its first failing assertion and it was exactly the reading side that went unchecked: the
+/// regression this covers was confirmed at the time by running the tagging command and reading
+/// back the value it had been asked to write.
+fn a_group_branch_tagged_after_its_work(f: &Fixture) -> (String, String) {
+    const OWNER: &str = "swarm:integration";
+    let uid = f.add_task("swarm group task");
+
+    // Claim. The swarm claims under its run owner and records where the group lands, both before
+    // any branch exists. Run as the swarm runs them, so the tagging step below is exercised
+    // against a task this same owner already holds.
+    git(&f.repo, &["branch", "integration", "main"]);
+    f.jkb()
+        .args(["task", "claim", &uid, "--owner", OWNER])
+        .assert()
+        .success();
+    for tag in ["onto=integration", "repo=proj"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "set", &uid, tag])
+            .assert()
+            .success();
+    }
+    let cut = git(&f.repo, &["rev-parse", "integration"]);
+
+    // Implement. A group branch off the integration branch, with work already on it.
+    git(
+        &f.repo,
+        &["checkout", "-q", "-b", "swarm-task/group", "integration"],
+    );
+    commit_in(&f.repo, "impl.txt", "work\n", "implement the group");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    assert_ne!(
+        git(&f.repo, &["rev-parse", "swarm-task/group"]),
+        cut,
+        "setup: the branch must already carry work by the time it is tagged"
+    );
+
+    // Tag. Exactly the command `/task-swarm` runs: it names the branch and supplies no cut point.
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "swarm-task/group"])
+        .args(["--owner", OWNER])
+        .assert()
+        .success();
+    (uid, cut)
+}
+
+/// What gets recorded is where the branch was cut, not where its tip happens to be now.
+#[test]
+fn a_branch_tagged_after_its_work_records_where_it_was_cut_not_its_tip() {
+    let f = Fixture::new();
+    let (uid, cut) = a_group_branch_tagged_after_its_work(&f);
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "base=swarm-task/group:{cut}"
+        )));
+}
+
+/// And the reader acts on it: a review of the branch the group's work has reached credits it.
+///
+/// This is the consequence that went unchecked. With the tip recorded as the cut point,
+/// `is_merged` answers `NothingToMerge`, `review record` puts every task of every group in the
+/// unlanded bucket and writes no `reviewed=`, and the land gate then refuses all of them —
+/// strictly worse than having recorded no cut point at all.
+#[test]
+fn a_review_credits_a_group_whose_branch_was_tagged_after_its_work() {
+    let f = Fixture::new();
+    let (uid, _) = a_group_branch_tagged_after_its_work(&f);
+
+    // Merge queue. The group's commits reach the integration branch.
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "swarm-task/group"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    f.add_finding("reviews/swarm", "something to fix");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "integration"])
+        .args(["--findings", "reviews/swarm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&uid));
+    assert_eq!(
+        f.status_of(&uid),
+        "needs_review",
+        "a review of the branch that contains this task's work did not credit it"
+    );
+}
+
+/// Deleting a branch takes its cut point with it.
+///
+/// `abandon --delete-branch` frees the branch *name* while leaving the task live, so the next
+/// `jkb task work` cuts a **new** branch under it. The old record still resolved and still
+/// differed from the new tip, so `is_merged` skipped its freshly-cut guard and `close-merged`
+/// marked the task done with nothing written on it.
+#[test]
+fn deleting_a_branch_with_its_session_takes_its_cut_point_too() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "batch", "main"]);
+    let uid = f.add_task("re-worked task");
+    let branch = f.work_onto(&uid, "batch")["branch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force", "--delete-branch"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base=").not());
+
+    // Everything moves on while the task is idle, so the branch re-cut below starts somewhere the
+    // stale record does not name — which is what makes the freshly-cut guard miss it. Trunk, so
+    // the re-cut branch is contained in trunk and `close-merged` would act.
+    commit_in(&f.repo, "trunk.txt", "moved\n", "trunk moves on");
+    git(&f.repo, &["branch", "-f", "batch", "main"]);
+
+    f.jkb()
+        .args(["task", "work", &uid, "--onto", "batch"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        git(&f.repo, &["rev-parse", "main"]),
+        "setup: the branch must be re-cut somewhere its predecessor's cut point does not name"
+    );
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "an empty re-cut branch closed as merged, on the cut point of the branch it replaced"
+    );
+}
+
+/// The land command and the In Flight row must answer "does this branch exist" the same way.
+///
+/// A branch living only on `origin/` is the ordinary state after a local ref is pruned. The row
+/// counted it and the command's preflight did not, so the one shared blocker printed two opposite
+/// explanations of the same task: the row said it is being built elsewhere, while the command said
+/// its worktree was abandoned and told the owner to open a new session — which cuts a second
+/// branch and detaches the task from its group.
+#[test]
+fn a_remote_only_work_branch_is_explained_the_same_way_by_the_row_and_the_command() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    // A swarm-shaped task: a group branch and a land target, no `.jkb/work` session. Its branch
+    // is published and its local ref pruned.
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "g\n", "group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["push", "-q", "origin", "grp"]);
+    git(&f.repo, &["branch", "-D", "grp"]);
+
+    let uid = f.add_task("a group being built elsewhere");
+    for tag in ["repo=proj", "onto=integration", "branch=grp"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "set", &uid, tag])
+            .assert()
+            .success();
+    }
+
+    let rows = f.staging(&[]);
+    let row = rows[0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["uid"] == serde_json::json!(uid))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        row["commits"], 1,
+        "the row measured a remote-only branch with a name git cannot resolve, and read the \
+         failure as zero commits: {rows}"
+    );
+    let blocked = row["land_blocked"].as_str().unwrap_or_default();
+    assert!(
+        blocked.contains("being built elsewhere"),
+        "the row treated a published branch as an abandoned checkout: {rows}"
+    );
+
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("being built elsewhere"));
+}
+
+/// `jkb task start --repo <other>` must not measure a cut point in whatever checkout the cwd is.
+///
+/// The database is global across repos (D32), so the command legitimately runs from anywhere. A
+/// namesake branch in the repo you are standing in is not the task's branch, and its tip recorded
+/// as the task's cut point — and reported as recorded — resolves to nothing when read from the
+/// right checkout, so the task is held forever and the recorder never overwrites it. `jkb task
+/// base` and `close-merged` already gate on standing in the task's repo; this was the third answer
+/// to that question and the only one that guessed.
+#[test]
+fn task_start_does_not_measure_a_cut_point_in_a_foreign_repo() {
+    let f = Fixture::new();
+    let uid = f.add_task("worked in another repo");
+
+    // A sibling checkout carrying a branch of the same name. The task's own repo does not have
+    // it, so anything recorded can only have come from here.
+    let other = f.home.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    std::fs::write(other.join("f.txt"), "x\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-qm", "base"]);
+    git(&other, &["branch", "shared"]);
+
+    let out = f
+        .jkb()
+        .current_dir(&other)
+        .args(["task", "start", &uid, "--branch", "shared"])
+        .args(["--repo", "proj", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task start: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["base"].is_null(),
+        "a namesake branch in the wrong checkout was recorded as this task's cut point: {v}"
+    );
+    assert_ne!(
+        v["base"].as_str(),
+        Some(git(&other, &["rev-parse", "shared"]).as_str()),
+        "the foreign repo's commit was recorded"
+    );
+
+    // And it says which of the two reasons applies, because they have different remedies.
+    f.jkb()
+        .current_dir(&other)
+        .args([
+            "task", "start", &uid, "--branch", "shared", "--repo", "proj",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not proj's checkout"));
 }

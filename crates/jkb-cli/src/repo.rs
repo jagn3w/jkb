@@ -119,11 +119,18 @@ pub(crate) struct Location<'a> {
 /// the answer is always "none", so every stale value would look adoptable. Ordering that
 /// correctly is exactly the kind of thing two call sites get wrong one at a time, so neither call
 /// site is told about it.
+///
+/// `repo_root` is `Some` only when the caller is standing in **the task's own** repository, which
+/// is the sole place a cut point can honestly be measured. `jkb task start --repo <other>` runs
+/// from anywhere (the database is global across repos, D32), and measuring a namesake branch in
+/// whatever checkout the cwd happens to be recorded another repo's commit as this task's verified
+/// cut point. The facets themselves are still written — naming where the work is happening does
+/// not require standing there.
 pub(crate) fn set_location_facets(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
     id: ItemId,
-    repo_root: &std::path::Path,
+    repo_root: Option<&std::path::Path>,
     loc: &Location<'_>,
 ) -> jkb_core::Result<()> {
     // Refuse a name git would read as an option **before it is stored**. `task start` records
@@ -135,7 +142,11 @@ pub(crate) fn set_location_facets(
         crate::gitrepo::valid_ref(name).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
     if let Some(branch) = loc.branch {
-        crate::base::ensure_recorded(conn, meta, id, repo_root, branch)?;
+        // `loc.onto` rather than the stored facet, because this transaction is about to write it:
+        // `jkb task work` records the land target and the branch together, and the cut point is
+        // where the branch diverged from that target. `ensure_recorded` falls back to the stored
+        // `onto=` when the caller is not supplying one.
+        crate::base::ensure_recorded(conn, meta, id, repo_root, branch, loc.onto)?;
     }
     for (facet, value) in [
         (FACET_BRANCH, loc.branch),
@@ -435,7 +446,7 @@ mod tests {
                         conn,
                         meta,
                         id,
-                        std::path::Path::new("/nonexistent-so-nothing-is-measured"),
+                        Some(std::path::Path::new("/nonexistent-so-nothing-is-measured")),
                         &Location {
                             branch: Some(branch),
                             onto: Some(onto),

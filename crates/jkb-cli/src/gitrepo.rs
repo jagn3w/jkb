@@ -5,6 +5,7 @@
 //! and refs — reimplementing that against a second implementation of the object model is
 //! how the answer starts disagreeing with `git log`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -321,56 +322,51 @@ pub fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
     .is_some())
 }
 
-/// Every local branch name, in one `git` call.
+/// Every branch that exists here, **counting a remote-tracking copy**, mapped to a ref that
+/// actually **resolves** to it — in one `git` call.
 ///
-/// [`has_branch`] is one subprocess per question; a caller checking N branches pays N of
-/// them. Each spawn measured ~11ms here, and the In Flight view re-asks on every database
-/// write, so the batch form is what keeps a redraw from costing a second.
+/// The batched form of the question [`branch_ref`] asks per branch, with the same
+/// [`Prefer::Local`] preference. [`has_branch`] is one subprocess per question and each spawn
+/// measured ~11ms here; `staging ls` redraws on every database write, so it resolves this once
+/// before its loop.
 ///
-/// # Errors
-/// Returns an error if `git` cannot be executed at all.
-pub fn local_branches(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
-    let Some(text) = git(
-        dir,
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    )?
-    else {
-        return Ok(std::collections::BTreeSet::new());
-    };
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
-/// Every branch name that exists here, **counting a remote-tracking copy** — one spawn.
-///
-/// The batched form of the question `branch_ref` asks per branch. `staging ls` redraws on every
-/// database write, so it resolves this once before its loop; asking per branch there is what the
-/// hoisting exists to avoid. It must be the *same* question, though: with the local-only set, a
-/// batch whose local ref had been pruned vanished from the listing while `task work` silently
-/// joined it and `task land` landed onto it — the three surfaces disagreeing, which is the one
-/// thing the single read is there to prevent (D38.2).
+/// It returns the **ref**, not mere membership, and that is the load-bearing part. A branch living
+/// only under `refs/remotes/origin/` is live — the ordinary state after a pruned local ref — but
+/// its bare short name resolves to nothing, so every git question asked with that name fails.
+/// `rev-list --count` failing read as **zero commits**, so the listing admitted such a batch and
+/// then told its tasks they had nothing to land, while `task work` and `task land` went on acting
+/// on it. Handing callers the resolved ref means they cannot ask a question the name cannot answer.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
-pub fn branches_including_remote(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
-    let mut out = local_branches(dir)?;
-    let listed = git(
+pub fn branch_refs(dir: &Path) -> Result<BTreeMap<String, String>> {
+    // `%(refname)` decides local-vs-remote and `%(refname:short)` is what git can be handed back.
+    // Classifying on the short form instead would read a local branch literally named
+    // `origin/x` as a remote copy of `x`.
+    let Some(text) = git(
         dir,
         &[
             "for-each-ref",
-            "--format=%(refname:short)",
+            "--format=%(refname)\t%(refname:short)",
+            "refs/heads",
             "refs/remotes/origin",
         ],
     )?
-    .unwrap_or_default();
-    for line in listed.lines() {
-        if let Some(name) = line.trim().strip_prefix("origin/") {
-            if !name.is_empty() && name != "HEAD" {
-                out.insert(name.to_owned());
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((full, short)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(name) = full.strip_prefix("refs/heads/") {
+            // The local ref wins, whichever order they arrive in — `Prefer::Local`.
+            out.insert(name.to_owned(), short.to_owned());
+        } else if let Some(name) = full.strip_prefix("refs/remotes/origin/") {
+            if name != "HEAD" {
+                out.entry(name.to_owned())
+                    .or_insert_with(|| short.to_owned());
             }
         }
     }
@@ -412,18 +408,43 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
     Ok(git(dir, &["status", "--porcelain"])?.is_some_and(|s| !s.is_empty()))
 }
 
-/// How many commits `branch` has that `onto` does not.
+/// How many commits `branch` has that `onto` does not. Both must be refs this repository can
+/// resolve — see [`branch_refs`].
+///
+/// An unresolvable operand is an **error**, not zero. It used to be zero, and zero is a load-
+/// bearing answer here: `land_blocker` reads it as "nothing to land" and the listing prints it as
+/// the row's commit count. So a remote-only batch, whose bare name resolves to nothing, was
+/// reported as having no commits and refused a landing the command then performed. A count that
+/// could not be taken must not be indistinguishable from a count of none.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed.
+/// Returns an error if `git` cannot be executed, if either revision does not resolve here, or if
+/// the count cannot be read.
 pub fn ahead_count(dir: &Path, onto: &str, branch: &str) -> Result<usize> {
     valid_ref(onto)?;
     valid_ref(branch)?;
-    Ok(
-        git(dir, &["rev-list", "--count", &format!("{onto}..{branch}")])?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
-    )
+    let range = format!("{onto}..{branch}");
+    let count = git(dir, &["rev-list", "--count", &range])?.with_context(|| {
+        format!(
+            "`git rev-list --count {range}` failed in {} — usually because one of those revisions \
+             does not resolve here. A branch that exists only on the remote has to be named by \
+             its `origin/` ref.",
+            dir.display()
+        )
+    })?;
+    count
+        .parse()
+        .with_context(|| format!("`git rev-list --count {range}` printed `{count}`"))
+}
+
+/// The commit where `a` and `b` diverged, or `None` when they share no history.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
+    valid_ref(a)?;
+    valid_ref(b)?;
+    Ok(git(dir, &["merge-base", a, b])?.filter(|s| !s.is_empty()))
 }
 
 /// Check `branch` out in the working tree at `dir`.
@@ -922,6 +943,77 @@ mod tests {
                 .0,
             MergeState::Unmerged,
             "but the local branch still has a commit trunk does not, so the batch is live"
+        );
+    }
+
+    /// A count that could not be taken must not be reported as a count of none.
+    ///
+    /// Zero is a load-bearing answer: `land_blocker` reads it as "nothing to land" and the In
+    /// Flight row prints it. A remote-only branch's bare name resolves to nothing, so `rev-list`
+    /// exited non-zero, the failure was mapped to zero, and the row refused a landing the command
+    /// then performed. Refusing here is what makes that shape unrepresentable, rather than
+    /// something each of the four call sites has to remember to avoid.
+    #[test]
+    fn an_unmeasurable_commit_count_is_refused_rather_than_reported_as_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        assert_eq!(
+            super::ahead_count(dir, "main", "unmerged").unwrap(),
+            2,
+            "a measurable count is still measured"
+        );
+        let err = super::ahead_count(dir, "main", "no-such-branch")
+            .expect_err("an unresolvable revision was answered with a number");
+        assert!(
+            err.to_string().contains("does not resolve"),
+            "the refusal must say what could not be measured: {err}"
+        );
+    }
+
+    /// `branch_refs` answers with a ref that resolves, not merely with the branch's name.
+    ///
+    /// A branch living only under `refs/remotes/origin/` is live — the ordinary state after a
+    /// pruned local ref — and every git question asked with its bare short name fails. Returning
+    /// the resolved ref is what stops a caller asking a question the name cannot answer.
+    #[test]
+    fn branch_refs_names_a_remote_only_branch_by_a_ref_that_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let run = |at: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}: {ok:?}");
+        };
+        run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
+        run(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run(&dir, &["push", "-q", "origin", "unmerged"]);
+        run(&dir, &["branch", "-D", "unmerged"]);
+
+        let refs = super::branch_refs(&dir).unwrap();
+        assert_eq!(
+            refs.get("unmerged").map(String::as_str),
+            Some("origin/unmerged"),
+            "a pruned branch was named by something git cannot resolve: {refs:?}"
+        );
+        assert_eq!(
+            refs.get("main").map(String::as_str),
+            Some("main"),
+            "a local branch must keep its own name, not be replaced by its remote copy: {refs:?}"
+        );
+        // And the ref it hands back is one the counting question accepts.
+        assert_eq!(
+            super::ahead_count(&dir, "main", &refs["unmerged"]).unwrap(),
+            2
         );
     }
 

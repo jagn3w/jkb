@@ -3087,8 +3087,10 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               make <v> the facet's ONLY value (add appends). Use for the
                               single-answer facets: branch=, onto=, repo=.
   jkb task base <uid> <branch> <sha>
-                              record where a branch was cut. Per branch, so `tag set` would
-                              delete a sibling's and refuses; this is the verb for it.
+                              record where a branch was cut, by hand. Per branch, so `tag set`
+                              would delete a sibling's and refuses; this is the verb for it.
+                              `jkb task start` measures it for you — prefer that, and use this
+                              only to repair a record.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -4281,7 +4283,14 @@ fn cmd_task_start(
             .key
             .clone(),
     };
-    let root = here.map_or_else(|| cwd.clone(), |c| c.root);
+    // Measured only when we are standing in **the task's own** repository. The database is global
+    // across repos (D32), so `--repo <other>` legitimately runs from anywhere — and measuring
+    // there recorded a namesake branch's tip from whatever checkout the cwd happened to be, as
+    // this task's cut point, reported as recorded. Read from the right checkout that sha does not
+    // resolve, so the task is held forever and the recorder never overwrites it. `jkb task base`
+    // and `close-merged` already gate on this same condition; this was the third answer to the
+    // question and the only one that guessed.
+    let measure_in = here.filter(|c| c.key == repo).map(|c| c.root);
     // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
     // anything merged, since trunk is trivially "merged into" itself.
     if let Some(t) = gitrepo::trunk(&cwd)? {
@@ -4321,6 +4330,7 @@ fn cmd_task_start(
         }
     }
     let displaced = held.clone();
+    let measure_root = measure_in.clone();
     db.write_txn("cli", move |conn, meta| {
         // The CAS answer is checked rather than discarded: losing it means someone claimed the
         // task between the probe and here, and reporting "started" while writing this session's
@@ -4340,7 +4350,7 @@ fn cmd_task_start(
             conn,
             meta,
             id,
-            &root,
+            measure_root.as_deref(),
             &repo::Location {
                 branch: Some(&b),
                 repo: Some(&r),
@@ -4368,13 +4378,17 @@ fn cmd_task_start(
     } else {
         println!("started {uid} on {repo}@{branch} (owner {owner})");
         // Say it when there is no cut point, rather than leaving it to be discovered by a
-        // `close-merged` that quietly declines to act. Nothing is recorded when the branch does
-        // not exist here — naming a branch you are about to cut is what `--branch` is for — and
-        // without one the task can never auto-close.
+        // `close-merged` that quietly declines to act. Both reasons are named, because they have
+        // different remedies: one is waited out, the other is run from somewhere else.
         if recorded.is_none() {
+            let why = if measure_in.is_none() {
+                format!("this is not {repo}'s checkout, so nothing here could measure {branch}")
+            } else {
+                format!("{branch} does not exist here")
+            };
             println!(
-                "  note: {branch} does not exist here, so no cut point was recorded and this \
-                 task will not auto-close. Run `jkb task base {uid} {branch} <sha>` once it does."
+                "  note: {why}, so no cut point was recorded and this task will not auto-close. \
+                 Run `jkb task base {uid} {branch} <sha>` from {repo} once it does."
             );
         }
     }
@@ -4654,7 +4668,7 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
             conn,
             meta,
             id,
-            &root,
+            Some(&root),
             &repo::Location {
                 branch: Some(&b),
                 repo: Some(&r),
@@ -4939,6 +4953,11 @@ struct Preflight {
 /// These are the same conditions `staging::land_blocker` reports per row (design D38.8) —
 /// this is the authority, and the row renders the verdict this side computes rather than
 /// re-deriving it from a projection that cannot express half of them.
+///
+/// Runs with the land lock already held, which is what lets these be checked **once**: a target
+/// checkout found clean here is still the one the graft a moment later goes into, so the second
+/// dirty check that used to sit on the other side of the lock closed no window and was simply a
+/// second wording of one rule.
 fn land_preflight(
     db: &Db,
     ctx: &repo::RepoCtx,
@@ -4990,7 +5009,19 @@ fn land_preflight(
     // each time a row claimed "Landable" for a task this command then refused: the uncommitted
     // session, the empty branch, the dirty target checkout, the review gate. Assembling the
     // facts is this side's job; judging them is not.
-    let ahead = gitrepo::ahead_count(&ctx.root, &onto, &branch)?;
+    //
+    // ONE question about the work branch, asked the same way the listing asks it: does it exist
+    // here — counting a remote-tracking copy — and under what name? Asking `has_branch` here while
+    // the row asked remote-inclusively made the one shared blocker print two opposite explanations
+    // for the same task: the row said it is being built elsewhere, the command said its worktree
+    // was abandoned and told the owner to open a new session, which detaches it from its group.
+    // The resolved ref is also what the count is taken with — a bare remote-only name resolves to
+    // nothing, and `ahead_count` refuses rather than answering zero.
+    let work_ref = gitrepo::branch_ref(&ctx.root, &branch, gitrepo::Prefer::Local)?;
+    let ahead = match &work_ref {
+        Some(reference) => gitrepo::ahead_count(&ctx.root, &onto, reference)?,
+        None => 0,
+    };
     let worktrees = gitrepo::worktrees(&ctx.root)?;
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
@@ -5004,7 +5035,7 @@ fn land_preflight(
         worktree: sess.as_ref().map(|s| s.worktree.as_path()),
         dirty,
         commits: ahead,
-        branch_exists: gitrepo::has_branch(&ctx.root, &branch)?,
+        branch_exists: work_ref.is_some(),
         target_dirty: target_dirty.as_deref(),
         // The review is enforced a moment later by `review::enforce`, which renders the same
         // verdict at length and is where `--no-review` records a waiver instead of refusing.
@@ -5034,6 +5065,27 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
     let ctx = repo::repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
     let tags = repo::task_tags(db, id)?;
+
+    // The lock is taken **before** anything is checked, not just before the graft.
+    //
+    // It used to be taken afterwards, which left a window between deciding the target checkout was
+    // clean and grafting into it — and the answer was a second, independently worded dirty check
+    // on the other side of the lock. That does not close the window, it moves it: the second check
+    // has exactly the same gap to the graft. What actually closes it is checking under the lock,
+    // so there is now one rule (`staging::target_dirty_reason`, shared with the In Flight row)
+    // evaluated once. A redundant guard that reads as protection is worse than none.
+    //
+    // Acquiring costs nothing here: it fails fast rather than waiting, and every other precondition
+    // below is equally worth serialising against a concurrent land.
+    //
+    // The lock file lives in `.jkb/`, and taking it this early means a land that is about to be
+    // *refused* creates that directory too — in a repo where `task work` has never run, and so has
+    // never excluded it. A lock file stranded by a kill would then show up as untracked and make
+    // the user's tree dirty. Excluded first, in `.git/info/exclude` exactly as `task work` does it:
+    // local to this clone, never their committed `.gitignore` (D36.2).
+    session::ensure_excluded(&ctx.root)?;
+    let _lock = session::LandLock::acquire(&ctx.root)?;
+
     let Preflight {
         sess,
         branch,
@@ -5048,16 +5100,7 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
     let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
     let waiver_owed = review::enforce(db, uid, &tags, no_review, json)?;
 
-    // Landing is serial: two grafts at once would each gate a tree the other is changing.
-    let _lock = session::LandLock::acquire(&ctx.root)?;
-
     let land_dir = land_dir_for(&ctx, &onto)?;
-    anyhow::ensure!(
-        !gitrepo::is_dirty(&land_dir)?,
-        "{} (checked out to {onto}) has uncommitted changes — landing would roll them back \
-         on a red gate",
-        land_dir.display()
-    );
 
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
     let gitrepo::Graft::Landed { grafted } = outcome else {
@@ -5289,6 +5332,12 @@ fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
         // It exists and holds some other branch (or none) — if it held `onto`, the lookup
         // above would have found it. Reuse it: it is a cache, and switching keeps its
         // build artifacts.
+        //
+        // This is not a second copy of the land gate's dirty rule (that one lives in
+        // `staging::target_dirty_reason` and is asked once, under the lock). It guards the
+        // mutation on the *next* line: `git switch` across branches carries uncommitted changes
+        // over, or refuses outright with a message about neither jkb nor the task. Hence its own
+        // remedy, which is about this scratch checkout rather than about landing.
         anyhow::ensure!(
             !gitrepo::is_dirty(&base)?,
             "{} has uncommitted changes — it is jkb's own scratch checkout, so commit or \
@@ -5386,8 +5435,20 @@ fn cmd_task_abandon(
         }
         gitrepo::worktree_remove(&ctx.root, &sess.worktree, force)?;
     }
+    // Deleting the branch takes its cut point with it. `--delete-branch` frees the branch *name*
+    // while leaving the task live, so the next `jkb task work` cuts a **new** branch under that
+    // name — and the old record still resolved, still differed from the new tip, so `is_merged`
+    // skipped its freshly-cut guard and `close-merged` closed a task with nothing written on it.
+    //
+    // Its own transaction, before the one below: that one has several early returns (a claim taken
+    // in the meantime, a task that finished while the worktree was being removed) and none of them
+    // change the fact that the branch is gone.
+    let mut branch_deleted = false;
     if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
+        branch_deleted = true;
+        let gone = branch.clone();
+        db.write_txn("cli", move |conn, meta| base::forget(conn, meta, id, &gone))?;
     }
     // Release, and reopen unless the task is already finished.
     //
@@ -5452,7 +5513,9 @@ fn cmd_task_abandon(
             serde_json::json!({
                 "uid": uid, "abandoned": true, "branch": branch, "reopened": reopened,
                 "status": final_status,
-                "worktree_removed": sess.is_some(), "branch_deleted": delete_branch,
+                // What happened, not what was asked for: `--delete-branch` on a branch that was
+                // already gone deletes nothing.
+                "worktree_removed": sess.is_some(), "branch_deleted": branch_deleted,
             })
         );
     } else if !reopened {
@@ -5479,8 +5542,15 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
     for s in &sessions {
         let task = by_branch.get(&s.branch);
         let onto = task.and_then(|t| t.onto.clone());
-        let ahead = match &onto {
-            Some(o) => gitrepo::ahead_count(&ctx.root, o, &s.branch)?,
+        // Resolved first: a recorded land target whose branch has since been deleted cannot be
+        // counted against, and `ahead_count` refuses an operand it cannot resolve rather than
+        // answering zero.
+        let onto_ref = match &onto {
+            Some(o) => gitrepo::branch_ref(&ctx.root, o, gitrepo::Prefer::Local)?,
+            None => None,
+        };
+        let ahead = match &onto_ref {
+            Some(reference) => gitrepo::ahead_count(&ctx.root, reference, &s.branch)?,
             None => 0,
         };
         // Deliberately no "attended" flag: nothing here can observe whether anyone is sitting
@@ -5718,14 +5788,19 @@ fn cmd_task_close_merged(
     // The main copy's key, for the same reason `task start` uses it: run from a session
     // worktree, `key(&cwd)` is the session's name and this silently matches no tasks at all.
     let explicit_repo = repo.is_some();
-    let repo = match repo {
-        Some(r) => r,
-        None => {
-            repo::repo_ctx()
-                .context("not inside a git repo — pass --repo, or run this from the repo")?
-                .key
-        }
-    };
+    let repo =
+        match repo {
+            Some(r) => r,
+            None => {
+                // Deliberately not "pass --repo": every branch is looked up in the repository we are
+                // standing in, so `check_repo_is_here` refuses that flag in exactly this situation.
+                // Recommending it sent the user round a loop with no exit.
+                repo::repo_ctx().context(
+                "not inside a git repo, and every branch is looked up here — run this from \
+                 the checkout of the repo whose tasks you want to close",
+            )?.key
+            }
+        };
     // `--repo` selects which tasks to consider; every git question below is still asked of the
     // repository we are standing in. Those must be the same place or the command probes one repo
     // about another's branches — reporting live work as gone and advising its tag be deleted. It
