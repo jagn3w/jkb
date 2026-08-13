@@ -2312,7 +2312,12 @@ fn a_review_of_one_branch_does_not_credit_a_tasks_other_live_branch() {
 /// Landing rolls the target back with `reset --hard` when the gate goes red, so uncommitted work
 /// sitting in that checkout would be destroyed by a landing that had nothing to do with it. The
 /// sibling test covers a dirty *session*; the target is the one whose changes a rollback actually
-/// reaches, and making the check answer "never dirty" killed no test at all.
+/// reaches.
+///
+/// This covers the refusal in `cmd_task_land`. `staging::target_dirty_reason` is a *second*,
+/// independently worded answer to the same question, feeding the listing row rather than the
+/// command — the two are covered separately below, because a mutation of either leaves the other
+/// intact and the reader would never know which one had stopped working.
 #[test]
 fn a_dirty_land_target_refuses_the_landing_and_keeps_its_changes() {
     let f = Fixture::new();
@@ -2363,5 +2368,53 @@ fn a_dirty_land_target_refuses_the_landing_and_keeps_its_changes() {
         f.status_of(&b),
         "in_progress",
         "a refused landing must leave the task where it was"
+    );
+}
+
+/// And the listing says so too, from its own check.
+///
+/// `staging ls` renders `land_blocker`, which asks `staging::target_dirty_reason` — a separate
+/// implementation from the refusal in `cmd_task_land`, with its own wording. Mutating it to
+/// "never dirty" killed nothing: the row went on promising a landing the command would refuse,
+/// which is the row-versus-command divergence the single read exists to prevent (D38.2).
+#[test]
+fn the_listing_reports_a_dirty_land_target_as_a_blocker() {
+    let f = Fixture::new();
+    let a = f.add_task("first");
+    let b = f.add_task("second");
+    let sa = f.work(&a);
+    let sb = f.work(&b);
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+    commit_in(
+        Path::new(sb["worktree"].as_str().unwrap()),
+        "b.txt",
+        "b\n",
+        "b",
+    );
+    f.jkb()
+        .args(["task", "land", &a, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+
+    let base = f.repo.join(".jkb").join("base");
+    std::fs::write(base.join("precious.txt"), "not committed\n").unwrap();
+
+    let rows = f.staging(&[]);
+    let blocked_for_b = rows[0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["uid"] == serde_json::json!(b))
+        .and_then(|t| t["land_blocked"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        blocked_for_b.contains("uncommitted changes"),
+        "the row promised a landing the command refuses: {rows}"
     );
 }
