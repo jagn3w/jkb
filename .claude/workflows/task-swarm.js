@@ -286,24 +286,25 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 // It goes through `jkb task base`, never `task tag set base=`. A cut point is per-branch, and
 // `tag set` clears the facet's other values — so recording this group's base with it deleted the
 // base of every other branch the task carried. `task tag` refuses that facet outright now; this
-// is the verb it points at. The sha is the integration branch's tip at the moment this group's
-// branch was cut from it, which is what the implementer step just did.
+// is the verb it points at.
+//
+// The value is the GROUP BRANCH's own tip, not the integration branch's. The integration branch
+// moves under a pipelined run — the merge queue fast-forwards it while later groups are still
+// working — so recording its tip named a commit the group's branch never sat on, and a group whose
+// implementer produced no commits was then closed wholesale with nothing written. `task base`
+// resolves a symbolic revision, so naming the branch is enough.
 function branchTagPrompt(group, branch) {
   const cmds = group.tasks
     .map(
       (t) =>
         `${JKB}${DB} task tag set ${t.uid} branch=${branch} && ` +
-        `${JKB}${DB} task base ${t.uid} ${branch} "$base"`,
+        `${JKB}${DB} task base ${t.uid} ${branch} ${branch}`,
     )
     .join(' && ')
   return `Mechanical step — in the main copy at ${REPO}, record this group's working branch and
 the commit it was cut from:
 
-First capture the base — the integration branch's tip that ${branch} was cut from:
-
-  base=$(git -C ${REPO} rev-parse ${INTEGRATION})
-
-Then run:
+Run:
 
 ${cmds}
 

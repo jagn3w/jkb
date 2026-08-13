@@ -169,7 +169,10 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     // `merge-tree` probe plus a full `worktree list`, ~6 spawns at ~11ms each) meant a repo
     // with a dozen branches spent about a second per redraw — which during a swarm run, where
     // claims and tags land continuously, never caught up.
-    let existing = gitrepo::local_branches(&ctx.root)?;
+    // Counting remote-tracking copies, because `task work` and `task land` do: a batch whose
+    // local ref was pruned is still live, and dropping it here hid the task from the picker and
+    // from In Flight while both of those went on acting on it.
+    let existing = gitrepo::branches_including_remote(&ctx.root)?;
     let worktrees = gitrepo::worktrees(&ctx.root)?;
     let mut cache = Cache::default();
 

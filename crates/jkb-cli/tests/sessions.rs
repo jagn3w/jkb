@@ -1822,28 +1822,30 @@ fn the_cut_point_is_measured_on_the_branch_not_the_land_target() {
     );
 }
 
-/// `task start` records where the branch diverged from trunk, which is neither trunk's tip nor
-/// the branch's own.
+/// `task start` records the branch's **own tip at tracking time** — the same rule `task work`
+/// uses, and the only one that answers the question the readers actually ask: *has anything
+/// happened on this branch since we started tracking it?*
 ///
-/// **Trunk's tip** is right only until trunk moves — routine with `origin/main` after any fetch.
-/// After that the recorded base is a commit the branch never sat on, the tip differs from it,
-/// `is_merged` skips its freshly-cut guard, and a branch with no commits closes the task as
-/// merged. That is the first case here.
+/// Two earlier rules were wrong in opposite directions and both are pinned here. **Trunk's tip**
+/// is right only until trunk moves (case 1). **The merge-base with trunk** is right only if the
+/// branch was cut from trunk — and this project's own flow cuts task branches from a *staging*
+/// branch, where the merge-base is behind the tip before any work happens (case 2), so an empty
+/// task closed as merged.
 ///
-/// **The branch's own tip** — the obvious repair, and what `task work` correctly uses — is wrong
-/// in the other direction for this command, which adopts a branch that may already carry work:
-/// base would equal tip forever and the task could never auto-close at all. That is the second
-/// case, and it is why the two commands genuinely differ rather than one of them being stale.
+/// Case 3 is the accepted cost, stated rather than discovered: a branch that already carried
+/// commits when tracking began records `base == tip`, so if nothing further is committed it is
+/// held rather than closed. A missed auto-close costs one command; a false one buries work
+/// (D34.4). Case 4 is why that cost is small and why the feature is not simply dead — one commit
+/// after `task start` and auto-close works normally.
 #[test]
-fn task_start_records_where_the_branch_left_trunk() {
-    // 1. Freshly cut branch, trunk has since moved: must be held, not closed.
+fn task_start_records_the_branch_tip_at_tracking_time() {
+    // 1. Cut from trunk, trunk has since moved: held.
     {
         let f = Fixture::new();
         git(&f.repo, &["branch", "feature"]);
         commit_in(&f.repo, "moved.txt", "trunk moves\n", "trunk moves on");
-        let fork = git(&f.repo, &["rev-parse", "feature"]);
-
-        let uid = f.add_task("started late");
+        let tip = git(&f.repo, &["rev-parse", "feature"]);
+        let uid = f.add_task("cut from trunk");
         f.jkb()
             .args(["task", "start", &uid, "--branch", "feature"])
             .assert()
@@ -1852,36 +1854,75 @@ fn task_start_records_where_the_branch_left_trunk() {
             .args(["--global", "task", "show", &uid])
             .assert()
             .success()
-            .stdout(predicate::str::contains(format!("base=feature:{fork}")));
+            .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        assert_eq!(f.status_of(&uid), "in_progress", "case 1");
+    }
 
+    // 2. Cut from a STAGING branch — the D38 flow — then staging lands: held.
+    {
+        let f = Fixture::new();
+        git(&f.repo, &["checkout", "-q", "-b", "stg"]);
+        commit_in(&f.repo, "s.txt", "staging\n", "staging work");
+        git(&f.repo, &["checkout", "-q", "-b", "mytask"]);
+        git(&f.repo, &["checkout", "-q", "main"]);
+        let tip = git(&f.repo, &["rev-parse", "mytask"]);
+
+        let uid = f.add_task("cut from staging");
+        f.jkb()
+            .args(["task", "start", &uid, "--branch", "mytask"])
+            .assert()
+            .success();
+        f.jkb()
+            .args(["--global", "task", "show", &uid])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("base=mytask:{tip}")));
+
+        git(&f.repo, &["merge", "-q", "--ff-only", "stg"]);
         f.jkb().args(["task", "close-merged"]).assert().success();
         assert_eq!(
             f.status_of(&uid),
             "in_progress",
-            "an empty branch closed as merged: the base was trunk's tip, which had moved past it"
+            "case 2: a branch cut from staging closed as merged with zero commits of its own — \
+             its base was measured against trunk, which it was never cut from"
         );
     }
 
-    // 2. Branch already carrying work, then merged: must still close.
+    // 3. Pre-existing commits and none after: held. The accepted missed close.
     {
         let f = Fixture::new();
         git(&f.repo, &["checkout", "-q", "-b", "wip"]);
         commit_in(&f.repo, "w.txt", "work\n", "work");
         git(&f.repo, &["checkout", "-q", "main"]);
-
-        let uid = f.add_task("started midway");
+        let uid = f.add_task("started after the work");
         f.jkb()
             .args(["task", "start", &uid, "--branch", "wip"])
             .assert()
             .success();
         git(&f.repo, &["merge", "-q", "--ff-only", "wip"]);
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        assert_eq!(f.status_of(&uid), "in_progress", "case 3");
+    }
 
+    // 4. A commit after tracking began: closes. Without this, "always held" would pass.
+    {
+        let f = Fixture::new();
+        git(&f.repo, &["branch", "later"]);
+        let uid = f.add_task("started then worked");
+        f.jkb()
+            .args(["task", "start", &uid, "--branch", "later"])
+            .assert()
+            .success();
+        git(&f.repo, &["checkout", "-q", "later"]);
+        commit_in(&f.repo, "l.txt", "later\n", "later work");
+        git(&f.repo, &["checkout", "-q", "main"]);
+        git(&f.repo, &["merge", "-q", "--ff-only", "later"]);
         f.jkb().args(["task", "close-merged"]).assert().success();
         assert_eq!(
             f.status_of(&uid),
             "done",
-            "a merged branch never closed: recording the branch's own tip makes base == tip, so \
-             the freshly-cut guard fires forever"
+            "case 4: auto-close no longer fires at all, so the feature is dead"
         );
     }
 }
@@ -1930,11 +1971,56 @@ fn a_remote_only_land_target_is_materialised_for_both_work_and_land() {
         "the batch was not materialised from its remote copy"
     );
 
-    // And the mirror: A can still land onto it.
+    // And the mirror: A can still land onto it. The local ref is deleted **again** first, or the
+    // land half asserts nothing — `task work c` above materialised it, so the preflight's probe
+    // was already true either way and reverting that probe left this test green.
+    git(&f.repo, &["branch", "-D", "batch"]);
+    assert!(
+        git(&f.repo, &["branch", "--format=%(refname:short)"])
+            .lines()
+            .all(|b| b != "batch"),
+        "setup: the land half must start with no local ref"
+    );
     f.jkb()
         .args(["task", "land", &a, "--gate", "true", "--no-review"])
         .assert()
         .success();
+}
+
+/// `staging ls` must count a remote-only batch, because `task work` and `task land` both do.
+///
+/// It is the one read behind the branch picker and In Flight (D38.2), so a local-only existence
+/// check made a live batch vanish from both while the two write commands went on acting on it —
+/// the surfaces disagreeing, which is the single thing that read exists to prevent.
+#[test]
+fn staging_ls_counts_a_batch_that_exists_only_on_the_remote() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    let uid = f.add_task("on a pruned batch");
+    let s = f.work_onto(&uid, "batch");
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+    git(&f.repo, &["push", "-q", "origin", "batch"]);
+    git(&f.repo, &["branch", "-D", "batch"]);
+
+    let rows = f.staging(&[]);
+    assert!(
+        !rows.as_array().unwrap().is_empty(),
+        "a batch whose local ref was pruned vanished from the one read the picker and In Flight \
+         both use, while work and land still act on it: {rows}"
+    );
+    assert_eq!(rows[0]["branch"], serde_json::json!("batch"));
 }
 
 /// A repo whose trunk cannot be discovered must still open a session when `--onto` names a branch
@@ -1971,4 +2057,40 @@ fn close_merged_refuses_an_explicit_repo_it_cannot_verify() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not a git repository"));
+}
+
+/// When no cut point can be measured, `task start` says so.
+///
+/// `--branch` exists to name a branch other than the one you are on, including one you are about
+/// to create — and a branch that does not exist here cannot be measured. Recording nothing is the
+/// right answer (a commit the branch never sat on is the alternative, and that is what closes
+/// tasks wrongly), but it must not be silent: the task simply never auto-closes, and without a
+/// word at the point of the decision that is discovered much later, by a `close-merged` that
+/// quietly declines to act.
+#[test]
+fn task_start_says_so_when_it_can_measure_no_cut_point() {
+    let f = Fixture::new();
+    let uid = f.add_task("branch not cut yet");
+
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "not-yet"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no cut point was recorded"))
+        .stdout(predicate::str::contains("jkb task base"));
+
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base=").not());
+
+    // And it stays quiet when there is one.
+    git(&f.repo, &["branch", "real"]);
+    let other = f.add_task("branch exists");
+    f.jkb()
+        .args(["task", "start", &other, "--branch", "real"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no cut point").not());
 }

@@ -96,16 +96,14 @@ pub(crate) fn clear_facet(
 /// Where a task is being worked. Every field is single-valued by nature: a second `branch=`
 /// is a contradiction, not extra information (design D36.6).
 ///
-/// `cut_from` is **not a location facet** and is not stored as one — it is where the caller
-/// believes `branch` began, handed to [`crate::base::ensure_recorded`], which decides whether to
-/// record it. It rides along because the two writes must happen in one order and neither caller
-/// should have to know that (see [`set_location_facets`]).
+/// There is deliberately no cut-point field. It used to ride along as a value the caller had
+/// computed, and three callers grew three theories of what it was; [`crate::base::ensure_recorded`]
+/// measures it instead, so there is nothing to pass and nothing to get wrong.
 #[derive(Default)]
 pub(crate) struct Location<'a> {
     pub(crate) branch: Option<&'a str>,
     pub(crate) repo: Option<&'a str>,
     pub(crate) onto: Option<&'a str>,
-    pub(crate) cut_from: Option<&'a str>,
 }
 
 /// Record where a task is being worked — the **one** writer of the location facets.
@@ -125,6 +123,7 @@ pub(crate) fn set_location_facets(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
     id: ItemId,
+    repo_root: &std::path::Path,
     loc: &Location<'_>,
 ) -> jkb_core::Result<()> {
     // Refuse a name git would read as an option **before it is stored**. `task start` records
@@ -136,7 +135,7 @@ pub(crate) fn set_location_facets(
         crate::gitrepo::valid_ref(name).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
     if let Some(branch) = loc.branch {
-        crate::base::ensure_recorded(conn, meta, id, branch, loc.cut_from)?;
+        crate::base::ensure_recorded(conn, meta, id, repo_root, branch)?;
     }
     for (facet, value) in [
         (FACET_BRANCH, loc.branch),
@@ -172,8 +171,10 @@ pub(crate) fn set_location_facets(
 /// is the entire reason `base=` exists — and of the two ways to be wrong, a missed auto-close
 /// costs one command while a wrong one buries work still in flight (design D34.4).
 ///
-/// The cost, accepted: a branch tagged by hand with no `base=` no longer auto-closes. `jkb task
-/// start` and `jkb task work` both record one, so this only affects facets written by hand.
+/// The cost, accepted: a branch with no usable `base=` no longer auto-closes. `jkb task start` and
+/// `jkb task work` both record one **when the branch exists here** — neither can measure a branch
+/// this repo does not have, and both prefer recording nothing to recording a commit the branch
+/// never sat on.
 ///
 /// # Errors
 /// Returns an error if git cannot be run.
@@ -434,6 +435,7 @@ mod tests {
                         conn,
                         meta,
                         id,
+                        std::path::Path::new("/nonexistent-so-nothing-is-measured"),
                         &Location {
                             branch: Some(branch),
                             onto: Some(onto),

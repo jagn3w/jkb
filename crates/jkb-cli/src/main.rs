@@ -4270,14 +4270,18 @@ fn cmd_task_start(
     // beside it. Every `repo=`-keyed surface (`staging ls`, In Flight, `task sessions`,
     // `batch_onto`, `task review record`) then stopped seeing the task, and `review record`
     // matching nothing is indistinguishable from a review that was never run.
+    // The MAIN copy's root and key. The cut point is measured there, never in a session
+    // worktree's directory, for the same reason the key is taken there.
+    let here = repo::repo_ctx().ok();
     let repo = match repo {
         Some(r) => r,
-        None => {
-            repo::repo_ctx()
-                .context("not inside a git repo — pass --repo, or run this from the repo")?
-                .key
-        }
+        None => here
+            .as_ref()
+            .context("not inside a git repo — pass --repo, or run this from the repo")?
+            .key
+            .clone(),
     };
+    let root = here.map_or_else(|| cwd.clone(), |c| c.root);
     // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
     // anything merged, since trunk is trivially "merged into" itself.
     if let Some(t) = gitrepo::trunk(&cwd)? {
@@ -4290,36 +4294,8 @@ fn cmd_task_start(
     }
 
     let id = resolve_task_uid(db, uid)?;
-    // Where this branch began, as **merge-base with trunk** — offered to `base::ensure_recorded`
-    // and used only if nothing is on record for this branch.
-    //
-    // It used to be trunk's *tip*, which is right only if trunk has not moved since the branch was
-    // cut. Once it has — routine with `origin/main` after any fetch — the recorded base is a
-    // commit the branch never sat on, so the tip differs from it, `is_merged` skips its
-    // freshly-cut guard, and a branch with no commits reads as merged and closes the task.
-    //
-    // The branch's own tip is not right either, and this is where `task start` genuinely differs
-    // from `task work`: that command *creates* the branch, so its tip is the cut point, while this
-    // one adopts a branch that may already carry work — recording its tip would mean base == tip
-    // forever and the task could never auto-close at all.
-    //
-    // `merge-base` is both. For a freshly cut branch it *is* the tip, so the empty-branch guard
-    // fires; once work exists the two differ and the merge check decides. Taken **now**, at the
-    // moment tracking begins, it also survives a rebase-merge — asking later would answer "the
-    // tip", since trunk has been fast-forwarded onto it (D34.2).
-    let cut = match (
-        gitrepo::trunk(&cwd)?,
-        gitrepo::branch_ref(&cwd, &branch, gitrepo::Prefer::Local)?,
-    ) {
-        (Some(trunk), Some(reference)) => gitrepo::merge_base(&cwd, &trunk, &reference)?,
-        // No trunk, or a branch that does not exist here: record nothing rather than a value that
-        // is not this branch's origin. Both readers decline to act without one, which is the safe
-        // direction (D34.4).
-        _ => None,
-    };
-
     let owner = owner.unwrap_or_else(owner::self_owner);
-    let (o, b, r, cut_sha) = (owner.clone(), branch.clone(), repo.clone(), cut.clone());
+    let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
     // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
     // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
     // answer as a refusal meant `task start` refused its own second run under a new pid, and
@@ -4364,10 +4340,10 @@ fn cmd_task_start(
             conn,
             meta,
             id,
+            &root,
             &repo::Location {
                 branch: Some(&b),
                 repo: Some(&r),
-                cut_from: cut_sha.as_deref(),
                 ..repo::Location::default()
             },
         )?;
@@ -4380,6 +4356,16 @@ fn cmd_task_start(
         );
     } else {
         println!("started {uid} on {repo}@{branch} (owner {owner})");
+        // Say it when there is no cut point, rather than leaving it to be discovered by a
+        // `close-merged` that quietly declines to act. Nothing is recorded when the branch does
+        // not exist here — naming a branch you are about to cut is what `--branch` is for — and
+        // without one the task can never auto-close.
+        if !base::any_recorded_for(db, id, &branch)? {
+            println!(
+                "  note: {branch} does not exist here, so no cut point was recorded and this \
+                 task will not auto-close. Run `jkb task base {uid} {branch} <sha>` once it does."
+            );
+        }
     }
     Ok(())
 }
@@ -4650,31 +4636,18 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     // recorded base, the empty-branch guard was skipped, and `close-merged` closed a task with no
     // work on it. The only question that answers this correctly is "is a cut point already
     // recorded for this branch", and it now has exactly one implementation.
-    // Measured on the branch, not guessed from `onto` — and taken *after* the branch exists.
-    //
-    // A cut point is where this branch begins, and once the branch is there that is simply its
-    // tip: a session has no commits yet, so `rev(branch) == rev(onto)` for one freshly cut and the
-    // two forms agree. They come apart exactly when the branch was **not** cut here and now — left
-    // behind by a `task work` that failed after creating it, made by hand, or adopted from the
-    // remote by `ensure_branch`. There `onto` has since moved, so the guess records a commit the
-    // branch never sat on: the tip no longer equals the base, `is_merged` skips its freshly-cut
-    // guard, and an empty branch reads as merged and closes the task.
-    //
-    // Measuring is also fail-safe where guessing is not. On an adopted branch that *does* carry
-    // commits, base == tip means "nothing to merge" and the readers decline to act — a missed
-    // auto-close, which costs one command, rather than a false one, which buries work (D34.4).
-    let cut = gitrepo::rev_commit(&ctx.root, &branch)?;
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
+    let root = ctx.root.clone();
     db.write_txn("cli", move |conn, meta| {
         repo::set_location_facets(
             conn,
             meta,
             id,
+            &root,
             &repo::Location {
                 branch: Some(&b),
                 repo: Some(&r),
                 onto: Some(&o),
-                cut_from: cut.as_deref(),
             },
         )
     })?;

@@ -100,13 +100,27 @@ pub(crate) fn resolve<'a>(
     None
 }
 
-/// Record the cut point for `branch` **if one is not already recorded for it** — the one writer.
+/// Record the cut point for `branch` **if one is not already recorded for it** — the one writer,
+/// and now the one **measurer**.
 ///
-/// `cut` is where the caller believes the branch began, consulted only when nothing is on record:
-/// `task start` passes trunk's tip, `task work` passes the tip of the branch the session hangs
-/// off. Both are guesses that are only correct at the moment the branch is created, which is why
-/// an existing record always wins — the whole class of bug this replaces was a later run
-/// recomputing a cut point from a commit the branch had long since moved past.
+/// It used to take the value from the caller, and three callers grew three theories of what a cut
+/// point is: trunk's tip, then the merge-base with trunk, then the land target's tip. Each was
+/// wrong in a different situation, and the last one was wrong in this project's own primary flow —
+/// a task branch cut from a *staging* branch is ahead of its merge-base with trunk before any work
+/// happens, so the freshly-cut guard never fired and an empty task closed as merged.
+///
+/// So there is nothing left to pass. The value is the branch's **own tip, right now**, which is by
+/// construction the answer to the only question the readers ask of it: *has anything happened on
+/// this branch since we started tracking it?* An existing record always wins, because that
+/// question is about the moment tracking began and no later run can re-derive it.
+///
+/// The failure mode is uniform and safe. A branch that already carried commits when tracking began
+/// records `base == tip`, so it reads as "nothing to merge" and is held rather than closed — a
+/// missed auto-close, which costs one command, never a false one, which buries work (D34.4).
+///
+/// This runs `git` inside the write transaction, which holds the writer thread for the length of
+/// one `rev-parse`. That is the price of the caller being unable to supply a value at all, and it
+/// is worth it: every defect this module has had was a caller computing the wrong one.
 ///
 /// A bare pre-qualification value is **adopted** (re-written as `<branch>:<sha>`) when this task
 /// records no branch other than `branch`, since then it can only have been cut for this one. That
@@ -129,6 +143,27 @@ pub(crate) fn resolve<'a>(
 /// # Errors
 /// Returns an error if a tag read or write fails.
 pub(crate) fn ensure_recorded(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: ItemId,
+    repo_root: &std::path::Path,
+    branch: &str,
+) -> jkb_core::Result<()> {
+    record_if_absent(
+        conn,
+        meta,
+        id,
+        branch,
+        measure(repo_root, branch)?.as_deref(),
+    )
+}
+
+/// The decision half of [`ensure_recorded`]: given a candidate, decide whether to record it.
+///
+/// Private, and split out only so the four adoption states can be unit-tested without a git repo.
+/// Callers outside this module reach [`ensure_recorded`], which measures — the candidate is not
+/// something any of them may choose.
+fn record_if_absent(
     conn: &Connection,
     meta: &WriteMeta,
     id: ItemId,
@@ -164,6 +199,8 @@ pub(crate) fn ensure_recorded(
         bare.iter().map(String::as_str).find(|v| is_object_id(v))
     };
 
+    // An attributable pre-qualification value wins over the measurement: it is the real cut
+    // point, and a tip measured now is not.
     if let Some(sha) = adopted.or(cut) {
         write(conn, meta, id, branch, sha)?;
     }
@@ -171,6 +208,33 @@ pub(crate) fn ensure_recorded(
         tag::remove(conn, meta, id, FACET, stale)?;
     }
     Ok(())
+}
+
+/// Whether a cut point is now recorded for `branch` — so a command can say out loud that it
+/// recorded none rather than leaving a later reader to decline silently.
+///
+/// # Errors
+/// Returns an error if the tags cannot be read.
+pub(crate) fn any_recorded_for(
+    db: &jkb_core::Db,
+    id: ItemId,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    Ok(resolve(&crate::repo::task_tags(db, id)?, branch).is_some())
+}
+
+/// The branch's own tip, or `None` if this repo does not have the branch.
+///
+/// Resolved through `branch_ref` so a branch that exists only on the remote still answers, and
+/// through `rev_commit` so the result is a real commit rather than something `rev-parse` merely
+/// managed to parse. `None` records nothing, and both readers then decline to act.
+fn measure(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Option<String>> {
+    let resolved = crate::gitrepo::branch_ref(repo_root, branch, crate::gitrepo::Prefer::Local)
+        .and_then(|r| match r {
+            Some(reference) => crate::gitrepo::rev_commit(repo_root, &reference),
+            None => Ok(None),
+        });
+    resolved.map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
 }
 
 /// Record the cut point for `branch`, replacing whatever this branch had — `jkb task base`.
@@ -212,7 +276,7 @@ pub(crate) fn write(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve, write, FACET};
+    use super::{record_if_absent, resolve, write, FACET};
     use crate::repo::{task_tags, FACET_BRANCH};
     use jkb_core::{item::NewItem, tag, Db};
     use jkb_types::ItemId;
@@ -258,16 +322,7 @@ mod tests {
     fn ensure(db: &Db, id: ItemId, branch: &str, cut: Option<&str>) {
         let (branch, cut) = (branch.to_owned(), cut.map(str::to_owned));
         db.write_txn("t", move |conn, meta| {
-            crate::repo::set_location_facets(
-                conn,
-                meta,
-                id,
-                &crate::repo::Location {
-                    branch: Some(&branch),
-                    cut_from: cut.as_deref(),
-                    ..crate::repo::Location::default()
-                },
-            )
+            record_if_absent(conn, meta, id, &branch, cut.as_deref())
         })
         .unwrap();
     }

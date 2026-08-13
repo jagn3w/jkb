@@ -345,6 +345,38 @@ pub fn local_branches(dir: &Path) -> Result<std::collections::BTreeSet<String>> 
         .collect())
 }
 
+/// Every branch name that exists here, **counting a remote-tracking copy** — one spawn.
+///
+/// The batched form of the question `branch_ref` asks per branch. `staging ls` redraws on every
+/// database write, so it resolves this once before its loop; asking per branch there is what the
+/// hoisting exists to avoid. It must be the *same* question, though: with the local-only set, a
+/// batch whose local ref had been pruned vanished from the listing while `task work` silently
+/// joined it and `task land` landed onto it — the three surfaces disagreeing, which is the one
+/// thing the single read is there to prevent (D38.2).
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn branches_including_remote(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
+    let mut out = local_branches(dir)?;
+    let listed = git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/remotes/origin",
+        ],
+    )?
+    .unwrap_or_default();
+    for line in listed.lines() {
+        if let Some(name) = line.trim().strip_prefix("origin/") {
+            if !name.is_empty() && name != "HEAD" {
+                out.insert(name.to_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Create branch `branch` at `start` if it does not already exist. Returns whether it was
 /// created.
 ///
@@ -691,22 +723,6 @@ pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
     };
     git_must(dir, &["branch", branch, &remote])?;
     Ok(true)
-}
-
-/// The commit where `a` and `b` diverged, or `None` if they share no history.
-///
-/// This is what "the commit a branch was cut from" literally means, and it is the honest cut
-/// point for a branch this tool did not create. Recorded **at the moment tracking begins** it also
-/// survives a rebase-merge, which rewrites every sha and fast-forwards trunk to the branch tip:
-/// asking `merge-base` later would then answer "the tip", making a landed branch look unstarted,
-/// which is the ambiguity `base=` exists to resolve (D34.2).
-///
-/// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
-    valid_ref(a)?;
-    valid_ref(b)?;
-    Ok(git(dir, &["merge-base", a, b])?.filter(|s| !s.is_empty()))
 }
 
 /// Whether this git understands `merge-tree --write-tree` (2.38+). Probed by running it
