@@ -2128,3 +2128,42 @@ fn task_start_says_so_when_it_can_measure_no_cut_point() {
         "the JSON path must carry the recorded cut point"
     );
 }
+
+/// A branch that exists nowhere **is** reported gone, with the remedy that clears it.
+///
+/// The sibling test asserts the opposite — that a branch living only on the remote is *not*
+/// called gone — and a mutation making `gone_branches` return "nothing is ever gone" satisfied it
+/// trivially while killing no other test. A pair of assertions where only the negative one exists
+/// covers nothing: the reporting could be deleted outright and the suite would stay green.
+#[test]
+fn a_branch_that_exists_nowhere_is_reported_gone() {
+    let f = Fixture::new();
+    let uid = f.add_task("vanished branch task");
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "repo=proj"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "add",
+            &uid,
+            "branch=never-existed",
+        ])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "close-merged"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("never-existed gone"))
+        .stdout(predicate::str::contains("jkb task tag rm"));
+    assert_eq!(
+        f.status_of(&uid),
+        "open",
+        "a task whose branch is gone is held for a decision, never closed"
+    );
+}
