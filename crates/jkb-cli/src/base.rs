@@ -210,17 +210,21 @@ fn record_if_absent(
     Ok(())
 }
 
-/// Whether a cut point is now recorded for `branch` — so a command can say out loud that it
-/// recorded none rather than leaving a later reader to decline silently.
+/// The cut point now recorded for `branch`, if any — so a command can report it rather than
+/// leaving a later reader to decline silently.
+///
+/// Returns the value, not a boolean: the human path only needs to know whether there is one, but
+/// the JSON path should carry what was recorded, and two accessors would let those two answers
+/// drift.
 ///
 /// # Errors
 /// Returns an error if the tags cannot be read.
-pub(crate) fn any_recorded_for(
+pub(crate) fn recorded_for(
     db: &jkb_core::Db,
     id: ItemId,
     branch: &str,
-) -> anyhow::Result<bool> {
-    Ok(resolve(&crate::repo::task_tags(db, id)?, branch).is_some())
+) -> anyhow::Result<Option<String>> {
+    Ok(resolve(&crate::repo::task_tags(db, id)?, branch).map(str::to_owned))
 }
 
 /// The branch's own tip, or `None` if this repo does not have the branch.

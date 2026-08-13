@@ -2085,6 +2085,18 @@ fn task_start_says_so_when_it_can_measure_no_cut_point() {
         .success()
         .stdout(predicate::str::contains("base=").not());
 
+    // The JSON path carries the same fact, or a consumer cannot see it at all.
+    let out = f
+        .jkb()
+        .args(["task", "start", &uid, "--branch", "not-yet", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v.get("base").is_some() && v["base"].is_null(),
+        "the JSON path must say that no cut point was recorded: {v}"
+    );
+
     // And it stays quiet when there is one.
     git(&f.repo, &["branch", "real"]);
     let other = f.add_task("branch exists");
@@ -2093,4 +2105,15 @@ fn task_start_says_so_when_it_can_measure_no_cut_point() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no cut point").not());
+    let out = f
+        .jkb()
+        .args(["task", "start", &other, "--branch", "real", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["base"].as_str(),
+        Some(git(&f.repo, &["rev-parse", "real"]).as_str()),
+        "the JSON path must carry the recorded cut point"
+    );
 }

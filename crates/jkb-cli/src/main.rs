@@ -4349,10 +4349,21 @@ fn cmd_task_start(
         )?;
         Ok(())
     })?;
+    // Reported on **both** paths. The human note below was added first and alone, which left a
+    // JSON consumer — the UI, a workflow — with no way to tell that no cut point was recorded and
+    // the task will therefore never auto-close. A fact worth saying out loud is worth saying to
+    // whoever is actually reading.
+    let recorded = base::recorded_for(db, id, &branch)?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "uid": uid, "branch": branch, "repo": repo, "owner": owner })
+            serde_json::json!({
+                "uid": uid,
+                "branch": branch,
+                "repo": repo,
+                "owner": owner,
+                "base": recorded,
+            })
         );
     } else {
         println!("started {uid} on {repo}@{branch} (owner {owner})");
@@ -4360,7 +4371,7 @@ fn cmd_task_start(
         // `close-merged` that quietly declines to act. Nothing is recorded when the branch does
         // not exist here — naming a branch you are about to cut is what `--branch` is for — and
         // without one the task can never auto-close.
-        if !base::any_recorded_for(db, id, &branch)? {
+        if recorded.is_none() {
             println!(
                 "  note: {branch} does not exist here, so no cut point was recorded and this \
                  task will not auto-close. Run `jkb task base {uid} {branch} <sha>` once it does."
