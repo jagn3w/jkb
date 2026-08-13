@@ -2305,3 +2305,63 @@ fn a_review_of_one_branch_does_not_credit_a_tasks_other_live_branch() {
         "a review of one branch credited a task whose other branch it never saw"
     );
 }
+
+/// A land target whose checkout has uncommitted changes refuses the landing, and does not lose
+/// them.
+///
+/// Landing rolls the target back with `reset --hard` when the gate goes red, so uncommitted work
+/// sitting in that checkout would be destroyed by a landing that had nothing to do with it. The
+/// sibling test covers a dirty *session*; the target is the one whose changes a rollback actually
+/// reaches, and making the check answer "never dirty" killed no test at all.
+#[test]
+fn a_dirty_land_target_refuses_the_landing_and_keeps_its_changes() {
+    let f = Fixture::new();
+    let a = f.add_task("first");
+    let b = f.add_task("second");
+    let sa = f.work(&a);
+    let sb = f.work(&b);
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+    commit_in(
+        Path::new(sb["worktree"].as_str().unwrap()),
+        "b.txt",
+        "b\n",
+        "b",
+    );
+
+    // Landing the first task materialises the batch's own checkout under `.jkb/base`.
+    f.jkb()
+        .args(["task", "land", &a, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    let base = f.repo.join(".jkb").join("base");
+    assert!(
+        base.is_dir(),
+        "setup: the land target's checkout should exist"
+    );
+
+    // Someone leaves uncommitted work in it.
+    let stray = base.join("precious.txt");
+    std::fs::write(&stray, "not committed anywhere\n").unwrap();
+
+    f.jkb()
+        .args(["task", "land", &b, "--gate", "true", "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uncommitted changes"));
+
+    assert_eq!(
+        std::fs::read_to_string(&stray).unwrap(),
+        "not committed anywhere\n",
+        "the refused landing destroyed uncommitted work in the target's checkout"
+    );
+    assert_eq!(
+        f.status_of(&b),
+        "in_progress",
+        "a refused landing must leave the task where it was"
+    );
+}
