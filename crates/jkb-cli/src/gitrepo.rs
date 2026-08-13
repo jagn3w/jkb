@@ -661,17 +661,52 @@ pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<Str
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the branch.
 pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<()> {
-    valid_ref(branch)?;
-    valid_ref(start)?;
-    if has_branch(dir, branch)? {
+    // Composed from [`adopt_remote`] rather than repeating its logic: two functions that both
+    // knew how to prefer a remote copy is the overlap that once made `create_branch` silently
+    // ignore its own `start` argument.
+    if adopt_remote(dir, branch)? {
         return Ok(());
     }
-    let start = match branch_ref(dir, branch, Prefer::Remote)? {
-        Some(remote) => remote,
-        None => start.to_owned(),
-    };
-    git_must(dir, &["branch", branch, &start])?;
+    create_branch(dir, branch, start)?;
     Ok(())
+}
+
+/// Create the local `branch` from its remote-tracking copy when that is the only place it
+/// exists. Returns whether the branch is usable locally afterwards.
+///
+/// Separate from [`ensure_branch`] because it needs **no start point**: it either adopts what is
+/// already published or reports that there is nothing to adopt. That matters at the callers that
+/// resolve a land target, where computing a start point means resolving trunk — which fails in a
+/// repo whose trunk cannot be discovered, and which is not needed at all when the branch exists.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or refuses to create the branch.
+pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
+    valid_ref(branch)?;
+    if has_branch(dir, branch)? {
+        return Ok(true);
+    }
+    let Some(remote) = branch_ref(dir, branch, Prefer::Remote)? else {
+        return Ok(false);
+    };
+    git_must(dir, &["branch", branch, &remote])?;
+    Ok(true)
+}
+
+/// The commit where `a` and `b` diverged, or `None` if they share no history.
+///
+/// This is what "the commit a branch was cut from" literally means, and it is the honest cut
+/// point for a branch this tool did not create. Recorded **at the moment tracking begins** it also
+/// survives a rebase-merge, which rewrites every sha and fast-forwards trunk to the branch tip:
+/// asking `merge-base` later would then answer "the tip", making a landed branch look unstarted,
+/// which is the ambiguity `base=` exists to resolve (D34.2).
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
+    valid_ref(a)?;
+    valid_ref(b)?;
+    Ok(git(dir, &["merge-base", a, b])?.filter(|s| !s.is_empty()))
 }
 
 /// Whether this git understands `merge-tree --write-tree` (2.38+). Probed by running it

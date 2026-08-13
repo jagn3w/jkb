@@ -1821,3 +1821,154 @@ fn the_cut_point_is_measured_on_the_branch_not_the_land_target() {
          which had moved, so the freshly-cut guard was skipped"
     );
 }
+
+/// `task start` records where the branch diverged from trunk, which is neither trunk's tip nor
+/// the branch's own.
+///
+/// **Trunk's tip** is right only until trunk moves — routine with `origin/main` after any fetch.
+/// After that the recorded base is a commit the branch never sat on, the tip differs from it,
+/// `is_merged` skips its freshly-cut guard, and a branch with no commits closes the task as
+/// merged. That is the first case here.
+///
+/// **The branch's own tip** — the obvious repair, and what `task work` correctly uses — is wrong
+/// in the other direction for this command, which adopts a branch that may already carry work:
+/// base would equal tip forever and the task could never auto-close at all. That is the second
+/// case, and it is why the two commands genuinely differ rather than one of them being stale.
+#[test]
+fn task_start_records_where_the_branch_left_trunk() {
+    // 1. Freshly cut branch, trunk has since moved: must be held, not closed.
+    {
+        let f = Fixture::new();
+        git(&f.repo, &["branch", "feature"]);
+        commit_in(&f.repo, "moved.txt", "trunk moves\n", "trunk moves on");
+        let fork = git(&f.repo, &["rev-parse", "feature"]);
+
+        let uid = f.add_task("started late");
+        f.jkb()
+            .args(["task", "start", &uid, "--branch", "feature"])
+            .assert()
+            .success();
+        f.jkb()
+            .args(["--global", "task", "show", &uid])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("base=feature:{fork}")));
+
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        assert_eq!(
+            f.status_of(&uid),
+            "in_progress",
+            "an empty branch closed as merged: the base was trunk's tip, which had moved past it"
+        );
+    }
+
+    // 2. Branch already carrying work, then merged: must still close.
+    {
+        let f = Fixture::new();
+        git(&f.repo, &["checkout", "-q", "-b", "wip"]);
+        commit_in(&f.repo, "w.txt", "work\n", "work");
+        git(&f.repo, &["checkout", "-q", "main"]);
+
+        let uid = f.add_task("started midway");
+        f.jkb()
+            .args(["task", "start", &uid, "--branch", "wip"])
+            .assert()
+            .success();
+        git(&f.repo, &["merge", "-q", "--ff-only", "wip"]);
+
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        assert_eq!(
+            f.status_of(&uid),
+            "done",
+            "a merged branch never closed: recording the branch's own tip makes base == tip, so \
+             the freshly-cut guard fires forever"
+        );
+    }
+}
+
+/// A land target that exists only on the remote must be materialised, not merely counted as live.
+///
+/// A bare branch name under `refs/remotes` is not a valid start point, so deciding the batch is
+/// live and handing the name on gave `git branch <session> <batch>` something it could not
+/// resolve — aborting `task work` after the claim had been taken. The mirror is `land`, which
+/// refused a target it would itself have checked out a moment later.
+#[test]
+fn a_remote_only_land_target_is_materialised_for_both_work_and_land() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    // Session A opens a batch, publishes it; the local ref is then pruned while A stays open.
+    let a = f.add_task("task a");
+    let sa = f.work_onto(&a, "batch");
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+    git(&f.repo, &["push", "-q", "origin", "batch"]);
+    git(&f.repo, &["branch", "-D", "batch"]);
+    assert!(
+        git(&f.repo, &["branch", "--format=%(refname:short)"])
+            .lines()
+            .all(|b| b != "batch"),
+        "setup: the local batch ref must be gone"
+    );
+
+    // A second task joins the batch through the implicit path — no --onto.
+    let c = f.add_task("task c");
+    f.jkb().args(["task", "work", &c]).assert().success();
+    assert_eq!(
+        git(&f.repo, &["rev-parse", "batch"]),
+        git(&f.repo, &["rev-parse", "origin/batch"]),
+        "the batch was not materialised from its remote copy"
+    );
+
+    // And the mirror: A can still land onto it.
+    f.jkb()
+        .args(["task", "land", &a, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+}
+
+/// A repo whose trunk cannot be discovered must still open a session when `--onto` names a branch
+/// that already exists — computing a start point that is not needed made the escape hatch the
+/// error message recommends fail too.
+#[test]
+fn an_explicit_onto_works_in_a_repo_with_no_discoverable_trunk() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "-m", "main", "dev"]); // not a DEFAULT_TRUNK, and no remote
+    git(&f.repo, &["branch", "feature-x"]);
+
+    let uid = f.add_task("trunkless task");
+    let s = f.work_onto(&uid, "feature-x");
+    assert_eq!(s["onto"].as_str().unwrap(), "feature-x");
+}
+
+/// `--repo` names which tasks to consider; the git questions are still asked here. When that
+/// cannot even be determined the command must refuse, not proceed and call every live branch gone.
+#[test]
+fn close_merged_refuses_an_explicit_repo_it_cannot_verify() {
+    let f = Fixture::new();
+    let uid = f.add_task("elsewhere task");
+    git(&f.repo, &["branch", "feature"]);
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .assert()
+        .success();
+
+    let outside = f.home.path().join("not-a-repo");
+    std::fs::create_dir_all(&outside).unwrap();
+    let mut cmd = f.jkb();
+    cmd.current_dir(&outside)
+        .args(["task", "close-merged", "--repo", "proj", "--trunk", "main"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a git repository"));
+}

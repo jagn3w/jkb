@@ -4290,14 +4290,33 @@ fn cmd_task_start(
     }
 
     let id = resolve_task_uid(db, uid)?;
-    // Where this branch *began*, offered to `base::ensure_recorded` as a guess and used only if
-    // nothing is on record for this branch. `task work` guesses the tip of the branch it hangs
-    // the session off; this guesses trunk's tip. Both are right only at the moment the branch is
-    // created, which is why deciding whether to use one is not this command's business.
-    let cut = gitrepo::rev(
-        &cwd,
-        &gitrepo::trunk(&cwd)?.unwrap_or_else(|| "HEAD".to_owned()),
-    )?;
+    // Where this branch began, as **merge-base with trunk** — offered to `base::ensure_recorded`
+    // and used only if nothing is on record for this branch.
+    //
+    // It used to be trunk's *tip*, which is right only if trunk has not moved since the branch was
+    // cut. Once it has — routine with `origin/main` after any fetch — the recorded base is a
+    // commit the branch never sat on, so the tip differs from it, `is_merged` skips its
+    // freshly-cut guard, and a branch with no commits reads as merged and closes the task.
+    //
+    // The branch's own tip is not right either, and this is where `task start` genuinely differs
+    // from `task work`: that command *creates* the branch, so its tip is the cut point, while this
+    // one adopts a branch that may already carry work — recording its tip would mean base == tip
+    // forever and the task could never auto-close at all.
+    //
+    // `merge-base` is both. For a freshly cut branch it *is* the tip, so the empty-branch guard
+    // fires; once work exists the two differ and the merge check decides. Taken **now**, at the
+    // moment tracking begins, it also survives a rebase-merge — asking later would answer "the
+    // tip", since trunk has been fast-forwarded onto it (D34.2).
+    let cut = match (
+        gitrepo::trunk(&cwd)?,
+        gitrepo::branch_ref(&cwd, &branch, gitrepo::Prefer::Local)?,
+    ) {
+        (Some(trunk), Some(reference)) => gitrepo::merge_base(&cwd, &trunk, &reference)?,
+        // No trunk, or a branch that does not exist here: record nothing rather than a value that
+        // is not this branch's origin. Both readers decline to act without one, which is the safe
+        // direction (D34.4).
+        _ => None,
+    };
 
     let owner = owner.unwrap_or_else(owner::self_owner);
     let (o, b, r, cut_sha) = (owner.clone(), branch.clone(), repo.clone(), cut.clone());
@@ -4699,16 +4718,20 @@ fn resolve_onto(
             "refusing to land on {branch}: it is this repo's trunk, and a task tagged with \
              it would read as merged the moment anything lands"
         );
-        // `ensure_branch`, not `create_branch`: the user has *named* an existing branch, so one
-        // that exists only on `origin/` must be checked out rather than replaced by an empty
-        // namesake cut from trunk.
-        gitrepo::ensure_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
+        // Adopt an existing branch — including one that exists only on `origin/` — rather than
+        // replacing it with an empty namesake cut from trunk. The start point is resolved **only**
+        // if there is nothing to adopt: computing it eagerly made every `task work` fail in a repo
+        // whose trunk cannot be discovered, including the `--onto` escape hatch the error
+        // recommends.
+        if !gitrepo::adopt_remote(&ctx.root, branch)? {
+            gitrepo::create_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
+        }
         return Ok(branch.to_owned());
     }
     // A session that already has a target keeps it — counting the remote-tracking copy, or a
     // batch whose local ref was pruned would silently retarget the session somewhere else.
     if let Some(branch) = repo::facet_one(tags, repo::FACET_ONTO) {
-        if gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?.is_some() {
+        if gitrepo::adopt_remote(&ctx.root, branch)? {
             return Ok(branch.clone());
         }
     }
@@ -4764,8 +4787,11 @@ fn batch_onto(db: &Db, ctx: &repo::RepoCtx) -> Result<Option<String>> {
             continue;
         };
         // Remote-aware for the same reason: a live batch whose local ref is gone must still be
-        // joinable, or the next session cuts a second batch beside it.
-        if gitrepo::branch_ref(&ctx.root, &onto, gitrepo::Prefer::Local)?.is_none() {
+        // joinable, or the next session cuts a second batch beside it. **Materialised**, not just
+        // detected — a bare branch name that only exists under `refs/remotes` is not a valid start
+        // point, so merely counting it as live handed `git branch <session> <batch>` a name it
+        // could not resolve and aborted the command.
+        if !gitrepo::adopt_remote(&ctx.root, &onto)? {
             continue;
         }
         match &found {
@@ -4960,8 +4986,16 @@ fn land_preflight(
     let onto = repo::facet_one(tags, repo::FACET_ONTO)
         .cloned()
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
+    // The same question the session paths ask, and materialised for the same reason: the land
+    // path checks the target out, so a target that exists only on `origin/` is usable — refusing
+    // it meant `land` rejected a branch it would itself have created a moment later.
+    //
+    // This **writes** — it can create a local ref — which is worth saying out loud in something
+    // called a preflight. It is confined to `cmd_task_land`, this function's only caller, which
+    // materialises the same branch moments later anyway; the listing surfaces use
+    // `staging::land_blocker`, which reads and never creates.
     anyhow::ensure!(
-        gitrepo::has_branch(&ctx.root, &onto)?,
+        gitrepo::adopt_remote(&ctx.root, &onto)?,
         "the land target {onto} no longer exists"
     );
     // Everything from here is `staging::land_blocker` — the ONE derivation of "may this
@@ -5586,6 +5620,30 @@ fn close_if_still_open(db: &Db, id: ItemId) -> Result<bool> {
     })?)
 }
 
+/// `--repo` names which tasks to consider; every git question is still asked of the repository
+/// we are standing in, so those must be the same place.
+///
+/// The refusal is a **refusal**, not a skip. Written as `if let Ok(here) = repo_ctx()` it did
+/// nothing at all outside a git repo — the case where the mismatch is total — and the run then
+/// reported every live branch of the named repo as gone, advising the user to delete the tag
+/// tracking it. An answer that is unavailable must not read as a benign one.
+fn check_repo_is_here(repo: &str) -> Result<()> {
+    let here = repo::repo_ctx().with_context(|| {
+        format!(
+            "--repo {repo} was given but this is not a git repository, and every branch would be \
+             looked up here — reporting {repo}'s live branches as gone. Run it from {repo}'s \
+             checkout."
+        )
+    })?;
+    anyhow::ensure!(
+        here.key == repo,
+        "--repo {repo} does not match the repository here ({}), and the branches would be looked \
+         up in this one. Run it from {repo}'s checkout.",
+        here.key
+    );
+    Ok(())
+}
+
 /// Which of `branches` do not exist here at all — asked **per branch**, with the same `Prefer`
 /// `close-merged` uses everywhere else.
 ///
@@ -5672,6 +5730,7 @@ fn cmd_task_close_merged(
     let cwd = std::env::current_dir()?;
     // The main copy's key, for the same reason `task start` uses it: run from a session
     // worktree, `key(&cwd)` is the session's name and this silently matches no tasks at all.
+    let explicit_repo = repo.is_some();
     let repo = match repo {
         Some(r) => r,
         None => {
@@ -5684,13 +5743,8 @@ fn cmd_task_close_merged(
     // repository we are standing in. Those must be the same place or the command probes one repo
     // about another's branches — reporting live work as gone and advising its tag be deleted. It
     // is a filter, not a redirect, so a mismatch is refused rather than guessed at.
-    if let Ok(here) = repo::repo_ctx() {
-        anyhow::ensure!(
-            here.key == repo,
-            "--repo {repo} does not match the repository here ({}), and the branches would be \
-             looked up in this one. Run it from {repo}'s checkout.",
-            here.key
-        );
+    if explicit_repo {
+        check_repo_is_here(&repo)?;
     }
     let trunk_ref = match trunk {
         Some(t) => t,
