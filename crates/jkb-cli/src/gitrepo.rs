@@ -135,11 +135,43 @@ pub fn trunk(dir: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Check a value that will be handed to `git` as a **ref operand**, not as a flag.
+///
+/// `git` parses argv positionally and has no way to know that `-D` was meant as a branch name, so
+/// a user-supplied ref beginning with `-` becomes an option: `jkb task work <uid> --onto=-D`
+/// reached `git branch -D <trunk>` and **deleted the repository's trunk branch**. (`clap` blocks
+/// the separated form `--onto -D` but passes `--onto=-D` through, which is the ordinary way to
+/// give an option a hyphenated value.)
+///
+/// Nothing legitimate is lost: `git check-ref-format` rejects a ref name starting with `-`, so
+/// such a branch cannot exist to be referred to. Empty is refused for the same reason.
+///
+/// Checked here, in the module every git invocation goes through, rather than at the handful of
+/// CLI flags that happen to accept a branch today — `--onto`, `--branch`, `--trunk`, `task base`,
+/// `task tag add branch=…`, and whatever is added next. A rule spread over entry points is the
+/// defect this file has now been taught twice.
+///
+/// # Errors
+/// Returns an error if `name` cannot be passed to git as an operand.
+pub fn valid_ref(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty(),
+        "an empty branch or revision name cannot be passed to git"
+    );
+    anyhow::ensure!(
+        !name.starts_with('-'),
+        "`{name}` cannot be used as a branch or revision: git reads a leading `-` as an option, \
+         and no valid ref name begins with one"
+    );
+    Ok(())
+}
+
 /// The commit `reference` resolves to, if any.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
+    valid_ref(reference)?;
     Ok(git(dir, &["rev-parse", reference])?.filter(|s| !s.is_empty()))
 }
 
@@ -216,6 +248,7 @@ pub fn worktrees(dir: &Path) -> Result<Vec<Worktree>> {
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    valid_ref(branch)?;
     Ok(worktrees(dir)?
         .into_iter()
         .find(|w| w.branch.as_deref() == Some(branch))
@@ -240,6 +273,8 @@ pub fn prune_worktrees(dir: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the worktree.
 pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
+    valid_ref(branch)?;
+    valid_ref(start)?;
     let path_s = path.to_string_lossy().into_owned();
     // `ensure_branch`, so a branch that exists only on the remote is checked out rather than
     // re-cut from `start`: the `-b` fallback this replaced had the same blind spot as every other
@@ -273,6 +308,7 @@ pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
+    valid_ref(branch)?;
     Ok(git(
         dir,
         &[
@@ -315,6 +351,8 @@ pub fn local_branches(dir: &Path) -> Result<std::collections::BTreeSet<String>> 
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the branch.
 pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
+    valid_ref(branch)?;
+    valid_ref(start)?;
     if has_branch(dir, branch)? {
         return Ok(false);
     }
@@ -327,6 +365,7 @@ pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to delete the branch.
 pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
+    valid_ref(branch)?;
     git_must(dir, &["branch", if force { "-D" } else { "-d" }, branch])?;
     Ok(())
 }
@@ -346,6 +385,8 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn ahead_count(dir: &Path, onto: &str, branch: &str) -> Result<usize> {
+    valid_ref(onto)?;
+    valid_ref(branch)?;
     Ok(
         git(dir, &["rev-list", "--count", &format!("{onto}..{branch}")])?
             .and_then(|s| s.parse().ok())
@@ -359,6 +400,7 @@ pub fn ahead_count(dir: &Path, onto: &str, branch: &str) -> Result<usize> {
 /// Returns an error if `git` cannot be executed or refuses the switch (a dirty tree, or the
 /// branch being checked out in another worktree).
 pub fn switch_to(dir: &Path, branch: &str) -> Result<()> {
+    valid_ref(branch)?;
     git_must(dir, &["switch", branch])?;
     Ok(())
 }
@@ -387,6 +429,8 @@ pub enum Graft {
 /// Returns an error if `git` cannot be executed, or if the working tree cannot be put on
 /// `onto` to begin with.
 pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
+    valid_ref(branch)?;
+    valid_ref(onto)?;
     git_must(dir, &["switch", onto])?;
     let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
 
@@ -413,6 +457,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
 /// # Errors
 /// Returns an error if `git` cannot be executed or the reset fails.
 pub fn reset_hard(dir: &Path, reference: &str) -> Result<()> {
+    valid_ref(reference)?;
     git_must(dir, &["reset", "--hard", reference])?;
     Ok(())
 }
@@ -430,6 +475,7 @@ pub fn reset_hard(dir: &Path, reference: &str) -> Result<()> {
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn rev_commit(dir: &Path, reference: &str) -> Result<Option<String>> {
+    valid_ref(reference)?;
     Ok(git(
         dir,
         &[
@@ -507,6 +553,8 @@ pub fn is_merged(
     base: Option<&str>,
     prefer: Prefer,
 ) -> Result<(MergeState, bool)> {
+    valid_ref(branch)?;
+    valid_ref(trunk_ref)?;
     if !exists(dir, trunk_ref)? {
         return Ok((MergeState::NoTrunk, false));
     }
@@ -578,6 +626,7 @@ pub fn is_merged(
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<String>> {
+    valid_ref(branch)?;
     let candidates = match prefer {
         Prefer::Remote => [format!("origin/{branch}"), branch.to_owned()],
         Prefer::Local => [branch.to_owned(), format!("origin/{branch}")],
@@ -612,6 +661,8 @@ pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<Str
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the branch.
 pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<()> {
+    valid_ref(branch)?;
+    valid_ref(start)?;
     if has_branch(dir, branch)? {
         return Ok(());
     }

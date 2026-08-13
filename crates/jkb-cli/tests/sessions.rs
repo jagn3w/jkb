@@ -1742,3 +1742,36 @@ fn a_fresh_batch_is_cut_from_trunk_not_adopted_from_a_stale_remote_namesake() {
         "the fresh batch carries the stale remote batch's commits"
     );
 }
+
+/// A branch name is user input and reaches `git` as a positional operand, so one beginning with
+/// `-` becomes an option.
+///
+/// `jkb task work <uid> --onto=-D` ran `git branch -D <trunk>` and **deleted the repository's
+/// trunk branch**. `clap` blocks the separated form `--onto -D` but passes `--onto=-D` through,
+/// which is the ordinary way to give an option a hyphenated value — so the CLI parser is not the
+/// guard, and cannot be.
+///
+/// Every flag that accepts a ref is probed, because the point is that the check lives below all of
+/// them rather than at each one.
+#[test]
+fn a_branch_name_cannot_smuggle_a_git_option() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "victim"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    let uid = f.add_task("injection probe");
+
+    let hostile = [
+        vec!["task", "work", uid.as_str(), "--onto=-D"],
+        vec!["task", "start", uid.as_str(), "--branch=-D"],
+        vec!["--global", "task", "base", uid.as_str(), "-D", "HEAD"],
+        vec!["task", "close-merged", "--trunk=-D"],
+    ];
+    for args in hostile {
+        f.jkb().args(&args).assert().failure();
+    }
+
+    // Both branches survive every attempt.
+    let after = git(&f.repo, &["branch", "--format=%(refname:short)"]);
+    assert!(after.contains("main"), "trunk was deleted: {after}");
+    assert!(after.contains("victim"), "a branch was deleted: {after}");
+}

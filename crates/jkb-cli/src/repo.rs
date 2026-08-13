@@ -127,6 +127,14 @@ pub(crate) fn set_location_facets(
     id: ItemId,
     loc: &Location<'_>,
 ) -> jkb_core::Result<()> {
+    // Refuse a name git would read as an option **before it is stored**. `task start` records
+    // branch facets without touching git at all, so a hostile value entered the store cleanly and
+    // then poisoned every later reader — and a reader that refuses is a whole `close-merged` run
+    // failing on one bad row. The store is the boundary worth defending; `gitrepo::valid_ref` at
+    // the git call is the backstop for values that predate this.
+    for name in [loc.branch, loc.onto].into_iter().flatten() {
+        crate::gitrepo::valid_ref(name).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
+    }
     if let Some(branch) = loc.branch {
         crate::base::ensure_recorded(conn, meta, id, branch, loc.cut_from)?;
     }

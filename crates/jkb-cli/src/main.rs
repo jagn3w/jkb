@@ -4373,6 +4373,7 @@ fn cmd_task_start(
 /// `is_merged` compares it against `rev-parse` output, and a value git cannot resolve silently
 /// disables the guard it exists to provide.
 fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Result<()> {
+    gitrepo::valid_ref(branch)?;
     let id = resolve_task_uid(db, uid)?;
     let cwd = std::env::current_dir()?;
     // Refuse a revision that cannot be resolved rather than storing it verbatim. `landed_with_base`
@@ -4453,6 +4454,11 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
          branches. Use `{}` instead.",
         base::VERB
     );
+    // The ref-valued facets are read back and handed to git, so the same rule applies here as at
+    // the location writer: a value git would read as an option must not reach the store.
+    if matches!(facet, repo::FACET_BRANCH | repo::FACET_ONTO) && !matches!(mode, TagMode::Rm) {
+        gitrepo::valid_ref(value)?;
+    }
     let (facet, value) = (facet.to_owned(), value.to_owned());
     let id = resolve_task_uid(db, &uid)?;
     db.write_txn("cli", move |conn, meta| {
@@ -5680,6 +5686,10 @@ fn cmd_task_close_merged(
              — pass --trunk",
         )?,
     };
+    // Checked where the flag is accepted, not only where it is eventually used: with no candidate
+    // task the probe never runs, so an unusable `--trunk` was silently accepted and the run
+    // reported "nothing to close" as though it had asked.
+    gitrepo::valid_ref(&trunk_ref)?;
 
     // Every open task tagged for this repo that names a branch. Typed, not interpolated into
     // the DSL: `--repo` is user-typed and a value with whitespace would re-tokenize into a
