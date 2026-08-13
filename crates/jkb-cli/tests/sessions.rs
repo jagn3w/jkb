@@ -1361,10 +1361,21 @@ fn re_working_an_abandoned_branch_keeps_its_original_cut_point() {
         "setup: the re-worked branch still has no commits of its own"
     );
 
-    // The harm. A branch with nothing on it re-merges to trunk's own tree, so on content alone
-    // it reads as merged; the recorded cut point is the only thing that separates "not started"
-    // from "landed". Overwritten with the target's newer tip, the branch no longer sits on its
-    // base, the guard is skipped, and the task closes with the work never written.
+    // Asserted as a **value**, before the consequence. This test passed under a mutation that
+    // recorded no cut point at all: with none, nothing ever closes, so the status assertion below
+    // is satisfied by the very regression the test is named for. A test whose name promises
+    // preservation has to look at what was preserved.
+    f.jkb()
+        .args(["--global", "task", "show", &empty])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "base={branch}:{cut_point}"
+        )));
+
+    // The harm itself. A branch with nothing on it re-merges to trunk's own tree, so on content
+    // alone it reads as merged; the recorded cut point is the only thing that separates "not
+    // started" from "landed".
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
         f.status_of(&empty),

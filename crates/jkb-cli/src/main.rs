@@ -4673,6 +4673,9 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
                 "branch": branch,
                 "onto": onto,
                 "resumed": resumed,
+                // Reported for the same reason `task start` reports it: a consumer cannot
+                // otherwise tell whether this session's work can ever auto-close.
+                "base": base::recorded_for(db, id, &branch)?,
                 "owner": owner,
             })
         );
