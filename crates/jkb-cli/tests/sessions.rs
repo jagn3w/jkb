@@ -1826,21 +1826,16 @@ fn the_cut_point_is_measured_on_the_branch_not_the_land_target() {
 /// uses, and the only one that answers the question the readers actually ask: *has anything
 /// happened on this branch since we started tracking it?*
 ///
-/// Two earlier rules were wrong in opposite directions and both are pinned here. **Trunk's tip**
-/// is right only until trunk moves (case 1). **The merge-base with trunk** is right only if the
-/// branch was cut from trunk — and this project's own flow cuts task branches from a *staging*
-/// branch, where the merge-base is behind the tip before any work happens (case 2), so an empty
-/// task closed as merged.
-///
-/// Case 3 is the accepted cost, stated rather than discovered: a branch that already carried
-/// commits when tracking began records `base == tip`, so if nothing further is committed it is
-/// held rather than closed. A missed auto-close costs one command; a false one buries work
-/// (D34.4). Case 4 is why that cost is small and why the feature is not simply dead — one commit
-/// after `task start` and auto-close works normally.
-#[test]
-fn task_start_records_the_branch_tip_at_tracking_time() {
-    // 1. Cut from trunk, trunk has since moved: held.
-    {
+/// Four cases, deliberately **four tests**. They were one test with four blocks, and a `#[test]`
+/// stops at its first failing assertion — so a mutation that should have killed case 4 killed
+/// case 1 first and the other three were never reached. A case that cannot be shown to fail on
+/// its own is not covering anything, which is the same defect as an assertion that cannot fail.
+mod cut_point {
+    use super::*;
+
+    /// Cut from trunk, trunk has since moved. Recording trunk's *tip* closes this as merged.
+    #[test]
+    fn a_branch_cut_from_trunk_that_moved_is_held() {
         let f = Fixture::new();
         git(&f.repo, &["branch", "feature"]);
         commit_in(&f.repo, "moved.txt", "trunk moves\n", "trunk moves on");
@@ -1856,11 +1851,13 @@ fn task_start_records_the_branch_tip_at_tracking_time() {
             .success()
             .stdout(predicate::str::contains(format!("base=feature:{tip}")));
         f.jkb().args(["task", "close-merged"]).assert().success();
-        assert_eq!(f.status_of(&uid), "in_progress", "case 1");
+        assert_eq!(f.status_of(&uid), "in_progress");
     }
 
-    // 2. Cut from a STAGING branch — the D38 flow — then staging lands: held.
-    {
+    /// Cut from a **staging** branch — the D38 flow this project is built around — then staging
+    /// lands. Measuring against *trunk* puts the base behind the tip before any work happens.
+    #[test]
+    fn a_branch_cut_from_staging_is_held_when_staging_lands() {
         let f = Fixture::new();
         git(&f.repo, &["checkout", "-q", "-b", "stg"]);
         commit_in(&f.repo, "s.txt", "staging\n", "staging work");
@@ -1884,13 +1881,14 @@ fn task_start_records_the_branch_tip_at_tracking_time() {
         assert_eq!(
             f.status_of(&uid),
             "in_progress",
-            "case 2: a branch cut from staging closed as merged with zero commits of its own — \
-             its base was measured against trunk, which it was never cut from"
+            "a branch cut from staging closed as merged with zero commits of its own"
         );
     }
 
-    // 3. Pre-existing commits and none after: held. The accepted missed close.
-    {
+    /// Pre-existing commits and none after: held. The accepted cost of one rule — a missed
+    /// auto-close, which costs a command, rather than a false one, which buries work (D34.4).
+    #[test]
+    fn a_branch_worked_before_tracking_began_is_held() {
         let f = Fixture::new();
         git(&f.repo, &["checkout", "-q", "-b", "wip"]);
         commit_in(&f.repo, "w.txt", "work\n", "work");
@@ -1902,11 +1900,13 @@ fn task_start_records_the_branch_tip_at_tracking_time() {
             .success();
         git(&f.repo, &["merge", "-q", "--ff-only", "wip"]);
         f.jkb().args(["task", "close-merged"]).assert().success();
-        assert_eq!(f.status_of(&uid), "in_progress", "case 3");
+        assert_eq!(f.status_of(&uid), "in_progress");
     }
 
-    // 4. A commit after tracking began: closes. Without this, "always held" would pass.
-    {
+    /// A commit after tracking began: closes. Without this the feature could be dead — "always
+    /// held" satisfies every other case here.
+    #[test]
+    fn a_branch_worked_after_tracking_began_still_auto_closes() {
         let f = Fixture::new();
         git(&f.repo, &["branch", "later"]);
         let uid = f.add_task("started then worked");
@@ -1922,7 +1922,7 @@ fn task_start_records_the_branch_tip_at_tracking_time() {
         assert_eq!(
             f.status_of(&uid),
             "done",
-            "case 4: auto-close no longer fires at all, so the feature is dead"
+            "auto-close no longer fires at all, so the feature is dead"
         );
     }
 }
