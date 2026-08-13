@@ -2167,3 +2167,141 @@ fn a_branch_that_exists_nowhere_is_reported_gone() {
         "a task whose branch is gone is held for a decision, never closed"
     );
 }
+
+/// A review of a staging branch must not credit a task whose work is not in it.
+///
+/// `onto=` says a task *intends* to land on a branch, not that it has. Crediting on intent stamps
+/// `reviewed=` on work the review never saw and then lets `jkb task land` graft it — the one
+/// direction this gate must not fail. `work_is_in` exists for exactly that, and its own doc says
+/// so, yet making it return "covered" for everything killed no test at all: the containment half
+/// of the gate was unverified.
+#[test]
+fn a_review_of_a_staging_branch_skips_work_it_does_not_contain() {
+    let f = Fixture::new();
+    let uid = f.add_task("still building");
+    let s = f.work_onto(&uid, "stg");
+    // Commits on the task's own branch, never landed onto the staging branch.
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "wip.txt",
+        "not landed\n",
+        "wip",
+    );
+    f.add_finding("reviews/stg-1", "a finding");
+
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "stg"])
+        .args(["--findings", "reviews/stg-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not merged into it yet"))
+        .stdout(predicate::str::contains(&uid));
+
+    // Not credited, and therefore still refused by the land gate.
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a task whose work is not in the reviewed branch was credited as reviewed"
+    );
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reviewed=").not());
+}
+
+/// And a task the review cannot decide about is reported as *undecidable*, naming the verb that
+/// fixes it — not as "not merged yet", which asserts a fact nothing checked.
+///
+/// The two buckets have different remedies, and collapsing them was a pass-26 finding. Making the
+/// classifier always claim a usable cut point killed no test, so the distinction it draws was
+/// unverified.
+#[test]
+fn a_review_names_the_task_it_cannot_decide_about() {
+    let f = Fixture::new();
+    let uid = f.add_task("no cut point");
+    let s = f.work_onto(&uid, "stg");
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "wip.txt",
+        "not landed\n",
+        "wip",
+    );
+    // Remove the cut point the session recorded, leaving containment undecidable.
+    let cut = git(&f.repo, &["rev-parse", &format!("{branch}~1")]);
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "rm",
+            &uid,
+            &format!("base={branch}:{cut}"),
+        ])
+        .assert()
+        .success();
+    f.add_finding("reviews/stg-2", "a finding");
+
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "stg"])
+        .args(["--findings", "reviews/stg-2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no cut point recorded"))
+        .stdout(predicate::str::contains("jkb task base"));
+}
+
+/// Reviewing a task's own branch must still check the *other* branches it records.
+///
+/// `branch=` went single-valued (D36.6), but `tag add` is additive and the readers deliberately
+/// index every value — a task really can carry two. A review of one of them has not seen the
+/// other, so crediting the task on the strength of the reviewed branch alone stamps `reviewed=`
+/// over work still in flight elsewhere. `others_are_covered` exists for that and had no test:
+/// making it answer "covered" for everything killed nothing.
+#[test]
+fn a_review_of_one_branch_does_not_credit_a_tasks_other_live_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("two branches");
+    let s = f.work(&uid);
+    let reviewed = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+
+    // A second, live branch with its own unmerged work, recorded on the same task.
+    let fork = git(&f.repo, &["rev-parse", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "sibling"]);
+    commit_in(&f.repo, "sib.txt", "sibling work\n", "sibling work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "branch=sibling"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "base", &uid, "sibling", &fork])
+        .assert()
+        .success();
+
+    f.add_finding("reviews/one", "a finding");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &reviewed])
+        .args(["--findings", "reviews/one"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&uid));
+
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reviewed=").not());
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a review of one branch credited a task whose other branch it never saw"
+    );
+}
