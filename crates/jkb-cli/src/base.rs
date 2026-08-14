@@ -202,6 +202,18 @@ fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> boo
 ///
 /// # Errors
 /// Returns an error if a tag read or write fails.
+/// Whether the caller knows this branch to be **new**.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// The caller created the branch in this operation, so it cannot be the branch any existing
+    /// record describes — only the one that had the name before.
+    JustCreated,
+    /// The caller did not create it and cannot tell. An existing record stands.
+    Unknown,
+}
+
+/// # Errors
+/// Returns an error if a tag read or write fails.
 pub(crate) fn ensure_recorded(
     conn: &Connection,
     meta: &WriteMeta,
@@ -209,7 +221,11 @@ pub(crate) fn ensure_recorded(
     repo_root: Option<&std::path::Path>,
     branch: &str,
     onto: Option<&str>,
+    freshness: Freshness,
 ) -> jkb_core::Result<()> {
+    if freshness == Freshness::JustCreated {
+        forget(conn, meta, id, branch)?;
+    }
     let tags = read_tags(conn, id)?;
     let cut = match repo_root {
         // Guarded by the same predicate `record_if_absent` early-returns on, so the two cannot
@@ -368,13 +384,19 @@ fn measure_git(
     let Some(onto) = onto else {
         return rev_commit(repo_root, &here);
     };
+    // A parent we cannot find is treated exactly like a parent that was never named. Dropping it
+    // and keeping trunk was the tempting thing and it is wrong in the one direction that matters:
+    // for a branch cut from a *staging* branch, a trunk-only merge-base sits behind the branch's
+    // real origin, so a branch with no work of its own reads as having some and closes as merged
+    // the moment the staging branch lands. That would make a mistyped `--onto` strictly worse than
+    // omitting it — the opposite of this function's whole rule.
+    let Some(target) = branch_ref(repo_root, onto, Prefer::Local)? else {
+        return rev_commit(repo_root, &here);
+    };
 
     // Everything this branch inherited rather than wrote: from the parent the caller named, and
-    // from trunk. `trunk` has already verified its own ref resolves, so it is used directly.
-    let against: Vec<String> = branch_ref(repo_root, onto, Prefer::Local)?
-        .into_iter()
-        .chain(trunk(repo_root)?)
-        .collect();
+    // from trunk.
+    let against: Vec<String> = std::iter::once(target).chain(trunk(repo_root)?).collect();
     let mut fork: Option<String> = None;
     for reference in against {
         let Some(candidate) = merge_base(repo_root, &here, &reference)? else {

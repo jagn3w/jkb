@@ -3094,11 +3094,13 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               single-answer facets: onto=, repo=. Writing branch= also
                               records where that branch was cut, but prefer `task start`,
                               which can be told the branch it was cut FROM.
+  jkb task start <uid> [--branch B] [--onto S]
+                              claim it and record the branch, the repo, and — from --onto, the
+                              branch B was cut from — where B forked. Prefer it over tagging
+                              branch= by hand.
   jkb task base <uid> <branch> <sha>
-                              record where a branch was cut, by hand. Per branch, so `tag set`
-                              would delete a sibling's and refuses; this is the verb for it.
-                              `jkb task start` measures it for you — prefer that, and use this
-                              only to repair a record.
+                              repair a cut point by hand. Per branch, so `tag set` would delete
+                              a sibling's and refuses; `task start` measures it for you.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -4307,23 +4309,7 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
                 .key
         }
     };
-    // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
-    // anything merged, since trunk is trivially "merged into" itself. `--onto main` is refused
-    // for the sibling reason `task work` refuses it (D34.3): it would put trunk in the branch
-    // picker as a batch to land onto.
-    if let Some(t) = gitrepo::trunk(&cwd)? {
-        let trunk_name = t.rsplit('/').next().unwrap_or(&t);
-        anyhow::ensure!(
-            branch != trunk_name,
-            "`{branch}` is this repo's trunk — start work on a feature branch, or the task \
-             would auto-close immediately"
-        );
-        anyhow::ensure!(
-            onto.as_deref() != Some(trunk_name),
-            "`{trunk_name}` is this repo's trunk, so it is not something to land onto — name \
-             the staging branch {branch} was cut from, or omit --onto"
-        );
-    }
+    let land_target = land_target_for(&cwd, &branch, onto.as_deref(), json)?;
 
     let id = resolve_task_uid(db, uid)?;
     // The one answer to "may a cut point be measured here" (`repo::measure_root_for`), shared with
@@ -4334,7 +4320,8 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     let measure_in = repo::measure_root_for(db, id, Some(&repo))?;
     let owner = owner.unwrap_or_else(owner::self_owner);
     let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
-    let n = onto.clone();
+    // The parent for the measurement is what the caller said; the land target is that minus trunk.
+    let (measure_against, n) = (onto.clone(), land_target.clone());
     // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
     // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
     // answer as a refusal meant `task start` refused its own second run under a new pid, and
@@ -4385,6 +4372,10 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
                 branch: Some(&b),
                 repo: Some(&r),
                 onto: n.as_deref(),
+                cut_from: measure_against.as_deref(),
+                // `task start` does not create the branch, so it cannot know. An existing record
+                // stands, which is the conservative direction.
+                ..repo::Location::default()
             },
         )?;
         Ok(())
@@ -4457,6 +4448,50 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
         );
     }
     Ok(())
+}
+
+/// What `--onto` should be **recorded** as, given what it was passed — and the trunk rules.
+///
+/// `--onto` carries two roles that only come apart at trunk: the branch this one was **cut from**
+/// (a measurement reference) and the branch it **lands on** (the `onto=` facet, which puts it in
+/// the staging picker). Trunk is a perfectly good answer to the first and an unacceptable one to
+/// the second (D34.3), so it is used for the measurement and dropped from the record.
+///
+/// Refusing the flag outright was the first version, and it left a branch genuinely cut from trunk
+/// with commits already on it able to record only `base == tip` — permanently `NothingToMerge`,
+/// never creditable, never landable — with `jkb task base` and a hand-computed merge-base as the
+/// only way out, which is the thing this area exists to stop callers doing.
+///
+/// The work branch itself may never be trunk: `branch=main` closes the task the instant anything
+/// merges, since trunk is trivially merged into itself.
+fn land_target_for(
+    cwd: &Path,
+    branch: &str,
+    onto: Option<&str>,
+    json: bool,
+) -> Result<Option<String>> {
+    let Some(t) = gitrepo::trunk(cwd)? else {
+        return Ok(onto.map(str::to_owned));
+    };
+    let trunk_name = t.rsplit('/').next().unwrap_or(&t);
+    anyhow::ensure!(
+        branch != trunk_name,
+        "`{branch}` is this repo's trunk — start work on a feature branch, or the task would \
+         auto-close immediately"
+    );
+    // Against the trunk *ref* as well as its short name: `--onto origin/main` slipped past a
+    // short-name-only check and was stored as a land target.
+    if onto.is_some_and(|o| o == trunk_name || o == t) {
+        if !json {
+            println!(
+                "note: {branch} was cut from {trunk_name}, so that is what its cut point is \
+                 measured against — but trunk is not recorded as a land target, or the task would \
+                 read as merged the moment anything landed."
+            );
+        }
+        return Ok(None);
+    }
+    Ok(onto.map(str::to_owned))
 }
 
 /// `task base <uid> <branch> <sha>` — record where a branch was cut (design D34.2).
@@ -4568,7 +4603,18 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
         db.write_txn("cli", move |conn, meta| {
             // No `onto`: this verb states no parent branch, so the cut point falls back to the
             // branch's own tip — the conservative answer, which holds rather than closes.
-            repo::record_branch(conn, meta, id, root.as_deref(), &value, None, how)
+            repo::record_branch(
+                conn,
+                meta,
+                id,
+                root.as_deref(),
+                &value,
+                None,
+                how,
+                // This verb does not create the branch, so it cannot know whether the name is
+                // new. An existing record stands, which is the conservative direction.
+                base::Freshness::Unknown,
+            )
         })?;
         report(json, &uid, "tagged");
         return Ok(());
@@ -4713,23 +4759,17 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     claim_session(db, id, uid, &owner, &worktree)?;
 
     let resumed = sessions.iter().any(|s| s.branch == branch);
-    if !resumed {
-        if let Some(parent) = worktree.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        anyhow::ensure!(
-            !worktree.exists(),
-            "{} exists but git does not know it as a worktree — remove it, or run \
-             `git worktree prune`",
-            worktree.display()
-        );
-        if let Err(e) = gitrepo::worktree_add(&ctx.root, &worktree, &branch, &onto) {
-            // Do not leave the task claimed for a session that failed to open.
-            let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
-            return Err(e);
-        }
-    }
+    // Whether `worktree_add` had to CREATE the branch, as opposed to re-attaching one that was
+    // already there. Not the same question as `resumed`, which is about the worktree — and the
+    // difference is the point: a branch created now is a new branch, so any cut point recorded
+    // under this name describes the one it replaced. `git branch -D` (which this command's own
+    // sibling used to recommend) followed by a fresh `task work` left the stale record in place,
+    // the freshly-cut guard was skipped, and `close-merged` closed a task with nothing on it.
+    let freshness = if resumed {
+        base::Freshness::Unknown
+    } else {
+        open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?
+    };
 
     // Record where the work is happening, exactly as `task start` does (D34.1), plus the
     // land target so `land` and a resumed `work` agree on it. These three facets are *set*,
@@ -4756,6 +4796,9 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
                 branch: Some(&b),
                 repo: Some(&r),
                 onto: Some(&o),
+                // `task work` cuts the branch from its land target, so the two are the same.
+                cut_from: None,
+                freshness,
             },
         )
     })?;
@@ -4785,6 +4828,40 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
         println!("  finish:   jkb task land {uid}");
     }
     Ok(())
+}
+
+/// Make the session's worktree, returning whether its **branch** had to be created.
+///
+/// Split out of `cmd_task_work` for length, and the return value is the point: a branch created
+/// now is a new branch, so any cut point recorded under this name describes the one it replaced
+/// (see `base::ensure_recorded`). On failure the claim is released, or the task would stay claimed
+/// for a session that never opened.
+fn open_worktree(
+    db: &Db,
+    id: ItemId,
+    root: &Path,
+    worktree: &Path,
+    branch: &str,
+    onto: &str,
+) -> Result<base::Freshness> {
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    anyhow::ensure!(
+        !worktree.exists(),
+        "{} exists but git does not know it as a worktree — remove it, or run \
+         `git worktree prune`",
+        worktree.display()
+    );
+    match gitrepo::worktree_add(root, worktree, branch, onto) {
+        Ok(true) => Ok(base::Freshness::JustCreated),
+        Ok(false) => Ok(base::Freshness::Unknown),
+        Err(e) => {
+            let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
+            Err(e)
+        }
+    }
 }
 
 /// Decide which branch this session's work will land on (design D36.3).
@@ -5067,11 +5144,18 @@ fn land_preflight(
     // it is the authority for, so the In Flight row and `land` explained the same task
     // differently.
     let sess = session_for(ctx, tags)?;
-    let branch = sess
-        .as_ref()
-        .map(|s| s.branch.clone())
-        .or_else(|| repo::facet_one(tags, repo::FACET_BRANCH).cloned())
-        .context("this task records no branch")?;
+    // Which branch the work is on, through the rule the In Flight row uses. Sharing the existence
+    // *predicate* was not enough: the row preferred a recorded branch that resolves while this
+    // took whichever came first, so the one shared blocker explained the same task two opposite
+    // ways — and this side's advice, `jkb task work`, cuts a second branch and detaches the task
+    // from its batch.
+    let refs = gitrepo::branch_refs(&ctx.root)?;
+    let branch = repo::work_branch(
+        sess.as_ref().map(|s| s.branch.as_str()),
+        repo::facet_values(tags, repo::FACET_BRANCH),
+        &refs,
+    )
+    .context("this task records no branch")?;
     let onto = repo::facet_one(tags, repo::FACET_ONTO)
         .cloned()
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
@@ -5100,8 +5184,8 @@ fn land_preflight(
     // was abandoned and told the owner to open a new session, which detaches it from its group.
     // The resolved ref is also what the count is taken with — a bare remote-only name resolves to
     // nothing, and `ahead_count` refuses rather than answering zero.
-    let work_ref = gitrepo::branch_ref(&ctx.root, &branch, gitrepo::Prefer::Local)?;
-    let ahead = match &work_ref {
+    let work_ref = refs.get(&branch);
+    let ahead = match work_ref {
         Some(reference) => gitrepo::ahead_count(&ctx.root, &onto, reference)?,
         None => 0,
     };
@@ -5632,9 +5716,12 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
             Some(o) => gitrepo::branch_ref(&ctx.root, o, gitrepo::Prefer::Local)?,
             None => None,
         };
+        // `None`, never `0`: a recorded land target that no longer exists makes the count
+        // unknowable, and zero already means "nothing to land" to every other reader. This is the
+        // fourth call site of `ahead_count` and the last one still folding the two together.
         let ahead = match &onto_ref {
-            Some(reference) => gitrepo::ahead_count(&ctx.root, reference, &s.branch)?,
-            None => 0,
+            Some(reference) => Some(gitrepo::ahead_count(&ctx.root, reference, &s.branch)?),
+            None => None,
         };
         // Deliberately no "attended" flag: nothing here can observe whether anyone is sitting
         // in a session. The owner's pid belongs to the one-second `jkb task work` process, so
@@ -5664,12 +5751,15 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
             } else {
                 ""
             };
+            let commits = match r["commits"].as_u64() {
+                Some(n) => format!("{n} commit(s)"),
+                None => "commits unknown (its land target is gone)".to_owned(),
+            };
             println!(
-                "{:<28} {} → {}  {} commit(s){dirty}",
+                "{:<28} {} → {}  {commits}{dirty}",
                 r["session"].as_str().unwrap_or("?"),
                 r["branch"].as_str().unwrap_or("?"),
                 r["onto"].as_str().unwrap_or("?"),
-                r["commits"],
             );
             if let Some(uid) = r["uid"].as_str() {
                 println!("  {uid} ({})", r["status"].as_str().unwrap_or("?"));

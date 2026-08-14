@@ -99,11 +99,31 @@ pub(crate) fn clear_facet(
 /// There is deliberately no cut-point field. It used to ride along as a value the caller had
 /// computed, and three callers grew three theories of what it was; [`crate::base::ensure_recorded`]
 /// measures it instead, so there is nothing to pass and nothing to get wrong.
-#[derive(Default)]
 pub(crate) struct Location<'a> {
     pub(crate) branch: Option<&'a str>,
     pub(crate) repo: Option<&'a str>,
     pub(crate) onto: Option<&'a str>,
+    /// The branch `branch` was **cut from**, for measuring the cut point. Usually the same as
+    /// `onto`, and deliberately a separate field because the two come apart at trunk: a branch cut
+    /// from trunk has a perfectly good measurement reference and must not record trunk as a land
+    /// target, or it reads as merged the moment anything lands (D34.3). `None` falls back to
+    /// `onto`, so the ordinary caller states it once.
+    pub(crate) cut_from: Option<&'a str>,
+    /// Whether the caller created `branch` in this operation. `jkb task work` knows, because
+    /// `worktree_add` tells it; nobody else does. See [`crate::base::ensure_recorded`].
+    pub(crate) freshness: crate::base::Freshness,
+}
+
+impl Default for Location<'_> {
+    fn default() -> Self {
+        Self {
+            branch: None,
+            repo: None,
+            onto: None,
+            cut_from: None,
+            freshness: crate::base::Freshness::Unknown,
+        }
+    }
 }
 
 /// Whether a branch value joins the ones a task already records, or replaces them.
@@ -136,6 +156,7 @@ pub(crate) enum BranchWrite {
 ///
 /// # Errors
 /// Returns an error if the name is not usable as a git ref, or a tag read or write fails.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_branch(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
@@ -144,17 +165,46 @@ pub(crate) fn record_branch(
     branch: &str,
     onto: Option<&str>,
     how: BranchWrite,
+    freshness: crate::base::Freshness,
 ) -> jkb_core::Result<()> {
     // Refuse a name git would read as an option **before it is stored**. A hostile value entered
     // the store cleanly and then poisoned every later reader — and a reader that refuses is a whole
     // `close-merged` run failing on one bad row. The store is the boundary worth defending;
     // `gitrepo::valid_ref` at the git call is the backstop for values that predate this.
     crate::gitrepo::valid_ref(branch).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    crate::base::ensure_recorded(conn, meta, id, repo_root, branch, onto)?;
+    crate::base::ensure_recorded(conn, meta, id, repo_root, branch, onto, freshness)?;
     match how {
         BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch),
         BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch),
     }
+}
+
+/// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
+/// row and `jkb task land`.
+///
+/// Both had already been given the same existence *predicate*, and still disagreed, because they
+/// chose which branch to ask about differently: the row preferred a recorded branch that resolves,
+/// the command took whichever `tag::applications` returned first (lexicographically smallest). A
+/// task carrying a stale `a-gone` beside a live `z-live` therefore got two opposite explanations
+/// from the one shared blocker — and `land`'s advice for the branch it picked is to run
+/// `jkb task work`, which cuts a *second* branch and detaches the task from its batch.
+///
+/// A live session wins outright: that is the branch with a checkout on disk, whatever the tags say
+/// (D36.2). Otherwise prefer one that exists, and fall back to the first recorded so a task whose
+/// branches have all been deleted still names one to report about.
+pub(crate) fn work_branch(
+    session: Option<&str>,
+    branches: &[String],
+    refs: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(s) = session {
+        return Some(s.to_owned());
+    }
+    branches
+        .iter()
+        .find(|b| refs.contains_key(*b))
+        .or_else(|| branches.first())
+        .cloned()
 }
 
 /// The repository a cut point for this task may honestly be measured in, or `None`.
@@ -220,8 +270,9 @@ pub(crate) fn set_location_facets(
             id,
             repo_root,
             branch,
-            loc.onto,
+            loc.cut_from.or(loc.onto),
             BranchWrite::Set,
+            loc.freshness,
         )?;
     }
     for (facet, value) in [(FACET_REPO, loc.repo), (FACET_ONTO, loc.onto)] {

@@ -341,13 +341,7 @@ fn stage_task(
 
     // The branch this task's work is on: its session's, or — for a swarm task, whose branch
     // is not a `.jkb/work` session — whichever `branch=` it recorded that still exists.
-    let work_branch = sess.map(|s| s.branch.clone()).or_else(|| {
-        branches
-            .iter()
-            .find(|b| existing.contains_key(*b))
-            .or_else(|| branches.first())
-            .cloned()
-    });
+    let work_branch = crate::repo::work_branch(sess.map(|s| s.branch.as_str()), branches, existing);
 
     // A terminal task is history: it is not landing, so its commit count cannot change what
     // the row says or what the gate would do, and counting it costs a `git rev-list` per row

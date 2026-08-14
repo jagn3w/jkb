@@ -100,7 +100,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **474 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **479 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -671,6 +671,28 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     value there is; using trunk alone there would be *less* conservative and would reopen the
     cut-from-staging bug (a branch cut from a staging branch is ahead of its merge-base with trunk
     before anything happens).
+    - A parent that **does not resolve** is therefore treated as no parent at all, not silently
+      dropped in favour of the trunk-only backstop. Dropping it looks harmless and is the one
+      direction that matters: for a branch cut from staging, a trunk-only merge-base sits behind
+      its real origin, which would make a mistyped `--onto` strictly worse than omitting one.
+    - `gitrepo::trunk` now **verifies its own answer resolves** on the `origin/HEAD` arm, which the
+      fallback arm always did. A dangling symref (default branch renamed, `origin/main` pruned) was
+      survivable while `ahead_count` quietly answered zero, and stopped being the moment it started
+      refusing — it took the whole of `staging ls`, and so both UI surfaces, down with it.
+  - **A branch is identified by name, and a name outlives the branch that held it.** Delete a
+    branch, cut a fresh one under the same name, and the old record still resolves and still
+    differs from the new tip — guard skipped, empty task closed. Nothing in git tells the two
+    apart, so the only reliable signal is the **moment of creation**: `worktree_add` returns
+    whether it created the branch, and `base::Freshness::JustCreated` makes `ensure_recorded`
+    forget first. That is the create-side half; `base::forget` at `abandon --delete-branch` is the
+    delete-side half. Between them they cover every branch jkb makes or destroys, which is why
+    neither is redundant — the residual gap is a branch both deleted *and* recreated outside jkb.
+  - **`--onto` names two things that only come apart at trunk**: the branch this one was **cut
+    from** (a measurement reference, `Location::cut_from`) and the branch it **lands on** (the
+    `onto=` facet). Trunk is a fine answer to the first and an unacceptable one to the second
+    (D34.3), so it is measured against and not recorded. Refusing the flag outright left a branch
+    genuinely cut from trunk, with commits already on it, able to record only `base == tip` —
+    permanently `NothingToMerge` — with a hand-computed merge-base as the only way out.
   - **So `/task-swarm` computes nothing: it runs `jkb task start --branch <group> --onto
     <integration>`.** One command for `branch=`/`repo=`/`onto=`/the cut point, idempotent under the
     run's own claim, and no value it could get wrong — it states the branch it *told the implementer
@@ -718,6 +740,13 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   stayed green with *either* one disabled. A redundant guard that reads as protection is worse than
   none. `land_dir_for` keeps a dirty check of its own: that one guards the `git switch` it is about
   to perform across branches, with its own remedy, and is not a second copy of the land rule.
+- **Which recorded branch a task's work is on is one rule** (`repo::work_branch`), shared by the In
+  Flight row and `jkb task land`. Sharing the existence *predicate* was not enough: the row
+  preferred a branch that resolves while the command took whichever `tag::applications` returned
+  first — the lexicographically smallest — so a task carrying a stale `a-gone` beside a live
+  `z-live` got two opposite explanations from the one shared blocker, and the command's advice for
+  the branch it picked (`jkb task work`) cuts a *second* branch and detaches the task from its
+  batch. A live session still wins outright: it is the branch with a checkout on disk.
 - `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
   algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
   directly and it must work in any repo.

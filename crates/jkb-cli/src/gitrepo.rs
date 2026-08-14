@@ -97,6 +97,13 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>> {
 /// whose default is `master` or `develop` must not be silently measured against a `main`
 /// that does not exist, because "no such ref" and "nothing merged" would look identical.
 ///
+/// **Whatever comes back resolves here.** `origin/HEAD` is a symbolic ref and can dangle — the
+/// remote's default branch renamed, or `origin/main` pruned — and it was the one arm that took its
+/// answer on trust while the fallback arm verified. A trunk that does not resolve used to make
+/// `ahead_count` quietly answer zero; it now refuses, which turned `jkb staging ls` from a listing
+/// into a hard error in exactly that repo. Callers are entitled to assume this ref works, and
+/// `base::measure_git` says so in as many words.
+///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
 pub fn trunk(dir: &Path) -> Result<Option<String>> {
@@ -111,24 +118,15 @@ pub fn trunk(dir: &Path) -> Result<Option<String>> {
         ],
     )? {
         if let Some((_, branch)) = sym.split_once('/') {
-            if !branch.is_empty() {
-                return Ok(Some(format!("origin/{branch}")));
+            let reference = format!("origin/{branch}");
+            if !branch.is_empty() && exists(dir, &reference)? {
+                return Ok(Some(reference));
             }
         }
     }
     for candidate in DEFAULT_TRUNKS {
         for reference in [format!("origin/{candidate}"), (*candidate).to_owned()] {
-            if git(
-                dir,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("{reference}^{{commit}}"),
-                ],
-            )?
-            .is_some_and(|s| !s.is_empty())
-            {
+            if exists(dir, &reference)? {
                 return Ok(Some(reference));
             }
         }
@@ -269,11 +267,16 @@ pub fn prune_worktrees(dir: &Path) -> Result<()> {
 }
 
 /// Add a worktree at `path` checked out to `branch`, creating that branch from `start` when
-/// it does not exist yet.
+/// it does not exist yet. Returns whether the branch was **created** rather than re-attached.
+///
+/// That answer is load-bearing, not incidental: a branch created here is a *new* branch, so any
+/// cut point the caller has recorded under this name describes the one it replaced. Discarding
+/// this signal is what let a stale record survive `git branch -D` plus a fresh `jkb task work`
+/// and close a task with nothing written on it.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the worktree.
-pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
+pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<bool> {
     valid_ref(branch)?;
     valid_ref(start)?;
     let path_s = path.to_string_lossy().into_owned();
@@ -281,9 +284,9 @@ pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Resul
     // re-cut from `start`: the `-b` fallback this replaced had the same blind spot as every other
     // bare `has_branch`, and here it would silently start a session over on top of commits that
     // had already been pushed.
-    ensure_branch(dir, branch, start)?;
+    let created = ensure_branch(dir, branch, start)?;
     git_must(dir, &["worktree", "add", &path_s, branch])?;
-    Ok(())
+    Ok(created)
 }
 
 /// Remove the worktree at `path` and prune the administrative entry. `force` discards
@@ -727,15 +730,16 @@ pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<Str
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the branch.
-pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<()> {
+/// Returns whether the branch was **created here** rather than already existing — the caller's
+/// only way to know that any record it holds under this name describes a *different* branch.
+pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
     // Composed from [`adopt_remote`] rather than repeating its logic: two functions that both
     // knew how to prefer a remote copy is the overlap that once made `create_branch` silently
     // ignore its own `start` argument.
     if adopt_remote(dir, branch)? {
-        return Ok(());
+        return Ok(false);
     }
-    create_branch(dir, branch, start)?;
-    Ok(())
+    create_branch(dir, branch, start)
 }
 
 /// Create the local `branch` from its remote-tracking copy when that is the only place it

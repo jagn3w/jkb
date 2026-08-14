@@ -1465,8 +1465,18 @@ fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
 fn a_cut_point_git_cannot_resolve_case(fake: &str) {
     let f = Fixture::new();
     let uid = f.add_task(&format!("bogus base task #base={fake}"));
-    let s = f.work(&uid);
-    let branch = s["branch"].as_str().unwrap().to_owned();
+    // Registered against a branch that **already exists**, via `task start`, so the planted value
+    // reaches the reader. `task work` would have *created* the branch, and a branch created now
+    // cannot be the one an existing record describes — so it is dropped and a real cut point
+    // measured, which is the rule
+    // `a_hand_deleted_branch_recut_by_task_work_does_not_inherit_its_cut_point` pins. Adoption is
+    // for a branch that was already there, which is what this exercises.
+    let branch = "feature".to_owned();
+    git(&f.repo, &["branch", &branch, "main"]);
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", &branch])
+        .assert()
+        .success();
 
     // Two rules, and which applies depends on the shape — asserting only one is what tied the
     // earlier versions of this test to a single path.
@@ -2883,4 +2893,244 @@ fn tagging_a_branch_does_not_measure_it_in_a_foreign_repo() {
         .success()
         .stdout(predicate::str::contains("branch=shared"))
         .stdout(predicate::str::contains("base=").not());
+}
+
+/// A branch deleted by hand and re-cut by `task work` does not inherit its predecessor's cut point.
+///
+/// A cut point is keyed by branch *name*, and a name outlives the branch that held it. `jkb task
+/// abandon` without `--delete-branch` prints "branch … kept — delete it with `git branch -D …`",
+/// so this is a route jkb's own advice sends people down: the record survives the deletion, the
+/// next `task work` re-cuts the name somewhere else, the stale value still resolves and still
+/// differs from the new tip, and the freshly-cut guard is skipped for a branch with nothing on it.
+///
+/// Nothing in git distinguishes the two branches, so the only reliable signal is the moment of
+/// creation — which `worktree_add` has and used to discard. `base::forget` covers the deletions
+/// jkb performs; this covers the creations, and between them every branch jkb makes or destroys.
+#[test]
+fn a_hand_deleted_branch_recut_by_task_work_does_not_inherit_its_cut_point() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "batch", "main"]);
+    let uid = f.add_task("re-cut by hand");
+    let s = f.work_onto(&uid, "batch");
+    let branch = s["branch"].as_str().unwrap().to_owned();
+
+    // Abandon WITHOUT --delete-branch, then follow the advice the command itself prints.
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    git(&f.repo, &["branch", "-D", &branch]);
+
+    // Everything moves on, so the stale record names a commit the re-cut branch is past.
+    commit_in(&f.repo, "trunk.txt", "moved\n", "trunk moves on");
+    git(&f.repo, &["branch", "-f", "batch", "main"]);
+
+    f.jkb()
+        .args(["task", "work", &uid, "--onto", "batch"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        git(&f.repo, &["rev-parse", "main"]),
+        "setup: the branch must be re-cut past its predecessor's cut point"
+    );
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "an empty re-cut branch closed as merged, inheriting the cut point of the branch that had \
+         its name before"
+    );
+}
+
+/// A parent branch that cannot be resolved is treated as no parent at all, never as trunk.
+///
+/// Dropping an unresolvable `--onto` and keeping the trunk backstop looks harmless and is the one
+/// direction that matters: for a branch cut from a *staging* branch, a trunk-only merge-base sits
+/// behind the branch's real origin, so a branch with no work of its own reads as having some and
+/// closes the moment staging lands. That would make a mistyped `--onto` strictly worse than
+/// omitting one — the opposite of the rule the measurement is built around.
+#[test]
+fn an_unresolvable_parent_branch_is_treated_as_no_parent_not_as_trunk() {
+    let f = Fixture::new();
+    // A staging branch ahead of trunk, and a branch cut from it carrying nothing of its own.
+    git(&f.repo, &["checkout", "-q", "-b", "stage"]);
+    commit_in(&f.repo, "s.txt", "staging\n", "staging work");
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "feature"]);
+
+    let uid = f.add_task("mistyped parent");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .args(["--onto", "stgae"]) // the typo
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+
+    // Staging lands, so `feature` is now contained in trunk while never having been worked.
+    git(&f.repo, &["merge", "-q", "--ff-only", "stage"]);
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "naming a parent that does not resolve was worse than naming none: the cut point fell \
+         back to a trunk-only merge-base behind the branch's real origin"
+    );
+}
+
+/// A dangling `origin/HEAD` must not take the whole staging listing down with it.
+///
+/// The remote's default branch gets renamed, or `origin/main` gets pruned, and `origin/HEAD` is
+/// left pointing at a ref that is not there. `gitrepo::trunk` took its own symref answer on trust
+/// while the fallback arm verified, which was survivable while `ahead_count` quietly answered zero
+/// — and stopped being survivable the moment it started refusing an operand it cannot resolve.
+/// `jkb staging ls` is the ONE read behind the branch picker and In Flight (D38.2), so an error
+/// there is both surfaces going dark.
+#[test]
+fn a_dangling_origin_head_does_not_break_the_staging_listing() {
+    let f = Fixture::new();
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+    git(
+        &f.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let uid = f.add_task("on a batch");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "a",
+    );
+
+    // The remote's default branch goes away; the symref stays and now points at nothing.
+    git(&f.repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+
+    let rows = f.staging(&[]);
+    assert!(
+        !rows.as_array().unwrap().is_empty(),
+        "a dangling origin/HEAD emptied the one read the picker and In Flight both use: {rows}"
+    );
+    let task = &rows[0]["tasks"][0];
+    assert_eq!(
+        task["commits"], 1,
+        "the session's own commits are measurable whatever trunk is doing: {rows}"
+    );
+}
+
+/// A branch cut from trunk can say so, and gets a usable cut point for it.
+///
+/// `--onto` names both the branch this one was cut from and the branch it lands on, and those come
+/// apart at trunk: trunk is a fine measurement reference and an unacceptable land target (D34.3).
+/// Refusing the flag outright left a branch genuinely cut from trunk, with commits already on it,
+/// able to record only `base == tip` — permanently `NothingToMerge` — with a hand-computed
+/// merge-base as the only escape.
+#[test]
+fn a_branch_cut_from_trunk_can_say_so_without_recording_trunk_as_a_land_target() {
+    let f = Fixture::new();
+    let fork = git(&f.repo, &["rev-parse", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "work done before registering");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("worked before registering");
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not recorded as a land target"));
+
+    let show = f
+        .jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success();
+    show.stdout(predicate::str::contains(format!("base=feature:{fork}")))
+        .stdout(predicate::str::contains("onto=").not());
+
+    // And the point of all that: the work is real, so once it lands the task closes.
+    git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "done",
+        "a branch cut from trunk with real work on it could not be given a usable cut point"
+    );
+}
+
+/// The row and the command must pick the *same* recorded branch to talk about.
+///
+/// They were given the same existence predicate and still disagreed, because they chose which
+/// branch to ask about differently: the row preferred one that resolves, the command took whichever
+/// `tag::applications` returned first — which is the lexicographically smallest. A task carrying a
+/// stale `a-gone` beside a live `z-live` therefore got two opposite explanations from the one
+/// shared blocker, and `land`'s advice for the branch it picked cuts a second branch and detaches
+/// the task from its batch.
+#[test]
+fn the_row_and_the_command_talk_about_the_same_branch() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "z-live", "integration"]);
+    commit_in(&f.repo, "z.txt", "z\n", "live work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("two recorded branches");
+    for tag in ["repo=proj", "onto=integration"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "set", &uid, tag])
+            .assert()
+            .success();
+    }
+    // A stale branch that sorts first, and the live one it must not be preferred over.
+    for b in ["branch=a-gone", "branch=z-live"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "add", &uid, b])
+            .assert()
+            .success();
+    }
+
+    let rows = f.staging(&[]);
+    let row = rows[0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["uid"] == serde_json::json!(uid))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        row["branch"],
+        serde_json::json!("z-live"),
+        "the row picked a branch that does not exist over one that does: {rows}"
+    );
+    let blocked = row["land_blocked"].as_str().unwrap_or_default().to_owned();
+
+    let out = f
+        .jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&blocked),
+        "the row and the command explained the same task differently.\n  row: {blocked}\n  cmd: {stderr}"
+    );
 }
