@@ -3596,3 +3596,50 @@ fn naming_a_branch_as_its_own_parent_records_nothing() {
         .success()
         .stdout(predicate::str::contains(format!("base=feature:{fork}")));
 }
+
+/// The invariant admits every legitimate repair and refuses the one dangerous value.
+///
+/// Enforcing "a branch with commits did not fork at its tip" inside `base::write` changes what
+/// `jkb task base` accepts, so the verb's whole point — correcting a wrong record by hand — has to
+/// still work. It does: any commit other than the tip is taken. Only the tip is refused, and that
+/// is the value nearest a user's hand (`git rev-parse <branch>`), which is why the check is here
+/// rather than trusting the message not to suggest it.
+#[test]
+fn the_repair_verb_still_repairs_and_refuses_only_the_tip() {
+    let f = Fixture::new();
+    let fork = git(&f.repo, &["rev-parse", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "feature"]);
+
+    let uid = f.add_task("repairable");
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success();
+    // A correction to a real commit is accepted.
+    f.jkb()
+        .args(["task", "base", &uid, "feature", &fork])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{fork}")));
+    // The tip is not.
+    f.jkb()
+        .args(["task", "base", &uid, "feature", &tip])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not where feature forked"));
+    // …and the refusal changed nothing.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{fork}")));
+}

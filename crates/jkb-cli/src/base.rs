@@ -664,11 +664,18 @@ pub(crate) fn write(
     // now stored a tip on a branch full of work, each by a different route. `record_if_absent`
     // consults the same predicate first so it can decline gracefully rather than error; this is
     // what makes sure it — and everything added later — cannot simply forget to.
-    if let Some(why) = rejected(repo_root, branch, sha)? {
+    if rejected(repo_root, branch, sha)?.is_some() {
+        // Worded for the surface that actually hits this — `jkb task base`, repairing a record by
+        // hand — rather than through `Missing::remedy`, which is written for the commands that
+        // *measure* and would tell someone already using the right verb to go and use another
+        // one. Which half of the rule was broken is derivable from the branch, so the message says
+        // both and lets the reader see which applies.
         return Err(jkb_types::Error::Validation(format!(
-            "`{sha}` cannot be {branch}'s cut point: {}. {}",
-            why.as_str(),
-            why.remedy("<uid>", branch, "its repo")
+            "`{sha}` is not where {branch} forked. A branch with commits of its own did not \
+             fork at its own tip — pass the fork point, e.g. `git merge-base <parent> \
+             {branch}` — and a branch with no commits of its own forked at exactly its tip, so \
+             that is the only value it can take. `jkb task start <uid> --branch {branch} --onto \
+             <parent>` works this out for you."
         ))
         .into());
     }
