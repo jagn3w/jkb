@@ -604,6 +604,14 @@ fn measure_git(
 ///
 /// `None` for `repo_root` means nothing can be verified here (see [`crate::repo::measure_root_for`]),
 /// and then nothing is: an unverifiable value is stored as given, exactly as it always was.
+///
+/// **Cost, accepted.** The same two git questions — does this branch exist, does it have commits
+/// of its own — are asked here, by the staleness check in [`ensure_recorded`], and inside
+/// [`measure`]: roughly a dozen short-lived `git` processes on the writer thread for one
+/// `jkb task work`. Threading a precomputed answer between them was the obvious economy and is
+/// deliberately not taken: carrying derived state between these three is exactly how the
+/// created-ness flag went wrong, and this runs on three interactive commands rather than in any
+/// loop. Measure before trading that back.
 fn rejected(
     repo_root: Option<&std::path::Path>,
     branch: &str,
