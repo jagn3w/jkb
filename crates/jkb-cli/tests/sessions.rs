@@ -3458,3 +3458,55 @@ fn quick_add_pairs_a_branch_with_its_cut_point_like_every_other_writer() {
         .stdout(predicate::str::contains("branch=planned"))
         .stdout(predicate::str::contains(format!("base=planned:{tip}")));
 }
+
+/// A branch whose work has been merged away is **held**, never closed on a re-measured tip.
+///
+/// The staleness check treats "no commits of its own" as evidence a recorded cut point belongs to
+/// whatever had the branch name before. That is also true of a branch whose commits were
+/// fast-forwarded into its batch or carried into trunk by a merge commit, and git cannot tell the
+/// two apart — so re-running a facet writer after that point discards the correct fork point and
+/// records the tip.
+///
+/// This pins the *direction* of that known false positive rather than the behaviour that produces
+/// it: the task must end up held. Held costs one command; the alternative for a recycled name is a
+/// false close, which buries work (D34.4). A future change that makes this case close again would
+/// be choosing the other direction, and should have to delete this test to do it.
+#[test]
+fn a_branch_whose_work_was_merged_away_is_held_never_closed() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "batch", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature", "batch"]);
+    commit_in(&f.repo, "w.txt", "work\n", "real work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("work that lands by fast-forward");
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "batch",
+        ])
+        .assert()
+        .success();
+
+    // The batch fast-forwards onto the branch's own commits, then trunk takes the batch — so the
+    // branch has no unique commit left anywhere.
+    git(&f.repo, &["checkout", "-q", "batch"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "batch"]);
+
+    // Anything that re-runs the writer now re-measures against a branch that looks untouched.
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "batch",
+        ])
+        .assert()
+        .success();
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "the accepted direction is a MISSED close here, because the same git facts describe a \
+         recycled branch name, where closing would bury work"
+    );
+}

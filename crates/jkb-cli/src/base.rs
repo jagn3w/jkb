@@ -297,6 +297,18 @@ pub(crate) fn ensure_recorded(
     // Nothing else needs checking, because a stale record can only do harm in this one case: with
     // commits of its own, the branch's mergedness is decided by `merge-tree` on content and the
     // recorded value is not consulted beyond being unequal to the tip.
+    //
+    // **The known false positive, and why it is the accepted direction.** "No commits of its own"
+    // is also true of a branch whose work has been *merged away* — fast-forwarded into its batch,
+    // or carried into trunk by a merge commit. Git cannot distinguish that from a recycled name:
+    // both are a branch with no unique commits and a record that is not its tip. So this discards
+    // a correct fork point in that case, re-measures, and records the tip — after which the task
+    // is **held** rather than auto-closed. That is a missed close, which costs one command; the
+    // alternative (not discarding) is a *false* close on a recycled name, which buries work
+    // (D34.4). Squash and rebase merges rewrite the shas, so the branch keeps unique commits and
+    // is unaffected — and `/task-swarm` records before its merge queue runs, never after. Pinned
+    // by `a_branch_whose_work_was_merged_away_is_held_never_closed`, so that this is not
+    // "corrected" into the unsafe direction.
     if let Some(recorded) = qualified(&tags, branch) {
         let stale = match untouched_tip(root, branch)? {
             Some(tip) => tip != recorded,
