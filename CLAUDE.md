@@ -100,7 +100,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **481 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **486 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -638,6 +638,13 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     start` compared the repo it was about to record, and `task tag set branch=` never asked — and
     the one that never asked is what let a sibling checkout's namesake branch be recorded as a
     task's verified cut point.
+  - **`--onto` names two things, and they come apart only at trunk**: the branch this one was
+    **cut from** (`Location::cut_from`, the measurement parent) and the branch it **lands on** (the
+    `onto=` facet). Trunk is a fine answer to the first and unacceptable as the second, so it is
+    measured against and not recorded — and a land target left from an earlier batch is cleared,
+    since the branch is no longer on one. A named parent that this repository does not have is
+    **refused**: storing it drops the task out of `jkb staging ls` and makes `task land` fail later
+    claiming a branch "no longer exists", which is not what happened.
   - **`jkb task base <uid> <branch> <sha>`** is the only writer a user reaches by hand;
     `jkb task tag add|set base=…` **refuses** and names it (`rm` still works — deleting a wrong
     record leaves the branch with none, which both readers read as "do not act"). A *workflow*
@@ -661,6 +668,29 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     trunk skips the freshly-cut guard and closes as merged. Naming the parent branch is not the
     kind of judgement that went wrong four times; **computing a commit id** was, and callers still
     cannot do that.
+  - **The tip is a measurement result under exactly one condition, and never a fallback.** A branch
+    with no commits of its own forked at its own tip, provably — that is the only case where the
+    tip is recorded. Everywhere else a failed measurement records **nothing** and says why
+    (`base::Missing`, surfaced as `base_missing_because` and as `close-merged`'s `undecidable`
+    bucket). Both read as "do not act", but nothing is *reported* and *repairable* by the next run
+    that can measure, while a tip is silent and permanent, since `ensure_recorded` never
+    overwrites. Three fallbacks here used to return the tip, and once the untouched case was
+    hoisted above them each was reachable **only** when the branch had work — that is, only where
+    the tip was the worst answer available. **No message anywhere may suggest passing a sha by
+    hand**, for the same reason: the sha nearest to hand is the branch tip.
+  - **"Has this branch done anything?" is asked of git, not inferred** (`gitrepo::has_own_commits`
+    — is any commit here reachable from no other branch, under `refs/heads` or *any* remote). It
+    needs no reference point, which is what makes a stale, wrong, unresolvable or *grandparent*
+    parent unable to change the one thing readers ask of the record. Its failure mode is safe by
+    construction: a mis-exclusion makes the branch look untouched, which records the tip only where
+    the tip is right and otherwise records nothing.
+  - **A record that cannot describe this branch is discarded before it blocks a measurement.** A
+    cut point is keyed by branch *name*, and a name outlives the branch that held it. No git fact
+    separates the old branch from the new one — but an untouched branch forked at its tip, so a
+    recorded value that is anything else on a branch with no commits of its own belongs to whatever
+    had the name before. That check needs nothing threaded from the caller; its predecessor was a
+    created-ness flag out of `worktree_add` that `jkb task start` could not supply and a crash
+    between the git write and the database write silently lost.
   - **And a caller can still name the wrong branch, so trunk is the backstop.** The fork point is
     the later of `merge-base(branch, onto)` and `merge-base(branch, trunk)` — commits reachable
     from trunk are not this branch's doing either. Taking the later can only move the fork point

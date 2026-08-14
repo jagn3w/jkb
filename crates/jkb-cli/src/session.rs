@@ -260,7 +260,16 @@ impl LandLock {
                          so its gate result stays meaningful; wait for it to finish",
                         holder.trim()
                     );
-                    let _ = fs::remove_file(&path);
+                    // Remove the stale lock only while it is still the one we judged. Two lands
+                    // seeing the same dead pid both reached this line, and an unconditional
+                    // unlink let the second delete the lock the FIRST had just created — leaving
+                    // both believing they held it, which is the one thing this file exists to
+                    // prevent. Re-reading narrows that to the instant between this check and the
+                    // unlink; it cannot close it without a real file lock, and the honest note is
+                    // that landing is serialised against ordinary use, not against a race.
+                    if fs::read_to_string(&path).unwrap_or_default() == holder {
+                        let _ = fs::remove_file(&path);
+                    }
                 }
                 Err(e) => return Err(e).context("taking the land lock"),
             }

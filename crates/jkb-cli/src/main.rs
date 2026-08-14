@@ -3983,16 +3983,32 @@ fn cmd_task_add(
 ) -> Result<()> {
     let input = text.join(" ");
     let qa = task::parse_quick_add(&input)?;
-    // The ref-shaped facets reach `tag::apply` from here without passing the check
-    // `repo::record_branch` and `cmd_task_tag` apply, so this was the one way a value git reads as
-    // an option could still enter the store — `#branch=--upload-pack=x`. One such row used to
-    // abort a whole `close-merged` run (that is now per-row too, but the value should not be
-    // stored in the first place: the store is the boundary worth defending).
+    // `#branch=` and `#onto=` reach `tag::apply` from here, below the checks the other writers
+    // apply, so this was the one route by which a value git reads as an option could still enter
+    // the store — `#branch=--upload-pack=x`.
+    let mut qa = qa;
     for (facet, value) in &qa.tags {
         if matches!(facet.as_str(), repo::FACET_BRANCH | repo::FACET_ONTO) {
             gitrepo::valid_ref(value)?;
         }
     }
+    // `branch=` is lifted out of the quick-add tags and applied afterwards through
+    // `repo::record_branch`, which is what pairs a branch with its cut point. Left here it went
+    // straight to `tag::apply`, so this entry point silently opted out of the pairing CLAUDE.md
+    // calls the architecture of this area.
+    //
+    // The `retain` is routing, not a guard: `tag::apply` is idempotent on `(item, facet, value)`,
+    // so leaving the tag in place would write the same row and change nothing observable. What it
+    // buys is that "`record_branch` is the only writer of `branch=`" is *literally* true — a claim
+    // the module doc makes and the next person will rely on. The cut point is recorded by the call
+    // below either way, and that is the part with a test.
+    let quick_add_branches: Vec<String> = qa
+        .tags
+        .iter()
+        .filter(|(f, _)| f == repo::FACET_BRANCH)
+        .map(|(_, v)| v.clone())
+        .collect();
+    qa.tags.retain(|(f, _)| f != repo::FACET_BRANCH);
     let mut had_explicit_placement = !qa.placements.is_empty();
     let uid = task::mint_uid(&qa.title);
     let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
@@ -4031,6 +4047,26 @@ fn cmd_task_add(
         }
         Ok(id)
     })?;
+    // Any `#branch=` from the quick-add line, applied through the one writer that pairs a branch
+    // with its cut point. A second transaction rather than a field on `NewTask`, because the
+    // measurement needs the task's `repo=` — which `task::create` has only just written.
+    if !quick_add_branches.is_empty() {
+        let root = repo::measure_root_for(db, id, None)?;
+        db.write_txn("cli", move |conn, meta| {
+            for branch in &quick_add_branches {
+                repo::record_branch(
+                    conn,
+                    meta,
+                    id,
+                    root.as_deref(),
+                    branch,
+                    None,
+                    repo::BranchWrite::Add,
+                )?;
+            }
+            Ok(())
+        })?;
+    }
     if json {
         println!(
             "{}",
@@ -4311,15 +4347,26 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     // beside it. Every `repo=`-keyed surface (`staging ls`, In Flight, `task sessions`,
     // `batch_onto`, `task review record`) then stopped seeing the task, and `review record`
     // matching nothing is indistinguishable from a review that was never run.
+    //
+    // Resolved **once**. It was built three times here, each discarding the `trunk` it had just
+    // spawned git to find, and two of those sat inside the write transaction — which holds the
+    // single writer thread while git runs.
+    let here = repo::repo_ctx().ok();
     let repo = match repo {
         Some(r) => r,
-        None => {
-            repo::repo_ctx()
-                .context("not inside a git repo — pass --repo, or run this from the repo")?
-                .key
-        }
+        None => here
+            .as_ref()
+            .context("not inside a git repo — pass --repo, or run this from the repo")?
+            .key
+            .clone(),
     };
-    let land_target = land_target_for(&cwd, &branch, onto.as_deref(), json)?;
+    // Only *this* repo's rules may be applied to the branch, so a `--repo <other>` run skips them
+    // rather than judging one repo's branch by another's trunk.
+    let ours = here.as_ref().filter(|c| c.key == repo);
+    let Land {
+        target: land_target,
+        dropped_trunk,
+    } = land_target_for(ours, &branch, onto.as_deref())?;
 
     let id = resolve_task_uid(db, uid)?;
     // The one answer to "may a cut point be measured here" (`repo::measure_root_for`), shared with
@@ -4332,6 +4379,10 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
     // The parent for the measurement is what the caller said; the land target is that minus trunk.
     let (measure_against, n) = (onto.clone(), land_target.clone());
+    // Naming trunk as the parent says this branch is NOT on a batch, so a land target left from an
+    // earlier one is now false — and left in place it keeps the task in `staging ls` under a batch
+    // it was never cut from, and keeps that batch reading as live work.
+    let clear_onto = dropped_trunk;
     // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
     // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
     // answer as a refusal meant `task start` refused its own second run under a new pid, and
@@ -4358,7 +4409,7 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     }
     let displaced = held.clone();
     let measure_root = measure_in.clone();
-    db.write_txn("cli", move |conn, meta| {
+    let missing = db.write_txn("cli", move |conn, meta| {
         // The CAS answer is checked rather than discarded: losing it means someone claimed the
         // task between the probe and here, and reporting "started" while writing this session's
         // branch onto their task is exactly the confusion the liveness guard above prevents.
@@ -4373,7 +4424,7 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
         // Through the one location-facet writer, exactly as `task work` does. These were
         // additive here, so `task work` followed by `task start` — which the guide encourages
         // — left the task carrying two `branch=` values for one worktree.
-        repo::set_location_facets(
+        let missing = repo::set_location_facets(
             conn,
             meta,
             id,
@@ -4383,12 +4434,12 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
                 repo: Some(&r),
                 onto: n.as_deref(),
                 cut_from: measure_against.as_deref(),
-                // `task start` does not create the branch, so it cannot know. An existing record
-                // stands, which is the conservative direction.
-                ..repo::Location::default()
             },
         )?;
-        Ok(())
+        if clear_onto {
+            repo::clear_facet(conn, meta, id, repo::FACET_ONTO)?;
+        }
+        Ok(missing)
     })?;
     report_started(
         db,
@@ -4398,7 +4449,8 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
             branch: &branch,
             repo: &repo,
             owner: &owner,
-            measured_here: measure_in.is_some(),
+            missing,
+            dropped_trunk,
         },
         json,
     )
@@ -4410,9 +4462,12 @@ struct Started<'a> {
     branch: &'a str,
     repo: &'a str,
     owner: &'a str,
-    /// Whether a cut point could be measured at all here — which is a different fact from whether
-    /// one ended up recorded, and the two have different remedies.
-    measured_here: bool,
+    /// Why no cut point was recorded, straight from the writer that decided. Re-deriving it here
+    /// from "were we in the right repo?" reported a missing branch when the real reason was that
+    /// no parent had been named — a different problem with a different remedy.
+    missing: Option<base::Missing>,
+    /// `--onto` named trunk: measured against, deliberately not recorded as a land target.
+    dropped_trunk: bool,
 }
 
 /// Report a `task start`, on **both** output paths.
@@ -4426,7 +4481,8 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
         branch,
         repo,
         owner,
-        measured_here,
+        missing,
+        dropped_trunk,
     } = *s;
     let recorded = base::recorded_for(db, id, branch)?;
     if json {
@@ -4438,37 +4494,37 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
                 "repo": repo,
                 "owner": owner,
                 "base": recorded,
-                // Why there is no cut point, when there is none. A consumer cannot otherwise tell
-                // "wait for the branch to exist" from "run this in the task's own repo", and the
-                // two have different remedies. Null when one was recorded.
-                "base_missing_because": match (&recorded, measured_here) {
-                    (Some(_), _) => None,
-                    (None, true) => Some("branch-does-not-exist-here"),
-                    (None, false) => Some("not-this-repos-checkout"),
-                },
+                // Why there is no cut point, when there is none — the writer's own reason. A
+                // consumer cannot otherwise tell "wait for the branch to exist" from "name the
+                // parent" from "run this in the task's own repo", and each has its own remedy.
+                "base_missing_because": recorded.is_none()
+                    .then(|| missing.map(base::Missing::as_str)).flatten(),
+                // A dropped land target is a thing that HAPPENED, so it is on both paths. The
+                // human note alone left a `--json` consumer unable to tell "trunk was named and
+                // dropped" from "no target was ever given".
+                "onto_dropped_trunk": dropped_trunk,
             })
         );
         return Ok(());
     }
     println!("started {uid} on {repo}@{branch} (owner {owner})");
-    // Say it when there is no cut point, rather than leaving it to be discovered by a
-    // `close-merged` that quietly declines to act. Both reasons are named, because they have
-    // different remedies: one is waited out, the other is run from somewhere else.
-    if recorded.is_none() {
-        let why = if measured_here {
-            format!("{branch} does not exist here")
-        } else {
-            format!("this is not {repo}'s checkout, so nothing here could measure {branch}")
-        };
-        // The remedy is to run this command again, not to hand-compute a commit id. Naming
-        // `jkb task base <uid> <branch> <sha>` here was actively harmful: the sha nearest to hand
-        // once the branch exists is its tip, which records `base == tip` — permanently
-        // `NothingToMerge`, never creditable, never landable. Re-running `task start` measures it
-        // correctly at any point and is idempotent, since an existing record is never overwritten.
+    if dropped_trunk {
         println!(
-            "  note: {why}, so no cut point was recorded and this task will not auto-close. \
-             Run this again from {repo} once it does; `jkb task base` is for repairing a wrong \
-             record, and passing the branch tip by hand is how a task becomes unlandable."
+            "  note: {branch} was cut from trunk, so that is what its cut point is measured \
+             against — but trunk is not recorded as a land target, or the task would read as \
+             merged the moment anything landed. Any earlier land target was cleared."
+        );
+    }
+    // Said here rather than left to a `close-merged` that quietly declines to act — and the
+    // reason comes from the writer, which is the only thing that knows which of the four it was.
+    //
+    // No remedy here ever names a hand-typed sha. The sha nearest to hand is the branch tip, and
+    // a cut point equal to the tip reads as "nothing has happened here" forever: never creditable,
+    // never landable, and never corrected, because `ensure_recorded` does not overwrite.
+    if let (None, Some(why)) = (&recorded, missing) {
+        println!(
+            "  note: no cut point was recorded, so this task will not auto-close — {}.",
+            why.remedy(uid, branch, repo)
         );
     }
     Ok(())
@@ -4488,34 +4544,58 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
 ///
 /// The work branch itself may never be trunk: `branch=main` closes the task the instant anything
 /// merges, since trunk is trivially merged into itself.
-fn land_target_for(
-    cwd: &Path,
-    branch: &str,
-    onto: Option<&str>,
-    json: bool,
-) -> Result<Option<String>> {
-    let Some(t) = gitrepo::trunk(cwd)? else {
-        return Ok(onto.map(str::to_owned));
+fn land_target_for(ctx: Option<&repo::RepoCtx>, branch: &str, onto: Option<&str>) -> Result<Land> {
+    let Some(ctx) = ctx else {
+        // Not in the task's repository, so neither the trunk rule nor the existence check can be
+        // applied. Nothing is measured there either (`measure_root_for`), so the caller's word is
+        // taken for the facet and the cut point is simply not recorded.
+        return Ok(Land {
+            target: onto.map(str::to_owned),
+            dropped_trunk: false,
+        });
     };
-    let trunk_name = t.rsplit('/').next().unwrap_or(&t);
-    anyhow::ensure!(
-        branch != trunk_name,
-        "`{branch}` is this repo's trunk — start work on a feature branch, or the task would \
-         auto-close immediately"
-    );
-    // Against the trunk *ref* as well as its short name: `--onto origin/main` slipped past a
-    // short-name-only check and was stored as a land target.
-    if onto.is_some_and(|o| o == trunk_name || o == t) {
-        if !json {
-            println!(
-                "note: {branch} was cut from {trunk_name}, so that is what its cut point is \
-                 measured against — but trunk is not recorded as a land target, or the task would \
-                 read as merged the moment anything landed."
-            );
+    if let Some(trunk_name) = ctx.trunk_name() {
+        anyhow::ensure!(
+            branch != trunk_name,
+            "`{branch}` is this repo's trunk — start work on a feature branch, or the task would \
+             auto-close immediately"
+        );
+        // Against the trunk *ref* as well as its short name: `--onto origin/main` slipped past a
+        // short-name-only check and was stored as a land target.
+        let trunk_ref = ctx.trunk.as_deref().unwrap_or(trunk_name);
+        if onto.is_some_and(|o| o == trunk_name || o == trunk_ref) {
+            return Ok(Land {
+                target: None,
+                dropped_trunk: true,
+            });
         }
-        return Ok(None);
     }
-    Ok(onto.map(str::to_owned))
+    // A land target this repository does not have is refused rather than stored. Storing it took
+    // the task out of `jkb staging ls` — the one read behind the picker and In Flight — and made
+    // `task land` fail later claiming the branch "no longer exists", which is not what happened.
+    // `task work --onto` may name a branch that does not exist yet because it *creates* it; this
+    // verb only records, so there is nothing here to make the name true.
+    if let Some(onto) = onto {
+        anyhow::ensure!(
+            gitrepo::branch_ref(&ctx.root, onto, gitrepo::Prefer::Local)?.is_some(),
+            "`{onto}` is not a branch in {} — a land target has to exist, or the task drops out \
+             of `jkb staging ls` and `jkb task land` fails on it later. Create it first, or name \
+             the branch {branch} was really cut from.",
+            ctx.key
+        );
+    }
+    Ok(Land {
+        target: onto.map(str::to_owned),
+        dropped_trunk: false,
+    })
+}
+
+/// What `--onto` resolved to: the land target to record, and whether trunk was dropped as one.
+struct Land {
+    target: Option<String>,
+    /// Trunk was named, so it is measured against but not recorded. Reported on **both** output
+    /// paths — a `--json` consumer could not otherwise tell a dropped target from one never given.
+    dropped_trunk: bool,
 }
 
 /// `task base <uid> <branch> <sha>` — record where a branch was cut (design D34.2).
@@ -4623,23 +4703,36 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
             TagMode::Add => repo::BranchWrite::Add,
             _ => repo::BranchWrite::Set,
         };
-        let value = value.to_owned();
-        db.write_txn("cli", move |conn, meta| {
-            // No `onto`: this verb states no parent branch, so the cut point falls back to the
-            // branch's own tip — the conservative answer, which holds rather than closes.
-            repo::record_branch(
-                conn,
-                meta,
-                id,
-                root.as_deref(),
-                &value,
-                None,
-                how,
-                // This verb does not create the branch, so it cannot know whether the name is
-                // new. An existing record stands, which is the conservative direction.
-                base::Freshness::Unknown,
-            )
+        let branch = value.to_owned();
+        // No `onto`: this verb states no parent. For an untouched branch that is still measurable
+        // (its tip is its fork point); for one with commits it is not, and nothing is recorded —
+        // which is said out loud rather than papered over with the tip.
+        let missing = db.write_txn("cli", {
+            let branch = branch.clone();
+            move |conn, meta| {
+                repo::record_branch(conn, meta, id, root.as_deref(), &branch, None, how)
+            }
         })?;
+        if let Some(why) = missing {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "uid": uid, "tagged": true, "base": None::<String>,
+                        "base_missing_because": why.as_str(),
+                    })
+                );
+                return Ok(());
+            }
+            let repo_key = repo::repo_ctx().map_or_else(|_| "its repo".to_owned(), |c| c.key);
+            println!("tagged: {uid}");
+            println!(
+                "  note: no cut point was recorded for {branch}, so this task will not \
+                 auto-close — {}",
+                why.remedy(&uid, &branch, &repo_key)
+            );
+            return Ok(());
+        }
         report(json, &uid, "tagged");
         return Ok(());
     }
@@ -4783,31 +4876,20 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     claim_session(db, id, uid, &owner, &worktree)?;
 
     let resumed = sessions.iter().any(|s| s.branch == branch);
-    // Whether `worktree_add` had to CREATE the branch, as opposed to re-attaching one that was
-    // already there. Not the same question as `resumed`, which is about the worktree — and the
-    // difference is the point: a branch created now is a new branch, so any cut point recorded
-    // under this name describes the one it replaced. `git branch -D` (which this command's own
-    // sibling used to recommend) followed by a fresh `task work` left the stale record in place,
-    // the freshly-cut guard was skipped, and `close-merged` closed a task with nothing on it.
-    let freshness = if resumed {
-        base::Freshness::Unknown
-    } else {
-        open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?
-    };
+    if !resumed {
+        open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?;
+    }
 
     // Record where the work is happening, exactly as `task start` does (D34.1), plus the
     // land target so `land` and a resumed `work` agree on it. These three facets are *set*,
     // not added: a second value would be a contradiction rather than extra information, and
     // is how a task ends up with two branches and one worktree.
     //
-    // The cut point is offered as a guess, and `base::ensure_recorded` decides. This used to be
-    // gated on `resumed` — worktree existence — which is a proxy for the wrong thing: re-working
-    // a branch after `abandon` leaves the branch but not the worktree, so `resumed` was false
-    // while `worktree_add` merely re-attached the existing branch, and the guess overwrote a real
-    // cut point with the land target's *current* tip. The branch tip then differed from its
-    // recorded base, the empty-branch guard was skipped, and `close-merged` closed a task with no
-    // work on it. The only question that answers this correctly is "is a cut point already
-    // recorded for this branch", and it now has exactly one implementation.
+    // The cut point is measured by `base::ensure_recorded`, which also discards a record that
+    // cannot describe this branch. Nothing about *this* call site decides that: it was gated on
+    // `resumed` once (worktree existence, a proxy for the wrong thing) and on a created-ness flag
+    // threaded out of `worktree_add` once, and both were state carried across the git/database
+    // boundary that a crash or a second entry point could lose.
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
     let root = ctx.root.clone();
     db.write_txn("cli", move |conn, meta| {
@@ -4822,7 +4904,6 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
                 onto: Some(&o),
                 // `task work` cuts the branch from its land target, so the two are the same.
                 cut_from: None,
-                freshness,
             },
         )
     })?;
@@ -4856,9 +4937,7 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
 
 /// Make the session's worktree, returning whether its **branch** had to be created.
 ///
-/// Split out of `cmd_task_work` for length, and the return value is the point: a branch created
-/// now is a new branch, so any cut point recorded under this name describes the one it replaced
-/// (see `base::ensure_recorded`).
+/// Split out of `cmd_task_work` for length.
 ///
 /// **Every** failure path releases the claim. `claim_session` has already written a
 /// `session:<pid>:<worktree>` owner, and `owner::is_alive` judges one solely by whether that
@@ -4872,7 +4951,7 @@ fn open_worktree(
     worktree: &Path,
     branch: &str,
     onto: &str,
-) -> Result<base::Freshness> {
+) -> Result<()> {
     let opened = open_worktree_inner(root, worktree, branch, onto);
     if opened.is_err() {
         let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
@@ -4881,12 +4960,7 @@ fn open_worktree(
 }
 
 /// The fallible half of [`open_worktree`], so one `Err` covers every way it can fail.
-fn open_worktree_inner(
-    root: &Path,
-    worktree: &Path,
-    branch: &str,
-    onto: &str,
-) -> Result<base::Freshness> {
+fn open_worktree_inner(root: &Path, worktree: &Path, branch: &str, onto: &str) -> Result<()> {
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -4897,11 +4971,7 @@ fn open_worktree_inner(
          `git worktree prune`",
         worktree.display()
     );
-    Ok(if gitrepo::worktree_add(root, worktree, branch, onto)? {
-        base::Freshness::JustCreated
-    } else {
-        base::Freshness::Unknown
-    })
+    gitrepo::worktree_add(root, worktree, branch, onto)
 }
 
 /// Decide which branch this session's work will land on (design D36.3).
@@ -5189,11 +5259,11 @@ fn land_preflight(
     // took whichever came first, so the one shared blocker explained the same task two opposite
     // ways — and this side's advice, `jkb task work`, cuts a second branch and detaches the task
     // from its batch.
-    let refs = gitrepo::branch_refs(&ctx.root)?;
+    let known = gitrepo::branch_refs(&ctx.root)?;
     let branch = repo::work_branch(
         sess.as_ref().map(|s| s.branch.as_str()),
         repo::facet_values(tags, repo::FACET_BRANCH),
-        &refs,
+        &known,
     )
     .context("this task records no branch")?;
     let onto = repo::facet_one(tags, repo::FACET_ONTO)
@@ -5224,10 +5294,17 @@ fn land_preflight(
     // was abandoned and told the owner to open a new session, which detaches it from its group.
     // The resolved ref is also what the count is taken with — a bare remote-only name resolves to
     // nothing, and `ahead_count` refuses rather than answering zero.
+    // BOTH operands resolved through the same map. The work branch was, and the land target was
+    // still passed as a bare name — so a target living only as `origin/<onto>` aborted the command
+    // with a raw git error before any of the graceful refusals below, while `staging ls` counted
+    // the identical pair without trouble. `adopt_remote` above has just materialised it locally,
+    // so the map is re-read rather than reused from before that.
+    let refs = gitrepo::branch_refs(&ctx.root)?;
     let work_ref = refs.get(&branch);
-    let ahead = match work_ref {
-        Some(reference) => gitrepo::ahead_count(&ctx.root, &onto, reference)?,
-        None => 0,
+    let onto_ref = refs.get(&onto);
+    let ahead = match (work_ref, onto_ref) {
+        (Some(work), Some(target)) => gitrepo::ahead_count(&ctx.root, target, work)?,
+        _ => 0,
     };
     let worktrees = gitrepo::worktrees(&ctx.root)?;
     let mut dirty_cache = BTreeMap::new();
@@ -5791,9 +5868,13 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
             } else {
                 ""
             };
-            let commits = match r["commits"].as_u64() {
-                Some(n) => format!("{n} commit(s)"),
-                None => "commits unknown (its land target is gone)".to_owned(),
+            // Three states, not two: a count, a target that has been deleted, and a session that
+            // never recorded one. Folding the last into the second sent people looking for a
+            // branch nobody had removed.
+            let commits = match (r["commits"].as_u64(), r["onto"].as_str()) {
+                (Some(n), _) => format!("{n} commit(s)"),
+                (None, Some(onto)) => format!("commits unknown ({onto} no longer exists)"),
+                (None, None) => "commits unknown (no land target recorded)".to_owned(),
             };
             println!(
                 "{:<28} {} → {}  {commits}{dirty}",
@@ -6059,6 +6140,7 @@ fn cmd_task_close_merged(
     let mut blocked = Vec::new();
     let mut pending = Vec::new();
     let mut undecidable = Vec::new();
+    let mut unresolvable = Vec::new();
     let mut warned_fallback = false;
 
     for id in ids {
@@ -6111,9 +6193,17 @@ fn cmd_task_close_merged(
             // branch and one unusable cut point would otherwise be labelled by whichever sorted
             // lower. The decision to hold was never in doubt either way; the explanation was.
             gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
+                // Two different faults, two different remedies: a branch with NO cut point
+                // needs one measured (`task start --onto`), while one whose recorded value this
+                // repo cannot resolve needs that value corrected (`task base`). Collapsed into
+                // one bucket, the message could only name one verb — and naming `task base` for
+                // the first case invites a hand-typed branch tip, which freezes the task.
                 let mut all_usable = true;
+                let mut any_recorded = false;
                 for b in &branches {
-                    all_usable &= repo::base_is_usable(&cwd, base::resolve(&tags, b))?;
+                    let recorded = base::resolve(&tags, b);
+                    any_recorded |= recorded.is_some();
+                    all_usable &= repo::base_is_usable(&cwd, recorded)?;
                 }
                 let gone = gone_branches(&cwd, &branches)?;
                 // A vanished branch keeps its own message. Hoisting the base check above
@@ -6131,6 +6221,8 @@ fn cmd_task_close_merged(
                     ));
                 } else if all_usable {
                     pending.push((uid, branch));
+                } else if any_recorded {
+                    unresolvable.push((uid, branch));
                 } else {
                     undecidable.push((uid, branch));
                 }
@@ -6170,6 +6262,7 @@ fn cmd_task_close_merged(
             blocked: &blocked,
             pending: &pending,
             undecidable: &undecidable,
+            unresolvable: &unresolvable,
         },
         json,
     )
@@ -6187,10 +6280,14 @@ struct CloseMergedReport<'a> {
     /// Genuinely still in flight. Counted, not listed: this is the ordinary case and naming
     /// every open task on every run buries the two buckets that need a decision.
     pending: &'a [(String, String)],
-    /// We declined to decide, because there is no usable cut point. Listed **individually** even
+    /// We declined to decide, because **no** cut point is recorded. Listed **individually** even
     /// though it is a form of "not closed": unlike `pending` it will never resolve on its own,
     /// and it has a remedy the user cannot guess.
     undecidable: &'a [(String, String)],
+    /// A cut point *is* recorded and this repository cannot resolve it. Split from `undecidable`
+    /// because only this half is repaired by `jkb task base`; the other half needs one measured,
+    /// and naming `task base` there invites a hand-typed branch tip, which freezes the task.
+    unresolvable: &'a [(String, String)],
 }
 
 /// Print what a `close-merged` run decided.
@@ -6211,6 +6308,7 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
                 "blocked": rows(r.blocked),
                 "pending": rows(r.pending),
                 "undecidable": rows(r.undecidable),
+                "unresolvable": rows(r.unresolvable),
             }))?
         );
         return Ok(());
@@ -6222,10 +6320,22 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     for (uid, branch) in r.blocked {
         println!("held  {uid} ({branch}) — `jkb task show {uid}` says why (usually open subtasks)");
     }
+    // Split, because the two halves have different remedies and only one of them is
+    // `jkb task base`. Recommending that verb for a task with NO cut point was actively harmful:
+    // the sha nearest to hand is the branch tip, and a cut point equal to the tip reads as
+    // "nothing has happened here" forever — the task stops being listed here at all and becomes
+    // permanently unlandable, since `ensure_recorded` never overwrites. `task start` measures.
     for (uid, branch) in r.undecidable {
         println!(
-            "unknown {uid} ({branch}) — no usable cut point, so whether it landed cannot be \
-             decided: `jkb task base {uid} <branch> <sha>`"
+            "unknown {uid} ({branch}) — no cut point recorded, so whether it landed cannot be \
+             decided: `jkb task start {uid} --branch <branch> --onto <parent>` measures one"
+        );
+    }
+    for (uid, branch) in r.unresolvable {
+        println!(
+            "unknown {uid} ({branch}) — its recorded cut point does not resolve in this repo, so \
+             whether it landed cannot be decided: correct it with \
+             `jkb task base {uid} <branch> <sha>`"
         );
     }
     // Independent of the other buckets. Gated on them, the count vanished in exactly the runs
@@ -6237,6 +6347,7 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     if r.closed.is_empty()
         && r.blocked.is_empty()
         && r.undecidable.is_empty()
+        && r.unresolvable.is_empty()
         && r.pending.is_empty()
     {
         println!("nothing to close");
@@ -6812,6 +6923,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
         recorded,
         skipped_unlanded,
         skipped_no_base,
+        unusable,
     } = review::record(db, &ctx.root, &ctx.key, &branch, sha.as_deref(), &findings)?;
 
     if json {
@@ -6826,6 +6938,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
                 })).collect::<Vec<_>>(),
                 "skipped_unlanded": skipped_unlanded,
                 "skipped_no_base": skipped_no_base,
+                "unusable": unusable,
             })
         );
         return Ok(());
@@ -6852,6 +6965,17 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
                 ""
             };
             println!("  {}{moved}", r.uid);
+        }
+    }
+    // Said out loud for the same reason as the buckets below: silence reads as "everything was
+    // tagged", and a task skipped here is one `task land` will refuse as never reviewed.
+    if !unusable.is_empty() {
+        println!(
+            "not tagged — a recorded branch cannot be handed to git at all, so nothing about them \
+             could be checked (`jkb task tag rm <uid> branch=<value>`):"
+        );
+        for uid in &unusable {
+            println!("  {uid}");
         }
     }
     // Said out loud, because a task landing on this branch whose work is not in it yet has

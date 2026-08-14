@@ -96,9 +96,12 @@ pub(crate) fn clear_facet(
 /// Where a task is being worked. Every field is single-valued by nature: a second `branch=`
 /// is a contradiction, not extra information (design D36.6).
 ///
-/// There is deliberately no cut-point field. It used to ride along as a value the caller had
-/// computed, and three callers grew three theories of what it was; [`crate::base::ensure_recorded`]
-/// measures it instead, so there is nothing to pass and nothing to get wrong.
+/// There is deliberately no cut-point *value* here. It used to ride along as a commit the caller
+/// had computed, and three callers grew three theories of what it was;
+/// [`crate::base::ensure_recorded`] measures it instead. What a caller may still state is
+/// `cut_from` — which *branch* this one forked off — because that is a fact the caller has rather
+/// than a judgement it has to make.
+#[derive(Default)]
 pub(crate) struct Location<'a> {
     pub(crate) branch: Option<&'a str>,
     pub(crate) repo: Option<&'a str>,
@@ -109,21 +112,6 @@ pub(crate) struct Location<'a> {
     /// target, or it reads as merged the moment anything lands (D34.3). `None` falls back to
     /// `onto`, so the ordinary caller states it once.
     pub(crate) cut_from: Option<&'a str>,
-    /// Whether the caller created `branch` in this operation. `jkb task work` knows, because
-    /// `worktree_add` tells it; nobody else does. See [`crate::base::ensure_recorded`].
-    pub(crate) freshness: crate::base::Freshness,
-}
-
-impl Default for Location<'_> {
-    fn default() -> Self {
-        Self {
-            branch: None,
-            repo: None,
-            onto: None,
-            cut_from: None,
-            freshness: crate::base::Freshness::Unknown,
-        }
-    }
 }
 
 /// Whether a branch value joins the ones a task already records, or replaces them.
@@ -156,27 +144,31 @@ pub(crate) enum BranchWrite {
 ///
 /// # Errors
 /// Returns an error if the name is not usable as a git ref, or a tag read or write fails.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_branch(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
     id: ItemId,
     repo_root: Option<&std::path::Path>,
     branch: &str,
-    onto: Option<&str>,
+    // Named `cut_from`, not `onto`, because it is only the **measurement parent** here — where
+    // `branch` forked. `Location` carries both, and they are the same branch for every caller but
+    // one: a branch cut from trunk has trunk as its parent and must not record trunk as a land
+    // target, or the task reads as merged the moment anything lands (D34.3). Calling both `onto`
+    // let a plausible "why are these two fields the same?" simplification reintroduce that.
+    cut_from: Option<&str>,
     how: BranchWrite,
-    freshness: crate::base::Freshness,
-) -> jkb_core::Result<()> {
+) -> jkb_core::Result<Option<crate::base::Missing>> {
     // Refuse a name git would read as an option **before it is stored**. A hostile value entered
     // the store cleanly and then poisoned every later reader — and a reader that refuses is a whole
     // `close-merged` run failing on one bad row. The store is the boundary worth defending;
     // `gitrepo::valid_ref` at the git call is the backstop for values that predate this.
     crate::gitrepo::valid_ref(branch).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    crate::base::ensure_recorded(conn, meta, id, repo_root, branch, onto, freshness)?;
+    let missing = crate::base::ensure_recorded(conn, meta, id, repo_root, branch, cut_from)?;
     match how {
-        BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch),
-        BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch),
+        BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch)?,
+        BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch)?,
     }
+    Ok(missing)
 }
 
 /// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
@@ -256,15 +248,20 @@ pub(crate) fn set_location_facets(
     id: ItemId,
     repo_root: Option<&std::path::Path>,
     loc: &Location<'_>,
-) -> jkb_core::Result<()> {
+) -> jkb_core::Result<Option<crate::base::Missing>> {
     if let Some(onto) = loc.onto {
         crate::gitrepo::valid_ref(onto).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
+    // Why no cut point was recorded, when none was — carried out so the command that reports it
+    // states the reason the writer actually had. Deriving it at the reporting site from a proxy
+    // ("were we in the right repo?") is how it came to claim a branch did not exist when the real
+    // reason was that the caller had named no parent.
+    let mut missing = None;
     if let Some(branch) = loc.branch {
         // `loc.onto`, the caller's statement of what this branch was cut from — never the stored
         // facet, which records an earlier moment and may name a batch this branch has nothing to
         // do with. See `base::ensure_recorded`.
-        record_branch(
+        missing = record_branch(
             conn,
             meta,
             id,
@@ -272,7 +269,6 @@ pub(crate) fn set_location_facets(
             branch,
             loc.cut_from.or(loc.onto),
             BranchWrite::Set,
-            loc.freshness,
         )?;
     }
     for (facet, value) in [(FACET_REPO, loc.repo), (FACET_ONTO, loc.onto)] {
@@ -280,7 +276,7 @@ pub(crate) fn set_location_facets(
             set_facet(conn, meta, id, facet, value)?;
         }
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// Does `branch` count as landed *for the purpose of acting on the task*?

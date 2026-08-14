@@ -267,16 +267,11 @@ pub fn prune_worktrees(dir: &Path) -> Result<()> {
 }
 
 /// Add a worktree at `path` checked out to `branch`, creating that branch from `start` when
-/// it does not exist yet. Returns whether the branch was **created** rather than re-attached.
-///
-/// That answer is load-bearing, not incidental: a branch created here is a *new* branch, so any
-/// cut point the caller has recorded under this name describes the one it replaced. Discarding
-/// this signal is what let a stale record survive `git branch -D` plus a fresh `jkb task work`
-/// and close a task with nothing written on it.
+/// it does not exist yet.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the worktree.
-pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<bool> {
+pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
     valid_ref(branch)?;
     valid_ref(start)?;
     let path_s = path.to_string_lossy().into_owned();
@@ -295,7 +290,7 @@ pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Resul
         }
         return Err(e);
     }
-    Ok(created)
+    Ok(())
 }
 
 /// Remove the worktree at `path` and prune the administrative entry. `force` discards
@@ -479,7 +474,16 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
 pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool> {
     valid_ref(reference)?;
     valid_ref(branch)?;
-    let remote = format!("origin/{branch}");
+    // Excluded under EVERY remote, not just `origin`: a second remote carrying the same branch
+    // name made this answer "no work of its own" for a branch full of it, and the caller then
+    // recorded the tip. `*/<branch>` is matched against ref names under `refs/remotes/`, so it
+    // covers `upstream/<branch>` and `fork/<branch>` alike.
+    //
+    // A mis-exclusion fails safe by construction: if the pattern somehow fails to exclude this
+    // branch, `--not` subtracts the branch from itself, no commit is unique, and the answer is
+    // "untouched" — which records the tip only where the tip is provably right and otherwise
+    // records nothing. It cannot manufacture a fork point.
+    let remotes = format!("*/{branch}");
     Ok(git(
         dir,
         &[
@@ -491,7 +495,7 @@ pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool
             branch,
             "--branches",
             "--exclude",
-            &remote,
+            &remotes,
             "--remotes",
         ],
     )?
@@ -1081,6 +1085,56 @@ mod tests {
             super::ahead_count(&dir, "main", &refs["unmerged"]).unwrap(),
             2
         );
+    }
+
+    /// A branch mirrored on a **non-origin** remote has still done its own work.
+    ///
+    /// `has_own_commits` is the load-bearing half of the cut-point measurement — a `false` here
+    /// makes the caller record the branch tip — and it excluded the branch only under `origin/`.
+    /// A second remote carrying the same name (a fork, an `upstream`) therefore made a branch full
+    /// of work look untouched. The pattern is `*/<branch>`, which also has to survive a nested
+    /// name like `task/x`, so that is what is exercised.
+    #[test]
+    fn a_branch_mirrored_on_another_remote_still_has_its_own_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}: {ok:?}");
+        };
+        // Its own commit, reachable from no other branch — pointing it at an existing branch
+        // would make the answer legitimately `false` and the test vacuous.
+        run(&["checkout", "-q", "-b", "task/x", "main"]);
+        std::fs::write(dir.join("own.txt"), "own").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "own work"]);
+        run(&["checkout", "-q", "main"]);
+        // A mirror of the same branch under a remote that is not `origin`.
+        run(&[
+            "update-ref",
+            "refs/remotes/upstream/task/x",
+            "refs/heads/task/x",
+        ]);
+        assert!(
+            super::has_own_commits(dir, "task/x", "task/x").unwrap(),
+            "a branch mirrored on a non-origin remote was reported as having done nothing, so \
+             its caller would record the tip as its cut point"
+        );
+        // The control: a branch that genuinely has nothing of its own still says so.
+        run(&["branch", "empty-one", "main"]);
+        assert!(!super::has_own_commits(dir, "empty-one", "empty-one").unwrap());
     }
 
     #[test]

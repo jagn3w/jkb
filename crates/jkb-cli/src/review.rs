@@ -303,7 +303,19 @@ pub(crate) fn record(
     // One merge probe per distinct (work branch, base): a swarm group puts the same `branch=`
     // on every task in it, and each probe is about four git spawns.
     let mut covered: BTreeMap<(String, Option<String>), bool> = BTreeMap::new();
+    let mut unusable = Vec::new();
     for t in crate::repo::repo_tasks(db, repo_key)? {
+        // A branch value git cannot be handed at all costs its own row and no more. `?`-ing on one
+        // aborted the entire run, which records `reviewed=` for NO task — so one malformed tag
+        // anywhere in the repo silently turned every landing in the batch into "never reviewed".
+        // Same guard, same reason, as the one at the top of `close-merged`'s row loop.
+        if crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH)
+            .iter()
+            .any(|b| crate::gitrepo::valid_ref(b).is_err())
+        {
+            unusable.push(t.meta.uid.clone());
+            continue;
+        }
         let names = |facet: &str| {
             crate::repo::facet_values(&t.tags, facet)
                 .iter()
@@ -346,6 +358,7 @@ pub(crate) fn record(
             recorded: Vec::new(),
             skipped_unlanded,
             skipped_no_base,
+            unusable,
         });
     }
 
@@ -381,6 +394,7 @@ pub(crate) fn record(
             .collect(),
         skipped_unlanded,
         skipped_no_base,
+        unusable,
     })
 }
 
@@ -393,6 +407,9 @@ pub(crate) struct Recording {
     /// Skipped because no `base=` is recorded for the task's work branch, so whether that work
     /// is contained in the reviewed branch cannot be decided. A different fact from "not merged".
     pub(crate) skipped_no_base: Vec<String>,
+    /// Skipped because a recorded branch value cannot be handed to git at all. Reported, not
+    /// fatal: one malformed tag must not stop the whole branch being credited.
+    pub(crate) unusable: Vec<String>,
 }
 
 /// Whether `work`'s commits are already contained in `branch`, memoized per `(work, base)`:

@@ -131,14 +131,64 @@ fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> boo
         .any(|b| b.as_str() != branch)
 }
 
-/// Whether the caller knows this branch to be **new**.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Freshness {
-    /// The caller created the branch in this operation, so it cannot be the branch any existing
-    /// record describes — only the one that had the name before.
-    JustCreated,
-    /// The caller did not create it and cannot tell. An existing record stands.
-    Unknown,
+/// Why no cut point could be recorded — carried out to the caller so the surface that *reports* it
+/// states the reason the writer actually had, rather than re-deriving one from a proxy.
+///
+/// Every variant means "nothing was recorded", which both readers treat as *do not act*. That is
+/// deliberately distinct from recording a plausible-looking value: a task with no cut point is
+/// listed by `close-merged` as undecidable, names a remedy, and is repaired by the next run that
+/// can measure. A task holding a wrong one is silent and permanent, because [`ensure_recorded`]
+/// never overwrites. Recording a guess is the worse of the two, always.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Missing {
+    /// Not standing in the task's own repository, so nothing here could honestly measure it.
+    NotThisRepo,
+    /// The branch does not exist in this repository yet.
+    NoSuchBranch,
+    /// The branch already has commits of its own and the caller named no parent, so there is
+    /// nothing to measure the fork point against.
+    NoParentNamed,
+    /// The caller named a parent this repository does not have.
+    ParentNotFound,
+    /// The branch and everything it could be measured against share no history.
+    NoCommonHistory,
+}
+
+impl Missing {
+    /// The stable, machine-readable form, for `--json` consumers.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotThisRepo => "not-this-repos-checkout",
+            Self::NoSuchBranch => "branch-does-not-exist-here",
+            Self::NoParentNamed => "no-parent-named-and-branch-has-commits",
+            Self::ParentNotFound => "named-parent-does-not-exist-here",
+            Self::NoCommonHistory => "no-shared-history-to-measure-against",
+        }
+    }
+
+    /// What the reader should do about it. Never "pass a sha by hand": the sha nearest to hand is
+    /// the branch tip, and a cut point equal to the tip reads as "nothing has happened here"
+    /// forever, which is how a task becomes permanently unlandable.
+    pub(crate) fn remedy(self, uid: &str, branch: &str, repo: &str) -> String {
+        match self {
+            Self::NotThisRepo => {
+                format!("run it again from {repo}, the repository {branch} lives in")
+            }
+            Self::NoSuchBranch => {
+                format!("run it again once {branch} exists")
+            }
+            Self::NoParentNamed | Self::ParentNotFound | Self::NoCommonHistory => format!(
+                "name the branch {branch} was cut from: \
+                 `jkb task start {uid} --branch {branch} --onto <parent>`"
+            ),
+        }
+    }
+}
+
+/// Where a branch forked, or why that could not be established.
+enum Measurement {
+    At(String),
+    Missing(Missing),
 }
 
 /// Record the cut point for `branch` **if one is not already recorded for it** — the one writer,
@@ -224,19 +274,79 @@ pub(crate) fn ensure_recorded(
     repo_root: Option<&std::path::Path>,
     branch: &str,
     onto: Option<&str>,
-    freshness: Freshness,
-) -> jkb_core::Result<()> {
-    if freshness == Freshness::JustCreated {
-        forget(conn, meta, id, branch)?;
-    }
-    let tags = read_tags(conn, id)?;
-    let cut = match repo_root {
-        // Guarded by the same predicate `record_if_absent` early-returns on, so the two cannot
-        // disagree about when a measurement would be thrown away.
-        Some(root) if qualified(&tags, branch).is_none() => measure(root, branch, onto)?,
-        _ => None,
+) -> jkb_core::Result<Option<Missing>> {
+    let Some(root) = repo_root else {
+        return Ok(Some(Missing::NotThisRepo));
     };
-    record_if_absent(conn, meta, id, &tags, branch, cut.as_deref())
+    let mut tags = read_tags(conn, id)?;
+
+    // A record that cannot describe *this* branch is discarded before it can block a measurement.
+    //
+    // A cut point is keyed by branch NAME, and a name outlives the branch that held it: delete a
+    // branch, cut a fresh one under the same name, and the old value still resolves. There is no
+    // git fact distinguishing the two branches — but there is one that makes the record provably
+    // wrong. **A branch with no commits of its own forked at its own tip**, by definition. So if
+    // the branch is untouched and the record says anything else, the record belongs to whatever
+    // held the name before.
+    //
+    // That is the whole guard, and it needs no flag threaded from the caller. An earlier version
+    // carried "did `worktree_add` just create this branch?" as a bool through three signatures,
+    // which `jkb task start` could not supply at all and a crash between the git write and the
+    // database write silently lost.
+    //
+    // Nothing else needs checking, because a stale record can only do harm in this one case: with
+    // commits of its own, the branch's mergedness is decided by `merge-tree` on content and the
+    // recorded value is not consulted beyond being unequal to the tip.
+    if let Some(recorded) = qualified(&tags, branch) {
+        let stale = match untouched_tip(root, branch)? {
+            Some(tip) => tip != recorded,
+            None => false,
+        };
+        if !stale {
+            return Ok(None);
+        }
+        forget(conn, meta, id, branch)?;
+        tags = read_tags(conn, id)?;
+    }
+
+    match measure(root, branch, onto)? {
+        Measurement::At(cut) => {
+            record_if_absent(conn, meta, id, &tags, branch, Some(&cut))?;
+            Ok(None)
+        }
+        // Nothing recorded, and the reason travels with it. Writing *something* here — the tip
+        // was the tempting value — is the failure this module keeps having: it reads as a real
+        // measurement, is never reported, and can never be corrected.
+        Measurement::Missing(why) => {
+            record_if_absent(conn, meta, id, &tags, branch, None)?;
+            Ok(if qualified(&read_tags(conn, id)?, branch).is_some() {
+                None // an attributable legacy value was adopted after all
+            } else {
+                Some(why)
+            })
+        }
+    }
+}
+
+/// The branch's tip **if the branch has no commits of its own**, in which case that tip is
+/// provably its fork point. `None` when it has done work, or does not exist here.
+///
+/// The one place "an untouched branch forked at its tip" is turned into a value, so the writer's
+/// staleness check and the measurement cannot disagree about what untouched means.
+fn untouched_tip(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Option<String>> {
+    untouched_tip_git(repo_root, branch)
+        .map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
+}
+
+fn untouched_tip_git(repo_root: &std::path::Path, branch: &str) -> anyhow::Result<Option<String>> {
+    use crate::gitrepo::{branch_ref, has_own_commits, rev_commit, Prefer};
+    let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
+        return Ok(None);
+    };
+    if has_own_commits(repo_root, &here, branch)? {
+        return Ok(None);
+    }
+    rev_commit(repo_root, &here)
 }
 
 /// A task's facet tags as a multi-map, read inside a transaction.
@@ -285,8 +395,26 @@ fn record_if_absent(
     if let Some(sha) = adopted.or(cut) {
         write(conn, meta, id, branch, sha)?;
     }
-    for stale in &bare {
-        tag::remove(conn, meta, id, FACET, stale)?;
+    // A bare value is removed only when it can never legitimately serve **any** branch of this
+    // task — which is exactly two cases:
+    //
+    //  * it was just adopted, so it now exists in qualified form and the bare copy would double
+    //    the record; or
+    //  * it is not a full object id, so `is_object_id` bars it from ever being adopted and
+    //    `base_is_usable` bars any reader from acting on it. `jkb task add "… #base=HEAD"` plants
+    //    exactly this, and leaving it lets a later run launder an unchecked string into the record
+    //    every landing decision reads.
+    //
+    // Everything else stays. Removing *every* bare value was the previous rule, and it destroyed
+    // the cut point the reader was still lending to a branch the task already had, the moment a
+    // second branch was added — `jkb task tag add <uid> branch=<second>` reaches this directly.
+    // An object id left in place is inert while the task names several branches (`resolve` lends
+    // one only to a task naming a single branch), and becomes lendable again if the other branch
+    // is removed, which is correct: it was that branch's cut point all along.
+    for value in &bare {
+        if Some(value.as_str()) == adopted || !is_object_id(value) {
+            tag::remove(conn, meta, id, FACET, value)?;
+        }
     }
     Ok(())
 }
@@ -340,36 +468,28 @@ pub(crate) fn recorded_for(
 
 /// The latest commit on `branch` that `branch` did not itself create — its fork point.
 ///
-/// **Why a fork point rather than the tip.** The tip is the cut point only at the instant the
-/// branch is created, so a writer that ran later recorded `base == tip` on a branch full of work,
-/// `is_merged` answered `NothingToMerge` forever, and the task could neither be credited nor land.
-/// A fork point is the same commit whenever it is measured, which is what removes the "call me at
-/// the right moment" precondition that `/task-swarm` structurally could not meet.
+/// **The tip is a measurement result under exactly one condition, and never a fallback.** A branch
+/// with no commits of its own forked at its own tip, provably; that is the only case where the tip
+/// is returned. Everywhere else, failing to measure yields [`Missing`] and *nothing is recorded*.
 ///
-/// **Why two reference points.** A fork point is only meaningful against the branch's real parent,
-/// and `onto` is what the caller *says* that is. Get it wrong — a mistyped `--onto`, or a session
-/// adopting a branch someone else cut from elsewhere — and the merge-base lands behind the
-/// branch's real origin, so a branch with no work of its own reads as having some and can close as
-/// merged. Trunk is the backstop: commits reachable from trunk are, by definition, not this
-/// branch's doing either. Taking the **later** of the two can only move the fork point forward,
-/// and a later fork point can only make the guard fire more often — so every way of getting the
-/// parent wrong degrades towards *holding* the task, never towards closing it.
+/// That distinction is the whole shape of this function, and getting it wrong is the defect it has
+/// had twice. `base == tip` reads as "nothing has happened on this branch" forever — correct for an
+/// untouched branch and catastrophic for one full of work, because `is_merged` then answers
+/// `NothingToMerge`, no review can credit the task, `task land` refuses it, and `ensure_recorded`
+/// will never overwrite. Three separate fallbacks here used to return the tip, and once the
+/// untouched case was hoisted above them every one of them was reachable *only* when the branch had
+/// work — i.e. only when the tip was the worst available answer.
 ///
-/// **Why the tip is still the answer with no parent at all.** `jkb task start` on a branch you are
-/// simply standing on states no parent, and the tip is the most conservative value available: it
-/// is at or after every fork point, so the guard fires until real work appears. Using trunk alone
-/// there would be *less* conservative and would reopen a bug this has already had — a branch cut
-/// from a staging branch is ahead of its merge-base with trunk before anything happens, so an
-/// empty one would close the moment the staging branch landed.
-///
-/// Refs resolve through `branch_ref` so a branch that exists only on the remote still answers, and
-/// the tip through `rev_commit` so the result is a real commit rather than something `rev-parse`
-/// merely managed to parse. `None` records nothing, and both readers then decline to act.
+/// **Why the caller cannot get this wrong.** `has_own_commits` asks git — is any commit here
+/// reachable from no other branch — and needs no reference point, so a stale parent, a wrong
+/// parent, an unresolvable one and a *grandparent* all fail to change the one thing readers ask of
+/// the record: whether it equals the tip. The reference points below only pick which meaningful
+/// commit to store for a branch that has genuinely diverged.
 fn measure(
     repo_root: &std::path::Path,
     branch: &str,
     onto: Option<&str>,
-) -> jkb_core::Result<Option<String>> {
+) -> jkb_core::Result<Measurement> {
     measure_git(repo_root, branch, onto)
         .map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
 }
@@ -379,47 +499,29 @@ fn measure_git(
     repo_root: &std::path::Path,
     branch: &str,
     onto: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    use crate::gitrepo::{
-        branch_ref, has_own_commits, is_ancestor, merge_base, rev_commit, trunk, Prefer,
-    };
+) -> anyhow::Result<Measurement> {
+    use crate::gitrepo::{branch_ref, is_ancestor, merge_base, trunk, Prefer};
     let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
-        return Ok(None);
+        return Ok(Measurement::Missing(Missing::NoSuchBranch));
     };
-
-    // Has this branch done anything at all? Asked of git — "is any commit here reachable from no
-    // other branch" — rather than inferred from a reference point the caller named, because there
-    // is no reference point that is right for every caller. A caller may name a *grandparent*
-    // (`--onto main` for a branch cut from a staging branch cut from main), and then every
-    // merge-base sits behind the branch's real origin, so a branch with nothing of its own records
-    // `base != tip`, skips the freshly-cut guard, and closes as merged once the staging branch
-    // lands. Naming trunk that way is something the CLI deliberately invites, so this is not an
-    // exotic path.
-    //
-    // This is the load-bearing half of the measurement. `is_merged` consults the cut point for one
-    // thing — whether it equals the tip — so a branch with work of its own is decided by
-    // `merge-tree` whatever the fork point is, and a branch without work is decided entirely by
-    // this. The merge-base below picks a *meaningful* commit to store rather than a correct/
-    // incorrect one; do not "simplify" it away, and do not let this check go.
-    if !has_own_commits(repo_root, &here, branch)? {
-        return rev_commit(repo_root, &here);
+    // The one case where the tip is the answer, and it is an answer rather than a guess.
+    if let Some(tip) = untouched_tip_git(repo_root, branch)? {
+        return Ok(Measurement::At(tip));
     }
 
+    // From here the branch has commits of its own, so its tip is certainly NOT its fork point and
+    // must never be recorded. Either a reference point yields one, or nothing is recorded.
     let Some(onto) = onto else {
-        return rev_commit(repo_root, &here);
+        return Ok(Measurement::Missing(Missing::NoParentNamed));
     };
-    // A parent we cannot find is treated exactly like a parent that was never named. Dropping it
-    // and keeping trunk was the tempting thing and it is wrong in the one direction that matters:
-    // for a branch cut from a *staging* branch, a trunk-only merge-base sits behind the branch's
-    // real origin, so a branch with no work of its own reads as having some and closes as merged
-    // the moment the staging branch lands. That would make a mistyped `--onto` strictly worse than
-    // omitting it — the opposite of this function's whole rule.
     let Some(target) = branch_ref(repo_root, onto, Prefer::Local)? else {
-        return rev_commit(repo_root, &here);
+        return Ok(Measurement::Missing(Missing::ParentNotFound));
     };
 
     // Everything this branch inherited rather than wrote: from the parent the caller named, and
-    // from trunk.
+    // from trunk. Taking the later of the two can only move the fork point forward, and only a
+    // fork point that reaches the tip could mislead — which the untouched check above has already
+    // excluded.
     let against: Vec<String> = std::iter::once(target).chain(trunk(repo_root)?).collect();
     let mut fork: Option<String> = None;
     for reference in against {
@@ -427,19 +529,16 @@ fn measure_git(
             continue;
         };
         // Both candidates are merge-bases with the same branch, so each is an ancestor of it and
-        // the two are ordered. Keep whichever is later; on an unorderable answer keep what we had,
-        // which is the same direction as everything else here.
+        // the two are ordered. Keep whichever is later; on an unorderable answer keep what we had.
         fork = match fork {
             Some(held) if !is_ancestor(repo_root, &held, &candidate)? => Some(held),
             _ => Some(candidate),
         };
     }
-    match fork {
-        Some(fork) => Ok(Some(fork)),
-        // Neither reference point resolved — a recorded target since deleted, a repo with no
-        // discoverable trunk. Back to the most conservative value.
-        None => rev_commit(repo_root, &here),
-    }
+    Ok(match fork {
+        Some(fork) => Measurement::At(fork),
+        None => Measurement::Missing(Missing::NoCommonHistory),
+    })
 }
 
 /// Record the cut point for `branch`, replacing whatever this branch had — `jkb task base`.
