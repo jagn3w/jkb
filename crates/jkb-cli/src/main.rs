@@ -3983,6 +3983,16 @@ fn cmd_task_add(
 ) -> Result<()> {
     let input = text.join(" ");
     let qa = task::parse_quick_add(&input)?;
+    // The ref-shaped facets reach `tag::apply` from here without passing the check
+    // `repo::record_branch` and `cmd_task_tag` apply, so this was the one way a value git reads as
+    // an option could still enter the store — `#branch=--upload-pack=x`. One such row used to
+    // abort a whole `close-merged` run (that is now per-row too, but the value should not be
+    // stored in the first place: the store is the boundary worth defending).
+    for (facet, value) in &qa.tags {
+        if matches!(facet.as_str(), repo::FACET_BRANCH | repo::FACET_ONTO) {
+            gitrepo::valid_ref(value)?;
+        }
+    }
     let mut had_explicit_placement = !qa.placements.is_empty();
     let uid = task::mint_uid(&qa.title);
     let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
@@ -4428,6 +4438,14 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
                 "repo": repo,
                 "owner": owner,
                 "base": recorded,
+                // Why there is no cut point, when there is none. A consumer cannot otherwise tell
+                // "wait for the branch to exist" from "run this in the task's own repo", and the
+                // two have different remedies. Null when one was recorded.
+                "base_missing_because": match (&recorded, measured_here) {
+                    (Some(_), _) => None,
+                    (None, true) => Some("branch-does-not-exist-here"),
+                    (None, false) => Some("not-this-repos-checkout"),
+                },
             })
         );
         return Ok(());
@@ -4442,9 +4460,15 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
         } else {
             format!("this is not {repo}'s checkout, so nothing here could measure {branch}")
         };
+        // The remedy is to run this command again, not to hand-compute a commit id. Naming
+        // `jkb task base <uid> <branch> <sha>` here was actively harmful: the sha nearest to hand
+        // once the branch exists is its tip, which records `base == tip` — permanently
+        // `NothingToMerge`, never creditable, never landable. Re-running `task start` measures it
+        // correctly at any point and is idempotent, since an existing record is never overwritten.
         println!(
             "  note: {why}, so no cut point was recorded and this task will not auto-close. \
-             Run `jkb task base {uid} {branch} <sha>` from {repo} once it does."
+             Run this again from {repo} once it does; `jkb task base` is for repairing a wrong \
+             record, and passing the branch tip by hand is how a task becomes unlandable."
         );
     }
     Ok(())
@@ -4834,11 +4858,30 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
 ///
 /// Split out of `cmd_task_work` for length, and the return value is the point: a branch created
 /// now is a new branch, so any cut point recorded under this name describes the one it replaced
-/// (see `base::ensure_recorded`). On failure the claim is released, or the task would stay claimed
-/// for a session that never opened.
+/// (see `base::ensure_recorded`).
+///
+/// **Every** failure path releases the claim. `claim_session` has already written a
+/// `session:<pid>:<worktree>` owner, and `owner::is_alive` judges one solely by whether that
+/// directory exists (D36.6) — so a bail-out caused by the directory being in the way leaves a
+/// claim that reads as alive forever, freed by neither `doctor --fix` nor `task reclaim`. Only the
+/// `worktree_add` arm used to release, while the doc claimed all of them did.
 fn open_worktree(
     db: &Db,
     id: ItemId,
+    root: &Path,
+    worktree: &Path,
+    branch: &str,
+    onto: &str,
+) -> Result<base::Freshness> {
+    let opened = open_worktree_inner(root, worktree, branch, onto);
+    if opened.is_err() {
+        let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
+    }
+    opened
+}
+
+/// The fallible half of [`open_worktree`], so one `Err` covers every way it can fail.
+fn open_worktree_inner(
     root: &Path,
     worktree: &Path,
     branch: &str,
@@ -4854,14 +4897,11 @@ fn open_worktree(
          `git worktree prune`",
         worktree.display()
     );
-    match gitrepo::worktree_add(root, worktree, branch, onto) {
-        Ok(true) => Ok(base::Freshness::JustCreated),
-        Ok(false) => Ok(base::Freshness::Unknown),
-        Err(e) => {
-            let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
-            Err(e)
-        }
-    }
+    Ok(if gitrepo::worktree_add(root, worktree, branch, onto)? {
+        base::Freshness::JustCreated
+    } else {
+        base::Freshness::Unknown
+    })
 }
 
 /// Decide which branch this session's work will land on (design D36.3).
@@ -5950,31 +5990,35 @@ fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
         .unwrap_or_default())
 }
 
-fn cmd_task_close_merged(
-    db: &Db,
+/// Which tasks `close-merged` considers, and what it measures them against.
+///
+/// Split from the loop for length; every rule here is about the *arguments*, not about any task.
+///
+/// # Errors
+/// Returns an error if the repo cannot be determined, `--repo` names a different one than this
+/// checkout, or trunk cannot be resolved.
+fn close_merged_scope(
+    cwd: &Path,
     repo: Option<String>,
     trunk: Option<String>,
-    dry_run: bool,
-    json: bool,
-) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    // The main copy's key, for the same reason `task start` uses it: run from a session
-    // worktree, `key(&cwd)` is the session's name and this silently matches no tasks at all.
+) -> Result<(String, String)> {
+    // The main copy's key, for the same reason `task start` uses it: run from a session worktree,
+    // `key(&cwd)` is the session's name and this silently matches no tasks at all.
     let explicit_repo = repo.is_some();
     let repo =
         match repo {
             Some(r) => r,
-            None => {
-                // Deliberately not "pass --repo": every branch is looked up in the repository we are
-                // standing in, so `check_repo_is_here` refuses that flag in exactly this situation.
-                // Recommending it sent the user round a loop with no exit.
-                repo::repo_ctx().context(
-                "not inside a git repo, and every branch is looked up here — run this from \
-                 the checkout of the repo whose tasks you want to close",
-            )?.key
-            }
+            // Deliberately not "pass --repo": every branch is looked up in the repository we are
+            // standing in, so `check_repo_is_here` refuses that flag in exactly this situation.
+            // Recommending it sent the user round a loop with no exit.
+            None => repo::repo_ctx()
+                .context(
+                    "not inside a git repo, and every branch is looked up here — run this from \
+                     the checkout of the repo whose tasks you want to close",
+                )?
+                .key,
         };
-    // `--repo` selects which tasks to consider; every git question below is still asked of the
+    // `--repo` selects which tasks to consider; every git question is still asked of the
     // repository we are standing in. Those must be the same place or the command probes one repo
     // about another's branches — reporting live work as gone and advising its tag be deleted. It
     // is a filter, not a redirect, so a mismatch is refused rather than guessed at.
@@ -5983,7 +6027,7 @@ fn cmd_task_close_merged(
     }
     let trunk_ref = match trunk {
         Some(t) => t,
-        None => gitrepo::trunk(&cwd)?.context(
+        None => gitrepo::trunk(cwd)?.context(
             "could not determine this repo's trunk (no origin/HEAD and no main/master/trunk) \
              — pass --trunk",
         )?,
@@ -5992,6 +6036,18 @@ fn cmd_task_close_merged(
     // task the probe never runs, so an unusable `--trunk` was silently accepted and the run
     // reported "nothing to close" as though it had asked.
     gitrepo::valid_ref(&trunk_ref)?;
+    Ok((repo, trunk_ref))
+}
+
+fn cmd_task_close_merged(
+    db: &Db,
+    repo: Option<String>,
+    trunk: Option<String>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let (repo, trunk_ref) = close_merged_scope(&cwd, repo, trunk)?;
 
     // Every open task tagged for this repo that names a branch. Typed, not interpolated into
     // the DSL: `--repo` is user-typed and a value with whitespace would re-tokenize into a
@@ -6013,6 +6069,19 @@ fn cmd_task_close_merged(
         }
         let branch = branches.join(", ");
 
+        // A value git cannot be handed at all must cost its own row and no more. Such a value can
+        // no longer be stored (`task add` and `task tag` both refuse one), but rows predating that
+        // check exist, and `?`-ing on one aborted the entire run — so a single malformed tag
+        // stopped every healthy task in the repo from closing, silently, because this also runs
+        // from `scripts/hooks/post-merge`.
+        //
+        // Checked once, at the top of the row, rather than around each probe: every git call below
+        // takes its ref from `branches`, so one guard covers all of them and there is no second
+        // place to remember. Wrapping only the merge probe missed `gone_branches`.
+        if let Err(e) = branches.iter().try_for_each(|b| gitrepo::valid_ref(b)) {
+            blocked.push((uid, format!("{branch} unusable: {e}")));
+            continue;
+        }
         let state = merged_state_of_all(&cwd, &branches, &trunk_ref, &tags, &mut warned_fallback)?;
         match state {
             gitrepo::MergeState::Merged => {

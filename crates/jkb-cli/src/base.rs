@@ -131,6 +131,16 @@ fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> boo
         .any(|b| b.as_str() != branch)
 }
 
+/// Whether the caller knows this branch to be **new**.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// The caller created the branch in this operation, so it cannot be the branch any existing
+    /// record describes — only the one that had the name before.
+    JustCreated,
+    /// The caller did not create it and cannot tell. An existing record stands.
+    Unknown,
+}
+
 /// Record the cut point for `branch` **if one is not already recorded for it** — the one writer,
 /// and the one **measurer**.
 ///
@@ -200,18 +210,11 @@ fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> boo
 /// With no `onto` the fallback is the branch's own tip, which is the pre-existing rule and errs
 /// towards holding (D34.4).
 ///
-/// # Errors
-/// Returns an error if a tag read or write fails.
-/// Whether the caller knows this branch to be **new**.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Freshness {
-    /// The caller created the branch in this operation, so it cannot be the branch any existing
-    /// record describes — only the one that had the name before.
-    JustCreated,
-    /// The caller did not create it and cannot tell. An existing record stands.
-    Unknown,
-}
-
+/// The `has_own_commits` gate in [`measure`] is what makes all of that safe rather than merely
+/// careful: a caller can name the wrong parent, an unresolvable one, or a *grandparent*, and none
+/// of it can change whether the recorded value equals the branch tip — which is the only thing any
+/// reader asks of it.
+///
 /// # Errors
 /// Returns an error if a tag read or write fails.
 pub(crate) fn ensure_recorded(
@@ -377,10 +380,31 @@ fn measure_git(
     branch: &str,
     onto: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    use crate::gitrepo::{branch_ref, is_ancestor, merge_base, rev_commit, trunk, Prefer};
+    use crate::gitrepo::{
+        branch_ref, has_own_commits, is_ancestor, merge_base, rev_commit, trunk, Prefer,
+    };
     let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
         return Ok(None);
     };
+
+    // Has this branch done anything at all? Asked of git — "is any commit here reachable from no
+    // other branch" — rather than inferred from a reference point the caller named, because there
+    // is no reference point that is right for every caller. A caller may name a *grandparent*
+    // (`--onto main` for a branch cut from a staging branch cut from main), and then every
+    // merge-base sits behind the branch's real origin, so a branch with nothing of its own records
+    // `base != tip`, skips the freshly-cut guard, and closes as merged once the staging branch
+    // lands. Naming trunk that way is something the CLI deliberately invites, so this is not an
+    // exotic path.
+    //
+    // This is the load-bearing half of the measurement. `is_merged` consults the cut point for one
+    // thing — whether it equals the tip — so a branch with work of its own is decided by
+    // `merge-tree` whatever the fork point is, and a branch without work is decided entirely by
+    // this. The merge-base below picks a *meaningful* commit to store rather than a correct/
+    // incorrect one; do not "simplify" it away, and do not let this check go.
+    if !has_own_commits(repo_root, &here, branch)? {
+        return rev_commit(repo_root, &here);
+    }
+
     let Some(onto) = onto else {
         return rev_commit(repo_root, &here);
     };

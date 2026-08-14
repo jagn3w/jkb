@@ -285,7 +285,16 @@ pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Resul
     // bare `has_branch`, and here it would silently start a session over on top of commits that
     // had already been pushed.
     let created = ensure_branch(dir, branch, start)?;
-    git_must(dir, &["worktree", "add", &path_s, branch])?;
+    if let Err(e) = git_must(dir, &["worktree", "add", &path_s, branch]) {
+        // Undo the branch this call created, or the retry sees it as pre-existing and reports
+        // `created == false` — and the caller then keeps the cut point of whatever branch had the
+        // name before, which is the exact inheritance the return value exists to prevent. The
+        // branch is seconds old and carries nothing, so there is nothing to lose by removing it.
+        if created {
+            let _ = git_run(dir, &["branch", "-D", branch])?;
+        }
+        return Err(e);
+    }
     Ok(created)
 }
 
@@ -448,6 +457,45 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
     valid_ref(a)?;
     valid_ref(b)?;
     Ok(git(dir, &["merge-base", a, b])?.filter(|s| !s.is_empty()))
+}
+
+/// Whether `reference` has any commit reachable from **no other branch**, local or remote.
+///
+/// "Has this branch done anything yet?", asked of git rather than inferred from a reference point
+/// the caller named. Naming one is where this kept going wrong: a caller may state a grandparent
+/// (`--onto main` for a branch cut from a staging branch cut from main), and every merge-base then
+/// lands behind the branch's real origin, so a branch with nothing of its own reads as having
+/// something. There is no reference point that is right for every caller, and this question does
+/// not need one.
+///
+/// `branch` is the short name, excluded from the "other branches" set under both `refs/heads/` and
+/// `refs/remotes/origin/` — a branch is not evidence of its own work.
+///
+/// Tags are deliberately not consulted: they mark commits rather than owning them, and a tagged
+/// branch has still done the work.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool> {
+    valid_ref(reference)?;
+    valid_ref(branch)?;
+    let remote = format!("origin/{branch}");
+    Ok(git(
+        dir,
+        &[
+            "rev-list",
+            "--max-count=1",
+            reference,
+            "--not",
+            "--exclude",
+            branch,
+            "--branches",
+            "--exclude",
+            &remote,
+            "--remotes",
+        ],
+    )?
+    .is_some_and(|s| !s.is_empty()))
 }
 
 /// Whether `a` is an ancestor of `b` — i.e. `b` already contains it.

@@ -3134,3 +3134,113 @@ fn the_row_and_the_command_talk_about_the_same_branch() {
         "the row and the command explained the same task differently.\n  row: {blocked}\n  cmd: {stderr}"
     );
 }
+
+/// A branch that has done nothing records its own tip, whatever parent the caller names.
+///
+/// The measurement used to depend on the caller naming a *useful* reference point, and four
+/// separate findings were the same consequence of that: a stale parent, a wrong one, an
+/// unresolvable one, and — reachable because the CLI invites `--onto <trunk>` — a **grandparent**.
+/// `main` is a truthful thing to say about a branch cut from a staging branch that was itself cut
+/// from main, and it put every merge-base behind the branch's real origin, so a branch with
+/// nothing on it recorded `base != tip`, skipped the freshly-cut guard, and closed as merged.
+///
+/// So the question is asked of git instead — has any commit here reached no other branch — and it
+/// needs no reference point at all.
+#[test]
+fn a_branch_that_has_done_nothing_records_its_tip_whatever_parent_is_named() {
+    let f = Fixture::new();
+    // main → stage (one commit) → feature (nothing of its own).
+    git(&f.repo, &["checkout", "-q", "-b", "stage"]);
+    commit_in(&f.repo, "s.txt", "staging\n", "staging work");
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "feature"]);
+
+    let uid = f.add_task("grandparent named as the parent");
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+
+    git(&f.repo, &["merge", "-q", "--ff-only", "stage"]);
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a branch with nothing of its own closed as merged: naming a grandparent put every \
+         merge-base behind its real origin"
+    );
+}
+
+/// One unusable branch value costs its own row and no more.
+///
+/// Quick-add reaches `tag::apply` below the ref check, so a value git reads as an option could be
+/// planted on a task; `close-merged` then aborted on it, closing nothing for *any* task in the
+/// repo — silently, because it also runs from `scripts/hooks/post-merge`. Both halves are covered
+/// here: the value is refused at the store now, and a row carrying one from before is isolated.
+#[test]
+fn one_unusable_branch_value_does_not_stop_the_whole_close_merged_run() {
+    let f = Fixture::new();
+    // Refused at the store, so it cannot be planted this way any more.
+    f.jkb()
+        .args(["--global", "task", "add", "hostile #branch=--upload-pack=x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used as a branch"));
+
+    // A healthy task whose branch really did land, beside a row carrying such a value from before
+    // the check existed — planted the only way left, straight through the tag repo.
+    git(&f.repo, &["checkout", "-q", "-b", "done-work"]);
+    commit_in(&f.repo, "d.txt", "d\n", "real work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let good = f.add_task("healthy task");
+    f.jkb()
+        .args([
+            "task",
+            "start",
+            &good,
+            "--branch",
+            "done-work",
+            "--onto",
+            "main",
+        ])
+        .assert()
+        .success();
+    git(&f.repo, &["merge", "-q", "--ff-only", "done-work"]);
+
+    let bad = f.add_task("legacy hostile row");
+    let db = f.db.to_str().unwrap().to_owned();
+    let legacy = jkb_core::Db::open(&db).unwrap();
+    let bad_id = legacy
+        .read({
+            let uid = bad.clone();
+            move |conn| jkb_core::item::id_for_uid(conn, &uid)
+        })
+        .unwrap()
+        .unwrap();
+    legacy
+        .write_txn("t", move |conn, meta| {
+            jkb_core::tag::apply(conn, meta, bad_id, "repo", "proj")?;
+            jkb_core::tag::apply(conn, meta, bad_id, "branch", "--upload-pack=x")
+        })
+        .unwrap();
+    drop(legacy);
+
+    f.jkb()
+        .args(["task", "close-merged"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unusable"));
+    assert_eq!(
+        f.status_of(&good),
+        "done",
+        "one malformed branch tag stopped every healthy task in the repo from closing"
+    );
+}
