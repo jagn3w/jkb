@@ -3091,7 +3091,9 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               can require one. /review-log does this for you.
   jkb task tag set <uid> <f>=<v>
                               make <v> the facet's ONLY value (add appends). Use for the
-                              single-answer facets: branch=, onto=, repo=.
+                              single-answer facets: onto=, repo=. Writing branch= also
+                              records where that branch was cut, but prefer `task start`,
+                              which can be told the branch it was cut FROM.
   jkb task base <uid> <branch> <sha>
                               record where a branch was cut, by hand. Per branch, so `tag set`
                               would delete a sibling's and refuses; this is the verb for it.
@@ -4297,25 +4299,14 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     // beside it. Every `repo=`-keyed surface (`staging ls`, In Flight, `task sessions`,
     // `batch_onto`, `task review record`) then stopped seeing the task, and `review record`
     // matching nothing is indistinguishable from a review that was never run.
-    // The MAIN copy's root and key. The cut point is measured there, never in a session
-    // worktree's directory, for the same reason the key is taken there.
-    let here = repo::repo_ctx().ok();
     let repo = match repo {
         Some(r) => r,
-        None => here
-            .as_ref()
-            .context("not inside a git repo — pass --repo, or run this from the repo")?
-            .key
-            .clone(),
+        None => {
+            repo::repo_ctx()
+                .context("not inside a git repo — pass --repo, or run this from the repo")?
+                .key
+        }
     };
-    // Measured only when we are standing in **the task's own** repository. The database is global
-    // across repos (D32), so `--repo <other>` legitimately runs from anywhere — and measuring
-    // there recorded a namesake branch's tip from whatever checkout the cwd happened to be, as
-    // this task's cut point, reported as recorded. Read from the right checkout that sha does not
-    // resolve, so the task is held forever and the recorder never overwrites it. `jkb task base`
-    // and `close-merged` already gate on this same condition; this was the third answer to the
-    // question and the only one that guessed.
-    let measure_in = here.filter(|c| c.key == repo).map(|c| c.root);
     // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
     // anything merged, since trunk is trivially "merged into" itself. `--onto main` is refused
     // for the sibling reason `task work` refuses it (D34.3): it would put trunk in the branch
@@ -4335,6 +4326,12 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     }
 
     let id = resolve_task_uid(db, uid)?;
+    // The one answer to "may a cut point be measured here" (`repo::measure_root_for`), shared with
+    // `jkb task base` and `jkb task tag`. `--repo <other>` names which task to tag and legitimately
+    // runs from anywhere; it does not license measuring a namesake branch in this checkout.
+    // `intended_repo` is the key about to be recorded, because this command is *stating* where the
+    // work is rather than reading it back.
+    let measure_in = repo::measure_root_for(db, id, Some(&repo))?;
     let owner = owner.unwrap_or_else(owner::self_owner);
     let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
     let n = onto.clone();
@@ -4472,7 +4469,6 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
 fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Result<()> {
     gitrepo::valid_ref(branch)?;
     let id = resolve_task_uid(db, uid)?;
-    let cwd = std::env::current_dir()?;
     // Refuse a revision that cannot be resolved rather than storing it verbatim. `landed_with_base`
     // treats an unresolvable cut point as no cut point, so a typo is no longer *dangerous* — but it
     // is still silent, and a task that quietly stops auto-closing is a bad way to learn you
@@ -4483,21 +4479,18 @@ fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Res
     // repo the cwd happens to be rejected a correct sha typed from a sibling checkout. Where the
     // value cannot be checked the literal is kept and the fact that nothing verified it is said
     // out loud, rather than implied by silence.
-    let task_repo = repo::task_tags(db, id)?;
-    let task_repo = repo::facet_one(&task_repo, repo::FACET_REPO).cloned();
-    let here = repo::repo_ctx().ok();
-    let checkable = match (&task_repo, &here) {
-        (Some(want), Some(ctx)) => *want == ctx.key,
-        (None, Some(_)) => true,
-        _ => false,
-    };
+    let task_repo = repo::facet_one(&repo::task_tags(db, id)?, repo::FACET_REPO).cloned();
     // Resolution and refusal are gated on the SAME condition, deliberately. Gating only the
     // refusal left the resolution running against whatever repo the cwd was in: standing in a
     // sibling checkout where the value happened to resolve, that repo's full commit id was written
     // as this task's cut point and printed as though verified. Rejecting a good sha was the nit
     // being fixed; accepting a foreign one silently is worse than either.
-    let resolved = if checkable {
-        let Some(resolved) = gitrepo::rev_commit(&cwd, sha)? else {
+    //
+    // And it is the *same* condition `task start` and `task tag` gate on, because it is the same
+    // question — `repo::measure_root_for`. It had three implementations, and the one that never
+    // asked is what put a sibling repo's commit on a task.
+    let resolved = if let Some(root) = repo::measure_root_for(db, id, None)? {
+        let Some(resolved) = gitrepo::rev_commit(&root, sha)? else {
             anyhow::bail!(
                 "`{sha}` is not a revision this repo can resolve, so nothing was recorded — a cut \
                  point git cannot resolve is treated as no cut point at all, and {branch} would \
@@ -4556,8 +4549,31 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
     if matches!(facet, repo::FACET_BRANCH | repo::FACET_ONTO) && !matches!(mode, TagMode::Rm) {
         gitrepo::valid_ref(value)?;
     }
-    let (facet, value) = (facet.to_owned(), value.to_owned());
     let id = resolve_task_uid(db, &uid)?;
+    // Putting a branch on a task records where that branch was cut, **however** the branch got
+    // there. This command used to write `branch=` on its own, which is the state that broke
+    // `/task-swarm` — and the swarm reached for it because the guide recommended it. Fixing the
+    // swarm alone would have left the hole open at the verb the next workflow reaches for.
+    //
+    // `add` still appends and `set` still replaces: a task can legitimately record two branches
+    // and every reader indexes both, so a command called `add` must not silently delete one. What
+    // changes is that neither can leave a branch without a cut point.
+    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
+        let root = repo::measure_root_for(db, id, None)?;
+        let how = match mode {
+            TagMode::Add => repo::BranchWrite::Add,
+            _ => repo::BranchWrite::Set,
+        };
+        let value = value.to_owned();
+        db.write_txn("cli", move |conn, meta| {
+            // No `onto`: this verb states no parent branch, so the cut point falls back to the
+            // branch's own tip — the conservative answer, which holds rather than closes.
+            repo::record_branch(conn, meta, id, root.as_deref(), &value, None, how)
+        })?;
+        report(json, &uid, "tagged");
+        return Ok(());
+    }
+    let (facet, value) = (facet.to_owned(), value.to_owned());
     db.write_txn("cli", move |conn, meta| {
         match mode {
             // `add` is additive, honest to its name: an open-ended facet legitimately holds

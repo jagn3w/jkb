@@ -106,26 +106,100 @@ pub(crate) struct Location<'a> {
     pub(crate) onto: Option<&'a str>,
 }
 
-/// Record where a task is being worked — the **one** writer of the location facets.
+/// Whether a branch value joins the ones a task already records, or replaces them.
+#[derive(Clone, Copy)]
+pub(crate) enum BranchWrite {
+    /// The task is being *moved* to this branch — `task work`, `task start`. A second `branch=`
+    /// there is a contradiction (D36.6).
+    Set,
+    /// This branch is *additional*. A task can legitimately record two, and every reader indexes
+    /// both, because deciding a task has landed on the strength of one while the other is live is
+    /// how work gets buried.
+    Add,
+}
+
+/// Put `branch` on the task **and** record where it was cut, in one call. The only way either
+/// happens.
 ///
-/// They had two: `task work` set them, `task start` added them with `tag::apply`. A task that
-/// saw both — which the guide encourages, since `start` tags from the ambient repo — ended up
-/// carrying two `branch=` values, and every reader that collapses the multi-map to one
+/// The pairing is the whole architecture of this area, and every incident in it has been the same
+/// two facts written apart: `/task-swarm` wrote `branch=` and no cut point, so once the readers
+/// began refusing to act without one every swarm task became undecidable; `jkb task tag set
+/// branch=` — which the guide recommended, and which the swarm therefore used — did the same and
+/// went on doing it after the swarm was fixed; `task work` re-stamped a cut point for a branch it
+/// was not re-cutting. Two independent writes that must agree will eventually not, so there is one
+/// write.
+///
+/// The cut point goes **first**, before `branch=` is touched. [`crate::base::ensure_recorded`]
+/// decides whether an unqualified legacy value belongs to this branch by asking what other branch
+/// the task names, and after the rewrite the answer is always "none", so every stale value would
+/// look adoptable.
+///
+/// # Errors
+/// Returns an error if the name is not usable as a git ref, or a tag read or write fails.
+pub(crate) fn record_branch(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    repo_root: Option<&std::path::Path>,
+    branch: &str,
+    onto: Option<&str>,
+    how: BranchWrite,
+) -> jkb_core::Result<()> {
+    // Refuse a name git would read as an option **before it is stored**. A hostile value entered
+    // the store cleanly and then poisoned every later reader — and a reader that refuses is a whole
+    // `close-merged` run failing on one bad row. The store is the boundary worth defending;
+    // `gitrepo::valid_ref` at the git call is the backstop for values that predate this.
+    crate::gitrepo::valid_ref(branch).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
+    crate::base::ensure_recorded(conn, meta, id, repo_root, branch, onto)?;
+    match how {
+        BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch),
+        BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch),
+    }
+}
+
+/// The repository a cut point for this task may honestly be measured in, or `None`.
+///
+/// The **one** answer to that question. It had three — `task base` compared the task's `repo=`
+/// against the checkout it was standing in, `task start` compared the repo it was about to record,
+/// and `task tag set branch=` never asked at all — and the one that guessed recorded a namesake
+/// branch's commit from a sibling checkout as this task's verified cut point. The database is
+/// global across repos (D32), so every one of these commands legitimately runs from anywhere; what
+/// none of them may do is measure a branch that merely shares a name.
+///
+/// `intended_repo` is the key the caller is about to record, for `task start`, which is stating
+/// where the work is rather than reading it back. Everyone else passes `None` and the task's own
+/// `repo=` answers. A task with no `repo=` recorded says nothing either way, so the checkout we are
+/// in is accepted — that is the pre-existing behaviour of the only command that asked.
+///
+/// # Errors
+/// Returns an error if the task's tags cannot be read.
+pub(crate) fn measure_root_for(
+    db: &Db,
+    id: ItemId,
+    intended_repo: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let Some(here) = repo_ctx().ok() else {
+        return Ok(None);
+    };
+    let want = match intended_repo {
+        Some(r) => Some(r.to_owned()),
+        None => facet_one(&task_tags(db, id)?, FACET_REPO).cloned(),
+    };
+    Ok(match want {
+        Some(want) if want != here.key => None,
+        _ => Some(here.root),
+    })
+}
+
+/// Record where a task is being worked — `task work` and `task start`.
+///
+/// They had a writer each: `task work` set the facets, `task start` added them with `tag::apply`.
+/// A task that saw both — which the guide encourages, since `start` tags from the ambient repo —
+/// ended up carrying two `branch=` values, and every reader that collapses the multi-map to one
 /// (`close-merged`'s merge probe, the staging rows) then picked whichever came first.
 ///
-/// It is also the one place the cut point is recorded, and it does that **first** — before
-/// `branch=` is rewritten. [`crate::base::ensure_recorded`] decides whether a pre-qualification
-/// value belongs to this branch by asking what other branch the task names, and after the rewrite
-/// the answer is always "none", so every stale value would look adoptable. Ordering that
-/// correctly is exactly the kind of thing two call sites get wrong one at a time, so neither call
-/// site is told about it.
-///
-/// `repo_root` is `Some` only when the caller is standing in **the task's own** repository, which
-/// is the sole place a cut point can honestly be measured. `jkb task start --repo <other>` runs
-/// from anywhere (the database is global across repos, D32), and measuring a namesake branch in
-/// whatever checkout the cwd happens to be recorded another repo's commit as this task's verified
-/// cut point. The facets themselves are still written — naming where the work is happening does
-/// not require standing there.
+/// The branch goes through [`record_branch`], which is what pairs it with its cut point; this
+/// function adds the two facets that carry no such obligation.
 pub(crate) fn set_location_facets(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
@@ -133,25 +207,24 @@ pub(crate) fn set_location_facets(
     repo_root: Option<&std::path::Path>,
     loc: &Location<'_>,
 ) -> jkb_core::Result<()> {
-    // Refuse a name git would read as an option **before it is stored**. `task start` records
-    // branch facets without touching git at all, so a hostile value entered the store cleanly and
-    // then poisoned every later reader — and a reader that refuses is a whole `close-merged` run
-    // failing on one bad row. The store is the boundary worth defending; `gitrepo::valid_ref` at
-    // the git call is the backstop for values that predate this.
-    for name in [loc.branch, loc.onto].into_iter().flatten() {
-        crate::gitrepo::valid_ref(name).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
+    if let Some(onto) = loc.onto {
+        crate::gitrepo::valid_ref(onto).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
     if let Some(branch) = loc.branch {
         // `loc.onto`, the caller's statement of what this branch was cut from — never the stored
         // facet, which records an earlier moment and may name a batch this branch has nothing to
         // do with. See `base::ensure_recorded`.
-        crate::base::ensure_recorded(conn, meta, id, repo_root, branch, loc.onto)?;
+        record_branch(
+            conn,
+            meta,
+            id,
+            repo_root,
+            branch,
+            loc.onto,
+            BranchWrite::Set,
+        )?;
     }
-    for (facet, value) in [
-        (FACET_BRANCH, loc.branch),
-        (FACET_REPO, loc.repo),
-        (FACET_ONTO, loc.onto),
-    ] {
+    for (facet, value) in [(FACET_REPO, loc.repo), (FACET_ONTO, loc.onto)] {
         if let Some(value) = value {
             set_facet(conn, meta, id, facet, value)?;
         }

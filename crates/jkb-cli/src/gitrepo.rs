@@ -447,6 +447,20 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
     Ok(git(dir, &["merge-base", a, b])?.filter(|s| !s.is_empty()))
 }
 
+/// Whether `a` is an ancestor of `b` — i.e. `b` already contains it.
+///
+/// `false` when the two are unrelated **and** when git could not answer, which is the same
+/// direction: a caller comparing two candidates keeps the one it already had rather than moving to
+/// one it could not order.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> Result<bool> {
+    valid_ref(a)?;
+    valid_ref(b)?;
+    Ok(git(dir, &["merge-base", "--is-ancestor", a, b])?.is_some())
+}
+
 /// Check `branch` out in the working tree at `dir`.
 ///
 /// # Errors

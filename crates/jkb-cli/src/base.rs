@@ -319,17 +319,29 @@ pub(crate) fn recorded_for(
     Ok(resolve(&crate::repo::task_tags(db, id)?, branch).map(str::to_owned))
 }
 
-/// Where `branch` diverged from `onto`, falling back to the branch's own tip.
+/// The latest commit on `branch` that `branch` did not itself create — its fork point.
 ///
-/// The merge-base is the answer that does not depend on when it is asked. The tip is only the cut
-/// point at the instant the branch is created; taken later it says "nothing has happened here"
-/// about a branch full of work, which reads as `NothingToMerge` and holds the task forever. For a
-/// branch just cut from its target the two agree, so nothing about the hand-driven session path
-/// changes — what changes is that a writer no longer has to run at the right moment.
+/// **Why a fork point rather than the tip.** The tip is the cut point only at the instant the
+/// branch is created, so a writer that ran later recorded `base == tip` on a branch full of work,
+/// `is_merged` answered `NothingToMerge` forever, and the task could neither be credited nor land.
+/// A fork point is the same commit whenever it is measured, which is what removes the "call me at
+/// the right moment" precondition that `/task-swarm` structurally could not meet.
 ///
-/// The fallback covers a task with no land target at all (`jkb task start` on a branch you are
-/// simply on) and one whose recorded target no longer resolves. Both keep the pre-existing rule,
-/// whose accepted cost is a missed auto-close rather than a false one (D34.4).
+/// **Why two reference points.** A fork point is only meaningful against the branch's real parent,
+/// and `onto` is what the caller *says* that is. Get it wrong — a mistyped `--onto`, or a session
+/// adopting a branch someone else cut from elsewhere — and the merge-base lands behind the
+/// branch's real origin, so a branch with no work of its own reads as having some and can close as
+/// merged. Trunk is the backstop: commits reachable from trunk are, by definition, not this
+/// branch's doing either. Taking the **later** of the two can only move the fork point forward,
+/// and a later fork point can only make the guard fire more often — so every way of getting the
+/// parent wrong degrades towards *holding* the task, never towards closing it.
+///
+/// **Why the tip is still the answer with no parent at all.** `jkb task start` on a branch you are
+/// simply standing on states no parent, and the tip is the most conservative value available: it
+/// is at or after every fork point, so the guard fires until real work appears. Using trunk alone
+/// there would be *less* conservative and would reopen a bug this has already had — a branch cut
+/// from a staging branch is ahead of its merge-base with trunk before anything happens, so an
+/// empty one would close the moment the staging branch landed.
 ///
 /// Refs resolve through `branch_ref` so a branch that exists only on the remote still answers, and
 /// the tip through `rev_commit` so the result is a real commit rather than something `rev-parse`
@@ -349,18 +361,39 @@ fn measure_git(
     branch: &str,
     onto: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    use crate::gitrepo::{branch_ref, merge_base, rev_commit, Prefer};
+    use crate::gitrepo::{branch_ref, is_ancestor, merge_base, rev_commit, trunk, Prefer};
     let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
         return Ok(None);
     };
-    if let Some(onto) = onto {
-        if let Some(target) = branch_ref(repo_root, onto, Prefer::Local)? {
-            if let Some(cut) = merge_base(repo_root, &here, &target)? {
-                return Ok(Some(cut));
-            }
-        }
+    let Some(onto) = onto else {
+        return rev_commit(repo_root, &here);
+    };
+
+    // Everything this branch inherited rather than wrote: from the parent the caller named, and
+    // from trunk. `trunk` has already verified its own ref resolves, so it is used directly.
+    let against: Vec<String> = branch_ref(repo_root, onto, Prefer::Local)?
+        .into_iter()
+        .chain(trunk(repo_root)?)
+        .collect();
+    let mut fork: Option<String> = None;
+    for reference in against {
+        let Some(candidate) = merge_base(repo_root, &here, &reference)? else {
+            continue;
+        };
+        // Both candidates are merge-bases with the same branch, so each is an ancestor of it and
+        // the two are ordered. Keep whichever is later; on an unorderable answer keep what we had,
+        // which is the same direction as everything else here.
+        fork = match fork {
+            Some(held) if !is_ancestor(repo_root, &held, &candidate)? => Some(held),
+            _ => Some(candidate),
+        };
     }
-    rev_commit(repo_root, &here)
+    match fork {
+        Some(fork) => Ok(Some(fork)),
+        // Neither reference point resolved — a recorded target since deleted, a repo with no
+        // discoverable trunk. Back to the most conservative value.
+        None => rev_commit(repo_root, &here),
+    }
 }
 
 /// Record the cut point for `branch`, replacing whatever this branch had — `jkb task base`.

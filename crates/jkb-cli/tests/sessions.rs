@@ -2768,3 +2768,119 @@ fn a_stale_land_target_is_not_used_to_measure_a_new_branchs_cut_point() {
          never cut from, so the freshly-cut guard was skipped"
     );
 }
+
+/// A **wrong** parent must degrade to holding the task, not to closing it.
+///
+/// `--onto` is what the caller says the branch was cut from, and a caller can be wrong: a mistyped
+/// name, or a session adopting a branch someone else cut from elsewhere. The merge-base then lands
+/// behind the branch's real origin, so a branch carrying no work of its own reads as carrying some
+/// and `merge-tree` closes it against trunk. Trunk is the backstop — commits reachable from it are
+/// not this branch's doing either — and taking the later of the two fork points can only make the
+/// freshly-cut guard fire more often.
+#[test]
+fn a_wrong_parent_branch_holds_the_task_rather_than_closing_it() {
+    let f = Fixture::new();
+
+    // A batch that forked from trunk before trunk moved on.
+    git(&f.repo, &["checkout", "-q", "-b", "other-batch"]);
+    commit_in(&f.repo, "other.txt", "other\n", "another batch");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    commit_in(&f.repo, "trunk.txt", "moved\n", "trunk moves on");
+
+    // A branch with nothing of its own, and a caller that names the wrong parent for it.
+    let tip = git(&f.repo, &["rev-parse", "main"]);
+    git(&f.repo, &["branch", "feature", "main"]);
+    let uid = f.add_task("misattributed branch");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .args(["--onto", "other-batch"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a branch with no work of its own closed as merged, because its cut point was measured \
+         only against a parent it was never cut from"
+    );
+}
+
+/// Putting a branch on a task records where it was cut, **however** the branch got there.
+///
+/// `jkb task tag set <uid> branch=…` wrote the facet on its own, which is precisely the state that
+/// blocked every `/task-swarm` group once the readers began refusing to act without a cut point —
+/// and the swarm reached for that command because the guide recommended it. Fixing the swarm alone
+/// left the hole open at the verb the next workflow reaches for, so the pairing moved into the one
+/// writer instead.
+#[test]
+fn tagging_a_branch_onto_a_task_records_its_cut_point_too() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "handmade", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "handmade"]);
+    let uid = f.add_task("tagged by hand");
+
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "branch=handmade"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=handmade:{tip}")));
+
+    // `add` keeps appending — a task can legitimately record two branches and every reader indexes
+    // both — but it cannot leave the second one without a cut point either.
+    git(&f.repo, &["branch", "second", "main"]);
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "branch=second"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("branch=handmade"))
+        .stdout(predicate::str::contains("branch=second"))
+        .stdout(predicate::str::contains(format!("base=second:{tip}")));
+}
+
+/// And it does not measure one in whatever checkout the cwd happens to be.
+///
+/// The same rule `jkb task base` and `jkb task start` follow, through the same function — it had
+/// three implementations, and this was the one that never asked at all.
+#[test]
+fn tagging_a_branch_does_not_measure_it_in_a_foreign_repo() {
+    let f = Fixture::new();
+    let uid = f.add_task("belongs to proj");
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "repo=proj"])
+        .assert()
+        .success();
+
+    let other = f.home.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    std::fs::write(other.join("f.txt"), "x\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-qm", "base"]);
+    git(&other, &["branch", "shared"]);
+
+    f.jkb()
+        .current_dir(&other)
+        .args(["--global", "task", "tag", "set", &uid, "branch=shared"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("branch=shared"))
+        .stdout(predicate::str::contains("base=").not());
+}

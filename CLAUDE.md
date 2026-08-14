@@ -100,7 +100,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **471 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **474 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -620,6 +620,24 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     deliberate asymmetry between them is visible in one screen. `landed_for_action` resolves the
     cut point itself from the task's tags rather than taking it as a parameter every caller had to
     remember to derive per branch.
+  - **Why it is stored at all, rather than derived.** A fork point *is* derivable — from `onto=` —
+    for as long as the parent branch exists. It has to be stored because **the parent is deleted
+    when the batch lands**, and `close-merged` asks afterwards. "Refs cannot separate landed from
+    never-started" is the reason a fork point is needed; this is the reason it is a record. Worth
+    stating, because a doc that under-justifies its own machinery invites the next pass to either
+    rip it out or bolt more onto it.
+  - **Putting a branch on a task and recording its cut point are one write** (`repo::record_branch`,
+    the only writer of `branch=`). Every incident in this area is those two facts written apart:
+    the swarm wrote `branch=` and no cut point; `jkb task tag set branch=` — which the guide
+    recommended, and which is therefore what the swarm used — did the same and went on doing it
+    after the swarm was fixed; `task work` re-stamped a cut point for a branch it was not
+    re-cutting. `add` still appends and `set` still replaces (a task can legitimately record two
+    branches, and every reader indexes both); neither can leave one without a cut point.
+  - **"May a cut point be measured here?" has one implementation** (`repo::measure_root_for`). It
+    had three — `task base` compared the task's `repo=` against the checkout it stood in, `task
+    start` compared the repo it was about to record, and `task tag set branch=` never asked — and
+    the one that never asked is what let a sibling checkout's namesake branch be recorded as a
+    task's verified cut point.
   - **`jkb task base <uid> <branch> <sha>`** is the only writer a user reaches by hand;
     `jkb task tag add|set base=…` **refuses** and names it (`rm` still works — deleting a wrong
     record leaves the branch with none, which both readers read as "do not act"). A *workflow*
@@ -643,6 +661,16 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     trunk skips the freshly-cut guard and closes as merged. Naming the parent branch is not the
     kind of judgement that went wrong four times; **computing a commit id** was, and callers still
     cannot do that.
+  - **And a caller can still name the wrong branch, so trunk is the backstop.** The fork point is
+    the later of `merge-base(branch, onto)` and `merge-base(branch, trunk)` — commits reachable
+    from trunk are not this branch's doing either. Taking the later can only move the fork point
+    forward, and a later fork point can only make the freshly-cut guard fire *more* often, so the
+    invariant is: **every way of getting the parent wrong — omitting it, mistyping it, adopting a
+    branch someone else cut elsewhere — degrades towards holding the task, never towards closing
+    it.** With no parent at all the answer is the branch's tip, which is the most conservative
+    value there is; using trunk alone there would be *less* conservative and would reopen the
+    cut-from-staging bug (a branch cut from a staging branch is ahead of its merge-base with trunk
+    before anything happens).
   - **So `/task-swarm` computes nothing: it runs `jkb task start --branch <group> --onto
     <integration>`.** One command for `branch=`/`repo=`/`onto=`/the cut point, idempotent under the
     run's own claim, and no value it could get wrong — it states the branch it *told the implementer
