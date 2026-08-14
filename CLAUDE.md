@@ -658,9 +658,8 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     answered `NothingToMerge`, `review record` bucketed every task of every group as unlanded, and
     the land gate refused all of them: **strictly worse than the bug it replaced**. A merge-base is
     the same commit whenever it is taken, so there is no longer a right moment to call the writer.
-    The tip remains the fallback when no target is stated — `jkb task start` on a branch you are
-    simply standing on — and there a branch that already had commits stays *held* rather than
-    closing (D34.4's accepted cost).
+    The tip is **not** a fallback: see the bullet below. When no parent is stated and the branch
+    already has commits, nothing is recorded and the reason is reported.
   - **The target is what the caller states in the call, never the task's stored `onto=`.** Which
     branch this one was cut from is something the caller knows *now*; the facet records an earlier
     moment. A task carrying `onto=` from a previous batch, given a new branch cut from trunk, would
@@ -711,12 +710,13 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
       refusing — it took the whole of `staging ls`, and so both UI surfaces, down with it.
   - **A branch is identified by name, and a name outlives the branch that held it.** Delete a
     branch, cut a fresh one under the same name, and the old record still resolves and still
-    differs from the new tip — guard skipped, empty task closed. Nothing in git tells the two
-    apart, so the only reliable signal is the **moment of creation**: `worktree_add` returns
-    whether it created the branch, and `base::Freshness::JustCreated` makes `ensure_recorded`
-    forget first. That is the create-side half; `base::forget` at `abandon --delete-branch` is the
-    delete-side half. Between them they cover every branch jkb makes or destroys, which is why
-    neither is redundant — the residual gap is a branch both deleted *and* recreated outside jkb.
+    differs from the new tip — guard skipped, empty task closed. The signal is derived from git,
+    not carried by the caller: **an untouched branch forked at its own tip**, so a recorded value
+    that is anything else, on a branch with no commits of its own, belongs to whatever had the
+    name before. A `worktree_add`-created-ness flag was tried first and removed: `jkb task start`
+    could not supply it and a crash between the git write and the database write lost it. The
+    known false positive — a branch whose work was *merged away* looks untouched too — costs a
+    missed close rather than a false one, and is pinned as such.
   - **`--onto` names two things that only come apart at trunk**: the branch this one was **cut
     from** (a measurement reference, `Location::cut_from`) and the branch it **lands on** (the
     `onto=` facet). Trunk is a fine answer to the first and an unacceptable one to the second

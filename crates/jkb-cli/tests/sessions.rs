@@ -1478,30 +1478,21 @@ fn a_cut_point_git_cannot_resolve_case(fake: &str) {
         .assert()
         .success();
 
-    // Two rules, and which applies depends on the shape — asserting only one is what tied the
-    // earlier versions of this test to a single path.
-    //
-    // Object-id *form* is what the write refuses, so a value without it must never appear as a
-    // qualified cut point at all. One that has the form is legitimately adopted, and is stopped
-    // instead by the reader, which cannot resolve it. Either way the task must not close.
-    let object_id_form =
-        matches!(fake.len(), 40 | 64) && fake.chars().all(|c| c.is_ascii_hexdigit());
-    let recorded = predicate::str::contains(format!("base={branch}:{fake}"));
-    let show = f
-        .jkb()
-        .args(["--global", "task", "show", &uid])
-        .assert()
-        .success();
-    if object_id_form {
-        show.stdout(recorded);
-    } else {
-        show.stdout(recorded.not());
-    }
+    // **None** of the three shapes may be stored, and for one reason rather than three: this
+    // branch has no commits of its own, so the only admissible cut point for it is its own tip
+    // (`base::rejected`), and none of these is that. Object-id *form* was previously the whole
+    // rule, and a 40-character fabrication therefore got adopted and had to be caught later by the
+    // reader; now the write refuses it and the reader never meets it.
     assert_eq!(
         git(&f.repo, &["rev-parse", &branch]),
         git(&f.repo, &["rev-parse", "main"]),
-        "setup: the session branch must have no commits of its own"
+        "setup: the branch must have no commits of its own"
     );
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base={branch}:{fake}")).not());
 
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
@@ -2302,7 +2293,11 @@ fn a_review_names_the_task_it_cannot_decide_about() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no cut point recorded"))
-        .stdout(predicate::str::contains("jkb task base"));
+        // MEASURE, never a hand-typed sha: the nearest one is the branch tip, which freezes the
+        // task at `NothingToMerge` for good. This was the third surface to name `jkb task base`
+        // for a task with no cut point at all.
+        .stdout(predicate::str::contains("jkb task start"))
+        .stdout(predicate::str::contains("jkb task base").not());
 }
 
 /// Reviewing a task's own branch must still check the *other* branches it records.
@@ -3509,4 +3504,95 @@ fn a_branch_whose_work_was_merged_away_is_held_never_closed() {
         "the accepted direction is a MISSED close here, because the same git facts describe a \
          recycled branch name, where closing would bury work"
     );
+}
+
+/// A cut point already in the store that git cannot resolve is still ignored by the reader.
+///
+/// The write now refuses such a value (`base::rejected`), so this state only arises from rows that
+/// predate the check — planted here the only way it can be. The reader-side guard is what covers
+/// those, and removing it would close them wrongly, so it keeps its own test now that the writer
+/// no longer produces the state.
+#[test]
+fn an_unresolvable_cut_point_already_in_the_store_is_ignored_by_the_reader() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "feature", "main"]);
+    let uid = f.add_task("legacy bogus base");
+
+    let legacy = jkb_core::Db::open(f.db.to_str().unwrap()).unwrap();
+    let id = legacy
+        .read({
+            let uid = uid.clone();
+            move |conn| jkb_core::item::id_for_uid(conn, &uid)
+        })
+        .unwrap()
+        .unwrap();
+    legacy
+        .write_txn("t", move |conn, meta| {
+            jkb_core::tag::apply(conn, meta, id, "repo", "proj")?;
+            jkb_core::tag::apply(conn, meta, id, "branch", "feature")?;
+            // A well-formed object id this repository does not have — `rev-parse` parses it
+            // happily, so only a verifying lookup rejects it.
+            jkb_core::tag::apply(
+                conn,
+                meta,
+                id,
+                "base",
+                "feature:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            )
+        })
+        .unwrap();
+    drop(legacy);
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "open",
+        "an empty branch closed as merged: its cut point did not resolve, so the freshly-cut \
+         guard was skipped instead of applied"
+    );
+}
+
+/// Naming a branch as its own parent records nothing, rather than recording its tip.
+///
+/// `--onto feature` on branch `feature`, or the likelier slip `--onto origin/feature` on a pushed
+/// branch, makes every merge-base come back as the tip — and a tip on a branch with work is the
+/// one value that must never be stored, because `is_merged` then answers `NothingToMerge` forever.
+///
+/// This is the third route by which a tip reached the store (after a fallback, and after an
+/// adopted legacy value beating the measurement), which is why the rule is enforced in one place
+/// that every writer passes through rather than fixed a fourth time at the site.
+#[test]
+fn naming_a_branch_as_its_own_parent_records_nothing() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "real work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "feature"]);
+
+    let uid = f.add_task("self-referential parent");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .args(["--onto", "feature", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"base\":null"));
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{tip}")).not());
+
+    // Nothing recorded is repairable; a recorded tip is not. Naming the real parent measures it.
+    let fork = git(&f.repo, &["merge-base", "feature", "main"]);
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=feature:{fork}")));
 }

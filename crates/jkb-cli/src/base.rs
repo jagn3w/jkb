@@ -139,10 +139,12 @@ fn is_the_only_branch(tags: &BTreeMap<String, Vec<String>>, branch: &str) -> boo
 /// listed by `close-merged` as undecidable, names a remedy, and is repaired by the next run that
 /// can measure. A task holding a wrong one is silent and permanent, because [`ensure_recorded`]
 /// never overwrites. Recording a guess is the worse of the two, always.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Missing {
     /// Not standing in the task's own repository, so nothing here could honestly measure it.
-    NotThisRepo,
+    /// Carries the repository it wanted, so no caller can name the wrong one in the remedy — one
+    /// of the two did, telling the user to re-run from the checkout that had just refused them.
+    NotThisRepo(String),
     /// The branch does not exist in this repository yet.
     NoSuchBranch,
     /// The branch already has commits of its own and the caller named no parent, so there is
@@ -152,32 +154,39 @@ pub(crate) enum Missing {
     ParentNotFound,
     /// The branch and everything it could be measured against share no history.
     NoCommonHistory,
+    /// The value is not this branch's fork point: it equals the tip of a branch that has done
+    /// work, or differs from the tip of one that has not. See [`rejected`].
+    NotTheForkPoint,
 }
 
 impl Missing {
     /// The stable, machine-readable form, for `--json` consumers.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            Self::NotThisRepo => "not-this-repos-checkout",
+            Self::NotThisRepo(_) => "not-this-repos-checkout",
             Self::NoSuchBranch => "branch-does-not-exist-here",
             Self::NoParentNamed => "no-parent-named-and-branch-has-commits",
             Self::ParentNotFound => "named-parent-does-not-exist-here",
             Self::NoCommonHistory => "no-shared-history-to-measure-against",
+            Self::NotTheForkPoint => "not-this-branchs-fork-point",
         }
     }
 
     /// What the reader should do about it. Never "pass a sha by hand": the sha nearest to hand is
     /// the branch tip, and a cut point equal to the tip reads as "nothing has happened here"
     /// forever, which is how a task becomes permanently unlandable.
-    pub(crate) fn remedy(self, uid: &str, branch: &str, repo: &str) -> String {
+    pub(crate) fn remedy(&self, uid: &str, branch: &str, _repo: &str) -> String {
         match self {
-            Self::NotThisRepo => {
-                format!("run it again from {repo}, the repository {branch} lives in")
+            Self::NotThisRepo(wanted) => {
+                format!("run it again from {wanted}, the repository {branch} lives in")
             }
             Self::NoSuchBranch => {
                 format!("run it again once {branch} exists")
             }
-            Self::NoParentNamed | Self::ParentNotFound | Self::NoCommonHistory => format!(
+            Self::NoParentNamed
+            | Self::ParentNotFound
+            | Self::NoCommonHistory
+            | Self::NotTheForkPoint => format!(
                 "name the branch {branch} was cut from: \
                  `jkb task start {uid} --branch {branch} --onto <parent>`"
             ),
@@ -219,9 +228,12 @@ enum Measurement {
 /// pre-existing commits, `base == tip` reads as "nothing to merge" and the task is *held* rather
 /// than closed — a missed auto-close costs one command; a false one buries work.
 ///
-/// This runs `git` inside the write transaction, so it is skipped entirely when a cut point is
-/// already recorded for `branch`: the measurement would be discarded, and the writer thread is
-/// held for the length of it.
+/// This runs `git` inside the write transaction, and — since the staleness check below — it does
+/// so even when a cut point is already recorded: three or four processes on the writer thread
+/// before the early return. That is the price of the check, which is what stops a record
+/// outliving the branch it describes, and it is paid on `task work` / `task start` / `task tag`
+/// rather than anywhere hot. Do not "optimise" it back to an early return on
+/// `qualified(..).is_some()`; that is the bug it replaced.
 ///
 /// A bare pre-qualification value is **adopted** (re-written as `<branch>:<sha>`) when this task
 /// records no branch other than `branch`, since then it can only have been cut for this one. That
@@ -276,7 +288,11 @@ pub(crate) fn ensure_recorded(
     onto: Option<&str>,
 ) -> jkb_core::Result<Option<Missing>> {
     let Some(root) = repo_root else {
-        return Ok(Some(Missing::NotThisRepo));
+        return Ok(Some(Missing::NotThisRepo(
+            crate::repo::facet_one(&read_tags(conn, id)?, crate::repo::FACET_REPO)
+                .cloned()
+                .unwrap_or_else(|| "its repo".to_owned()),
+        )));
     };
     let mut tags = read_tags(conn, id)?;
 
@@ -322,15 +338,20 @@ pub(crate) fn ensure_recorded(
     }
 
     match measure(root, branch, onto)? {
-        Measurement::At(cut) => {
-            record_if_absent(conn, meta, id, &tags, branch, Some(&cut))?;
-            Ok(None)
-        }
+        Measurement::At(cut) => Ok(record_if_absent(
+            conn,
+            meta,
+            id,
+            Some(root),
+            &tags,
+            branch,
+            Some(&cut),
+        )?),
         // Nothing recorded, and the reason travels with it. Writing *something* here — the tip
         // was the tempting value — is the failure this module keeps having: it reads as a real
         // measurement, is never reported, and can never be corrected.
         Measurement::Missing(why) => {
-            record_if_absent(conn, meta, id, &tags, branch, None)?;
+            record_if_absent(conn, meta, id, Some(root), &tags, branch, None)?;
             Ok(if qualified(&read_tags(conn, id)?, branch).is_some() {
                 None // an attributable legacy value was adopted after all
             } else {
@@ -379,12 +400,13 @@ fn record_if_absent(
     conn: &Connection,
     meta: &WriteMeta,
     id: ItemId,
+    repo_root: Option<&std::path::Path>,
     tags: &BTreeMap<String, Vec<String>>,
     branch: &str,
     cut: Option<&str>,
-) -> jkb_core::Result<()> {
+) -> jkb_core::Result<Option<Missing>> {
     if qualified(tags, branch).is_some() {
-        return Ok(());
+        return Ok(None);
     }
 
     let bare: Vec<String> = facet_values(tags, FACET)
@@ -404,8 +426,18 @@ fn record_if_absent(
 
     // An attributable pre-qualification value wins over the measurement: it is the real cut
     // point, and anything measured now is a guess about the past.
+    //
+    // …unless it is not a cut point at all. Adoption used to beat the measurement unconditionally,
+    // including the one measurement that is a *proof* — an untouched branch forked at its own tip
+    // — so a planted `#base=<older sha>` was preferred over it and the branch then read as having
+    // moved. `rejected` is consulted rather than re-implemented, so the graceful path here and the
+    // hard refusal in `write` cannot disagree about what is admissible.
+    let mut refused = None;
     if let Some(sha) = adopted.or(cut) {
-        write(conn, meta, id, branch, sha)?;
+        match rejected(repo_root, branch, sha)? {
+            None => write(conn, meta, id, repo_root, branch, sha)?,
+            Some(why) => refused = Some(why),
+        }
     }
     // A bare value is removed only when it can never legitimately serve **any** branch of this
     // task — which is exactly two cases:
@@ -428,7 +460,7 @@ fn record_if_absent(
             tag::remove(conn, meta, id, FACET, value)?;
         }
     }
-    Ok(())
+    Ok(refused)
 }
 
 /// Drop every cut point [`resolve`] would hand `branch` — because the branch itself is gone.
@@ -553,6 +585,56 @@ fn measure_git(
     })
 }
 
+/// Whether `sha` may be stored as `branch`'s cut point, or why not.
+///
+/// **The one rule**, and the reason it is a function rather than a comment: the readers ask a cut
+/// point exactly one question — does it equal the branch tip — so there are only two admissible
+/// values, and which one applies is decided by git, not by whoever is writing.
+///
+///  * a branch with **no commits of its own** forked at its own tip, so its cut point *must* be
+///    that tip;
+///  * a branch **with** commits of its own certainly did not fork at its tip, so its cut point
+///    must be anything else.
+///
+/// Violating the second is the defect this module has now had three times, by three different
+/// routes: a fallback that returned the tip, an adopted legacy value that beat the measurement,
+/// and a caller naming the branch as its own parent so the merge-base came back as the tip. Each
+/// was fixed where it happened. This is the check that makes a fourth route impossible — and it
+/// binds `jkb task base` too, where the sha nearest a user's hand is `git rev-parse <branch>`.
+///
+/// `None` for `repo_root` means nothing can be verified here (see [`crate::repo::measure_root_for`]),
+/// and then nothing is: an unverifiable value is stored as given, exactly as it always was.
+fn rejected(
+    repo_root: Option<&std::path::Path>,
+    branch: &str,
+    sha: &str,
+) -> jkb_core::Result<Option<Missing>> {
+    let Some(root) = repo_root else {
+        return Ok(None);
+    };
+    let tip = tip_of(root, branch)?;
+    Ok(match (untouched_tip(root, branch)?, tip) {
+        // Untouched: the tip is the only admissible value.
+        (Some(untouched), _) if sha != untouched => Some(Missing::NotTheForkPoint),
+        // Has work: the tip is the one inadmissible value.
+        (None, Some(tip)) if sha == tip => Some(Missing::NotTheForkPoint),
+        _ => None,
+    })
+}
+
+/// The branch's tip, or `None` if this repository does not have the branch.
+fn tip_of(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Option<String>> {
+    tip_of_git(repo_root, branch).map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
+}
+
+fn tip_of_git(repo_root: &std::path::Path, branch: &str) -> anyhow::Result<Option<String>> {
+    use crate::gitrepo::{branch_ref, rev_commit, Prefer};
+    match branch_ref(repo_root, branch, Prefer::Local)? {
+        Some(here) => rev_commit(repo_root, &here),
+        None => Ok(None),
+    }
+}
+
 /// Record the cut point for `branch`, replacing whatever this branch had — `jkb task base`.
 ///
 /// Deliberately **not** [`crate::repo::set_facet`]: that clears the facet's other values, which
@@ -566,9 +648,22 @@ pub(crate) fn write(
     conn: &Connection,
     meta: &WriteMeta,
     id: ItemId,
+    repo_root: Option<&std::path::Path>,
     branch: &str,
     sha: &str,
 ) -> jkb_core::Result<()> {
+    // Enforced HERE, not at the callers, because the callers are the problem: three of them have
+    // now stored a tip on a branch full of work, each by a different route. `record_if_absent`
+    // consults the same predicate first so it can decline gracefully rather than error; this is
+    // what makes sure it — and everything added later — cannot simply forget to.
+    if let Some(why) = rejected(repo_root, branch, sha)? {
+        return Err(jkb_types::Error::Validation(format!(
+            "`{sha}` cannot be {branch}'s cut point: {}. {}",
+            why.as_str(),
+            why.remedy("<uid>", branch, "its repo")
+        ))
+        .into());
+    }
     // The form check lives HERE rather than at the CLI verb, because the verb is not the only way
     // in: `ensure_recorded` writes too, and a caller-side rule is one more thing every present and
     // future writer has to remember — the failure this module exists to end.
@@ -639,7 +734,7 @@ mod tests {
         let (branch, cut) = (branch.to_owned(), cut.map(str::to_owned));
         db.write_txn("t", move |conn, meta| {
             let tags = read_tags(conn, id)?;
-            record_if_absent(conn, meta, id, &tags, &branch, cut.as_deref())
+            record_if_absent(conn, meta, id, None, &tags, &branch, cut.as_deref())
         })
         .unwrap();
     }
@@ -920,6 +1015,7 @@ mod tests {
                 conn,
                 meta,
                 id,
+                None,
                 "task/b",
                 "cccccccccccccccccccccccccccccccccccccccc",
             )
@@ -954,7 +1050,9 @@ mod tests {
         for symbolic in ["HEAD", "main", "@", "origin/main", "1111111"] {
             let sym = symbolic.to_owned();
             let err = db
-                .write_txn("t", move |conn, meta| write(conn, meta, id, "task/a", &sym))
+                .write_txn("t", move |conn, meta| {
+                    write(conn, meta, id, None, "task/a", &sym)
+                })
                 .expect_err("a symbolic revision must be refused, not recorded");
             assert!(
                 err.to_string().contains("full commit id"),

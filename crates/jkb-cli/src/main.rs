@@ -4052,9 +4052,11 @@ fn cmd_task_add(
     // measurement needs the task's `repo=` — which `task::create` has only just written.
     if !quick_add_branches.is_empty() {
         let root = repo::measure_root_for(db, id, None)?;
-        db.write_txn("cli", move |conn, meta| {
-            for branch in &quick_add_branches {
-                repo::record_branch(
+        let branches = quick_add_branches.clone();
+        let reasons = db.write_txn("cli", move |conn, meta| {
+            let mut reasons = Vec::new();
+            for branch in &branches {
+                reasons.push(repo::record_branch(
                     conn,
                     meta,
                     id,
@@ -4062,10 +4064,25 @@ fn cmd_task_add(
                     branch,
                     None,
                     repo::BranchWrite::Add,
-                )?;
+                )?);
             }
-            Ok(())
+            Ok(reasons)
         })?;
+        // Reported, like every other branch writer. Naming a branch you are about to cut is the
+        // ordinary use of `#branch=` on a quick-add line, so "no cut point yet" is the *common*
+        // outcome here — and dropping it with a bare `?` made this the one writer that leaves a
+        // task unable to auto-close without saying so.
+        if !json {
+            for (branch, why) in quick_add_branches.iter().zip(reasons) {
+                if let Some(why) = why {
+                    println!(
+                        "  note: no cut point was recorded for {branch}, so this task will not \
+                         auto-close — {}.",
+                        why.remedy(&uid, branch, "its repo")
+                    );
+                }
+            }
+        }
     }
     if json {
         println!(
@@ -4481,7 +4498,7 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
         branch,
         repo,
         owner,
-        missing,
+        ref missing,
         dropped_trunk,
     } = *s;
     let recorded = base::recorded_for(db, id, branch)?;
@@ -4498,7 +4515,7 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
                 // consumer cannot otherwise tell "wait for the branch to exist" from "name the
                 // parent" from "run this in the task's own repo", and each has its own remedy.
                 "base_missing_because": recorded.is_none()
-                    .then(|| missing.map(base::Missing::as_str)).flatten(),
+                    .then(|| missing.as_ref().map(base::Missing::as_str)).flatten(),
                 // A dropped land target is a thing that HAPPENED, so it is on both paths. The
                 // human note alone left a `--json` consumer unable to tell "trunk was named and
                 // dropped" from "no target was ever given".
@@ -4646,7 +4663,10 @@ fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Res
         sha.to_owned()
     };
     let (b, s) = (branch.to_owned(), resolved.clone());
-    db.write_txn("cli", move |conn, meta| base::write(conn, meta, id, &b, &s))?;
+    let root = repo::measure_root_for(db, id, None)?;
+    db.write_txn("cli", move |conn, meta| {
+        base::write(conn, meta, id, root.as_deref(), &b, &s)
+    })?;
     if json {
         println!(
             "{}",
@@ -4713,27 +4733,32 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
                 repo::record_branch(conn, meta, id, root.as_deref(), &branch, None, how)
             }
         })?;
-        if let Some(why) = missing {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "uid": uid, "tagged": true, "base": None::<String>,
-                        "base_missing_because": why.as_str(),
-                    })
-                );
-                return Ok(());
-            }
-            let repo_key = repo::repo_ctx().map_or_else(|_| "its repo".to_owned(), |c| c.key);
-            println!("tagged: {uid}");
+        // ONE object shape on the JSON path whether or not a cut point was recorded — two
+        // disjoint ones meant a consumer keying on `action` saw nothing on the reporting path and
+        // one keying on `base` saw nothing on the other.
+        if json {
             println!(
-                "  note: no cut point was recorded for {branch}, so this task will not \
-                 auto-close — {}",
-                why.remedy(&uid, &branch, &repo_key)
+                "{}",
+                serde_json::json!({
+                    "uid": uid,
+                    "action": "tagged",
+                    "base_missing_because": missing.as_ref().map(base::Missing::as_str),
+                })
             );
             return Ok(());
         }
-        report(json, &uid, "tagged");
+        println!("tagged: {uid}");
+        if let Some(why) = missing {
+            // The repo comes from `Missing` itself, not from `repo_ctx()`. Passing the checkout we
+            // are standing in told the user to re-run from the repository that had just refused
+            // them — the same `remedy` reads correctly at `task start`, which passes the key it is
+            // recording, so the message was fine and one of its two callers was not.
+            println!(
+                "  note: no cut point was recorded for {branch}, so this task will not \
+                 auto-close — {}.",
+                why.remedy(&uid, &branch, "its repo")
+            );
+        }
         return Ok(());
     }
     let (facet, value) = (facet.to_owned(), value.to_owned());
@@ -6948,7 +6973,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
         // not an error (design D38.4). But "no task records this branch" and "tasks record it
         // and every one was skipped" are different facts, and printing the first while the
         // skipped list appears directly beneath it contradicted the very next line.
-        if skipped_unlanded.is_empty() && skipped_no_base.is_empty() {
+        if skipped_unlanded.is_empty() && skipped_no_base.is_empty() && unusable.is_empty() {
             println!("no task records branch={branch} — nothing to tag (review still filed)");
         } else {
             println!("nothing tagged for branch={branch} — every matching task was skipped, below (review still filed)");
@@ -6981,10 +7006,15 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
     // Said out loud, because a task landing on this branch whose work is not in it yet has
     // NOT been reviewed, and silence would read as "everything was tagged".
     if !skipped_no_base.is_empty() {
+        // MEASURE, never a hand-typed sha. This is the third surface to have named
+        // `jkb task base <uid> <branch> <sha>` for a task that has *no* cut point, and the sha
+        // nearest a user's hand is `git rev-parse <branch>` — the tip, which freezes the task at
+        // `NothingToMerge` for good. `/review-log` prints this on every run, so it is the most
+        // frequently read of the three.
         println!(
             "not tagged — no cut point recorded for their work branch, so whether this review \
-             saw them cannot be decided (run `jkb task start`, or `jkb task base <uid> <branch> \
-             <sha>`):"
+             saw them cannot be decided. Measure one with \
+             `jkb task start <uid> --branch <branch> --onto <parent>`:"
         );
         for uid in &skipped_no_base {
             println!("  {uid}");

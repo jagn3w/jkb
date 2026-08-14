@@ -479,10 +479,13 @@ pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool
     // recorded the tip. `*/<branch>` is matched against ref names under `refs/remotes/`, so it
     // covers `upstream/<branch>` and `fork/<branch>` alike.
     //
-    // A mis-exclusion fails safe by construction: if the pattern somehow fails to exclude this
-    // branch, `--not` subtracts the branch from itself, no commit is unique, and the answer is
-    // "untouched" — which records the tip only where the tip is provably right and otherwise
-    // records nothing. It cannot manufacture a fork point.
+    // Under-exclusion is the direction that hurts, and it is worth being exact about: if the
+    // pattern fails to exclude this branch, `--not` subtracts the branch from itself, no commit
+    // is unique, and a branch full of work answers `false` — which is the pass-31 defect above,
+    // the caller recording its tip. It is not safe by construction; it is covered by
+    // `a_branch_mirrored_on_another_remote_still_has_its_own_commits`, which fails loudly if the
+    // exclusion stops matching. (`base::rejected` is the backstop that keeps a wrong answer here
+    // from being *stored*, but a wrong answer is still a wrong answer.)
     let remotes = format!("*/{branch}");
     Ok(git(
         dir,
@@ -782,8 +785,14 @@ pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<Str
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the branch.
-/// Returns whether the branch was **created here** rather than already existing — the caller's
-/// only way to know that any record it holds under this name describes a *different* branch.
+/// Returns whether the branch was **created here** rather than already existing.
+///
+/// Used only by [`worktree_add`], to undo a branch it created when the worktree add then fails.
+/// It was once threaded out to the cut-point writer as evidence that a record under this name
+/// belonged to a different branch; that is now derived in `base::ensure_recorded` from git alone
+/// ("an untouched branch forked at its own tip"), because a flag has to be supplied by every
+/// caller — `jkb task start` could not — and is lost by a crash between the git write and the
+/// database write.
 pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
     // Composed from [`adopt_remote`] rather than repeating its logic: two functions that both
     // knew how to prefer a remote copy is the overlap that once made `create_branch` silently
@@ -1068,6 +1077,9 @@ mod tests {
         run(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
         run(&dir, &["push", "-q", "origin", "unmerged"]);
         run(&dir, &["branch", "-D", "unmerged"]);
+        // `main` must exist BOTH locally and on the remote, or nothing competes and the
+        // local-over-remote assertion below holds whichever way the preference is written.
+        run(&dir, &["push", "-q", "origin", "main"]);
 
         let refs = super::branch_refs(&dir).unwrap();
         assert_eq!(
