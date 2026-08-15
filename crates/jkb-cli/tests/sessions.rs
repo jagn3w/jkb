@@ -3635,11 +3635,25 @@ fn the_repair_verb_still_repairs_and_refuses_only_the_tip() {
         .args(["task", "base", &uid, "feature", &tip])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("is not where feature forked"));
+        .stderr(predicate::str::contains("cannot be feature's cut point"));
     // …and the refusal changed nothing.
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
         .stdout(predicate::str::contains(format!("base=feature:{fork}")));
+
+    // The other half of the rule, which the first version of this test never reached: once the
+    // branch's work has been fast-forwarded away it looks untouched, and then only its tip is
+    // admissible — so even its *true* fork point is refused. That is deliberate (git cannot tell
+    // that state from a branch never started, and guessing "landed" closes a task with nothing on
+    // it), and the cost is that such a task cannot be made to auto-close by editing its cut point.
+    // The remedy the refusal names must therefore be a status change, not another sha.
+    git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
+    f.jkb()
+        .args(["task", "base", &uid, "feature", &fork])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("jkb task set"))
+        .stderr(predicate::str::contains("--status done"));
 }

@@ -211,7 +211,8 @@ enum Measurement {
 /// nothing left to pass.
 ///
 /// **What is measured** is where `branch` diverged from the branch it lands on — their merge-base
-/// ([`measure`]) — falling back to the branch's own tip when no land target is known.
+/// ([`measure`]). The tip is **not** a fallback; see [`measure`] for the one condition under which
+/// it is the answer.
 ///
 /// The merge-base is what makes the answer independent of *when* it is taken, and that is the
 /// point. The tip is only the cut point at one instant, the moment the branch is created; a writer
@@ -224,9 +225,9 @@ enum Measurement {
 /// An existing record still always wins: only the first observation can know a cut point a later
 /// rebase has moved past, and re-measuring is what overwrote real ones.
 ///
-/// The failure mode stays safe in the direction D34.4 requires. With no land target and
-/// pre-existing commits, `base == tip` reads as "nothing to merge" and the task is *held* rather
-/// than closed — a missed auto-close costs one command; a false one buries work.
+/// The failure mode stays safe in the direction D34.4 requires: where a fork point cannot be
+/// established, nothing is recorded and the task is *held* rather than closed — a missed
+/// auto-close costs one command; a false one buries work.
 ///
 /// This runs `git` inside the write transaction, and — since the staleness check below — it does
 /// so even when a cut point is already recorded: three or four processes on the writer thread
@@ -268,9 +269,6 @@ enum Measurement {
 /// an empty branch identical to trunk would then skip the freshly-cut guard and close as merged.
 /// Naming the parent branch is not the kind of judgement that went wrong four times; *computing a
 /// commit id* was, and callers still cannot do that.
-///
-/// With no `onto` the fallback is the branch's own tip, which is the pre-existing rule and errs
-/// towards holding (D34.4).
 ///
 /// The `has_own_commits` gate in [`measure`] is what makes all of that safe rather than merely
 /// careful: a caller can name the wrong parent, an unresolvable one, or a *grandparent*, and none
@@ -592,7 +590,7 @@ fn measure_git(
 /// values, and which one applies is decided by git, not by whoever is writing.
 ///
 ///  * a branch with **no commits of its own** forked at its own tip, so its cut point *must* be
-///    that tip;
+///    that tip — see the caveat below, which is a deliberate cost rather than an oversight;
 ///  * a branch **with** commits of its own certainly did not fork at its tip, so its cut point
 ///    must be anything else.
 ///
@@ -601,6 +599,15 @@ fn measure_git(
 /// and a caller naming the branch as its own parent so the merge-base came back as the tip. Each
 /// was fixed where it happened. This is the check that makes a fourth route impossible — and it
 /// binds `jkb task base` too, where the sha nearest a user's hand is `git rev-parse <branch>`.
+///
+/// **"No commits of its own" describes two states, and this refuses both the same way.** A branch
+/// that was never started, and one whose commits were fast-forwarded away into its batch or trunk,
+/// are the same to git. So on a branch in the second state this refuses its *true* fork point and
+/// admits only the tip — which means such a task cannot be made to auto-close by editing its cut
+/// point at all. That is the D34.4 trade taken deliberately: the alternative admits an older value
+/// on a never-started branch, which skips the freshly-cut guard and closes a task with nothing on
+/// it. The remedy for a task that genuinely landed is `jkb task set <uid> --status done`, not a
+/// cut point — the missed close still costs one command, just not the one the error used to name.
 ///
 /// `None` for `repo_root` means nothing can be verified here (see [`crate::repo::measure_root_for`]),
 /// and then nothing is: an unverifiable value is stored as given, exactly as it always was.
@@ -671,11 +678,17 @@ pub(crate) fn write(
         // one. Which half of the rule was broken is derivable from the branch, so the message says
         // both and lets the reader see which applies.
         return Err(jkb_types::Error::Validation(format!(
-            "`{sha}` is not where {branch} forked. A branch with commits of its own did not \
-             fork at its own tip — pass the fork point, e.g. `git merge-base <parent> \
-             {branch}` — and a branch with no commits of its own forked at exactly its tip, so \
-             that is the only value it can take. `jkb task start <uid> --branch {branch} --onto \
-             <parent>` works this out for you."
+            "`{sha}` cannot be {branch}'s cut point.\n\
+             \n\
+             If {branch} has commits of its own it did not fork at its own tip, so pass the fork \
+             point — `jkb task start <uid> --branch {branch} --onto <parent>` measures it for \
+             you.\n\
+             \n\
+             If it has none, only its tip is admissible, and that is deliberate even when the \
+             work really did land: git cannot tell a branch that was never started from one \
+             whose commits were fast-forwarded away, and of the two, guessing 'landed' closes a \
+             task with nothing on it. If this one did land, close it directly with \
+             `jkb task set <uid> --status done` rather than editing its cut point."
         ))
         .into());
     }
