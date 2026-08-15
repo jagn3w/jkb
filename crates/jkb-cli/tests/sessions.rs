@@ -90,6 +90,27 @@ impl Fixture {
         v["uid"].as_str().unwrap().to_owned()
     }
 
+    /// Plant a raw `base=` value on a task, the way a database that predates the reservation
+    /// still holds one.
+    ///
+    /// It used to be planted through `jkb task add "… #base=<v>"`, which reached `tag::apply`
+    /// below every check. That route is closed — `jkb_core::tag` reserves the facet and refuses
+    /// a general write of it (design D46) — so the fixture goes through `apply_reserved`, the
+    /// privileged door, and the *reader* is still exercised against exactly the same stored value.
+    fn plant_base(&self, uid: &str, value: &str) {
+        let db = jkb_core::Db::open(self.db.to_str().unwrap()).unwrap();
+        let uid = uid.to_owned();
+        let value = value.to_owned();
+        let id = db
+            .read(move |conn| jkb_core::item::id_for_uid(conn, &uid))
+            .unwrap()
+            .unwrap();
+        db.write_txn("t", move |conn, meta| {
+            jkb_core::tag::apply_reserved(conn, meta, id, "base", &value)
+        })
+        .unwrap();
+    }
+
     /// Open a session and return its JSON description.
     fn work(&self, uid: &str) -> serde_json::Value {
         self.work_args(&["task", "work", uid, "--json"])
@@ -1422,6 +1443,101 @@ fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
         .success()
         .stdout(predicate::str::contains(format!("base=task/x:{first}")))
         .stdout(predicate::str::contains(format!("base=task/y:{second}")));
+
+    // `rm` is deliberately still allowed, and it is the only repair for a record whose branch is
+    // gone: deleting a wrong one leaves the branch with none, which both readers read as "do not
+    // act". The reservation guards the *write* — a value that never met the writer's rules — not
+    // the removal, and tightening it to cover `tag::remove` would close this off silently.
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "rm",
+            &uid,
+            &format!("base=task/x:{first}"),
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("base=task/x:{first}")).not())
+        .stdout(predicate::str::contains(format!("base=task/y:{second}")));
+}
+
+/// …and it cannot be written through a **task line** either, which was the route that stayed open
+/// after the tag command was closed: `#base=` in quick-add text reached `tag::apply` directly.
+///
+/// The store is what refuses it now (`jkb_core::tag` reserves the facet), so this checks the
+/// surface — that the message names the verb that owns it, rather than leaving a user who typed a
+/// modifier to guess. The same wording as the tag refusal, on purpose: it is the same mistake.
+#[test]
+fn a_task_line_cannot_set_the_cut_point() {
+    let f = Fixture::new();
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "add",
+            "planted #base=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("jkb task base"));
+    // Nothing was created: the refusal is before the write, so there is no half-made task to
+    // clean up and no task carrying the value with the modifier merely dropped.
+    f.jkb()
+        .args(["--global", "query", "kind:task"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("planted").not());
+}
+
+/// `task start --repo <other>` names **that** repository in its remedy — the one it was handed,
+/// not the one the task used to be in and not a placeholder.
+///
+/// The reason it could get this wrong is the ordering the fix pins: `Missing::NotThisRepo` reads
+/// the task's `repo=`, and the location facets used to be written *after* the branch, so on a
+/// task's first `task start --repo <other>` there was no `repo=` yet and the note fell back to
+/// "its repo" — on the one run that was given the answer as an argument.
+#[test]
+fn a_start_in_another_repo_names_that_repo_in_its_remedy() {
+    let f = Fixture::new();
+    let uid = f.add_task("cross-repo task");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "start",
+            &uid,
+            "--repo",
+            "otherproj",
+            "--branch",
+            "feat/x",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run it again from otherproj"))
+        .stdout(predicate::str::contains("its repo").not());
+
+    // And after a *change* of repo it names the new one, not the previous. Same bug, second shape:
+    // the note was written from a facet the same transaction was about to overwrite.
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "start",
+            &uid,
+            "--repo",
+            "thirdproj",
+            "--branch",
+            "feat/y",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run it again from thirdproj"));
 }
 
 /// A cut point git cannot resolve must not act as one, however it got into the store.
@@ -1432,9 +1548,11 @@ fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
 /// trunk's own tree back, and reads as merged. A missing cut point refuses to act; a garbage one
 /// closed the task with the work never written.
 ///
-/// The value is injected the way a user actually can — `#base=` in quick-add text, which reaches
-/// `tag::apply` without passing the `jkb task tag` refusal — and `task work` then adopts the bare
-/// value as this branch's cut point. So this covers the reservation's gap as well as the policy.
+/// The value is planted directly in the store, which is now the only way it can be there: every
+/// write route refuses it (`jkb_core::tag` reserves the facet), so what this test covers is the
+/// **reader's** policy against a value a database predating that reservation still holds. `task
+/// start` then adopts the bare value as this branch's cut point, or would if the writer's rules
+/// let it.
 ///
 /// **Run at both lengths, and the 40-character one is the case that mattered.** `git rev-parse`
 /// is a parser, not a lookup: a full-length hex string is already a well-formed object name, so
@@ -1464,7 +1582,8 @@ fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
 
 fn a_cut_point_git_cannot_resolve_case(fake: &str) {
     let f = Fixture::new();
-    let uid = f.add_task(&format!("bogus base task #base={fake}"));
+    let uid = f.add_task("bogus base task");
+    f.plant_base(&uid, fake);
     // Registered against a branch that **already exists**, via `task start`, so the planted value
     // reaches the reader. `task work` would have *created* the branch, and a branch created now
     // cannot be the one an existing record describes — so it is dropped and a real cut point
@@ -3396,7 +3515,7 @@ fn adding_a_second_branch_keeps_the_first_ones_legacy_cut_point() {
             move |conn, meta| {
                 jkb_core::tag::apply(conn, meta, id, "repo", "proj")?;
                 jkb_core::tag::apply(conn, meta, id, "branch", "first")?;
-                jkb_core::tag::apply(conn, meta, id, "base", &legacy)
+                jkb_core::tag::apply_reserved(conn, meta, id, "base", &legacy)
             }
         })
         .unwrap();
@@ -3531,8 +3650,10 @@ fn an_unresolvable_cut_point_already_in_the_store_is_ignored_by_the_reader() {
             jkb_core::tag::apply(conn, meta, id, "repo", "proj")?;
             jkb_core::tag::apply(conn, meta, id, "branch", "feature")?;
             // A well-formed object id this repository does not have — `rev-parse` parses it
-            // happily, so only a verifying lookup rejects it.
-            jkb_core::tag::apply(
+            // happily, so only a verifying lookup rejects it. Planted with `apply_reserved`,
+            // the privileged door: `tag::apply` refuses the facet outright now, and a database
+            // that predates the reservation still holds values like this one.
+            jkb_core::tag::apply_reserved(
                 conn,
                 meta,
                 id,

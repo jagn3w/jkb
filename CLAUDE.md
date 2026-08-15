@@ -613,13 +613,48 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   today's trunk tip, and `jkb task tag set base=` from nothing at all (`set_facet` clears the
   facet's other values, i.e. **other branches' records** — and that command was the remedy the old
   error message named *and* what `/task-swarm` ran).
-  - The fix is a choke point, not a fourth rule: `FACET` is **private** to `base.rs`, so no other
-    module can spell it, format `<branch>:<sha>`, or take one apart. The writer's question has one
-    implementation (`ensure_recorded`, which never overwrites and *adopts* an attributable legacy
-    value instead of replacing it), the reader's has one (`resolve`), and they sit adjacent so the
-    deliberate asymmetry between them is visible in one screen. `landed_for_action` resolves the
-    cut point itself from the task's tags rather than taking it as a parameter every caller had to
-    remember to derive per branch.
+  - The fix is a choke point, not a fourth rule. The writer's question has one implementation
+    (`ensure_recorded`, which never overwrites and *adopts* an attributable legacy value instead of
+    replacing it), the reader's has one (`resolve`), and they sit adjacent so the deliberate
+    asymmetry between them is visible in one screen. `landed_for_action` resolves the cut point
+    itself from the task's tags rather than taking it as a parameter every caller had to remember
+    to derive per branch.
+  - **The reservation lives in `jkb-core::tag`, not in `base.rs`** — because a private constant
+    cannot bind a crate that never wanted to spell it. Keeping `FACET` private to `base.rs` was the
+    first version, and a **fifth** route turned up in a different crate: `jkb-sync`'s engine applies
+    the `#f=v` modifiers parsed out of a synced `tasks.md` line straight to the store, so a
+    `#base=<sha>` typed into a mounted file — `.codereviews/<run>/tasks.md` is exactly such a mount
+    — reached the store without meeting `rejected` or `is_object_id` at all. So the store enforces
+    it now: `tag::apply` **refuses** a reserved facet, `tag::reconcile_authored` (file sync's tag
+    seam) makes one invisible in **both** directions, and `tag::apply_reserved` is the one
+    privileged door, called only by `base::write`. Core therefore knows the string `base`
+    (`tag::FACET_BASE`, which `base.rs`'s `FACET` is defined as, so there is still one of it) — a
+    deliberate weakening of "no other module can spell it" that buys something better: **spelling
+    it no longer helps.** `base.rs` still owns everything that makes the value mean something —
+    the `<branch>:<sha>` encoding, `resolve`'s attribution, `rejected`'s admissibility rule — and
+    nothing outside it may format or take one apart. A reader-side fork-point check was considered
+    and **rejected**: a branch whose work was fast-forwarded away has no commits of its own, so
+    `rejected` admits only its tip, and a correct record would start reading as inadmissible —
+    `jkb task review record` would stop crediting landed swarm branches, which is the D38 flow.
+  - **Both halves of the sync-side skip are load-bearing, and the second is the dangerous one.**
+    The engine reconciles a file-backed item's tags to exactly what the file declares. A cut point
+    is deliberately *not* in the file — nothing writes it there — so a reconcile that read "absent
+    from the document" as "delete it" would erase the record on every sync of the file the task
+    lives in: worse damage than the fabricated value the first half refuses. And the refusal is a
+    **skip**, not an error: a user may type anything into a file, and erroring takes the whole
+    reconcile down over one modifier. `render` omits reserved facets too, so a stale `#base=` is
+    stripped from the file in one sync and then settles — rendering one while refusing to import it
+    is what makes `kb_changed` stick true and turns every later disk edit into a conflict.
+  - **A reserved facet is excluded from the `SyncDoc`, not merely from what `render` writes**
+    (`tag::authored_applications_for`, the read half of the pair). The engine detects per-item
+    edits by comparing the assembled KB side against the base parsed back out of the *file*, where
+    a cut point can never appear — so carrying one into the assembled side makes every task holding
+    one read as permanently KB-edited, and the next disk edit to that line comes back a **conflict**
+    that writes nothing. A review finding is a file-backed task and `jkb task work` on one records a
+    cut point, so that is the ordinary case. Pinned by
+    `recording_a_cut_point_does_not_turn_the_next_disk_edit_into_a_conflict`.
+  - `branch=` carries **no** such reservation. "`record_branch` is the only writer of `branch=`" is
+    a convention this crate keeps, not something the store enforces; say it that way.
   - **Why it is stored at all, rather than derived.** A fork point *is* derivable — from `onto=` —
     for as long as the parent branch exists. It has to be stored because **the parent is deleted
     when the batch lands**, and `close-merged` asks afterwards. "Refs cannot separate landed from

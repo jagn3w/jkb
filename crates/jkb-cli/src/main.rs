@@ -3988,6 +3988,16 @@ fn cmd_task_add(
     // the store — `#branch=--upload-pack=x`.
     let mut qa = qa;
     for (facet, value) in &qa.tags {
+        // `#base=` would be refused by `jkb_core::tag::apply` a few frames down regardless — that
+        // is the reservation doing its job. It is named here only so the message points at the
+        // verb that owns it, exactly as `jkb task tag add base=` does; a user typing this into a
+        // task line and a user typing it at the tag command deserve the same answer.
+        anyhow::ensure!(
+            !base::is_reserved_facet(facet),
+            "`#{facet}=` records where a *branch* was cut, not where a task is, so it cannot be \
+             set from a task line. Use `{}` instead.",
+            base::VERB
+        );
         if matches!(facet.as_str(), repo::FACET_BRANCH | repo::FACET_ONTO) {
             gitrepo::valid_ref(value)?;
         }
@@ -3999,9 +4009,11 @@ fn cmd_task_add(
     //
     // The `retain` is routing, not a guard: `tag::apply` is idempotent on `(item, facet, value)`,
     // so leaving the tag in place would write the same row and change nothing observable. What it
-    // buys is that "`record_branch` is the only writer of `branch=`" is *literally* true — a claim
-    // the module doc makes and the next person will rely on. The cut point is recorded by the call
-    // below either way, and that is the part with a test.
+    // buys is that "`record_branch` is the only writer of `branch=` in this crate" holds without
+    // an exception the next reader has to carry. It is a convention, not an enforced invariant —
+    // `branch=` is an ordinary facet and the store will take one from anyone, unlike `base=`,
+    // which `jkb_core::tag` reserves. The cut point is recorded by the call below either way, and
+    // that is the part with a test.
     let quick_add_branches: Vec<String> = qa
         .tags
         .iter()

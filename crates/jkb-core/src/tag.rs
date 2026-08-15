@@ -2,8 +2,33 @@
 //!
 //! A facet (e.g. `read_year`, `topic`, `size`) is declared once; applications
 //! attach a value to an item and may carry per-application properties.
+//!
+//! ## Reserved facets
+//!
+//! Almost every facet holds *content*: something a person or an agent asserted about an item,
+//! and which any writer may set. A few hold **coordination state jkb itself maintains**, where a
+//! value that did not come from the code that owns it is not merely wrong but actively harmful.
+//! [`FACET_BASE`] is the one such facet today (design D46: it records the commit a branch was cut
+//! from, and a fabricated value makes a task close as merged with nothing on its branch).
+//!
+//! Those facets are listed in `RESERVED` and the rule is enforced **here, at the store**, not at
+//! the writers. That siting is the whole point. The rule previously lived in `jkb-cli`, where four
+//! consecutive review passes each found a different writer that had not been taught it — and the
+//! fifth found a writer in a different crate entirely (`jkb-sync`'s engine, applying facets parsed
+//! out of a synced `tasks.md` line). Every route into the store now passes one of three doors:
+//!
+//! * [`apply`] — the general writer. **Refuses** a reserved facet.
+//! * [`reconcile_authored`] — for a caller reconciling an item's tags to a set that came from a
+//!   *document* (file sync). Reserved facets are invisible to it in **both** directions: it never
+//!   stores one, and never removes one.
+//! * [`apply_reserved`] — the privileged writer, for the module that owns the facet. In this
+//!   workspace its only non-test caller is `jkb-cli`'s `base` module.
+//!
+//! Cross-crate visibility cannot make the third callable by exactly one module, so the guarantee
+//! is honest rather than absolute: no facet can be written **by accident**, and every write of a
+//! reserved one is a call to a function whose name says it is not for you.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde_json::json;
@@ -12,6 +37,32 @@ use jkb_types::ItemId;
 
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
+
+/// The facet recording the commit a branch was cut from (design D46), spelled once.
+///
+/// The *encoding* of the value — `<branch>:<sha>` — is not core's business and is private to
+/// `jkb-cli`'s `base` module, which is the only thing that may format or split one. What lives
+/// here is the narrower fact that the facet is **reserved**, because that is a property of the
+/// store and has to bind writers in every crate.
+pub const FACET_BASE: &str = "base";
+
+/// Facets no general writer may set. See the module docs.
+const RESERVED: &[&str] = &[FACET_BASE];
+
+/// Whether `facet` is reserved — its value is jkb's own coordination state, not content.
+#[must_use]
+pub fn is_reserved(facet: &str) -> bool {
+    RESERVED.contains(&facet)
+}
+
+/// The refusal, worded once so every route that hits it says the same thing.
+fn reserved_refusal(facet: &str) -> crate::Error {
+    jkb_types::Error::Validation(format!(
+        "`{facet}` is a reserved facet: its value is coordination state jkb maintains, not \
+         content, so it cannot be set through a general tag write. Use the command that owns it."
+    ))
+    .into()
+}
 
 /// Declare a facet with a value kind (idempotent).
 ///
@@ -29,9 +80,37 @@ pub fn define_facet(conn: &Connection, facet: &str, value_kind: &str) -> Result<
 /// Apply `facet = value` to `item` (auto-declaring the facet as `string` if new).
 /// Idempotent on `(item, facet, value)`.
 ///
+/// **Refuses a reserved facet** (see the module docs). Loudly, rather than silently dropping it:
+/// a caller reaching here with a reserved facet is passing along a value someone typed, and the
+/// one thing that must not happen is for it to look accepted. The caller that legitimately has
+/// user-authored tags to store *and* must not fail on one — file sync, where a hard error would
+/// take a whole reconcile down — has [`reconcile_authored`] instead.
+///
+/// # Errors
+/// Returns an error if `facet` is reserved, or if a statement or the changelog append fails.
+pub fn apply(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    facet: &str,
+    value: &str,
+) -> Result<()> {
+    if is_reserved(facet) {
+        return Err(reserved_refusal(facet));
+    }
+    apply_reserved(conn, meta, item, facet, value)
+}
+
+/// [`apply`] **without** the reserved-facet refusal — for the module that owns the facet.
+///
+/// Named so that a call site reads as a deliberate exception. Its only non-test caller in this
+/// workspace is `jkb-cli`'s `base` module, which owns [`FACET_BASE`]; tests use it to plant the
+/// legacy and hand-typed values that predate the refusal, which is exactly what a real database
+/// still holds.
+///
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
-pub fn apply(
+pub fn apply_reserved(
     conn: &Connection,
     meta: &WriteMeta,
     item: ItemId,
@@ -91,6 +170,51 @@ pub fn remove(
     Ok(())
 }
 
+/// Reconcile `item`'s tags to exactly `desired` — for a caller whose `desired` set was
+/// **authored in a document** rather than by jkb (file sync).
+///
+/// Reserved facets are invisible in **both** directions, and both halves are load-bearing:
+///
+/// * a reserved facet in `desired` is skipped, never stored. It got there because someone typed
+///   `#base=…` into a synced `tasks.md`, or because an older export wrote one back. Skipping
+///   rather than erroring is the difference between one ignored modifier and a whole reconcile
+///   pass failing on one file.
+/// * a reserved facet already on the item is never removed. This half is the one that would do
+///   *worse* damage than the value it guards against: the item's real, measured cut point is not
+///   in the document — it cannot be, since nothing writes it there — so a reconcile that treated
+///   "absent from the file" as "delete it" would erase a live cut point on every sync of the
+///   file the task is recorded in.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn reconcile_authored(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    desired: &[(String, String)],
+) -> Result<()> {
+    let want: HashSet<(&str, &str)> = desired
+        .iter()
+        .map(|(f, v)| (f.as_str(), v.as_str()))
+        .collect();
+    let current = applications(conn, item)?;
+    let have: HashSet<(&str, &str)> = current
+        .iter()
+        .map(|(f, v)| (f.as_str(), v.as_str()))
+        .collect();
+    for (facet, value) in &current {
+        if !is_reserved(facet) && !want.contains(&(facet.as_str(), value.as_str())) {
+            remove(conn, meta, item, facet, value)?;
+        }
+    }
+    for (facet, value) in desired {
+        if !is_reserved(facet) && !have.contains(&(facet.as_str(), value.as_str())) {
+            apply(conn, meta, item, facet, value)?;
+        }
+    }
+    Ok(())
+}
+
 /// The `(facet, value)` applications on `item`, ordered. Lets sync diff a task's
 /// current tags against the file's declared set.
 ///
@@ -141,6 +265,29 @@ pub fn applications_for(
     for row in rows {
         let (id, facet, value) = row?;
         out.entry(id).or_default().push((facet, value));
+    }
+    Ok(out)
+}
+
+/// [`applications_for`] with reserved facets removed — the read half of the pair whose write half
+/// is [`reconcile_authored`], so a document-shaped caller cannot **see** one either.
+///
+/// Not a nicety, and not redundant with the serializer that declines to write one out. File sync
+/// detects per-item edits by comparing an item's assembled signature against the base document
+/// parsed back from the file — and a reserved facet is never in the file. Left in the assembled
+/// side, it makes every task carrying one look permanently KB-edited, so the next disk edit to
+/// that same line is reported as a conflict and refused. Recording a cut point would quietly make
+/// a task's line uneditable.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn authored_applications_for(
+    conn: &Connection,
+    items: &[ItemId],
+) -> Result<HashMap<ItemId, Vec<(String, String)>>> {
+    let mut out = applications_for(conn, items)?;
+    for tags in out.values_mut() {
+        tags.retain(|(facet, _)| !is_reserved(facet));
     }
     Ok(out)
 }
@@ -201,9 +348,108 @@ pub fn facets(conn: &Connection) -> Result<Vec<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, facets, items_with, rename_facet};
+    use super::{
+        applications, apply, apply_reserved, facets, items_with, reconcile_authored, rename_facet,
+        FACET_BASE,
+    };
     use crate::item::{upsert, NewItem};
     use crate::Db;
+    use jkb_types::ItemId;
+
+    fn an_item(db: &Db) -> ItemId {
+        db.write_txn("t", |conn, meta| {
+            upsert(
+                conn,
+                meta,
+                &NewItem {
+                    uid: "task:t".to_owned(),
+                    kind: "task".to_owned(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )
+        })
+        .unwrap()
+    }
+
+    fn tags_of(db: &Db, id: ItemId) -> Vec<(String, String)> {
+        db.read(move |conn| applications(conn, id)).unwrap()
+    }
+
+    /// The general writer refuses a reserved facet. Enforced at the store rather than at the
+    /// writers, because the writers are the problem: five have now had to be taught this rule one
+    /// at a time, the last of them in another crate (design D46).
+    #[test]
+    fn the_general_writer_refuses_a_reserved_facet() {
+        let db = Db::open_in_memory().unwrap();
+        let id = an_item(&db);
+        let err = db
+            .write_txn("t", move |conn, meta| {
+                apply(conn, meta, id, FACET_BASE, "feature:abc")
+            })
+            .expect_err("a reserved facet must be refused, not stored");
+        assert!(
+            err.to_string().contains("reserved facet"),
+            "the refusal must say why: {err}"
+        );
+        assert!(tags_of(&db, id).is_empty());
+    }
+
+    /// A document may not author one either — and, crucially, it may not *un*-author one. The
+    /// cut point is never written into the file, so "absent from the document" must not read as
+    /// "delete it" or every sync of a task's own file would erase its cut point.
+    #[test]
+    fn a_document_can_neither_author_nor_erase_a_reserved_facet() {
+        let db = Db::open_in_memory().unwrap();
+        let id = an_item(&db);
+        db.write_txn("t", move |conn, meta| {
+            apply_reserved(conn, meta, id, FACET_BASE, "feature:abc")?;
+            apply(conn, meta, id, "area", "sync")
+        })
+        .unwrap();
+
+        // A document declaring a different `base=` and no `area=`.
+        let desired = vec![(FACET_BASE.to_owned(), "feature:deadbeef".to_owned())];
+        db.write_txn("t", move |conn, meta| {
+            reconcile_authored(conn, meta, id, &desired)
+        })
+        .unwrap();
+
+        assert_eq!(
+            tags_of(&db, id),
+            vec![(FACET_BASE.to_owned(), "feature:abc".to_owned())],
+            "the document's `base=` was stored, or the item's real one was reconciled away"
+        );
+    }
+
+    /// Everything unreserved still reconciles exactly — this is the sync engine's whole tag
+    /// contract, and skipping reserved facets must not have made the rest lenient.
+    #[test]
+    fn reconciling_still_adds_and_drops_ordinary_facets() {
+        let db = Db::open_in_memory().unwrap();
+        let id = an_item(&db);
+        db.write_txn("t", move |conn, meta| {
+            apply(conn, meta, id, "area", "sync")?;
+            apply(conn, meta, id, "size", "small")
+        })
+        .unwrap();
+        let desired = vec![
+            ("area".to_owned(), "sync".to_owned()),
+            ("owner".to_owned(), "me".to_owned()),
+        ];
+        db.write_txn("t", move |conn, meta| {
+            reconcile_authored(conn, meta, id, &desired)
+        })
+        .unwrap();
+        assert_eq!(
+            tags_of(&db, id),
+            vec![
+                ("area".to_owned(), "sync".to_owned()),
+                ("owner".to_owned(), "me".to_owned())
+            ]
+        );
+    }
 
     #[test]
     fn tagged_items_are_found_by_facet_and_value() {

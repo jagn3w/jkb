@@ -127,7 +127,11 @@ pub(crate) enum BranchWrite {
 }
 
 /// Put `branch` on the task **and** record where it was cut, in one call. The only way either
-/// happens.
+/// happens *in this crate* — and for the cut point, the only way anywhere, since
+/// [`jkb_core::tag::apply`] refuses the facet and [`crate::base::write`] holds the sole privileged
+/// write (design D46). `branch=` carries no such reservation: it is an ordinary facet, and the
+/// claim about it is a convention this crate keeps, backed by `main.rs` routing every `#branch=`
+/// and `jkb task tag` through here rather than by anything the store enforces.
 ///
 /// The pairing is the whole architecture of this area, and every incident in it has been the same
 /// two facts written apart: `/task-swarm` wrote `branch=` and no cut point, so once the readers
@@ -242,6 +246,14 @@ pub(crate) fn measure_root_for(
 ///
 /// The branch goes through [`record_branch`], which is what pairs it with its cut point; this
 /// function adds the two facets that carry no such obligation.
+///
+/// **`record_branch` runs last, after the context facets are in place.** [`crate::base::Missing`]
+/// names the repository a cut point would have to be measured in, and it reads that from the
+/// task's `repo=`. Written afterwards, that read saw the *previous* repository — or, on a task's
+/// first `jkb task start --repo <other>`, no repository at all, so the one run that was handed the
+/// answer as an argument printed a placeholder. Recording the context first makes
+/// `ensure_recorded` name the same repository [`measure_root_for`] compared against, by
+/// construction rather than by two call sites agreeing.
 pub(crate) fn set_location_facets(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
@@ -252,6 +264,11 @@ pub(crate) fn set_location_facets(
     if let Some(onto) = loc.onto {
         crate::gitrepo::valid_ref(onto).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
+    for (facet, value) in [(FACET_REPO, loc.repo), (FACET_ONTO, loc.onto)] {
+        if let Some(value) = value {
+            set_facet(conn, meta, id, facet, value)?;
+        }
+    }
     // Why no cut point was recorded, when none was — carried out so the command that reports it
     // states the reason the writer actually had. Deriving it at the reporting site from a proxy
     // ("were we in the right repo?") is how it came to claim a branch did not exist when the real
@@ -261,6 +278,10 @@ pub(crate) fn set_location_facets(
         // `loc.onto`, the caller's statement of what this branch was cut from — never the stored
         // facet, which records an earlier moment and may name a batch this branch has nothing to
         // do with. See `base::ensure_recorded`.
+        //
+        // Writing `onto=` above does NOT make that stored facet an input here: the parent is still
+        // the one the caller passed. What changes order is only which facets are already on the
+        // task when the measurement reports its failure.
         missing = record_branch(
             conn,
             meta,
@@ -270,11 +291,6 @@ pub(crate) fn set_location_facets(
             loc.cut_from.or(loc.onto),
             BranchWrite::Set,
         )?;
-    }
-    for (facet, value) in [(FACET_REPO, loc.repo), (FACET_ONTO, loc.onto)] {
-        if let Some(value) = value {
-            set_facet(conn, meta, id, facet, value)?;
-        }
     }
     Ok(missing)
 }

@@ -2496,3 +2496,352 @@ fn a_bound_item_that_lost_its_placement_is_refused_not_re_imported() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reserved facets: a file may not author jkb's own coordination state (D46)
+// ---------------------------------------------------------------------------
+
+/// The `(facet, value)` tags of the item bound to `uri`.
+fn tags_of(db: &Db, uri: &str) -> Vec<(String, String)> {
+    let uri = uri.to_owned();
+    db.read(move |conn| match binding::item_for_uri(conn, &uri)? {
+        Some(id) => jkb_core::tag::applications(conn, id),
+        None => Ok(Vec::new()),
+    })
+    .unwrap()
+}
+
+/// Record a cut point the way `jkb task base` does — the privileged writer, since the store
+/// refuses a general write of a reserved facet.
+fn record_cut_point(db: &Db, uri: &str, value: &str) {
+    let uri = uri.to_owned();
+    let value = value.to_owned();
+    db.write_txn("cli", move |conn, meta| {
+        let id = binding::item_for_uri(conn, &uri)?.expect("bound item");
+        jkb_core::tag::apply_reserved(conn, meta, id, jkb_core::tag::FACET_BASE, &value)
+    })
+    .unwrap();
+}
+
+const TASKS_WITH_BASE: &str = "\
+## Backend
+- [ ] Fix flaky test #size=small #base=feature:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ^fix
+";
+
+/// A `#base=` typed into a synced `tasks.md` may not reach the store.
+///
+/// This is the route the D46 choke point did not cover: the cut point decides whether
+/// `close-merged` marks a task done, and every *`jkb-cli`* writer was made to check the value —
+/// while the sync engine applied whatever `#f=v` a line carried, straight through. A review-finding
+/// task lives in exactly such a mount (`.codereviews/<run>/tasks.md`), so a fabricated cut point
+/// could be typed in and would then close a task with nothing on its branch.
+///
+/// The line is **skipped, not an error**: a user may type anything into a file, and a hard error
+/// would take the whole reconcile down over one modifier.
+#[test]
+fn a_synced_file_cannot_set_a_reserved_facet() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_WITH_BASE).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "a `#base=` line failed the reconcile instead of being skipped: {:?}",
+        report.failed()
+    );
+    assert_eq!(report.count(Outcome::Created), 1);
+    assert_eq!(
+        tags_of(&db, &format!("{uri}#fix")),
+        vec![("size".to_owned(), "small".to_owned())],
+        "a task line authored a reserved facet"
+    );
+}
+
+/// And the modifier is stripped from the file, in one sync, after which the file is settled.
+///
+/// The alternative — render it but refuse to import it — is the shape that has bitten this engine
+/// before: the KB render and the disk would then disagree permanently, `kb_changed` would stick
+/// true, and every later disk edit would come back as a conflict. So `render` omits it, which
+/// canonicalizes the disk parse, the KB assembly and the re-rendered base together.
+#[test]
+fn a_reserved_facet_is_stripped_from_the_file_and_then_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_WITH_BASE).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+
+    sync(&db, "docs/plan").unwrap();
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(
+        !after.contains("#base="),
+        "the reserved facet was written back into the file: {after}"
+    );
+    assert!(
+        after.contains("#size=small"),
+        "an ordinary facet was dropped with it: {after}"
+    );
+
+    // Settled: two further syncs change nothing at all. A file that oscillated here would be
+    // rewritten on every pass forever.
+    for pass in 1..=2 {
+        let report = sync(&db, "docs/plan").unwrap();
+        assert_eq!(
+            report.count(Outcome::UpToDate),
+            1,
+            "pass {pass} did not settle: {report:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), after, "pass {pass}");
+    }
+}
+
+/// A cut point already recorded for a file-backed task **survives** its file being synced.
+///
+/// This is the trap in fixing the one above, and it does strictly worse damage than the bug it
+/// guards: the engine reconciles an item's tags to exactly what the file declares, and the cut
+/// point is deliberately not in the file — nothing writes it there. So "absent from the document"
+/// must not mean "delete it", or every sync of the file a task lives in would erase the record
+/// that decides whether it can land.
+#[test]
+fn a_recorded_cut_point_survives_repeated_syncs_of_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    let cut = "fix-branch:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    record_cut_point(&db, &format!("{uri}#fix"), cut);
+
+    // A settled file: recording a cut point must not even make the file look dirty.
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::UpToDate),
+        1,
+        "recording a cut point made the file need rewriting: {report:?}"
+    );
+
+    // And a real disk edit — which is what runs the tag reconcile over every item in the file.
+    let edited = TASKS_MD.replace("Fix flaky test", "Fix the flaky test");
+    assert_ne!(edited, TASKS_MD, "setup: the edit must change the line");
+    fs::write(&file, &edited).unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Imported), 1);
+
+    assert_eq!(
+        tags_of(&db, &format!("{uri}#fix")),
+        vec![(jkb_core::tag::FACET_BASE.to_owned(), cut.to_owned())],
+        "syncing the task's own file erased its cut point"
+    );
+}
+
+/// The realistic route, and the one that actually runs the tag reconcile: a file that has been
+/// synced for weeks, into which someone types a `#base=` **while editing the line**.
+///
+/// The edit to the title is not decoration. A `#base=` on its own changes no *document* — `render`
+/// omits it from the disk parse and from the re-rendered base alike — so the direction machinery
+/// sees nothing changed and the `Normalized` arm quietly rewrites the file without ever calling
+/// `apply_doc`. That version of this test passed with the reconcile's skip removed, which is the
+/// definition of vacuous. With a real edit beside it the file imports, `reconcile_authored` is
+/// handed a document declaring `base=`, and the skip is what stops it reaching the store.
+#[test]
+fn a_reserved_facet_typed_into_a_settled_file_is_stripped_and_never_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate),
+        1,
+        "setup: the file should be settled"
+    );
+
+    let typed = TASKS_MD.replace(
+        "- [ ] Set up CI ^setup",
+        "- [ ] Set up the CI #base=setup:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ^setup",
+    );
+    assert_ne!(typed, TASKS_MD, "setup: the edit must change the line");
+    fs::write(&file, &typed).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the hand-typed modifier failed the reconcile: {:?}",
+        report.failed()
+    );
+    assert_eq!(
+        report.count(Outcome::Imported),
+        1,
+        "this must go through the import arm, or the tag reconcile never runs: {report:?}"
+    );
+    assert!(
+        tags_of(&db, &format!("{uri}#setup")).is_empty(),
+        "a hand-typed `#base=` reached the store: {:?}",
+        tags_of(&db, &format!("{uri}#setup"))
+    );
+    // The edit itself was taken, so the assertion above is about the modifier and not about a
+    // reconcile that failed silently and imported nothing.
+    assert_eq!(
+        content_for(&db, &format!("{uri}#setup")).as_deref(),
+        Some("Set up the CI"),
+        "the edit beside the modifier was not imported"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        TASKS_MD.replace("Set up CI", "Set up the CI"),
+        "the modifier was left on disk, where the next sync would keep re-reading it"
+    );
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+}
+
+/// The same two facts across **every mount mode**, because that axis has produced the same shape
+/// of must-fix three passes running: an arm that behaves differently on an export-only or
+/// import-only mount, with nothing testing it.
+///
+/// Two invariants, and they are the harm rather than the outcomes — which legitimately differ per
+/// mode, since only an exporting mount rewrites the file:
+///
+/// 1. a `#base=` in the file never reaches the store, and never fails the reconcile;
+/// 2. a cut point already recorded for a task in that file is still there afterwards;
+/// 3. a mount that writes the file does not write a cut point into it.
+///
+/// Both sides move, on different items, so every mode does real work rather than skipping: the
+/// disk edit alone is nothing for an export-only mount to act on, and an arm that never ran is an
+/// assertion that cannot fail. Export-only is checked **first**, because a matrix that fails fast
+/// on its easiest case proves nothing about the others.
+#[test]
+fn no_mount_mode_lets_a_file_write_or_erase_a_cut_point() {
+    for mode in [SyncMode::Export, SyncMode::Import, SyncMode::Bidirectional] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tasks.md");
+        fs::write(&file, TASKS_MD).unwrap();
+        let uri = uri_for(&file);
+
+        // Import once on a bidirectional mount so the tasks exist whatever the mode under test —
+        // an export-only mount has nothing to reconcile against an empty KB.
+        let db = Db::open_in_memory().unwrap();
+        mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+        sync(&db, "docs/plan").unwrap();
+
+        let cut = "setup-branch:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        record_cut_point(&db, &format!("{uri}#setup"), cut);
+
+        mount_dir(
+            &db,
+            "docs/plan",
+            dir.path(),
+            mode,
+            "tasks",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+
+        // A hand-typed cut point on a *different* task, beside a real edit so the file genuinely
+        // changed (a modifier alone renders away and never reaches the reconcile).
+        fs::write(
+            &file,
+            TASKS_MD.replace(
+                "- [x] Ship button ^ship",
+                "- [x] Ship the button #base=ship:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ^ship",
+            ),
+        )
+        .unwrap();
+        // …and a KB-side change on a third task, so an export-only mount has something to write
+        // rather than skipping the pass entirely.
+        kb_set_status(&db, &format!("{uri}#fix"), "in_progress");
+
+        let report = sync(&db, "docs/plan").unwrap();
+        assert!(
+            report.failed().is_empty(),
+            "{mode:?}: the reconcile failed on a hand-typed modifier: {:?}",
+            report.failed()
+        );
+        assert!(
+            tags_of(&db, &format!("{uri}#ship")).is_empty(),
+            "{mode:?}: a task line authored a cut point: {:?}",
+            tags_of(&db, &format!("{uri}#ship"))
+        );
+        assert_eq!(
+            tags_of(&db, &format!("{uri}#setup")),
+            vec![(jkb_core::tag::FACET_BASE.to_owned(), cut.to_owned())],
+            "{mode:?}: syncing the file erased a recorded cut point"
+        );
+        // The mount had a cut point in the store and a task line to write; whatever it wrote, it
+        // must not have put the cut point on disk. (Nothing is written on an import-only mount,
+        // where the file keeps whatever the hand typed into it.)
+        if mode != SyncMode::Import {
+            let on_disk = fs::read_to_string(&file).unwrap();
+            assert!(
+                !on_disk.contains("#base="),
+                "{mode:?}: a cut point was written into the file: {on_disk}"
+            );
+        }
+    }
+}
+
+/// Recording a cut point must not make a task's line **uneditable**.
+///
+/// The engine detects per-item edits by comparing the assembled KB signature against the base
+/// document parsed back out of the file — and a cut point is never in the file. Carried into the
+/// assembled side it makes that item look permanently KB-edited, so the next disk edit to the same
+/// line is a same-item change on both sides: a conflict, which under `manual` writes nothing and
+/// flags the file. A review finding is a file-backed task, and `jkb task work` on one records a cut
+/// point, so this is the ordinary case rather than a corner.
+#[test]
+fn recording_a_cut_point_does_not_turn_the_next_disk_edit_into_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    record_cut_point(
+        &db,
+        &format!("{uri}#fix"),
+        "fix-branch:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    );
+
+    // A KB change on a *different* task, so the file-level decision is "both sides moved" and the
+    // three-way per-item comparison actually runs. Without it the cut point is invisible to the
+    // whole-file hashes and this never reaches the merge.
+    kb_set_status(&db, &format!("{uri}#ship"), "in_progress");
+    // …and a disk edit to the line of the task that holds the cut point.
+    fs::write(
+        &file,
+        TASKS_MD.replace("Fix flaky test", "Fix the flaky test"),
+    )
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Conflict),
+        0,
+        "editing the line of a task that holds a cut point was reported as a conflict: {report:?}"
+    );
+    assert_eq!(
+        report.count(Outcome::Merged),
+        1,
+        "the two disjoint edits should have merged: {report:?}"
+    );
+    assert_eq!(
+        content_for(&db, &format!("{uri}#fix")).as_deref(),
+        Some("Fix the flaky test"),
+        "the disk edit was refused because the task held a cut point"
+    );
+}

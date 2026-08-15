@@ -19,9 +19,28 @@
 //! each answering *"is a base already recorded for this branch?"* from a different proxy.
 //!
 //! So that question has exactly one implementation here ([`ensure_recorded`]), the reader's
-//! question has exactly one ([`resolve`]), they sit next to each other so the deliberate
-//! asymmetry between them is visible in one screen, and [`FACET`] is **private**: no other module
-//! can spell the facet, format a `<branch>:<sha>` value, or take one apart.
+//! question has exactly one ([`resolve`]), and they sit next to each other so the deliberate
+//! asymmetry between them is visible in one screen.
+//!
+//! ## What stops a fifth route — and where it lives
+//!
+//! Keeping the facet name private to this module was the first attempt at that, and it was not
+//! enough: a fifth route turned up in **another crate**. `jkb-sync`'s engine applies the `#f=v`
+//! modifiers parsed out of a synced `tasks.md` line straight to the store, so a `#base=<sha>`
+//! typed into a mounted file — `.codereviews/<run>/tasks.md` is exactly such a mount — reached
+//! the store without passing [`rejected`] or [`is_object_id`] at all. A private constant cannot
+//! bind a crate that never wanted to spell it.
+//!
+//! So the reservation itself now lives at the store, in [`jkb_core::tag`]: [`apply`](jkb_core::tag::apply)
+//! refuses a reserved facet, [`reconcile_authored`](jkb_core::tag::reconcile_authored) makes one
+//! invisible to file sync in both directions, and [`apply_reserved`](jkb_core::tag::apply_reserved)
+//! is the privileged door this module comes through. `jkb-core` therefore knows the *string*
+//! `base` — [`jkb_core::tag::FACET_BASE`], which [`FACET`] is defined as, so there is still only
+//! one of it. That is a real, deliberate weakening of "no other module can spell the facet", and
+//! it buys something better: spelling it no longer helps, because the store refuses the write.
+//! What stays here is everything that makes a cut point mean something — the `<branch>:<sha>`
+//! encoding, [`resolve`]'s attribution rules, and the admissibility rule in [`rejected`]. Nothing
+//! outside this module may format or take apart one of those values.
 //!
 //! There are three more things anyone can want of a cut point, and each has one implementation
 //! here too: **measure** it ([`ensure_recorded`], which is why callers pass no value —
@@ -44,8 +63,10 @@ use rusqlite::Connection;
 
 use crate::repo::{facet_values, FACET_BRANCH};
 
-/// The facet the cut point is stored under. **Private on purpose** — see the module docs.
-const FACET: &str = "base";
+/// The facet the cut point is stored under, still spelled once — but the one spelling now lives
+/// in `jkb-core`, which is what lets the *store* refuse a write nobody here could see coming.
+/// See the module docs.
+const FACET: &str = tag::FACET_BASE;
 
 /// The verb that writes a cut point, named in every refusal so the remedy is always reachable.
 pub(crate) const VERB: &str = "jkb task base <uid> <branch> <sha>";
@@ -57,8 +78,12 @@ pub(crate) const VERB: &str = "jkb task base <uid> <branch> <sha>";
 /// string in an earlier error message named that exact command, and `/task-swarm` was changed to
 /// run it — so the tool was instructing its users to destroy the records it then refused to act
 /// without.
+///
+/// Delegates to [`jkb_core::tag::is_reserved`] rather than re-deciding: the store is what enforces
+/// this now, and a second predicate here would be a second answer to drift from it. What this
+/// wrapper adds is the *surface* — the CLI can name [`VERB`] in its refusal, which core cannot.
 pub(crate) fn is_reserved_facet(facet: &str) -> bool {
-    facet == FACET
+    tag::is_reserved(facet)
 }
 
 /// Whether `value` is a full object id — the only form a cut point may be **stored** in.
@@ -144,6 +169,11 @@ pub(crate) enum Missing {
     /// Not standing in the task's own repository, so nothing here could honestly measure it.
     /// Carries the repository it wanted, so no caller can name the wrong one in the remedy — one
     /// of the two did, telling the user to re-run from the checkout that had just refused them.
+    ///
+    /// The name is read from the task's `repo=`, which is the same value
+    /// [`crate::repo::measure_root_for`] compared the checkout against. That equality is what
+    /// [`crate::repo::set_location_facets`] writes the context facets *before* the branch for; do
+    /// not reorder it back.
     NotThisRepo(String),
     /// The branch does not exist in this repository yet.
     NoSuchBranch,
@@ -597,8 +627,15 @@ fn measure_git(
 /// Violating the second is the defect this module has now had three times, by three different
 /// routes: a fallback that returned the tip, an adopted legacy value that beat the measurement,
 /// and a caller naming the branch as its own parent so the merge-base came back as the tip. Each
-/// was fixed where it happened. This is the check that makes a fourth route impossible — and it
-/// binds `jkb task base` too, where the sha nearest a user's hand is `git rev-parse <branch>`.
+/// was fixed where it happened. This is the check that no writer *reaching this module* can walk
+/// around — [`write`] enforces it, so `jkb task base` is bound too, where the sha nearest a user's
+/// hand is `git rev-parse <branch>`.
+///
+/// Reaching this module is the part that is not this function's doing, and the part a fourth
+/// route once got around: `jkb-sync` wrote the facet without ever calling anything here. What
+/// makes that impossible now is not a check but a **reservation at the store** —
+/// [`jkb_core::tag::apply`] refuses the facet, so [`write`] is the only way in and this rule is
+/// therefore on the only path. See the module docs.
 ///
 /// **"No commits of its own" describes two states, and this refuses both the same way.** A branch
 /// that was never started, and one whose commits were fast-forwarded away into its batch or trunk,
@@ -710,7 +747,11 @@ pub(crate) fn write(
             tag::remove(conn, meta, id, &f, &v)?;
         }
     }
-    tag::apply(conn, meta, id, FACET, &qualified)
+    // The privileged door. `tag::apply` refuses this facet outright, which is what makes every
+    // other writer in the workspace — including ones in crates that have never heard of a cut
+    // point — unable to reach the store with one. This line is the single exception, and it is
+    // below both checks above.
+    tag::apply_reserved(conn, meta, id, FACET, &qualified)
 }
 
 #[cfg(test)]
@@ -749,7 +790,11 @@ mod tests {
                 },
             )?;
             for (f, v) in &pairs {
-                tag::apply(conn, meta, id, f, v)?;
+                // `apply_reserved`: `tag::apply` refuses `base=` now, which is the point of the
+                // reservation — but these fixtures have to be able to build the states a real
+                // database still holds, including the legacy and hand-planted values that
+                // predate it.
+                tag::apply_reserved(conn, meta, id, f, v)?;
             }
             Ok(id)
         })

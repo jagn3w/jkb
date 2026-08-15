@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use jkb_core::blob;
 use jkb_core::dsl::{slug, tokenize, unquote};
+use jkb_core::tag;
 use jkb_types::{EdgeType, Error as TypeError};
 
 use super::{SyncBlock, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
@@ -383,7 +384,16 @@ fn render_task(
     if let Some(d) = &item.due {
         parts.push(format!("@{d}"));
     }
-    for (facet, value) in &item.tags {
+    // A reserved facet is jkb's own coordination state (design D46) and has no business in a file
+    // the user commits, so it is never written out. This covers the value that came off the
+    // **disk** — parsed from a hand-typed `#base=`, which the store then refuses — and it is what
+    // makes the round trip *settle*: every document the engine compares goes through this one
+    // function, so the disk parse and the re-rendered base lose the modifier together and the file
+    // is normalized once rather than disagreeing with the KB forever. (The value that came from
+    // the **KB** is excluded a step earlier, by `assemble_kb_doc`; it has to be, or the item's
+    // signature would differ from the base's and every later disk edit to that line would be a
+    // conflict.)
+    for (facet, value) in item.tags.iter().filter(|(f, _)| !tag::is_reserved(f)) {
         parts.push(format!("#{facet}={value}"));
     }
     for m in &item.mirrors {

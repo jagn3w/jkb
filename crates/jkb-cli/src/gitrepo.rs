@@ -281,10 +281,11 @@ pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Resul
     // had already been pushed.
     let created = ensure_branch(dir, branch, start)?;
     if let Err(e) = git_must(dir, &["worktree", "add", &path_s, branch]) {
-        // Undo the branch this call created, or the retry sees it as pre-existing and reports
-        // `created == false` — and the caller then keeps the cut point of whatever branch had the
-        // name before, which is the exact inheritance the return value exists to prevent. The
-        // branch is seconds old and carries nothing, so there is nothing to lose by removing it.
+        // Undo the branch this call created: a failed `git worktree add` must not leave behind a
+        // branch the user never asked for, cluttering `git branch` and the staging listing (which
+        // derives its rows from branches that exist). Only the branch this call cut is removed —
+        // it is seconds old, has no checkout and carries nothing, so there is nothing to lose —
+        // and one that was already there is left strictly alone.
         if created {
             let _ = git_run(dir, &["branch", "-D", branch])?;
         }
