@@ -13,6 +13,7 @@ mod store;
 
 pub mod binding;
 pub mod blob;
+pub mod branch;
 pub mod claim;
 pub mod containment;
 pub mod dsl;
