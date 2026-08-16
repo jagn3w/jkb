@@ -483,7 +483,8 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   parent's home); `jkb task show` lists them and says why the parent is held. Deliberately no
   status rollup: auto-close is a separate, git-triggered decision, and two mechanisms racing
   to close one task is how it closes for the wrong reason.
-- **`jkb task start <uid>`** claims the task *and* tags `branch=`/`repo=`/`base=` from the
+- **`jkb task start <uid>`** claims the task *and* records `branch=`/`repo=`, its land target and
+  its measured cut point, from the
   ambient git repo — one moment, one command, so the tag is never missing on exactly the
   tasks that needed it. It refuses the trunk branch (which would auto-close instantly).
 - **Merge detection is strategy-agnostic** (`jkb-cli/src/gitrepo.rs`). `--is-ancestor` and
@@ -491,7 +492,7 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   it rewrites the branch into one new commit. The check that works for all three asks a
   different question — `git merge-tree --write-tree trunk branch` equalling trunk's own tree
   means the branch **adds nothing**, however it landed. Falls back to `--is-ancestor` on git
-  <2.38 and *says so*. `base=` exists because refs alone cannot separate a rebase-merged
+  <2.38 and *says so*. A recorded cut point exists because refs alone cannot separate a rebase-merged
   branch (GitHub fast-forwards, leaving it byte-identical to trunk) from one just created.
 - **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
   is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
@@ -568,7 +569,7 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
 - **The land target** is the branch you started from — unless that is trunk, in which case a
   branch is cut from trunk named after the first task and sessions hang off *that* (landing on
   trunk would make every task read as merged, D34.3). Later sessions join the batch the live
-  ones share. Recorded as the `onto=` tag beside D34's `branch=`/`repo=`/`base=`.
+  ones share. Recorded as `branch_records.land_target`, beside the branch's measured cut point.
 - **The gate is remembered per repo** in `namespaces.metadata.gate` on `repos/<repo>`:
   `--gate` wins, then the stored command, then autodetect (`scripts/check.sh`, `scripts/test.sh`,
   `make test`) — and a flag or a detection is *stored*, so the guess is made once. The chosen
@@ -595,203 +596,121 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   session branch whose commits may be pushed), `create_branch` takes `start` literally (the caller
   is *making* one, and a stale namesake on the remote must not be adopted in its place). Folding
   both into the primitive made it ignore its own `start` argument.
-- **Location facets are set, not added.** `branch=`/`repo=`/`onto=` go through `set_facet`, which
+- **Location facets are set, not added.** `branch=`/`repo=` go through `set_facet`, which
   clears the facet's other values first. `tag::apply` is additive, which is right for open-ended
   facets and wrong here: a second `branch=` is a contradiction, not extra information, and readers
   that collapse the multi-map pick one and mint a second session for a task that already has one.
   `task_tags` therefore returns **all** values per facet, and the session lookup matches a task's
   recorded branches against the worktrees that actually exist.
-- **The cut point is not a location facet — `jkb-cli/src/base.rs` owns it (D46).** "Branch X was
-  cut from commit Y" is a fact about a *branch*, but tags key on `(item, facet)`, so the branch
-  has to be encoded into the value (`base=<branch>:<sha>`). That encoding leaked to ~12 sites and
-  **four consecutive review passes each found a different one holding a different theory of it**.
-  None were reader bugs — given a correct record, `close-merged` and `review record` have always
-  agreed across all four states (no base / this branch / another branch only / legacy bare). They
-  were three *writers* answering **"is a cut point already recorded for this branch?"** from three
-  different proxies: `task work` from `resumed` (worktree existence — wrong after `abandon`, which
-  keeps the branch), `task start` from a check that discarded a legacy value and substituted
-  today's trunk tip, and `jkb task tag set base=` from nothing at all (`set_facet` clears the
-  facet's other values, i.e. **other branches' records** — and that command was the remedy the old
-  error message named *and* what `/task-swarm` ran).
-  - The fix is a choke point, not a fourth rule. The writer's question has one implementation
-    (`ensure_recorded`, which never overwrites and *adopts* an attributable legacy value instead of
-    replacing it), the reader's has one (`resolve`), and they sit adjacent so the deliberate
-    asymmetry between them is visible in one screen. `landed_for_action` resolves the cut point
-    itself from the task's tags rather than taking it as a parameter every caller had to remember
-    to derive per branch.
-  - **The reservation lives in `jkb-core::tag`, not in `base.rs`** — because a private constant
-    cannot bind a crate that never wanted to spell it. Keeping `FACET` private to `base.rs` was the
-    first version, and a **fifth** route turned up in a different crate: `jkb-sync`'s engine applies
-    the `#f=v` modifiers parsed out of a synced `tasks.md` line straight to the store, so a
-    `#base=<sha>` typed into a mounted file — `.codereviews/<run>/tasks.md` is exactly such a mount
-    — reached the store without meeting `rejected` or `is_object_id` at all. So the store enforces
-    it now: `tag::apply` **refuses** a reserved facet, `tag::reconcile_authored` (file sync's tag
-    seam) makes one invisible in **both** directions, and `tag::apply_reserved` is the one
-    privileged door, called only by `base::write`. Core therefore knows the string `base`
-    (`tag::FACET_BASE`, which `base.rs`'s `FACET` is defined as, so there is still one of it) — a
-    deliberate weakening of "no other module can spell it" that buys something better: **spelling
-    it no longer helps.** `base.rs` still owns everything that makes the value mean something —
-    the `<branch>:<sha>` encoding, `resolve`'s attribution, `rejected`'s admissibility rule — and
-    nothing outside it may format or take one apart. A reader-side fork-point check was considered
-    and **rejected**: a branch whose work was fast-forwarded away has no commits of its own, so
-    `rejected` admits only its tip, and a correct record would start reading as inadmissible —
-    `jkb task review record` would stop crediting landed swarm branches, which is the D38 flow.
-  - **Both halves of the sync-side skip are load-bearing, and the second is the dangerous one.**
-    The engine reconciles a file-backed item's tags to exactly what the file declares. A cut point
-    is deliberately *not* in the file — nothing writes it there — so a reconcile that read "absent
-    from the document" as "delete it" would erase the record on every sync of the file the task
-    lives in: worse damage than the fabricated value the first half refuses. And the refusal is a
-    **skip**, not an error: a user may type anything into a file, and erroring takes the whole
-    reconcile down over one modifier. `render` omits reserved facets too, so a stale `#base=` is
-    stripped from the file in one sync and then settles — rendering one while refusing to import it
-    is what makes `kb_changed` stick true and turns every later disk edit into a conflict.
-  - **A reserved facet is excluded from the `SyncDoc`, not merely from what `render` writes**
-    (`tag::authored_applications_for`, the read half of the pair). The engine detects per-item
-    edits by comparing the assembled KB side against the base parsed back out of the *file*, where
-    a cut point can never appear — so carrying one into the assembled side makes every task holding
-    one read as permanently KB-edited, and the next disk edit to that line comes back a **conflict**
-    that writes nothing. A review finding is a file-backed task and `jkb task work` on one records a
-    cut point, so that is the ordinary case. Pinned by
-    `recording_a_cut_point_does_not_turn_the_next_disk_edit_into_a_conflict`.
-  - `branch=` carries **no** such reservation. "`record_branch` is the only writer of `branch=`" is
-    a convention this crate keeps, not something the store enforces; say it that way.
-  - **Why it is stored at all, rather than derived.** A fork point *is* derivable — from `onto=` —
-    for as long as the parent branch exists. It has to be stored because **the parent is deleted
-    when the batch lands**, and `close-merged` asks afterwards. "Refs cannot separate landed from
-    never-started" is the reason a fork point is needed; this is the reason it is a record. Worth
-    stating, because a doc that under-justifies its own machinery invites the next pass to either
-    rip it out or bolt more onto it.
-  - **Putting a branch on a task and recording its cut point are one write** (`repo::record_branch`,
-    the only writer of `branch=`). Every incident in this area is those two facts written apart:
-    the swarm wrote `branch=` and no cut point; `jkb task tag set branch=` — which the guide
-    recommended, and which is therefore what the swarm used — did the same and went on doing it
-    after the swarm was fixed; `task work` re-stamped a cut point for a branch it was not
-    re-cutting. `add` still appends and `set` still replaces (a task can legitimately record two
-    branches, and every reader indexes both); neither can leave one without a cut point.
-  - **"May a cut point be measured here?" has one implementation** (`repo::measure_root_for`). It
-    had three — `task base` compared the task's `repo=` against the checkout it stood in, `task
-    start` compared the repo it was about to record, and `task tag set branch=` never asked — and
-    the one that never asked is what let a sibling checkout's namesake branch be recorded as a
-    task's verified cut point.
-  - **`--onto` names two things, and they come apart only at trunk**: the branch this one was
-    **cut from** (`Location::cut_from`, the measurement parent) and the branch it **lands on** (the
-    `onto=` facet). Trunk is a fine answer to the first and unacceptable as the second, so it is
-    measured against and not recorded — and a land target left from an earlier batch is cleared,
-    since the branch is no longer on one. A named parent that this repository does not have is
-    **refused**: storing it drops the task out of `jkb staging ls` and makes `task land` fail later
-    claiming a branch "no longer exists", which is not what happened.
-  - **`jkb task base <uid> <branch> <sha>`** is the only writer a user reaches by hand;
-    `jkb task tag add|set base=…` **refuses** and names it (`rm` still works — deleting a wrong
-    record leaves the branch with none, which both readers read as "do not act"). A *workflow*
-    should not reach it either — see the measurement rule below.
-  - **What is measured is the merge-base of the branch and its land target, not the branch's tip.**
-    The tip is only the cut point at one instant, the moment the branch is created, so the writer
-    had a hidden precondition: *call me before any work happens*. `/task-swarm` cannot — it can only
-    name a group's branch once an implementer has produced one — and each attempt to work around
-    that computed its own value. The integration branch's tip named a commit the group's branch
-    never sat on; then the group branch's own tip made `base == tip` permanently, so `is_merged`
-    answered `NothingToMerge`, `review record` bucketed every task of every group as unlanded, and
-    the land gate refused all of them: **strictly worse than the bug it replaced**. A merge-base is
-    the same commit whenever it is taken, so there is no longer a right moment to call the writer.
-    The tip is **not** a fallback: see the bullet below. When no parent is stated and the branch
-    already has commits, nothing is recorded and the reason is reported.
-  - **The target is what the caller states in the call, never the task's stored `onto=`.** Which
-    branch this one was cut from is something the caller knows *now*; the facet records an earlier
-    moment. A task carrying `onto=` from a previous batch, given a new branch cut from trunk, would
-    measure their merge-base — well behind the new branch's tip — so an empty branch identical to
-    trunk skips the freshly-cut guard and closes as merged. Naming the parent branch is not the
-    kind of judgement that went wrong four times; **computing a commit id** was, and callers still
-    cannot do that.
-  - **The tip is a measurement result under exactly one condition, and never a fallback.** A branch
-    with no commits of its own forked at its own tip, provably — that is the only case where the
-    tip is recorded. Everywhere else a failed measurement records **nothing** and says why
-    (`base::Missing`, surfaced as `base_missing_because` and as `close-merged`'s `undecidable`
-    bucket). Both read as "do not act", but nothing is *reported* and *repairable* by the next run
-    that can measure, while a tip is silent and permanent, since `ensure_recorded` never
-    overwrites. Three fallbacks here used to return the tip, and once the untouched case was
-    hoisted above them each was reachable **only** when the branch had work — that is, only where
-    the tip was the worst answer available. **No message anywhere may suggest passing a sha by
-    hand**, for the same reason: the sha nearest to hand is the branch tip.
-  - **"Has this branch done anything?" is asked of git, not inferred** (`gitrepo::has_own_commits`
-    — is any commit here reachable from no other branch, under `refs/heads` or *any* remote). It
-    needs no reference point, which is what makes a stale, wrong, unresolvable or *grandparent*
-    parent unable to change the one thing readers ask of the record. Its failure mode is safe by
-    construction: a mis-exclusion makes the branch look untouched, which records the tip only where
-    the tip is right and otherwise records nothing.
-  - **A record that cannot describe this branch is discarded before it blocks a measurement.** A
-    cut point is keyed by branch *name*, and a name outlives the branch that held it. No git fact
-    separates the old branch from the new one — but an untouched branch forked at its tip, so a
-    recorded value that is anything else on a branch with no commits of its own belongs to whatever
-    had the name before. That check needs nothing threaded from the caller; its predecessor was a
-    created-ness flag out of `worktree_add` that `jkb task start` could not supply and a crash
-    between the git write and the database write silently lost.
-  - **And a caller can still name the wrong branch, so trunk is the backstop.** The fork point is
-    the later of `merge-base(branch, onto)` and `merge-base(branch, trunk)` — commits reachable
-    from trunk are not this branch's doing either. Taking the later can only move the fork point
-    forward, and a later fork point can only make the freshly-cut guard fire *more* often, so the
-    invariant is: **every way of getting the parent wrong — omitting it, mistyping it, adopting a
-    branch someone else cut elsewhere — degrades towards holding the task, never towards closing
-    it.** With no parent at all the answer is the branch's tip, which is the most conservative
-    value there is; using trunk alone there would be *less* conservative and would reopen the
-    cut-from-staging bug (a branch cut from a staging branch is ahead of its merge-base with trunk
-    before anything happens).
-    - A parent that **does not resolve** is therefore treated as no parent at all, not silently
-      dropped in favour of the trunk-only backstop. Dropping it looks harmless and is the one
-      direction that matters: for a branch cut from staging, a trunk-only merge-base sits behind
-      its real origin, which would make a mistyped `--onto` strictly worse than omitting one.
-    - `gitrepo::trunk` now **verifies its own answer resolves** on the `origin/HEAD` arm, which the
-      fallback arm always did. A dangling symref (default branch renamed, `origin/main` pruned) was
-      survivable while `ahead_count` quietly answered zero, and stopped being the moment it started
-      refusing — it took the whole of `staging ls`, and so both UI surfaces, down with it.
-  - **A branch is identified by name, and a name outlives the branch that held it.** Delete a
-    branch, cut a fresh one under the same name, and the old record still resolves and still
-    differs from the new tip — guard skipped, empty task closed. The signal is derived from git,
-    not carried by the caller: **an untouched branch forked at its own tip**, so a recorded value
-    that is anything else, on a branch with no commits of its own, belongs to whatever had the
-    name before. A `worktree_add`-created-ness flag was tried first and removed: `jkb task start`
-    could not supply it and a crash between the git write and the database write lost it. The
-    known false positive — a branch whose work was *merged away* looks untouched too — costs a
-    missed close rather than a false one, and is pinned as such.
-  - **`--onto` names two things that only come apart at trunk**: the branch this one was **cut
-    from** (a measurement reference, `Location::cut_from`) and the branch it **lands on** (the
-    `onto=` facet). Trunk is a fine answer to the first and an unacceptable one to the second
-    (D34.3), so it is measured against and not recorded. Refusing the flag outright left a branch
-    genuinely cut from trunk, with commits already on it, able to record only `base == tip` —
-    permanently `NothingToMerge` — with a hand-computed merge-base as the only way out.
-  - **So `/task-swarm` computes nothing: it runs `jkb task start --branch <group> --onto
-    <integration>`.** One command for `branch=`/`repo=`/`onto=`/the cut point, idempotent under the
-    run's own claim, and no value it could get wrong — it states the branch it *told the implementer
-    to branch off*, which it knows for certain. Every previous fix here gave the swarm a *better
-    value to compute*; the defect was that it computed one at all.
-  - **Deleting a branch takes its cut point with it** (`base::forget`, called by
-    `task abandon --delete-branch`). Abandoning frees the branch *name* while leaving the task live,
-    so the next `task work` cuts a new branch under it — and the dead record still resolved, still
-    differed from the new tip, so the freshly-cut guard was skipped and `close-merged` closed a task
-    with nothing written on it. `forget` drops exactly what `resolve` would hand that branch,
-    legacy-attribution rule included, so it cannot leave behind the one value the reader will lend.
-  - **Only a full object id may be stored, and the rule is about form rather than reachability.**
-    A symbolic revision (`HEAD`, `main`, `@`) is the dangerous value precisely because it resolves
-    in *every* clone, to something different in each: stored and re-resolved later it names an
-    unrelated commit, `is_merged` skips its freshly-cut guard, and a task with no work on it
-    closes. A *foreign* object id is harmless by comparison — it simply does not resolve, and both
-    readers decline to act. So `base::is_object_id` (40 hex, or 64 for a sha-256 repo) gates the
-    write in `base.rs`, **not** at the CLI verb, because the verb is not the only writer —
-    `jkb task add "… #base=HEAD"` reaches `tag::apply` directly — and it gates the read too, since
-    a value predating the check never passed the write.
-  - **`git rev-parse` is a parser, not a lookup.** Handed a 40-character hex string it exits 0 and
-    echoes it back for an object the repo does not have, so `gitrepo::rev` answers "is this
-    spellable". Anything asking "is this a commit I have" uses `gitrepo::rev_commit`
-    (`--verify --quiet <ref>^{commit}`), which `exists()` is expressed in terms of. Using the
-    parser as an existence check closed an empty branch as merged.
-  - **`jkb task base` validates only where it can.** The database is global across repos (D32), so
-    the command runs from anywhere; resolution and refusal are gated on the **same** condition —
-    standing in the task's own repo — because gating only the refusal let a sibling checkout's
-    commit id be recorded as verified. Elsewhere the value is kept verbatim and the fact that
-    nothing checked it is printed.
-  - **A git ref (`refs/jkb/base/<branch>`) was considered and rejected.** It would make per-branch
-    keying structural, but jkb runs inside other people's professional repositories and must not
-    decorate them with refs the user never asked for. Coordination stays in the store; git is for
-    branches and commits.
+- **A branch is a record, not a tag value (D46, re-founded by the B-series).** "Branch X was cut
+  from commit Y", "X lands on Y", and "jkb merged X into Y" are facts about a *branch*. They lived
+  as tag applications on whichever tasks happened to name the branch, and tag applications are
+  **item-keyed, multi-valued, untyped and writable from any route**. Each of those four properties
+  produced its own family of defects across fifteen review passes — 47 findings, 100 in the wider
+  cluster, 20 must-fix:
+  - item-keyed → the per-branch fact had to be encoded into the value (`base=<branch>:<sha>`), and
+    that encoding leaked to ~12 sites with their own attribution rules;
+  - multi-valued → the documented repair (`jkb task tag set base=`) **deleted other branches'
+    records**, and records otherwise accumulated;
+  - untyped → `HEAD` stored verbatim; a 40-hex string that is no commit accepted;
+  - open-write → five write routes had to be taught the rule one at a time, the fifth found *after*
+    a store-side reservation was added for the other four, and the reservation's own asymmetry was
+    itself a must-fix.
+  Six ascending choke points did not close it. The fix is the one D40 and D45 already made twice:
+  **prefer an invariant the schema enforces over one every caller must uphold.** `branch_records`
+  (migration `V013`, `jkb_core::branch`) is keyed `(repo, branch)`, so the encoding, the
+  attribution rules and the question *"which branch does this value belong to?"* stop existing.
+  Design: `openspec/changes/jkb-branch-records/`.
+  - **D38.1's "no table" clause is repealed, openly — its *argument* is kept.** Branch **existence**
+    is still derived from refs (`gitrepo::branch_ref(s)`), and no row is ever evidence a branch
+    exists. What is stored is only the facts git does not own. The argument against a stored entity
+    was always about copying a git-owned fact and then needing to reconcile it.
+  - **`branch=` deliberately does **not** move.** "Which branch is this task on" is genuinely
+    item-keyed, legitimately multi-valued, and round-trips through a synced `tasks.md` line. The
+    findings there (`work_branch`, `close-merged`'s picker, `task abandon`) are **choice-rule**
+    defects; a table permits two rows just as a facet permits two values and fixes none of them.
+    `repo=` stays too, and is also the row's key column — that duplicates a *value*, not a fact.
+  - **`onto=` does move**, to `land_target`. It was branch-keyed by accident of having one writer:
+    two tasks on one branch could record different targets, and `None` could not be told from
+    "never recorded". Now NULL on an existing row means *lands on trunk / on no batch* and a
+    missing row means *unknown*. `reviewed=`/`review=` stay facets — nothing in the corpus is about
+    their cardinality.
+  - **Measurement is unchanged, and `jkb-cli/src/base.rs` still owns all of it.** Core owns storage
+    and the CHECK; core does not shell out to git. Every rule below survives verbatim.
+    - **The tip is a measurement result under exactly one condition, and never a fallback.** A
+      branch with no commits of its own forked at its own tip, provably (`untouched_tip`, the one
+      place that is turned into a value). Everywhere else a failed measurement records **nothing**
+      and says why (`base::Missing` → `base_missing_because`, `close-merged`'s `undecidable`
+      bucket): nothing is *reported and repairable*, a tip is silent and permanent.
+    - **What is measured is a merge-base, not a tip** — the same commit whenever it is taken, which
+      is why there is no longer a right moment to call the writer. `/task-swarm` can only name a
+      group's branch after an implementer has committed on it.
+    - **The parent is what the caller states in the call**, never a stored land target, which
+      records an earlier moment.
+    - **"Has this branch done anything?" is asked of git** (`has_own_commits`), so a stale, wrong,
+      unresolvable or *grandparent* parent cannot change the one thing readers ask of the record.
+    - **The backstop:** the fork point is the later of `merge-base(branch, onto)` and
+      `merge-base(branch, trunk)`. Every way of getting the parent wrong degrades towards **holding
+      the task, never towards closing it**.
+  - **The staleness rule is the write's *shape*, not a step in it.** A branch name outlives the
+    branch that held it, so a recorded value on an untouched branch that is not its tip belongs to
+    whatever had the name before. That is no longer `forget` ∘ insert: it is the `WHERE` clause of
+    `branch::record_cut_point`'s single `INSERT … ON CONFLICT DO UPDATE`, which clears the
+    predecessor's `landed_*` in the same statement. A port cannot drop it by omission or
+    mis-sequence it — there is no sequence. What `base.rs` contributes is the *evidence*:
+    `Cut::UntouchedTip` versus `Cut::Fork`, constructed only from `untouched_tip`'s answer.
+  - **The instance anchor is the one sound read-time check, because it is not a signature.** Three
+    states present one identical observable signature — no commits of its own, record ≠ tip, adds
+    nothing to trunk: rebase-ff-merged externally, merge-commit-merged externally, and a recycled
+    name. D34.2 requires closing the first and D34.4 forbids closing the last, so **no signature
+    predicate evaluated at read time can be right**. A branch's *creation reflog entry* separates
+    them: written once per instance, destroyed by the deletion that ends it, forged by no verb
+    (`branch -f`/`checkout -B` append `Reset`-class entries), and its loss is structurally
+    detectable because expiry removes oldest-first and only a creation entry has `old = zeros`.
+    Stored as `(anchor_sha, anchor_ts)` — the pair, because recreating a branch from the same start
+    point yields the same sha. **Not the message text**, which varies (`from main` / `from HEAD` /
+    `from main~0`), and not `git log -g --format=%ct`, which prints the *commit's* time.
+    - A **mismatch** is positive proof of recycling: it supersedes on the write side and refuses to
+      act on the read side (`base::stale_instance`, `close-merged` and `review record`).
+    - A **match plus a `commit`-class-only journal** licenses *retaining* a record on an untouched
+      branch — the merged-away case, whose fork point discard-and-hold used to throw away. That
+      relaxes a previously pinned direction, knowingly; unknown entry classes fail **closed**.
+    - **Absent or truncated declines**, degrading to the untouched-tip predicate. Every failure
+      mode lands on the old behaviour, never on a new close. Coverage is *established*, not
+      assumed: `gc.refs/heads/<branch>.reflogExpire = never` is written beside the record (exact
+      ref, so no naming scheme is needed) and removed when the branch is forgotten; `jkb doctor`
+      reports entries for branches nothing records.
+    - Residual, stated rather than guaranteed over: recycling where the anchor is unverifiable
+      (reflogs off, hand-expired, or read in a different checkout), plus the remote-only path.
+  - **Landing is an event where jkb performs it** — `jkb task land` after its gate is green, and
+    `jkb task landed <branch> --onto <target>` for the merge queue, which is bash. It does not
+    replace the inference, it *shrinks its domain*: from one branch per task to one per batch, and
+    the survivor is the branch whose cut point is provable. `landed_head` — the branch's own tip at
+    that moment — is what stops the event re-creating the same name-staleness one column over; the
+    event is credited only while the branch still points there **or is gone**. The queue's verb is
+    a new write route for a trusted fact, so it refuses unless the work really is in the target,
+    judged by the same predicate readers use (**not** by ancestry: the queue rebases a detached
+    HEAD, so every entry after the first has rewritten commits and its tip is no ancestor of the
+    target).
+  - **No verb anywhere accepts a commit id.** `jkb task base <uid> <branch> <sha>` produced three
+    findings across three passes, all the same shape — the sha nearest a user's hand is the branch
+    tip, and a cut point equal to the tip freezes the task at `NothingToMerge` with no repair path.
+    Each was fixed by rewording a message; there are only so many messages. It is now
+    **`jkb task base --forget <branch>`**, which drops the cut point (not the row: the branch still
+    exists, and taking its land target with it would drop the task out of `jkb staging ls` as a
+    side effect of repairing a commit id). `branch::forget` — the row delete — is
+    `abandon --delete-branch`'s verb, where the branch really is gone.
+  - **The transition deleted and back-filled nothing.** Back-filling imports exactly the values
+    five passes proved unreliable; leaving them inert was unsafe once the reserved-facet apparatus
+    went, since a surviving `base=` on a file-backed task would start exporting `#base=…` into
+    synced files. The rows and the reservation had to go together.
+  - **`V013` locks older binaries out of the global `~/.jkb/jkb.db`.** Accepted: `V012` already did
+    on this branch, so anything that can open the database today is built from `staging-workflow`.
+  - **A git ref (`refs/jkb/base/<branch>`) is still rejected.** jkb runs inside other people's
+    professional repositories and must not decorate them with refs the user never asked for.
+    Writing `.git/config` locally is judged differently — like `.git/info/exclude` (D36) it is
+    local, unpushed, and cannot leak via push.
+
 - **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
   whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
   would wedge landing until the directory was deleted by hand), and it is removed once its batch
@@ -824,8 +743,8 @@ linearly, the gate runs on the integrated result — reached by hand instead of 
 coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
 
 - **A staging branch is derived, never stored.** It is any git branch named by some task's
-  `onto=` facet that still exists. There is no `kind='staging'` item and no table: which
-  branches exist and which tasks are on them live in the facets, sessions live in git
+  branch's `land_target` that still exists. There is no `kind='staging'` item: which branches
+  exist comes from git and which tasks are on them comes from the records, sessions live in git
   worktrees, merge state comes from `gitrepo::is_merged` (squash-safe, D34.2). A staging
   *item* would copy facts git owns and then need reconciling — the failure D36.2 avoided by
   refusing a session state file.
@@ -867,15 +786,17 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   the findings decide landing. Recording a review is the **only** author of that transition.
 - **`jkb task tag set`** is the sibling of `add`/`rm` that makes a value a facet's only one.
   `add` stays additive, honest to its name — an open-ended facet legitimately holds several
-  values. `set` is for `branch=`/`onto=`/`repo=`, where a second value is a
-  contradiction and a reader collapsing the multi-map picks one at random (D36.6). Load-bearing
-  because `/task-swarm` re-tags a group on every pass. **It refuses `base=`** — that one is
-  per-branch, so replacing the facet's other values deletes another branch's record; see the
-  cut-point note in D36 above and use `jkb task base`.
-- **The swarm records where it is working.** `/task-swarm` sets `onto=<integration>`/`repo=` at
-  claim, and runs `jkb task start --branch <group-branch>` once the implementer has one — which
-  records `branch=`/`repo=` and *measures* the cut point, so the swarm supplies no value it could
-  get wrong (see the measurement rule under D46). `staging ls` then shows swarm work and
+  values. `set` is for `branch=`/`repo=`, where a second value is a contradiction and a reader
+  collapsing the multi-map picks one at random (D36.6). Load-bearing because `/task-swarm` re-tags
+  a group on every pass. **It refuses `onto=`** — where a branch lands is a fact about the branch
+  and lives in its record, so a facet of that name would reach no reader; use
+  `jkb task work --onto` / `task start --onto`.
+- **The swarm records where it is working.** `/task-swarm` sets `repo=` at claim, and runs
+  `jkb task start --branch <group-branch> --onto <integration>` once the implementer has one —
+  which records `branch=`/`repo=`, the land target and the *measured* cut point in one write, so
+  the swarm supplies no value it could get wrong (see the measurement rules under D46). The land
+  target cannot be recorded at claim, because at that point the group has no branch and the target
+  is a fact about a branch. `staging ls` then shows swarm work and
   hand-driven work in one view rather than the half it was told about. `/review-log` calls
   `jkb task review record` after mounting its findings, and says whether the branch can land.
 - **Deliberately unchanged:** `scripts/merge-queue.sh`. The swarm already runs a fresh

@@ -244,19 +244,19 @@ Return ok=true with a one-line confirmation. Do not fabricate changes.`
 }
 
 function claimPrompt(group, verb) {
-  // On claim, also record WHERE the work is landing. `onto=` is the integration branch, and
-  // it is the same facet `jkb task work` writes for a hand-driven session — so `jkb staging
-  // ls` sees swarm work and manual work in one view instead of only the half it was told
-  // about (design D38.1/D38.2). `tag set` rather than `tag add`: a second `onto=` is a
-  // contradiction, and the swarm re-tags a group on every pass.
+  // On claim, record which REPO the work is in. Where it *lands* is a fact about a branch, and
+  // at claim time the group has no branch yet — it is recorded a step later, by the one command
+  // that names the branch and its parent together (`jkb task start --branch … --onto …`, see
+  // `branchTagPrompt`). That is also what puts swarm work into `jkb staging ls` beside manual
+  // work, one view rather than the half it was told about (design D38.1/D38.2).
+  //
+  // `tag set` rather than `tag add`: a second `repo=` is a contradiction, and the swarm re-tags a
+  // group on every pass.
   const locate =
     verb === 'claim'
       ? [`repo=$(basename "$(git -C ${REPO} rev-parse --show-toplevel)")`]
           .concat(
-            group.tasks.flatMap((t) => [
-              `${JKB}${DB} task tag set ${t.uid} onto=${INTEGRATION}`,
-              `${JKB}${DB} task tag set ${t.uid} repo="$repo"`,
-            ]),
+            group.tasks.map((t) => `${JKB}${DB} task tag set ${t.uid} repo="$repo"`),
           )
           .join(' && ')
       : null
@@ -279,7 +279,8 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 //
 // The cut point is recorded with it, and is not optional bookkeeping: landing and review-recording
 // both refuse to act on a branch with no base, because without one an empty freshly-cut branch and
-// a landed one are indistinguishable. The swarm once wrote `onto=`/`branch=`/`repo=` and no base,
+// a landed one are indistinguishable. The swarm once wrote a land target, `branch=` and `repo=`
+// and no cut point,
 // so `jkb task review record` on the integration branch skipped every swarm task, reporting them
 // as "not merged into it yet" while they were fully contained in it.
 //
@@ -292,7 +293,8 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 // What it does state is `--onto ${INTEGRATION}` — *which branch this one was cut from*, which the
 // swarm knows for certain because it told the implementer to branch off it. `task start` measures
 // the rest (their merge-base) and refuses to overwrite a cut point already recorded, so re-running
-// it on a retry pass is safe. It also sets `branch=`/`repo=`/`onto=`, which is why there is one
+// it on a retry pass is safe. It also sets `branch=`/`repo=` and the branch's land target, which
+// is why there is one
 // command here rather than three, and it is idempotent under this run's own claim.
 function branchTagPrompt(group, branch) {
   const cmds = group.tasks

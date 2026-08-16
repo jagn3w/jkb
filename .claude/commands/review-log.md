@@ -175,7 +175,8 @@ jkb task review record --branch "$branch" --findings "$ns"
 
 Pass `--branch` explicitly, using step 1's value. It defaults to the branch checked out where
 it runs, which is right in a session and ambiguous anywhere else: run from the main copy that
-default is the *staging* branch. `record` does now match a staging branch, via `onto=`, but only
+default is the *staging* branch. `record` does now match a staging branch, via each branch's
+recorded land target, but only
 for tasks whose own work is already **in** it — so relying on the default silently reviews a
 different set from the one you are looking at. It tags every task carrying that `branch=` with
 `reviewed=<sha>` and `review=<ns>`, and moves `in_progress` tasks to `needs_review`. A branch

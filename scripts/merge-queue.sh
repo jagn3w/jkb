@@ -60,6 +60,13 @@ fi
 start=$(date +%s)
 if ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
    && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1; then
+  # Record that jkb itself grafted this branch (design B4), so `close-merged` asks one question
+  # per BATCH instead of one per task -- and asks it about the branch whose cut point is provable.
+  # The verb refuses unless the work really is in $BASE, so this cannot claim a landing that did
+  # not happen; a failure here is reported and never fails the queue, since the commits ARE in
+  # $BASE either way and the ref-based inference still covers the task.
+  jkb task landed "$BRANCH" --onto "$BASE" >/dev/null 2>&1 \
+    || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
   echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
   exit 0
 fi

@@ -95,7 +95,7 @@ export class InFlightProvider implements vscode.TreeDataProvider<FlightNode> {
     // Abandon is offered for any row that records a **branch**, because that is exactly what
     // `jkb task abandon` can act on: it falls back to the recorded `branch=` so a session
     // whose checkout was deleted by hand can still be cleaned up in the KB — clearing the
-    // claim, dropping `onto=`, optionally deleting the branch. Keying this on the worktree
+    // claim, clearing its branches' land targets, optionally deleting the branch. Keying this on the worktree
     // removed the only route to that path; keying it on *state* was wrong in both directions,
     // offering the action on a landed row whose worktree `land` had already removed and
     // hiding it on a cancelled row whose worktree nothing else will ever clean up.
