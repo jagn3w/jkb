@@ -1590,10 +1590,10 @@ fn a_start_in_another_repo_still_records_the_land_target() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
+        .stdout(predicate::str::contains("lands on batch-1"))
         // The cut point is still, correctly, not measured here — the two facts are independent,
         // and asserting both is what stops a fix for one silently enabling the other.
-        .stdout(predicate::str::contains("feat/x: no cut point recorded"))
-        .stdout(predicate::str::contains("lands on batch-1"));
+        .stdout(predicate::str::contains("feat/x: no cut point recorded"));
 }
 
 /// A cut point this repository cannot resolve is treated as **none** — the task is held, never
