@@ -3797,11 +3797,15 @@ fn a_branch_repointed_after_landing_is_not_credited_with_it() {
 
     // Sanity: while the branch still points at what landed, the event is credited — and with no
     // cut point of its own, nothing else could have closed it.
+    //
+    // Asserted as **"would close"**, not as the uid appearing anywhere: a task with no cut point
+    // is also printed, by name, in the `unknown` bucket, so a bare uid match passed with the
+    // credited-landing arm deleted. The bucket is the assertion.
     f.jkb()
         .args(["task", "close-merged", "--dry-run"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(&uid));
+        .stdout(predicate::str::contains(format!("would close {uid}")));
 
     // Now re-point it at unmerged work, as a recreated namesake would be.
     git(&f.repo, &["checkout", "-q", "-b", "elsewhere", "main"]);
