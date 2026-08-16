@@ -802,8 +802,74 @@ pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{facet_values, set_location_facets, task_tags, Location, FACET_BRANCH};
+    use super::{
+        facet_values, record_land_target, set_location_facets, task_tags, Location, FACET_BRANCH,
+    };
     use jkb_core::{item::NewItem, Db};
+
+    /// A scratch repository with one commit, a branch, and a tag on the same commit.
+    fn repo_with_a_branch_and_a_tag(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                // The developer's global config sets `core.hooksPath` and signs commits; either
+                // would fail this fixture for reasons unrelated to what it tests.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}: {ok:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("base.txt"), "base").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+        run(&["branch", "batch", "main"]);
+        run(&["tag", "v1.0", "main"]);
+    }
+
+    /// The land-target rule lives at the **writer**, not at the flags that feed it.
+    ///
+    /// Both CLI verbs ask `gitrepo::branch_name` first, for the sake of a sentence a user can act
+    /// on — but that is two sites, and this area's whole history is a rule taught to call sites one
+    /// at a time. What makes the third one safe is that nothing can put a value in
+    /// `branch_records.land_target` that `gitrepo::branch_refs` does not key on, whatever it was
+    /// spelled as: every reader looks a target up by branch name, and a miss there is silent.
+    #[test]
+    fn a_land_target_is_stored_only_as_a_name_the_readers_key_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        repo_with_a_branch_and_a_tag(tmp.path());
+        // Owned, because the writer-actor's closure must be `'static`.
+        let root = tmp.path().to_path_buf();
+        let db = Db::open_in_memory().unwrap();
+
+        // A tag resolves perfectly well and is not a branch. Refused rather than stored.
+        let at = root.clone();
+        let refused = db.write_txn("t", move |conn, meta| {
+            record_land_target(conn, meta, Some(&at), "proj", "feat", Some("v1.0"))
+        });
+        assert!(
+            refused.is_err(),
+            "a tag was stored as a land target, which drops its task out of `staging ls`"
+        );
+
+        // A branch is stored, and under the bare name the listing keys on.
+        db.write_txn("t", move |conn, meta| {
+            record_land_target(conn, meta, Some(&root), "proj", "feat", Some("batch"))
+        })
+        .unwrap();
+        let stored = db
+            .read(|conn| jkb_core::branch::get(conn, "proj", "feat"))
+            .unwrap()
+            .and_then(|r| r.land_target);
+        assert_eq!(stored.as_deref(), Some("batch"));
+    }
 
     /// The policy both entry points share: with no base recorded for this branch we do not act,
     /// whatever git would say. `is_merged` deliberately falls through its freshly-cut guard when
