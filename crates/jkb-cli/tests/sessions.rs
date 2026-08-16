@@ -3917,6 +3917,124 @@ fn a_hand_recreated_branch_is_held_even_with_no_jkb_write_in_between() {
     );
 }
 
+/// The read-side anchor check fires through **`review record`**, not only through `close-merged`.
+///
+/// The two readers share one implementation (`repo::landed_for_action`), and a mutation of
+/// `base::stale_instance` kills the `close-merged` test — but "the seam is shared" is an argument,
+/// not a test, and this is the reader whose failure mode is the *quieter* of the two: crediting a
+/// recycled branch stamps `reviewed=<sha>` for work no review saw, which then opens the land gate.
+///
+/// The branch is deleted and recreated by hand with no jkb write in between, so the writer-side
+/// supersede arm never runs.
+#[test]
+fn a_review_does_not_credit_a_branch_recreated_under_its_name() {
+    let f = Fixture::new();
+    let uid = f.add_task("recycled under review");
+    git(&f.repo, &["branch", "stg", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature", "stg"]);
+    commit_in(&f.repo, "w.txt", "work\n", "real work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "stg",
+        ])
+        .assert()
+        .success();
+
+    // The work lands on the staging branch, so a review of `stg` legitimately covers it.
+    git(&f.repo, &["checkout", "-q", "stg"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    // Sanity, and what makes the assertion below able to fail: as it stands the review credits it.
+    f.add_finding("reviews/stg-a", "a finding");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "stg"])
+        .args(["--findings", "reviews/stg-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&uid));
+    assert_eq!(f.status_of(&uid), "needs_review", "setup: it should credit");
+
+    // Now the branch is deleted and recreated under the same name, entirely outside jkb, and the
+    // task is put back where a second review would find it.
+    f.jkb()
+        .args(["--global", "task", "set", &uid, "--status", "in_progress"])
+        .assert()
+        .success();
+    git(&f.repo, &["branch", "-D", "feature"]);
+    // Recreated at the staging branch's tip — **already-landed content**, which is the shape a
+    // recycled name actually takes. That placement is what makes this test able to fail: the tip
+    // now differs from the recorded cut point, so `is_merged`'s freshly-cut guard does NOT fire,
+    // and `merge-tree` answers with the staging branch's own tree, i.e. Merged. The anchor is then
+    // the only thing between this task and a `reviewed=` it never earned.
+    //
+    // An earlier version recreated the branch at `main`, where the tip happened to equal the
+    // recorded cut point — so the freshly-cut guard held it and disabling the anchor killed
+    // nothing. Only mutation was ever going to surface that.
+    git(&f.repo, &["branch", "feature", "stg"]);
+    assert_ne!(
+        git(&f.repo, &["rev-parse", "feature"]),
+        git(&f.repo, &["merge-base", "feature", "main"]),
+        "setup: the namesake's tip must differ from the recorded cut point, or the freshly-cut \
+         guard decides this instead of the anchor"
+    );
+
+    f.add_finding("reviews/stg-b", "another finding");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "stg"])
+        .args(["--findings", "reviews/stg-b"])
+        .assert()
+        .success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a review credited a branch recreated under the reviewed name — `reviewed=` would then \
+         open the land gate for work no review saw"
+    );
+}
+
+/// `jkb doctor` reports reflog retention entries for branches nothing records any more.
+///
+/// The entries are written beside a record to keep the instance anchor from expiring, and removed
+/// when the branch is forgotten. The residue is a branch recorded and never forgotten: inert
+/// config, but config the user did not ask for, and this project's rule is that jkb does not leave
+/// things in other people's repositories silently.
+///
+/// Both directions, because a report that names everything is as useless as one that names
+/// nothing: a **recorded** branch's entry must not be listed.
+#[test]
+fn doctor_reports_retention_entries_for_branches_nothing_records() {
+    let f = Fixture::new();
+    let uid = f.add_task("recorded branch");
+    git(&f.repo, &["branch", "live", "main"]);
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "live"])
+        .assert()
+        .success();
+    // An entry for a branch no record claims — what `abandon --delete-branch` would have removed.
+    git(
+        &f.repo,
+        &[
+            "config",
+            "--local",
+            "gc.refs/heads/ghost.reflogExpire",
+            "never",
+        ],
+    );
+
+    f.jkb()
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no longer recorded"))
+        // The remedy is spelled out: the user did not write this entry and should not have to
+        // work out the key.
+        .stdout(predicate::str::contains("gc.refs/heads/ghost.reflogExpire"))
+        // …and the recorded branch's own entry is not reported as residue.
+        .stdout(predicate::str::contains("gc.refs/heads/live").not());
+}
+
 /// Degradation is toward today's behaviour, never toward a judgement.
 ///
 /// Every way the ref journal can be unavailable — never written, or truncated so its oldest
