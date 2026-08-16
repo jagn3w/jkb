@@ -381,6 +381,54 @@ pub fn branch_refs(dir: &Path) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
+/// What a caller-supplied name turns out to be, when the question is "is this a **branch**".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchName {
+    /// It names a branch, under the bare short name [`branch_refs`] keys it by. An
+    /// `origin/`-qualified spelling of a branch that exists here comes back canonicalized.
+    Is(String),
+    /// Nothing here goes by that name — a branch the caller may legitimately be about to create.
+    Unknown,
+    /// It resolves to a commit, but not through a branch: a tag, a raw object id, `HEAD`.
+    NotABranch,
+}
+
+/// Which **branch** `name` refers to, as [`branch_refs`] keys them — the one answer to "is this a
+/// branch, and what is it called".
+///
+/// Distinct from [`branch_ref`], which maps a branch name to a revision. This maps an arbitrary
+/// user-supplied string to a *key*, and that is the direction every consumer of a stored branch
+/// name needs: `jkb staging ls` indexes batches by bare short name, so a land target stored as
+/// `origin/integration` — which `rev-parse` resolves perfectly well — matched no row and silently
+/// dropped its task out of the one listing behind the branch picker and In Flight. A tag was
+/// accepted the same way and vanished the task with nothing created and nothing reported.
+///
+/// The exact key wins over the `origin/`-stripped form, so a local branch genuinely named
+/// `origin/x` is itself rather than a remote copy of `x`.
+///
+/// # Errors
+/// Returns an error if `name` cannot be handed to git, or if `git` cannot be executed.
+pub fn branch_name(dir: &Path, name: &str) -> Result<BranchName> {
+    valid_ref(name)?;
+    let refs = branch_refs(dir)?;
+    if refs.contains_key(name) {
+        return Ok(BranchName::Is(name.to_owned()));
+    }
+    if let Some(short) = name.strip_prefix("origin/") {
+        if refs.contains_key(short) {
+            return Ok(BranchName::Is(short.to_owned()));
+        }
+    }
+    // It is not a branch. Whether it is *something* decides which of the two answers this is: a
+    // name nothing here uses is a branch waiting to be cut, a name that resolves is a real object
+    // the caller has mistaken for a branch, and only the second is worth refusing loudly.
+    Ok(if exists(dir, name)? {
+        BranchName::NotABranch
+    } else {
+        BranchName::Unknown
+    })
+}
+
 /// Create branch `branch` at `start` if it does not already exist. Returns whether it was
 /// created.
 ///
@@ -651,7 +699,8 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
     Ok(git(dir, &["merge-base", a, b])?.filter(|s| !s.is_empty()))
 }
 
-/// Whether `reference` has any commit reachable from **no other branch**, local or remote.
+/// Whether `reference` has any commit reachable from **no other branch**, local or remote —
+/// `None` when git could not answer.
 ///
 /// "Has this branch done anything yet?", asked of git rather than inferred from a reference point
 /// the caller named. Naming one is where this kept going wrong: a caller may state a grandparent
@@ -659,6 +708,15 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
 /// lands behind the branch's real origin, so a branch with nothing of its own reads as having
 /// something. There is no reference point that is right for every caller, and this question does
 /// not need one.
+///
+/// **A failure is not a `false`.** `rev-list` exits non-zero for reasons that have nothing to do
+/// with this branch — one broken ref anywhere under `refs/heads` or `refs/remotes` (an interrupted
+/// fetch, a stale `packed-refs`, a ref to a pruned object) fails the whole traversal. Spelled
+/// `false`, that is the single most damaging answer available: "untouched" is the one state in
+/// which the caller records the branch **tip** as its cut point, and a cut point equal to the tip
+/// freezes the task at `NothingToMerge` for good, with `ensure_recorded` declining to overwrite it.
+/// Same rule as [`ahead_count`] — a question that could not be asked must not be spelled the same
+/// as an answer of no.
 ///
 /// `branch` is the short name, excluded from the "other branches" set under both `refs/heads/` and
 /// `refs/remotes/origin/` — a branch is not evidence of its own work.
@@ -668,7 +726,7 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
-pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool> {
+pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<Option<bool>> {
     valid_ref(reference)?;
     valid_ref(branch)?;
     // Excluded under EVERY remote, not just `origin`: a second remote carrying the same branch
@@ -678,12 +736,16 @@ pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool
     //
     // Under-exclusion is the direction that hurts, and it is worth being exact about: if the
     // pattern fails to exclude this branch, `--not` subtracts the branch from itself, no commit
-    // is unique, and a branch full of work answers `false` — which is the pass-31 defect above,
-    // the caller recording its tip. It is not safe by construction; it is covered by
+    // is unique, and a branch full of work answers "untouched" — which is the pass-31 defect
+    // above, the caller recording its tip. It is **not** safe by construction, and nothing
+    // downstream catches it: `base::rejected` re-asks this very predicate, so it agrees with a
+    // wrong answer by construction rather than backstopping it. What covers it is
     // `a_branch_mirrored_on_another_remote_still_has_its_own_commits`, which fails loudly if the
-    // exclusion stops matching. (`base::rejected` is the backstop that keeps a wrong answer here
-    // from being *stored*, but a wrong answer is still a wrong answer.)
+    // exclusion stops matching.
     let remotes = format!("*/{branch}");
+    // `git` maps a non-zero exit to `Ok(None)`, which is exactly the distinction wanted here:
+    // success with empty output is "no commits of its own", a failed traversal is "could not
+    // answer". Mapping instead of `is_some_and` is the whole fix.
     Ok(git(
         dir,
         &[
@@ -699,7 +761,7 @@ pub fn has_own_commits(dir: &Path, reference: &str, branch: &str) -> Result<bool
             "--remotes",
         ],
     )?
-    .is_some_and(|s| !s.is_empty()))
+    .map(|s| !s.is_empty()))
 }
 
 /// Whether `a` is an ancestor of `b` — i.e. `b` already contains it.
@@ -938,12 +1000,19 @@ pub fn is_merged(
 /// The ref that represents `branch` here — the local branch or its remote-tracking copy — or
 /// `None` if neither exists. `prefer` decides which is asked for first (see [`Prefer`]).
 ///
-/// The **one** implementation of "does this branch exist, and under what name". [`is_merged`]
-/// resolves it to decide between `BranchMissing` and a real comparison; `close-merged` resolves it
-/// to decide whether to tell the user a branch is gone. A second spelling of that question got
-/// written as a bare `has_branch`, which only looks at `refs/heads/` — so a branch living solely
-/// on the remote, the ordinary state after a local branch is deleted post-merge or on a fresh
-/// clone, was reported "gone, remove the stale tag" while it still carried unmerged work.
+/// The **one** implementation of "given a branch name, what ref may I hand to git for it". It
+/// takes a branch name and hands back a *revision*: [`is_merged`] resolves one to decide between
+/// `BranchMissing` and a real comparison, `close-merged` to decide whether to tell the user a
+/// branch is gone. A second spelling of that question got written as a bare `has_branch`, which
+/// only looks at `refs/heads/` — so a branch living solely on the remote, the ordinary state after
+/// a local branch is deleted post-merge or on a fresh clone, was reported "gone, remove the stale
+/// tag" while it still carried unmerged work.
+///
+/// It is deliberately **not** the answer to "is this string a branch". Its argument is assumed to
+/// be one already, and its probe is `rev-parse`, which resolves a tag, a raw object id and
+/// `origin/<b>` alike — so used as an admission check it accepts values that are not branches at
+/// all. That question is [`branch_name`], and the difference between the two is what let an
+/// `origin/`-qualified land target be stored under a key `staging ls` could never look up.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
@@ -1336,14 +1405,45 @@ mod tests {
             "refs/remotes/upstream/task/x",
             "refs/heads/task/x",
         ]);
-        assert!(
+        assert_eq!(
             super::has_own_commits(dir, "task/x", "task/x").unwrap(),
+            Some(true),
             "a branch mirrored on a non-origin remote was reported as having done nothing, so \
              its caller would record the tip as its cut point"
         );
         // The control: a branch that genuinely has nothing of its own still says so.
         run(&["branch", "empty-one", "main"]);
-        assert!(!super::has_own_commits(dir, "empty-one", "empty-one").unwrap());
+        assert_eq!(
+            super::has_own_commits(dir, "empty-one", "empty-one").unwrap(),
+            Some(false)
+        );
+    }
+
+    /// A `rev-list` that could not run is **not** "this branch has done nothing".
+    ///
+    /// That answer is the one the caller turns into "record the tip as the cut point", which
+    /// freezes the task at `NothingToMerge` with no repair path — so a failed traversal must be
+    /// distinguishable from an empty one. A broken ref anywhere under `refs/heads` fails the whole
+    /// walk, which is how an unrelated interrupted fetch reached this.
+    #[test]
+    fn a_rev_list_that_could_not_run_is_not_an_answer_of_no() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        // A ref pointing at an object this repository does not have — what an interrupted fetch
+        // or a stale `packed-refs` leaves behind. `rev-list --branches` then exits non-zero.
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+        std::fs::write(
+            dir.join(".git/refs/heads/broken"),
+            format!("{}\n", "0".repeat(39) + "1"),
+        )
+        .unwrap();
+        assert_eq!(
+            super::has_own_commits(dir, "main", "main").unwrap(),
+            None,
+            "a traversal git refused was reported as `this branch has done nothing`, which is \
+             what makes the caller record the tip"
+        );
     }
 
     #[test]

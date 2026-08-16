@@ -4306,3 +4306,360 @@ fn the_repair_verb_forgets_rather_than_accepting_a_sha() {
             "feature: cut from {fork}"
         )));
 }
+
+/// A land target is recorded under the name every reader looks it up by.
+///
+/// The `--onto` guard asked `branch_ref` — "does this revision resolve" — and `origin/<batch>`
+/// resolves perfectly well, so it was accepted and stored verbatim. `jkb staging ls` keys batches
+/// by the bare short names `branch_refs` returns, so the task silently dropped out of the one read
+/// behind both the branch picker and In Flight: exactly the outcome the guard was added to
+/// prevent. `jkb task land` then reached `adopt_remote("origin/<batch>")` and cut a junk local
+/// branch by that literal name.
+#[test]
+fn a_land_target_is_recorded_under_the_name_the_listing_keys_on() {
+    let f = Fixture::new();
+    let remote = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "-u", "origin", "main"]);
+    // A batch that lives only on the remote — the ordinary state after a local ref is pruned, and
+    // the case that makes `origin/<batch>` the natural thing for a user to type.
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["push", "-q", "origin", "integration"]);
+    git(&f.repo, &["branch", "-D", "integration"]);
+    git(
+        &f.repo,
+        &["checkout", "-q", "-b", "feat", "origin/integration"],
+    );
+    commit_in(&f.repo, "f.txt", "work\n", "feature work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("a batch named with its remote prefix");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feat"])
+        .args(["--onto", "origin/integration"])
+        .assert()
+        .success();
+
+    // Stored as the map key, not the caller's spelling.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("lands on integration"))
+        .stdout(predicate::str::contains("lands on origin/integration").not());
+
+    // And therefore visible in the one listing behind the picker and In Flight.
+    let rows = f.staging(&[]);
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["branch"] == serde_json::json!("integration"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        row["tasks"]
+            .as_array()
+            .is_some_and(|ts| ts.iter().any(|t| t["uid"] == serde_json::json!(uid))),
+        "the task was dropped from `staging ls` by the spelling of its land target: {rows}"
+    );
+}
+
+/// A tag is not a branch, whatever `rev-parse` says about it.
+///
+/// It resolves, so the old guard admitted it, and the task then vanished from `staging ls` with
+/// nothing created and nothing reported — the failure mode with no symptom at all.
+#[test]
+fn a_revision_that_is_not_a_branch_is_refused_as_a_land_target() {
+    let f = Fixture::new();
+    git(&f.repo, &["tag", "v1.0", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feat"]);
+    commit_in(&f.repo, "f.txt", "work\n", "feature work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("aimed at a tag");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feat", "--onto", "v1.0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not a branch"));
+    // Nothing was recorded, so nothing has to be un-done.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("lands on").not());
+}
+
+/// `jkb task abandon` acts on the branch the row it was clicked from names.
+///
+/// It was the third, unconverted implementation of "which recorded branch holds this task's
+/// work": it took the session's branch or else the *first* `branch=` value, and
+/// `tag::applications` orders by value. A task carrying a stale `a-gone` beside a live `z-live`
+/// therefore had `--delete-branch` destroy `a-gone` and forget its cut point, while `staging ls`
+/// and `jkb task land` — which share `repo::work_branch` — both said the row was about `z-live`.
+#[test]
+fn abandon_acts_on_the_same_branch_the_row_and_the_land_command_name() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "z-live", "integration"]);
+    commit_in(&f.repo, "z.txt", "z\n", "live work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("two recorded branches, one gone");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "z-live"])
+        .args(["--onto", "integration"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "branch=a-gone"])
+        .assert()
+        .success();
+
+    let out = f
+        .jkb()
+        .args([
+            "task",
+            "abandon",
+            &uid,
+            "--force",
+            "--delete-branch",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "abandon: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["branch"],
+        serde_json::json!("z-live"),
+        "abandon reported a branch the user was never shown: {v}"
+    );
+    assert_eq!(
+        v["branch_deleted"],
+        serde_json::json!(true),
+        "abandon deleted nothing, having picked a branch that was already gone: {v}"
+    );
+    assert!(
+        git(&f.repo, &["branch", "--list", "z-live"]).is_empty(),
+        "the branch the row named is still there"
+    );
+}
+
+/// A `rev-list` git refused is not "this branch has done nothing".
+///
+/// "Untouched" is the single answer that makes the branch **tip** admissible as its cut point, and
+/// a cut point equal to the tip reads as `NothingToMerge` forever — never creditable, never
+/// landable, and never corrected, since `ensure_recorded` declines to overwrite. So a traversal
+/// that could not run must record nothing and say why, exactly as every other failed measurement
+/// here does. Same rule as `ahead_count`: a question that could not be asked must not be spelled
+/// the same as an answer of no.
+#[test]
+fn a_ref_walk_git_refused_records_nothing_rather_than_the_tip() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-q", "-b", "feat"]);
+    commit_in(&f.repo, "f.txt", "work\n", "feature work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "feat"]);
+    // A ref pointing at an object this repository does not have — what an interrupted fetch or a
+    // stale `packed-refs` leaves behind. It fails `rev-list --branches` and nothing else.
+    std::fs::write(
+        f.repo.join(".git/refs/heads/broken"),
+        format!("{}1\n", "0".repeat(39)),
+    )
+    .unwrap();
+
+    let uid = f.add_task("measured where git cannot walk the refs");
+    let out = f
+        .jkb()
+        .args(["task", "start", &uid, "--branch", "feat"])
+        .args(["--onto", "main", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task start: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_ne!(
+        v["base"],
+        serde_json::json!(tip),
+        "the tip of a branch full of work was recorded as its cut point, which freezes it: {v}"
+    );
+    assert_eq!(
+        v["base"],
+        serde_json::Value::Null,
+        "something was recorded from a measurement git could not make: {v}"
+    );
+    assert_eq!(
+        v["base_missing_because"],
+        serde_json::json!("git-could-not-answer-here"),
+        "the reason reported was not the one the writer had: {v}"
+    );
+}
+
+/// `close-merged` reports each branch under the fault it actually has.
+///
+/// A task may legitimately record several branches, and folding them with an AND over "usable"
+/// and an OR over "recorded" mislabelled every task whose branches differ: one branch with a good
+/// cut point beside one with none routed the whole task to "its recorded cut point does not
+/// resolve", which was true of neither half, and named a repair that would do nothing.
+#[test]
+fn close_merged_reports_each_branch_under_its_own_fault() {
+    let f = Fixture::new();
+    // alpha: untouched, so its cut point is measured and resolves.
+    git(&f.repo, &["branch", "alpha", "main"]);
+    // beta: has commits and is named with no parent, so nothing could be measured for it.
+    git(&f.repo, &["checkout", "-q", "-b", "beta", "main"]);
+    commit_in(&f.repo, "b.txt", "b\n", "beta work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    // gamma: same, and then given a cut point this repository cannot resolve.
+    git(&f.repo, &["checkout", "-q", "-b", "gamma", "main"]);
+    commit_in(&f.repo, "g.txt", "g\n", "gamma work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("branches that differ in fault");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "alpha", "--onto", "main"])
+        .assert()
+        .success();
+    for b in ["beta", "gamma"] {
+        f.jkb()
+            .args([
+                "--global",
+                "task",
+                "tag",
+                "add",
+                &uid,
+                &format!("branch={b}"),
+            ])
+            .assert()
+            .success();
+    }
+    // Planted after the tagging, so the measurement (which records nothing for a branch with
+    // commits and no parent) cannot overwrite it.
+    f.plant_cut_point("gamma", &"c".repeat(40));
+
+    let out = f
+        .jkb()
+        .args(["task", "close-merged", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "close-merged: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let branches = |bucket: &str| {
+        v[bucket]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["uid"] == serde_json::json!(uid))
+            .map(|r| r["branch"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        branches("undecidable"),
+        vec!["beta".to_owned()],
+        "the branch with no cut point at all was not reported as such: {v}"
+    );
+    assert_eq!(
+        branches("unresolvable"),
+        vec!["gamma".to_owned()],
+        "the branch whose recorded cut point does not resolve was not reported as such: {v}"
+    );
+}
+
+/// A landing onto the very branch a review is being recorded for **is** the answer.
+///
+/// Walking past it to ask "and is that branch contained in itself?" needs the target's own cut
+/// point, which the review path has no reason to hold — a batch measured in a repository with no
+/// discoverable trunk records none — and the reader then declined to credit work jkb had itself
+/// just grafted onto that branch. Before the landing event existed this asked about the task's own
+/// branch and answered `Merged`, so following the event must not make the answer worse.
+#[test]
+fn a_review_credits_a_landing_onto_the_branch_being_reviewed() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("landed onto the reviewed branch");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "grp"])
+        .args(["--onto", "integration"])
+        .assert()
+        .success();
+    // The state the fix is about: the target has a row and a land target, and no cut point.
+    f.jkb()
+        .args(["task", "base", "--forget", "integration"])
+        .assert()
+        .success();
+
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "grp"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args(["task", "landed", "grp", "--onto", "integration"])
+        .assert()
+        .success();
+
+    f.add_finding("reviews/batch", "something to fix");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "integration"])
+        .args(["--findings", "reviews/batch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&uid));
+    assert_eq!(
+        f.status_of(&uid),
+        "needs_review",
+        "a review of the branch jkb landed this task's work onto did not credit it"
+    );
+}
+
+/// The landing verb says when the event it just recorded can never decide anything.
+///
+/// `close-merged` follows a landing to its target and then asks whether *that* branch reached
+/// trunk, which needs the target's own cut point; with none it holds the task and reports it as
+/// still in flight, which is indistinguishable from the truth. The verb deliberately does not
+/// measure one itself: a cut point is only provable while a branch is untouched, and a landing is
+/// the moment the target stops being — the queue's first entry fast-forwards it onto commits its
+/// source branch still holds, so `has_own_commits` truthfully says "nothing of its own" and the
+/// tip, the one value that freezes a task for good, becomes admissible.
+#[test]
+fn the_landing_verb_reports_a_target_that_cannot_credit_it() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let uid = f.add_task("landed onto an unrecorded batch");
+    // `--onto main` measures against trunk and deliberately records no land target (D34.3), so
+    // nothing ever ensures a row for `integration`.
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "grp", "--onto", "main"])
+        .assert()
+        .success();
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "grp"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let out = f
+        .jkb()
+        .args(["task", "landed", "grp", "--onto", "integration", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task landed: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["creditable"],
+        serde_json::json!(false),
+        "an event that can never be credited was reported as though it could: {v}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no usable cut point"),
+        "nothing said the landing will not close its tasks: {out:?}"
+    );
+}

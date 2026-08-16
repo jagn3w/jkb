@@ -221,8 +221,17 @@ fn read_tags(
 /// cut from trunk, and when it is freshly cut and untouched that measurement is the one provable
 /// case — its own tip.
 ///
+/// **The stored value is a bare branch name**, canonicalized here rather than at the flags that
+/// feed it. `jkb staging ls` keys batches by the short names `gitrepo::branch_refs` returns, so a
+/// target stored as the caller spelled it — `origin/integration`, which `rev-parse` resolves
+/// perfectly well — matched no row and silently dropped its task out of the one listing behind the
+/// branch picker and In Flight. Doing it at the single writer is what stops the next flag that
+/// accepts a branch from having to remember; the CLI verbs also ask
+/// [`crate::gitrepo::branch_name`], but for the sake of a better sentence, not for the rule.
+///
 /// # Errors
-/// Returns an error if git cannot be run or a record write fails.
+/// Returns an error if git cannot be run, if `target` is not a branch in this repository, or if a
+/// record write fails.
 pub(crate) fn record_land_target(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
@@ -231,6 +240,14 @@ pub(crate) fn record_land_target(
     branch: &str,
     target: Option<&str>,
 ) -> jkb_core::Result<()> {
+    // With no root nothing here can be checked — the caller is recording for a repository it is
+    // not standing in — so the word is taken as given, exactly as the cut point is simply not
+    // measured there.
+    let canonical = match (repo_root, target) {
+        (Some(root), Some(target)) => Some(canonical_branch(root, target)?),
+        _ => None,
+    };
+    let target = canonical.as_deref().or(target);
     jkb_core::branch::set_land_target(conn, meta, repo, branch, target)?;
     // A branch is never its own land target in any real flow, and measuring one against trunk here
     // would be a **second** measurement of the same branch with a different parent than
@@ -243,6 +260,31 @@ pub(crate) fn record_land_target(
         crate::base::ensure_recorded(conn, meta, root, repo, target, trunk.as_deref())?;
     }
     Ok(())
+}
+
+/// The bare branch name `target` refers to here, or a refusal naming what it actually is.
+///
+/// The refusal is the point: a value that is not a branch cannot be *stored* as a land target,
+/// whichever flag it arrived through, because every reader looks the target up by branch name and
+/// a miss there is silent.
+fn canonical_branch(root: &std::path::Path, target: &str) -> jkb_core::Result<String> {
+    let refuse = |what: &str| {
+        Err(jkb_types::Error::Validation(format!(
+            "`{target}` {what}, so it cannot be recorded as a land target — `jkb staging ls` \
+             looks batches up by branch name, and a task whose target is not one simply \
+             disappears from it"
+        ))
+        .into())
+    };
+    match crate::gitrepo::branch_name(root, target)
+        .map_err(|e| jkb_types::Error::Validation(e.to_string()))?
+    {
+        crate::gitrepo::BranchName::Is(name) => Ok(name),
+        crate::gitrepo::BranchName::Unknown => refuse("is not a branch in this repository"),
+        crate::gitrepo::BranchName::NotABranch => {
+            refuse("resolves to a commit but is not a branch (a tag, an object id, or `HEAD`)")
+        }
+    }
 }
 
 /// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
@@ -271,6 +313,41 @@ pub(crate) fn work_branch(
         .find(|b| refs.contains_key(*b))
         .or_else(|| branches.first())
         .cloned()
+}
+
+/// A task's live session, if it has one, and the branch its work is on.
+pub(crate) struct Work {
+    /// The `.jkb/work` session checked out on one of the task's recorded branches.
+    pub(crate) session: Option<crate::session::Session>,
+    /// The branch [`work_branch`] chose. `None` only when the task records no branch at all.
+    pub(crate) branch: Option<String>,
+}
+
+/// Everything "where is this task's work" means, resolved **once** — the entry point for a caller
+/// that has a task's tags and nothing else.
+///
+/// The session and the branch are returned together because they are one answer. Handing back only
+/// the session left each caller to pick a branch for itself, and `jkb task abandon` picked
+/// differently from `jkb staging ls` and `jkb task land`: it took the first `branch=` value, which
+/// `tag::applications` orders lexicographically, so a task carrying a stale `a-old` beside a live
+/// `z-live` had `--delete-branch` destroy `a-old` and forget its cut point while the row the user
+/// clicked Abandon on named `z-live`. Three consumers of one rule, two of them converted.
+///
+/// The batched surface ([`crate::staging`]) still calls [`work_branch`] directly with the sessions
+/// and refs it has already read once for the whole listing — the same rule, not a second one.
+///
+/// # Errors
+/// Returns an error if git cannot be run.
+pub(crate) fn work_for(ctx: &RepoCtx, tags: &BTreeMap<String, Vec<String>>) -> Result<Work> {
+    let branches = facet_values(tags, FACET_BRANCH);
+    // Match by worktree rather than by "the task's branch tag": a task that picked up a second
+    // `branch=` still resolves to the session that actually exists on disk (D36.2).
+    let session = crate::session::discover(&ctx.root)?
+        .into_iter()
+        .find(|s| branches.contains(&s.branch));
+    let refs = gitrepo::branch_refs(&ctx.root)?;
+    let branch = work_branch(session.as_ref().map(|s| s.branch.as_str()), branches, &refs);
+    Ok(Work { session, branch })
 }
 
 /// The repository a cut point for this task may honestly be measured in, or `None`.
@@ -459,6 +536,19 @@ pub(crate) fn landed_for_action(
         let Some(landing) = record.landed.as_ref().filter(|l| credited(cwd, &asking, l)) else {
             return landed_with_base(cwd, &asking, trunk_ref, record.cut_point.as_deref(), prefer);
         };
+        // The event *is* the answer when it names the very branch containment is being asked
+        // against. Walking on to ask "and is `S` contained in `S`?" needs `S`'s own cut point,
+        // which the review path frequently has no reason to hold — `jkb task review record`
+        // passes the reviewed branch here, and a batch measured in a repository with no
+        // discoverable trunk records none — and the reader then declined to credit work jkb had
+        // itself just grafted onto that branch. Before the event existed this asked about the
+        // task's own branch and answered `Merged`, so following the event must not be the thing
+        // that makes the answer worse. (This is not the 6.8 state: there the target is a
+        // *different* branch from the one asked about, and whether it in turn reached trunk is a
+        // question the record genuinely cannot answer.)
+        if landing.onto == trunk_ref {
+            return Ok((crate::gitrepo::MergeState::Merged, false));
+        }
         asking = landing.onto.clone();
     }
     Ok((crate::gitrepo::MergeState::NothingToMerge, false))

@@ -65,7 +65,10 @@ if ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
   # The verb refuses unless the work really is in $BASE, so this cannot claim a landing that did
   # not happen; a failure here is reported and never fails the queue, since the commits ARE in
   # $BASE either way and the ref-based inference still covers the task.
-  jkb task landed "$BRANCH" --onto "$BASE" >/dev/null 2>&1 \
+  # stdout is noise here; stderr is not. The verb warns when $BASE has no usable cut point, which
+  # is the difference between a landing that closes its tasks and one that leaves them reading as
+  # still in flight — swallowing that made the only report of it invisible.
+  jkb task landed "$BRANCH" --onto "$BASE" >/dev/null \
     || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
   echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
   exit 0

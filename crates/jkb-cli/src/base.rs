@@ -114,6 +114,14 @@ pub(crate) enum Missing {
     /// The value is not this branch's fork point: it equals the tip of a branch that has done
     /// work, or differs from the tip of one that has not. See [`rejected`].
     NotTheForkPoint,
+    /// Git could not say whether the branch has commits of its own, so which of the two admissible
+    /// values applies is unknown. A repository-level fault — a broken ref under `refs/heads` or
+    /// `refs/remotes` fails the whole traversal — not anything about this branch.
+    ///
+    /// Its own variant rather than folded into the others because "untouched" is the answer that
+    /// makes the tip admissible, and guessing it is how a task acquires a cut point equal to its
+    /// tip and never closes again.
+    CannotAsk,
 }
 
 impl Missing {
@@ -126,6 +134,7 @@ impl Missing {
             Self::ParentNotFound => "named-parent-does-not-exist-here",
             Self::NoCommonHistory => "no-shared-history-to-measure-against",
             Self::NotTheForkPoint => "not-this-branchs-fork-point",
+            Self::CannotAsk => "git-could-not-answer-here",
         }
     }
 
@@ -140,6 +149,13 @@ impl Missing {
             Self::NoSuchBranch => {
                 format!("run it again once {branch} exists")
             }
+            // Nothing about the task or the branch is wrong, so no jkb verb repairs it: the
+            // repository itself cannot answer, and the next run after it can will measure.
+            Self::CannotAsk => format!(
+                "git could not walk this repository's refs, so whether {branch} has any commits \
+                 of its own is unknown — repair the repository (`git fsck` names a broken ref) \
+                 and run it again"
+            ),
             Self::NoParentNamed
             | Self::ParentNotFound
             | Self::NoCommonHistory
@@ -345,24 +361,43 @@ pub(crate) fn recorded_for(db: &Db, repo: &str, branch: &str) -> anyhow::Result<
         .and_then(|r| r.cut_point))
 }
 
+/// Whether a branch is provably untouched, and at which tip.
+///
+/// Three states, not two, because the third is the one that costs: "git could not tell us" spelled
+/// as `No` merely declines, but spelled as `At(tip)` records the tip of a branch full of work and
+/// freezes its task for good. Both readers below fail closed on [`Untouched::Unknown`].
+enum Untouched {
+    /// No commits of its own, so this tip **is** its fork point.
+    At(String),
+    /// It has commits of its own, or does not exist here.
+    No,
+    /// Git could not answer — a broken ref anywhere fails the traversal.
+    Unknown,
+}
+
 /// The branch's tip **if the branch has no commits of its own**, in which case that tip is
-/// provably its fork point. `None` when it has done work, or does not exist here.
+/// provably its fork point.
 ///
 /// The one place "an untouched branch forked at its tip" is turned into a value, so the
 /// admissibility rule and the measurement cannot disagree about what untouched means.
-fn untouched_tip(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Option<String>> {
+fn untouched_tip(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Untouched> {
     git(untouched_tip_git(repo_root, branch))
 }
 
-fn untouched_tip_git(repo_root: &std::path::Path, branch: &str) -> anyhow::Result<Option<String>> {
+fn untouched_tip_git(repo_root: &std::path::Path, branch: &str) -> anyhow::Result<Untouched> {
     use crate::gitrepo::{branch_ref, has_own_commits, rev_commit, Prefer};
     let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
-        return Ok(None);
+        return Ok(Untouched::No);
     };
-    if has_own_commits(repo_root, &here, branch)? {
-        return Ok(None);
+    match has_own_commits(repo_root, &here, branch)? {
+        None => return Ok(Untouched::Unknown),
+        Some(true) => return Ok(Untouched::No),
+        Some(false) => {}
     }
-    rev_commit(repo_root, &here)
+    Ok(match rev_commit(repo_root, &here)? {
+        Some(tip) => Untouched::At(tip),
+        None => Untouched::No,
+    })
 }
 
 /// The latest commit on `branch` that `branch` did not itself create — its fork point.
@@ -403,8 +438,13 @@ fn measure_git(
         return Ok(Measurement::Missing(Missing::NoSuchBranch));
     };
     // The one case where the tip is the answer, and it is an answer rather than a guess.
-    if let Some(tip) = untouched_tip_git(repo_root, branch)? {
-        return Ok(Measurement::At(Cut::UntouchedTip(tip)));
+    match untouched_tip_git(repo_root, branch)? {
+        Untouched::At(tip) => return Ok(Measurement::At(Cut::UntouchedTip(tip))),
+        // Not knowing whether the branch is untouched means not knowing which of the two
+        // admissible values applies, and the tempting guess — "untouched" — is the one that makes
+        // the tip storable. Record nothing and say so.
+        Untouched::Unknown => return Ok(Measurement::Missing(Missing::CannotAsk)),
+        Untouched::No => {}
     }
 
     // From here the branch has commits of its own, so its tip is certainly NOT its fork point and
@@ -476,10 +516,13 @@ fn rejected(
     };
     let tip = tip_of(root, branch)?;
     Ok(match (untouched_tip(root, branch)?, tip) {
+        // Which rule applies is unknown, so neither can be checked. Refusing costs a measurement
+        // that is reported and repeatable; admitting costs a value that may be the tip.
+        (Untouched::Unknown, _) => Some(Missing::CannotAsk),
         // Untouched: the tip is the only admissible value.
-        (Some(untouched), _) if sha != untouched => Some(Missing::NotTheForkPoint),
+        (Untouched::At(untouched), _) if sha != untouched => Some(Missing::NotTheForkPoint),
         // Has work: the tip is the one inadmissible value.
-        (None, Some(tip)) if sha == tip => Some(Missing::NotTheForkPoint),
+        (Untouched::No, Some(tip)) if sha == tip => Some(Missing::NotTheForkPoint),
         _ => None,
     })
 }

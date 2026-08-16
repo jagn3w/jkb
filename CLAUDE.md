@@ -649,6 +649,12 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
       records an earlier moment.
     - **"Has this branch done anything?" is asked of git** (`has_own_commits`), so a stale, wrong,
       unresolvable or *grandparent* parent cannot change the one thing readers ask of the record.
+      It answers `Option<bool>`, and the third state is load-bearing: `rev-list` exits non-zero on
+      a broken ref anywhere under `refs/heads`/`refs/remotes`, and "git could not answer" spelled
+      as *no* is the single worst value available — "untouched" is exactly the state in which the
+      tip becomes storable. Same rule as `ahead_count`. It is **not** safe by construction and
+      `base::rejected` is not its backstop, since `rejected` re-asks the same predicate and so
+      agrees with a wrong answer; what covers a mis-exclusion is a test that fails loudly.
     - **The backstop:** the fork point is the later of `merge-base(branch, onto)` and
       `merge-base(branch, trunk)`. Every way of getting the parent wrong degrades towards **holding
       the task, never towards closing it**.
