@@ -3918,6 +3918,56 @@ fn naming_a_batch_as_a_land_target_does_not_replace_its_cut_point() {
     );
 }
 
+/// A batch that has already been landed on records **nothing**, rather than its tip.
+///
+/// The other half of the fill: filling a gap is safe, but only where a cut point can honestly be
+/// measured. A batch whose first group has been fast-forwarded into it has moved and yet has no
+/// commits of its own, so the only obtainable value is its tip — which is the frozen
+/// `NothingToMerge` state arrived at through the fill arm instead of the supersede one. Nothing
+/// recorded is reported and repairable by a later run; a tip is silent and permanent.
+///
+/// The gate is `base::advice`, the same question every message asks before naming a measuring
+/// verb, so there is one answer to "may a cut point be measured on this branch right now".
+#[test]
+fn a_batch_already_landed_on_records_nothing_rather_than_its_tip() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    // A first group, landed by hand — no jkb command has referenced the batch, so it has no record.
+    git(&f.repo, &["checkout", "-q", "-b", "grp-a", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "grp-a"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    assert_eq!(
+        f.cut_point_of("integration"),
+        None,
+        "setup: the batch has no record yet, so this is the fill arm"
+    );
+
+    let uid = f.add_task("second group");
+    git(&f.repo, &["checkout", "-q", "-b", "grp-b", "integration"]);
+    commit_in(&f.repo, "h.txt", "more group work\n", "more group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args([
+            "task",
+            "start",
+            &uid,
+            "--branch",
+            "grp-b",
+            "--onto",
+            "integration",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        f.cut_point_of("integration"),
+        None,
+        "the batch's tip was recorded as its cut point, which reads as `NothingToMerge` for ever"
+    );
+}
+
 /// A landing whose target has **no record of its own** is held, not closed.
 ///
 /// The event says the work is in `S`; deciding whether `S` reached trunk needs `S`'s cut point,
@@ -4484,16 +4534,6 @@ fn recording_a_branch_retains_its_ref_journal() {
         .assert()
         .success();
     let key = "gc.refs/heads/feature.reflogExpire";
-    // `--default` so an unset key exits 0 and this assertion is what reports it: the helper
-    // asserts on git's exit status, so a bare `--get` would panic with git's silence instead.
-    assert_eq!(
-        git(
-            &f.repo,
-            &["config", "--local", "--default", "", "--get", key]
-        ),
-        "never",
-        "no retention entry was written beside the record"
-    );
 
     // The **entry** the anchor is read from, not the file it lives in.
     let creation_entry = |branch: &str| -> Option<String> {
@@ -4529,6 +4569,20 @@ fn recording_a_branch_retains_its_ref_journal() {
         Some(anchor.as_str()),
         "the retention entry did not hold the creation entry through `reflog expire --all`, so \
          the instance anchor is not durable"
+    );
+
+    // The mechanism, asserted after the property it is supposed to produce — so a `retain_reflog`
+    // reduced to a no-op fails on the durability above rather than here, where the panic would say
+    // only that a config key is missing. `--default` so an unset key exits 0 and this assertion is
+    // what reports it: the helper asserts on git's exit status, so a bare `--get` would panic with
+    // git's silence instead.
+    assert_eq!(
+        git(
+            &f.repo,
+            &["config", "--local", "--default", "", "--get", key]
+        ),
+        "never",
+        "no retention entry was written beside the record"
     );
 
     // Deleting the branch takes the record and the entry with it.
