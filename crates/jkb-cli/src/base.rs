@@ -790,8 +790,9 @@ mod tests {
             while let Some(c) = chars.next() {
                 match c {
                     '\\' => {
-                        // The escaped character is consumed, so `\"` cannot end the literal and a
-                        // line continuation (`\` + newline) folds a wrapped message into one.
+                        // The escaped character is consumed, so an embedded `\"` cannot end the
+                        // literal early. `jkb doctor` prints a message containing one; without
+                        // this it would split into pieces that each look innocent.
                         if let Some(next) = chars.next() {
                             lit.push(next);
                         }
@@ -805,14 +806,22 @@ mod tests {
         out
     }
 
+    /// The scanner reads **messages**, not identifiers, and an escaped quote inside a message does
+    /// not end it early.
+    ///
+    /// Both halves are load-bearing for the guard above. `measure_root_for` is an ordinary
+    /// function name and must not be mistaken for a sentence, or the guard fires on code that
+    /// tells nobody anything. And a message containing `\"` — `jkb doctor` prints one — must stay
+    /// whole, or it splits into fragments that each look innocent while the sentence they form
+    /// does not.
     #[test]
-    fn the_literal_scanner_folds_a_wrapped_message_and_ignores_identifiers() {
-        let code = "let x = measure_root_for(a);\nbail!(\"say \\\n --onto and measure\");";
+    fn the_literal_scanner_reads_messages_not_identifiers_and_keeps_an_escaped_quote() {
+        let code = "let x = measure_root_for(a);\nbail!(\"say \\\"--onto\\\" and measure\");";
         let lits = string_literals(code);
-        assert_eq!(lits.len(), 1, "identifiers were read as literals: {lits:?}");
-        assert!(
-            lits[0].contains("--onto") && lits[0].contains("measure"),
-            "a message wrapped across source lines was split in two: {lits:?}"
+        assert_eq!(
+            lits,
+            vec!["say \"--onto\" and measure".to_owned()],
+            "an escaped quote split the message, or an identifier was read as one"
         );
     }
 }
