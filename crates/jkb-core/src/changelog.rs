@@ -143,21 +143,27 @@ impl Entity {
     }
 }
 
-/// Append one changelog entry for a mutation within the current transaction.
+/// Refuse an entry `undo` could not honour, at the moment it is written.
 ///
-/// # Errors
-/// Returns an error if the insert fails, or if `op` is `insert` for an [`Entity`] whose inserts
-/// have no inverse — a programming error, refused here because the alternative is a silent one:
-/// `undo_last` skips the whole transaction and reverts an older one in its place.
-pub(crate) fn append(
-    conn: &Connection,
-    meta: &WriteMeta,
-    op: &str,
-    entity: Entity,
-    entity_id: &str,
-    before: Option<&Value>,
-    after: Option<&Value>,
-) -> Result<()> {
+/// The two ways a table can reach the log without reaching `undo`, and both fail here rather than
+/// at some later, unrelated `jkb undo`:
+///
+///  * **Its inserts have no inverse.** [`InsertInverse::Never`] says so; logging one anyway makes
+///    `undo_last` skip the transaction and revert an older one in its place.
+///  * **It is missing from [`Entity::ALL`].** The exhaustive [`Entity::insert_inverse`] match
+///    forces the *decision* for a new variant, but nothing forces it into the list — and a variant
+///    absent from the list is invisible to the derived allowlist, which is the silent half of this
+///    defect all over again. Membership is cheap to check and turns that into a loud failure at the
+///    new table's first write.
+fn undoable(op: &str, entity: Entity) -> Result<()> {
+    if !Entity::ALL.contains(&entity) {
+        return Err(jkb_types::Error::Validation(format!(
+            "`{}` is missing from `changelog::Entity::ALL`, so `undo` cannot see it: a bare \
+             `jkb undo` would skip this transaction and revert an older one",
+            entity.as_str()
+        ))
+        .into());
+    }
     if op == OP_INSERT && entity.insert_inverse() == InsertInverse::Never {
         return Err(jkb_types::Error::Validation(format!(
             "`{}` records no invertible insert, so logging one would make `jkb undo` skip this \
@@ -167,6 +173,25 @@ pub(crate) fn append(
         ))
         .into());
     }
+    Ok(())
+}
+
+/// Append one changelog entry for a mutation within the current transaction.
+///
+/// # Errors
+/// Returns an error if the insert fails, or if this entry could not be undone in the way its op
+/// implies — see [`undoable`]. Those are programming errors, refused here because the alternative
+/// is a silent one: `undo_last` skips the whole transaction and reverts an older one in its place.
+pub(crate) fn append(
+    conn: &Connection,
+    meta: &WriteMeta,
+    op: &str,
+    entity: Entity,
+    entity_id: &str,
+    before: Option<&Value>,
+    after: Option<&Value>,
+) -> Result<()> {
+    undoable(op, entity)?;
     let before = before.map(ToString::to_string);
     let after = after.map(ToString::to_string);
     conn.prepare_cached(
@@ -226,5 +251,30 @@ mod tests {
             super::append(conn, meta, "update", never, "1", None, None)
         })
         .unwrap();
+    }
+
+    /// The other way a table reaches the log without reaching `undo`: the variant exists and
+    /// decided its inverse, but nobody added it to `ALL`, so the derived allowlist cannot see it.
+    ///
+    /// The exhaustive match forces the decision; nothing forces the listing, and an unlisted table
+    /// fails exactly the way this whole redesign exists to stop — silently, at somebody else's
+    /// `jkb undo`. Checked against the *policy*, so it survives the membership changing.
+    #[test]
+    fn logging_an_entity_missing_from_the_list_is_refused() {
+        for e in Entity::ALL {
+            assert!(
+                super::undoable("update", *e).is_ok(),
+                "{} is listed and still refused",
+                e.as_str()
+            );
+        }
+        // Every variant this build knows is in `ALL`; the guard is what makes a future one that is
+        // not fail loudly, and `Entity::ALL.contains` is the only thing standing between that
+        // variant and an invisible skip.
+        assert_eq!(
+            Entity::ALL.len(),
+            14,
+            "a variant was added or removed — check it reached `ALL`, not just `insert_inverse`"
+        );
     }
 }
