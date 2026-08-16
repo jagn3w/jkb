@@ -334,9 +334,11 @@ pub fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
 /// actually **resolves** to it — in one `git` call.
 ///
 /// The batched form of the question [`branch_ref`] asks per branch, with the same
-/// [`Prefer::Local`] preference. [`has_branch`] is one subprocess per question and each spawn
-/// measured ~11ms here; `staging ls` redraws on every database write, so it resolves this once
-/// before its loop.
+/// [`Prefer::Local`] preference — for names that **are** branches. It is not simply `branch_ref`
+/// in bulk: its keys are the set of branch names, so a tag or a raw object id is absent here and
+/// resolvable there, and that difference is [`branch_name`]'s whole reason for existing.
+/// [`has_branch`] is one subprocess per question and each spawn measured ~11ms here; `staging ls`
+/// redraws on every database write, so it resolves this once before its loop.
 ///
 /// It returns the **ref**, not mere membership, and that is the load-bearing part. A branch living
 /// only under `refs/remotes/origin/` is live — the ordinary state after a pruned local ref — but
@@ -1363,6 +1365,63 @@ mod tests {
             super::ahead_count(&dir, "main", &refs["unmerged"]).unwrap(),
             2
         );
+    }
+
+    /// "Is this a branch, and what is it called" — every answer, including the two that are not
+    /// branches at all.
+    ///
+    /// The exact key must win over the `origin/`-stripped form, or a local branch genuinely named
+    /// `origin/x` would be read as a remote copy of `x` and its land target recorded against the
+    /// wrong branch. And a tag has to be distinguishable from a name nothing uses: the first is a
+    /// caller naming the wrong kind of thing, the second is a branch waiting to be cut, and
+    /// `jkb task work --onto` may legitimately do the latter.
+    #[test]
+    fn branch_name_answers_which_branch_a_spelling_refers_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let run = |at: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}: {ok:?}");
+        };
+        run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
+        run(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run(&dir, &["push", "-q", "origin", "unmerged"]);
+        run(&dir, &["branch", "-D", "unmerged"]);
+        run(&dir, &["tag", "v1.0", "main"]);
+        // A local branch whose name happens to start with the remote's.
+        run(&dir, &["branch", "origin/decoy", "main"]);
+
+        use super::BranchName::{Is, NotABranch, Unknown};
+        let name = |n: &str| super::branch_name(&dir, n).unwrap();
+        assert_eq!(name("main"), Is("main".to_owned()));
+        assert_eq!(
+            name("unmerged"),
+            Is("unmerged".to_owned()),
+            "a branch that survives only on the remote is still a branch"
+        );
+        assert_eq!(
+            name("origin/unmerged"),
+            Is("unmerged".to_owned()),
+            "the remote-qualified spelling must canonicalize to the key the listing uses"
+        );
+        assert_eq!(
+            name("origin/decoy"),
+            Is("origin/decoy".to_owned()),
+            "a local branch named `origin/…` was read as a remote copy of something else"
+        );
+        assert_eq!(name("v1.0"), NotABranch, "a tag was accepted as a branch");
+        assert_eq!(name("HEAD"), NotABranch);
+        assert_eq!(name("no-such-thing"), Unknown);
     }
 
     /// A branch mirrored on a **non-origin** remote has still done its own work.

@@ -516,8 +516,11 @@ fn rejected(
     };
     let tip = tip_of(root, branch)?;
     Ok(match (untouched_tip(root, branch)?, tip) {
-        // Which rule applies is unknown, so neither can be checked. Refusing costs a measurement
-        // that is reported and repeatable; admitting costs a value that may be the tip.
+        // Which of the two rules applies is unknown, so neither can be checked. Written as the
+        // fail-closed *default* rather than as a live guard: `measure` asks the same question
+        // first and stops at `Missing::CannotAsk`, so nothing reaches here today. It matters
+        // because the alternative default is `None` — admit the value — and this function's whole
+        // job is to be the arm that cannot admit a tip by accident.
         (Untouched::Unknown, _) => Some(Missing::CannotAsk),
         // Untouched: the tip is the only admissible value.
         (Untouched::At(untouched), _) if sha != untouched => Some(Missing::NotTheForkPoint),
