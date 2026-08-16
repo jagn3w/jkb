@@ -808,12 +808,15 @@ fn abandoning_one_task_of_a_group_keeps_the_others_on_the_batch() {
             .success();
     }
 
-    f.jkb()
+    // The state, asserted before the sentence about it: a mutation that clears the target while
+    // still printing the note would otherwise be caught only by the report, and the report is not
+    // the thing that keeps the batch.
+    let out = f
+        .jkb()
         .args(["task", "abandon", &a, "--force"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("land target was kept"))
-        .stderr(predicate::str::contains(&b));
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "abandon: {out:?}");
 
     let rows = f.staging(&[]);
     let batch = rows
@@ -832,6 +835,12 @@ fn abandoning_one_task_of_a_group_keeps_the_others_on_the_batch() {
         uids.contains(&b.as_str()),
         "the sibling lost its land target when its group-mate was abandoned: {uids:?}"
     );
+    let note = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        note.contains("land target was kept") && note.contains(&b),
+        "nothing said the branch was shared, so the kept target looks like the command \
+         doing nothing: {note}"
+    );
 
     // …and once nothing live is left on the branch the clear happens as before, which is what the
     // clear is for. "Live" is the task lifecycle: an abandoned task stays open and stays on its
@@ -840,11 +849,12 @@ fn abandoning_one_task_of_a_group_keeps_the_others_on_the_batch() {
         .args(["--global", "task", "set", &a, "--status", "cancelled"])
         .assert()
         .success();
-    f.jkb()
+    let last = f
+        .jkb()
         .args(["task", "abandon", &b, "--force"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("land target was kept").not());
+        .output()
+        .unwrap();
+    assert!(last.status.success(), "abandon: {last:?}");
     assert!(
         !f.staging(&[])
             .as_array()
@@ -852,6 +862,10 @@ fn abandoning_one_task_of_a_group_keeps_the_others_on_the_batch() {
             .iter()
             .any(|r| r["branch"] == "integration"),
         "a batch with no live task on it is still offered as a land target"
+    );
+    assert!(
+        !String::from_utf8_lossy(&last.stderr).contains("land target was kept"),
+        "a terminal task was counted as work still on the branch"
     );
 }
 
