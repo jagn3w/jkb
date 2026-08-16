@@ -28,7 +28,10 @@
 //! - **The parent is what the caller states in this call**, never the stored land target, which
 //!   records an earlier moment and may name a batch this branch has nothing to do with.
 //! - **`has_own_commits` is asked of git**, so a stale, wrong, unresolvable or *grandparent*
-//!   parent cannot change the one thing readers ask of the record: whether it equals the tip.
+//!   parent cannot change the one thing readers ask of the record: whether it equals the tip. And
+//!   it may answer *neither* — a broken ref anywhere fails the traversal — which is
+//!   [`Missing::CannotAsk`, not "untouched"](Untouched), because "untouched" is the answer that
+//!   makes the tip storable.
 //!
 //! ## The staleness rule is the write's shape, not a step in it
 //!

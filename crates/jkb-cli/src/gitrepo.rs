@@ -1377,6 +1377,8 @@ mod tests {
     /// `jkb task work --onto` may legitimately do the latter.
     #[test]
     fn branch_name_answers_which_branch_a_spelling_refers_to() {
+        use super::BranchName::{Is, NotABranch, Unknown};
+
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("repo");
         let remote = tmp.path().join("remote.git");
@@ -1401,7 +1403,6 @@ mod tests {
         // A local branch whose name happens to start with the remote's.
         run(&dir, &["branch", "origin/decoy", "main"]);
 
-        use super::BranchName::{Is, NotABranch, Unknown};
         let name = |n: &str| super::branch_name(&dir, n).unwrap();
         assert_eq!(name("main"), Is("main".to_owned()));
         assert_eq!(

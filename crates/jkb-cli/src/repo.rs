@@ -331,7 +331,7 @@ pub(crate) struct Work {
 /// differently from `jkb staging ls` and `jkb task land`: it took the first `branch=` value, which
 /// `tag::applications` orders lexicographically, so a task carrying a stale `a-old` beside a live
 /// `z-live` had `--delete-branch` destroy `a-old` and forget its cut point while the row the user
-/// clicked Abandon on named `z-live`. Three consumers of one rule, two of them converted.
+/// clicked Abandon on named `z-live` — the third consumer of a rule two of them already shared.
 ///
 /// The batched surface ([`crate::staging`]) still calls [`work_branch`] directly with the sessions
 /// and refs it has already read once for the whole listing — the same rule, not a second one.
