@@ -300,9 +300,16 @@ pub(crate) fn record(
     // fully contained.
     let mut skipped_no_base = Vec::new();
     let mut on_branch: Vec<(ItemId, String)> = Vec::new();
-    // One merge probe per distinct (work branch, base): a swarm group puts the same `branch=`
-    // on every task in it, and each probe is about four git spawns.
-    let mut covered: BTreeMap<(String, Option<String>), bool> = BTreeMap::new();
+    // One merge probe per distinct work branch: a swarm group puts the same `branch=` on every
+    // task in it, and each probe is about four git spawns.
+    //
+    // Keyed on the branch alone. It used to be keyed `(branch, base)`, because two tasks in one
+    // repo could name the same branch with *different* cut points — an item-keyed store made that
+    // representable. `(repo, branch)` is the record's key now, so it is not.
+    let mut covered: BTreeMap<String, bool> = BTreeMap::new();
+    // Every branch record in this repo, in one read: the loop below asks about one branch per
+    // task and a per-task lookup is the N+1 shape `repo_tasks` exists to avoid.
+    let records = crate::repo::branch_records(db, repo_key)?;
     let mut unusable = Vec::new();
     for t in crate::repo::repo_tasks(db, repo_key)? {
         // A branch value git cannot be handed at all costs its own row and no more. `?`-ing on one
@@ -336,17 +343,17 @@ pub(crate) fn record(
             // The task's OTHER branches are still probed, which is the point of the check: a
             // task carrying a second, live session branch must not be credited by a review that
             // never saw it.
-            if others_are_covered(repo_root, &t, branch, &mut covered)? {
+            if others_are_covered(db, repo_root, repo_key, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
-            } else if !task_records_a_base(repo_root, &t)? {
+            } else if !task_records_a_base(repo_root, &records, &t)? {
                 skipped_no_base.push(t.meta.uid.clone());
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
             }
-        } else if names(crate::repo::FACET_ONTO) {
-            if work_is_in(repo_root, &t, branch, &mut covered)? {
+        } else if lands_on(&records, &t, branch) {
+            if work_is_in(db, repo_root, repo_key, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
-            } else if !task_records_a_base(repo_root, &t)? {
+            } else if !task_records_a_base(repo_root, &records, &t)? {
                 skipped_no_base.push(t.meta.uid.clone());
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
@@ -412,64 +419,84 @@ pub(crate) struct Recording {
     pub(crate) unusable: Vec<String>,
 }
 
-/// Whether `work`'s commits are already contained in `branch`, memoized per `(work, base)`:
+/// Whether `work`'s commits are already contained in `branch`, memoized per work branch:
 /// `is_merged` is about four git spawns and a swarm group puts one branch on every task in it.
 ///
 /// `BranchMissing` counts as contained — a branch that is gone was deleted by `land`, which only
 /// happens once its commits reached the target.
 fn branch_is_in(
+    db: &Db,
     repo_root: &std::path::Path,
-    t: &crate::repo::RepoTask,
+    repo_key: &str,
     work: &str,
     branch: &str,
-    covered: &mut BTreeMap<(String, Option<String>), bool>,
+    covered: &mut BTreeMap<String, bool>,
 ) -> Result<bool> {
-    // Per branch, resolved by the one module that knows how a cut point is recorded: lending one
-    // branch's to a sibling disables the "nothing on it yet" guard for that sibling. Two tasks in
-    // the same repo can name the same branch with different cut points, so the memo is keyed on
-    // both.
-    let base = crate::base::resolve(&t.tags, work);
-    let key = (work.to_owned(), base.map(str::to_owned));
-    if let Some(known) = covered.get(&key) {
+    if let Some(known) = covered.get(work) {
         return Ok(*known);
     }
-    // `landed_for_action`, not `is_merged`: crediting a task as reviewed is acting on the
-    // answer, and a branch with no recorded base must not be credited — an empty live sibling
-    // otherwise reads as covered and `reviewed=<sha>` is stamped for work no review saw.
-    let (state, _) = crate::repo::landed_with_base(
+    // `landed_for_action`, not `is_merged`: crediting a task as reviewed is acting on the answer,
+    // and a branch with no recorded cut point must not be credited — an empty live sibling
+    // otherwise reads as covered and `reviewed=<sha>` is stamped for work no review saw. It is
+    // also what refuses a record whose branch shows a verified anchor mismatch, so a recycled name
+    // holds rather than being credited.
+    let (state, _) = crate::repo::landed_for_action(
+        db,
         repo_root,
+        repo_key,
         work,
         branch,
-        base,
         crate::gitrepo::Prefer::Local,
     )?;
     let answer = matches!(
         state,
         crate::gitrepo::MergeState::Merged | crate::gitrepo::MergeState::BranchMissing
     );
-    covered.insert(key, answer);
+    covered.insert(work.to_owned(), answer);
     Ok(answer)
+}
+
+/// Whether any branch this task records lands on `branch` — the `onto=` arm, now read from the
+/// branch's own record.
+///
+/// Per branch rather than per task, which is what it always meant: a task carrying two branches
+/// had one `onto=` facet, so a review of the batch one branch lands on also matched the other.
+fn lands_on(
+    records: &BTreeMap<String, jkb_core::branch::BranchRecord>,
+    t: &crate::repo::RepoTask,
+    branch: &str,
+) -> bool {
+    crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH)
+        .iter()
+        .any(|work| {
+            records
+                .get(work)
+                .and_then(|r| r.land_target.as_deref())
+                .is_some_and(|target| target == branch)
+        })
 }
 
 /// Whether every `branch=` this task records **other than the reviewed one** is already
 /// contained in the reviewed branch.
 ///
-/// Split out from [`work_is_in`] because the two callers ask different questions. On the `onto=`
+/// Split out from [`work_is_in`] because the two callers ask different questions. On the land-target
 /// arm the task's branch is a sub-branch and containment is the whole question. On the `branch=`
 /// arm the reviewed branch is the task's own, so probing it against itself is not just redundant
 /// — it answers `NothingToMerge` for a session that has not committed yet, and skips the task.
 fn others_are_covered(
+    db: &Db,
     repo_root: &std::path::Path,
+    repo_key: &str,
     t: &crate::repo::RepoTask,
     branch: &str,
-    covered: &mut BTreeMap<(String, Option<String>), bool>,
+    covered: &mut BTreeMap<String, bool>,
 ) -> Result<bool> {
     let works = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
     for work in works {
         if work == branch {
             continue;
         }
-        if !branch_is_in(repo_root, t, work, branch, covered)? {
+        if !branch_is_in(db, repo_root, repo_key, work, branch, covered)? {
             return Ok(false);
         }
     }
@@ -486,14 +513,14 @@ fn others_are_covered(
 /// Both degenerate answers are **not covered**, because this decides whether to open the land
 /// gate and it must fail closed:
 ///
-/// - **No `branch=` at all.** `/task-swarm` writes `onto=` at claim and `branch=` only once an
-///   implementer has one, so a task mid-claim has intent and no work. Returning "covered"
+/// - **No `branch=` at all.** `/task-swarm` records a land target at claim and `branch=` only once
+///   an implementer has one, so a task mid-claim has intent and no work. Returning "covered"
 ///   there stamped `reviewed=` on a task that had not been written yet.
 /// - **`NothingToMerge`.** A branch cut from the target with nothing committed on it re-merges
-///   to the target's own tree, so on content alone it reads `Merged`. `base=` exists precisely
-///   to separate that from "contributed nothing because it landed" (D34.2), so it is passed
-///   here; without it, `jkb task work` followed by a staging review credited a session that
-///   had no commits.
+///   to the target's own tree, so on content alone it reads `Merged`. The cut point exists
+///   precisely to separate that from "contributed nothing because it landed" (D34.2), so it is
+///   consulted here; without it, `jkb task work` followed by a staging review credited a session
+///   that had no commits.
 ///
 /// `BranchMissing` **is** covered: a branch that is gone was deleted by `land`, which happens
 /// only after its commits reached the target.
@@ -503,21 +530,20 @@ fn others_are_covered(
 /// `task start` used to leave two — and `tasks_by_branch` indexes every value for that same
 /// reason. Probing only the first meant a stale, deleted branch answered `BranchMissing`,
 /// stamped `reviewed=`, and opened the gate for a live sibling branch the review never saw.
-///
-/// Memoized per `(work branch, base)`: `is_merged` is about four git spawns, and a swarm group
-/// puts the same `branch=` on every task in it.
 fn work_is_in(
+    db: &Db,
     repo_root: &std::path::Path,
+    repo_key: &str,
     t: &crate::repo::RepoTask,
     branch: &str,
-    covered: &mut BTreeMap<(String, Option<String>), bool>,
+    covered: &mut BTreeMap<String, bool>,
 ) -> Result<bool> {
     let branches = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
     if branches.is_empty() {
         return Ok(false);
     }
     for work in branches {
-        if !branch_is_in(repo_root, t, work, branch, covered)? {
+        if !branch_is_in(db, repo_root, repo_key, work, branch, covered)? {
             return Ok(false);
         }
     }
@@ -527,18 +553,23 @@ fn work_is_in(
 /// Whether every branch this task records has a cut point this repo can actually use — the fact
 /// that decides whether a containment answer is "no" or "unknown".
 ///
-/// Asks `repo::base_is_usable`, the same question `close-merged` asks, rather than "does a base
-/// tag exist". They come apart exactly where it matters: `landed_with_base` short-circuits on an
+/// Asks `repo::base_is_usable`, the same question `close-merged` asks, rather than "is a record
+/// present". They come apart exactly where it matters: `landed_with_base` short-circuits on an
 /// unusable cut point without ever probing git, so a task whose work *is* merged was reported as
 /// "not merged into it yet" — a claim nothing had checked — and neither remedy offered could
 /// resolve it, while the `skipped_no_base` bucket that names the recording verb sat unused. Also
-/// per branch: a base recorded for a sibling says nothing about this one.
+/// per branch: a record for a sibling says nothing about this one.
 ///
 /// # Errors
 /// Returns an error if git cannot be run.
-fn task_records_a_base(repo_root: &std::path::Path, t: &crate::repo::RepoTask) -> Result<bool> {
+fn task_records_a_base(
+    repo_root: &std::path::Path,
+    records: &BTreeMap<String, jkb_core::branch::BranchRecord>,
+    t: &crate::repo::RepoTask,
+) -> Result<bool> {
     for work in crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH) {
-        if !crate::repo::base_is_usable(repo_root, crate::base::resolve(&t.tags, work))? {
+        let cut = records.get(work).and_then(|r| r.cut_point.as_deref());
+        if !crate::repo::base_is_usable(repo_root, cut)? {
             return Ok(false);
         }
     }

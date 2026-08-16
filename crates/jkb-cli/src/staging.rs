@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use jkb_core::Db;
 
-use crate::repo::{facet_one, facet_values, RepoCtx, RepoTask, FACET_BRANCH, FACET_ONTO};
+use crate::repo::{facet_one, facet_values, RepoCtx, RepoTask, FACET_BRANCH};
 use crate::{gitrepo, review, session};
 
 /// Where a task sits in the pipeline. Derived, never stored.
@@ -155,12 +155,28 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     let tasks = crate::repo::repo_tasks(db, &ctx.key)?;
     let sessions = session::discover(&ctx.root)?;
 
-    // Group tasks by the branch they land on. A task with no `onto=` is not on a staging
-    // branch — it has never been through `task work` — and is simply not in this view.
+    // Group tasks by the branch they land on, read from each **branch's** own record (D38.1
+    // holds: which branches exist still comes from git, below — a record is never evidence one
+    // does). A task none of whose branches records a land target has never been through
+    // `task work` and is simply not in this view.
+    //
+    // One read for the whole repo, joined in memory: this view redraws on every database write
+    // and holds a row per task (design risk 2).
+    //
+    // A task is grouped under **every** target its branches name, not just the first. It was one
+    // `onto=` facet per task, so a task carrying two branches had one answer and the second
+    // branch's batch simply did not know about it.
+    let records = crate::repo::branch_records(db, &ctx.key)?;
     let mut by_onto: BTreeMap<String, Vec<&RepoTask>> = BTreeMap::new();
     for t in &tasks {
-        if let Some(onto) = facet_one(&t.tags, FACET_ONTO) {
-            by_onto.entry(onto.clone()).or_default().push(t);
+        let mut targets: Vec<&str> = facet_values(&t.tags, FACET_BRANCH)
+            .iter()
+            .filter_map(|b| records.get(b).and_then(|r| r.land_target.as_deref()))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            by_onto.entry(target.to_owned()).or_default().push(t);
         }
     }
 

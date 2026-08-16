@@ -18,6 +18,7 @@ mod session;
 mod staging;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -767,19 +768,22 @@ enum TaskCmd {
         #[arg(short = 'a', long)]
         all: bool,
     },
-    /// Record the commit a branch was cut from, replacing only that branch's record.
+    /// Drop a branch's recorded cut point, so the next `task start` / `task work` measures it
+    /// again.
     ///
-    /// `task start` and `task work` record this themselves; this is for a branch created by
-    /// hand, or to correct one. Without it a rebase-merged branch — which GitHub fast-forwards,
-    /// leaving it byte-identical to trunk — cannot be told apart from a branch that was just
-    /// created and never touched, so `close-merged` and `review record` both decline to act.
+    /// **No verb anywhere accepts a commit id**, and that is the point of this one. This used to
+    /// take a sha, and produced three findings across three review passes, all the same shape:
+    /// the sha nearest a user's hand is the branch tip, a cut point equal to the tip reads as
+    /// "nothing has happened here" forever, and the task then can neither be credited by a review
+    /// nor land — with no repair path. Each was fixed by rewording a message; there are only so
+    /// many messages.
+    ///
+    /// The one case forgetting cannot repair — a branch whose work was merged away — is closed
+    /// with `jkb task set <uid> --status done`, which is also not a sha.
     Base {
-        /// The task uid.
-        uid: String,
-        /// The branch the cut point belongs to.
-        branch: String,
-        /// The commit it was cut from (any git revision; resolved here).
-        sha: String,
+        /// The branch whose record to drop. Keyed by branch, so no task uid is needed.
+        #[arg(long, value_name = "BRANCH")]
+        forget: String,
     },
     /// Start work: claim the task and record the branch and repo it is being done on, so
     /// `jkb task close-merged` can close it once that branch lands. Both default from the
@@ -875,6 +879,21 @@ enum TaskCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Record that a branch was grafted onto another — for the merge queue, which is bash and
+    /// cannot write the record directly the way `jkb task land` does.
+    ///
+    /// A landing event is a **trusted** fact: readers act on it without re-deriving anything from
+    /// refs, so this verb is a new write route for exactly the class of fact this area exists to
+    /// protect. It therefore refuses unless the branch's work really is in the target, judged by
+    /// the same policy every reader uses — so a hand-run for work that has not landed fails, and
+    /// one for work that has records a truth.
+    Landed {
+        /// The branch that was grafted.
+        branch: String,
+        /// The branch it was grafted onto.
+        #[arg(long)]
+        onto: String,
+    },
     /// Release a task's claim held by an owner (defaults to this process).
     Release {
         /// The task uid.
@@ -924,11 +943,8 @@ enum TaskTagCmd {
     },
     /// Make `facet=value` the facet's **only** value, replacing any others.
     ///
-    /// Use for facets with one true answer — `branch=`, `repo=`, `onto=` — where a second
-    /// value is a contradiction rather than extra information (design D36.6).
-    ///
-    /// **Not `base=`**: a cut point belongs to one branch, so a task working two of them has two
-    /// records and this would delete one. `jkb task base` writes that one, and this refuses it.
+    /// Use for facets with one true answer — `branch=`, `repo=` — where a second value is a
+    /// contradiction rather than extra information (design D36.6).
     Set {
         /// The task uid.
         uid: String,
@@ -3091,16 +3107,16 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               can require one. /review-log does this for you.
   jkb task tag set <uid> <f>=<v>
                               make <v> the facet's ONLY value (add appends). Use for the
-                              single-answer facets: onto=, repo=. Writing branch= also
-                              records where that branch was cut, but prefer `task start`,
-                              which can be told the branch it was cut FROM.
+                              single-answer facets: repo=. Writing branch= also records where
+                              that branch was cut, but prefer `task start`, which can be told
+                              the branch it was cut FROM.
   jkb task start <uid> [--branch B] [--onto S]
-                              claim it and record the branch, the repo, and — from --onto, the
-                              branch B was cut from — where B forked. Prefer it over tagging
-                              branch= by hand.
-  jkb task base <uid> <branch> <sha>
-                              repair a cut point by hand. Per branch, so `tag set` would delete
-                              a sibling's and refuses; `task start` measures it for you.
+                              claim it and record the branch, the repo, where B lands, and —
+                              from --onto — where B forked. Prefer it to tagging branch=.
+  jkb task base --forget <branch>
+                              drop a branch's cut point so the next `task start` measures a
+                              fresh one. No verb takes a sha — the nearest one to hand is the
+                              branch tip, which freezes the task.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -3988,17 +4004,18 @@ fn cmd_task_add(
     // the store — `#branch=--upload-pack=x`.
     let mut qa = qa;
     for (facet, value) in &qa.tags {
-        // `#base=` would be refused by `jkb_core::tag::apply` a few frames down regardless — that
-        // is the reservation doing its job. It is named here only so the message points at the
-        // verb that owns it, exactly as `jkb task tag add base=` does; a user typing this into a
-        // task line and a user typing it at the tag command deserve the same answer.
+        // A land target is a fact about a *branch* and lives in that branch's record, so a facet
+        // named `onto` reaches no reader at all. Refused rather than stored inert: a user who
+        // typed it expecting effect deserves an answer, not silence. (`base=` needs no such
+        // refusal — nothing reads that name either, and every message about a cut point must
+        // avoid naming a verb that takes a sha, which is how three passes of findings started.)
         anyhow::ensure!(
-            !base::is_reserved_facet(facet),
-            "`#{facet}=` records where a *branch* was cut, not where a task is, so it cannot be \
-             set from a task line. Use `{}` instead.",
-            base::VERB
+            facet != "onto",
+            "`#onto=` records where a *branch* lands, not where a task is, so it cannot be set \
+             from a task line. Use `jkb task work <uid> --onto <branch>` or `jkb task start \
+             <uid> --branch <b> --onto <branch>`."
         );
-        if matches!(facet.as_str(), repo::FACET_BRANCH | repo::FACET_ONTO) {
+        if facet == repo::FACET_BRANCH {
             gitrepo::valid_ref(value)?;
         }
     }
@@ -4146,7 +4163,8 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         }
         TaskCmd::Show { uid } => {
             let id = resolve_task_uid(db, &uid)?;
-            output::print_item_full(db, id, json)?;
+            let extra = task_branch_extra(db, id)?;
+            output::print_item_full(db, id, json, &extra)?;
             // Subtasks are shown after the body: a parent is off the ready frontier until
             // they are all terminal, so "why isn't this actionable?" must be answerable
             // from the same command that shows the task.
@@ -4177,6 +4195,61 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
+}
+
+/// What this task's branches record — the cut point, the land target, and any landing jkb itself
+/// performed — for `jkb task show`.
+///
+/// Read for **every** branch the task names, keyed by branch: that is what the record is keyed by,
+/// and a task legitimately carries two. The old shape — a `base=<branch>:<sha>` tag among the
+/// task's tags — showed the same thing by accident of the encoding, and is what a dozen call sites
+/// then had to take apart.
+///
+/// The repository is the task's own `repo=`, so this reads correctly from anywhere; the database
+/// is global across repos (D32) and a namesake branch elsewhere is a different branch.
+fn task_branch_extra(db: &Db, id: ItemId) -> Result<output::Extra> {
+    let tags = repo::task_tags(db, id)?;
+    let branches = repo::facet_values(&tags, repo::FACET_BRANCH);
+    // The task's own `repo=` first, so this reads correctly from anywhere; otherwise the checkout
+    // we are standing in, which is what `record_branch` keys a task with no stated repo under.
+    let repo_key = repo::facet_one(&tags, repo::FACET_REPO)
+        .cloned()
+        .or_else(|| repo::repo_ctx().ok().map(|c| c.key));
+    let Some(repo_key) = repo_key else {
+        return Ok(output::Extra::default());
+    };
+    let records = repo::branch_records(db, &repo_key)?;
+    let mut extra = output::Extra::default();
+    let mut rows = Vec::new();
+    for b in branches {
+        let Some(r) = records.get(b) else { continue };
+        let mut line = match &r.cut_point {
+            Some(cut) => format!("  {b}: cut from {cut}"),
+            None => format!("  {b}: no cut point recorded"),
+        };
+        if let Some(target) = &r.land_target {
+            let _ = write!(line, ", lands on {target}");
+        }
+        if let Some(l) = &r.landed {
+            let _ = write!(line, ", landed on {} at {}", l.onto, l.at);
+        }
+        extra.lines.push(line);
+        rows.push(serde_json::json!({
+            "branch": b,
+            "cut_point": r.cut_point,
+            "land_target": r.land_target,
+            "landed_at": r.landed.as_ref().map(|l| l.at.clone()),
+            "landed_onto": r.landed.as_ref().map(|l| l.onto.clone()),
+            "landed_head": r.landed.as_ref().map(|l| l.head.clone()),
+        }));
+    }
+    if !extra.lines.is_empty() {
+        extra.lines.insert(0, "branches:".to_owned());
+    }
+    extra
+        .json
+        .insert("branches".to_owned(), serde_json::Value::Array(rows));
+    Ok(extra)
 }
 
 /// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
@@ -4291,12 +4364,13 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             },
             json,
         )?,
-        TaskCmd::Base { uid, branch, sha } => cmd_task_base(db, &uid, &branch, &sha, json)?,
+        TaskCmd::Base { forget } => cmd_task_base_forget(db, &forget, json)?,
         TaskCmd::CloseMerged {
             repo,
             trunk,
             dry_run,
         } => cmd_task_close_merged(db, repo, trunk, dry_run, json)?,
+        TaskCmd::Landed { branch, onto } => cmd_task_landed(db, &branch, &onto, json)?,
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Review { cmd } => cmd_task_review(db, cmd, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
@@ -4466,13 +4540,12 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
             },
         )?;
         if clear_onto {
-            repo::clear_facet(conn, meta, id, repo::FACET_ONTO)?;
+            repo::clear_land_targets(conn, meta, id, measure_root.as_deref())?;
         }
         Ok(missing)
     })?;
     report_started(
         db,
-        id,
         &Started {
             uid,
             branch: &branch,
@@ -4504,7 +4577,7 @@ struct Started<'a> {
 /// The human note was added first and alone, which left a JSON consumer — the UI, a workflow —
 /// with no way to tell that no cut point was recorded and the task will therefore never
 /// auto-close. A fact worth saying out loud is worth saying to whoever is actually reading.
-fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()> {
+fn report_started(db: &Db, s: &Started<'_>, json: bool) -> Result<()> {
     let Started {
         uid,
         branch,
@@ -4513,7 +4586,7 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
         ref missing,
         dropped_trunk,
     } = *s;
-    let recorded = base::recorded_for(db, id, branch)?;
+    let recorded = base::recorded_for(db, repo, branch)?;
     if json {
         println!(
             "{}",
@@ -4562,14 +4635,15 @@ fn report_started(db: &Db, id: ItemId, s: &Started<'_>, json: bool) -> Result<()
 /// What `--onto` should be **recorded** as, given what it was passed — and the trunk rules.
 ///
 /// `--onto` carries two roles that only come apart at trunk: the branch this one was **cut from**
-/// (a measurement reference) and the branch it **lands on** (the `onto=` facet, which puts it in
-/// the staging picker). Trunk is a perfectly good answer to the first and an unacceptable one to
-/// the second (D34.3), so it is used for the measurement and dropped from the record.
+/// (a measurement reference) and the branch it **lands on** (`branch_records.land_target`, which
+/// puts it in the staging picker). Trunk is a perfectly good answer to the first and an
+/// unacceptable one to the second (D34.3), so it is used for the measurement and dropped from the
+/// record.
 ///
 /// Refusing the flag outright was the first version, and it left a branch genuinely cut from trunk
 /// with commits already on it able to record only `base == tip` — permanently `NothingToMerge`,
-/// never creditable, never landable — with `jkb task base` and a hand-computed merge-base as the
-/// only way out, which is the thing this area exists to stop callers doing.
+/// never creditable, never landable — with a hand-computed merge-base as the only way out, which
+/// is the thing this area exists to stop callers doing.
 ///
 /// The work branch itself may never be trunk: `branch=main` closes the task the instant anything
 /// merges, since trunk is trivially merged into itself.
@@ -4627,65 +4701,97 @@ struct Land {
     dropped_trunk: bool,
 }
 
-/// `task base <uid> <branch> <sha>` — record where a branch was cut (design D34.2).
+/// `task landed <branch> --onto <target>` — record a landing the merge queue performed (B4).
 ///
-/// The only cut-point writer a user or a workflow can reach; `base::ensure_recorded` is the other
-/// one and refuses to overwrite. `sha` is resolved through git when we are in a repo, so a
-/// caller may pass `HEAD`, a branch name or a short hash and the record is a full commit id —
-/// `is_merged` compares it against `rev-parse` output, and a value git cannot resolve silently
-/// disables the guard it exists to provide.
-fn cmd_task_base(db: &Db, uid: &str, branch: &str, sha: &str, json: bool) -> Result<()> {
+/// **Why this cannot be a fabrication route.** `jkb task land` writes the record in Rust, straight
+/// after its own gate; the queue is bash and needs a verb. So the verb re-establishes the fact it
+/// is being told, by asking the same question every reader asks: is this branch's work in the
+/// target (`repo::landed_with_base` → `Merged`)? A branch with nothing on it answers
+/// `NothingToMerge` and is refused, which is the case a fabricated call would otherwise use to
+/// claim a landing for work that does not exist.
+///
+/// Deliberately **not** "is the branch's tip an ancestor of the target". A queue entry that landed
+/// after an earlier one is rebased, so its commits are rewritten and the branch ref — which the
+/// detached rebase does not move — is not an ancestor of the target at all. That check would have
+/// refused every entry but the first, which is precisely the case the serial queue exists for.
+/// Containment by content is the project's own definition of landed (D34.2) and is the one that
+/// survives rebase and squash alike.
+fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> {
     gitrepo::valid_ref(branch)?;
-    let id = resolve_task_uid(db, uid)?;
-    // Refuse a revision that cannot be resolved rather than storing it verbatim. `landed_with_base`
-    // treats an unresolvable cut point as no cut point, so a typo is no longer *dangerous* — but it
-    // is still silent, and a task that quietly stops auto-closing is a bad way to learn you
-    // fat-fingered a sha.
-    //
-    // Only when we are standing in **the task's own repo**, though. The database is global across
-    // repos (D32), so this command is reachable from anywhere, and validating against whatever
-    // repo the cwd happens to be rejected a correct sha typed from a sibling checkout. Where the
-    // value cannot be checked the literal is kept and the fact that nothing verified it is said
-    // out loud, rather than implied by silence.
-    let task_repo = repo::facet_one(&repo::task_tags(db, id)?, repo::FACET_REPO).cloned();
-    // Resolution and refusal are gated on the SAME condition, deliberately. Gating only the
-    // refusal left the resolution running against whatever repo the cwd was in: standing in a
-    // sibling checkout where the value happened to resolve, that repo's full commit id was written
-    // as this task's cut point and printed as though verified. Rejecting a good sha was the nit
-    // being fixed; accepting a foreign one silently is worse than either.
-    //
-    // And it is the *same* condition `task start` and `task tag` gate on, because it is the same
-    // question — `repo::measure_root_for`. It had three implementations, and the one that never
-    // asked is what put a sibling repo's commit on a task.
-    let resolved = if let Some(root) = repo::measure_root_for(db, id, None)? {
-        let Some(resolved) = gitrepo::rev_commit(&root, sha)? else {
-            anyhow::bail!(
-                "`{sha}` is not a revision this repo can resolve, so nothing was recorded — a cut \
-                 point git cannot resolve is treated as no cut point at all, and {branch} would \
-                 silently never auto-close. Pass a commit that exists here."
-            );
-        };
-        resolved
-    } else {
-        eprintln!(
-            "warning: recorded `{sha}` unverified — this is not {}'s checkout, so nothing here \
-             could resolve it. If it is wrong, {branch} will silently never auto-close.",
-            task_repo.as_deref().unwrap_or("the task's repo")
-        );
-        sha.to_owned()
-    };
-    let (b, s) = (branch.to_owned(), resolved.clone());
-    let root = repo::measure_root_for(db, id, None)?;
+    gitrepo::valid_ref(onto)?;
+    let ctx = repo::repo_ctx()?;
+    // The branch's own tip, read **before** anything else could move it, and required: a landing
+    // that cannot say which tip landed can never be credited, so recording one without it would
+    // be a row that reads as "landed" to nothing.
+    let head = gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?
+        .and_then(|r| gitrepo::rev_commit(&ctx.root, &r).transpose())
+        .transpose()?
+        .with_context(|| format!("{branch} does not exist in {}", ctx.key))?;
+    let cut = repo::branch_record(db, &ctx.key, branch)?.and_then(|r| r.cut_point);
+    let (state, _) = repo::landed_with_base(
+        &ctx.root,
+        branch,
+        onto,
+        cut.as_deref(),
+        gitrepo::Prefer::Local,
+    )?;
+    anyhow::ensure!(
+        state == gitrepo::MergeState::Merged,
+        "{branch}'s work is not in {onto} ({state:?}), so nothing was recorded — this verb \
+         reports a landing the merge queue has already performed, and a record that a landing \
+         happened is acted on without re-checking. If {branch} has no cut point recorded, \
+         `jkb task start <uid> --branch {branch} --onto {onto}` measures one."
+    );
+    let (key, b, o, h) = (
+        ctx.key.clone(),
+        branch.to_owned(),
+        onto.to_owned(),
+        head.clone(),
+    );
     db.write_txn("cli", move |conn, meta| {
-        base::write(conn, meta, id, root.as_deref(), &b, &s)
+        jkb_core::branch::record_landing(conn, meta, &key, &b, &o, &h)
     })?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "uid": uid, "branch": branch, "base": resolved })
+            serde_json::json!({ "repo": ctx.key, "branch": branch, "onto": onto, "head": head })
         );
     } else {
-        println!("{uid}: {branch} was cut from {resolved}");
+        println!("recorded: {branch} landed on {onto} (from {head})");
+    }
+    Ok(())
+}
+
+/// `task base --forget <branch>` — drop a branch's recorded cut point (design B6).
+///
+/// The **only** cut-point verb a user or a workflow can reach, and it takes no commit id. Its
+/// predecessor did, and produced a finding family: the sha nearest a user's hand is the branch
+/// tip, recording the tip freezes the task at `NothingToMerge` permanently, and nothing could
+/// repair it. Forgetting always can — the next `jkb task start` / `task work` measures again.
+///
+/// Keyed `(repo, branch)`, so it names no task: a cut point is a fact about a branch, and every
+/// task on that branch shared the one record.
+fn cmd_task_base_forget(db: &Db, branch: &str, json: bool) -> Result<()> {
+    gitrepo::valid_ref(branch)?;
+    // The record is keyed by repo, so this has to be run where the branch lives. The database is
+    // global across repos (D32) and a namesake branch elsewhere is a different branch.
+    let ctx = repo::repo_ctx()?;
+    let (b, key) = (branch.to_owned(), ctx.key.clone());
+    let dropped = db.write_txn("cli", move |conn, meta| {
+        base::forget_cut_point(conn, meta, &key, &b)
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "repo": ctx.key, "branch": branch, "forgotten": dropped })
+        );
+    } else if dropped {
+        println!("forgot {branch}'s cut point in {}", ctx.key);
+        println!(
+            "  next: `jkb task start <uid> --branch {branch} --onto <parent>` measures it again"
+        );
+    } else {
+        println!("{branch} had no recorded cut point in {}", ctx.key);
     }
     Ok(())
 }
@@ -4700,24 +4806,19 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
     let (facet, value) = facet_value
         .split_once('=')
         .context("tag must be `facet=value`, e.g. `size=small`")?;
-    // A facet with structure the generic commands do not understand is refused, not mangled. The
-    // cut point is per-branch multi-valued, so `set` clears other *branches'* records and `add`
-    // appends an unattributable one — and the previous refusal message named `tag set base=` as
-    // the remedy, which `/task-swarm` then adopted, so the tool was recommending the write that
-    // destroys the records it refuses to act without.
-    //
-    // `rm` is still allowed: deleting a wrong record is a legitimate repair, and its effect is to
-    // leave the branch with none — which both readers treat as "do not act".
+    // A land target is a fact about a *branch* and lives in that branch's record, so a facet named
+    // `onto` reaches no reader. Refused rather than stored inert — a user who typed it expecting
+    // effect deserves an answer, not silence — and `rm` is refused with it, since there is nothing
+    // for it to remove either.
     anyhow::ensure!(
-        !base::is_reserved_facet(facet) || matches!(mode, TagMode::Rm),
-        "`{facet}` records where a *branch* was cut, not where a task is: `add` would leave a \
-         value naming no branch, and `set` would delete the records of the task's other \
-         branches. Use `{}` instead.",
-        base::VERB
+        facet != "onto",
+        "`onto` records where a *branch* lands, not where a task is, so it is no longer a tag. \
+         Use `jkb task work <uid> --onto <branch>`, or `jkb task start <uid> --branch <b> \
+         --onto <branch>`."
     );
-    // The ref-valued facets are read back and handed to git, so the same rule applies here as at
+    // The ref-valued facet is read back and handed to git, so the same rule applies here as at
     // the location writer: a value git would read as an option must not reach the store.
-    if matches!(facet, repo::FACET_BRANCH | repo::FACET_ONTO) && !matches!(mode, TagMode::Rm) {
+    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
         gitrepo::valid_ref(value)?;
     }
     let id = resolve_task_uid(db, &uid)?;
@@ -4957,7 +5058,7 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
                 "resumed": resumed,
                 // Reported for the same reason `task start` reports it: a consumer cannot
                 // otherwise tell whether this session's work can ever auto-close.
-                "base": base::recorded_for(db, id, &branch)?,
+                "base": base::recorded_for(db, &ctx.key, &branch)?,
                 "owner": owner,
             })
         );
@@ -5038,9 +5139,17 @@ fn resolve_onto(
     }
     // A session that already has a target keeps it — counting the remote-tracking copy, or a
     // batch whose local ref was pruned would silently retarget the session somewhere else.
-    if let Some(branch) = repo::facet_one(tags, repo::FACET_ONTO) {
+    //
+    // Read from the branch's own record, and from **every** branch this task records: the session
+    // branch is minted before this runs, so on a resume the target hangs off whichever branch the
+    // previous run recorded it against.
+    let records = repo::branch_records(db, &ctx.key)?;
+    for work in repo::facet_values(tags, repo::FACET_BRANCH) {
+        let Some(branch) = records.get(work).and_then(|r| r.land_target.as_deref()) else {
+            continue;
+        };
         if gitrepo::adopt_remote(&ctx.root, branch)? {
-            return Ok(branch.clone());
+            return Ok(branch.to_owned());
         }
     }
     // Join the batch the other live sessions are landing on.
@@ -5303,8 +5412,10 @@ fn land_preflight(
         &known,
     )
     .context("this task records no branch")?;
-    let onto = repo::facet_one(tags, repo::FACET_ONTO)
-        .cloned()
+    // The land target of the branch the work is on — asked of that branch's record, so a task
+    // carrying a stale sibling branch cannot answer with the sibling's batch.
+    let onto = repo::branch_record(db, &ctx.key, &branch)?
+        .and_then(|r| r.land_target)
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
     // The same question the session paths ask, and materialised for the same reason: the land
     // path checks the target out, so a target that exists only on `origin/` is usable — refusing
@@ -5471,6 +5582,10 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
             gate_source: source.label(),
             keep_worktree,
             waiver: waiver_owed.then_some(head.as_str()),
+            // Only a real commit id: `head` falls back to the literal "unknown" for the waiver
+            // string, and a landing event whose `landed_head` is not a commit can never be
+            // credited — it would silently mean "never credited" rather than "not recorded".
+            head: base::is_object_id(&head).then_some(head.as_str()),
         },
         json,
     )
@@ -5489,6 +5604,12 @@ struct Landed<'a> {
     keep_worktree: bool,
     /// The branch HEAD to record as `review-waived=`, when `--no-review` carried this land.
     waiver: Option<&'a str>,
+    /// The branch's **own tip** at the moment of the graft, recorded as `landed_head`.
+    ///
+    /// `graft` rebases a detached HEAD, so the branch ref still points here afterwards — which is
+    /// what lets a later reader tell this landing from one belonging to a namesake branch cut
+    /// under the same name after the fact.
+    head: Option<&'a str>,
 }
 
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
@@ -5511,6 +5632,26 @@ fn settle_landing(
         let sha = sha.to_owned();
         db.write_txn("cli", move |conn, meta| {
             repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, &sha)
+        })?;
+    }
+
+    // The landing itself, recorded because jkb performed it (design B4). It shrinks the number of
+    // branches whose landing has to be *inferred* from refs from one per task to one per batch —
+    // and the surviving one, the staging branch, is the case where the cut point is provable (an
+    // untouched branch forked at its own tip) rather than measured against a moving parent.
+    //
+    // After the gate, deliberately: a land that rolled back must leave no event. Before the
+    // session-disposal guard below, equally deliberately: the commits are on the target by this
+    // point, so the event is true whatever happens to the worktree.
+    if let Some(head) = landed.head {
+        let (key, branch, onto, head) = (
+            ctx.key.clone(),
+            landed.branch.to_owned(),
+            landed.onto.to_owned(),
+            head.to_owned(),
+        );
+        db.write_txn("cli", move |conn, meta| {
+            jkb_core::branch::record_landing(conn, meta, &key, &branch, &onto, &head)
         })?;
     }
 
@@ -5768,17 +5909,19 @@ fn cmd_task_abandon(
     if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
         branch_deleted = true;
-        let gone = branch.clone();
-        db.write_txn("cli", move |conn, meta| base::forget(conn, meta, id, &gone))?;
+        let (gone, key, root) = (branch.clone(), ctx.key.clone(), ctx.root.clone());
+        db.write_txn("cli", move |conn, meta| {
+            base::forget(conn, meta, Some(&root), &key, &gone)
+        })?;
     }
     // Release, and reopen unless the task is already finished.
     //
-    // `onto=` is cleared **only** when the task is reopened, which is exactly when it stops
-    // being true: an abandoned task is no longer landing on that batch, and leaving the facet
-    // made it keep rendering as live `implementing` work — which in turn kept its staging
+    // The land target is cleared **only** when the task is reopened, which is exactly when it
+    // stops being true: an abandoned task is no longer landing on that batch, and leaving it
+    // made the task keep rendering as live `implementing` work — which in turn kept its staging
     // branch classified unmerged and offered as a land target long after the batch was spent
-    // (D36.3). For a task that stays `done` or `cancelled` the facet is history: it records
-    // which batch the work went to (or was dropped from), and the In Flight view reads it.
+    // (D36.3). For a task that stays `done` or `cancelled` it is history: it records which batch
+    // the work went to (or was dropped from), and the In Flight view reads it.
     //
     // The status is re-read inside the transaction, so a task that finished while this
     // command was removing a worktree is not reopened by a decision taken before that.
@@ -5787,6 +5930,7 @@ fn cmd_task_abandon(
     // left alone, and then announced as "open again" with `"reopened": true`, which the
     // extension believes.
     let observed = held.clone();
+    let abandon_root = ctx.root.clone();
     let (reopened, final_status) = db.write_txn("cli", move |conn, meta| {
         // Only the claim judged above, and nothing at all when there was none. `held` was read
         // before two git subprocesses (`worktree remove`, `delete-branch`) — a far wider window
@@ -5823,7 +5967,7 @@ fn cmd_task_abandon(
         if jkb_types::TaskStatus::is_terminal_str(Some(current.as_str())) {
             return Ok((false, current));
         }
-        repo::clear_facet(conn, meta, id, repo::FACET_ONTO)?;
+        repo::clear_land_targets(conn, meta, id, Some(&abandon_root))?;
         task::set_status(conn, meta, id, jkb_types::TaskStatus::Open)?;
         Ok((true, "open".to_owned()))
     })?;
@@ -6056,20 +6200,22 @@ fn gone_branches(cwd: &Path, branches: &[String]) -> Result<Vec<String>> {
 /// Taking one branch — the lexicographically smallest, as `tag::applications` orders them — meant
 /// a task with `a-merged` and `z-live` closed while `z-live` was still in flight.
 fn merged_state_of_all(
+    db: &Db,
     cwd: &Path,
+    repo_key: &str,
     branches: &[String],
     trunk_ref: &str,
-    tags: &BTreeMap<String, Vec<String>>,
     warned_fallback: &mut bool,
 ) -> Result<gitrepo::MergeState> {
     let mut state = gitrepo::MergeState::Merged;
     for b in branches {
         // `landed_for_action`, not `is_merged`: closing a task is acting on the answer, so a
-        // branch with no recorded base must not count as landed. The remote copy answers "did
-        // this work ship?" — after a merged PR the local branch is usually stale or already
-        // deleted (design D34.2).
+        // branch with no recorded cut point must not count as landed. It is also what consults a
+        // landing jkb itself performed, and what refuses a record whose branch shows a verified
+        // anchor mismatch. The remote copy answers "did this work ship?" — after a merged PR the
+        // local branch is usually stale or already deleted (design D34.2).
         let (s, fell_back) =
-            repo::landed_for_action(cwd, b, trunk_ref, tags, gitrepo::Prefer::Remote)?;
+            repo::landed_for_action(db, cwd, repo_key, b, trunk_ref, gitrepo::Prefer::Remote)?;
         if fell_back && !*warned_fallback {
             *warned_fallback = true;
             eprintln!(
@@ -6179,6 +6325,9 @@ fn cmd_task_close_merged(
     let mut undecidable = Vec::new();
     let mut unresolvable = Vec::new();
     let mut warned_fallback = false;
+    // Every branch record in the repo, in one read — the buckets below ask about a task's
+    // branches once per task, and this also runs from `scripts/hooks/post-merge`.
+    let records = repo::branch_records(db, &repo)?;
 
     for id in ids {
         let (uid, status, tags) = close_merged_row(db, id)?;
@@ -6201,7 +6350,8 @@ fn cmd_task_close_merged(
             blocked.push((uid, format!("{branch} unusable: {e}")));
             continue;
         }
-        let state = merged_state_of_all(&cwd, &branches, &trunk_ref, &tags, &mut warned_fallback)?;
+        let state =
+            merged_state_of_all(db, &cwd, &repo, &branches, &trunk_ref, &mut warned_fallback)?;
         match state {
             gitrepo::MergeState::Merged => {
                 // A merged branch is evidence, not proof: a task with unfinished subtasks
@@ -6238,7 +6388,7 @@ fn cmd_task_close_merged(
                 let mut all_usable = true;
                 let mut any_recorded = false;
                 for b in &branches {
-                    let recorded = base::resolve(&tags, b);
+                    let recorded = records.get(b).and_then(|r| r.cut_point.as_deref());
                     any_recorded |= recorded.is_some();
                     all_usable &= repo::base_is_usable(&cwd, recorded)?;
                 }
@@ -6322,8 +6472,8 @@ struct CloseMergedReport<'a> {
     /// and it has a remedy the user cannot guess.
     undecidable: &'a [(String, String)],
     /// A cut point *is* recorded and this repository cannot resolve it. Split from `undecidable`
-    /// because only this half is repaired by `jkb task base`; the other half needs one measured,
-    /// and naming `task base` there invites a hand-typed branch tip, which freezes the task.
+    /// because this half has to be *dropped* before it can be re-measured, while the other half
+    /// only needs measuring.
     unresolvable: &'a [(String, String)],
 }
 
@@ -6357,11 +6507,11 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     for (uid, branch) in r.blocked {
         println!("held  {uid} ({branch}) — `jkb task show {uid}` says why (usually open subtasks)");
     }
-    // Split, because the two halves have different remedies and only one of them is
-    // `jkb task base`. Recommending that verb for a task with NO cut point was actively harmful:
-    // the sha nearest to hand is the branch tip, and a cut point equal to the tip reads as
-    // "nothing has happened here" forever — the task stops being listed here at all and becomes
-    // permanently unlandable, since `ensure_recorded` never overwrites. `task start` measures.
+    // Split, because the two halves have different remedies: one needs a cut point *measured*,
+    // the other needs the unusable one *dropped* first. Neither names a sha, and no verb accepts
+    // one any more — the sha nearest to hand is the branch tip, and a cut point equal to the tip
+    // reads as "nothing has happened here" forever, which is how a task became permanently
+    // unlandable with no repair path.
     for (uid, branch) in r.undecidable {
         println!(
             "unknown {uid} ({branch}) — no cut point recorded, so whether it landed cannot be \
@@ -6371,8 +6521,9 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     for (uid, branch) in r.unresolvable {
         println!(
             "unknown {uid} ({branch}) — its recorded cut point does not resolve in this repo, so \
-             whether it landed cannot be decided: correct it with \
-             `jkb task base {uid} <branch> <sha>`"
+             whether it landed cannot be decided: drop it with `{}` and let \
+             `jkb task start {uid} --branch <branch> --onto <parent>` measure a new one",
+            base::FORGET_VERB
         );
     }
     // Independent of the other buckets. Gated on them, the count vanished in exactly the runs
@@ -6769,6 +6920,38 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         }
     }
 
+    // Reflog retention entries this clone holds for branches nothing records any more.
+    //
+    // `base::ensure_recorded` writes an exact-ref `gc.refs/heads/<b>.reflogExpire = never` beside
+    // a branch record, so the instance anchor it stored survives `git gc`; `base::forget` removes
+    // it. The residue is a branch that was recorded and never forgotten — inert config, but config
+    // the user did not ask for, so it is reported rather than left to accumulate silently.
+    //
+    // Only inside a repo: `jkb doctor` runs from anywhere, and the entries are per clone.
+    if let Ok(ctx) = repo::repo_ctx() {
+        let retained = gitrepo::retained_reflogs(&ctx.root)?;
+        let recorded = repo::branch_records(db, &ctx.key)?;
+        let stale: Vec<&String> = retained
+            .iter()
+            .filter(|b| !recorded.contains_key(*b))
+            .collect();
+        if stale.is_empty() {
+            println!(
+                "reflog retention: {} entry(ies), all recorded",
+                retained.len()
+            );
+        } else {
+            println!(
+                "reflog retention: {} entry(ies) for branches no longer recorded in {}",
+                stale.len(),
+                ctx.key
+            );
+            for b in stale {
+                println!("  {b} — `git config --unset-all \"gc.refs/heads/{b}.reflogExpire\"`");
+            }
+        }
+    }
+
     // Stale task claims: owner-existence reclaim (design D27.2). For each claimed task
     // probe whether the recorded owner still exists (`kill -0`); a claim whose owner is
     // gone is orphaned (no time-based staleness — a paused-but-alive owner is retained).
@@ -7019,7 +7202,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
     // NOT been reviewed, and silence would read as "everything was tagged".
     if !skipped_no_base.is_empty() {
         // MEASURE, never a hand-typed sha. This is the third surface to have named
-        // `jkb task base <uid> <branch> <sha>` for a task that has *no* cut point, and the sha
+        // `jkb task base` with a sha for a task that has *no* cut point, and the sha
         // nearest a user's hand is `git rev-parse <branch>` — the tip, which freezes the task at
         // `NothingToMerge` for good. `/review-log` prints this on every run, so it is the most
         // frequently read of the three.

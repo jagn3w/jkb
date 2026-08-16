@@ -90,25 +90,39 @@ impl Fixture {
         v["uid"].as_str().unwrap().to_owned()
     }
 
-    /// Plant a raw `base=` value on a task, the way a database that predates the reservation
-    /// still holds one.
+    /// Plant a cut point directly in `branch_records`, bypassing the measurement.
     ///
-    /// It used to be planted through `jkb task add "… #base=<v>"`, which reached `tag::apply`
-    /// below every check. That route is closed — `jkb_core::tag` reserves the facet and refuses
-    /// a general write of it (design D46) — so the fixture goes through `apply_reserved`, the
-    /// privileged door, and the *reader* is still exercised against exactly the same stored value.
-    fn plant_base(&self, uid: &str, value: &str) {
+    /// There is no CLI verb that accepts a commit id — deliberately, design B6 — so a *reader*
+    /// test that needs a specific stored value writes the row. Everything the schema enforces
+    /// still applies: the CHECK refuses anything but a full lowercase object id, so this cannot
+    /// plant a state the store would not hold.
+    ///
+    /// `repo` is the fixture's repo key, which is what the record is keyed under.
+    fn plant_cut_point(&self, branch: &str, sha: &str) {
         let db = jkb_core::Db::open(self.db.to_str().unwrap()).unwrap();
-        let uid = uid.to_owned();
-        let value = value.to_owned();
-        let id = db
-            .read(move |conn| jkb_core::item::id_for_uid(conn, &uid))
-            .unwrap()
-            .unwrap();
+        let (repo, branch, sha) = (self.repo_key(), branch.to_owned(), sha.to_owned());
         db.write_txn("t", move |conn, meta| {
-            jkb_core::tag::apply_reserved(conn, meta, id, "base", &value)
+            jkb_core::branch::record_cut_point(
+                conn,
+                meta,
+                &repo,
+                &branch,
+                &jkb_core::branch::Cut::Fork(sha),
+                None,
+                jkb_core::branch::Supersede::default(),
+            )
+            .map(|_| ())
         })
         .unwrap();
+    }
+
+    /// The repo key the records are stored under — the basename of the fixture's checkout.
+    fn repo_key(&self) -> String {
+        self.repo
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Open a session and return its JSON description.
@@ -531,30 +545,36 @@ fn a_second_branch_tag_does_not_fork_the_session() {
         .stdout(predicate::str::contains("landed"));
 }
 
-/// `task work` sets the location facets rather than adding to them, so re-targeting a session
-/// cannot leave the task claiming two land targets at once.
+/// Re-targeting a session cannot leave the task claiming two land targets at once.
+///
+/// Where a branch lands is a **column** on that branch's record now, so "two targets" is not a
+/// state the store can hold for one branch — a re-target overwrites it. `task work` returns the
+/// same session, so both runs are about the same branch.
 #[test]
-fn retargeting_a_session_replaces_the_facets_it_records() {
+fn retargeting_a_session_replaces_the_target_it_records() {
     let f = Fixture::new();
     let uid = f.add_task("retargeted task");
-    f.work_onto(&uid, "batch-one");
-    f.work_onto(&uid, "batch-two");
+    let first = f.work_onto(&uid, "batch-one");
+    let second = f.work_onto(&uid, "batch-two");
+    assert_eq!(
+        first["branch"], second["branch"],
+        "setup: the second run must return the same session"
+    );
+    assert_eq!(second["onto"].as_str().unwrap(), "batch-two");
 
-    // `item show` is the read that carries tags; `task show` does not.
     let out = f
         .jkb()
-        .args(["item", "show", &uid, "--json"])
+        .args(["--global", "task", "show", &uid, "--json"])
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let onto: Vec<&str> = v["tags"]
+    let targets: Vec<&str> = v["branches"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| t["facet"] == "onto")
-        .map(|t| t["value"].as_str().unwrap())
+        .filter_map(|b| b["land_target"].as_str())
         .collect();
-    assert_eq!(onto, vec!["batch-two"], "one target, not two");
+    assert_eq!(targets, vec!["batch-two"], "one target, not two");
 }
 
 /// `--keep-worktree` must leave the session on what actually landed. `graft` rebases a
@@ -906,8 +926,8 @@ fn no_review_lands_but_records_a_waiver() {
 }
 
 /// `tag add` appends and `tag set` replaces. The distinction is load-bearing: `/task-swarm`
-/// re-tags a group on every pass, and an appending `onto=` would leave the task claiming two
-/// land targets at once — while a command named `add` must not silently delete a value.
+/// re-tags a group on every pass, and an appending `repo=` would leave the task claiming two
+/// repositories at once — while a command named `add` must not silently delete a value.
 #[test]
 fn tag_add_appends_but_tag_set_replaces() {
     let f = Fixture::new();
@@ -927,21 +947,19 @@ fn tag_add_appends_but_tag_set_replaces() {
         .stdout(predicate::str::contains("area=ui"))
         .stdout(predicate::str::contains("area=cli"));
 
-    // `set` collapses a facet to one value — what the location facets need.
-    f.jkb()
-        .args(["--global", "task", "tag", "set", &uid, "onto=batch-one"])
-        .assert()
-        .success();
-    f.jkb()
-        .args(["--global", "task", "tag", "set", &uid, "onto=batch-two"])
-        .assert()
-        .success();
+    // `set` collapses a facet to one value — what the remaining location facet needs.
+    for v in ["proj-one", "proj-two"] {
+        f.jkb()
+            .args(["--global", "task", "tag", "set", &uid, &format!("repo={v}")])
+            .assert()
+            .success();
+    }
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains("onto=batch-two"))
-        .stdout(predicate::str::contains("onto=batch-one").not());
+        .stdout(predicate::str::contains("repo=proj-two"))
+        .stdout(predicate::str::contains("repo=proj-one").not());
 }
 
 /// A cancelled task is `dropped`, never `landed`. Those are opposite outcomes, and an earlier
@@ -1391,7 +1409,7 @@ fn re_working_an_abandoned_branch_keeps_its_original_cut_point() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "base={branch}:{cut_point}"
+            "{branch}: cut from {cut_point}"
         )));
 
     // The harm itself. A branch with nothing on it re-merges to trunk's own tree, so on content
@@ -1406,93 +1424,94 @@ fn re_working_an_abandoned_branch_keeps_its_original_cut_point() {
     );
 }
 
-/// The cut point cannot be written through the generic tag command, which would delete the
-/// records belonging to the task's *other* branches.
+/// A land target cannot be written through the generic tag command or a task line, and the
+/// refusal names the verbs that own it.
 ///
-/// This is not a style preference. The refusal replaced an error message that named
-/// `jkb task tag set base=<branch>:<sha>` as its own remedy, and `/task-swarm` was changed to run
-/// exactly that — so following the tool's advice destroyed the records the tool then refused to
-/// act without.
+/// Where a branch lands is a fact about the **branch** and lives in that branch's record, so a
+/// facet named `onto` reaches no reader at all. Refusing rather than storing it inert is a UX
+/// judgement, not a data-integrity one: a stray facet cannot close a task falsely, but a user who
+/// typed it expecting effect deserves an answer instead of silence.
 #[test]
-fn the_cut_point_cannot_be_written_through_the_generic_tag_command() {
+fn a_land_target_cannot_be_written_as_a_tag() {
     let f = Fixture::new();
     let uid = f.add_task("hand-tagged task");
 
-    for mode in ["add", "set"] {
+    for mode in ["add", "set", "rm"] {
         f.jkb()
-            .args(["--global", "task", "tag", mode, &uid, "base=task/x:abc"])
+            .args(["--global", "task", "tag", mode, &uid, "onto=batch"])
             .assert()
             .failure()
-            .stderr(predicate::str::contains("jkb task base"));
-    }
-
-    // The verb it points at records per branch, leaving siblings alone. Real revisions: the verb
-    // refuses one this repo cannot resolve, because an unresolvable cut point is treated as none.
-    let first = git(&f.repo, &["rev-parse", "HEAD"]);
-    commit_in(&f.repo, "second.txt", "second\n", "second");
-    let second = git(&f.repo, &["rev-parse", "HEAD"]);
-    for (branch, sha) in [("task/x", &first), ("task/y", &second)] {
-        f.jkb()
-            .args(["--global", "task", "base", &uid, branch, sha])
-            .assert()
-            .success();
+            .stderr(predicate::str::contains("jkb task work"));
     }
     f.jkb()
-        .args(["--global", "task", "show", &uid])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(format!("base=task/x:{first}")))
-        .stdout(predicate::str::contains(format!("base=task/y:{second}")));
-
-    // `rm` is deliberately still allowed, and it is the only repair for a record whose branch is
-    // gone: deleting a wrong one leaves the branch with none, which both readers read as "do not
-    // act". The reservation guards the *write* — a value that never met the writer's rules — not
-    // the removal, and tightening it to cover `tag::remove` would close this off silently.
-    f.jkb()
-        .args([
-            "--global",
-            "task",
-            "tag",
-            "rm",
-            &uid,
-            &format!("base=task/x:{first}"),
-        ])
-        .assert()
-        .success();
-    f.jkb()
-        .args(["--global", "task", "show", &uid])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(format!("base=task/x:{first}")).not())
-        .stdout(predicate::str::contains(format!("base=task/y:{second}")));
-}
-
-/// …and it cannot be written through a **task line** either, which was the route that stayed open
-/// after the tag command was closed: `#base=` in quick-add text reached `tag::apply` directly.
-///
-/// The store is what refuses it now (`jkb_core::tag` reserves the facet), so this checks the
-/// surface — that the message names the verb that owns it, rather than leaving a user who typed a
-/// modifier to guess. The same wording as the tag refusal, on purpose: it is the same mistake.
-#[test]
-fn a_task_line_cannot_set_the_cut_point() {
-    let f = Fixture::new();
-    f.jkb()
-        .args([
-            "--global",
-            "task",
-            "add",
-            "planted #base=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        ])
+        .args(["--global", "task", "add", "planted #onto=batch"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("jkb task base"));
-    // Nothing was created: the refusal is before the write, so there is no half-made task to
-    // clean up and no task carrying the value with the modifier merely dropped.
+        .stderr(predicate::str::contains("jkb task work"));
+    // Nothing was created: the refusal is before the write, so there is no half-made task
+    // carrying the value with the modifier merely dropped.
     f.jkb()
         .args(["--global", "query", "kind:task"])
         .assert()
         .success()
         .stdout(predicate::str::contains("planted").not());
+}
+
+/// A `base=` **tag** now decides nothing, whatever is done to it.
+///
+/// This is the shape of the whole change, asserted from the outside. There used to be a reserved
+/// facet with a store-side refusal, a privileged writer, an authored/unauthored read split, and
+/// skips in both directions of the sync reconcile — six ascending choke points, the fifth write
+/// route found *after* the fifth of them, and a must-fix inside the reservation's own asymmetry.
+/// The fact moved to `branch_records`, so a tag called `base` is ordinary content: it can be
+/// added, renamed onto or off the name, and none of it moves a landing decision.
+#[test]
+fn a_base_tag_is_ordinary_content_and_decides_nothing() {
+    let f = Fixture::new();
+    let uid = f.add_task("plain task");
+    let head = git(&f.repo, &["rev-parse", "HEAD"]);
+
+    // Renaming a facet onto the name — the fifth write route a review pass found, after the
+    // store-side reservation had been added for the other four — is just a rename now.
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "area=sync"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "tag", "rename", "area", "base"])
+        .assert()
+        .success();
+    // …and it is freely writable directly, by every route that used to be closed off.
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "tag",
+            "add",
+            &uid,
+            &format!("base={head}"),
+        ])
+        .assert()
+        .success();
+
+    // The task records a real branch with NO cut point, so the only thing that could close it is
+    // the tag — which is what this asserts cannot happen. `main` is deliberately not used: trunk
+    // is trivially merged into itself.
+    git(&f.repo, &["branch", "feature"]);
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "branch=feature"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "base", "--forget", "feature"])
+        .assert()
+        .success();
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "open",
+        "a `base=` tag closed a task whose branch has no recorded cut point"
+    );
 }
 
 /// `task start --repo <other>` names **that** repository in its remedy — the one it was handed,
@@ -1540,123 +1559,73 @@ fn a_start_in_another_repo_names_that_repo_in_its_remedy() {
         .stdout(predicate::str::contains("run it again from thirdproj"));
 }
 
-/// A cut point git cannot resolve must not act as one, however it got into the store.
+/// A cut point this repository cannot resolve is treated as **none** — the task is held, never
+/// closed.
 ///
-/// `is_merged` separates "freshly cut, nothing on it yet" from "landed" by comparing the branch
-/// tip against `rev-parse <base>`. When the base does not resolve, that comparison is false rather
-/// than unknown, so the guard is *skipped*: an empty branch falls through to `merge-tree`, gets
-/// trunk's own tree back, and reads as merged. A missing cut point refuses to act; a garbage one
-/// closed the task with the work never written.
+/// `is_merged` decides "freshly cut, nothing on it yet" by comparing the branch tip against
+/// `rev-parse <base>`. When the base does not resolve, that right-hand side is `None`, the
+/// comparison is false rather than unknown, and the guard is *skipped*: the branch falls through
+/// to `merge-tree` and reads as merged. A missing cut point refuses to act; a garbage one closed
+/// the task with the work never written.
 ///
-/// The value is planted directly in the store, which is now the only way it can be there: every
-/// write route refuses it (`jkb_core::tag` reserves the facet), so what this test covers is the
-/// **reader's** policy against a value a database predating that reservation still holds. `task
-/// start` then adopts the bare value as this branch's cut point, or would if the writer's rules
-/// let it.
+/// **The branch has commits of its own**, which is what makes the reader the thing under test.
+/// On an untouched branch the *writer* would supersede a stored value that is not the tip (an
+/// untouched branch forked at its own tip), so the reader would never meet it — and a test that
+/// cannot reach the code it names is not covering it.
 ///
-/// **Run at both lengths, and the 40-character one is the case that mattered.** `git rev-parse`
-/// is a parser, not a lookup: a full-length hex string is already a well-formed object name, so
-/// it exits 0 and echoes it back for an object the clone does not have. The first version of this
-/// test used a 16-character value, which `rev-parse` *does* reject, so it passed against a check
-/// that let every fabricated 40-character sha straight through — a constant chosen without
-/// thinking about it hid the entire defect.
+/// `git rev-parse` is a parser, not a lookup: a full-length hex string is already a well-formed
+/// object name, so it exits 0 and echoes it back for an object the clone does not have. An earlier
+/// version of this test used a 16-character value, which `rev-parse` *does* reject, so it passed
+/// against a check that let every fabricated 40-character sha straight through.
 #[test]
 fn a_cut_point_git_cannot_resolve_is_treated_as_none() {
-    // Three shapes, three different reasons the task must not close, and picking only one is how
-    // the first two versions of this test passed against real defects:
-    //
-    // - a short hex string: rejected by `rev-parse`, and never adopted, since it is not an
-    //   object id;
-    // - a full-length hex string: **accepted** by `rev-parse`, which parses rather than looks up,
-    //   so only a verifying resolution rejects it;
-    // - a symbolic revision: resolves in *every* repository, to something different in each, so
-    //   the write must refuse the form outright and the reader must not honour it.
-    for fake in [
-        "deadbeefdeadbeef",
-        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        "HEAD",
-    ] {
-        a_cut_point_git_cannot_resolve_case(fake);
-    }
-}
-
-fn a_cut_point_git_cannot_resolve_case(fake: &str) {
     let f = Fixture::new();
     let uid = f.add_task("bogus base task");
-    f.plant_base(&uid, fake);
-    // Registered against a branch that **already exists**, via `task start`, so the planted value
-    // reaches the reader. `task work` would have *created* the branch, and a branch created now
-    // cannot be the one an existing record describes — so it is dropped and a real cut point
-    // measured, which is the rule
-    // `a_hand_deleted_branch_recut_by_task_work_does_not_inherit_its_cut_point` pins. Adoption is
-    // for a branch that was already there, which is what this exercises.
-    let branch = "feature".to_owned();
-    git(&f.repo, &["branch", &branch, "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "branch work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    f.plant_cut_point("feature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
     f.jkb()
-        .args(["task", "start", &uid, "--branch", &branch])
+        .args(["task", "start", &uid, "--branch", "feature"])
         .assert()
         .success();
-
-    // **None** of the three shapes may be stored, and for one reason rather than three: this
-    // branch has no commits of its own, so the only admissible cut point for it is its own tip
-    // (`base::rejected`), and none of these is that. Object-id *form* was previously the whole
-    // rule, and a 40-character fabrication therefore got adopted and had to be caught later by the
-    // reader; now the write refuses it and the reader never meets it.
-    assert_eq!(
-        git(&f.repo, &["rev-parse", &branch]),
-        git(&f.repo, &["rev-parse", "main"]),
-        "setup: the branch must have no commits of its own"
-    );
-    f.jkb()
-        .args(["--global", "task", "show", &uid])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(format!("base={branch}:{fake}")).not());
 
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
         f.status_of(&uid),
         "in_progress",
-        "an empty branch was closed as merged: the cut point `{fake}` did not resolve, so the \
+        "a branch was closed as merged against a cut point that does not resolve here, so the \
          freshly-cut guard was skipped instead of applied"
     );
 }
 
-/// And the verb refuses to record one in the first place, so a typo is loud rather than a task
-/// that quietly stops auto-closing.
+/// And a value that is not a full object id cannot be **stored** at all, whichever door it comes
+/// through — the schema refuses it.
+///
+/// A symbolic revision is the dangerous shape precisely because it resolves in *every* clone, to
+/// something different in each. It used to be refused by a check at the CLI verb, then by a check
+/// inside the writer; it is now a CHECK constraint, so there is no door left to add one to.
 #[test]
-fn task_base_refuses_a_revision_this_repo_cannot_resolve() {
+fn only_a_full_object_id_can_be_stored_as_a_cut_point() {
     let f = Fixture::new();
-    let uid = f.add_task("typo base task");
-
-    // Both lengths: a 40-character hex string parses as a well-formed object name, so only a
-    // *verifying* resolution rejects one this repo does not have.
-    for fake in ["aaaaaaa", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"] {
-        f.jkb()
-            .args(["--global", "task", "base", &uid, "task/x", fake])
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(
-                "not a revision this repo can resolve",
-            ));
+    let db = jkb_core::Db::open(f.db.to_str().unwrap()).unwrap();
+    for bad in ["HEAD", "main", "deadbeefdeadbeef", "1111111"] {
+        let value = bad.to_owned();
+        let err = db.write_txn("t", move |conn, meta| {
+            jkb_core::branch::record_cut_point(
+                conn,
+                meta,
+                "proj",
+                "feature",
+                &jkb_core::branch::Cut::Fork(value),
+                None,
+                jkb_core::branch::Supersede::default(),
+            )
+            .map(|_| ())
+        });
+        assert!(err.is_err(), "`{bad}` was stored as a cut point");
     }
-    f.jkb()
-        .args(["--global", "task", "show", &uid])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("base=").not());
-
-    // A real revision still records, resolved to its full id.
-    let head = git(&f.repo, &["rev-parse", "HEAD"]);
-    f.jkb()
-        .args(["--global", "task", "base", &uid, "task/x", "HEAD"])
-        .assert()
-        .success();
-    f.jkb()
-        .args(["--global", "task", "show", &uid])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(format!("base=task/x:{head}")));
 }
 
 /// `close-merged` must say "no usable cut point" rather than "still in flight". They are
@@ -1683,17 +1652,10 @@ fn close_merged_names_a_task_it_cannot_decide() {
         .stdout(predicate::str::contains("still in flight"))
         .stdout(predicate::str::contains(&uid).not());
 
-    // Remove it, as `task tag rm` or an unattributable legacy value would.
-    let base = git(&f.repo, &["rev-parse", "HEAD"]);
+    // Drop it — the one verb that touches a recorded cut point, and the one whose whole purpose
+    // is to leave the branch with none.
     f.jkb()
-        .args([
-            "--global",
-            "task",
-            "tag",
-            "rm",
-            &uid,
-            &format!("base=feature-x:{base}"),
-        ])
+        .args(["--global", "task", "base", "--forget", "feature-x"])
         .assert()
         .success();
 
@@ -1703,13 +1665,12 @@ fn close_merged_names_a_task_it_cannot_decide() {
         .success()
         .stdout(predicate::str::contains(&uid))
         .stdout(predicate::str::contains("no cut point recorded"))
-        // The remedy MEASURES. Naming `jkb task base` for a task with no cut point invites the
-        // sha nearest to hand — the branch tip — and a cut point equal to the tip reads as
-        // "nothing has happened here" forever: never creditable, never landable, and never
-        // corrected, since `ensure_recorded` does not overwrite. That is strictly worse than the
-        // state being reported, so this surface must not send anyone there.
+        // The remedy MEASURES. No verb accepts a sha any more, so no message can suggest one —
+        // the sha nearest a user's hand is the branch tip, and a cut point equal to the tip reads
+        // as "nothing has happened here" forever: never creditable, never landable, and never
+        // corrected. That is strictly worse than the state being reported.
         .stdout(predicate::str::contains("jkb task start"))
-        .stdout(predicate::str::contains("jkb task base").not());
+        .stdout(predicate::str::contains("<sha>").not());
     assert_eq!(
         f.status_of(&uid),
         "in_progress",
@@ -1754,14 +1715,15 @@ fn a_branch_that_exists_only_on_the_remote_is_not_reported_gone() {
         .stdout(predicate::str::contains("gone").not());
 }
 
-/// `jkb task base` must not resolve a revision against a repo that is not the task's.
+/// A record made in one repository is not visible to another — the key, asserted end to end.
 ///
-/// The database is global across repos, so this command runs from anywhere. Resolving in whatever
-/// checkout happens to be current means a sha that exists *there* is recorded as this task's cut
-/// point and printed as though verified — a wrong commit id presented as a checked one, which is
-/// worse than the rejected-good-sha nit the check was added to fix.
+/// The database is global across repos (D32), so every one of these commands legitimately runs
+/// from anywhere. A namesake branch in a sibling checkout is a different branch, and the old shape
+/// had no way to say so: the value was a tag on a task, and three separate commands each had their
+/// own idea of when it was safe to measure. `repo` is a key column now, so the question is
+/// answered by the store rather than remembered by each caller.
 #[test]
-fn task_base_does_not_resolve_a_sha_against_a_foreign_repo() {
+fn a_cut_point_recorded_in_one_repo_is_not_lent_to_a_namesake_branch_in_another() {
     let f = Fixture::new();
     let other = f.home.path().join("other");
     std::fs::create_dir_all(&other).unwrap();
@@ -1769,28 +1731,57 @@ fn task_base_does_not_resolve_a_sha_against_a_foreign_repo() {
     std::fs::write(other.join("o.txt"), "other\n").unwrap();
     git(&other, &["add", "-A"]);
     git(&other, &["commit", "-qm", "other base"]);
-    let foreign = git(&other, &["rev-parse", "HEAD"]);
+    // A namesake branch there, with work on it, so it could be mistaken for the task's.
+    git(&other, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(other.join("p.txt"), "more\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-qm", "other work"]);
+    git(&other, &["checkout", "-q", "main"]);
 
+    // The task's own repo, and a real measured cut point in it.
     let uid = f.add_task("cross repo task");
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "our work");
+    git(&f.repo, &["checkout", "-q", "main"]);
     f.jkb()
-        .args(["--global", "task", "tag", "add", &uid, "repo=proj"])
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
         .assert()
         .success();
-
-    // Standing in the *other* repo, where `foreign` resolves and the task's repo is elsewhere.
-    let mut cmd = f.jkb();
-    cmd.current_dir(&other)
-        .args(["--global", "task", "base", &uid, "task/x", &foreign])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("unverified"));
-
-    // Recorded verbatim and flagged, never presented as a resolved commit in this repo.
+    let ours = git(&f.repo, &["merge-base", "feature", "main"]);
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=task/x:{foreign}")));
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {ours}"
+        )));
+
+    // Standing in the *other* repo, nothing may be measured for this task and the record it
+    // already has is untouched.
+    let mut cmd = f.jkb();
+    cmd.current_dir(&other)
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--repo", "proj",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {ours}"
+        )));
+    // …and the other repo's own record for that name does not exist at all, so nothing there
+    // can be read as this task's.
+    let mut show = f.jkb();
+    show.current_dir(&other)
+        .args(["--global", "task", "base", "--forget", "feature"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("had no recorded cut point"));
 }
 
 /// A batch branch that exists only on the remote must be checked out, never re-cut from trunk.
@@ -1900,7 +1891,7 @@ fn a_branch_name_cannot_smuggle_a_git_option() {
     let hostile = [
         vec!["task", "work", uid.as_str(), "--onto=-D"],
         vec!["task", "start", uid.as_str(), "--branch=-D"],
-        vec!["--global", "task", "base", uid.as_str(), "-D", "HEAD"],
+        vec!["--global", "task", "base", "--forget", "-D"],
         vec!["task", "close-merged", "--trunk=-D"],
     ];
     for args in hostile {
@@ -1946,7 +1937,7 @@ fn the_cut_point_is_measured_on_the_branch_not_the_land_target() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "base=task/stranded-task:{branch_tip}"
+            "task/stranded-task: cut from {branch_tip}"
         )));
 
     // The branch carries nothing of its own, so the task must not close.
@@ -1986,7 +1977,7 @@ mod cut_point {
             .args(["--global", "task", "show", &uid])
             .assert()
             .success()
-            .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+            .stdout(predicate::str::contains(format!("feature: cut from {tip}")));
         f.jkb().args(["task", "close-merged"]).assert().success();
         assert_eq!(f.status_of(&uid), "in_progress");
     }
@@ -2011,7 +2002,7 @@ mod cut_point {
             .args(["--global", "task", "show", &uid])
             .assert()
             .success()
-            .stdout(predicate::str::contains(format!("base=mytask:{tip}")));
+            .stdout(predicate::str::contains(format!("mytask: cut from {tip}")));
 
         git(&f.repo, &["merge", "-q", "--ff-only", "stg"]);
         f.jkb().args(["task", "close-merged"]).assert().success();
@@ -2257,7 +2248,7 @@ fn task_start_says_so_when_it_can_measure_no_cut_point() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains("base=").not());
+        .stdout(predicate::str::contains("cut from").not());
 
     // The JSON path carries the same fact, or a consumer cannot see it at all.
     let out = f
@@ -2391,17 +2382,9 @@ fn a_review_names_the_task_it_cannot_decide_about() {
         "not landed\n",
         "wip",
     );
-    // Remove the cut point the session recorded, leaving containment undecidable.
-    let cut = git(&f.repo, &["rev-parse", &format!("{branch}~1")]);
+    // Drop the cut point the session recorded, leaving containment undecidable.
     f.jkb()
-        .args([
-            "--global",
-            "task",
-            "tag",
-            "rm",
-            &uid,
-            &format!("base={branch}:{cut}"),
-        ])
+        .args(["task", "base", "--forget", &branch])
         .assert()
         .success();
     f.add_finding("reviews/stg-2", "a finding");
@@ -2413,10 +2396,10 @@ fn a_review_names_the_task_it_cannot_decide_about() {
         .success()
         .stdout(predicate::str::contains("no cut point recorded"))
         // MEASURE, never a hand-typed sha: the nearest one is the branch tip, which freezes the
-        // task at `NothingToMerge` for good. This was the third surface to name `jkb task base`
-        // for a task with no cut point at all.
+        // task at `NothingToMerge` for good. No verb takes one any more, so no message can name
+        // one — this was the third surface that had to be corrected individually.
         .stdout(predicate::str::contains("jkb task start"))
-        .stdout(predicate::str::contains("jkb task base").not());
+        .stdout(predicate::str::contains("<sha>").not());
 }
 
 /// Reviewing a task's own branch must still check the *other* branches it records.
@@ -2439,7 +2422,9 @@ fn a_review_of_one_branch_does_not_credit_a_tasks_other_live_branch() {
         "a",
     );
 
-    // A second, live branch with its own unmerged work, recorded on the same task.
+    // A second, live branch with its own unmerged work, recorded on the same task. Its cut point
+    // is planted rather than measured through `task start`, which would take the live session's
+    // claim; what this test is about is the reader, and the reader needs a usable record.
     let fork = git(&f.repo, &["rev-parse", "main"]);
     git(&f.repo, &["checkout", "-q", "-b", "sibling"]);
     commit_in(&f.repo, "sib.txt", "sibling work\n", "sibling work");
@@ -2448,10 +2433,7 @@ fn a_review_of_one_branch_does_not_credit_a_tasks_other_live_branch() {
         .args(["--global", "task", "tag", "add", &uid, "branch=sibling"])
         .assert()
         .success();
-    f.jkb()
-        .args(["--global", "task", "base", &uid, "sibling", &fork])
-        .assert()
-        .success();
+    f.plant_cut_point("sibling", &fork);
 
     f.add_finding("reviews/one", "a finding");
     f.jkb()
@@ -2607,20 +2589,19 @@ fn a_group_branch_tagged_after_its_work(f: &Fixture) -> (String, String) {
     const OWNER: &str = "swarm:integration";
     let uid = f.add_task("swarm group task");
 
-    // Claim. The swarm claims under its run owner and records where the group lands, both before
-    // any branch exists. Run as the swarm runs them, so the tagging step below is exercised
-    // against a task this same owner already holds.
+    // Claim. The swarm claims under its run owner and records which repo the work is in, before
+    // any branch exists — where it *lands* is a fact about a branch, so it is recorded a step
+    // later by the same command that names the branch. Run as the swarm runs them, so the tagging
+    // step below is exercised against a task this same owner already holds.
     git(&f.repo, &["branch", "integration", "main"]);
     f.jkb()
         .args(["task", "claim", &uid, "--owner", OWNER])
         .assert()
         .success();
-    for tag in ["onto=integration", "repo=proj"] {
-        f.jkb()
-            .args(["--global", "task", "tag", "set", &uid, tag])
-            .assert()
-            .success();
-    }
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "repo=proj"])
+        .assert()
+        .success();
     let cut = git(&f.repo, &["rev-parse", "integration"]);
 
     // Implement. A group branch off the integration branch, with work already on it.
@@ -2656,7 +2637,7 @@ fn a_branch_tagged_after_its_work_records_where_it_was_cut_not_its_tip() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "base=swarm-task/group:{cut}"
+            "swarm-task/group: cut from {cut}"
         )));
 }
 
@@ -2713,7 +2694,7 @@ fn deleting_a_branch_with_its_session_takes_its_cut_point_too() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains("base=").not());
+        .stdout(predicate::str::contains("cut from").not());
 
     // Everything moves on while the task is idle, so the branch re-cut below starts somewhere the
     // stale record does not name — which is what makes the freshly-cut guard miss it. Trunk, so
@@ -2767,12 +2748,24 @@ fn a_remote_only_work_branch_is_explained_the_same_way_by_the_row_and_the_comman
     git(&f.repo, &["branch", "-D", "grp"]);
 
     let uid = f.add_task("a group being built elsewhere");
-    for tag in ["repo=proj", "onto=integration", "branch=grp"] {
-        f.jkb()
-            .args(["--global", "task", "tag", "set", &uid, tag])
-            .assert()
-            .success();
-    }
+    f.jkb()
+        .args(["--global", "task", "tag", "set", &uid, "repo=proj"])
+        .assert()
+        .success();
+    // The branch and its land target, through the one writer that records both — which is what
+    // `/task-swarm` runs once its implementer has a branch.
+    f.jkb()
+        .args([
+            "task",
+            "start",
+            &uid,
+            "--branch",
+            "grp",
+            "--onto",
+            "integration",
+        ])
+        .assert()
+        .success();
 
     let rows = f.staging(&[]);
     let row = rows[0]["tasks"]
@@ -2855,14 +2848,17 @@ fn task_start_does_not_measure_a_cut_point_in_a_foreign_repo() {
 }
 
 /// A cut point is measured against the parent the caller **states**, never one read back from the
-/// task's `onto=`.
+/// branch's recorded land target.
 ///
-/// Which branch this one was cut from is something the caller knows in the moment; the stored
-/// facet records some earlier moment, and a stale one is worse than none. A task carrying `onto=`
-/// from a previous batch, given a new branch cut from trunk, would measure their merge-base — a
-/// commit well behind the new branch's tip — and an empty branch identical to trunk would then
-/// skip the freshly-cut guard and close as merged with no work on it. That is the one direction
-/// D34.4 forbids, so the fallback with no stated parent is the branch's own tip, which holds.
+/// Which branch this one was cut from is something the caller knows in the moment; the stored land
+/// target records some earlier moment, and a stale one is worse than none. Reading it back would
+/// measure a merge-base with a batch this branch was never cut from — a commit well behind its
+/// tip — and the freshly-cut guard would then be skipped for work that never landed.
+///
+/// The branch has **commits of its own**, which is what makes this discriminating: an untouched
+/// branch records its own tip whatever parent is named, so the stated-versus-stored distinction
+/// would be invisible there. With work and no stated parent the honest answer is *nothing
+/// recorded*, and anything else means the stored value was consulted.
 #[test]
 fn a_stale_land_target_is_not_used_to_measure_a_new_branchs_cut_point() {
     let f = Fixture::new();
@@ -2873,32 +2869,45 @@ fn a_stale_land_target_is_not_used_to_measure_a_new_branchs_cut_point() {
     git(&f.repo, &["checkout", "-q", "main"]);
     // ...and trunk has moved on since.
     commit_in(&f.repo, "new.txt", "new\n", "trunk moves on");
-    let tip = git(&f.repo, &["rev-parse", "main"]);
-    git(&f.repo, &["branch", "feature", "main"]);
+    // A branch with real work of its own.
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "f.txt", "feature\n", "feature work");
+    git(&f.repo, &["checkout", "-q", "main"]);
 
-    let uid = f.add_task("new work, old facet");
-    for tag in ["repo=proj", "onto=stale-batch"] {
-        f.jkb()
-            .args(["--global", "task", "tag", "set", &uid, tag])
-            .assert()
-            .success();
-    }
+    // The task's branch carries a land target from that earlier round, and its cut point is then
+    // dropped — the state a re-measurement would have to fill.
+    let uid = f.add_task("new work, old target");
     f.jkb()
         .args(["task", "start", &uid, "--branch", "feature"])
+        .args(["--onto", "stale-batch"])
         .assert()
         .success();
+    f.jkb()
+        .args(["task", "base", "--forget", "feature"])
+        .assert()
+        .success();
+
+    // Re-run naming NO parent. Reading the stored land target back would record a merge-base with
+    // `stale-batch`; the honest answer is nothing, and the reason.
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"base\":null"))
+        .stdout(predicate::str::contains(
+            "no-parent-named-and-branch-has-commits",
+        ));
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+        .stdout(predicate::str::contains("cut from").not());
 
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
         f.status_of(&uid),
         "in_progress",
-        "an empty branch closed as merged: its cut point was measured against a batch it was \
-         never cut from, so the freshly-cut guard was skipped"
+        "a task with no measurable cut point must be held, never closed"
     );
 }
 
@@ -2933,7 +2942,7 @@ fn a_wrong_parent_branch_holds_the_task_rather_than_closing_it() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+        .stdout(predicate::str::contains(format!("feature: cut from {tip}")));
 
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
@@ -2966,7 +2975,9 @@ fn tagging_a_branch_onto_a_task_records_its_cut_point_too() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=handmade:{tip}")));
+        .stdout(predicate::str::contains(format!(
+            "handmade: cut from {tip}"
+        )));
 
     // `add` keeps appending — a task can legitimately record two branches and every reader indexes
     // both — but it cannot leave the second one without a cut point either.
@@ -2981,7 +2992,7 @@ fn tagging_a_branch_onto_a_task_records_its_cut_point_too() {
         .success()
         .stdout(predicate::str::contains("branch=handmade"))
         .stdout(predicate::str::contains("branch=second"))
-        .stdout(predicate::str::contains(format!("base=second:{tip}")));
+        .stdout(predicate::str::contains(format!("second: cut from {tip}")));
 }
 
 /// And it does not measure one in whatever checkout the cwd happens to be.
@@ -3015,7 +3026,7 @@ fn tagging_a_branch_does_not_measure_it_in_a_foreign_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains("branch=shared"))
-        .stdout(predicate::str::contains("base=").not());
+        .stdout(predicate::str::contains("cut from").not());
 }
 
 /// A branch deleted by hand and re-cut by `task work` does not inherit its predecessor's cut point.
@@ -3103,7 +3114,7 @@ fn an_unresolvable_parent_branch_is_refused_rather_than_quietly_reinterpreted() 
         .assert()
         .success()
         .stdout(predicate::str::contains("onto=").not())
-        .stdout(predicate::str::contains("base=").not());
+        .stdout(predicate::str::contains("cut from").not());
 }
 
 /// A dangling `origin/HEAD` must not take the whole staging listing down with it.
@@ -3186,8 +3197,10 @@ fn a_branch_cut_from_trunk_can_say_so_without_recording_trunk_as_a_land_target()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success();
-    show.stdout(predicate::str::contains(format!("base=feature:{fork}")))
-        .stdout(predicate::str::contains("onto=").not());
+    show.stdout(predicate::str::contains(format!(
+        "feature: cut from {fork}"
+    )))
+    .stdout(predicate::str::contains("onto=").not());
 
     // And the point of all that: the work is real, so once it lands the task closes.
     git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
@@ -3216,19 +3229,24 @@ fn the_row_and_the_command_talk_about_the_same_branch() {
     git(&f.repo, &["checkout", "-q", "main"]);
 
     let uid = f.add_task("two recorded branches");
-    for tag in ["repo=proj", "onto=integration"] {
-        f.jkb()
-            .args(["--global", "task", "tag", "set", &uid, tag])
-            .assert()
-            .success();
-    }
-    // A stale branch that sorts first, and the live one it must not be preferred over.
-    for b in ["branch=a-gone", "branch=z-live"] {
-        f.jkb()
-            .args(["--global", "task", "tag", "add", &uid, b])
-            .assert()
-            .success();
-    }
+    // The live branch and its land target, through the one writer that records both.
+    f.jkb()
+        .args([
+            "task",
+            "start",
+            &uid,
+            "--branch",
+            "z-live",
+            "--onto",
+            "integration",
+        ])
+        .assert()
+        .success();
+    // …then a stale branch that sorts first, which must not be preferred over it.
+    f.jkb()
+        .args(["--global", "task", "tag", "add", &uid, "branch=a-gone"])
+        .assert()
+        .success();
 
     let rows = f.staging(&[]);
     let row = rows[0]["tasks"]
@@ -3289,7 +3307,7 @@ fn a_branch_that_has_done_nothing_records_its_tip_whatever_parent_is_named() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{tip}")));
+        .stdout(predicate::str::contains(format!("feature: cut from {tip}")));
 
     git(&f.repo, &["merge", "-q", "--ff-only", "stage"]);
     f.jkb().args(["task", "close-merged"]).assert().success();
@@ -3392,7 +3410,9 @@ fn the_tip_is_recorded_only_for_a_branch_that_has_done_nothing() {
         .args(["--global", "task", "show", &a])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=untouched:{tip}")));
+        .stdout(predicate::str::contains(format!(
+            "untouched: cut from {tip}"
+        )));
 
     // A branch with commits, and no parent named — the documented `jkb task start` invocation.
     git(&f.repo, &["checkout", "-q", "-b", "worked"]);
@@ -3413,7 +3433,7 @@ fn the_tip_is_recorded_only_for_a_branch_that_has_done_nothing() {
         .args(["--global", "task", "show", &b])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=worked:{worked_tip}")).not());
+        .stdout(predicate::str::contains(format!("worked: cut from {worked_tip}")).not());
 
     // …and unlike a recorded tip, that state is repairable: naming the parent measures it.
     let fork = git(&f.repo, &["merge-base", "worked", "main"]);
@@ -3425,7 +3445,7 @@ fn the_tip_is_recorded_only_for_a_branch_that_has_done_nothing() {
         .args(["--global", "task", "show", &b])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=worked:{fork}")));
+        .stdout(predicate::str::contains(format!("worked: cut from {fork}")));
 }
 
 /// A record that cannot describe this branch is discarded, whichever verb notices.
@@ -3467,7 +3487,9 @@ fn a_stale_record_is_discarded_by_task_start_not_only_by_task_work() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{recut}")));
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {recut}"
+        )));
 
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
@@ -3477,65 +3499,56 @@ fn a_stale_record_is_discarded_by_task_start_not_only_by_task_work() {
     );
 }
 
-/// Adding a second branch must not destroy the cut point the first one is still using.
+/// Naming a second branch on a task must not disturb the first one's record.
 ///
-/// `resolve` lends an unqualified legacy value to a task naming a single branch. The writer used
-/// to delete every unqualified value it did not adopt, so `jkb task tag add <uid> branch=<second>`
-/// threw it away — and deletion is irreversible, where keeping it is not: remove the second branch
-/// tag and the first is entitled to its record again.
+/// This was the purest finding in the whole corpus, and it was a *storage* defect rather than a
+/// caller's mistake: a cut point was a tag value on a task, so the per-branch fact had to be
+/// encoded into the value, and the documented repair — `jkb task tag set base=` — cleared the
+/// facet's other values, which were other branches' records. The key is `(repo, branch)` now, so
+/// one branch's record is not addressable from another's write.
 ///
-/// The legacy state is planted through the tag repo directly, because that is the only way it
-/// occurs now — `task tag add base=` is refused outright (D46), and every CLI route that writes
-/// `branch=` adopts an attributable value on the way past. The sync engine still applies tags
-/// without going through any of that, which is why such rows exist at all.
+/// Asserted through the CLI rather than only at the store, because the store is not where it went
+/// wrong: every writer here goes through `record_branch`, and this is what makes a second one
+/// harmless.
 #[test]
-fn adding_a_second_branch_keeps_the_first_ones_legacy_cut_point() {
+fn recording_a_second_branch_leaves_the_first_ones_cut_point_alone() {
     let f = Fixture::new();
-    // The legacy value must be a DIFFERENT commit from the branches' tips, or the sha the
-    // assertion looks for is also the one `second` legitimately records and the test passes
-    // whether or not the value survived. (It did exactly that when first written.)
-    let legacy = git(&f.repo, &["rev-parse", "main"]);
-    commit_in(&f.repo, "later.txt", "later\n", "trunk moves on");
-    git(&f.repo, &["branch", "first", "main"]);
-    git(&f.repo, &["branch", "second", "main"]);
-    assert_ne!(legacy, git(&f.repo, &["rev-parse", "first"]), "setup");
-    let uid = f.add_task("legacy base task");
+    let uid = f.add_task("two branch task");
 
-    let legacy_db = jkb_core::Db::open(f.db.to_str().unwrap()).unwrap();
-    let id = legacy_db
-        .read({
-            let uid = uid.clone();
-            move |conn| jkb_core::item::id_for_uid(conn, &uid)
-        })
-        .unwrap()
-        .unwrap();
-    legacy_db
-        .write_txn("t", {
-            let legacy = legacy.clone();
-            move |conn, meta| {
-                jkb_core::tag::apply(conn, meta, id, "repo", "proj")?;
-                jkb_core::tag::apply(conn, meta, id, "branch", "first")?;
-                jkb_core::tag::apply_reserved(conn, meta, id, "base", &legacy)
-            }
-        })
-        .unwrap();
-    drop(legacy_db);
+    // Two branches, each with work of its own and a different fork point, so a record lent from
+    // one to the other would be visible rather than coincidentally equal.
+    git(&f.repo, &["checkout", "-q", "-b", "first"]);
+    commit_in(&f.repo, "a.txt", "a\n", "first work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let first_fork = git(&f.repo, &["merge-base", "first", "main"]);
+    commit_in(&f.repo, "trunk.txt", "trunk\n", "trunk moves on");
+    git(&f.repo, &["checkout", "-q", "-b", "second"]);
+    commit_in(&f.repo, "b.txt", "b\n", "second work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let second_fork = git(&f.repo, &["merge-base", "second", "main"]);
+    assert_ne!(first_fork, second_fork, "setup: the forks must differ");
 
+    for branch in ["first", "second"] {
+        f.jkb()
+            .args(["task", "start", &uid, "--branch", branch, "--onto", "main"])
+            .assert()
+            .success();
+    }
     f.jkb()
-        .args(["--global", "task", "tag", "add", &uid, "branch=second"])
+        .args(["--global", "task", "tag", "add", &uid, "branch=first"])
         .assert()
         .success();
-    // Un-name the second branch: the first is entitled to its record again, and can only get it
-    // if adding the second did not delete it.
-    f.jkb()
-        .args(["--global", "task", "tag", "rm", &uid, "branch=second"])
-        .assert()
-        .success();
+
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(&legacy));
+        .stdout(predicate::str::contains(format!(
+            "first: cut from {first_fork}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "second: cut from {second_fork}"
+        )));
 }
 
 /// `jkb task add "… #branch=X"` records a cut point for X, like every other way of naming one.
@@ -3570,49 +3583,125 @@ fn quick_add_pairs_a_branch_with_its_cut_point_like_every_other_writer() {
         .assert()
         .success()
         .stdout(predicate::str::contains("branch=planned"))
-        .stdout(predicate::str::contains(format!("base=planned:{tip}")));
+        .stdout(predicate::str::contains(format!("planned: cut from {tip}")));
 }
 
-/// A branch whose work has been merged away is **held**, never closed on a re-measured tip.
-///
-/// The staleness check treats "no commits of its own" as evidence a recorded cut point belongs to
-/// whatever had the branch name before. That is also true of a branch whose commits were
-/// fast-forwarded into its batch or carried into trunk by a merge commit, and git cannot tell the
-/// two apart — so re-running a facet writer after that point discards the correct fork point and
-/// records the tip.
-///
-/// This pins the *direction* of that known false positive rather than the behaviour that produces
-/// it: the task must end up held. Held costs one command; the alternative for a recycled name is a
-/// false close, which buries work (D34.4). A future change that makes this case close again would
-/// be choosing the other direction, and should have to delete this test to do it.
-#[test]
-fn a_branch_whose_work_was_merged_away_is_held_never_closed() {
-    let f = Fixture::new();
-    git(&f.repo, &["branch", "batch", "main"]);
-    git(&f.repo, &["checkout", "-q", "-b", "feature", "batch"]);
-    commit_in(&f.repo, "w.txt", "work\n", "real work");
-    git(&f.repo, &["checkout", "-q", "main"]);
+// ---------------------------------------------------------------------------
+// Landing is an event where jkb performs it (design B4)
+// ---------------------------------------------------------------------------
 
-    let uid = f.add_task("work that lands by fast-forward");
+/// Set up a swarm-shaped task: a group branch with work, recorded against an integration branch.
+/// Returns the task uid and the group branch name.
+fn a_group_landing_on_an_integration_branch(f: &Fixture) -> (String, String) {
+    let uid = f.add_task("group landing");
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
     f.jkb()
         .args([
-            "task", "start", &uid, "--branch", "feature", "--onto", "batch",
+            "task",
+            "start",
+            &uid,
+            "--branch",
+            "grp",
+            "--onto",
+            "integration",
         ])
         .assert()
         .success();
+    (uid, "grp".to_owned())
+}
 
-    // The batch fast-forwards onto the branch's own commits, then trunk takes the batch — so the
-    // branch has no unique commit left anywhere.
-    git(&f.repo, &["checkout", "-q", "batch"]);
-    git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
-    git(&f.repo, &["checkout", "-q", "main"]);
-    git(&f.repo, &["merge", "-q", "--ff-only", "batch"]);
-
-    // Anything that re-runs the writer now re-measures against a branch that looks untouched.
+/// The merge queue's verb **refuses** to record a landing that has not happened.
+///
+/// A landing event is a trusted fact: readers act on it without re-deriving anything from refs, so
+/// the one verb that writes it from outside Rust is a new write route for exactly the class of
+/// fact this whole area exists to protect. It re-establishes what it is being told by asking the
+/// same question every reader asks — is this branch's work in the target — so a hand-run for work
+/// that is still in flight fails.
+#[test]
+fn the_landing_verb_refuses_a_branch_whose_work_is_not_in_the_target() {
+    let f = Fixture::new();
+    let (uid, branch) = a_group_landing_on_an_integration_branch(&f);
     f.jkb()
-        .args([
-            "task", "start", &uid, "--branch", "feature", "--onto", "batch",
-        ])
+        .args(["task", "landed", &branch, "--onto", "integration"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not in integration"));
+
+    // And nothing was recorded, so the reader is not handed a landing that did not happen.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed on").not());
+}
+
+/// A branch landed by jkb onto a staging branch closes its task when that staging branch reaches
+/// trunk — **and not before**.
+///
+/// This is what the landing event buys: the number of branches whose landing has to be inferred
+/// from refs drops from one per task to one per batch, and the surviving one is the branch whose
+/// cut point is provable (a freshly cut batch forked at its own tip) rather than measured against
+/// a moving parent.
+#[test]
+fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
+    let f = Fixture::new();
+    let (uid, branch) = a_group_landing_on_an_integration_branch(&f);
+
+    // The queue's graft: the batch fast-forwards to the group's commits.
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", "integration"])
+        .assert()
+        .success();
+
+    // The work is in the batch, and the batch has not reached trunk.
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a task closed while its batch was still unmerged"
+    );
+
+    git(&f.repo, &["merge", "-q", "--ff-only", "integration"]);
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "done",
+        "the batch reached trunk and the recorded landing was not followed"
+    );
+}
+
+/// A landing whose target has **no record of its own** is held, not closed.
+///
+/// The event says the work is in `S`; deciding whether `S` reached trunk needs `S`'s cut point,
+/// and with none the policy is the same as everywhere else — do not act. In the ordinary flows
+/// this state is unreachable, because recording a land target ensures the target's own row; the
+/// test builds it by recording a branch without one.
+#[test]
+fn a_landing_onto_a_batch_with_no_record_is_held() {
+    let f = Fixture::new();
+    let uid = f.add_task("landed onto an unknown batch");
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    // Measured against **trunk**, which `land_target_for` deliberately does not record as a land
+    // target (D34.3) — so `grp` gets a cut point and nothing ever ensures a row for `integration`.
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "grp", "--onto", "main"])
+        .assert()
+        .success();
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "grp"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "integration"]);
+    f.jkb()
+        .args(["task", "landed", "grp", "--onto", "integration"])
         .assert()
         .success();
 
@@ -3620,17 +3709,336 @@ fn a_branch_whose_work_was_merged_away_is_held_never_closed() {
     assert_eq!(
         f.status_of(&uid),
         "in_progress",
-        "the accepted direction is a MISSED close here, because the same git facts describe a \
-         recycled branch name, where closing would bury work"
+        "a landing was credited onto a branch with no recorded cut point"
+    );
+}
+
+/// A branch re-pointed after a jkb landing is **not** credited with that landing.
+///
+/// Without this the event re-creates the exact staleness the record is keyed by name to avoid: the
+/// row is keyed by branch name, a name outlives its branch, and a namesake would present its
+/// predecessor's landing — closing a task with nothing on it through the *trusted* path. A land
+/// does not move the branch ref, so `tip == landed_head` holds until something re-points it.
+///
+/// The re-pointed branch carries work trunk does not have, so the fallback inference answers
+/// "unmerged" — which is what makes this test able to fail: if `landed_head` were ignored, the
+/// event would credit the batch, which *has* reached trunk, and the task would close.
+#[test]
+fn a_branch_repointed_after_landing_is_not_credited_with_it() {
+    let f = Fixture::new();
+    let (uid, branch) = a_group_landing_on_an_integration_branch(&f);
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", "integration"])
+        .assert()
+        .success();
+    git(&f.repo, &["merge", "-q", "--ff-only", "integration"]);
+
+    // Sanity: while the branch still points at what landed, the event is credited.
+    f.jkb()
+        .args(["task", "close-merged", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&uid));
+
+    // Now re-point it at unmerged work, as a recreated namesake would be.
+    git(&f.repo, &["checkout", "-q", "-b", "elsewhere", "main"]);
+    commit_in(&f.repo, "other.txt", "not landed\n", "other work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    git(&f.repo, &["branch", "-f", &branch, "elsewhere"]);
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a re-pointed branch inherited its predecessor's landing event and closed a task whose \
+         current work is not in trunk"
+    );
+}
+
+/// A branch whose work was merged away: **held** where the instance anchor cannot be verified,
+/// correctly closed by content where it can.
+///
+/// This test pinned one direction — held — and the edit is deliberate. Read the retain-license
+/// paragraph of `openspec/changes/jkb-branch-records/design.md` (B5) before changing it again.
+///
+/// The rule it pinned: "no commits of its own" is evidence a recorded cut point belongs to
+/// whatever had the branch name before, so the record is discarded and re-measured to the tip,
+/// after which nothing can close. That is also true of a branch whose commits were
+/// fast-forwarded into its batch, and *refs alone cannot tell those apart* — so the missed close
+/// was the accepted cost of never taking the other direction, which buries work (D34.4).
+///
+/// The checkout-local **ref journal** does tell them apart. A merged-away branch was never
+/// deleted, so its creation entry still matches the anchor stored with the record, and its tip was
+/// reached only by `commit`-class entries; a recycled name's log starts fresh, and every verb that
+/// re-points a branch writes a `Reset`-class entry. So where the anchor verifies, the record is
+/// **retained** and content decides — which closes this correctly. Where it cannot (reflogs off,
+/// the log expired, a different checkout) nothing changed: discard, re-measure, hold.
+///
+/// Both arms are asserted, because the licence is only sound if its failure lands on the old
+/// behaviour rather than on a new close.
+#[test]
+fn a_branch_whose_work_was_merged_away_closes_only_when_its_instance_is_verifiable() {
+    for reflogs in [true, false] {
+        let f = Fixture::new();
+        if !reflogs {
+            // No ref journal at all — the "cannot judge instance identity" state, and the one
+            // every other failure mode degrades to.
+            git(&f.repo, &["config", "core.logAllRefUpdates", "false"]);
+            std::fs::remove_dir_all(f.repo.join(".git/logs")).ok();
+        }
+        git(&f.repo, &["branch", "batch", "main"]);
+        git(&f.repo, &["checkout", "-q", "-b", "feature", "batch"]);
+        commit_in(&f.repo, "w.txt", "work\n", "real work");
+        git(&f.repo, &["checkout", "-q", "main"]);
+
+        let uid = f.add_task("work that lands by fast-forward");
+        f.jkb()
+            .args([
+                "task", "start", &uid, "--branch", "feature", "--onto", "batch",
+            ])
+            .assert()
+            .success();
+
+        // The batch fast-forwards onto the branch's own commits, then trunk takes the batch — so
+        // the branch has no unique commit left anywhere.
+        git(&f.repo, &["checkout", "-q", "batch"]);
+        git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
+        git(&f.repo, &["checkout", "-q", "main"]);
+        git(&f.repo, &["merge", "-q", "--ff-only", "batch"]);
+
+        // Anything that re-runs the writer now sees a branch that looks untouched.
+        f.jkb()
+            .args([
+                "task", "start", &uid, "--branch", "feature", "--onto", "batch",
+            ])
+            .assert()
+            .success();
+
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        let expected = if reflogs { "done" } else { "in_progress" };
+        assert_eq!(
+            f.status_of(&uid),
+            expected,
+            "reflogs={reflogs}: with a verifiable instance anchor the merged-away branch closes \
+             by content; without one the record is discarded and the task is held, which is the \
+             accepted direction because the same git facts describe a recycled name"
+        );
+    }
+}
+
+/// A branch re-pointed with `branch -f` is **never** retained, even though its creation entry
+/// still matches.
+///
+/// The anchor proves the ref journal belongs to this instance; it does not prove the branch has
+/// not been moved. `branch -f` and `checkout -B` preserve the log and append a `Reset`-class
+/// entry, so the licence requires *both* halves: a matching creation entry **and** nothing but
+/// `commit`-class entries since. Without the second half a hand-repointed branch would keep a
+/// record describing where it used to be.
+#[test]
+fn a_repointed_branch_does_not_keep_its_old_cut_point() {
+    let f = Fixture::new();
+    // A branch cut from trunk with work on it, and a recorded fork point.
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "real work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    commit_in(&f.repo, "t.txt", "trunk\n", "trunk moves on");
+    let uid = f.add_task("repointed branch");
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success();
+    let fork = git(&f.repo, &["merge-base", "feature", "main"]);
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {fork}"
+        )));
+
+    // Re-pointed by hand at trunk: it now has no commits of its own, and its recorded cut point
+    // describes a branch shape that no longer exists.
+    git(&f.repo, &["branch", "-f", "feature", "main"]);
+    let tip = git(&f.repo, &["rev-parse", "feature"]);
+    assert_ne!(tip, fork, "setup: the re-point must move the branch");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("feature: cut from {tip}")))
+        .stdout(predicate::str::contains(format!("feature: cut from {fork}")).not());
+}
+
+/// The **no-writer window**: a branch deleted and recreated by hand, with no jkb command in
+/// between, is held rather than closed.
+///
+/// This is the residual the supersede arm alone cannot reach — it fires when a *writer* runs, and
+/// here `close-merged` is the first thing to look at the branch. The read-side anchor check closes
+/// it: the recreated branch's log starts fresh, so its creation entry differs from the one stored
+/// with the record, which is positive proof of recycling. It acts only toward hold, so an absent
+/// or truncated log leaves the read exactly as it was.
+#[test]
+fn a_hand_recreated_branch_is_held_even_with_no_jkb_write_in_between() {
+    let f = Fixture::new();
+    // A branch with work, landed into trunk by a merge commit — so on content alone it reads as
+    // merged, and only the record separates "landed" from "recreated empty".
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "real work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let uid = f.add_task("recycled by hand");
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success();
+
+    // Deleted and recreated under the same name, entirely outside jkb.
+    git(&f.repo, &["branch", "-D", "feature"]);
+    commit_in(&f.repo, "t.txt", "trunk\n", "trunk moves on");
+    git(&f.repo, &["branch", "feature", "main"]);
+
+    // No jkb write in between: `close-merged` is the first thing to see the new branch.
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "a task closed against the record of the branch that previously had this name — the new \
+         branch has nothing on it"
+    );
+}
+
+/// Degradation is toward today's behaviour, never toward a judgement.
+///
+/// Every way the ref journal can be unavailable — never written, or truncated so its oldest
+/// surviving entry is not a creation entry — makes both anchor checks decline. Declining means the
+/// reader proceeds exactly as it did before the anchor existed, and the writer falls back to the
+/// untouched-tip predicate: discard-and-hold. Neither can mint a close.
+#[test]
+fn an_unreadable_ref_journal_declines_rather_than_deciding() {
+    for damage in ["absent", "truncated"] {
+        let f = Fixture::new();
+        git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+        commit_in(&f.repo, "w.txt", "work\n", "real work");
+        git(&f.repo, &["checkout", "-q", "main"]);
+        let uid = f.add_task("no readable journal");
+        f.jkb()
+            .args([
+                "task", "start", &uid, "--branch", "feature", "--onto", "main",
+            ])
+            .assert()
+            .success();
+        let fork = git(&f.repo, &["merge-base", "feature", "main"]);
+
+        let log = f.repo.join(".git/logs/refs/heads/feature");
+        if damage == "absent" {
+            std::fs::remove_file(&log).unwrap();
+        } else {
+            // Drop the creation entry, leaving a log whose oldest line is a `commit` entry —
+            // which is exactly what expiry produces, and what announces its own truncation.
+            let text = std::fs::read_to_string(&log).unwrap();
+            let rest: Vec<&str> = text.lines().skip(1).collect();
+            std::fs::write(&log, format!("{}\n", rest.join("\n"))).unwrap();
+        }
+
+        // The reader still acts on the record it has: declining is not refusing.
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        assert_eq!(
+            f.status_of(&uid),
+            "in_progress",
+            "{damage}: an unmerged branch must stay in flight"
+        );
+        f.jkb()
+            .args(["--global", "task", "show", &uid])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "feature: cut from {fork}"
+            )));
+
+        // And the branch really does land, so this is not asserting that nothing ever closes.
+        git(
+            &f.repo,
+            &["merge", "-q", "--no-ff", "-m", "merge", "feature"],
+        );
+        f.jkb().args(["task", "close-merged"]).assert().success();
+        assert_eq!(
+            f.status_of(&uid),
+            "done",
+            "{damage}: an unreadable journal blocked a genuine close"
+        );
+    }
+}
+
+/// The reflog retention entry is written beside a record, and removed when the branch is
+/// forgotten.
+///
+/// The instance anchor is only as durable as the reflog, so coverage is a condition this
+/// establishes rather than assumes: `gc.refs/heads/<branch>.reflogExpire = never` holds the
+/// creation entry through config-driven expiry. Exact-ref, so no branch naming scheme is needed.
+#[test]
+fn recording_a_branch_retains_its_ref_journal() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "feature", "main"]);
+    let uid = f.add_task("retained");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .assert()
+        .success();
+    let key = "gc.refs/heads/feature.reflogExpire";
+    // `--default` so an unset key exits 0 and this assertion is what reports it: the helper
+    // asserts on git's exit status, so a bare `--get` would panic with git's silence instead.
+    assert_eq!(
+        git(
+            &f.repo,
+            &["config", "--local", "--default", "", "--get", key]
+        ),
+        "never",
+        "no retention entry was written beside the record"
+    );
+
+    // It survives a config-driven expiry of everything else.
+    git(&f.repo, &["config", "gc.reflogExpire", "now"]);
+    git(&f.repo, &["reflog", "expire", "--all"]);
+    assert!(
+        f.repo.join(".git/logs/refs/heads/feature").exists(),
+        "the retention entry did not hold the creation entry through `reflog expire --all`"
+    );
+
+    // Deleting the branch takes the record and the entry with it.
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force", "--delete-branch"])
+        .assert()
+        .success();
+    assert!(
+        git(
+            &f.repo,
+            &["config", "--local", "--default", "", "--get", key]
+        )
+        .is_empty(),
+        "the retention entry outlived the branch it was for"
     );
 }
 
 /// A cut point already in the store that git cannot resolve is still ignored by the reader.
 ///
-/// The write now refuses such a value (`base::rejected`), so this state only arises from rows that
-/// predate the check — planted here the only way it can be. The reader-side guard is what covers
-/// those, and removing it would close them wrongly, so it keeps its own test now that the writer
-/// no longer produces the state.
+/// The writer will not produce this state — `rejected` refuses an inadmissible measurement and the
+/// schema refuses a malformed value — so it only arises from a record made in another clone, or
+/// one whose commit has since been garbage-collected. The reader-side guard is what covers those,
+/// and removing it would close them wrongly, so it keeps its own test now that the writer no
+/// longer produces the state.
+///
+/// The branch here is untouched, so nothing this run does could measure over the planted value:
+/// `close-merged` never writes, which is exactly what makes this the reader's test.
 #[test]
 fn an_unresolvable_cut_point_already_in_the_store_is_ignored_by_the_reader() {
     let f = Fixture::new();
@@ -3648,21 +4056,13 @@ fn an_unresolvable_cut_point_already_in_the_store_is_ignored_by_the_reader() {
     legacy
         .write_txn("t", move |conn, meta| {
             jkb_core::tag::apply(conn, meta, id, "repo", "proj")?;
-            jkb_core::tag::apply(conn, meta, id, "branch", "feature")?;
-            // A well-formed object id this repository does not have — `rev-parse` parses it
-            // happily, so only a verifying lookup rejects it. Planted with `apply_reserved`,
-            // the privileged door: `tag::apply` refuses the facet outright now, and a database
-            // that predates the reservation still holds values like this one.
-            jkb_core::tag::apply_reserved(
-                conn,
-                meta,
-                id,
-                "base",
-                "feature:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-            )
+            jkb_core::tag::apply(conn, meta, id, "branch", "feature")
         })
         .unwrap();
     drop(legacy);
+    // A well-formed object id this repository does not have — `rev-parse` parses it happily, so
+    // only a verifying lookup rejects it.
+    f.plant_cut_point("feature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
     f.jkb().args(["task", "close-merged"]).assert().success();
     assert_eq!(
@@ -3701,7 +4101,7 @@ fn naming_a_branch_as_its_own_parent_records_nothing() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{tip}")).not());
+        .stdout(predicate::str::contains(format!("feature: cut from {tip}")).not());
 
     // Nothing recorded is repairable; a recorded tip is not. Naming the real parent measures it.
     let fork = git(&f.repo, &["merge-base", "feature", "main"]);
@@ -3715,24 +4115,26 @@ fn naming_a_branch_as_its_own_parent_records_nothing() {
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{fork}")));
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {fork}"
+        )));
 }
 
-/// The invariant admits every legitimate repair and refuses the one dangerous value.
+/// The one repair verb takes **no commit id**, and forgetting is what it does.
 ///
-/// Enforcing "a branch with commits did not fork at its tip" inside `base::write` changes what
-/// `jkb task base` accepts, so the verb's whole point — correcting a wrong record by hand — has to
-/// still work. It does: any commit other than the tip is taken. Only the tip is refused, and that
-/// is the value nearest a user's hand (`git rev-parse <branch>`), which is why the check is here
-/// rather than trusting the message not to suggest it.
+/// `jkb task base <uid> <branch> <sha>` produced three findings across three review passes, all
+/// the same shape: the sha nearest a user's hand is `git rev-parse <branch>` — the tip — and a cut
+/// point equal to the tip reads as "nothing has happened here" forever, after which the task can
+/// neither be credited by a review nor land, with no repair path. Each was fixed by rewording a
+/// message. Forgetting always repairs, because the next `task start` measures again.
 #[test]
-fn the_repair_verb_still_repairs_and_refuses_only_the_tip() {
+fn the_repair_verb_forgets_rather_than_accepting_a_sha() {
     let f = Fixture::new();
-    let fork = git(&f.repo, &["rev-parse", "main"]);
     git(&f.repo, &["checkout", "-q", "-b", "feature"]);
     commit_in(&f.repo, "w.txt", "work\n", "work");
     git(&f.repo, &["checkout", "-q", "main"]);
     let tip = git(&f.repo, &["rev-parse", "feature"]);
+    let fork = git(&f.repo, &["merge-base", "feature", "main"]);
 
     let uid = f.add_task("repairable");
     f.jkb()
@@ -3741,40 +4143,48 @@ fn the_repair_verb_still_repairs_and_refuses_only_the_tip() {
         ])
         .assert()
         .success();
-    // A correction to a real commit is accepted.
     f.jkb()
-        .args(["task", "base", &uid, "feature", &fork])
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {fork}"
+        )));
+
+    // No positional sha is accepted at all — the argument form is gone, so no message can name it.
+    f.jkb()
+        .args(["--global", "task", "base", &uid, "feature", &tip])
+        .assert()
+        .failure();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {fork}"
+        )));
+
+    // Forgetting drops it, and the next measurement puts it back.
+    f.jkb()
+        .args(["task", "base", "--forget", "feature"])
         .assert()
         .success();
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{fork}")));
-    // The tip is not.
+        .stdout(predicate::str::contains("cut from").not());
     f.jkb()
-        .args(["task", "base", &uid, "feature", &tip])
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be feature's cut point"));
-    // …and the refusal changed nothing.
+        .success();
     f.jkb()
         .args(["--global", "task", "show", &uid])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("base=feature:{fork}")));
-
-    // The other half of the rule, which the first version of this test never reached: once the
-    // branch's work has been fast-forwarded away it looks untouched, and then only its tip is
-    // admissible — so even its *true* fork point is refused. That is deliberate (git cannot tell
-    // that state from a branch never started, and guessing "landed" closes a task with nothing on
-    // it), and the cost is that such a task cannot be made to auto-close by editing its cut point.
-    // The remedy the refusal names must therefore be a status change, not another sha.
-    git(&f.repo, &["merge", "-q", "--ff-only", "feature"]);
-    f.jkb()
-        .args(["task", "base", &uid, "feature", &fork])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("jkb task set"))
-        .stderr(predicate::str::contains("--status done"));
+        .stdout(predicate::str::contains(format!(
+            "feature: cut from {fork}"
+        )));
 }

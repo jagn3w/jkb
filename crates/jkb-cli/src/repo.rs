@@ -20,11 +20,10 @@ use crate::gitrepo;
 pub(crate) const FACET_BRANCH: &str = "branch";
 pub(crate) const FACET_REPO: &str = "repo";
 
-/// The branch a session's work lands on (design D36.3). Recorded at `task work` so a resumed
-/// session — and `task land` itself — target the branch the batch was always going to, not
-/// whatever happens to be checked out later.
-pub(crate) const FACET_ONTO: &str = "onto";
-
+/// The branch a session's work lands on used to be a facet here (`onto=`). It is now
+/// `branch_records.land_target`, because it was branch-keyed by accident of having exactly one
+/// writer: two tasks on one branch could record different land targets, and `None` on a facet
+/// could not tell "lands on trunk" from "never recorded". See `jkb_core::branch::BranchRecord`.
 /// A task's facet tags, **every** value per facet.
 ///
 /// Tags are a multi-map: `tag::apply` adds, so a task can legitimately carry two `branch=`
@@ -47,10 +46,11 @@ pub(crate) fn facet_values<'a>(
     tags.get(facet).map_or(&[], Vec::as_slice)
 }
 
-/// The single value of a facet that should only ever have one (`onto`, `repo`).
+/// The single value of a facet that should only ever have one (`repo`).
 ///
-/// **Not the cut point.** That one is per-branch multi-valued and belongs to [`crate::base`],
-/// which is the only module allowed to read or write it.
+/// The two facts that are per-*branch* rather than per-task — where a branch was cut and where it
+/// lands — are not facets at all any more; they are `branch_records` columns, keyed
+/// `(repo, branch)`, so there is nothing here to collapse.
 pub(crate) fn facet_one<'a>(
     tags: &'a BTreeMap<String, Vec<String>>,
     facet: &str,
@@ -76,21 +76,6 @@ pub(crate) fn set_facet(
         }
     }
     tag::apply(conn, meta, id, facet, value)
-}
-
-/// Remove every value of a facet, leaving the task carrying none.
-pub(crate) fn clear_facet(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    facet: &str,
-) -> jkb_core::Result<()> {
-    for (f, v) in tag::applications(conn, id)? {
-        if f == facet {
-            tag::remove(conn, meta, id, &f, &v)?;
-        }
-    }
-    Ok(())
 }
 
 /// Where a task is being worked. Every field is single-valued by nature: a second `branch=`
@@ -127,11 +112,7 @@ pub(crate) enum BranchWrite {
 }
 
 /// Put `branch` on the task **and** record where it was cut, in one call. The only way either
-/// happens *in this crate* — and for the cut point, the only way anywhere, since
-/// [`jkb_core::tag::apply`] refuses the facet and [`crate::base::write`] holds the sole privileged
-/// write (design D46). `branch=` carries no such reservation: it is an ordinary facet, and the
-/// claim about it is a convention this crate keeps, backed by `main.rs` routing every `#branch=`
-/// and `jkb task tag` through here rather than by anything the store enforces.
+/// happens in this crate.
 ///
 /// The pairing is the whole architecture of this area, and every incident in it has been the same
 /// two facts written apart: `/task-swarm` wrote `branch=` and no cut point, so once the readers
@@ -141,13 +122,18 @@ pub(crate) enum BranchWrite {
 /// was not re-cutting. Two independent writes that must agree will eventually not, so there is one
 /// write.
 ///
-/// The cut point goes **first**, before `branch=` is touched. [`crate::base::ensure_recorded`]
-/// decides whether an unqualified legacy value belongs to this branch by asking what other branch
-/// the task names, and after the rewrite the answer is always "none", so every stale value would
-/// look adoptable.
+/// **There is no ordering constraint between the two halves any more.** There used to be — the cut
+/// point had to be written before `branch=`, because attribution of an unqualified legacy value
+/// asked what other branch the task named, and after the rewrite the answer was always "none". The
+/// record is keyed `(repo, branch)`, so nothing about it is attributed from the task's facets and
+/// nothing about the order matters.
+///
+/// The repository the record is keyed under is the task's own `repo=` when it has one, else the
+/// checkout we are standing in. Those two agree by construction wherever both exist:
+/// [`measure_root_for`] hands back a root only when they match.
 ///
 /// # Errors
-/// Returns an error if the name is not usable as a git ref, or a tag read or write fails.
+/// Returns an error if the name is not usable as a git ref, or a tag or record write fails.
 pub(crate) fn record_branch(
     conn: &rusqlite::Connection,
     meta: &jkb_core::WriteMeta,
@@ -167,12 +153,96 @@ pub(crate) fn record_branch(
     // `close-merged` run failing on one bad row. The store is the boundary worth defending;
     // `gitrepo::valid_ref` at the git call is the backstop for values that predate this.
     crate::gitrepo::valid_ref(branch).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    let missing = crate::base::ensure_recorded(conn, meta, id, repo_root, branch, cut_from)?;
+    let missing = match repo_key_for(conn, id, repo_root)? {
+        Some((root, repo)) => {
+            crate::base::ensure_recorded(conn, meta, &root, &repo, branch, cut_from)?
+        }
+        // Not standing in the task's own repository, so nothing here could honestly measure it: a
+        // namesake branch in whatever checkout the cwd happens to be is not this task's branch.
+        None => Some(crate::base::Missing::NotThisRepo(
+            facet_one(&read_tags(conn, id)?, FACET_REPO)
+                .cloned()
+                .unwrap_or_else(|| "its repo".to_owned()),
+        )),
+    };
     match how {
         BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch)?,
         BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch)?,
     }
     Ok(missing)
+}
+
+/// The `(checkout root, repo key)` a branch record for this task may be keyed and measured under,
+/// or `None` when there is none.
+///
+/// The key is the task's `repo=` when it has one — the value every `repo=`-scoped surface uses —
+/// and otherwise this checkout's own key, which is the case of a task that has not been told where
+/// it lives yet. It is never *guessed* from a checkout that disagrees with the task: `repo_root` is
+/// already `None` there (see [`measure_root_for`]), which is what stops a namesake branch in a
+/// sibling checkout being recorded as this task's verified cut point.
+fn repo_key_for(
+    conn: &rusqlite::Connection,
+    id: ItemId,
+    repo_root: Option<&std::path::Path>,
+) -> jkb_core::Result<Option<(PathBuf, String)>> {
+    let Some(root) = repo_root else {
+        return Ok(None);
+    };
+    let stated = facet_one(&read_tags(conn, id)?, FACET_REPO).cloned();
+    let key = match stated {
+        Some(key) => Some(key),
+        None => {
+            crate::gitrepo::key(root).map_err(|e| jkb_types::Error::Validation(e.to_string()))?
+        }
+    };
+    Ok(key.map(|k| (root.to_path_buf(), k)))
+}
+
+/// A task's facet tags as a multi-map, read inside a transaction.
+fn read_tags(
+    conn: &rusqlite::Connection,
+    id: ItemId,
+) -> jkb_core::Result<BTreeMap<String, Vec<String>>> {
+    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (facet, value) in tag::applications(conn, id)? {
+        tags.entry(facet).or_default().push(value);
+    }
+    Ok(tags)
+}
+
+/// Record which branch `branch` lands on, and make sure that target has a record of its own.
+///
+/// The **ensure-on-reference** is what makes `close-merged`'s landing path mean anything: a
+/// landing event says the work is in `S`, and the next question is whether `S` reached trunk —
+/// which needs `S`'s own cut point. Doing it here rather than at the sites that *cut* a batch
+/// covers the swarm too, whose integration branch is cut by a prompt.
+///
+/// `S` is measured against **trunk**, its parent by construction (design D38): a batch branch is
+/// cut from trunk, and when it is freshly cut and untouched that measurement is the one provable
+/// case — its own tip.
+///
+/// # Errors
+/// Returns an error if git cannot be run or a record write fails.
+pub(crate) fn record_land_target(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    repo_root: Option<&std::path::Path>,
+    repo: &str,
+    branch: &str,
+    target: Option<&str>,
+) -> jkb_core::Result<()> {
+    jkb_core::branch::set_land_target(conn, meta, repo, branch, target)?;
+    // A branch is never its own land target in any real flow, and measuring one against trunk here
+    // would be a **second** measurement of the same branch with a different parent than
+    // `record_branch` just used — two answers to one question, which is the shape this whole area
+    // exists to remove. (`--onto <this branch>` is refused as a measurement parent by `rejected`;
+    // this makes sure the ensure-on-reference does not quietly record what that refusal declined.)
+    if let (Some(root), Some(target)) = (repo_root, target.filter(|t| *t != branch)) {
+        let trunk =
+            crate::gitrepo::trunk(root).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
+        crate::base::ensure_recorded(conn, meta, root, repo, target, trunk.as_deref())?;
+    }
+    Ok(())
 }
 
 /// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
@@ -264,10 +334,8 @@ pub(crate) fn set_location_facets(
     if let Some(onto) = loc.onto {
         crate::gitrepo::valid_ref(onto).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
     }
-    for (facet, value) in [(FACET_REPO, loc.repo), (FACET_ONTO, loc.onto)] {
-        if let Some(value) = value {
-            set_facet(conn, meta, id, facet, value)?;
-        }
+    if let Some(repo) = loc.repo {
+        set_facet(conn, meta, id, FACET_REPO, repo)?;
     }
     // Why no cut point was recorded, when none was — carried out so the command that reports it
     // states the reason the writer actually had. Deriving it at the reporting site from a proxy
@@ -278,10 +346,6 @@ pub(crate) fn set_location_facets(
         // `loc.onto`, the caller's statement of what this branch was cut from — never the stored
         // facet, which records an earlier moment and may name a batch this branch has nothing to
         // do with. See `base::ensure_recorded`.
-        //
-        // Writing `onto=` above does NOT make that stored facet an input here: the parent is still
-        // the one the caller passed. What changes order is only which facets are already on the
-        // task when the measurement reports its failure.
         missing = record_branch(
             conn,
             meta,
@@ -291,8 +355,44 @@ pub(crate) fn set_location_facets(
             loc.cut_from.or(loc.onto),
             BranchWrite::Set,
         )?;
+        // The land target is a fact about the BRANCH, so it is recorded against it rather than
+        // against the task — which is what stops two tasks on one branch recording different
+        // targets, and what makes "lands on trunk" (an explicit `None`) distinguishable from
+        // "never recorded" (no row).
+        //
+        // Only when the caller states one: `task start` without `--onto` says nothing about where
+        // the branch lands, and writing `None` there would clear a target the branch already has.
+        if let Some(onto) = loc.onto {
+            if let Some((root, repo)) = repo_key_for(conn, id, repo_root)? {
+                record_land_target(conn, meta, Some(&root), &repo, branch, Some(onto))?;
+            }
+        }
     }
     Ok(missing)
+}
+
+/// Clear the land target of every branch this task records — `jkb task abandon`, and a
+/// `--onto <trunk>` that says the branch is on no batch.
+///
+/// Every branch, not the one a chooser picks: leaving a stale target on a sibling keeps the task
+/// rendering as live `implementing` work and keeps that batch classified unmerged and offered as a
+/// land target long after it is spent (design D36.3).
+///
+/// # Errors
+/// Returns an error if a tag read or a record write fails.
+pub(crate) fn clear_land_targets(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    repo_root: Option<&std::path::Path>,
+) -> jkb_core::Result<()> {
+    let Some((_, repo)) = repo_key_for(conn, id, repo_root)? else {
+        return Ok(());
+    };
+    for branch in facet_values(&read_tags(conn, id)?, FACET_BRANCH) {
+        jkb_core::branch::set_land_target(conn, meta, &repo, branch, None)?;
+    }
+    Ok(())
 }
 
 /// Does `branch` count as landed *for the purpose of acting on the task*?
@@ -300,10 +400,24 @@ pub(crate) fn set_location_facets(
 /// The one place that turns a git fact into a decision, and the only thing the three readers —
 /// `close-merged`, `review::others_are_covered`, `review::work_is_in` — may ask.
 ///
-/// The cut point is resolved **here**, from the task's tags, rather than being passed in. It was
-/// a parameter, and every caller therefore had to remember to resolve it per branch; two of them
-/// forgot in different ways. A reader now supplies the task's tags and the branch it is asking
+/// The cut point is resolved **here**, from `branch`'s own record, rather than being passed in. It
+/// was a parameter, and every caller therefore had to remember to resolve it per branch; two of
+/// them forgot in different ways. A reader now supplies the repo and the branch it is asking
 /// about, which are the two things it certainly knows.
+///
+/// Three things are asked, in this order, and the first two exist to keep the third from acting on
+/// a record that is not this branch's:
+///
+/// 1. **Is the record's branch the same instance of the name?** A verified anchor mismatch is
+///    positive proof the branch was deleted and recreated, so nothing here may act — see
+///    [`crate::base::stale_instance`]. Absent or unverifiable, this declines and the read proceeds
+///    exactly as it did before.
+/// 2. **Did jkb itself land this branch?** Where it did, the work is in `landed_onto` and the
+///    remaining question is whether *that* branch reached trunk — one branch per batch instead of
+///    one per task, and the batch is the case where the cut point is provable rather than measured
+///    against a moving parent. The event is credited **only** while the branch still points at
+///    `landed_head` or is gone: the row is keyed by name, and a name outlives its branch.
+/// 3. Otherwise the ordinary inference, unchanged.
 ///
 /// [`gitrepo::is_merged`] answers a narrower, purely factual question: does this branch add
 /// anything to trunk? It deliberately falls through its freshly-cut guard when given no base,
@@ -312,32 +426,92 @@ pub(crate) fn set_location_facets(
 /// trunk's own tree, so an empty live session read as `Merged` and `close-merged` marked its task
 /// done with the work still uncommitted.
 ///
-/// So the policy lives here. **No base recorded for this branch means we do not act.** Without
-/// one, "cut and not started" and "landed and cleaned up" are indistinguishable — that ambiguity
-/// is the entire reason `base=` exists — and of the two ways to be wrong, a missed auto-close
+/// So the policy lives here. **No cut point recorded for this branch means we do not act.** Without
+/// one, "cut and not started" and "landed and cleaned up" are indistinguishable — that ambiguity is
+/// the entire reason a cut point is stored — and of the two ways to be wrong, a missed auto-close
 /// costs one command while a wrong one buries work still in flight (design D34.4).
 ///
-/// The cost, accepted: a branch with no usable `base=` no longer auto-closes. `jkb task start` and
-/// `jkb task work` both record one **when the branch exists here** — neither can measure a branch
-/// this repo does not have, and both prefer recording nothing to recording a commit the branch
-/// never sat on.
-///
 /// # Errors
-/// Returns an error if git cannot be run.
+/// Returns an error if git or the database cannot be read.
 pub(crate) fn landed_for_action(
+    db: &Db,
     cwd: &std::path::Path,
+    repo: &str,
     branch: &str,
     trunk_ref: &str,
-    tags: &BTreeMap<String, Vec<String>>,
     prefer: crate::gitrepo::Prefer,
 ) -> anyhow::Result<(crate::gitrepo::MergeState, bool)> {
-    landed_with_base(
-        cwd,
-        branch,
-        trunk_ref,
-        crate::base::resolve(tags, branch),
-        prefer,
-    )
+    // Bounded, because a landing event names another branch whose own record is consulted next: a
+    // batch landed onto a batch is legitimate, a cycle is not, and following one forever is how a
+    // `post-merge` hook stops returning.
+    let mut asking = branch.to_owned();
+    for _ in 0..8 {
+        let record = branch_record(db, repo, &asking)?;
+        let Some(record) = record else {
+            return landed_with_base(cwd, &asking, trunk_ref, None, prefer);
+        };
+        if crate::base::stale_instance(cwd, &asking, &record)? {
+            // Proof that this record describes a branch that no longer exists. Acting on it is the
+            // silent, permanent failure D34.4 forbids, so we hold and let the next writer repair
+            // the record (the supersede arm fires on exactly this).
+            return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
+        }
+        let Some(landing) = record.landed.as_ref().filter(|l| credited(cwd, &asking, l)) else {
+            return landed_with_base(cwd, &asking, trunk_ref, record.cut_point.as_deref(), prefer);
+        };
+        asking = landing.onto.clone();
+    }
+    Ok((crate::gitrepo::MergeState::NothingToMerge, false))
+}
+
+/// Whether a recorded landing still describes the branch that carries the name now.
+///
+/// A land does not move the branch ref — the graft rebases detached and fast-forwards the target —
+/// so the branch still points at `landed_head` afterwards, until something re-points it. A gone
+/// branch counts too: deletion after landing is ordinary cleanup, and `is_merged` already treats a
+/// missing branch as contained on the review side.
+///
+/// Without this the event re-creates the exact staleness the record is keyed by name to avoid: a
+/// namesake recreated after a jkb landing would present its predecessor's, and close a task with
+/// nothing on it through the *trusted* path.
+fn credited(cwd: &std::path::Path, branch: &str, landing: &jkb_core::branch::Landing) -> bool {
+    match crate::gitrepo::branch_ref(cwd, branch, crate::gitrepo::Prefer::Local) {
+        Ok(None) => true,
+        Ok(Some(reference)) => {
+            crate::gitrepo::rev_commit(cwd, &reference).ok().flatten() == Some(landing.head.clone())
+        }
+        // A git failure is not evidence the event applies. Falling through to the inference path
+        // holds the task, which is the safe direction.
+        Err(_) => false,
+    }
+}
+
+/// One branch's record, read through the writer-actor.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub(crate) fn branch_record(
+    db: &Db,
+    repo: &str,
+    branch: &str,
+) -> Result<Option<jkb_core::branch::BranchRecord>> {
+    let (repo, branch) = (repo.to_owned(), branch.to_owned());
+    Ok(db.read(move |conn| jkb_core::branch::get(conn, &repo, &branch))?)
+}
+
+/// Every branch record in a repo, keyed by branch — **one** read, for the surfaces that need many.
+///
+/// The staging view redraws on every database write and holds a row per task, so a lookup per task
+/// there is the N+1 shape `repo_tasks` exists to avoid (design risk 2).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub(crate) fn branch_records(
+    db: &Db,
+    repo: &str,
+) -> Result<BTreeMap<String, jkb_core::branch::BranchRecord>> {
+    let repo = repo.to_owned();
+    Ok(db.read(move |conn| jkb_core::branch::for_repo(conn, &repo))?)
 }
 
 /// [`landed_for_action`] for a caller that has already resolved the base for this branch.
@@ -441,6 +615,11 @@ pub(crate) fn repo_ctx() -> Result<RepoCtx> {
 pub(crate) struct SessionTask {
     pub(crate) uid: String,
     pub(crate) status: String,
+    /// Where **this** branch lands, from its own record.
+    ///
+    /// Per branch rather than per task, which is what it always was in substance: a task carrying
+    /// two branches had one `onto=` facet, so whichever branch you looked up got the other's
+    /// answer.
     pub(crate) onto: Option<String>,
 }
 
@@ -450,10 +629,19 @@ pub(crate) struct SessionTask {
 /// session state file to fall out of step with git (design D36.2). A task carrying two of
 /// them is indexed under both, so a worktree is found whichever one names it.
 pub(crate) fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
+    // One read for every branch record in the repo, joined in memory — never a lookup per task.
+    let records = branch_records(db, repo_key)?;
     let mut out = BTreeMap::new();
     for t in repo_tasks(db, repo_key)? {
         for branch in facet_values(&t.tags, FACET_BRANCH) {
-            out.insert(branch.clone(), t.session_task());
+            out.insert(
+                branch.clone(),
+                SessionTask {
+                    uid: t.meta.uid.clone(),
+                    status: t.meta.status.clone().unwrap_or_default(),
+                    onto: records.get(branch).and_then(|r| r.land_target.clone()),
+                },
+            );
         }
     }
     Ok(out)
@@ -487,14 +675,6 @@ pub(crate) struct RepoTask {
 }
 
 impl RepoTask {
-    pub(crate) fn session_task(&self) -> SessionTask {
-        SessionTask {
-            uid: self.meta.uid.clone(),
-            status: self.meta.status.clone().unwrap_or_default(),
-            onto: facet_one(&self.tags, FACET_ONTO).cloned(),
-        }
-    }
-
     /// The first line of the task's body — what a human calls the task.
     pub(crate) fn title(&self) -> String {
         crate::output::title_of(&self.meta)
@@ -531,7 +711,7 @@ pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{facet_values, set_location_facets, task_tags, Location, FACET_BRANCH, FACET_ONTO};
+    use super::{facet_values, set_location_facets, task_tags, Location, FACET_BRANCH};
     use jkb_core::{item::NewItem, Db};
 
     /// The policy both entry points share: with no base recorded for this branch we do not act,
@@ -558,10 +738,16 @@ mod tests {
         assert!(!fell_back);
     }
 
-    /// The three location facets are *set*, not added: a second `branch=` is a contradiction, and
-    /// a reader that collapses the multi-map picks one at random (design D36.6).
+    /// `branch=` is *set*, not added, by this writer: a second value is a contradiction rather
+    /// than extra information, and a reader that collapses the multi-map picks one at random
+    /// (design D36.6).
+    ///
+    /// The land target is no longer a facet at all — it is `branch_records.land_target`, keyed by
+    /// branch, so "two tasks on one branch disagree about where it lands" is unrepresentable
+    /// rather than merely discouraged. Retargeting through the CLI is covered end to end by
+    /// `retargeting_a_session_replaces_the_facets_it_records`, which needs a real repository.
     #[test]
-    fn the_location_facets_are_single_valued() {
+    fn the_branch_facet_is_single_valued() {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
@@ -595,6 +781,5 @@ mod tests {
 
         let tags = task_tags(&db, id).unwrap();
         assert_eq!(facet_values(&tags, FACET_BRANCH), ["task/b".to_owned()]);
-        assert_eq!(facet_values(&tags, FACET_ONTO), ["batch/two".to_owned()]);
     }
 }

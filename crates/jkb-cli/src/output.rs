@@ -167,13 +167,27 @@ pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
     Ok(rows)
 }
 
+/// Facts about an item that are not the item's own row — a task's branch records — for the one
+/// command that shows them.
+///
+/// Carried in rather than printed beside, because a `--json` consumer reading one document must
+/// not get half the answer: `json` is merged into the item object and `lines` are printed inside
+/// its header block.
+#[derive(Default)]
+pub struct Extra {
+    /// Fields merged into the item's JSON object.
+    pub json: serde_json::Map<String, Value>,
+    /// Human lines printed after the item's own header fields.
+    pub lines: Vec<String>,
+}
+
 /// Fetch and print a single item in full — every listing field plus the
 /// untruncated `content`. Used by `jkb task show` so agents can read a task body
 /// the frontier/query listings only snippet.
 ///
 /// # Errors
 /// Returns an error if the read fails or the item no longer exists.
-pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
+pub fn print_item_full(db: &Db, id: ItemId, as_json: bool, extra: &Extra) -> Result<()> {
     let id = id.get();
     let row = db.read(move |conn| {
         let row = conn
@@ -217,7 +231,7 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
     };
     let tag_pairs: Vec<String> = tags.iter().map(|(f, v)| format!("{f}={v}")).collect();
     if as_json {
-        let v = json!({
+        let mut v = json!({
             "id": id,
             "uid": uid,
             "kind": kind,
@@ -229,6 +243,14 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
             "tags": tags.iter().map(|(f, v)| json!({"facet": f, "value": v}))
                 .collect::<Vec<_>>(),
         });
+        // Merged into the SAME object rather than printed beside it: a caller with facts that are
+        // not the item's own — a task's branch records — otherwise has to emit a second JSON
+        // document, and a `--json` consumer reading one line gets half the answer.
+        if let Some(map) = v.as_object_mut() {
+            for (k, value) in &extra.json {
+                map.insert(k.clone(), value.clone());
+            }
+        }
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
         println!("uid:       {uid}");
@@ -247,6 +269,9 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool) -> Result<()> {
         }
         if !tag_pairs.is_empty() {
             println!("tags:      {}", tag_pairs.join(", "));
+        }
+        for line in &extra.lines {
+            println!("{line}");
         }
         println!();
         println!("{}", content.as_deref().unwrap_or("(no content)"));

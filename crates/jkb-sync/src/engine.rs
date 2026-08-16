@@ -2003,9 +2003,9 @@ fn create_item(
     )?;
     // The same call the update path makes, so a file's tags reach the store by exactly one
     // route whether the line is new or re-attached. It was two — a bare `apply` loop here and a
-    // reconcile there — and a rule that has to hold at both (reserved facets are not authored in
-    // a document, design D46) is a rule one of them will eventually not have.
-    tag::reconcile_authored(conn, meta, id, &it.tags)?;
+    // reconcile there — and a rule that has to hold at both is a rule one of them will
+    // eventually not have.
+    tag::reconcile_tags(conn, meta, id, &it.tags)?;
     Ok(id)
 }
 
@@ -2022,7 +2022,7 @@ fn update_item(
         item::set_content(conn, meta, id, &it.content, None)?;
     }
     set_task_columns(conn, meta, id, it)?;
-    tag::reconcile_authored(conn, meta, id, &it.tags)?;
+    tag::reconcile_tags(conn, meta, id, &it.tags)?;
     task::set_primary_home(conn, meta, id, home, it.position)?;
     Ok(())
 }
@@ -2130,11 +2130,7 @@ fn assemble_kb_doc(
     // Batch every per-item lookup into one query each, keyed by item id, so this is a
     // constant number of round-trips instead of O(N) point queries for N items.
     let ids: Vec<ItemId> = resolved.iter().map(|(_, id)| *id).collect();
-    // Reserved facets are excluded from the document, not merely from what `render` writes. This
-    // side is compared against the base parsed back out of the file, where a reserved facet can
-    // never appear — carried here it would make every task holding a cut point read as
-    // permanently KB-edited, and the next disk edit to that line would come back a conflict.
-    let mut tags = tag::authored_applications_for(conn, &ids)?;
+    let mut tags = tag::applications_for(conn, &ids)?;
     let mut mirrors = mirror_paths_for(conn, &ids, &file_ns_path)?;
     let parents = edge::edges_from_many(conn, &ids, EdgeType::ParentOf)?;
     let deps = edge::edges_from_many(conn, &ids, EdgeType::DependsOn)?;

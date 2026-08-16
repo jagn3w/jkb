@@ -396,6 +396,202 @@ pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// What a branch's **ref journal** (its reflog) says about the instance of the name that exists
+/// here right now.
+///
+/// A branch name outlives the branch that held it, and nothing in git's object/ref model separates
+/// a recycled name from the branch that had it before — the recorded value still resolves, still
+/// differs from the new tip, and the freshly-cut guard is skipped. The checkout-local ref journal
+/// does separate them, because deleting a branch destroys its log, so the recreated branch's log
+/// provably starts fresh with a creation entry of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefJournal {
+    /// The creation entry's `new` revision.
+    pub anchor_sha: String,
+    /// The creation entry's **own** timestamp. Recreating a branch from the same start point
+    /// yields the same sha, so this is what separates the two instances.
+    ///
+    /// Deliberately not read from `git log -g --format=%ct`, which prints the *commit's* time.
+    pub anchor_ts: i64,
+    /// Whether every entry after the creation one is `commit`-class.
+    ///
+    /// The retain-license: a branch whose work was merged away looks untouched (its commits are
+    /// reachable from the batch), and discarding its real fork point there costs a missed close.
+    /// Its journal is creation plus commits — whereas every verb that *re-points* a branch writes
+    /// a `Reset`-class entry. Unknown message classes count as **not** commit-class, so a git
+    /// whose reflog vocabulary changes can only re-price the missed close, never mint a false
+    /// close.
+    pub only_commits: bool,
+}
+
+/// Read `branch`'s ref journal, or `None` when it cannot judge instance identity.
+///
+/// `None` in three cases, all of which degrade every consumer to the untouched-tip predicate
+/// rather than to a judgement: no log at all (`core.logAllRefUpdates = false`, or a fresh clone
+/// that never had one), a log whose oldest surviving entry is **not** a creation entry (expiry
+/// removes oldest-first, so a truncated log announces its own truncation), and an unparseable
+/// line.
+///
+/// The journal is read from git's own log file, located through `git rev-parse --git-path`, which
+/// is what maps `logs/refs/heads/<branch>` to the **common** directory — so a session worktree
+/// reads the same journal the main copy wrote. There is no porcelain for this: the reflog pretty
+/// formats expose the new revision (`%H`) and the entry date (`%gd`) but never the `old` value,
+/// and `old = zeros` is the only thing that identifies a creation entry without parsing the
+/// message text, which varies (`from main`, `from HEAD`, `from main~0`).
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn ref_journal(dir: &Path, branch: &str) -> Result<Option<RefJournal>> {
+    valid_ref(branch)?;
+    let Some(path) = git(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &format!("logs/refs/heads/{branch}"),
+        ],
+    )?
+    .filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let Some(created) = lines.next().and_then(parse_reflog_entry) else {
+        return Ok(None);
+    };
+    // Only a creation entry has `old = zeros`. Anything else as the oldest surviving line means
+    // the log has been truncated, and a truncated log cannot say which instance created the ref.
+    if created.old.bytes().any(|b| b != b'0') {
+        return Ok(None);
+    }
+    // Fails **closed** on a line this cannot read: an unparseable entry is an unknown class, and
+    // an unknown class must count against retaining the record, never for it.
+    let only_commits = lines.all(|l| {
+        parse_reflog_entry(l)
+            .is_some_and(|e| e.message.starts_with("commit:") || e.message.starts_with("commit ("))
+    });
+    Ok(Some(RefJournal {
+        anchor_sha: created.new,
+        anchor_ts: created.ts,
+        only_commits,
+    }))
+}
+
+/// One parsed reflog line: `<old> <new> <who> <ts> <tz>\t<message>`.
+struct ReflogEntry {
+    old: String,
+    new: String,
+    ts: i64,
+    message: String,
+}
+
+/// Parse one reflog line, or `None` if it is not one.
+///
+/// The format is git's own and stable: two object ids, an identity, `<unix-ts> <tz>`, a TAB, then
+/// the message. The identity contains spaces, so the timestamp is found from the **end** of the
+/// pre-TAB half rather than by counting fields forward.
+fn parse_reflog_entry(line: &str) -> Option<ReflogEntry> {
+    let (head, message) = line.split_once('\t')?;
+    let fields: Vec<&str> = head.split_whitespace().collect();
+    // `<tz>` last, `<unix-ts>` before it — counted from the END, because the identity in the
+    // middle contains spaces and a forward field count would drift with it.
+    let ts = fields.get(fields.len().checked_sub(2)?)?.parse().ok()?;
+    Some(ReflogEntry {
+        old: (*fields.first()?).to_owned(),
+        new: (*fields.get(1)?).to_owned(),
+        ts,
+        message: message.trim().to_owned(),
+    })
+}
+
+/// Keep `branch`'s ref journal from expiring, by writing an **exact-ref** retention entry in this
+/// clone's local config.
+///
+/// The instance anchor is only as durable as the reflog, so coverage is a condition the
+/// implementation establishes rather than assumes. `gc.<pattern>.reflogExpire` accepts an exact
+/// ref, which is why no branch naming scheme is needed: retention is written per recorded branch,
+/// covering existing names, swarm group branches and `task/<session>` alike.
+///
+/// Writing `.git/config` locally is on the acceptable side of this project's decoration rule —
+/// like `.git/info/exclude` it is local, unpushed and invisible in anything the user commits,
+/// and unlike a `refs/jkb/*` scheme it cannot leak via push.
+///
+/// Failures are **not** propagated: retention is a durability improvement, not a precondition. A
+/// clone that never got the entry expires on schedule and the anchor check then declines, which
+/// is the same degradation as reflogs being off.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed at all.
+pub fn retain_reflog(dir: &Path, branch: &str) -> Result<()> {
+    valid_ref(branch)?;
+    for key in reflog_retention_keys(branch) {
+        let _ = git_run(dir, &["config", "--local", &key, "never"])?;
+    }
+    Ok(())
+}
+
+/// Drop the retention entries [`retain_reflog`] wrote, for a branch that is gone.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed at all.
+pub fn release_reflog(dir: &Path, branch: &str) -> Result<()> {
+    valid_ref(branch)?;
+    for key in reflog_retention_keys(branch) {
+        // Non-zero simply means there was nothing to unset.
+        let _ = git_run(dir, &["config", "--local", "--unset-all", &key])?;
+    }
+    Ok(())
+}
+
+/// The two config keys retention is written under, spelled once so writing and unsetting cannot
+/// drift.
+fn reflog_retention_keys(branch: &str) -> [String; 2] {
+    [
+        format!("gc.refs/heads/{branch}.reflogExpire"),
+        format!("gc.refs/heads/{branch}.reflogExpireUnreachable"),
+    ]
+}
+
+/// Every branch this clone holds a reflog retention entry for.
+///
+/// `jkb doctor` reports the ones no branch record claims: the residue of a recorded branch that
+/// was never forgotten. Inert config, but config nobody asked for, so it is surfaced rather than
+/// left to accumulate silently.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn retained_reflogs(dir: &Path) -> Result<Vec<String>> {
+    // `--name-only` so a value containing whitespace cannot be mistaken for part of the key. git
+    // lower-cases the variable name but preserves the subsection, which is the branch.
+    let Some(text) = git(
+        dir,
+        &[
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            r"^gc\.refs/heads/.*\.reflogexpire$",
+        ],
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("gc.refs/heads/")
+                .and_then(|r| r.strip_suffix(".reflogexpire"))
+                .map(str::to_owned)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Delete branch `branch`, discarding unmerged commits when `force`.
 ///
 /// # Errors

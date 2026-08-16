@@ -20,7 +20,6 @@ use std::collections::{HashMap, HashSet};
 
 use jkb_core::blob;
 use jkb_core::dsl::{slug, tokenize, unquote};
-use jkb_core::tag;
 use jkb_types::{EdgeType, Error as TypeError};
 
 use super::{SyncBlock, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer};
@@ -384,16 +383,13 @@ fn render_task(
     if let Some(d) = &item.due {
         parts.push(format!("@{d}"));
     }
-    // A reserved facet is jkb's own coordination state (design D46) and has no business in a file
-    // the user commits, so it is never written out. This covers the value that came off the
-    // **disk** — parsed from a hand-typed `#base=`, which the store then refuses — and it is what
-    // makes the round trip *settle*: every document the engine compares goes through this one
-    // function, so the disk parse and the re-rendered base lose the modifier together and the file
-    // is normalized once rather than disagreeing with the KB forever. (The value that came from
-    // the **KB** is excluded a step earlier, by `assemble_kb_doc`; it has to be, or the item's
-    // signature would differ from the base's and every later disk edit to that line would be a
-    // conflict.)
-    for (facet, value) in item.tags.iter().filter(|(f, _)| !tag::is_reserved(f)) {
+    // Every facet round-trips. There used to be a filter here, dropping the reserved `base=`
+    // facet, and it had to be paired with a matching exclusion on the KB side — an asymmetry that
+    // was itself a must-fix, because the two universes have to be the same one or a task holding
+    // the facet reads as permanently KB-edited and its next disk edit comes back a conflict. The
+    // fact that needed protecting is a `branch_records` row now, so both sides draw from one
+    // universe and neither has to remember a rule.
+    for (facet, value) in &item.tags {
         parts.push(format!("#{facet}={value}"));
     }
     for m in &item.mirrors {
