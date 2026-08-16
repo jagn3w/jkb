@@ -110,10 +110,9 @@ pub fn link_weighted(
             Some(&describe(before_weight)),
             Some(&describe(weight.or(before_weight))),
         )?,
-        None => changelog::append(
+        None => changelog::upsert(
             conn,
             meta,
-            "insert",
             Entity::Edges,
             &id.to_string(),
             None,

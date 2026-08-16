@@ -3,7 +3,7 @@
 //! An item may be placed under many namespaces (design D3) — e.g. a task under
 //! both its `tasks/…` home and a `repos/…` mirror.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{ItemId, NamespaceId, PlacementRole};
@@ -33,6 +33,18 @@ pub fn place(
     position: i64,
 ) -> Result<()> {
     crate::nstype::check_placement(conn, item, namespace)?;
+    // Whether this placement already existed, read before the upsert. The sync engine re-places
+    // every mirror on every `apply_doc`, so logging that as an insert had `jkb undo` of an
+    // ordinary file sync unplace mirrors that long predated it.
+    let existing: Option<i64> = conn
+        .prepare_cached(
+            "SELECT position FROM placements
+              WHERE item_id = ?1 AND namespace_id = ?2 AND role = ?3",
+        )?
+        .query_row(params![item.get(), namespace.get(), role.as_str()], |row| {
+            row.get(0)
+        })
+        .optional()?;
     let rowid: i64 = conn
         .prepare_cached(
             "INSERT INTO placements (item_id, namespace_id, role, position)
@@ -50,13 +62,21 @@ pub fn place(
         "role": role.as_str(),
         "position": position,
     });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
         Entity::Placements,
         &rowid.to_string(),
-        None,
+        existing
+            .map(|position| {
+                json!({
+                    "item_id": item.get(),
+                    "namespace_id": namespace.get(),
+                    "role": role.as_str(),
+                    "position": position,
+                })
+            })
+            .as_ref(),
         Some(&after),
     )?;
     Ok(())

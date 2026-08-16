@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, params_from_iter, types::Value, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::ItemId;
@@ -52,6 +52,14 @@ pub fn apply(
     value: &str,
 ) -> Result<()> {
     define_facet(conn, facet, "string")?;
+    // Idempotent means the second call updates a row that was already there, and logging that as
+    // an insert made `jkb undo` remove a tag application the transaction had not created.
+    let existing: Option<i64> = conn
+        .prepare_cached(
+            "SELECT rowid FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+        )?
+        .query_row(params![item.get(), facet, value], |row| row.get(0))
+        .optional()?;
     let rowid: i64 = conn
         .prepare_cached(
             "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, ?2, ?3)
@@ -60,13 +68,14 @@ pub fn apply(
         )?
         .query_row(params![item.get(), facet, value], |row| row.get(0))?;
     let after = json!({ "item_id": item.get(), "facet": facet, "value": value });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
         Entity::TagApplications,
         &rowid.to_string(),
-        None,
+        // The key is the whole row, so a re-application's before-state is its after-state; what
+        // this records is that there *was* one.
+        existing.map(|_| after.clone()).as_ref(),
         Some(&after),
     )?;
     Ok(())

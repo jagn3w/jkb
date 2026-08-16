@@ -69,10 +69,9 @@ pub fn contain(
     let before_json = before.map(
         |(p, pos)| json!({ "child_item_id": child.get(), "parent_item_id": p, "position": pos }),
     );
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        if before.is_some() { "update" } else { "insert" },
         Entity::Containment,
         &child.get().to_string(),
         before_json.as_ref(),

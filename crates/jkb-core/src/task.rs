@@ -166,10 +166,9 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
             |row| row.get(0),
         )?;
     let item_id = ItemId::new(id);
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
         Entity::Items,
         &id.to_string(),
         None,

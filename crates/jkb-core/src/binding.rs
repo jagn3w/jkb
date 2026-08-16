@@ -41,6 +41,10 @@ pub fn set(
     serializer: Option<&str>,
 ) -> Result<()> {
     let mode = sync_mode.map(SyncMode::as_str);
+    // The binding this replaces, read before the upsert. Sync's re-attach path calls this for
+    // items that were already bound, and logging that as an insert had `jkb undo` delete the
+    // binding row — leaving a file-backed item with no uri at all.
+    let before = get(conn, item)?;
     conn.prepare_cached(
         "INSERT INTO bindings (item_id, uri, sync_mode, serializer) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(item_id) DO UPDATE SET
@@ -49,13 +53,21 @@ pub fn set(
     .execute(params![item.get(), uri, mode, serializer])?;
     let after =
         json!({ "item_id": item.get(), "uri": uri, "sync_mode": mode, "serializer": serializer });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
         Entity::Bindings,
         &item.get().to_string(),
-        None,
+        before
+            .map(|b| {
+                json!({
+                    "item_id": item.get(),
+                    "uri": b.uri,
+                    "sync_mode": b.sync_mode,
+                    "serializer": b.serializer,
+                })
+            })
+            .as_ref(),
         Some(&after),
     )?;
     Ok(())

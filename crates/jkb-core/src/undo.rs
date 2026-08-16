@@ -612,6 +612,135 @@ mod tests {
         }
     }
 
+    /// Undoing a transaction that **re-saved** a view leaves the view standing.
+    ///
+    /// `view::save` upserts, and it used to log the op `insert` unconditionally — so `undo` took
+    /// the generic `DELETE … WHERE rowid = ?` and destroyed a saved query the transaction had
+    /// merely edited, reporting success. The op is derived from the before-state now
+    /// (`changelog::upsert`), so the second save is an `update`, which this module has no inverse
+    /// for and therefore does not act on.
+    #[test]
+    fn undoing_a_re_saved_view_does_not_delete_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            crate::view::save(c, m, "bugs", "kind:task status:open")
+        })
+        .unwrap();
+        let second = db
+            .write_txn("t", |c, m| {
+                crate::view::save(c, m, "bugs", "kind:task status:done")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, second))
+            .unwrap();
+        assert_eq!(
+            db.read(|c| crate::view::get(c, "bugs")).unwrap().as_deref(),
+            Some("kind:task status:done"),
+            "undoing an edit to a view deleted the view"
+        );
+    }
+
+    /// Undoing a transaction that **re-placed** an existing mirror leaves the placement standing.
+    ///
+    /// `placement::place` is idempotent on `(item, namespace, role)` and the sync engine re-places
+    /// every mirror on every `apply_doc`, so logging that as an insert made `jkb undo` of an
+    /// ordinary file sync unplace mirrors that long predated the transaction.
+    #[test]
+    fn undoing_a_re_placement_does_not_unplace_the_item() {
+        use jkb_types::PlacementRole;
+        let db = Db::open_in_memory().unwrap();
+        let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
+        let ns = db
+            .write_txn("t", |c, _| crate::ns::ensure(c, "x/y"))
+            .unwrap();
+        db.write_txn("t", move |c, m| {
+            crate::placement::place(c, m, id, ns, PlacementRole::Primary, 0)
+        })
+        .unwrap();
+        let second = db
+            .write_txn("t", move |c, m| {
+                crate::placement::place(c, m, id, ns, PlacementRole::Primary, 1)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, second))
+            .unwrap();
+        let placed: i64 = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM placements WHERE item_id = ?1",
+                    [id.get()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            placed, 1,
+            "undoing a re-placement unplaced an item that was already there"
+        );
+    }
+
+    /// Undoing a transaction that **re-bound** an already-bound item leaves it bound.
+    ///
+    /// Sync's re-attach path calls `binding::set` for items that were already bound; logging that
+    /// as an insert had undo delete the binding row, leaving a file-backed item with no uri.
+    #[test]
+    fn undoing_a_re_binding_does_not_strip_the_binding() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
+        db.write_txn("t", move |c, m| {
+            crate::binding::set(c, m, id, "file:///tmp/a.md", None, None)
+        })
+        .unwrap();
+        let second = db
+            .write_txn("t", move |c, m| {
+                crate::binding::set(c, m, id, "file:///tmp/b.md", None, None)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, second))
+            .unwrap();
+        assert!(
+            db.read(move |c| crate::binding::get(c, id))
+                .unwrap()
+                .is_some(),
+            "undoing a re-binding deleted the binding the transaction had only edited"
+        );
+    }
+
+    /// Undoing a transaction that **re-applied** an existing tag leaves the tag on the item.
+    ///
+    /// `tag::apply` is documented as idempotent, and its `ON CONFLICT` arm updates the row that is
+    /// already there — logged as an insert, `undo` removed a tag application the transaction never
+    /// created.
+    #[test]
+    fn undoing_a_re_applied_tag_does_not_remove_it() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
+        db.write_txn("t", move |c, m| {
+            crate::tag::apply(c, m, id, "size", "small")
+        })
+        .unwrap();
+        let second = db
+            .write_txn("t", move |c, m| {
+                crate::tag::apply(c, m, id, "size", "small")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, second))
+            .unwrap();
+        assert_eq!(
+            db.read(move |c| crate::tag::applications(c, id)).unwrap(),
+            vec![("size".to_owned(), "small".to_owned())],
+            "undoing a re-application removed a tag the transaction had not created"
+        );
+    }
+
     #[test]
     fn undo_last_reverts_the_most_recent_transaction() {
         let db = Db::open_in_memory().unwrap();

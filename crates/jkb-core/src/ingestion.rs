@@ -88,14 +88,9 @@ pub fn record_capture(conn: &Connection, meta: &WriteMeta, key: Key<'_>) -> Resu
             ],
             |r| r.get(0),
         )?;
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        if existing.is_some() {
-            "update"
-        } else {
-            "insert"
-        },
         Entity::Ingestions,
         &rowid.to_string(),
         existing.map(|status| json!({ "status": status })).as_ref(),

@@ -64,10 +64,9 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, item: &NewItem) -> Result<Ite
         "kind": item.kind.clone(),
         "mime": item.mime.clone(),
     });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
         Entity::Items,
         &id.to_string(),
         None,

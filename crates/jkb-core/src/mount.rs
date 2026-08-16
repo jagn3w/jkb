@@ -91,10 +91,9 @@ pub fn create(
             "conflict_policy": m.conflict_policy,
         })
     });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        if before.is_some() { "update" } else { "insert" },
         Entity::Mounts,
         &namespace.get().to_string(),
         before_json.as_ref(),

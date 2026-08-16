@@ -314,17 +314,12 @@ pub fn record_cut_point(
     let Some(id) = written else {
         return Ok(false);
     };
-    changelog::append(
+    // `changelog::upsert` records an `insert` only when there was no row, so `undo`'s
+    // `DELETE … WHERE rowid = ?` inverts exactly what happened. Superseding an existing row is an
+    // update and is deliberately not invertible by `undo` — the same treatment claims get.
+    changelog::upsert(
         conn,
         meta,
-        // `insert` only when there was no row, so `undo`'s `DELETE … WHERE rowid = ?` inverts
-        // exactly what happened. Superseding an existing row is an update and is deliberately not
-        // invertible by `undo` — the same treatment claims get.
-        if before.is_some() {
-            "update"
-        } else {
-            changelog::OP_INSERT
-        },
         Entity::BranchRecords,
         &id.to_string(),
         before.as_ref().map(record_json).as_ref(),
@@ -360,10 +355,9 @@ pub fn set_land_target(
              RETURNING id",
         )?
         .query_row(params![repo, branch, target], |row| row.get(0))?;
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        if before.is_some() { "update" } else { "insert" },
         Entity::BranchRecords,
         &id.to_string(),
         before.as_ref().map(record_json).as_ref(),
@@ -403,10 +397,9 @@ pub fn record_landing(
              RETURNING id",
         )?
         .query_row(params![repo, branch, onto, head], |row| row.get(0))?;
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        if before.is_some() { "update" } else { "insert" },
         Entity::BranchRecords,
         &id.to_string(),
         before.as_ref().map(record_json).as_ref(),
@@ -636,8 +629,10 @@ mod tests {
             &Cut::Fork(A.to_owned()),
             Supersede::default(),
         );
-        // Even asserting untouched-ness cannot smuggle a `Fork` in, because the arm compares
-        // against `excluded.cut_point` and the flag is only ever set for a measured tip.
+        // What stops a `Fork` reaching the supersede arm is [`Supersede::untouched`]'s
+        // provenance, not this statement: see [`Cut`] and design Open risk 6. The `SUPERSEDED`
+        // comparison against `excluded.cut_point` would *admit* a fabricated flag, so nothing is
+        // claimed for it here.
         let wrote = record(
             &db,
             "task/x",
