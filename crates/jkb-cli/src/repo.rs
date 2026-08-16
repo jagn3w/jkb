@@ -516,10 +516,10 @@ pub(crate) fn branch_records(
 
 /// [`landed_for_action`] for a caller that has already resolved the base for this branch.
 ///
-/// The policy — **no base, do not act** — lives here so both entry points share it. A caller
-/// holding a resolved base previously had to re-qualify it into a `<branch>:<sha>` string purely
-/// so the other entry point could take it apart again, which is the kind of round trip that
-/// invites someone to skip the helper and call `is_merged` directly.
+/// The policy — **no cut point, do not act** — lives here so both entry points share it. Anything
+/// that already holds a branch's cut point (the review pass, which reads every record in the repo
+/// at once) comes through this door rather than calling `is_merged` directly, which would skip the
+/// policy.
 ///
 /// # Errors
 /// Returns an error if git cannot be run.
@@ -568,8 +568,9 @@ pub(crate) fn base_is_usable(cwd: &std::path::Path, base: Option<&str>) -> anyho
         // Two questions, and both must hold. **Form first**: a symbolic revision like `HEAD`
         // resolves in every repository, to whatever that one is pointed at now, so a stored
         // `HEAD` would pass the git check and mean something different every time it is read.
-        // Checked here, on the reader's side, so it holds however the value reached the store —
-        // `base::write` refuses to record one, but a legacy or hand-edited tag never passed it.
+        // Checked here, on the reader's side, so it holds however the value reached the store.
+        // The schema now refuses one at the write (`branch_records`' CHECK), but a value recorded
+        // before that CHECK existed never passed it.
         //
         // **Then existence**, via `rev_commit` rather than `rev`: plain `rev-parse` parses rather
         // than looks up, so it accepts any 40-character hex string and a fabricated sha read as a
