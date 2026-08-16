@@ -4138,6 +4138,39 @@ fn doctor_reports_retention_entries_for_branches_nothing_records() {
     );
 }
 
+/// A bare `jkb undo` after `jkb task start` reverts **that** transaction, not an older one.
+///
+/// `task start` writes a `branch_records` row, logged as an `insert`. An insert into a table
+/// `undo`'s allowlist did not name made `undo_last` skip the whole transaction — so this did not
+/// fail, it quietly reverted the previous one and reported success, deleting the task itself. The
+/// allowlist is derived from `changelog::Entity::insert_inverse` now; this is the end-to-end shape
+/// of the same regression.
+#[test]
+fn undo_after_task_start_reverts_the_start_and_not_the_task_that_preceded_it() {
+    let f = Fixture::new();
+    let uid = f.add_task("undo after start");
+    git(&f.repo, &["branch", "feature-u", "main"]);
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature-u"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("feature-u: cut from"));
+
+    f.jkb().args(["undo"]).assert().success();
+
+    // The start is undone: no branch, no record. The **task** is untouched — reverting it instead
+    // is the failure, and it is silent.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("feature-u").not());
+}
+
 /// The landing verb's refusal must not send you to measure a branch whose work has just landed.
 ///
 /// This is the family rule at `base::MEASURE_VERB`: the refusal fires at the one moment a branch
