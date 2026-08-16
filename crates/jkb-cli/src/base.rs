@@ -435,6 +435,69 @@ pub(crate) fn ensure_recorded(
     Ok(if had_record { None } else { why })
 }
 
+/// Fill in a cut point for a branch this call merely **refers to** — someone else's land target.
+///
+/// Distinct from [`ensure_recorded`] because the two answer different questions, and using the
+/// measuring one here destroyed live records. `jkb task start B --onto integration` is a statement
+/// about **B**; whatever it can observe about `integration` is not evidence about `integration`'s
+/// identity. But the merge queue fast-forwards a batch branch, which leaves it truthfully reading
+/// as *untouched* — so `ensure_recorded`'s supersede arm fired on the batch, replaced the real cut
+/// point X with the batch's current tip T1, and froze every task already landed on it at
+/// `NothingToMerge` **permanently**: `is_merged` answers that whenever `cut_point == tip`, and
+/// `jkb task base --forget` cannot repair it because [`advice`] then answers [`Advice::TooLate`].
+///
+/// So this may only ever **fill**, in two independent ways: it returns before measuring if a cut
+/// point is already recorded, and it passes [`Supersede::default()`](Supersede), under which
+/// `record_cut_point`'s statement is `WHERE cut_point IS NULL`. Staleness evidence belongs to the
+/// branch being recorded, not to the branch it names as a parent.
+///
+/// And filling is itself gated on [`advice`] — the same question every *message* asks before
+/// naming a measuring verb. If it would be harmful to tell a reader to measure this branch now, it
+/// is harmful to measure it now: on a branch that has moved and has no commits of its own the only
+/// obtainable value is its tip, which is the frozen state above arrived at through the other arm.
+/// Recording nothing is reported and repairable; a tip is silent and permanent.
+///
+/// # Errors
+/// Returns an error if git cannot be run or the record cannot be written.
+pub(crate) fn fill_for_reference(
+    conn: &Connection,
+    meta: &WriteMeta,
+    repo_root: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    onto: Option<&str>,
+) -> jkb_core::Result<()> {
+    if branch::get(conn, repo, branch)?.is_some_and(|r| r.cut_point.is_some()) {
+        return Ok(());
+    }
+    if advice(repo_root, branch)? != Advice::Measure {
+        return Ok(());
+    }
+    let Measurement::At(cut) = measure(repo_root, branch, onto)? else {
+        return Ok(());
+    };
+    if rejected(Some(repo_root), branch, cut.sha())?.is_some() {
+        return Ok(());
+    }
+    let anchor = git(gitrepo::ref_journal(repo_root, branch))?.map(|j| branch::Anchor {
+        sha: j.anchor_sha,
+        ts: j.anchor_ts,
+    });
+    branch::record_cut_point(
+        conn,
+        meta,
+        repo,
+        branch,
+        &cut,
+        anchor.as_ref(),
+        Supersede::default(),
+    )?;
+    // The anchor is only as durable as the reflog, so coverage is established rather than assumed
+    // — the same best-effort licence `ensure_recorded` takes.
+    git(gitrepo::retain_reflog(repo_root, branch))?;
+    Ok(())
+}
+
 /// Whether `record`'s branch is a **different branch of the same name** — verified, positive proof
 /// of recycling, read at the moment a reader is about to act on the record.
 ///

@@ -4027,10 +4027,10 @@ fn cmd_task_add(
     // The `retain` is routing, not a guard: `tag::apply` is idempotent on `(item, facet, value)`,
     // so leaving the tag in place would write the same row and change nothing observable. What it
     // buys is that "`record_branch` is the only writer of `branch=` in this crate" holds without
-    // an exception the next reader has to carry. It is a convention, not an enforced invariant —
-    // `branch=` is an ordinary facet and the store will take one from anyone, unlike `base=`,
-    // which `jkb_core::tag` reserves. The cut point is recorded by the call below either way, and
-    // that is the part with a test.
+    // an exception the next reader has to carry. It is a convention, not an enforced invariant:
+    // `branch=` is an ordinary facet and the store will take one from anyone — `jkb_core::tag`
+    // reserves nothing, deliberately, and says why in its module doc. The cut point is recorded by
+    // the call below either way, and that is the part with a test.
     let quick_add_branches: Vec<String> = qa
         .tags
         .iter()
@@ -4512,7 +4512,7 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     }
     let displaced = held.clone();
     let measure_root = measure_in.clone();
-    let missing = db.write_txn("cli", move |conn, meta| {
+    let (missing, shared) = db.write_txn("cli", move |conn, meta| {
         // The CAS answer is checked rather than discarded: losing it means someone claimed the
         // task between the probe and here, and reporting "started" while writing this session's
         // branch onto their task is exactly the confusion the liveness guard above prevents.
@@ -4539,11 +4539,14 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
                 cut_from: measure_against.as_deref(),
             },
         )?;
-        if clear_onto {
-            repo::clear_land_targets(conn, meta, id, measure_root.as_deref())?;
-        }
-        Ok(missing)
+        let shared = if clear_onto {
+            repo::clear_land_targets(conn, meta, id, measure_root.as_deref())?
+        } else {
+            Vec::new()
+        };
+        Ok((missing, shared))
     })?;
+    report_shared_branches(&shared);
     report_started(
         db,
         &Started {
@@ -4556,6 +4559,23 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
         },
         json,
     )
+}
+
+/// Say which land targets were left alone, and who they belong to.
+///
+/// On stderr, so `--json` output stays machine-readable, and unconditionally: a land target is a
+/// property of the *branch*, so a command acting on one task can silently change what every other
+/// task on that branch sees. Reporting is the difference between "your siblings kept their batch"
+/// and a batch that quietly vanished from `jkb staging ls`.
+fn report_shared_branches(shared: &[repo::SharedBranch]) {
+    for s in shared {
+        eprintln!(
+            "note: {} still carries work for {} other task(s) — its land target was kept ({})",
+            s.branch,
+            s.tasks.len(),
+            s.tasks.join(", ")
+        );
+    }
 }
 
 /// What `task start` has just recorded, for reporting it.
@@ -4868,10 +4888,15 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
         .context("tag must be `facet=value`, e.g. `size=small`")?;
     // A land target is a fact about a *branch* and lives in that branch's record, so a facet named
     // `onto` reaches no reader. Refused rather than stored inert — a user who typed it expecting
-    // effect deserves an answer, not silence — and `rm` is refused with it, since there is nothing
-    // for it to remove either.
+    // effect deserves an answer, not silence.
+    //
+    // `rm` is deliberately **not** refused. The refusal exists to stop a value nothing reads being
+    // *set*; removing one is always safe, and there is a route that still creates them — a synced
+    // `tasks.md` line carrying `#onto=` goes through `tag::reconcile_tags`, which is inert by
+    // design (B3) but real. Refusing `rm` left the only command that could remove such a tag
+    // declining on the grounds that it could not exist.
     anyhow::ensure!(
-        facet != "onto",
+        facet != "onto" || matches!(mode, TagMode::Rm),
         "`onto` records where a *branch* lands, not where a task is, so it is no longer a tag. \
          Use `jkb task work <uid> --onto <branch>`, or `jkb task start <uid> --branch <b> \
          --onto <branch>`."
@@ -4941,8 +4966,10 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
             // several values, and a command called `add` must not silently delete one.
             TagMode::Add => tag::apply(conn, meta, id, &facet, &value),
             // `set` replaces the facet's other values. Right for the facets answering "where
-            // is this being worked" — a second `onto=` is a contradiction, not extra
-            // information, and a reader collapsing the multi-map picks one at random (D36.6).
+            // is this being worked" — `repo=` is the one left here, and a second value for it is
+            // a contradiction, not extra information, which a reader collapsing the multi-map
+            // resolves at random (D36.6). (`onto=` is refused above; `branch=` is routed through
+            // `repo::record_branch`, which honours the same mode.)
             TagMode::Set => repo::set_facet(conn, meta, id, &facet, &value),
             TagMode::Rm => tag::remove(conn, meta, id, &facet, &value),
         }
@@ -5993,7 +6020,7 @@ fn cmd_task_abandon(
     // extension believes.
     let observed = held.clone();
     let abandon_root = ctx.root.clone();
-    let (reopened, final_status) = db.write_txn("cli", move |conn, meta| {
+    let (reopened, final_status, shared) = db.write_txn("cli", move |conn, meta| {
         // Only the claim judged above, and nothing at all when there was none. `held` was read
         // before two git subprocesses (`worktree remove`, `delete-branch`) — a far wider window
         // than the `ps` fork that motivated `clear_if` — so a claim taken in the meantime
@@ -6009,7 +6036,7 @@ fn cmd_task_abandon(
             let current = item::get(conn, id)?
                 .and_then(|m| m.status)
                 .unwrap_or_default();
-            return Ok((false, current));
+            return Ok((false, current, Vec::new()));
         }
         if let Some(prev) = &observed {
             if !claim::clear_if(conn, meta, id, prev)? {
@@ -6020,19 +6047,20 @@ fn cmd_task_abandon(
                 let current = item::get(conn, id)?
                     .and_then(|m| m.status)
                     .unwrap_or_default();
-                return Ok((false, current));
+                return Ok((false, current, Vec::new()));
             }
         }
         let current = item::get(conn, id)?
             .and_then(|m| m.status)
             .unwrap_or_default();
         if jkb_types::TaskStatus::is_terminal_str(Some(current.as_str())) {
-            return Ok((false, current));
+            return Ok((false, current, Vec::new()));
         }
-        repo::clear_land_targets(conn, meta, id, Some(&abandon_root))?;
+        let shared = repo::clear_land_targets(conn, meta, id, Some(&abandon_root))?;
         task::set_status(conn, meta, id, jkb_types::TaskStatus::Open)?;
-        Ok((true, "open".to_owned()))
+        Ok((true, "open".to_owned(), shared))
     })?;
+    report_shared_branches(&shared);
 
     if json {
         println!(

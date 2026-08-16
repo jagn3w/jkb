@@ -236,7 +236,9 @@ fn read_tags(
 ///
 /// `S` is measured against **trunk**, its parent by construction (design D38): a batch branch is
 /// cut from trunk, and when it is freshly cut and untouched that measurement is the one provable
-/// case — its own tip.
+/// case — its own tip. The measuring is [`crate::base::fill_for_reference`]'s, which may only fill
+/// a gap: this call is about `branch`, and what it can observe about `target` is not evidence
+/// about `target`.
 ///
 /// **The stored value is a bare branch name**, canonicalized here rather than at the flags that
 /// feed it. `jkb staging ls` keys batches by the short names `gitrepo::branch_refs` returns, so a
@@ -274,7 +276,12 @@ pub(crate) fn record_land_target(
     if let (Some(root), Some(target)) = (repo_root, target.filter(|t| *t != branch)) {
         let trunk =
             crate::gitrepo::trunk(root).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-        crate::base::ensure_recorded(conn, meta, root, repo, target, trunk.as_deref())?;
+        // `fill_for_reference`, never `ensure_recorded`: the target is not the branch this call is
+        // recording, so nothing observed about it here is evidence about *its* identity. The batch
+        // a merge queue has just fast-forwarded reads as untouched, and the measuring entry point
+        // took that as proof of recycling and replaced the batch's real cut point with its current
+        // tip — freezing every task already landed on it, permanently. See `base::fill_for_reference`.
+        crate::base::fill_for_reference(conn, meta, root, repo, target, trunk.as_deref())?;
     }
     Ok(())
 }
@@ -481,12 +488,28 @@ pub(crate) fn set_location_facets(
     Ok(missing)
 }
 
-/// Clear the land target of every branch this task records — `jkb task abandon`, and a
-/// `--onto <trunk>` that says the branch is on no batch.
+/// A land target left in place because the branch is not this task's alone.
+pub(crate) struct SharedBranch {
+    /// The branch whose land target was kept.
+    pub(crate) branch: String,
+    /// The uids of the other live tasks recorded on it.
+    pub(crate) tasks: Vec<String>,
+}
+
+/// Clear the land target of every branch this task records **and no other live task does** —
+/// `jkb task abandon`, and a `--onto <trunk>` that says the branch is on no batch.
 ///
-/// Every branch, not the one a chooser picks: leaving a stale target on a sibling keeps the task
-/// rendering as live `implementing` work and keeps that batch classified unmerged and offered as a
-/// land target long after it is spent (design D36.3).
+/// Every such branch, not the one a chooser picks: leaving a stale target on a sibling keeps the
+/// task rendering as live `implementing` work and keeps that batch classified unmerged and offered
+/// as a land target long after it is spent (design D36.3).
+///
+/// **But a land target is a property of the branch, not of the task**, and `/task-swarm` puts up
+/// to four tasks on one group branch. Under the old item-keyed `onto=` facet this command could
+/// only reach its own task; keyed `(repo, branch)` it reaches every task on the branch, and
+/// abandoning one of a group silently dropped its three siblings out of `jkb staging ls` and out
+/// of `jkb task land` — whose advice for a task with no target is `jkb task work`, which cuts a
+/// *second* branch and detaches it from the batch. So a shared branch keeps its target and is
+/// returned, for the caller to say so.
 ///
 /// # Errors
 /// Returns an error if a tag read or a record write fails.
@@ -495,14 +518,61 @@ pub(crate) fn clear_land_targets(
     meta: &jkb_core::WriteMeta,
     id: ItemId,
     repo_root: Option<&std::path::Path>,
-) -> jkb_core::Result<()> {
+) -> jkb_core::Result<Vec<SharedBranch>> {
     let Some((_, repo)) = repo_key_for(conn, id, repo_root)? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut shared = Vec::new();
     for branch in facet_values(&read_tags(conn, id)?, FACET_BRANCH) {
-        jkb_core::branch::set_land_target(conn, meta, &repo, branch, None)?;
+        let others = live_tasks_on_branch(conn, id, &repo, branch)?;
+        if others.is_empty() {
+            jkb_core::branch::set_land_target(conn, meta, &repo, branch, None)?;
+        } else {
+            shared.push(SharedBranch {
+                branch: branch.clone(),
+                tasks: others,
+            });
+        }
     }
-    Ok(())
+    Ok(shared)
+}
+
+/// The uids of the **other** non-terminal tasks recorded on `branch` in `repo`.
+///
+/// A task with no `repo=` of its own counts: this command's own repo comes from the checkout when
+/// the facet is absent, so an unstated repo is the same repo far more often than not, and of the
+/// two ways to be wrong here only clearing a live sibling's target does damage.
+fn live_tasks_on_branch(
+    conn: &rusqlite::Connection,
+    id: ItemId,
+    repo: &str,
+    branch: &str,
+) -> jkb_core::Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.uid, i.status FROM items i
+           JOIN tag_applications t
+             ON t.item_id = i.id AND t.facet = ?1 AND t.value = ?2
+          WHERE i.id <> ?3
+            AND NOT EXISTS (
+                SELECT 1 FROM tag_applications r
+                 WHERE r.item_id = i.id AND r.facet = ?4 AND r.value <> ?5
+            )
+          ORDER BY i.uid",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![FACET_BRANCH, branch, id.get(), FACET_REPO, repo],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (uid, status) = row?;
+        // Terminal statuses filtered here rather than in SQL, so the one definition of "terminal"
+        // (`TaskStatus`) stays the only one.
+        if !jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
+            out.push(uid);
+        }
+    }
+    Ok(out)
 }
 
 /// Does `branch` count as landed *for the purpose of acting on the task*?
@@ -672,9 +742,12 @@ pub(crate) fn landed_with_base(
     // A missing base refuses to act; a garbage one closed the task.
     //
     // The check belongs at the policy layer, not in `is_merged`: that function answers a factual
-    // question and deliberately falls through when it has no usable base. Here is also where it
-    // catches every route a bad value can arrive by — a mistyped `jkb task base`, a `#base=`
-    // quick-add modifier, a hand-edited tag — rather than one of them.
+    // question and deliberately falls through when it has no usable base. The routes it once
+    // caught are gone — no verb takes a commit id, and `base=` is an ordinary facet nothing reads
+    // — but a value can still be unresolvable *here*: a record made in another clone of the
+    // repository, or one whose commit has since been garbage-collected. The schema's CHECK
+    // (`branch_records`, mirrored by `base::is_object_id`) governs the value's **form**; only git
+    // can answer whether this checkout has the object.
     if !base_is_usable(cwd, Some(base))? {
         return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
     }

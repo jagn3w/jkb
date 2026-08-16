@@ -116,6 +116,19 @@ impl Fixture {
         .unwrap();
     }
 
+    /// The cut point stored for `branch`, read back through core.
+    ///
+    /// The CLI reports a cut point only against a *task*, and the records this reads about belong
+    /// to a batch branch no task is on — which is precisely the branch the ensure-on-reference
+    /// writes and the one that got overwritten.
+    fn cut_point_of(&self, branch: &str) -> Option<String> {
+        let db = jkb_core::Db::open(self.db.to_str().unwrap()).unwrap();
+        let (repo, branch) = (self.repo_key(), branch.to_owned());
+        db.read(move |conn| jkb_core::branch::get(conn, &repo, &branch))
+            .unwrap()
+            .and_then(|r| r.cut_point)
+    }
+
     /// The repo key the records are stored under — the basename of the fixture's checkout.
     fn repo_key(&self) -> String {
         self.repo
@@ -762,6 +775,84 @@ fn staging_ls_groups_tasks_under_the_branch_they_land_on() {
         .success();
     git(&f.repo, &["branch", "-D", &onto]);
     assert!(f.staging(&[]).as_array().unwrap().is_empty());
+}
+
+/// Abandoning one task of a swarm group leaves its siblings on the batch.
+///
+/// A land target is keyed `(repo, branch)`, and `/task-swarm` puts up to four tasks on one group
+/// branch — so a command acting on one task reaches all four. Under the old item-keyed `onto=`
+/// facet this was per task and could not touch a sibling; keyed by branch it dropped the other
+/// three out of `jkb staging ls` and out of `jkb task land`, whose advice for a task with no
+/// target cuts a *second* branch and detaches it from the batch.
+#[test]
+fn abandoning_one_task_of_a_group_keeps_the_others_on_the_batch() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let a = f.add_task("group task a");
+    let b = f.add_task("group task b");
+    for uid in [&a, &b] {
+        f.jkb()
+            .args([
+                "task",
+                "start",
+                uid,
+                "--branch",
+                "grp",
+                "--onto",
+                "integration",
+            ])
+            .assert()
+            .success();
+    }
+
+    f.jkb()
+        .args(["task", "abandon", &a, "--force"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("land target was kept"))
+        .stderr(predicate::str::contains(&b));
+
+    let rows = f.staging(&[]);
+    let batch = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["branch"] == "integration")
+        .expect("abandoning one task of the group took the whole batch out of the listing");
+    let uids: Vec<&str> = batch["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["uid"].as_str())
+        .collect();
+    assert!(
+        uids.contains(&b.as_str()),
+        "the sibling lost its land target when its group-mate was abandoned: {uids:?}"
+    );
+
+    // …and once nothing live is left on the branch the clear happens as before, which is what the
+    // clear is for. "Live" is the task lifecycle: an abandoned task stays open and stays on its
+    // branch, so only a terminal one stops holding the batch.
+    f.jkb()
+        .args(["--global", "task", "set", &a, "--status", "cancelled"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "abandon", &b, "--force"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("land target was kept").not());
+    assert!(
+        !f.staging(&[])
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["branch"] == "integration"),
+        "a batch with no live task on it is still offered as a land target"
+    );
 }
 
 /// Recording a review tags the task and moves it into `needs_review` — the only author of
@@ -1424,19 +1515,23 @@ fn re_working_an_abandoned_branch_keeps_its_original_cut_point() {
     );
 }
 
-/// A land target cannot be written through the generic tag command or a task line, and the
-/// refusal names the verbs that own it.
+/// A land target cannot be **written** as a tag, and a stray one can still be removed.
 ///
 /// Where a branch lands is a fact about the **branch** and lives in that branch's record, so a
 /// facet named `onto` reaches no reader at all. Refusing rather than storing it inert is a UX
 /// judgement, not a data-integrity one: a stray facet cannot close a task falsely, but a user who
 /// typed it expecting effect deserves an answer instead of silence.
+///
+/// `rm` is the other half and is deliberately **not** refused. The refusal is about setting a value
+/// nothing reads; removing one is always safe, and refusing it made the only command that could
+/// remove such a tag decline on the grounds that it could not exist — while two routes still create
+/// one, a synced `tasks.md` line carrying `#onto=` and the facet rename exercised below.
 #[test]
 fn a_land_target_cannot_be_written_as_a_tag() {
     let f = Fixture::new();
     let uid = f.add_task("hand-tagged task");
 
-    for mode in ["add", "set", "rm"] {
+    for mode in ["add", "set"] {
         f.jkb()
             .args(["--global", "task", "tag", mode, &uid, "onto=batch"])
             .assert()
@@ -1448,6 +1543,29 @@ fn a_land_target_cannot_be_written_as_a_tag() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("jkb task work"));
+
+    // A stray `onto=` that got in by another route comes back out. Planted through `tag rename`,
+    // which is a real route with no guard on the destination name — the same shape as the sync
+    // one, and reachable from this test without a mount.
+    let stray = f.add_task("stray onto #batchref=batch");
+    f.jkb()
+        .args(["--global", "tag", "rename", "batchref", "onto"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "query", "tag:onto=batch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&stray));
+    f.jkb()
+        .args(["--global", "task", "tag", "rm", &stray, "onto=batch"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "query", "tag:onto=batch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&stray).not());
     // Nothing was created: the refusal is before the write, so there is no half-made task
     // carrying the value with the modifier merely dropped.
     f.jkb()
@@ -3729,6 +3847,77 @@ fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
     );
 }
 
+/// Naming a batch as a land target never **replaces** the batch's cut point — only fills it.
+///
+/// The ensure-on-reference used to go through the measuring entry point, and a merge queue leaves
+/// the batch in exactly the state that defeats it: the group's commits are fast-forwarded into the
+/// batch but the group branch still holds them, so `has_own_commits(integration)` is truthfully
+/// `false`. The measuring path reads "untouched" as proof the record belongs to a different branch
+/// of the same name, and replaces the batch's real cut point with its **current tip** — after
+/// which `is_merged` answers `NothingToMerge` for ever (cut point == tip) and every task already
+/// landed on that batch is frozen, with `--forget` unable to repair it.
+///
+/// The value is asserted before the consequence, because "the second group's task did not close"
+/// is also true when nothing was recorded at all.
+#[test]
+fn naming_a_batch_as_a_land_target_does_not_replace_its_cut_point() {
+    let f = Fixture::new();
+    let (first, group) = a_group_landing_on_an_integration_branch(&f);
+    let cut = f
+        .cut_point_of("integration")
+        .expect("setup: referencing the batch recorded its cut point");
+
+    // The merge queue's graft. The group branch survives it, which is what makes the batch read as
+    // having no commits of its own.
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", &group]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args(["task", "landed", &group, "--onto", "integration"])
+        .assert()
+        .success();
+
+    // The swarm's next group names the same batch. This call is a statement about `grp-b`; what it
+    // can observe about `integration` is not evidence about `integration`.
+    let second = f.add_task("second group");
+    git(&f.repo, &["checkout", "-q", "-b", "grp-b", "integration"]);
+    commit_in(&f.repo, "h.txt", "more group work\n", "more group work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args([
+            "task",
+            "start",
+            &second,
+            "--branch",
+            "grp-b",
+            "--onto",
+            "integration",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        f.cut_point_of("integration").as_deref(),
+        Some(cut.as_str()),
+        "referencing the batch again replaced its cut point with its current tip, which reads as \
+         `NothingToMerge` for ever and freezes every task already landed on it"
+    );
+
+    // …and the task that had already landed on the batch still closes when the batch reaches
+    // trunk, which is the whole point of the record that was being overwritten.
+    f.jkb()
+        .args(["--global", "task", "base", "--forget", &group])
+        .assert()
+        .success();
+    git(&f.repo, &["merge", "-q", "--ff-only", "integration"]);
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&first),
+        "done",
+        "the batch reached trunk and the task landed on it stayed open"
+    );
+}
+
 /// A landing whose target has **no record of its own** is held, not closed.
 ///
 /// The event says the work is in `S`; deciding whether `S` reached trunk needs `S`'s cut point,
@@ -4284,6 +4473,11 @@ fn an_unreadable_ref_journal_declines_rather_than_deciding() {
 fn recording_a_branch_retains_its_ref_journal() {
     let f = Fixture::new();
     git(&f.repo, &["branch", "feature", "main"]);
+    // The control: same repository, same expiry, no record and therefore no retention entry. Its
+    // creation entry must be gone afterwards, or the positive assertion below proves nothing —
+    // `git reflog expire` leaves an empty log **file** behind either way, so asserting the file
+    // exists passed with `retain_reflog` reduced to a no-op.
+    git(&f.repo, &["branch", "unrecorded", "main"]);
     let uid = f.add_task("retained");
     f.jkb()
         .args(["task", "start", &uid, "--branch", "feature"])
@@ -4301,12 +4495,40 @@ fn recording_a_branch_retains_its_ref_journal() {
         "no retention entry was written beside the record"
     );
 
+    // The **entry** the anchor is read from, not the file it lives in.
+    let creation_entry = |branch: &str| -> Option<String> {
+        let log = std::fs::read_to_string(f.repo.join(format!(".git/logs/refs/heads/{branch}")))
+            .unwrap_or_default();
+        // A creation entry is the one whose `old` revision is all zeros — the same fact
+        // `gitrepo::ref_journal` keys on, and the reason expiry cannot remove it silently.
+        log.lines()
+            .find(|l| {
+                l.split(' ')
+                    .next()
+                    .is_some_and(|old| !old.is_empty() && old.chars().all(|c| c == '0'))
+            })
+            .map(str::to_owned)
+    };
+    let anchor = creation_entry("feature").expect("setup: the branch has a creation entry");
+    assert!(
+        creation_entry("unrecorded").is_some(),
+        "setup: the control branch has a creation entry to lose"
+    );
+
     // It survives a config-driven expiry of everything else.
     git(&f.repo, &["config", "gc.reflogExpire", "now"]);
     git(&f.repo, &["reflog", "expire", "--all"]);
-    assert!(
-        f.repo.join(".git/logs/refs/heads/feature").exists(),
-        "the retention entry did not hold the creation entry through `reflog expire --all`"
+    assert_eq!(
+        creation_entry("unrecorded"),
+        None,
+        "setup: the expiry did not remove an unretained creation entry, so this run cannot show \
+         that retention did anything"
+    );
+    assert_eq!(
+        creation_entry("feature").as_deref(),
+        Some(anchor.as_str()),
+        "the retention entry did not hold the creation entry through `reflog expire --all`, so \
+         the instance anchor is not durable"
     );
 
     // Deleting the branch takes the record and the entry with it.
