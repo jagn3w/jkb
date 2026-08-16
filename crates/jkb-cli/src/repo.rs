@@ -562,8 +562,15 @@ pub(crate) fn landed_for_action(
         };
         if crate::base::stale_instance(cwd, &asking, &record)? {
             // Proof that this record describes a branch that no longer exists. Acting on it is the
-            // silent, permanent failure D34.4 forbids, so we hold and let the next writer repair
-            // the record (the supersede arm fires on exactly this).
+            // silent, permanent failure D34.4 forbids, so we hold.
+            //
+            // The repair is not automatic and this comment used to say it was: nothing here
+            // rewrites the row, and the hold lasts until a **writer** runs on that branch — the
+            // next `jkb task start` / `jkb task work`, whose supersede arm fires on exactly this,
+            // or `jkb task base --forget <branch>` by hand. That arm additionally required the
+            // freshly measured cut point to *differ*, so a branch recycled at the same commit
+            // (trunk had not moved) could never be repaired at all; see
+            // `branch::record_cut_point`'s `SUPERSEDED`.
             return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
         }
         let Some(landing) = record.landed.as_ref().filter(|l| credited(cwd, &asking, l)) else {
