@@ -698,6 +698,21 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     judged by the same predicate readers use (**not** by ancestry: the queue rebases a detached
     HEAD, so every entry after the first has rewritten commits and its tip is no ancestor of the
     target).
+    - **A landing onto the branch you are asking about *is* the answer** — `landed_for_action`
+      stops there rather than walking on to ask "and is `S` contained in `S`?", which needs `S`'s
+      own cut point. `jkb task review record` passes the *reviewed branch*, so without this it
+      declined to credit work jkb had itself just grafted onto that branch. It is not the "landed
+      onto a batch with no record" state, which is still **held**: there the target is a different
+      branch, and whether it in turn reached trunk is a question the record genuinely cannot
+      answer.
+    - **The queue's verb reports, and deliberately does not measure.** The obvious fix for a
+      landing onto a target with no cut point is to record one there — and it is wrong: a cut point
+      is provable only while a branch is untouched, and a landing is exactly the moment the target
+      stops being one. The queue's first entry fast-forwards the target onto commits its source
+      branch still holds, so `has_own_commits` truthfully says "nothing of its own" and the **tip**
+      gets stored for the whole batch, which is permanent. The record has to be made when the batch
+      is *cut* (`--onto <batch>`); `jkb task landed` says so, on stderr and as `creditable: false`,
+      and `merge-queue.sh` no longer swallows that.
   - **No verb anywhere accepts a commit id.** `jkb task base <uid> <branch> <sha>` produced three
     findings across three passes, all the same shape — the sha nearest a user's hand is the branch
     tip, and a cut point equal to the tip freezes the task at `NothingToMerge` with no repair path.
@@ -737,6 +752,21 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   `z-live` got two opposite explanations from the one shared blocker, and the command's advice for
   the branch it picked (`jkb task work`) cuts a *second* branch and detaches the task from its
   batch. A live session still wins outright: it is the branch with a checkout on disk.
+  **It is asked through `repo::work_for`**, which returns the session *and* the branch together, so
+  a caller cannot take one and pick the other for itself — which is what `jkb task abandon` did as
+  a third implementation, taking the first `branch=` value (`tag::applications` orders by value) and
+  deleting a stale sibling under `--delete-branch` while the row the user clicked named the live
+  one. The batched listing still calls `work_branch` directly with the sessions and refs it has
+  already read once: same rule, not a second one.
+- **A land target is a *branch*, not a revision that resolves** (`gitrepo::branch_name` →
+  `Is`/`Unknown`/`NotABranch`). `branch_ref` maps a branch name to a ref you may hand to git;
+  this maps an arbitrary string to the **key** `branch_refs` uses, and the two come apart on
+  exactly the values that hurt — `origin/<batch>` and a tag both `rev-parse` fine, and both were
+  accepted and stored, the first under a key `jkb staging ls` cannot look up. The canonicalization
+  and the refusal live at `repo::record_land_target`, the single writer, so the next flag that
+  accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
+  of a sentence the user can act on. Trunk is compared against the canonical name, not against two
+  spellings guessed by hand.
 - `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
   algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
   directly and it must work in any repo.

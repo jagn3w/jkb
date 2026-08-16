@@ -4663,3 +4663,37 @@ fn the_landing_verb_reports_a_target_that_cannot_credit_it() {
         "nothing said the landing will not close its tasks: {out:?}"
     );
 }
+
+/// Trunk named by its remote-tracking spelling is still trunk.
+///
+/// The trunk comparison used to be made against the caller's own spelling, checked against both
+/// trunk's short name and its full ref — two hand-guessed spellings of one branch. It is now made
+/// against the canonical branch name, after resolution, so there is one comparison against one
+/// name and `--onto origin/main` cannot be recorded as a land target by arriving in a third form.
+#[test]
+fn trunk_named_through_its_remote_copy_is_still_dropped_as_a_land_target() {
+    let f = Fixture::new();
+    let remote = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&f.repo, &["push", "-q", "-u", "origin", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feature"]);
+    commit_in(&f.repo, "w.txt", "work\n", "work");
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    let uid = f.add_task("cut from trunk, named through origin");
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "feature"])
+        .args(["--onto", "origin/main"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not recorded as a land target"));
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("lands on").not());
+}
