@@ -767,9 +767,12 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
   of a sentence the user can act on. Trunk is compared against the canonical name, not against two
   spellings guessed by hand.
-- `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
-  algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
-  directly and it must work in any repo.
+- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner, with **one**
+  knowledge-base call: after a genuine fast-forward it runs `jkb task landed <branch> --onto
+  <target>` to record the landing event (D46). That makes it a jkb client, so its caller must
+  export `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script
+  header states the contract. `jkb task land` is the same algorithm in Rust for the human path
+  (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
 
 ## Staging branches and review-gated landing (D38)
 
@@ -835,8 +838,10 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   is a fact about a branch. `staging ls` then shows swarm work and
   hand-driven work in one view rather than the half it was told about. `/review-log` calls
   `jkb task review record` after mounting its findings, and says whether the branch can land.
-- **Deliberately unchanged:** `scripts/merge-queue.sh`. The swarm already runs a fresh
-  REVIEWER before a group reaches the queue (D27.6) — that *is* its gate, and stricter.
+- **No review gate in `scripts/merge-queue.sh`** — deliberately, and that is the only sense in
+  which D38 left it alone (it gained a `jkb task landed` call under D46; see the D36 note above).
+  The swarm already runs a fresh REVIEWER before a group reaches the queue (D27.6) — that *is* its
+  gate, and stricter.
   Requiring `reviewed=` there would make the REVIEWER write facets to satisfy a check its own
   approval already answered. **Review staleness** is recorded (`reviewed=<sha>`) but not
   enforced: making every post-review fixup force a re-review is the fastest way to make people
