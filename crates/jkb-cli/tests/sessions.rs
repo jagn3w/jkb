@@ -1559,6 +1559,43 @@ fn a_start_in_another_repo_names_that_repo_in_its_remedy() {
         .stdout(predicate::str::contains("run it again from thirdproj"));
 }
 
+/// `task start --repo <other> --onto <batch>` **records the land target**, and does not drop it.
+///
+/// A land target is a name, not a measurement: unlike the cut point there is nothing about it a
+/// foreign checkout could honestly establish, so there is nothing to withhold. The write used to
+/// be gated on having a repository *root* — which `--repo <other>` deliberately does not give —
+/// so the flag was accepted, ignored, and never mentioned: the task simply never appeared in
+/// `jkb staging ls` and `jkb task land` failed later saying it recorded no land target.
+#[test]
+fn a_start_in_another_repo_still_records_the_land_target() {
+    let f = Fixture::new();
+    let uid = f.add_task("cross-repo task on a batch");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "start",
+            &uid,
+            "--repo",
+            "otherproj",
+            "--branch",
+            "feat/x",
+            "--onto",
+            "batch-1",
+        ])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        // The cut point is still, correctly, not measured here — the two facts are independent,
+        // and asserting both is what stops a fix for one silently enabling the other.
+        .stdout(predicate::str::contains("feat/x: no cut point recorded"))
+        .stdout(predicate::str::contains("lands on batch-1"));
+}
+
 /// A cut point this repository cannot resolve is treated as **none** — the task is held, never
 /// closed.
 ///
@@ -3645,6 +3682,15 @@ fn the_landing_verb_refuses_a_branch_whose_work_is_not_in_the_target() {
 /// from refs drops from one per task to one per batch, and the surviving one is the branch whose
 /// cut point is provable (a freshly cut batch forked at its own tip) rather than measured against
 /// a moving parent.
+///
+/// **The group's own cut point is dropped first, and that is the whole test.** Without it this
+/// passed with the credited-landing arm of `repo::landed_for_action` deleted: the group branch has
+/// commits of its own and a cut point behind them, so once trunk reached the batch the *ordinary*
+/// inference answered `Merged` and closed the task all by itself. Every assertion held while the
+/// thing under test did nothing. With no cut point the branch's own inference must refuse to act
+/// (D34.4), so only following the landing event can close this — which is exactly what the event
+/// is for, and exactly the state B4 exists to rescue, since a squashed or rebased landing destroys
+/// the ref inference too.
 #[test]
 fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
     let f = Fixture::new();
@@ -3656,6 +3702,12 @@ fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
     git(&f.repo, &["checkout", "-q", "main"]);
     f.jkb()
         .args(["task", "landed", &branch, "--onto", "integration"])
+        .assert()
+        .success();
+    // Leave the group branch with nothing its own inference can decide on. `--forget` keeps the
+    // landing deliberately (they are separate facts), which is the state this asserts about.
+    f.jkb()
+        .args(["--global", "task", "base", "--forget", &branch])
         .assert()
         .success();
 
@@ -3672,7 +3724,8 @@ fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
     assert_eq!(
         f.status_of(&uid),
         "done",
-        "the batch reached trunk and the recorded landing was not followed"
+        "the batch reached trunk and the recorded landing was not followed — with no cut point of \
+         its own, nothing but the landing event can decide this branch"
     );
 }
 
@@ -3734,9 +3787,16 @@ fn a_branch_repointed_after_landing_is_not_credited_with_it() {
         .args(["task", "landed", &branch, "--onto", "integration"])
         .assert()
         .success();
+    // As in the test above: with a cut point of its own the group branch closes by ordinary
+    // inference, and the sanity check below would then hold whether or not the event is consulted.
+    f.jkb()
+        .args(["--global", "task", "base", "--forget", &branch])
+        .assert()
+        .success();
     git(&f.repo, &["merge", "-q", "--ff-only", "integration"]);
 
-    // Sanity: while the branch still points at what landed, the event is credited.
+    // Sanity: while the branch still points at what landed, the event is credited — and with no
+    // cut point of its own, nothing else could have closed it.
     f.jkb()
         .args(["task", "close-merged", "--dry-run"])
         .assert()
@@ -4031,8 +4091,88 @@ fn doctor_reports_retention_entries_for_branches_nothing_records() {
         // The remedy is spelled out: the user did not write this entry and should not have to
         // work out the key.
         .stdout(predicate::str::contains("gc.refs/heads/ghost.reflogExpire"))
+        // BOTH keys. Retention writes `reflogExpire` and `reflogExpireUnreachable`, while the
+        // scan matches only the first — so a remedy naming one key left the other in
+        // `.git/config` and the next run reported "all recorded" over the top of it, guaranteeing
+        // the residue this check exists to stop.
+        .stdout(predicate::str::contains(
+            "gc.refs/heads/ghost.reflogExpireUnreachable",
+        ))
         // …and the recorded branch's own entry is not reported as residue.
         .stdout(predicate::str::contains("gc.refs/heads/live").not());
+
+    // `--fix` removes it, through the same verb `base::forget` uses — and the entry really is
+    // gone from the config, not merely unreported.
+    git(
+        &f.repo,
+        &[
+            "config",
+            "--local",
+            "gc.refs/heads/ghost.reflogExpireUnreachable",
+            "never",
+        ],
+    );
+    f.jkb()
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ghost — removed"));
+    let left = std::process::Command::new("git")
+        .current_dir(&f.repo)
+        .args([
+            "config",
+            "--local",
+            "--get-regexp",
+            "^gc[.]refs/heads/ghost",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&left.stdout).trim().is_empty(),
+        "`doctor --fix` left a retention entry behind: {}",
+        String::from_utf8_lossy(&left.stdout)
+    );
+}
+
+/// The landing verb's refusal must not send you to measure a branch whose work has just landed.
+///
+/// This is the family rule at `base::MEASURE_VERB`: the refusal fires at the one moment a branch
+/// is provably empty — the queue has just fast-forwarded the target onto its commits — so naming
+/// `jkb task start … --onto` there records the branch **tip** as its cut point, which reads as
+/// "nothing has happened here" for ever and freezes the task at `NothingToMerge`.
+///
+/// Both directions, and the fixture is built to distinguish them: the same refusal on a branch
+/// that has genuinely never moved *does* name the verb, because there the tip provably is its fork
+/// point. A test that only checked for absence would pass against a message that never mentions
+/// the verb at all.
+#[test]
+fn the_landing_refusal_names_a_measuring_verb_only_where_measuring_is_safe() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "integration", "main"]);
+    git(&f.repo, &["checkout", "-q", "-b", "grp", "integration"]);
+    commit_in(&f.repo, "g.txt", "group work\n", "group work");
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", "grp"]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+
+    // A hand-run queue: the graft happened, and nothing ever recorded a cut point for `grp`.
+    f.jkb()
+        .args(["task", "landed", "grp", "--onto", "integration"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has moved since it was cut"))
+        .stderr(predicate::str::contains("jkb task start").not());
+
+    // The other side of the same question: a branch that has never moved can be measured, so the
+    // refusal says so.
+    git(&f.repo, &["branch", "fresh", "main"]);
+    f.jkb()
+        .args(["task", "landed", "fresh", "--onto", "integration"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "jkb task start <uid> --branch fresh --onto <parent>",
+        ));
 }
 
 /// Degradation is toward today's behaviour, never toward a judgement.

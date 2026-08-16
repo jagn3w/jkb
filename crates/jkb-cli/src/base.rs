@@ -109,12 +109,13 @@ fn measure_verb(uid: &str, branch: &str) -> String {
 /// answer, and only one of them may name a measuring verb.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Advice {
-    /// The branch has commits of its own, so its fork point is a real, measurable commit. This is
-    /// the only state in which telling someone to measure is safe.
+    /// A fork point can honestly be measured right now — either the branch has commits of its own
+    /// (so its fork point is a real commit behind them), or it has never moved since it was cut
+    /// (so its tip provably *is* its fork point).
     Measure,
-    /// The branch has no commits of its own *now*. Either it was never started, or its work was
-    /// fast-forwarded away into a batch or trunk — git cannot tell those apart (D34.4), and in the
-    /// second case anything measured here is the tip.
+    /// The branch has no commits of its own and has **moved** since it was cut, so its work was
+    /// carried away — fast-forwarded into a batch, squashed into trunk, or rebased. Anything
+    /// measurable here is its tip, and `cut_point == tip` freezes the task for good.
     TooLate,
     /// The branch does not exist in this repository.
     Gone,
@@ -134,11 +135,12 @@ impl Advice {
             // Deliberately names **no** runnable command for this branch. Everything a reader
             // could copy from here would record the tip.
             Self::TooLate => format!(
-                "nothing here can measure it: {branch} has no commits of its own any more, so the \
-                 only value obtainable now is its tip — which reads as \"nothing has happened on \
-                 this branch\" for ever. A cut point has to be recorded while the branch is being \
-                 cut, before its work lands. If this work did land, close the task directly \
-                 (`jkb task set <uid> --status done`)"
+                "nothing here can measure it: {branch} has moved since it was cut and now has no \
+                 commits of its own, so its work was carried away and the only value obtainable \
+                 is its tip — which reads as \"nothing has happened on this branch\" for ever. A \
+                 cut point has to be recorded while the branch is being cut, before its work \
+                 lands. If this work did land, close the task directly (`jkb task set <uid> \
+                 --status done`)"
             ),
             Self::Gone => format!(
                 "{branch} does not exist in this repository, so nothing here can measure it — \
@@ -210,7 +212,19 @@ pub(crate) fn advice(repo_root: &std::path::Path, branch: &str) -> jkb_core::Res
     }
     Ok(match untouched_tip(repo_root, branch)? {
         Untouched::No => Advice::Measure,
-        Untouched::At(_) => Advice::TooLate,
+        // "No commits of its own" is two states, and only one of them is a problem (D34.4): a
+        // branch that was never started, and one whose work was carried away. Refs cannot tell
+        // them apart — but the **ref journal** can, by the same fact the retain-license uses: a
+        // branch that has never moved since it was cut still points at its creation entry's
+        // revision, so its tip provably *is* its fork point and recording it is right. A branch
+        // that has moved and yet has nothing of its own had its work taken elsewhere.
+        //
+        // Absent or truncated journal → `TooLate`, the conservative side: withholding the verb
+        // costs a sentence, naming it on a merged-away branch costs the task permanently.
+        Untouched::At(tip) => match git(gitrepo::ref_journal(repo_root, branch))? {
+            Some(journal) if journal.anchor_sha == tip => Advice::Measure,
+            _ => Advice::TooLate,
+        },
         Untouched::Unknown => Advice::CannotAsk,
     })
 }
