@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use jkb_types::Error as TypeError;
 
+use crate::changelog::{Entity, InsertInverse};
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -52,6 +53,8 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
     ("update", Some("edges"), Inverse::EdgeWeight),
     ("update", Some("mounts"), Inverse::MountConfig),
     ("update", Some("containment"), Inverse::ContainmentRow),
+    // (`insert` is deliberately absent from these table-specific entries and handled by the
+    // wildcard below, whose membership is DERIVED from `Entity::insert_inverse`.)
     // A sync transaction deletes items AND advances the file's journal. With no inverse here
     // the journal survived the undo, so `last_synced_hash` still described bytes whose items
     // were gone — and the next reconcile saw "KB changed, disk did not" and exported an
@@ -61,7 +64,7 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
     // NOT selectable — see `SELECTS_A_TRANSACTION`. This inverse exists to accompany a sync
     // transaction that also touched items; on its own the journal is bookkeeping, not work.
     ("update", Some("sync_state"), Inverse::SyncStateRow),
-    // Any table on `UNDOABLE_TABLES`; an insert into anything else is an error, not a skip.
+    // Any table `undoable_tables` names; an insert into anything else is an error, not a skip.
     // The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so a
     // table-specific `insert` inverse placed after it would never be reached.
     ("insert", None, Inverse::DeleteRow),
@@ -90,27 +93,29 @@ fn inverse_for(op: &str, table: &str) -> Option<Inverse> {
         .map(|(_, _, inv)| *inv)
 }
 
-/// Tables whose inserts `undo` may reverse. This allowlist guards the table-name
-/// interpolation below (the name comes from our own code, never user input, but
-/// we validate anyway).
-const UNDOABLE_TABLES: &[&str] = &[
-    "items",
-    "namespaces",
-    "placements",
-    "edges",
-    "tag_defs",
-    "tag_applications",
-    "bindings",
-    "mounts",
-    "blobs",
-    "ingestions",
-    // Every `jkb ingest` writes one per chunk and every `task add --under` writes one, so
-    // omitting it made a bare `jkb undo` die on the most common transaction shape there is —
-    // and, because a failed undo records no `undo` marker, re-select the same transaction
-    // forever. `child_item_id` is an `INTEGER PRIMARY KEY`, hence the rowid, so the generic
-    // delete-by-rowid inverse addresses the right row.
-    "containment",
-];
+/// Tables whose inserts `undo` may reverse — **derived**, never listed.
+///
+/// This used to be a hand-maintained array, and maintaining it is the defect. A table reaching the
+/// schema and a writer without reaching the list is silent and worse than a crash: `undo_last`
+/// skips any transaction containing an insert into an unlisted table, so a bare `jkb undo` after
+/// the new command reverts an *older* transaction instead — deleting rows nobody asked about and
+/// reporting success. `containment` shipped that way; so did `branch_records`.
+///
+/// The membership question now has one answer, [`Entity::insert_inverse`], which is an exhaustive
+/// match: a new table does not compile until it is answered, and [`crate::changelog::append`]
+/// refuses to log an `insert` for a table that answered [`InsertInverse::Never`]. So there is no
+/// longer a state where a table is written, logged as an insert, and unknown here.
+fn undoable_tables() -> impl Iterator<Item = &'static str> {
+    Entity::ALL
+        .iter()
+        .filter(|e| e.insert_inverse() == InsertInverse::DeleteRow)
+        .map(|e| e.as_str())
+}
+
+/// How many there are, for the SQL placeholder lists.
+fn undoable_count() -> usize {
+    undoable_tables().count()
+}
 
 /// Invert one changelog entry, returning how many rows it changed.
 ///
@@ -118,7 +123,7 @@ const UNDOABLE_TABLES: &[&str] = &[
 /// status update) is passed over rather than failing the undo.
 ///
 /// # Errors
-/// Returns a validation error for an insert into a table outside [`UNDOABLE_TABLES`] — a
+/// Returns a validation error for an insert into a table [`undoable_tables`] does not name — a
 /// half-undone transaction is worse than none — or for an unreadable snapshot.
 fn invert_entry(
     conn: &Connection,
@@ -217,13 +222,16 @@ fn invert_entry(
             }
         }
         Inverse::DeleteRow => {
-            if !UNDOABLE_TABLES.contains(&table) {
-                return Err(
-                    TypeError::Validation(format!("cannot undo unknown table '{table}'")).into(),
-                );
-            }
+            // The interpolated name comes from the **enum**, not from the string the log handed
+            // us: a row written by a newer binary, or a hand-edited log, cannot name a table this
+            // build will splice into SQL.
+            let entity = Entity::parse(table)
+                .filter(|e| e.insert_inverse() == InsertInverse::DeleteRow)
+                .ok_or_else(|| {
+                    TypeError::Validation(format!("cannot undo unknown table '{table}'"))
+                })?;
             rows += conn
-                .prepare_cached(&format!("DELETE FROM {table} WHERE rowid = ?1"))?
+                .prepare_cached(&format!("DELETE FROM {} WHERE rowid = ?1", entity.as_str()))?
                 .execute([rowid()?])?;
         }
     }
@@ -331,7 +339,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         conn,
         meta,
         "undo",
-        "changelog",
+        Entity::Changelog,
         &txn_id.to_string(),
         None,
         None,
@@ -503,16 +511,19 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
 /// Undo the most recent **invertible** transaction that has not already been undone, and
 /// return the number of rows it changed (0 if there is nothing to undo).
 ///
-/// Invertible means the transaction contains an entry [`INVERSES`] covers — an `insert` into
-/// an [`UNDOABLE_TABLES`] table, an item `delete` (which carries a restorable snapshot), an
+/// Invertible means the transaction contains an entry [`INVERSES`] covers — an `insert` into a
+/// table [`undoable_tables`] names, an item `delete` (which carries a restorable snapshot), an
 /// edge weight `update`, a mount config `update`, a containment `update` — **and** no insert
-/// into a table outside that list, which [`undo`] refuses rather than half-inverting.
+/// into a table outside that set, which [`undo`] refuses rather than half-inverting.
 ///
-/// The predicate is **generated** from those two lists rather than written out a second time.
-/// Both halves have drifted before: the mount inverse reached `undo` alone, so a bare
-/// `jkb undo` walked past a mount edit and reverted an older transaction; and `containment`
-/// reached the schema without reaching `UNDOABLE_TABLES`, so undo died on every transaction
-/// an `ingest` or a `task add --under` produced.
+/// The predicate is **generated** from [`INVERSES`] and [`undoable_tables`] rather than written
+/// out a second time. Both halves have drifted before: the mount inverse reached `undo` alone, so
+/// a bare `jkb undo` walked past a mount edit and reverted an older transaction; `containment`
+/// reached the schema without reaching the allowlist, so undo died on every transaction an
+/// `ingest` or a `task add --under` produced; and `branch_records` reached it without reaching the
+/// allowlist either, so a bare `jkb undo` after `jkb task start` reverted an unrelated older
+/// transaction and said it had succeeded. The allowlist is now derived and that last route is
+/// closed at the source (see [`undoable_tables`]).
 ///
 /// A transaction with none of those — the delete-only one `jkb item rm` produces, say — must
 /// still count: otherwise `jkb undo` would skip straight past it and revert somebody's
@@ -536,16 +547,12 @@ pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
             clauses.push("(c.op = ? AND c.entity_type = ?)".to_owned());
             args.push(SqlValue::Text((*t).to_owned()));
         } else {
-            // An insert is only invertible for a table on `UNDOABLE_TABLES` — otherwise
-            // `undo` errors. That list is therefore part of this predicate too, or the two
+            // An insert is only invertible for a table `undoable_tables` names — otherwise
+            // `undo` errors. That set is therefore part of this predicate too, or the two
             // halves of "invertible" disagree again.
-            let holes = vec!["?"; UNDOABLE_TABLES.len()].join(", ");
+            let holes = vec!["?"; undoable_count()].join(", ");
             clauses.push(format!("(c.op = ? AND c.entity_type IN ({holes}))"));
-            args.extend(
-                UNDOABLE_TABLES
-                    .iter()
-                    .map(|t| SqlValue::Text((*t).to_owned())),
-            );
+            args.extend(undoable_tables().map(|t| SqlValue::Text(t.to_owned())));
         }
     }
     // …and a transaction containing ANY insert into an unlisted table is skipped whole,
@@ -559,26 +566,23 @@ pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
     // transaction, and since no caller actually logs an unlisted insert it never
     // short-circuits — measured at ~6x on a database dominated by one large ingest (12.4s →
     // 71.8s). This subquery is materialized once.
-    let unlisted = vec!["?"; UNDOABLE_TABLES.len()].join(", ");
-    args.extend(
-        UNDOABLE_TABLES
-            .iter()
-            .map(|t| SqlValue::Text((*t).to_owned())),
-    );
+    let unlisted = vec!["?"; undoable_count()].join(", ");
+    args.extend(undoable_tables().map(|t| SqlValue::Text(t.to_owned())));
     args.push(SqlValue::Integer(meta.txn_id));
     let sql = format!(
         "SELECT MAX(txn_id) FROM changelog c
          WHERE ({})
            AND c.txn_id NOT IN (
                SELECT txn_id FROM changelog
-               WHERE op = 'insert' AND entity_type NOT IN ({unlisted})
+               WHERE op = '{op_insert}' AND entity_type NOT IN ({unlisted})
            )
            AND c.txn_id < ?
            AND NOT EXISTS (
                SELECT 1 FROM changelog u
                WHERE u.op = 'undo' AND u.entity_id = CAST(c.txn_id AS TEXT)
            )",
-        clauses.join(" OR ")
+        clauses.join(" OR "),
+        op_insert = crate::changelog::OP_INSERT
     );
     let target: Option<i64> = conn
         .prepare_cached(&sql)?
@@ -884,7 +888,7 @@ mod tests {
     /// A bare `jkb undo` must survive the most common transaction shape in the system.
     ///
     /// Every `jkb ingest` writes a `containment` row per chunk and every `task add --under`
-    /// writes one, but `containment` was not on `UNDOABLE_TABLES` — so `undo` aborted with
+    /// writes one, but `containment` was not on the undo allowlist — so `undo` aborted with
     /// "cannot undo unknown table", and because an aborted undo rolls back without writing an
     /// `undo` marker, the very next `jkb undo` selected the same transaction and died again,
     /// permanently.
@@ -924,6 +928,51 @@ mod tests {
             .read(|c| item::id_for_uid(c, "parent"))
             .unwrap()
             .is_none());
+    }
+
+    /// The other half of the same family, one table later: `jkb task start` writes a
+    /// `branch_records` row, logged as an `insert`.
+    ///
+    /// An insert into a table the allowlist does not name makes `undo_last` skip the whole
+    /// transaction — so a bare `jkb undo` after `task start` did not fail, it quietly reverted the
+    /// *previous* transaction and reported success, deleting the task itself. That is the failure
+    /// mode worth a test: not "undo errors" but "undo silently reverts the wrong thing".
+    ///
+    /// The membership is derived from `Entity::insert_inverse` now, so this is a regression test
+    /// for the derivation rather than for a line in a list.
+    #[test]
+    fn a_transaction_that_records_a_branch_is_the_one_undo_last_reverts() {
+        use crate::branch::{self, Cut, Supersede};
+        use crate::item;
+
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| upsert(c, m, &note("the-task")))
+            .unwrap();
+        db.write_txn("t", |c, m| {
+            branch::record_cut_point(
+                c,
+                m,
+                "jkb",
+                "task/x",
+                &Cut::Fork("a".repeat(40)),
+                None,
+                Supersede::default(),
+            )
+        })
+        .unwrap();
+
+        assert!(db.write_txn("t", undo_last).unwrap() > 0);
+        assert_eq!(
+            db.read(|c| branch::get(c, "jkb", "task/x")).unwrap(),
+            None,
+            "the branch record survived the undo that claimed to have reverted its transaction"
+        );
+        assert!(
+            db.read(|c| item::id_for_uid(c, "the-task"))
+                .unwrap()
+                .is_some(),
+            "undo reverted an older transaction instead, deleting a task nobody asked about"
+        );
     }
 
     /// Re-parenting is an upsert, so undoing it must put the previous container back — not

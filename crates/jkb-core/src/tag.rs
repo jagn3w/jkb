@@ -22,6 +22,7 @@ use serde_json::json;
 
 use jkb_types::ItemId;
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -63,7 +64,7 @@ pub fn apply(
         conn,
         meta,
         "insert",
-        "tag_applications",
+        Entity::TagApplications,
         &rowid.to_string(),
         None,
         Some(&after),
@@ -94,7 +95,7 @@ pub fn remove(
             conn,
             meta,
             "delete",
-            "tag_applications",
+            Entity::TagApplications,
             &item.get().to_string(),
             Some(&json!({ "item_id": item.get(), "facet": facet, "value": value })),
             None,
@@ -226,7 +227,7 @@ pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -
         conn,
         meta,
         "update",
-        "tag_defs",
+        Entity::TagDefs,
         old,
         Some(&json!({ "facet": old })),
         Some(&json!({ "facet": new })),

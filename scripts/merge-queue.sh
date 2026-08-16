@@ -21,6 +21,17 @@ BRANCH="${1:?usage: merge-queue.sh <branch> <base> <worktree>}"
 BASE="${2:?missing <base>}"
 WT="${3:?missing <worktree>}"
 
+# WHICH jkb, AND WHICH STORE. This script writes to the knowledge base (step 3 records the
+# landing), and a swarm run can be configured with its own binary (`cfg.jkb`) and its own database
+# (`cfg.db`). A bare `jkb` resolves neither: the landing event would be written into the user's
+# PRODUCTION store under a `(repo, branch)` key nothing there asks about, while every task in the
+# run's own database silently got none.
+#
+# Taken from the environment rather than as a fourth positional argument, so the caller sets it
+# once for the whole invocation and `jkb`'s own `$JKB_DB` fallback does the rest -- there is no
+# `--db` to thread through, and no second place for a future jkb call in this script to forget.
+: "${JKB:=jkb}"
+
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; exit 3; }
 git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; exit 3; }
 git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; exit 3; }
@@ -68,7 +79,7 @@ if ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
   # stdout is noise here; stderr is not. The verb warns when $BASE has no usable cut point, which
   # is the difference between a landing that closes its tasks and one that leaves them reading as
   # still in flight — swallowing that made the only report of it invisible.
-  jkb task landed "$BRANCH" --onto "$BASE" >/dev/null \
+  "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
     || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
   echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
   exit 0

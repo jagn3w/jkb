@@ -1,13 +1,13 @@
 //! Staging branches: what is in flight in this repo (design D38.1/D38.2).
 //!
-//! A **staging branch** is a git branch named by some task's `onto=` facet that still exists
-//! in git. There is no `kind='staging'` item and no staging table — every fact here is
+//! A **staging branch** is a git branch named as some branch's **land target** that still
+//! exists in git. There is no `kind='staging'` item and no staging table — every fact here is
 //! already authoritative somewhere else:
 //!
 //! | fact | source |
 //! | --- | --- |
-//! | which branches are staging branches | tasks' `onto=` facets |
-//! | which tasks are on one | the same facets |
+//! | which branches are staging branches | `branch_records.land_target` |
+//! | which tasks are on one | that, joined to the tasks' `branch=` facets |
 //! | whether a session exists | `session::discover` (git worktrees) |
 //! | whether it merged to trunk | `gitrepo::is_merged` (squash-safe, D34.2) |
 //! | what state a task is in | `items.status` (D27.7) |
@@ -164,7 +164,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     // and holds a row per task (design risk 2).
     //
     // A task is grouped under **every** target its branches name, not just the first. It was one
-    // `onto=` facet per task, so a task carrying two branches had one answer and the second
+    // one land target per task, so a task carrying two branches had one answer and the second
     // branch's batch simply did not know about it.
     let records = crate::repo::branch_records(db, &ctx.key)?;
     let mut by_onto: BTreeMap<String, Vec<&RepoTask>> = BTreeMap::new();
@@ -276,7 +276,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 /// Per-`collect` memo for the two answers that are **per branch and per review**, not per
 /// task, and were being recomputed identically for every row.
 ///
-/// `/task-swarm` tags every task of a group with the same `branch=`/`onto=` pair, and
+/// `/task-swarm` puts every task of a group on the same branch, with one land target, and
 /// `merge-queue.sh` never deletes a group branch, so a run that worked 40 tasks left ~10
 /// distinct pairs behind 40 rows: 40 `git rev-list --count` spawns and 40 byte-identical
 /// findings queries — each a subtree scan serialized on the writer thread — on a view the
@@ -528,7 +528,7 @@ pub(crate) struct LandFacts<'a> {
 /// said "Landable" for a task the command refused outright.
 ///
 /// Only the checks a *row* can be missing are here. `land_preflight` keeps three of its own
-/// (no branch recorded, no `onto=`, a land target that no longer exists), because a task in
+/// (no branch recorded, no land target, one that no longer exists), because a task in
 /// that state is not on a staging branch at all and so has no row to disagree with.
 pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
     match facts.state {
@@ -552,7 +552,7 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
         // A task whose branch exists but has no `.jkb/work` checkout never had a session:
         // that is what a `/task-swarm` task looks like, and this view shows those on purpose.
         // Telling its owner to run `jkb task work` was worse than unhelpful — following the
-        // advice cuts a second branch and overwrites the group's `branch=`/`onto=` facets,
+        // advice cuts a second branch and overwrites the group's recorded branch and target,
         // detaching the task from the batch the merge queue is about to land.
         return Some(if facts.branch_exists {
             "It has no session checkout — it is being built elsewhere (a swarm group lands \

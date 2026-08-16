@@ -22,6 +22,7 @@ use serde_json::json;
 
 use jkb_types::ItemId;
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -72,7 +73,7 @@ pub fn contain(
         conn,
         meta,
         if before.is_some() { "update" } else { "insert" },
-        "containment",
+        Entity::Containment,
         &child.get().to_string(),
         before_json.as_ref(),
         Some(&json!({

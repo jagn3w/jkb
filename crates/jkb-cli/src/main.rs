@@ -120,8 +120,8 @@ enum Command {
     /// Staging branches: what is in flight, and where it will land.
     ///
     /// A staging branch is the branch a batch of tasks lands on before it reaches trunk —
-    /// the same thing `/task-swarm` calls its integration branch. It is derived from tasks'
-    /// `onto=` facets plus git, never stored (design D38.1).
+    /// the same thing `/task-swarm` calls its integration branch. It is derived from the land
+    /// targets recorded for branches, plus git; the branch itself is never stored (D38.1).
     Staging {
         #[command(subcommand)]
         cmd: StagingCmd,
@@ -794,10 +794,10 @@ enum TaskCmd {
         /// The branch (default: the current branch here).
         #[arg(long)]
         branch: Option<String>,
-        /// The branch this one was cut from and will land on. Recorded as `onto=`, and it is
-        /// what the cut point is measured against — without it only the branch's own tip can
-        /// be measured, which reads as "nothing has happened here" on a branch that already
-        /// has commits.
+        /// The branch this one was cut from and will land on. Recorded as `--branch`'s land
+        /// target, and it is what the cut point is measured against — without it only the
+        /// branch's own tip can be measured, which reads as "nothing has happened here" on a
+        /// branch that already has commits.
         #[arg(long)]
         onto: Option<String>,
         /// The repo key (default: the basename of this git repo's root).
@@ -3114,9 +3114,9 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               claim it and record the branch, the repo, where B lands, and —
                               from --onto — where B forked. Prefer it to tagging branch=.
   jkb task base --forget <branch>
-                              drop a branch's cut point so the next `task start` measures a
-                              fresh one. No verb takes a sha — the nearest one to hand is the
-                              branch tip, which freezes the task.
+                              drop a branch's cut point; it prints what can be recorded next,
+                              which depends on the branch. No verb takes a sha — the nearest
+                              one to hand is the branch tip, which freezes the task.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -4755,13 +4755,20 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
         cut.as_deref(),
         gitrepo::Prefer::Local,
     )?;
-    anyhow::ensure!(
-        state == gitrepo::MergeState::Merged,
-        "{branch}'s work is not in {onto} ({state:?}), so nothing was recorded — this verb \
-         reports a landing the merge queue has already performed, and a record that a landing \
-         happened is acted on without re-checking. If {branch} has no cut point recorded, \
-         `jkb task start <uid> --branch {branch} --onto {onto}` measures one."
-    );
+    // The remedy comes from `base::advice`, which asks git about the branch — it is never written
+    // out here, and this is the surface that taught the rule. A refusal at *this* moment is
+    // usually a branch that has just been fast-forwarded into `onto`, i.e. one with no commits of
+    // its own left: naming a measuring verb there records its tip, which freezes the task at
+    // `NothingToMerge` permanently. See `base::MEASURE_VERB`.
+    if state != gitrepo::MergeState::Merged {
+        let advice = base::advice(&ctx.root, branch)?;
+        anyhow::bail!(
+            "{branch}'s work is not in {onto} ({state:?}), so nothing was recorded — this verb \
+             reports a landing the merge queue has already performed, and a record that a landing \
+             happened is acted on without re-checking. If {branch} has no cut point recorded, {}.",
+            advice.sentence("<uid>", branch)
+        );
+    }
     let (key, b, o, h) = (
         ctx.key.clone(),
         branch.to_owned(),
@@ -4797,11 +4804,14 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
         println!("recorded: {branch} landed on {onto} (from {head})");
     }
     if !creditable {
+        // Same rule as the refusal above, applied to the *target*: the graft has just moved
+        // `onto`'s tip onto commits the source branch still holds, so `onto` has no commits of its
+        // own either and `advice` will say so rather than naming a verb that would record its tip.
+        let advice = base::advice(&ctx.root, onto)?;
         eprintln!(
             "note: {onto} has no usable cut point recorded, so this landing cannot decide \
-             whether its tasks are done — they will report as still in flight. Record it where it \
-             can be measured, when the batch is cut: `jkb task work <uid> --onto {onto}` or \
-             `jkb task start <uid> --branch <branch> --onto {onto}`."
+             whether its tasks are done — they will report as still in flight. {}.",
+            advice.sentence("<uid>", onto)
         );
     }
     Ok(())
@@ -4832,8 +4842,13 @@ fn cmd_task_base_forget(db: &Db, branch: &str, json: bool) -> Result<()> {
         );
     } else if dropped {
         println!("forgot {branch}'s cut point in {}", ctx.key);
+        // What happens next depends on the branch, not on this command: forgetting a cut point on
+        // a branch whose work has already been fast-forwarded away leaves nothing measurable, and
+        // saying "the next `task start` measures it again" there is how the task acquires a cut
+        // point equal to its tip.
         println!(
-            "  next: `jkb task start <uid> --branch {branch} --onto <parent>` measures it again"
+            "  next: {}",
+            base::advice(&ctx.root, branch)?.sentence("<uid>", branch)
         );
     } else {
         println!("{branch} had no recorded cut point in {}", ctx.key);
@@ -6468,11 +6483,17 @@ fn cmd_task_close_merged(
                 } else if no_cut_point.is_empty() && unusable_cut_point.is_empty() {
                     pending.push((uid, branch));
                 } else {
+                    // The remedy is asked of git here, where the branch names are still separate,
+                    // and carried into the report — `report_close_merged` cannot know whether
+                    // measuring is safe for these branches, and a branch that reaches this bucket
+                    // *after* its work landed is exactly the one where it is not (`base::advice`).
                     if !no_cut_point.is_empty() {
-                        undecidable.push((uid.clone(), no_cut_point.join(", ")));
+                        let remedy = base::advice_for_any(&cwd, &uid, &no_cut_point)?;
+                        undecidable.push((uid.clone(), no_cut_point.join(", "), remedy));
                     }
                     if !unusable_cut_point.is_empty() {
-                        unresolvable.push((uid, unusable_cut_point.join(", ")));
+                        let remedy = base::advice_for_any(&cwd, &uid, &unusable_cut_point)?;
+                        unresolvable.push((uid, unusable_cut_point.join(", "), remedy));
                     }
                 }
             }
@@ -6536,11 +6557,17 @@ struct CloseMergedReport<'a> {
     /// The second field names only the branches actually in this state, not every branch the task
     /// records — a task whose branches differ in fault appears in both buckets, under the right
     /// half of itself each time.
-    undecidable: &'a [(String, String)],
+    ///
+    /// `(uid, branches, remedy)`; see the note on `unresolvable` for why the remedy arrives
+    /// pre-computed.
+    undecidable: &'a [(String, String, String)],
     /// A cut point *is* recorded and this repository cannot resolve it. Split from `undecidable`
-    /// because this half has to be *dropped* before it can be re-measured, while the other half
-    /// only needs measuring. Per branch, for the same reason.
-    unresolvable: &'a [(String, String)],
+    /// because this half has to be *dropped* before anything else can help it, while the other
+    /// half has nothing to drop. Per branch, for the same reason.
+    ///
+    /// `(uid, branches, remedy)`. The remedy is computed where the branches are known and git can
+    /// be asked, never here: see `base::MEASURE_VERB`.
+    unresolvable: &'a [(String, String, String)],
 }
 
 /// Print what a `close-merged` run decided.
@@ -6548,6 +6575,13 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     let rows = |v: &[(String, String)]| {
         v.iter()
             .map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
+            .collect::<Vec<_>>()
+    };
+    // The buckets that carry a remedy put it on the JSON too — a consumer that cannot see why a
+    // task is stuck is in the state the human note exists to prevent.
+    let held_rows = |v: &[(String, String, String)]| {
+        v.iter()
+            .map(|(u, b, why)| serde_json::json!({"uid": u, "branch": b, "remedy": why}))
             .collect::<Vec<_>>()
     };
     if json {
@@ -6560,8 +6594,8 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
                 "closed": rows(r.closed),
                 "blocked": rows(r.blocked),
                 "pending": rows(r.pending),
-                "undecidable": rows(r.undecidable),
-                "unresolvable": rows(r.unresolvable),
+                "undecidable": held_rows(r.undecidable),
+                "unresolvable": held_rows(r.unresolvable),
             }))?
         );
         return Ok(());
@@ -6578,17 +6612,16 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     // one any more — the sha nearest to hand is the branch tip, and a cut point equal to the tip
     // reads as "nothing has happened here" forever, which is how a task became permanently
     // unlandable with no repair path.
-    for (uid, branch) in r.undecidable {
+    for (uid, branch, remedy) in r.undecidable {
         println!(
             "unknown {uid} ({branch}) — no cut point recorded, so whether it landed cannot be \
-             decided: `jkb task start {uid} --branch <branch> --onto <parent>` measures one"
+             decided: {remedy}"
         );
     }
-    for (uid, branch) in r.unresolvable {
+    for (uid, branch, remedy) in r.unresolvable {
         println!(
             "unknown {uid} ({branch}) — its recorded cut point does not resolve in this repo, so \
-             whether it landed cannot be decided: drop it with `{}` and let \
-             `jkb task start {uid} --branch <branch> --onto <parent>` measure a new one",
+             whether it landed cannot be decided: drop it with `{}`; {remedy}",
             base::FORGET_VERB
         );
     }
@@ -7008,12 +7041,27 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
             );
         } else {
             println!(
-                "reflog retention: {} entry(ies) for branches no longer recorded in {}",
+                "reflog retention: {} entry(ies) for branches no longer recorded in {}{}",
                 stale.len(),
-                ctx.key
+                ctx.key,
+                if fix { ", removing" } else { "" }
             );
             for b in stale {
-                println!("  {b} — `git config --unset-all \"gc.refs/heads/{b}.reflogExpire\"`");
+                if fix {
+                    // The same verb `base::forget` uses, so a repair here and a repair there
+                    // cannot come to mean different things.
+                    gitrepo::release_reflog(&ctx.root, b)?;
+                    println!("  {b} — removed");
+                } else {
+                    // BOTH keys, derived from the pair that wrote them. Retention writes
+                    // `reflogExpire` *and* `reflogExpireUnreachable`, while `retained_reflogs`
+                    // only matches the first — so a remedy naming one key left the other behind
+                    // and the next run reported "all recorded" over the top of it.
+                    let keys = gitrepo::reflog_retention_keys(b)
+                        .map(|k| format!("git config --unset-all \"{k}\""))
+                        .join(" && ");
+                    println!("  {b} — `{keys}` (or `jkb doctor --fix`)");
+                }
             }
         }
     }
@@ -7223,7 +7271,9 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
                     "uid": r.uid, "moved_to_review": r.moved_to_review,
                 })).collect::<Vec<_>>(),
                 "skipped_unlanded": skipped_unlanded,
-                "skipped_no_base": skipped_no_base,
+                "skipped_no_base": skipped_no_base.iter().map(|(uid, why)| serde_json::json!({
+                    "uid": uid, "remedy": why,
+                })).collect::<Vec<_>>(),
                 "unusable": unusable,
             })
         );
@@ -7267,18 +7317,17 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
     // Said out loud, because a task landing on this branch whose work is not in it yet has
     // NOT been reviewed, and silence would read as "everything was tagged".
     if !skipped_no_base.is_empty() {
-        // MEASURE, never a hand-typed sha. This is the third surface to have named
-        // `jkb task base` with a sha for a task that has *no* cut point, and the sha
-        // nearest a user's hand is `git rev-parse <branch>` — the tip, which freezes the task at
-        // `NothingToMerge` for good. `/review-log` prints this on every run, so it is the most
-        // frequently read of the three.
+        // Never a hand-typed sha, and never a measuring verb this surface chose: the remedy is
+        // per task, asked of git by `review::record`, because a branch that reaches this bucket
+        // *after* its work landed cannot be measured at all and telling anyone to try records its
+        // tip — which freezes the task at `NothingToMerge` for good. `/review-log` prints this on
+        // every run, so it is the most frequently read of the family.
         println!(
             "not tagged — no cut point recorded for their work branch, so whether this review \
-             saw them cannot be decided. Measure one with \
-             `jkb task start <uid> --branch <branch> --onto <parent>`:"
+             saw them cannot be decided:"
         );
-        for uid in &skipped_no_base {
-            println!("  {uid}");
+        for (uid, remedy) in &skipped_no_base {
+            println!("  {uid} — {remedy}");
         }
     }
     if !skipped_unlanded.is_empty() {

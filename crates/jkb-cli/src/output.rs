@@ -218,7 +218,7 @@ pub fn print_item_full(db: &Db, id: ItemId, as_json: bool, extra: &Extra) -> Res
             )?
             .query_row([id], |r| r.get::<_, String>(0))
             .ok();
-        // Tags carry where the work is happening (`branch=`/`onto=`) and whether it has been
+        // Tags carry where the work is happening (`branch=`/`repo=`) and whether it has been
         // reviewed (`reviewed=`/`review=`) — the state D38 introduced. Showing a task without
         // them means the only way to see why it will or will not land is another command.
         let tags = tag::applications(conn, ItemId::new(id))?;

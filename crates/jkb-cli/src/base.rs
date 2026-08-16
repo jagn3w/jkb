@@ -71,6 +71,150 @@ use crate::gitrepo;
 /// passes were the same shape, each fixed by rewording a message; there are only so many messages.
 pub(crate) const FORGET_VERB: &str = "jkb task base --forget <branch>";
 
+/// The verb that *measures* a cut point, spelled **once** and **private to this module**.
+///
+/// Nothing outside `base` may name it. That is not tidiness: a remedy naming this verb is only
+/// safe when whoever prints it knows the branch's state, and three surfaces in a row printed it at
+/// a moment when running it was actively harmful. The general rule, which this constant's privacy
+/// is the enforcement of:
+///
+/// > **No message may name a measuring verb at a moment when measuring is harmful.**
+///
+/// Measuring is harmful exactly when the branch has **no commits of its own right now**, because
+/// then the only value that can be measured is its tip — and `cut_point == tip` reads as "nothing
+/// has happened on this branch" for ever: never creditable, never landable, and never corrected,
+/// since `ensure_recorded` does not overwrite. A branch that has just been fast-forwarded into its
+/// target is in exactly that state, which is why `jkb task landed`'s refusal — printed at the one
+/// moment the work is provably gone from the branch — was the third instance of the family.
+///
+/// So the sentence is not something a surface writes. It is something a surface *asks for*, from
+/// [`advice`], which puts the question to git. The one exception is [`Missing::remedy`], and it is
+/// an exception by construction rather than by permission: the variants that name the verb are
+/// only ever produced past `measure`'s untouched check, i.e. only for a branch that provably has
+/// commits of its own.
+const MEASURE_VERB: &str = "jkb task start <uid> --branch <branch> --onto <parent>";
+
+/// [`MEASURE_VERB`] with the task and branch filled in, where the caller knows them — a
+/// substitution rather than a second `format!`, so the verb really is spelled once.
+fn measure_verb(uid: &str, branch: &str) -> String {
+    MEASURE_VERB
+        .replace("<uid>", uid)
+        .replace("<branch>", branch)
+}
+
+/// What to tell a reader whose branch has **no usable cut point** — decided by asking git about the
+/// branch, never written out by the surface that prints it.
+///
+/// See [`MEASURE_VERB`] for why this exists at all. The variants are the states that change the
+/// answer, and only one of them may name a measuring verb.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Advice {
+    /// The branch has commits of its own, so its fork point is a real, measurable commit. This is
+    /// the only state in which telling someone to measure is safe.
+    Measure,
+    /// The branch has no commits of its own *now*. Either it was never started, or its work was
+    /// fast-forwarded away into a batch or trunk — git cannot tell those apart (D34.4), and in the
+    /// second case anything measured here is the tip.
+    TooLate,
+    /// The branch does not exist in this repository.
+    Gone,
+    /// Git could not walk the repository's refs, so nothing about the branch can be established.
+    CannotAsk,
+}
+
+impl Advice {
+    /// The sentence to print, with no leading capital and no trailing stop, so it composes into a
+    /// caller's own message the way [`Missing::remedy`] does.
+    ///
+    /// `uid` may be a placeholder (`<uid>`) where the surface is branch-keyed rather than
+    /// task-keyed — `jkb task landed` knows a branch and no task.
+    pub(crate) fn sentence(self, uid: &str, branch: &str) -> String {
+        match self {
+            Self::Measure => format!("measure one with `{}`", measure_verb(uid, branch)),
+            // Deliberately names **no** runnable command for this branch. Everything a reader
+            // could copy from here would record the tip.
+            Self::TooLate => format!(
+                "nothing here can measure it: {branch} has no commits of its own any more, so the \
+                 only value obtainable now is its tip — which reads as \"nothing has happened on \
+                 this branch\" for ever. A cut point has to be recorded while the branch is being \
+                 cut, before its work lands. If this work did land, close the task directly \
+                 (`jkb task set <uid> --status done`)"
+            ),
+            Self::Gone => format!(
+                "{branch} does not exist in this repository, so nothing here can measure it — \
+                 remove the stale record (`jkb task tag rm <uid> branch={branch}`), or close the \
+                 task directly if its work landed"
+            ),
+            Self::CannotAsk => format!(
+                "git could not walk this repository's refs, so whether {branch} has any commits of \
+                 its own is unknown — repair the repository (`git fsck` names a broken ref) and \
+                 run it again"
+            ),
+        }
+    }
+}
+
+impl Advice {
+    /// How much this state argues for *not* acting, so a message about several branches can be
+    /// governed by the most restrictive of them.
+    ///
+    /// A bucket naming two branches must not advise measuring merely because one of them could
+    /// be: the reader runs the command once, against whichever name is at hand.
+    fn caution(self) -> u8 {
+        match self {
+            Self::Measure => 0,
+            Self::CannotAsk => 1,
+            Self::Gone => 2,
+            Self::TooLate => 3,
+        }
+    }
+}
+
+/// The sentence for a bucket that names several branches — the most cautious of their answers,
+/// spoken about the branch that produced it.
+///
+/// # Errors
+/// Returns an error if git cannot be run at all.
+pub(crate) fn advice_for_any(
+    repo_root: &std::path::Path,
+    uid: &str,
+    branches: &[String],
+) -> jkb_core::Result<String> {
+    let mut worst: Option<(Advice, &String)> = None;
+    for b in branches {
+        let a = advice(repo_root, b)?;
+        if worst.is_none_or(|(held, _)| a.caution() > held.caution()) {
+            worst = Some((a, b));
+        }
+    }
+    Ok(match worst {
+        Some((a, b)) => a.sentence(uid, b),
+        // No branch to ask about: the caller has nothing to advise, and inventing a verb here is
+        // precisely what this module refuses to do.
+        None => "no branch is recorded for it, so there is nothing to look at".to_owned(),
+    })
+}
+
+/// Ask git what a reader should do about `branch`'s missing cut point.
+///
+/// The seam behind [`MEASURE_VERB`]'s rule. Every surface that refuses, holds or reports for want
+/// of a cut point routes through here, so none of them has to know — or remember — that measuring
+/// is only safe on a branch that has commits of its own.
+///
+/// # Errors
+/// Returns an error if git cannot be run at all.
+pub(crate) fn advice(repo_root: &std::path::Path, branch: &str) -> jkb_core::Result<Advice> {
+    use crate::gitrepo::{branch_ref, Prefer};
+    if git(branch_ref(repo_root, branch, Prefer::Local))?.is_none() {
+        return Ok(Advice::Gone);
+    }
+    Ok(match untouched_tip(repo_root, branch)? {
+        Untouched::No => Advice::Measure,
+        Untouched::At(_) => Advice::TooLate,
+        Untouched::Unknown => Advice::CannotAsk,
+    })
+}
+
 /// Whether `value` is a full object id — the only form a cut point may be **stored** in.
 ///
 /// A cut point has to mean the same commit in every clone, and only a full object id does.
@@ -144,6 +288,12 @@ impl Missing {
     /// What the reader should do about it. Never "pass a sha by hand": the sha nearest to hand is
     /// the branch tip, and a cut point equal to the tip reads as "nothing has happened here"
     /// forever, which is how a task becomes permanently unlandable.
+    ///
+    /// This is the one place outside [`advice`] that names [`MEASURE_VERB`], and it is safe **by
+    /// construction**, not by permission: the four variants below that name it are produced only
+    /// past `measure`'s untouched check, i.e. only for a branch that provably has commits of its
+    /// own — which is exactly [`Advice::Measure`]'s condition. A new variant reachable on an
+    /// untouched branch must not join that arm; call [`advice`] instead.
     pub(crate) fn remedy(&self, uid: &str, branch: &str, _repo: &str) -> String {
         match self {
             Self::NotThisRepo(wanted) => {
@@ -163,8 +313,8 @@ impl Missing {
             | Self::ParentNotFound
             | Self::NoCommonHistory
             | Self::NotTheForkPoint => format!(
-                "name the branch {branch} was cut from: \
-                 `jkb task start {uid} --branch {branch} --onto <parent>`"
+                "name the branch {branch} was cut from: `{}`",
+                measure_verb(uid, branch)
             ),
         }
     }
@@ -550,4 +700,105 @@ fn tip_of_git(repo_root: &std::path::Path, branch: &str) -> anyhow::Result<Optio
 /// crosses that boundary in six places and each spelling was a chance to lose the message.
 fn git<T>(result: anyhow::Result<T>) -> jkb_core::Result<T> {
     result.map_err(|e| jkb_types::Error::Validation(e.to_string()).into())
+}
+
+#[cfg(test)]
+mod tests {
+    /// **Only `base.rs` may tell a reader to measure a cut point.**
+    ///
+    /// The rule this enforces is stated at [`super::MEASURE_VERB`]: a remedy naming a measuring
+    /// verb is only safe when whoever prints it knows the branch's state, and three surfaces in a
+    /// row printed one at a moment when running it was harmful. The constant is private to this
+    /// module so no other file can *format* the verb, and [`super::advice`] is how a surface gets
+    /// the sentence instead — but privacy cannot stop someone typing the words out, so this reads
+    /// the crate's own sources back.
+    ///
+    /// The predicate is narrow on purpose, and it reads **string literals**, not lines. `--onto`
+    /// appears legitimately in the agent guide and in clap's help, which *list* a command's syntax
+    /// rather than prescribing it, and `measure_root_for` is an ordinary identifier; what no
+    /// legitimate site does is put `--onto` and a measuring word in one **message**.
+    ///
+    /// What it cannot catch is a remedy that names the verb without either word. That is a real
+    /// limit, and the reason it is worth having anyway is that every one of the four historical
+    /// instances said "measure".
+    #[test]
+    fn only_this_module_tells_a_reader_to_measure_a_cut_point() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        // Read the directory rather than listing the files: a list would be one more thing to
+        // remember, which is the shape of defect this whole test exists to close.
+        for entry in std::fs::read_dir(&dir).expect("crate sources") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            if path.file_name().is_some_and(|f| f == "base.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source file");
+            let code: String = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for literal in string_literals(&code) {
+                let names_verb = literal.contains("--onto");
+                let tells_you_to_measure = literal.contains("measur") || literal.contains("Measur");
+                if names_verb && tells_you_to_measure {
+                    offenders.push(format!(
+                        "{}: {literal}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a surface outside `base.rs` names a measuring verb in a message. It cannot know \
+             whether measuring is safe for that branch — call `base::advice(root, branch)` and \
+             print its sentence. Offenders:\n{}",
+            offenders.join("\n---\n")
+        );
+    }
+
+    /// Every double-quoted literal in `code`, escapes skipped. Crude by design — it exists to feed
+    /// the scan above, not to parse Rust — and it errs towards *including* text, which can only
+    /// make the guard stricter.
+    fn string_literals(code: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = code.chars();
+        while let Some(c) = chars.next() {
+            if c != '"' {
+                continue;
+            }
+            let mut lit = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        // The escaped character is consumed, so `\"` cannot end the literal and a
+                        // line continuation (`\` + newline) folds a wrapped message into one.
+                        if let Some(next) = chars.next() {
+                            lit.push(next);
+                        }
+                    }
+                    '"' => break,
+                    _ => lit.push(c),
+                }
+            }
+            out.push(lit);
+        }
+        out
+    }
+
+    #[test]
+    fn the_literal_scanner_folds_a_wrapped_message_and_ignores_identifiers() {
+        let code = "let x = measure_root_for(a);\nbail!(\"say \\\n --onto and measure\");";
+        let lits = string_literals(code);
+        assert_eq!(lits.len(), 1, "identifiers were read as literals: {lits:?}");
+        assert!(
+            lits[0].contains("--onto") && lits[0].contains("measure"),
+            "a message wrapped across source lines was split in two: {lits:?}"
+        );
+    }
 }

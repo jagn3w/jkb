@@ -14,6 +14,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -95,7 +96,7 @@ pub fn record_capture(conn: &Connection, meta: &WriteMeta, key: Key<'_>) -> Resu
         } else {
             "insert"
         },
-        "ingestions",
+        Entity::Ingestions,
         &rowid.to_string(),
         existing.map(|status| json!({ "status": status })).as_ref(),
         Some(&json!({

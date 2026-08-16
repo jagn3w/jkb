@@ -27,6 +27,7 @@ use serde_json::json;
 
 use jkb_types::{Error as TypeError, ItemId};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -119,7 +120,7 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
         conn,
         meta,
         "claim",
-        "items",
+        Entity::Items,
         &item.get().to_string(),
         Some(&json!({
             "status": before.status,
@@ -192,7 +193,7 @@ pub fn clear(conn: &Connection, meta: &WriteMeta, item: ItemId) -> Result<bool> 
             conn,
             meta,
             "release",
-            "items",
+            Entity::Items,
             &item.get().to_string(),
             Some(&json!({
                 "claimant_id": before.claimant_id,
@@ -232,7 +233,7 @@ pub fn release(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -
             conn,
             meta,
             "release",
-            "items",
+            Entity::Items,
             &item.get().to_string(),
             Some(&json!({
                 "claimant_id": before.claimant_id,
@@ -319,7 +320,7 @@ pub fn reclaim_dead(
             conn,
             meta,
             "reclaim",
-            "items",
+            Entity::Items,
             &c.id.get().to_string(),
             Some(&json!({ "claimant_id": c.owner, "claimed_at": c.claimed_at })),
             Some(&json!({ "claimant_id": null, "claimed_at": null })),

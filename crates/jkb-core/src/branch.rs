@@ -13,17 +13,22 @@
 //!
 //! ## The one write, and why it has that shape
 //!
-//! [`record_cut_point`] is a single `INSERT … ON CONFLICT DO UPDATE` whose one update arm is the
-//! staleness discard. It is not `forget` followed by an insert — not a sequence at all — because
-//! every previous fix in this area was a rule a caller had to remember in the right order, and
-//! this one cannot be dropped by omission or mis-sequenced: there is nothing to sequence, and
-//! dropping it means writing different SQL than the design specifies.
+//! [`record_cut_point`] is a single `INSERT … ON CONFLICT DO UPDATE` carrying the staleness
+//! discard. It is not `forget` followed by an insert — not a sequence at all — because every
+//! previous fix in this area was a rule a caller had to remember in the right order, and this one
+//! cannot be dropped by omission or mis-sequenced: there is nothing to sequence, and dropping it
+//! means writing different SQL than the design specifies.
+//!
+//! Its update path has **two** arms — fill a `NULL`, or supersede another instance's record — and
+//! only the second may destroy anything. [`SUPERSEDED`] is that condition, spelled once and used
+//! by both the `WHERE` and the `SET`.
 
 use std::collections::BTreeMap;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -146,6 +151,24 @@ impl Supersede {
     }
 }
 
+/// "This write is replacing another instance's record" — spelled **once**, and used in both the
+/// `WHERE` clause and the `SET` list of [`record_cut_point`]'s single statement.
+///
+/// `?6` is [`Supersede::fires`], `?7` is [`Supersede::anchor_mismatch`]. Two proofs, and they are
+/// not equally strong:
+///
+///  * The untouched signature is only evidence *when the values disagree* — an untouched branch
+///    forked at its own tip, so a stored value that is anything else belongs to whatever held the
+///    name before. Where they agree there is nothing to prove and nothing to replace.
+///  * A verified anchor mismatch is positive proof on its own, whatever was measured. Gating it on
+///    the values differing froze a branch recycled at the same commit: `stale_instance` refused it
+///    on every read and no writer could ever repair it.
+///
+/// Contains no user data — only bound parameters and column names — so interpolating it is not a
+/// SQL-injection seam. It is a `const` rather than two hand-copied predicates because the copies
+/// disagreeing is exactly the defect: one cleared a landing the other had no intention of touching.
+const SUPERSEDED: &str = "((?6 AND branch_records.cut_point <> excluded.cut_point) OR ?7)";
+
 /// Read one branch's record.
 ///
 /// # Errors
@@ -207,11 +230,29 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchRecord> {
 
 /// Record `branch`'s cut point — the **one** writer, and the one place the staleness rule lives.
 ///
-/// One statement. Its only `DO UPDATE` arm fires when the stored value is `NULL` (a gap to fill)
-/// or when `supersede` proves the stored value describes a different instance of the name — and
-/// in that case it clears the predecessor's landing event in the same statement, because a row
-/// that provably describes a branch that no longer exists must not hand its namesake a landing it
-/// never had.
+/// One statement, with **two** distinguishable arms, and the distinction is load-bearing:
+///
+///  * **Fill.** The stored cut point is `NULL`, so this write only adds what was missing. It
+///    touches nothing else — in particular it leaves any landing event alone. A landing is a fact
+///    jkb established by performing the merge and cannot re-derive afterwards (squash and rebase
+///    both destroy the ref inference, which is why the event exists at all), so a write that adds a
+///    fact must not silently destroy one. This arm is reached by the ordinary repair sequence:
+///    `jkb task base --forget` deliberately keeps the landing, and the next `task start`/`task
+///    work` fills the gap it left.
+///  * **Supersede.** [`Supersede`] proves the stored row describes a *different instance* of the
+///    branch name, so the row is replaced — and the predecessor's landing is cleared in the same
+///    statement, because a row that provably belongs to a branch that no longer exists must not
+///    hand its namesake a landing it never had.
+///
+/// The two are spelled once, as [`SUPERSEDED`], and used in both the `WHERE` and the `SET`: the
+/// defect this had was a `SET` list that cleared the landing on *both* arms while the doc claimed
+/// it happened "in that case" only.
+///
+/// A **verified anchor mismatch supersedes on its own**, whatever value this run measured. It is
+/// positive proof of recycling, and requiring the measurement to differ as well meant a branch
+/// recycled at the same commit — trunk had not moved — kept its predecessor's anchor for good, so
+/// every reader's [`crate::branch`] staleness check refused it and its land gate could never be
+/// satisfied.
 ///
 /// What it can write is bounded by its inputs, not by discipline: with `supersede` all-false the
 /// statement can only fill a `NULL`, and the untouched arm can write nothing but the value that
@@ -241,22 +282,32 @@ pub fn record_cut_point(
         Some(a) => (Some(a.sha.as_str()), Some(a.ts)),
         None => (None, None),
     };
+    let sql = format!(
+        "INSERT INTO branch_records
+             (repo, branch, cut_point, anchor_sha, anchor_ts, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT (repo, branch) DO UPDATE SET
+             cut_point = excluded.cut_point,
+             anchor_sha = excluded.anchor_sha,
+             anchor_ts = excluded.anchor_ts,
+             landed_at = CASE WHEN {SUPERSEDED} THEN NULL ELSE branch_records.landed_at END,
+             landed_onto = CASE WHEN {SUPERSEDED} THEN NULL ELSE branch_records.landed_onto END,
+             landed_head = CASE WHEN {SUPERSEDED} THEN NULL ELSE branch_records.landed_head END
+         WHERE branch_records.cut_point IS NULL OR {SUPERSEDED}
+         RETURNING id"
+    );
     let written: Option<i64> = conn
-        .prepare_cached(
-            "INSERT INTO branch_records
-                 (repo, branch, cut_point, anchor_sha, anchor_ts, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT (repo, branch) DO UPDATE SET
-                 cut_point = excluded.cut_point,
-                 anchor_sha = excluded.anchor_sha,
-                 anchor_ts = excluded.anchor_ts,
-                 landed_at = NULL, landed_onto = NULL, landed_head = NULL
-             WHERE branch_records.cut_point IS NULL
-                OR (?6 AND branch_records.cut_point <> excluded.cut_point)
-             RETURNING id",
-        )?
+        .prepare_cached(&sql)?
         .query_row(
-            params![repo, branch, sha, anchor_sha, anchor_ts, supersede.fires()],
+            params![
+                repo,
+                branch,
+                sha,
+                anchor_sha,
+                anchor_ts,
+                supersede.fires(),
+                supersede.anchor_mismatch
+            ],
             |row| row.get(0),
         )
         .optional()?;
@@ -269,8 +320,12 @@ pub fn record_cut_point(
         // `insert` only when there was no row, so `undo`'s `DELETE … WHERE rowid = ?` inverts
         // exactly what happened. Superseding an existing row is an update and is deliberately not
         // invertible by `undo` — the same treatment claims get.
-        if before.is_some() { "update" } else { "insert" },
-        "branch_records",
+        if before.is_some() {
+            "update"
+        } else {
+            changelog::OP_INSERT
+        },
+        Entity::BranchRecords,
         &id.to_string(),
         before.as_ref().map(record_json).as_ref(),
         Some(&json!({
@@ -309,7 +364,7 @@ pub fn set_land_target(
         conn,
         meta,
         if before.is_some() { "update" } else { "insert" },
-        "branch_records",
+        Entity::BranchRecords,
         &id.to_string(),
         before.as_ref().map(record_json).as_ref(),
         Some(&json!({ "repo": repo, "branch": branch, "land_target": target })),
@@ -352,7 +407,7 @@ pub fn record_landing(
         conn,
         meta,
         if before.is_some() { "update" } else { "insert" },
-        "branch_records",
+        Entity::BranchRecords,
         &id.to_string(),
         before.as_ref().map(record_json).as_ref(),
         Some(&json!({
@@ -399,7 +454,7 @@ pub fn forget_cut_point(
         conn,
         meta,
         "update",
-        "branch_records",
+        Entity::BranchRecords,
         &id.to_string(),
         Some(&record_json(&before)),
         Some(&json!({ "repo": repo, "branch": branch, "cut_point": null })),
@@ -432,7 +487,7 @@ pub fn forget(conn: &Connection, meta: &WriteMeta, repo: &str, branch: &str) -> 
         conn,
         meta,
         "delete",
-        "branch_records",
+        Entity::BranchRecords,
         &format!("{repo}:{branch}"),
         Some(&record_json(&before)),
         None,
@@ -597,8 +652,11 @@ mod tests {
     }
 
     /// A verified anchor mismatch is positive proof of recycling and supersedes on its own —
-    /// unlike the untouched signature it works when the namesake already carries commits, which
-    /// repairs the record before anything reads it.
+    /// unlike the untouched signature it works when the namesake already carries commits.
+    ///
+    /// The repair is not automatic: a *reader* that sees a mismatch holds (`base::stale_instance`),
+    /// and the row is only rewritten when a writer next runs on that branch — the next
+    /// `jkb task start` / `jkb task work`, or `jkb task base --forget <branch>` by hand.
     #[test]
     fn a_verified_anchor_mismatch_supersedes_on_its_own() {
         let db = Db::open_in_memory().unwrap();
@@ -666,6 +724,93 @@ mod tests {
         assert_eq!(
             r.landed, None,
             "the recreated branch inherited its predecessor's landing event"
+        );
+    }
+
+    /// **The `SET` list.** Filling a cut point that was never recorded must not destroy a landing
+    /// event, because a landing cannot be re-derived — squash and rebase both defeat the ref
+    /// inference, which is the entire reason the event is stored.
+    ///
+    /// This is the documented repair sequence: `jkb task base --forget` deliberately keeps the
+    /// landing ("where it lands, and whether jkb landed it, are separate facts"), and the next
+    /// `task start` / `task work` fills the gap it left. That second step used to take the same
+    /// `landed_* = NULL` assignment as the supersede arm, so following the advice in the message
+    /// destroyed the event and held the task for good.
+    #[test]
+    fn filling_a_missing_cut_point_keeps_a_landing_it_did_not_supersede() {
+        let db = Db::open_in_memory().unwrap();
+        // A landing recorded before any cut point — the row `record_landing` creates on its own,
+        // and also the state `forget_cut_point` leaves behind.
+        db.write_txn("t", |conn, meta| {
+            record_landing(conn, meta, "jkb", "task/x", "batch", C)
+        })
+        .unwrap();
+        let wrote = record(
+            &db,
+            "task/x",
+            &Cut::Fork(A.to_owned()),
+            Supersede::default(),
+        );
+        assert!(wrote, "the gap was not filled");
+        let r = row(&db, "task/x").unwrap();
+        assert_eq!(r.cut_point.as_deref(), Some(A));
+        assert_eq!(
+            r.landed.map(|l| (l.onto, l.head)),
+            Some(("batch".to_owned(), C.to_owned())),
+            "filling a missing cut point destroyed a landing event nothing can re-derive"
+        );
+    }
+
+    /// **The `WHERE` clause.** A verified anchor mismatch supersedes whatever this run measured —
+    /// including when the fresh measurement happens to equal the stored one.
+    ///
+    /// Delete `task/x` by hand and cut a fresh one while trunk has not moved: the new instance
+    /// forks at the same commit, so the cut point is unchanged and only the anchor differs. Gating
+    /// the update arm on the *value* differing left the predecessor's anchor in place, so
+    /// `base::stale_instance` refused the record on every read, `landed_for_action` short-circuited
+    /// to `NothingToMerge`, and no writer could ever repair it.
+    #[test]
+    fn a_name_recycled_at_the_same_commit_is_superseded_by_the_anchor_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let old = Anchor {
+            sha: A.to_owned(),
+            ts: 100,
+        };
+        record_with_anchor(
+            &db,
+            "task/x",
+            &Cut::Fork(A.to_owned()),
+            &old,
+            Supersede::default(),
+        );
+        db.write_txn("t", |conn, meta| {
+            record_landing(conn, meta, "jkb", "task/x", "batch", C)
+        })
+        .unwrap();
+        // The recreated instance: same fork point, a later creation entry.
+        let fresh = Anchor {
+            sha: A.to_owned(),
+            ts: 200,
+        };
+        record_with_anchor(
+            &db,
+            "task/x",
+            &Cut::Fork(A.to_owned()),
+            &fresh,
+            Supersede {
+                untouched: false,
+                anchor_mismatch: true,
+            },
+        );
+        let r = row(&db, "task/x").unwrap();
+        assert_eq!(
+            r.anchor,
+            Some(fresh),
+            "the predecessor's anchor stood, so every reader will refuse this record for good"
+        );
+        assert_eq!(
+            r.landed, None,
+            "the recreated branch kept its predecessor's landing event"
         );
     }
 

@@ -8,6 +8,7 @@ use serde_json::json;
 
 use jkb_types::{ConflictPolicy, NamespaceId, SyncMode};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -94,7 +95,7 @@ pub fn create(
         conn,
         meta,
         if before.is_some() { "update" } else { "insert" },
-        "mounts",
+        Entity::Mounts,
         &namespace.get().to_string(),
         before_json.as_ref(),
         Some(&after),

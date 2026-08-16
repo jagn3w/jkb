@@ -27,6 +27,11 @@ export const meta = {
 const cfg = (typeof args === 'string' ? JSON.parse(args) : args) || {}
 const JKB = cfg.jkb || 'jkb' // how to invoke the jkb binary
 const DB = cfg.db ? ` --db ${cfg.db}` : '' // optional --db flag
+// `scripts/merge-queue.sh` writes to the KB too (it records the landing), and it is bash, so it
+// cannot read `JKB`/`DB` above. The same two choices are handed to it through the environment:
+// `$JKB` is the binary, and `jkb` already falls back to `$JKB_DB` when no `--db` is given. Without
+// this the queue wrote a swarm run's landings into the user's production store.
+const QUEUE_ENV = [`JKB='${JKB}'`, cfg.db ? `JKB_DB='${cfg.db}'` : ''].filter(Boolean).join(' ') + ' '
 const SCOPE = cfg.scope || '' // a jkb DSL scope, e.g. "ns:codereviews/**"
 const TASKS = Array.isArray(cfg.tasks) ? cfg.tasks : null // or explicit task uids
 // Design gate (D28): in scope mode the swarm only touches tasks whose design has been
@@ -208,7 +213,7 @@ Return the verdict, notes, and handoff. Change nothing.`
 function mergeRunnerPrompt(branch) {
   return `You are a MECHANICAL merge-queue runner — NO reasoning, NO conflict resolution. Run ONE script and report its result. Do all git work in the integration worktree at ${INTEGRATION_WT}.
 
-Run EXACTLY: \`cd ${INTEGRATION_WT} && ${REPO}/scripts/merge-queue.sh ${branch} ${INTEGRATION} ${INTEGRATION_WT}\` (use ./scripts/merge-queue.sh if that path is right for this repo).
+Run EXACTLY: \`cd ${INTEGRATION_WT} && ${QUEUE_ENV}${REPO}/scripts/merge-queue.sh ${branch} ${INTEGRATION} ${INTEGRATION_WT}\` (use ./scripts/merge-queue.sh if that path is right for this repo).
 
 The script rebases ${branch} onto the current ${INTEGRATION} tip, fast-forwards (linear, no merge commit), and runs the gate. Do NOT resolve conflicts, edit code, or retry — just run it once and read its exit code:
 - exit 0 → landed=true, detail = the script's "landed: …" line.

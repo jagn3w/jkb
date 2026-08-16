@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use jkb_types::{EdgeId, EdgeType, Error as TypeError, ItemId};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -104,7 +105,7 @@ pub fn link_weighted(
             conn,
             meta,
             "update",
-            "edges",
+            Entity::Edges,
             &id.to_string(),
             Some(&describe(before_weight)),
             Some(&describe(weight.or(before_weight))),
@@ -113,7 +114,7 @@ pub fn link_weighted(
             conn,
             meta,
             "insert",
-            "edges",
+            Entity::Edges,
             &id.to_string(),
             None,
             Some(&describe(weight)),
@@ -242,7 +243,7 @@ pub fn unlink(
             conn,
             meta,
             "delete",
-            "edges",
+            Entity::Edges,
             &format!("{}->{}", src.get(), dst.get()),
             Some(&json!({ "src": src.get(), "dst": dst.get(), "type": edge_type.as_str() })),
             None,

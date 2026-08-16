@@ -19,6 +19,7 @@ use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, TaskStatus};
 
+use crate::changelog::Entity;
 use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
 use crate::query::{Query, Scope, TagPred};
 use crate::store::WriteMeta;
@@ -169,7 +170,7 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
         conn,
         meta,
         "insert",
-        "items",
+        Entity::Items,
         &id.to_string(),
         None,
         Some(&json!({
@@ -433,7 +434,7 @@ pub fn set_status(
         conn,
         meta,
         "update",
-        "items",
+        Entity::Items,
         &task.get().to_string(),
         Some(&json!({ "status": before })),
         Some(&json!({ "status": status.as_str() })),
@@ -498,7 +499,7 @@ pub fn set_priority(
         conn,
         meta,
         "update",
-        "items",
+        Entity::Items,
         &task.get().to_string(),
         Some(&json!({ "priority": before })),
         Some(&json!({ "priority": priority })),
@@ -526,7 +527,7 @@ pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&s
         conn,
         meta,
         "update",
-        "items",
+        Entity::Items,
         &task.get().to_string(),
         Some(&json!({ "due": before })),
         Some(&json!({ "due": due })),

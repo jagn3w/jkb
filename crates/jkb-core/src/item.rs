@@ -7,6 +7,7 @@ use serde_json::json;
 
 use jkb_types::{Error as TypeError, ItemId, Resolution};
 
+use crate::changelog::Entity;
 use crate::sql::like_escape;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
@@ -67,7 +68,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, item: &NewItem) -> Result<Ite
         conn,
         meta,
         "insert",
-        "items",
+        Entity::Items,
         &id.to_string(),
         None,
         Some(&after),
@@ -313,7 +314,7 @@ pub fn set_resolution(
         conn,
         meta,
         "update",
-        "items",
+        Entity::Items,
         &item.get().to_string(),
         Some(&json!({ "resolution": before })),
         Some(&json!({ "resolution": resolution.as_str() })),
@@ -605,7 +606,7 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) ->
         conn,
         meta,
         "delete",
-        "items",
+        Entity::Items,
         &item.get().to_string(),
         Some(&before),
         None,
@@ -806,7 +807,7 @@ pub fn set_content(
         conn,
         meta,
         "update",
-        "items",
+        Entity::Items,
         &item.get().to_string(),
         Some(&json!({ "content_len": before.map(|c| c.len()) })),
         Some(&json!({ "content_len": content.len() })),

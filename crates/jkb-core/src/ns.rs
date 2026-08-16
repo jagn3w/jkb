@@ -10,6 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use jkb_types::{Error as TypeError, NamespaceId};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -333,7 +334,7 @@ pub fn set_metadata(
         conn,
         meta,
         "update",
-        "namespaces",
+        Entity::Namespaces,
         &id.get().to_string(),
         None,
         Some(metadata),
@@ -512,7 +513,7 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
         conn,
         meta,
         "update",
-        "namespaces",
+        Entity::Namespaces,
         &root_id.to_string(),
         Some(&json!({ "path": from })),
         Some(&json!({ "path": to })),
@@ -558,7 +559,7 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
         conn,
         meta,
         "delete",
-        "namespaces",
+        Entity::Namespaces,
         &id.get().to_string(),
         Some(&json!({ "path": normalized })),
         None,

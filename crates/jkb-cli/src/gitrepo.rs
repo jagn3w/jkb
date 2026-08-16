@@ -596,9 +596,14 @@ pub fn release_reflog(dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// The two config keys retention is written under, spelled once so writing and unsetting cannot
-/// drift.
-fn reflog_retention_keys(branch: &str) -> [String; 2] {
+/// The two config keys retention is written under, spelled once so writing, unsetting **and the
+/// remedy `jkb doctor` prints** cannot drift.
+///
+/// `doctor` used to format one of them inline and named only `reflogExpire`, so a user who ran the
+/// command it printed left `reflogExpireUnreachable` behind — and `retained_reflogs` matches only
+/// the first key, so the next run reported "all recorded" while the residue the check exists to
+/// stop sat in `.git/config` for good.
+pub fn reflog_retention_keys(branch: &str) -> [String; 2] {
     [
         format!("gc.refs/heads/{branch}.reflogExpire"),
         format!("gc.refs/heads/{branch}.reflogExpireUnreachable"),

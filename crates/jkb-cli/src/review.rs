@@ -3,7 +3,9 @@
 //! Whether a review has run is the one fact in the staging picture with nowhere authoritative
 //! to live: git does not know, and the reviewer is a Claude workflow the CLI cannot run. So it
 //! is **stored**, as facets on the task — the smallest thing that can hold it, already
-//! carrying the sibling `branch=`/`onto=`/`base=` facets, and queryable for free.
+//! carrying the sibling `branch=`/`repo=` facets, and queryable for free. (Where a branch was
+//! cut and where it lands are facts about the *branch* and live in `branch_records`; review
+//! state is a fact about the *task*, so it stays here.)
 //!
 //! It deliberately does **not** live on the review folder's namespace: that object's metadata
 //! is owned by the sync engine (`layout`, `header_line`, `position`, `prose`), and adding a
@@ -250,9 +252,10 @@ pub(crate) struct Recorded {
 /// Record that a review ran against `branch` at `sha`, producing findings under `findings_ns`.
 ///
 /// Keyed by **branch**, because that is what a review knows: it reviewed a range on a branch,
-/// not a task. Tasks are found through `branch=` (a session's own branch) **and** `onto=` (the
+/// not a task. Tasks are found through `branch=` (a session's own branch) **and** their branches'
+/// recorded land target (the
 /// staging branch a batch lands on), so reviewing either level tags the work it covers — a
-/// staging-branch review is the D38 flow, and its tasks share only `onto=`.
+/// staging-branch review is the D38 flow, and its tasks share only the land target.
 ///
 /// A branch no task claims (trunk, an ad-hoc range) matches nothing and returns an empty list
 /// — a note for the caller to print, not an error, because reviewing an arbitrary range is a
@@ -282,12 +285,12 @@ pub(crate) fn record(
     sha: Option<&str>,
     findings_ns: &str,
 ) -> Result<Recording> {
-    // Matched on `branch=` — the task's own work is what was reviewed — **or** on `onto=`
+    // Matched on `branch=` — the task's own work is what was reviewed — **or** on the land target
     // *when that work is already in the reviewed branch*. A review of a staging branch is the
-    // D38 flow, and its tasks share only `onto=<staging>`; matching `branch=` alone tagged
+    // D38 flow, and its tasks share only the land target; matching `branch=` alone tagged
     // nothing and left the whole batch refused as never reviewed.
     //
-    // The containment test is what keeps the gate from failing open. `onto=` says a task
+    // The containment test is what keeps the gate from failing open. A land target says a task
     // *intends* to land on this branch, not that it has: a task still being built in its own
     // session has commits the reviewed branch has never seen, and crediting it would let
     // `jkb task land` graft never-reviewed work — the one direction a safety check must not
@@ -295,7 +298,7 @@ pub(crate) fn record(
     let mut skipped_unlanded = Vec::new();
     // Skipped for a DIFFERENT reason: the landing policy needs a `base=` for the work branch and
     // none is recorded, so containment is undecidable. Reporting these as "not merged yet" was
-    // simply untrue — `/task-swarm` writes `onto=`/`branch=`/`repo=` and never `base=`, so every
+    // simply untrue — `/task-swarm` recorded a land target and a branch but never a cut point, so every
     // swarm task landed here and the command asserted something false about a branch that was
     // fully contained.
     let mut skipped_no_base = Vec::new();
@@ -346,7 +349,7 @@ pub(crate) fn record(
             if others_are_covered(db, repo_root, repo_key, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
             } else if !task_records_a_base(repo_root, &records, &t)? {
-                skipped_no_base.push(t.meta.uid.clone());
+                skipped_no_base.push(no_base_row(repo_root, &t)?);
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
             }
@@ -354,7 +357,7 @@ pub(crate) fn record(
             if work_is_in(db, repo_root, repo_key, &t, branch, &mut covered)? {
                 on_branch.push((t.meta.id, t.meta.uid.clone()));
             } else if !task_records_a_base(repo_root, &records, &t)? {
-                skipped_no_base.push(t.meta.uid.clone());
+                skipped_no_base.push(no_base_row(repo_root, &t)?);
             } else {
                 skipped_unlanded.push(t.meta.uid.clone());
             }
@@ -405,15 +408,29 @@ pub(crate) fn record(
     })
 }
 
+/// The row for a task whose work branch has no cut point: its uid, and what to do about it.
+///
+/// Asked of git per task rather than written out once by the printer — see `base::MEASURE_VERB`.
+fn no_base_row(repo_root: &std::path::Path, t: &crate::repo::RepoTask) -> Result<(String, String)> {
+    let branches = crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH);
+    let remedy = crate::base::advice_for_any(repo_root, &t.meta.uid, branches)?;
+    Ok((t.meta.uid.clone(), remedy))
+}
+
 /// What a `review record` did, and what it deliberately did not do.
 pub(crate) struct Recording {
     pub(crate) recorded: Vec<Recorded>,
     /// Tasks landing on this branch whose own work is not in it yet, so the review cannot
     /// have covered them. Reported, because silence here reads as "everything was tagged".
     pub(crate) skipped_unlanded: Vec<String>,
-    /// Skipped because no `base=` is recorded for the task's work branch, so whether that work
+    /// Skipped because no cut point is recorded for the task's work branch, so whether that work
     /// is contained in the reviewed branch cannot be decided. A different fact from "not merged".
-    pub(crate) skipped_no_base: Vec<String>,
+    ///
+    /// `(uid, remedy)`. The remedy is asked of git **here**, where the task's branches are known,
+    /// and never written out by the surface that prints it: whether measuring a cut point is safe
+    /// depends on whether that branch still has commits of its own, and this bucket is reached by
+    /// branches that frequently do not (see `base::MEASURE_VERB`).
+    pub(crate) skipped_no_base: Vec<(String, String)>,
     /// Skipped because a recorded branch value cannot be handed to git at all. Reported, not
     /// fatal: one malformed tag must not stop the whole branch being credited.
     pub(crate) unusable: Vec<String>,
@@ -456,11 +473,12 @@ fn branch_is_in(
     Ok(answer)
 }
 
-/// Whether any branch this task records lands on `branch` — the `onto=` arm, now read from the
+/// Whether any branch this task records lands on `branch` — the land-target arm, read from the
 /// branch's own record.
 ///
 /// Per branch rather than per task, which is what it always meant: a task carrying two branches
-/// had one `onto=` facet, so a review of the batch one branch lands on also matched the other.
+/// had one land target between them, so a review of the batch one branch lands on also matched the
+/// other.
 fn lands_on(
     records: &BTreeMap<String, jkb_core::branch::BranchRecord>,
     t: &crate::repo::RepoTask,

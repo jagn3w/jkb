@@ -3,8 +3,8 @@
 //!
 //! A session is a git worktree holding one task's work on one branch, so N terminals can
 //! drive N tasks without sharing a checkout. Everything a session needs to be found again
-//! lives in git (the worktree and its branch) and the KB (the task's `branch=`/`onto=` tags
-//! and its claim) — there is no session state file to drift.
+//! lives in git (the worktree and its branch) and the KB (the task's `branch=` tag and claim,
+//! and that branch's own record) — there is no session state file to drift.
 
 use std::fs;
 use std::io::Write;

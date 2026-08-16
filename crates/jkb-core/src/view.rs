@@ -7,6 +7,7 @@ use serde_json::json;
 
 use jkb_types::{ItemId, PlacementRole};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, ns, placement, query, Error, Result};
 
@@ -38,7 +39,7 @@ pub fn save(conn: &Connection, meta: &WriteMeta, name: &str, query_str: &str) ->
         conn,
         meta,
         "insert",
-        "items",
+        Entity::Items,
         &id.to_string(),
         None,
         Some(&json!({ "uid": uid, "kind": "view" })),

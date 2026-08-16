@@ -8,6 +8,7 @@ use serde_json::json;
 
 use jkb_types::{ItemId, NamespaceId, PlacementRole};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -53,7 +54,7 @@ pub fn place(
         conn,
         meta,
         "insert",
-        "placements",
+        Entity::Placements,
         &rowid.to_string(),
         None,
         Some(&after),
@@ -92,7 +93,7 @@ pub fn set_primary(
             conn,
             meta,
             "delete",
-            "placements",
+            Entity::Placements,
             &rowid.to_string(),
             Some(&json!({ "item_id": item.get(), "namespace_id": old_ns, "role": "primary" })),
             None,
@@ -137,7 +138,7 @@ pub fn unplace(
             conn,
             meta,
             "delete",
-            "placements",
+            Entity::Placements,
             &rowid.to_string(),
             Some(&json!({
                 "item_id": item.get(),

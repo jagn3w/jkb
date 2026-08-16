@@ -198,6 +198,23 @@ fn repo_key_for(
     Ok(key.map(|k| (root.to_path_buf(), k)))
 }
 
+/// The repository key this write is *about*, with no checkout involved.
+///
+/// The caller's `--repo` wins — `task start` is stating where the work is — and otherwise the
+/// task's own `repo=`. Distinct from [`repo_key_for`], which additionally demands a checkout to
+/// **measure** in; a land target needs no measurement, so demanding one there silently dropped the
+/// flag.
+fn stated_repo(
+    conn: &rusqlite::Connection,
+    id: ItemId,
+    loc: &Location<'_>,
+) -> jkb_core::Result<Option<String>> {
+    Ok(match loc.repo {
+        Some(repo) => Some(repo.to_owned()),
+        None => facet_one(&read_tags(conn, id)?, FACET_REPO).cloned(),
+    })
+}
+
 /// A task's facet tags as a multi-map, read inside a transaction.
 fn read_tags(
     conn: &rusqlite::Connection,
@@ -439,9 +456,25 @@ pub(crate) fn set_location_facets(
         //
         // Only when the caller states one: `task start` without `--onto` says nothing about where
         // the branch lands, and writing `None` there would clear a target the branch already has.
+        //
+        // **Keyed by the task's repository, not by the checkout we are standing in.** This used to
+        // go through `repo_key_for`, which needs a *root* — so `jkb task start --repo <other>
+        // --onto <batch>`, which legitimately runs from anywhere, dropped `--onto` in silence: the
+        // task never appeared in `jkb staging ls` and `jkb task land` later failed saying it
+        // recorded no land target, with nothing having said why. `record_land_target`'s own
+        // no-root arm ("nothing here can be checked, so the word is taken as given") was thereby
+        // unreachable. A land target is a name, not a measurement: unlike the cut point there is
+        // nothing about it this checkout could honestly establish, so there is nothing to withhold.
         if let Some(onto) = loc.onto {
-            if let Some((root, repo)) = repo_key_for(conn, id, repo_root)? {
-                record_land_target(conn, meta, Some(&root), &repo, branch, Some(onto))?;
+            match repo_key_for(conn, id, repo_root)? {
+                Some((root, repo)) => {
+                    record_land_target(conn, meta, Some(&root), &repo, branch, Some(onto))?;
+                }
+                None => {
+                    if let Some(repo) = stated_repo(conn, id, loc)? {
+                        record_land_target(conn, meta, None, &repo, branch, Some(onto))?;
+                    }
+                }
             }
         }
     }
