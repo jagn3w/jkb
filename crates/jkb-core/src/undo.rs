@@ -1466,6 +1466,48 @@ mod tests {
         );
     }
 
+    /// A namespace's `metadata` and a binding's sync stamp both come back — the two writers that
+    /// recorded **no** before-state at all.
+    ///
+    /// Neither is decorative: a file sync writes both on every reconcile, so with either one
+    /// uninvertible `jkb undo` after a sync is refused outright, and before the refusal existed it
+    /// silently reverted an older transaction instead.
+    #[test]
+    fn undoing_a_metadata_write_and_a_sync_stamp_restores_what_each_replaced() {
+        use crate::{binding, ns};
+        use serde_json::json;
+
+        let db = Db::open_in_memory().unwrap();
+        let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
+        let nsid = db.write_txn("t", |c, _| ns::ensure(c, "x/y")).unwrap();
+        db.write_txn("t", move |c, m| {
+            ns::set_metadata(c, m, nsid, &json!({ "layout": "first" }))?;
+            binding::set(c, m, id, "file:///tmp/a.md", None, None)?;
+            binding::mark_synced(c, m, id, "hash-one")
+        })
+        .unwrap();
+        db.write_txn("t", move |c, m| {
+            ns::set_metadata(c, m, nsid, &json!({ "layout": "second" }))?;
+            binding::mark_synced(c, m, id, "hash-two")
+        })
+        .unwrap();
+
+        db.write_txn("t", undo_last).unwrap();
+        assert_eq!(
+            db.read(move |c| ns::get_metadata(c, nsid)).unwrap(),
+            Some(json!({ "layout": "first" })),
+            "undoing a metadata write did not restore the JSON it replaced"
+        );
+        assert_eq!(
+            db.read(move |c| binding::get(c, id))
+                .unwrap()
+                .and_then(|b| b.last_synced_hash),
+            Some("hash-one".to_owned()),
+            "undoing a sync stamp left the binding claiming it had settled on bytes the undo threw \
+             away"
+        );
+    }
+
     /// Undoing a transaction that **removed** a tag application puts it back, with its props.
     ///
     /// A delete is inverted by re-inserting the row its before-state describes, which is the
