@@ -3885,6 +3885,57 @@ fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
     );
 }
 
+/// A branch whose ref journal cannot be read is described as **unknown**, never as a branch whose
+/// work was carried away.
+///
+/// "No commits of its own" is two states (D34.4) and only the reflog separates them, so with no
+/// journal the answer is genuinely unknown. It was spelled the same as the definite one: the
+/// message asserted as fact that the branch "has moved since it was cut … so its work was carried
+/// away" and offered `jkb task set <uid> --status done` — advice to close a task whose branch may
+/// be untouched and unstarted. Reachable through `core.logAllRefUpdates=false`, reflog expiry, a
+/// reftable repository, and a branch that exists only as `origin/<b>`, which is the ordinary state
+/// after a merged PR deletes the local copy.
+///
+/// The verb is still withheld, deliberately — not knowing is a reason to say so, not to act.
+#[test]
+fn an_unreadable_ref_journal_is_reported_as_unknown_not_as_work_carried_away() {
+    let f = Fixture::new();
+    let uid = f.add_task("no journal task");
+    // A branch with no commits of its own and, after the forget, no cut point — so `close-merged`
+    // has to advise rather than decide.
+    git(&f.repo, &["branch", "quiet", "main"]);
+    f.jkb()
+        .args(["task", "start", &uid, "--branch", "quiet", "--onto", "main"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "base", "--forget", "quiet"])
+        .assert()
+        .success();
+    // The journal, removed the way expiry or `logAllRefUpdates=false` leaves it.
+    std::fs::remove_file(f.repo.join(".git/logs/refs/heads/quiet")).unwrap();
+
+    let out = f
+        .jkb()
+        .args(["task", "close-merged", "--dry-run"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains("cannot be read"),
+        "an unreadable journal is not reported as unknown:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("its work was carried away"),
+        "an untouched branch was told its work had already landed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--status done"),
+        "the reader was offered a verb that closes a task on a branch nothing is known about:\n\
+         {stdout}"
+    );
+}
+
 /// A batch deleted after it landed must not make the landing event **worse** than the inference
 /// it replaced.
 ///

@@ -1716,35 +1716,69 @@ mod tests {
 
 #[cfg(test)]
 mod selection_tests {
-    use super::is_work;
+    use super::{is_work, undo_last};
+    use crate::changelog::{self, Entity};
+    use crate::item::{self, upsert, NewItem};
+    use crate::Db;
 
-    /// A journal-only sync transaction must never be what a bare `jkb undo` picks.
+    /// A bare `jkb undo` must reach past **exactly** what `is_work` calls bookkeeping, and nothing
+    /// else.
     ///
-    /// Several sync transactions write nothing but the journal — flagging `needs_attention`,
-    /// re-settling a stale base, populating a legacy row. Adding `sync_state` to the inverse
-    /// list made those eligible, so `jkb undo` meaning to take back a `task add` would rewind a
-    /// journal flag instead, report "reverted 1 change(s)", leave the task untouched, and make
-    /// the refused file invisible to `jkb doctor`.
+    /// `undo_last`'s SQL spells the two pairs out as bound parameters, so this is what stops that
+    /// query and `is_work` drifting into disagreement — and it asserts the *consequence* rather
+    /// than the predicate, so it cannot be satisfied by the function under test agreeing with
+    /// itself.
+    ///
+    /// The two members earn their place differently. Several sync transactions write nothing but
+    /// the journal — flagging `needs_attention`, re-settling a stale base, populating a legacy row
+    /// — and once `sync_state` gained an inverse those became "the last invertible transaction",
+    /// so `jkb undo` meaning to take back a `task add` rewound a journal flag, reported "reverted
+    /// 1 change(s)" and left the task untouched. An `undo` marker is the record that a transaction
+    /// was reverted, and treating it as work would make every `jkb undo` after the first refuse
+    /// (nothing inverts an undo), which is a stuck command rather than a wrong one.
     #[test]
-    fn a_journal_only_transaction_is_not_the_last_undoable_change() {
-        assert!(
-            !is_work("update", "sync_state"),
-            "a journal-only sync transaction can be selected by a bare `jkb undo`"
-        );
+    fn a_bookkeeping_only_transaction_is_not_the_last_change() {
+        for (op, entity) in [("update", Entity::SyncState), ("undo", Entity::Changelog)] {
+            assert!(
+                !is_work(op, entity.as_str()),
+                "{op}/{} is treated as the user's work",
+                entity.as_str()
+            );
+            let db = Db::open_in_memory().unwrap();
+            db.write_txn("t", |c, m| {
+                upsert(
+                    c,
+                    m,
+                    &NewItem {
+                        uid: "target".to_owned(),
+                        kind: "note".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )
+            })
+            .unwrap();
+            db.write_txn("t", move |c, m| {
+                changelog::append(c, m, op, entity, "file:///x", None, None)
+            })
+            .unwrap();
+
+            db.write_txn("t", undo_last).unwrap();
+            assert!(
+                db.read(|c| item::id_for_uid(c, "target"))
+                    .unwrap()
+                    .is_none(),
+                "a transaction of nothing but {op}/{} was taken as the user's last change, so \
+                 `jkb undo` rewound bookkeeping and left the real one standing",
+                entity.as_str()
+            );
+        }
     }
 
-    /// An `undo` marker is not work either — a second `jkb undo` must step back another
-    /// transaction, not refuse because undoing an undo has no inverse.
-    #[test]
-    fn an_undo_marker_is_not_work() {
-        assert!(
-            !is_work("undo", "changelog"),
-            "the marker `undo` writes counts as work, so the next `jkb undo` selects the undo \
-             itself and refuses for ever"
-        );
-    }
-
-    /// Everything else is work — the exclusion is two tuples, not a policy that grows.
+    /// Everything else is work — including the kinds this module has no inverse for. That is the
+    /// point: they make their transaction selectable, and `undo` then refuses it by name rather
+    /// than reaching past it.
     #[test]
     fn real_work_still_selects_a_transaction() {
         for (op, table) in [
@@ -1753,11 +1787,8 @@ mod selection_tests {
             ("update", "edges"),
             ("update", "mounts"),
             ("update", "containment"),
-            // …including the kinds this module has NO inverse for. That is the point: they make
-            // their transaction selectable, and `undo` then refuses it by name.
-            ("update", "namespaces"),
-            ("delete", "tag_applications"),
-            ("update", "branch_records"),
+            ("update", "tag_defs"),
+            ("claim", "items"),
         ] {
             assert!(is_work(op, table), "{op}/{table} stopped counting as work");
         }
