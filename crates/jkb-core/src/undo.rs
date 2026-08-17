@@ -68,24 +68,24 @@ enum Inverse {
     ///
     /// The generic answer for a write that changed an existing row, and the one that needs
     /// nothing hand-written per statement: what a writer already has to supply — the values
-    /// that were there before — *is* the inverse. See [`ROW_KEYS`].
+    /// that were there before — *is* the inverse. A **subset** of the table's columns, since a
+    /// write that touched one column restores one column.
     Columns,
     /// Put a deleted row back, from the columns `before` names.
     ///
-    /// The mirror image of [`Inverse::Columns`], driven by the same payload and validated by the
-    /// same check. `OR IGNORE`, so re-running an undo is not an error.
+    /// The mirror image of [`Inverse::Columns`], driven by the same payload — but validated more
+    /// strictly: a deleted row's before-state must name **every** column of its table, because
+    /// there is no surviving row for the unnamed ones to keep their values in. See
+    /// [`check_restorable`]. `OR IGNORE`, so re-running an undo is not an error.
     ReinsertRow,
     /// Delete the inserted row by `rowid`.
     DeleteRow,
 }
 
-/// Whether this entry's inverse is driven by a before-state made of column values — which is the
-/// question [`check_restorable`] validates and nothing else needs to ask.
-fn is_row_shaped(op: &str, table: &str) -> bool {
-    matches!(
-        inverse_for(op, table),
-        Some(Inverse::Columns | Inverse::ReinsertRow)
-    )
+/// The generic inverse driven by a before-state made of column values, if this entry has one —
+/// which is the question [`check_restorable`] validates and nothing else needs to ask.
+fn row_shaped(op: &str, table: &str) -> Option<Inverse> {
+    inverse_for(op, table).filter(|i| matches!(i, Inverse::Columns | Inverse::ReinsertRow))
 }
 
 /// The column names `table` has, straight from the schema.
@@ -118,9 +118,9 @@ pub(crate) fn check_restorable(
     table: &str,
     before: Option<&Value>,
 ) -> Result<()> {
-    if !is_row_shaped(op, table) {
+    let Some(inverse) = row_shaped(op, table) else {
         return Ok(());
-    }
+    };
     let fields = before.and_then(Value::as_object).filter(|o| !o.is_empty());
     let Some(fields) = fields else {
         return Err(TypeError::Validation(format!(
@@ -136,6 +136,31 @@ pub(crate) fn check_restorable(
             return Err(TypeError::Validation(format!(
                 "`{key}` is not a column of `{table}`, so undoing this `{op}` would not restore \
                  it — log the previous value under the column's own name"
+            ))
+            .into());
+        }
+    }
+    // A DELETED ROW'S BEFORE-STATE MUST BE THE WHOLE ROW. An update leaves the row in place, so
+    // the columns it does not name keep their values; a delete leaves nothing, so an unnamed
+    // column is a value that cannot come back. The failure is silent in the worst way — the
+    // reinsert is `OR IGNORE`, so omitting a `NOT NULL` column with no default (`branch_records`
+    // has one) makes undoing the delete restore *nothing at all* and report success.
+    //
+    // Checked against the schema rather than a list, so adding a column to a table makes every
+    // deleter of it fail at its next write until the column is logged. That is the property a
+    // per-writer assertion cannot have: it covers columns nobody has added yet.
+    if inverse == Inverse::ReinsertRow {
+        let missing: Vec<&str> = columns
+            .iter()
+            .filter(|c| !fields.contains_key(*c))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(TypeError::Validation(format!(
+                "the before-state for this `{op}` on `{table}` does not name {} — undoing a \
+                 delete re-inserts the row from exactly what is logged, so an unnamed column \
+                 comes back as its default, or the whole row is silently not restored at all",
+                missing.join(", ")
             ))
             .into());
         }
@@ -1463,6 +1488,175 @@ mod tests {
             vec![(from.get(), 7)],
             "the re-home was not undone: the item should be back in its old namespace, at the \
              position it had"
+        );
+    }
+
+    /// Every row of `table`, whole, in a form two dumps can be compared with.
+    ///
+    /// `SELECT *`, deliberately: the comparison then covers a column added to the schema later
+    /// without anybody remembering to extend it — which is the failure mode a hand-written list of
+    /// expected fields has, and the one this family keeps producing.
+    fn dump(db: &Db, table: &'static str) -> Vec<Vec<String>> {
+        db.read(move |c| {
+            let mut stmt = c.prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))?;
+            let width = stmt.column_count();
+            let rows = stmt.query_map([], |r| {
+                (0..width)
+                    .map(|i| {
+                        r.get::<_, rusqlite::types::Value>(i)
+                            .map(|v| format!("{v:?}"))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap()
+    }
+
+    /// Run `delete` and undo it, asserting `table` comes back **byte for byte**.
+    ///
+    /// The `assert_ne` is not decoration: without it a setup that deleted nothing would pass this
+    /// trivially, which is exactly how a round-trip test goes vacuous.
+    fn delete_round_trips(
+        db: &Db,
+        table: &'static str,
+        delete: impl FnOnce(&rusqlite::Connection, &crate::WriteMeta) -> crate::Result<()>
+            + Send
+            + 'static,
+    ) {
+        let before = dump(db, table);
+        db.write_txn("t", move |c, m| delete(c, m)).unwrap();
+        assert_ne!(
+            dump(db, table),
+            before,
+            "setup: nothing was actually deleted from `{table}`"
+        );
+        db.write_txn("t", undo_last).unwrap();
+        assert_eq!(
+            dump(db, table),
+            before,
+            "undoing a delete from `{table}` did not restore the row exactly as it was"
+        );
+    }
+
+    /// **Every** deleter's before-state round-trips its whole row.
+    ///
+    /// One assertion shape for all five, comparing `SELECT *` before and after rather than the
+    /// columns whoever wrote the test happened to think of. That matters because the gap it closes
+    /// was precisely a *thought-of* column list: `tag::remove`'s `props`, `placement::unplace`'s
+    /// `position` and `metadata`, `ns::remove`'s `kind`, `edge::unlink`'s `props` and
+    /// `branch::forget`'s `created_at` were all added to the log this round and none of them was
+    /// asserted anywhere — each could be poisoned to a wrong value with the whole workspace green.
+    ///
+    /// It also needs no row generators, which is what makes it proportionate: the rows are built
+    /// by the ordinary repo API, so they are valid by construction, and `SELECT *` extends the
+    /// comparison to any column added later. `check_restorable` covers the other half — a column
+    /// *omitted* from the before-state, which this could only catch when the fixture happens to
+    /// give it a non-default value.
+    #[test]
+    fn undoing_a_delete_restores_the_whole_row_for_every_deleter() {
+        use crate::{branch, edge, ns, placement, tag};
+        use jkb_types::{EdgeType, PlacementRole};
+        use serde_json::json;
+
+        let db = Db::open_in_memory().unwrap();
+        let (item, other, ns_id) = db
+            .write_txn("t", |c, m| {
+                let item = upsert(c, m, &note("a"))?;
+                let other = upsert(c, m, &note("b"))?;
+                let ns_id = ns::ensure(c, "x/y")?;
+                Ok((item, other, ns_id))
+            })
+            .unwrap();
+
+        // Each row is given a value that is NOT the column's default, so a before-state that
+        // omits or fabricates the column cannot restore it by luck.
+        db.write_txn("t", move |c, m| {
+            tag::apply(c, m, item, "size", "small")?;
+            placement::place(c, m, item, ns_id, PlacementRole::Reference, 5)?;
+            edge::link_weighted(
+                c,
+                m,
+                item,
+                other,
+                EdgeType::Supports,
+                Some(2.5),
+                Some(&json!({ "why": "evidence" })),
+            )?;
+            branch::record_cut_point(
+                c,
+                m,
+                "jkb",
+                "task/x",
+                &branch::Cut::Fork("a".repeat(40)),
+                Some(&branch::Anchor {
+                    sha: "b".repeat(40),
+                    ts: 7,
+                }),
+                branch::Supersede::default(),
+            )?;
+            ns::ensure(c, "x/doomed")?;
+            Ok(())
+        })
+        .unwrap();
+
+        delete_round_trips(&db, "tag_applications", move |c, m| {
+            tag::remove(c, m, item, "size", "small")
+        });
+        delete_round_trips(&db, "placements", move |c, m| {
+            placement::unplace(c, m, item, ns_id).map(|_| ())
+        });
+        delete_round_trips(&db, "edges", move |c, m| {
+            edge::unlink(c, m, item, other, EdgeType::Supports)
+        });
+        delete_round_trips(&db, "namespaces", |c, m| ns::remove(c, m, "x/doomed"));
+        delete_round_trips(&db, "branch_records", |c, m| {
+            branch::forget(c, m, "jkb", "task/x").map(|_| ())
+        });
+    }
+
+    /// Undoing an edit to an item's body restores the body **and its hash**.
+    ///
+    /// `item::set_content` is the one column write this round changed whose before-state nothing
+    /// read back: logging `{"content": "anything at all"}` passed validation, restored garbage,
+    /// and left the whole workspace green. Both columns are asserted because restoring the content
+    /// while leaving `content_hash` describing the replacement makes the item its own mismatch —
+    /// which is worse than not undoing at all, since `content_hash` is globally unique and is what
+    /// ingest dedups on.
+    #[test]
+    fn undoing_a_content_edit_restores_the_body_and_its_hash() {
+        use crate::item;
+
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| {
+                upsert(
+                    c,
+                    m,
+                    &NewItem {
+                        uid: "doc".to_owned(),
+                        kind: "document".to_owned(),
+                        content: Some("the original body".to_owned()),
+                        content_hash: Some("b3:original".to_owned()),
+                        mime: None,
+                    },
+                )
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| {
+            item::set_content(c, m, id, "a replacement body", Some("b3:replacement"))
+        })
+        .unwrap();
+
+        db.write_txn("t", undo_last).unwrap();
+        let meta = db
+            .read(move |c| item::get(c, id))
+            .unwrap()
+            .expect("the item survives");
+        assert_eq!(
+            (meta.content.as_deref(), meta.content_hash.as_deref()),
+            (Some("the original body"), Some("b3:original")),
+            "undoing a content edit did not restore the body and the hash it was logged with"
         );
     }
 

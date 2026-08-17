@@ -3968,9 +3968,16 @@ fn a_landing_whose_target_was_deleted_falls_back_to_the_branch_itself() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // NOT `contains("branch=grp")`: the remedy interpolates the literal placeholder
+    // `branch=<name>`, so that string can never appear and asserting on it protects nothing (it
+    // was written that way first, and a skeptic found it unfireable). What actually went wrong is
+    // that the task was routed into the *gone* bucket at all — on a state derived from a branch
+    // that is not one of its own, so the branch list in that message is empty and the remedy names
+    // nothing while telling the user to delete a record.
     assert!(
-        !stdout.contains("branch=grp"),
-        "the report told the user to delete the record of the branch that landed:\n{stdout}"
+        !stdout.contains("gone —"),
+        "a state about the landing's target was reported as the task's own branch being gone, \
+         and the remedy names no branch at all:\n{stdout}"
     );
     assert!(
         stdout.contains(&format!("would close {uid}")),
