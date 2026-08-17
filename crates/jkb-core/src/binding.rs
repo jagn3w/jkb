@@ -166,19 +166,31 @@ pub fn synced_uris_for_file(conn: &Connection, bare_uri: &str) -> Result<Vec<Str
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
 pub fn mark_synced(conn: &Connection, meta: &WriteMeta, item: ItemId, hash: &str) -> Result<()> {
-    conn.prepare_cached(
-        "UPDATE bindings SET last_synced_hash = ?2,
-             last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE item_id = ?1",
-    )?
-    .execute(params![item.get(), hash])?;
+    // Read the stamp this replaces: an update to `bindings` is undone by writing its
+    // before-state back column by column, so logging none would have `jkb undo` of a sync leave
+    // the binding claiming it had settled on bytes the undo has just thrown away.
+    let before: Option<(Option<String>, Option<String>)> = conn
+        .prepare_cached("SELECT last_synced_hash, last_synced_at FROM bindings WHERE item_id = ?1")?
+        .query_row([item.get()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    let updated = conn
+        .prepare_cached(
+            "UPDATE bindings SET last_synced_hash = ?2,
+                 last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE item_id = ?1",
+        )?
+        .execute(params![item.get(), hash])?;
+    // No binding to stamp: there is nothing to record and nothing to undo.
+    let (Some((before_hash, before_at)), 1..) = (before, updated) else {
+        return Ok(());
+    };
     changelog::append(
         conn,
         meta,
         "update",
         Entity::Bindings,
         &item.get().to_string(),
-        None,
+        Some(&json!({ "last_synced_hash": before_hash, "last_synced_at": before_at })),
         Some(&json!({ "last_synced_hash": hash })),
     )?;
     Ok(())

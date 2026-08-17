@@ -63,14 +63,14 @@ CREATE TABLE branch_records (
     -- Only a full object id may be stored. A symbolic revision (`HEAD`, `main`, `@`) is the
     -- dangerous value precisely because it resolves in *every* clone, to something different in
     -- each: stored and re-resolved later it names an unrelated commit, `is_merged` skips its
-    -- freshly-cut guard, and a task with no work on it closes. `base::is_object_id` still checks
-    -- the same form in Rust so the error is a sentence rather than a constraint violation -- two
-    -- copies deliberately, the same pairing as `V006`'s status CHECK beside
-    -- `TaskStatus::from_manual_str`.
+    -- freshly-cut guard, and a task with no work on it closes. **This CHECK is the only thing
+    -- that enforces it** -- no Rust guard runs before the write, so the refusal a caller sees is
+    -- a constraint violation, and that is the whole enforcement rather than a backstop behind
+    -- one. `base::is_object_id` asks the same question on the *reader's* side
+    -- (`repo::base_is_usable`), for values recorded before this table existed.
     --
-    -- Lowercase is required because the *writer* lowercases: `is_object_id` accepts uppercase hex
-    -- (git never emits it, but a test or a hand-written value can), and a CHECK that refused what
-    -- the guard accepts is two rules disagreeing.
+    -- Lowercase is required because `branch::record_cut_point` lowercases what it is handed, so a
+    -- value that reaches the store has already been normalized.
     CHECK (cut_point IS NULL OR (
         length(cut_point) IN (40, 64)
         AND lower(cut_point) = cut_point

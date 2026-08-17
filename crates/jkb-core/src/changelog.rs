@@ -5,19 +5,21 @@
 //!
 //! [`Entity`] is a closed set, and [`Entity::insert_inverse`] is an exhaustive match. Together
 //! they make one recurring defect unrepresentable: a new table reaching the schema and a writer,
-//! while [`crate::undo`]'s allowlist is never told about it. That omission is silent and it is
-//! *worse than a crash* — `undo_last` skips any transaction containing an insert into an unlisted
-//! table, so a bare `jkb undo` after the new command walks past it and reverts somebody's older
-//! transaction instead, deleting the wrong rows and reporting success.
+//! while [`crate::undo`] is never told how an insert into it comes back. That omission used to be
+//! silent and *worse than a crash* — `undo_last` skipped any transaction containing an insert it
+//! could not invert, so a bare `jkb undo` after the new command walked past it and reverted
+//! somebody's older transaction instead, deleting the wrong rows and reporting success.
 //!
-//! It has happened repeatedly — `containment` reached the schema without reaching the allowlist,
-//! and `branch_records` after it — because the enforcement was procedural: every future author of
-//! a table had to remember a list in another module. Now they cannot write the string at all. The
+//! It happened repeatedly — `containment` reached the schema without reaching the list, and
+//! `branch_records` after it — because the enforcement was procedural: every future author of a
+//! table had to remember a list in another module. Now they cannot write the string at all. The
 //! new variant does not compile until `insert_inverse` says how an insert into it comes back,
-//! [`Entity::ALL`] is generated beside the variants by [`entities!`] so it cannot omit one, the
-//! allowlist is *derived* from that answer rather than maintained beside it, and [`write`]
-//! refuses an `insert` for a table whose answer is [`InsertInverse::Never`] — so a wrong decision
-//! fails loudly at the new writer's first write rather than quietly at some later undo.
+//! [`Entity::ALL`] is generated beside the variants by [`entities!`] so it cannot omit one, and
+//! [`write`] refuses an `insert` for a table whose answer is [`InsertInverse::Never`] — so a wrong
+//! decision fails loudly at the new writer's first write rather than quietly at some later undo.
+//! `undo` itself now **refuses** anything it cannot invert rather than skipping it, so the worst a
+//! gap here can still cost is a refusal; these checks exist to make that refusal land on the
+//! author rather than on a user.
 //!
 //! ## The op is **derived**, never chosen
 //!
@@ -39,8 +41,8 @@ use serde_json::Value;
 use crate::store::WriteMeta;
 use crate::Result;
 
-/// The op recorded for a row a transaction created — the one op whose inverse is generic, and
-/// therefore the one that needs the allowlist below.
+/// The op recorded for a row a transaction created — the one op whose inverse is a bare
+/// `DELETE`, and therefore the one that needs [`Entity::insert_inverse`]'s answer.
 ///
 /// Written only by [`upsert`], from a before-state; [`append`] refuses it. See the module doc.
 pub(crate) const OP_INSERT: &str = "insert";
@@ -51,7 +53,7 @@ const OP_UPDATE: &str = "update";
 /// Declare the entity set **once**, generating the variants, their stored names and
 /// [`Entity::ALL`] together.
 ///
-/// [`Entity::ALL`] is what the derived undo allowlist iterates, and it used to be a hand-written
+/// [`Entity::ALL`] is what [`Entity::parse`] iterates, and it used to be a hand-written
 /// list beside the enum: a variant could exist, decide its inverse, and never reach it — the
 /// silent half of the very defect the type exists to close. A runtime guard and a test were tried
 /// first and the test was vacuous (it asserted the list's *length*, which fires on the correct
@@ -69,7 +71,7 @@ macro_rules! entities {
         }
 
         impl Entity {
-            /// Every table, so the undo allowlist can be derived rather than repeated. Generated
+            /// Every table, so a stored name can be resolved back to a variant. Generated
             /// with the variants by [`entities!`], so it cannot be missing one.
             pub(crate) const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
 
@@ -137,10 +139,10 @@ impl Entity {
     /// How an `insert` against this table is undone.
     ///
     /// **Exhaustive, and that is the point.** A new variant does not compile until this arm exists,
-    /// so "the undo allowlist was never told about the new table" stops being a thing anyone can
-    /// forget. Answer [`InsertInverse::DeleteRow`] and the table joins the allowlist automatically;
-    /// answer [`InsertInverse::Never`] and [`append`] refuses the first `insert` written against
-    /// it, by name.
+    /// so "`undo` was never told about the new table" stops being a thing anyone can forget.
+    /// Answer [`InsertInverse::DeleteRow`] and an insert into the table is undone by deleting the
+    /// row; answer [`InsertInverse::Never`] and [`append`] refuses the first `insert` written
+    /// against it, by name.
     pub(crate) fn insert_inverse(self) -> InsertInverse {
         match self {
             Self::Items
@@ -165,12 +167,12 @@ impl Entity {
 /// Refuse an entry `undo` could not honour, at the moment it is written.
 ///
 /// The table's inserts may have no inverse — [`InsertInverse::Never`] says so, and logging one
-/// anyway makes `undo_last` skip the transaction and revert an older one in its place. That fails
-/// here rather than at some later, unrelated `jkb undo`.
+/// anyway makes `jkb undo` refuse every transaction that contains one, permanently. That fails
+/// here, on the author, rather than on a user with work they cannot take back.
 ///
 /// The other way a table used to reach the log without reaching `undo` — existing as a variant but
-/// missing from [`Entity::ALL`], which the derived allowlist iterates — is no longer a state: both
-/// are generated together by [`entities!`].
+/// missing from [`Entity::ALL`], which [`Entity::parse`] iterates — is no longer a state: both are
+/// generated together by [`entities!`].
 fn undoable(op: &str, entity: Entity) -> Result<()> {
     if op == OP_INSERT && entity.insert_inverse() == InsertInverse::Never {
         return Err(jkb_types::Error::Validation(format!(
@@ -224,9 +226,9 @@ pub(crate) fn upsert(
 ///
 /// # Errors
 /// Returns an error if the op is `insert`, if the entry could not be undone in the way its op
-/// implies (see [`undoable`]), or if the statement fails. Those are programming errors, refused
-/// here because the alternative is a silent one: `undo` inverts the wrong way, or `undo_last`
-/// skips the whole transaction and reverts an older one in its place.
+/// implies (see [`undoable`] and [`crate::undo::check_restorable`]), or if the statement fails.
+/// Those are programming errors, refused here because the alternative is a silent one: `undo`
+/// inverts the wrong way, or restores nothing and reports success.
 pub(crate) fn append(
     conn: &Connection,
     meta: &WriteMeta,
@@ -261,6 +263,10 @@ fn write(
     after: Option<&Value>,
 ) -> Result<()> {
     undoable(op, entity)?;
+    // …and, for a write whose inverse is to put the before-state's columns back, that the
+    // before-state can actually do that. See `undo::check_restorable`: the alternative is an
+    // inverse that runs, restores nothing, and reports success.
+    crate::undo::check_restorable(conn, op, entity.as_str(), before)?;
     let before = before.map(ToString::to_string);
     let after = after.map(ToString::to_string);
     conn.prepare_cached(

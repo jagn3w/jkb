@@ -274,9 +274,9 @@ pub fn record_cut_point(
     supersede: Supersede,
 ) -> Result<bool> {
     let before = get(conn, repo, branch)?;
-    // Lowercased here, at the door, rather than at any caller: `base::is_object_id` accepts
-    // uppercase hex and the CHECK does not, and two guards that disagree about the same value are
-    // how a legal write becomes a constraint violation nobody can read.
+    // Lowercased here, at the door, rather than at any caller: the CHECK on `branch_records`
+    // requires lowercase (so a value cannot be stored twice under two spellings), git never emits
+    // uppercase hex, and a hand-written or test value that does is normalized rather than refused.
     let sha = cut.sha().to_ascii_lowercase();
     let (anchor_sha, anchor_ts) = match anchor {
         Some(a) => (Some(a.sha.as_str()), Some(a.ts)),
@@ -316,7 +316,8 @@ pub fn record_cut_point(
     };
     // `changelog::upsert` records an `insert` only when there was no row, so `undo`'s
     // `DELETE … WHERE rowid = ?` inverts exactly what happened. Superseding an existing row is an
-    // update and is deliberately not invertible by `undo` — the same treatment claims get.
+    // update, undone by writing `record_json`'s columns back (`undo::Inverse::Columns`), which is
+    // why that helper emits **every** column rather than the ones this statement touched.
     changelog::upsert(
         conn,
         meta,
@@ -470,11 +471,23 @@ pub fn forget(conn: &Connection, meta: &WriteMeta, repo: &str, branch: &str) -> 
     let Some(before) = get(conn, repo, branch)? else {
         return Ok(false);
     };
+    // `id` and `created_at` alongside the record's own fields: `undo` re-inserts the row from
+    // exactly what is logged here, and `created_at` is NOT NULL with no default.
+    let (id, created_at): (i64, String) = conn
+        .prepare_cached(
+            "SELECT id, created_at FROM branch_records WHERE repo = ?1 AND branch = ?2",
+        )?
+        .query_row(params![repo, branch], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let removed = conn
         .prepare_cached("DELETE FROM branch_records WHERE repo = ?1 AND branch = ?2")?
         .execute(params![repo, branch])?;
     if removed == 0 {
         return Ok(false);
+    }
+    let mut row = record_json(&before);
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("id".to_owned(), json!(id));
+        obj.insert("created_at".to_owned(), json!(created_at));
     }
     changelog::append(
         conn,
@@ -482,7 +495,7 @@ pub fn forget(conn: &Connection, meta: &WriteMeta, repo: &str, branch: &str) -> 
         "delete",
         Entity::BranchRecords,
         &format!("{repo}:{branch}"),
-        Some(&record_json(&before)),
+        Some(&row),
         None,
     )?;
     Ok(true)
@@ -809,9 +822,9 @@ mod tests {
         );
     }
 
-    /// The pairing of `base::is_object_id` and the schema CHECK: the guard accepts uppercase hex
-    /// (git never emits it, a hand-written value can), so the writer lowercases and the two
-    /// cannot disagree about the same value.
+    /// The CHECK requires lowercase, so the writer lowercases what it is handed rather than
+    /// refusing it: git never emits uppercase hex, but a hand-written or test value can, and one
+    /// commit spellable two ways is one commit that can be recorded twice.
     #[test]
     fn an_uppercase_object_id_is_stored_lowercased_rather_than_refused() {
         let db = Db::open_in_memory().unwrap();
@@ -828,11 +841,12 @@ mod tests {
         );
     }
 
-    /// The invariant is the **schema's**, not the guard's. `base::is_object_id` exists to produce
-    /// a sentence rather than a constraint violation; bypass it and the store still refuses, which
-    /// is what makes "a symbolic revision is never stored" true however the value arrives.
+    /// The schema is the **only** check: nothing in Rust inspects a cut point's form before the
+    /// write, so `record_cut_point` is where a symbolic revision has to fail, whatever route it
+    /// arrived by. (`base::is_object_id` asks the same question, but on the reader's side —
+    /// `repo::base_is_usable` — for values that predate this table.)
     #[test]
-    fn the_schema_refuses_a_symbolic_revision_even_with_the_guard_bypassed() {
+    fn the_schema_is_what_refuses_a_symbolic_revision() {
         let db = Db::open_in_memory().unwrap();
         for bad in ["HEAD", "main", "@", "1111111", &"z".repeat(40)] {
             let planted = (*bad).to_owned();

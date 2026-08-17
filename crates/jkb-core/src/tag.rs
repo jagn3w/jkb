@@ -94,19 +94,29 @@ pub fn remove(
     facet: &str,
     value: &str,
 ) -> Result<()> {
+    // Read `props` before the delete: `undo` puts the application back from exactly the columns
+    // recorded here, and one restored without them is a different application.
+    let props: Option<String> = conn
+        .prepare_cached(
+            "SELECT props FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+        )?
+        .query_row(params![item.get(), facet, value], |r| r.get(0))
+        .optional()?;
     let removed = conn
         .prepare_cached(
             "DELETE FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
         )?
         .execute(params![item.get(), facet, value])?;
-    if removed > 0 {
+    if let (1.., Some(props)) = (removed, props) {
         changelog::append(
             conn,
             meta,
             "delete",
             Entity::TagApplications,
             &item.get().to_string(),
-            Some(&json!({ "item_id": item.get(), "facet": facet, "value": value })),
+            Some(&json!({
+                "item_id": item.get(), "facet": facet, "value": value, "props": props,
+            })),
             None,
         )?;
     }

@@ -232,19 +232,40 @@ pub fn unlink(
     dst: ItemId,
     edge_type: EdgeType,
 ) -> Result<()> {
+    // The WHOLE row, under the column names `edges` actually has. It used to log
+    // `{src, dst, type}` — the arguments this function was called with, which name no column and
+    // omit the `props`, `weight` and `created_at` an edge carries — so `undo` had nothing to
+    // rebuild the edge from and the knowledge the edge encoded was simply gone.
+    let row = conn
+        .prepare_cached(
+            "SELECT id, src_item_id, dst_item_id, type, props, weight, created_at FROM edges
+              WHERE src_item_id = ?1 AND dst_item_id = ?2 AND type = ?3",
+        )?
+        .query_row(params![src.get(), dst.get(), edge_type.as_str()], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "src_item_id": r.get::<_, i64>(1)?,
+                "dst_item_id": r.get::<_, i64>(2)?,
+                "type": r.get::<_, String>(3)?,
+                "props": r.get::<_, String>(4)?,
+                "weight": r.get::<_, Option<f64>>(5)?,
+                "created_at": r.get::<_, String>(6)?,
+            }))
+        })
+        .optional()?;
     let removed = conn
         .prepare_cached(
             "DELETE FROM edges WHERE src_item_id = ?1 AND dst_item_id = ?2 AND type = ?3",
         )?
         .execute(params![src.get(), dst.get(), edge_type.as_str()])?;
-    if removed > 0 {
+    if let (1.., Some(row)) = (removed, row) {
         changelog::append(
             conn,
             meta,
             "delete",
             Entity::Edges,
             &format!("{}->{}", src.get(), dst.get()),
-            Some(&json!({ "src": src.get(), "dst": dst.get(), "type": edge_type.as_str() })),
+            Some(&row),
             None,
         )?;
     }

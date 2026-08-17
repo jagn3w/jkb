@@ -791,11 +791,18 @@ pub fn set_content(
     content: &str,
     content_hash: Option<&str>,
 ) -> Result<()> {
-    let before: Option<String> = conn
-        .prepare_cached("SELECT content FROM items WHERE id = ?1")?
-        .query_row([item.get()], |row| row.get::<_, Option<String>>(0))
-        .optional()?
-        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    // The previous body, under the column names it came from. It used to be logged as
+    // `{"content_len": n}`, which reads like a before-state and restores nothing: `jkb undo`
+    // of a sync import would have left the imported text in place. Both columns are needed —
+    // restoring the content while leaving `content_hash` describing the new text would make the
+    // item its own mismatch. `changelog::write` now refuses a payload that names anything but
+    // this table's columns, so the old shape cannot come back.
+    let before: Option<(Option<String>, Option<String>)> = conn
+        .prepare_cached("SELECT content, content_hash FROM items WHERE id = ?1")?
+        .query_row([item.get()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    let (before_content, before_hash) =
+        before.ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
     conn.prepare_cached(
         "UPDATE items SET content = ?2, content_hash = ?3,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -808,8 +815,8 @@ pub fn set_content(
         "update",
         Entity::Items,
         &item.get().to_string(),
-        Some(&json!({ "content_len": before.map(|c| c.len()) })),
-        Some(&json!({ "content_len": content.len() })),
+        Some(&json!({ "content": before_content, "content_hash": before_hash })),
+        Some(&json!({ "content": content, "content_hash": content_hash })),
     )?;
     Ok(())
 }
