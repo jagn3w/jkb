@@ -46,6 +46,24 @@
 //! nobody has taught this module about is a named refusal rather than a transaction that fails
 //! identically for ever.
 //!
+//! ## …which requires every arm to report its result honestly
+//!
+//! The wrapper can only see failures that are *reported*. Several arms used to answer `Ok(0)` for
+//! work they had not done — an `INSERT OR IGNORE` whose UNIQUE key an unlogged writer had
+//! re-taken, an `UPDATE … WHERE rowid = ?` addressing a row since deleted, an arm handed no
+//! before-state at all — and a lie there is worse than a raw error, because [`undo`] writes its
+//! `undo` marker on the strength of it. The user is told "reverted 0 change(s)", exit 0; then
+//! clearing the obstruction and re-running meets [`already_undone`], and the before-state is gone
+//! for good.
+//!
+//! So: **a count that could not be taken is not spelled the same as a count of none** (the rule
+//! `gitrepo::ahead_count` and `gitrepo::has_own_commits` were each corrected against). [`restored`]
+//! is the one place a restoring statement's row count is judged, and a restore reports zero only
+//! where a named condition says the row was deliberately not put back — in this module, exactly
+//! one: [`restore_children`]'s `WHERE EXISTS` guards, skipping a row whose other endpoint is gone.
+//! [`Inverse::DeleteRow`] is the only arm for which zero is honest without a guard, because the
+//! state an insert's inverse promises is *absence*, which a `DELETE` matching nothing already has.
+//!
 //! ## The inverses
 //!
 //! Listed once, in [`INVERSES`]. **Inserts** are reversed by deleting the affected row by `rowid`
@@ -101,7 +119,8 @@ enum Inverse {
     /// The mirror image of [`Inverse::Columns`], driven by the same payload — but validated more
     /// strictly: a deleted row's before-state must name **every** column of its table, because
     /// there is no surviving row for the unnamed ones to keep their values in. See
-    /// [`check_restorable`]. `OR IGNORE`, so re-running an undo is not an error.
+    /// [`check_restorable`]. A plain `INSERT`, so a key some unlogged writer has re-taken is a
+    /// refusal rather than a swallowed conflict — see [`reinsert_row`].
     ReinsertRow,
     /// Delete the inserted row by `rowid`.
     DeleteRow,
@@ -283,6 +302,32 @@ fn restorable_fields(
         .unwrap_or_default())
 }
 
+/// The row count a **restoring** statement reported, or the error that a restore which restored
+/// nothing is.
+///
+/// A count that could not be taken must not be spelled the same as a count of none — the rule
+/// `gitrepo::ahead_count` and `gitrepo::has_own_commits` were each corrected against, here in
+/// undo's arms. Every arm of [`invert_entry`] returns a row count, [`undo`] adds it to the number
+/// it reports as reverted, and an arm that restored nothing while returning `Ok(0)` is claiming to
+/// have done work it did not do. That lie is not merely a wrong number: **`undo` writes its
+/// `undo` marker only when every inverse succeeded**, so a truthful failure is a named refusal the
+/// user can retry after clearing whatever is in the way, while `Ok(0)` reports success, marks the
+/// transaction undone, and makes the retry refuse with "it has already been undone" — the
+/// before-state gone for good.
+///
+/// So a restore reports zero **only** where a named condition says the row was deliberately not
+/// put back; every other zero comes through here. The one such condition in this module is an
+/// endpoint that no longer exists (see [`restore_children`]), and it is expressed as a `WHERE
+/// EXISTS` guard on the statement rather than as an `OR IGNORE` that would also hide a conflict.
+fn restored(rows: usize, nothing_happened: &str) -> Result<usize> {
+    if rows == 0 {
+        return Err(
+            TypeError::Validation(format!("it restored nothing — {nothing_happened}")).into(),
+        );
+    }
+    Ok(rows)
+}
+
 /// Put the columns named in `before` back on the row `entity_id` identifies.
 fn restore_columns(
     conn: &Connection,
@@ -299,10 +344,7 @@ fn restore_columns(
         ))
         .into());
     };
-    let fields = restorable_fields(conn, op, table, before)?;
-    if fields.is_empty() {
-        return Ok(0);
-    }
+    let fields = empty_is_a_refusal(restorable_fields(conn, op, table, before)?, op, table)?;
     // Every key column here is an integer one; a row id that is not a number is a corrupt entry,
     // not something to coerce.
     let row: i64 = entity_id.parse().map_err(|_| {
@@ -325,7 +367,38 @@ fn restore_columns(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    Ok(conn.prepare_cached(&sql)?.execute(params_from_iter(args))?)
+    // NO ROW, NO RESTORE. `UPDATE … WHERE rowid = ?` matching nothing means the row this entry
+    // describes is gone — deleted by a later transaction, or an `items` row whose delete is being
+    // undone in the wrong order — so the before-state was written nowhere. Reported as zero it was
+    // indistinguishable from a restore that happened, and the marker written on the strength of it
+    // made the retry refuse.
+    restored(
+        conn.prepare_cached(&sql)?.execute(params_from_iter(args))?,
+        &format!(
+            "no row of `{table}` has rowid {row} any more, so its previous values have \
+                  nowhere to go — put that row back first, or revert the change that removed it"
+        ),
+    )
+}
+
+/// A before-state that named no column is a refusal, not an empty restore.
+///
+/// [`check_restorable`] has already refused an absent or empty before-state for every op/table
+/// pair [`row_shaped`] covers, so this cannot fire for one of them — and an unreachable
+/// `return Ok(0)` in its place is the same lie as any other: it says "restored, zero rows".
+fn empty_is_a_refusal(
+    fields: Vec<(String, SqlValue)>,
+    op: &str,
+    table: &str,
+) -> Result<Vec<(String, SqlValue)>> {
+    if fields.is_empty() {
+        return Err(TypeError::Validation(format!(
+            "the before-state logged for this `{op}` on `{table}` names no column of it, so there \
+             is nothing to restore"
+        ))
+        .into());
+    }
+    Ok(fields)
 }
 
 /// Put a deleted row back, exactly as `before` describes it.
@@ -336,15 +409,28 @@ fn reinsert_row(conn: &Connection, op: &str, table: &str, before: Option<&Value>
         ))
         .into());
     };
-    let fields = restorable_fields(conn, op, table, before)?;
-    if fields.is_empty() {
-        return Ok(0);
-    }
-    // `OR IGNORE` so a re-run is not an error, and so a row whose foreign keys are gone (the other
-    // end of an edge deleted in the same transaction and not restored) is skipped rather than
-    // failing the whole undo — the rule `restore_children` already follows.
+    let fields = empty_is_a_refusal(restorable_fields(conn, op, table, before)?, op, table)?;
+    // A PLAIN `INSERT`. This was `INSERT OR IGNORE`, on two rationales that were both false.
+    //
+    // *"so a row whose foreign keys are gone is skipped rather than failing the whole undo."*
+    // `SQLite`'s ON CONFLICT clauses apply to UNIQUE, NOT NULL, CHECK and PRIMARY KEY constraints
+    // and **not** to FOREIGN KEY constraints, so `OR IGNORE` never skipped a dangling-endpoint row
+    // — it raised, exactly as a plain `INSERT` does. Verified by execution, not by reading. What
+    // does skip such a row is `restore_children`'s explicit `WHERE EXISTS` guards.
+    //
+    // *"so a re-run is not an error."* A completed undo is refused by `already_undone`; a
+    // rolled-back one left nothing behind to collide with.
+    //
+    // What `OR IGNORE` did do was swallow the case this whole module exists for: an unlogged
+    // writer re-taking a UNIQUE key (`ns::ensure` re-creating a deleted `namespaces.path`,
+    // `apply_doc` re-placing a placement, `jkb task depend` re-linking an edge). The conflict
+    // vanished, the arm answered `Ok(0)`, the CLI printed "reverted 0 change(s)" and exited 0 —
+    // and then the marker was written, so clearing the conflict and re-running met "it has already
+    // been undone" with the row's `metadata` — its namespace type, a file's sync structure, a
+    // repo's gate — gone for good. Now the conflict leaves through `undo`'s funnel as a named
+    // refusal, nothing is marked, and the retry works.
     let sql = format!(
-        "INSERT OR IGNORE INTO \"{}\" ({}) VALUES ({})",
+        "INSERT INTO \"{}\" ({}) VALUES ({})",
         entity.as_str(),
         fields
             .iter()
@@ -353,6 +439,9 @@ fn reinsert_row(conn: &Connection, op: &str, table: &str, before: Option<&Value>
             .join(", "),
         vec!["?"; fields.len()].join(", ")
     );
+    // Not wrapped in `restored`: an unqualified `INSERT … VALUES` either inserts its one row or
+    // raises, so a zero here is not a state. It is `OR IGNORE` that makes zero reachable, which is
+    // the whole reason it is gone.
     Ok(conn
         .prepare_cached(&sql)?
         .execute(params_from_iter(fields.into_iter().map(|(_, v)| v)))?)
@@ -482,7 +571,20 @@ fn invert_entry(
     let mut rows = 0;
     // Dispatch through `INVERSES` — the same list `undo` refuses a missing entry from.
     let Some(inverse) = inverse_for(op, table) else {
-        return Ok(0);
+        // ZERO IS THE ANSWER FOR BOOKKEEPING, AND ONLY FOR IT. The one member that gets here is
+        // the `undo` marker itself: undoing an undo is not something this module does, and there
+        // is no work behind the entry to leave un-restored. A *work* entry with no inverse is
+        // `blocker`'s refusal, so reaching here with one would mean the scan and the dispatch
+        // disagree about `INVERSES` — which is the "reverted 0 change(s)" that left the row you
+        // asked about untouched, back again one layer down.
+        return if is_work(op, table) {
+            Err(TypeError::Validation(format!(
+                "no inverse for `{op}` on `{table}`, and the pre-flight did not catch it"
+            ))
+            .into())
+        } else {
+            Ok(0)
+        };
     };
     // A `match`, not an if-chain with a fall-through: the fall-through was
     // `DELETE FROM <table>`, so a future `Inverse` variant added to the enum and the table
@@ -504,69 +606,47 @@ fn invert_entry(
             })
             .transpose()
     };
+    // AN ABSENT BEFORE-STATE IS A REFUSAL, NOT AN EMPTY RESTORE. Four arms used to read it with
+    // `if let Some(snap)`, so an entry logged without one restored nothing and answered `Ok(0)` —
+    // the same lie as a swallowed conflict, and the more dangerous one on the three arms
+    // `check_restorable` does not cover (`edges`, `mounts`, `containment` are not `row_shaped`,
+    // so nothing validates their payloads at the write). Unreachable today, because every one of
+    // those entries is written by `changelog::upsert`, which derives `update` from a before-state
+    // being present — but "unreachable" is what the `OR IGNORE` conflict was assumed to be too.
+    let required = |what: &str| -> Result<Value> {
+        snapshot(what)?.ok_or_else(|| {
+            Error::from(TypeError::Validation(format!(
+                "reversing `{op}` on `{table}` needs the {what} it was logged with, and this entry \
+                 has none"
+            )))
+        })
+    };
     match inverse {
         // An item delete is inverted by putting the snapshot back (see `restore_item`).
         Inverse::ItemSnapshot => {
-            if let Some(snap) = snapshot("item snapshot")? {
-                rows += restore_item(conn, &snap)?;
-            }
+            rows += restore_item(conn, &required("item snapshot")?)?;
         }
         // An edge weight update is inverted by putting the previous weight back. Without
         // this the edge would keep whatever weight the undone transaction gave it.
         Inverse::EdgeWeight => {
-            if let Some(snap) = snapshot("edge before-state")? {
-                rows += conn
-                    .prepare_cached("UPDATE edges SET weight = ?2 WHERE rowid = ?1")?
-                    .execute(params![
-                        rowid()?,
-                        snap.get("weight").and_then(Value::as_f64)
-                    ])?;
-            }
+            rows += restore_edge_weight(conn, rowid()?, &required("edge before-state")?)?;
+        }
+        Inverse::SyncStateRow => {
+            rows += revert_sync_state(conn, entity_id, snapshot("sync journal before-state")?)?;
         }
         // A mount edit is inverted by putting the previous configuration back. `jkb mount
         // create` doubles as the update command, so without this the generic insert
         // inverse would `DELETE FROM mounts` and destroy a mount that existed before the
         // transaction, leaving its `file://` bindings with nothing to sync them.
-        Inverse::SyncStateRow => {
-            rows += revert_sync_state(conn, entity_id, snapshot("sync journal before-state")?)?;
-        }
         Inverse::MountConfig => {
-            if let Some(snap) = snapshot("mount before-state")? {
-                let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
-                rows += conn
-                    .prepare_cached(
-                        "UPDATE mounts
-                            SET backing_uri = ?2, sync_mode = ?3, serializer = ?4,
-                                include_glob = ?5, exclude_glob = ?6, conflict_policy = ?7
-                          WHERE namespace_id = ?1",
-                    )?
-                    .execute(params![
-                        rowid()?,
-                        field("backing_uri"),
-                        field("sync_mode"),
-                        field("serializer"),
-                        field("include_glob"),
-                        field("exclude_glob"),
-                        field("conflict_policy"),
-                    ])?;
-            }
+            rows += restore_mount_config(conn, rowid()?, &required("mount before-state")?)?;
         }
         // Re-parenting is an update, not an insert (`containment::contain` upserts on the
         // child), so the generic inverse would delete a row that existed beforehand and
         // un-parent the item instead of putting its previous container back.
         Inverse::ContainmentRow => {
-            if let Some(snap) = snapshot("containment before-state")? {
-                rows += conn
-                    .prepare_cached(
-                        "UPDATE containment SET parent_item_id = ?2, position = ?3
-                          WHERE child_item_id = ?1",
-                    )?
-                    .execute(params![
-                        rowid()?,
-                        snap.get("parent_item_id").and_then(Value::as_i64),
-                        snap.get("position").and_then(Value::as_i64).unwrap_or(0),
-                    ])?;
-            }
+            rows +=
+                restore_containment_row(conn, rowid()?, &required("containment before-state")?)?;
         }
         // Every write that changed an existing row, for the entities in `COLUMN_UPDATES`: put
         // the columns named in `before` back. Nothing is hand-written per statement, so a new
@@ -581,6 +661,12 @@ fn invert_entry(
             let snap = snapshot("deleted row")?;
             rows += reinsert_row(conn, op, table, snap.as_ref())?;
         }
+        // THE ONE ARM WHERE ZERO IS AN HONEST ANSWER, and the condition is worth naming because
+        // every other arm here now refuses one. The inverse of an insert is *absence*: a `DELETE`
+        // matching no row means the row this transaction created is already gone — dropped by a
+        // later `jkb item rm`, or cascaded away with its parent — so the state this arm promises
+        // is the state that already holds. Every restoring arm promises the opposite (a row with
+        // particular values *present*), which no count of zero can be evidence of.
         Inverse::DeleteRow => {
             // The interpolated name comes from the **enum**, not from the string the log handed
             // us: a row written by a newer binary, or a hand-edited log, cannot name a table this
@@ -596,6 +682,57 @@ fn invert_entry(
         }
     }
     Ok(rows)
+}
+
+/// Put an edge's previous weight back on the row `row` identifies.
+fn restore_edge_weight(conn: &Connection, row: i64, snap: &Value) -> Result<usize> {
+    restored(
+        conn.prepare_cached("UPDATE edges SET weight = ?2 WHERE rowid = ?1")?
+            .execute(params![row, snap.get("weight").and_then(Value::as_f64)])?,
+        &format!("edge {row} is gone, so its previous weight has nowhere to go"),
+    )
+}
+
+/// Put a mount's previous configuration back on the namespace `row` identifies.
+fn restore_mount_config(conn: &Connection, row: i64, snap: &Value) -> Result<usize> {
+    let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
+    restored(
+        conn.prepare_cached(
+            "UPDATE mounts
+                SET backing_uri = ?2, sync_mode = ?3, serializer = ?4,
+                    include_glob = ?5, exclude_glob = ?6, conflict_policy = ?7
+              WHERE namespace_id = ?1",
+        )?
+        .execute(params![
+            row,
+            field("backing_uri"),
+            field("sync_mode"),
+            field("serializer"),
+            field("include_glob"),
+            field("exclude_glob"),
+            field("conflict_policy"),
+        ])?,
+        &format!(
+            "namespace {row} has no mount any more, so its previous configuration has nowhere to go"
+        ),
+    )
+}
+
+/// Put an item's previous container and position back on the containment row keyed by `row`.
+fn restore_containment_row(conn: &Connection, row: i64, snap: &Value) -> Result<usize> {
+    restored(
+        conn.prepare_cached(
+            "UPDATE containment SET parent_item_id = ?2, position = ?3 WHERE child_item_id = ?1",
+        )?
+        .execute(params![
+            row,
+            snap.get("parent_item_id").and_then(Value::as_i64),
+            snap.get("position").and_then(Value::as_i64).unwrap_or(0),
+        ])?,
+        &format!(
+            "item {row} is contained by nothing now, so its previous container has nowhere to go"
+        ),
+    )
 }
 
 /// Put one sync journal row back the way it was, or remove one the transaction created.
@@ -635,17 +772,25 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
         // right — it is what lets an importing mount heal — but it is not by itself the guard.
         // The blob itself is never deleted (`jkb blob ls` still finds it), so this loses a
         // pointer, not content.
-        return Ok(conn
-            .prepare_cached(
+        //
+        // Zero rows is a lie here as much as on the restoring arm below: nothing in this codebase
+        // deletes a `sync_state` row (`grep -n "DELETE FROM sync_state" crates` is empty), so a
+        // uri with no row means the journal entry names a file the journal never had — and
+        // clearing nothing leaves the base still describing items this undo is deleting, which is
+        // precisely the item-less export the paragraph above exists to prevent.
+        return restored(
+            conn.prepare_cached(
                 "UPDATE sync_state
                     SET last_synced_hash = NULL, base_blob_hash = NULL, document = NULL
                   WHERE uri = ?1",
             )?
-            .execute(params![entity_id])?);
+            .execute(params![entity_id])?,
+            &format!("the sync journal has no row for `{entity_id}`, so its base was not cleared"),
+        );
     };
     let field = |k: &str| snap.get(k).and_then(Value::as_str).map(str::to_owned);
-    Ok(conn
-        .prepare_cached(
+    restored(
+        conn.prepare_cached(
             "UPDATE sync_state
                 SET status = ?2, serializer = ?3, last_synced_hash = ?4, base_blob_hash = ?5,
                     document = ?6, parse_error = ?7, quarantine_blob_hash = ?8
@@ -665,7 +810,9 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
             // `needs_attention` with nothing saying why.
             field("parse_error"),
             field("quarantine_blob_hash"),
-        ])?)
+        ])?,
+        &format!("the sync journal has no row for `{entity_id}` to restore"),
+    )
 }
 
 /// Why this entry's inverse could not be **run**, judged by inspection alone — or `None` if
@@ -956,9 +1103,10 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
 /// tag applications, edges, and binding that cascaded away with it. Returns the number of
 /// rows restored.
 ///
-/// The item is inserted **first** so the children's foreign keys resolve. Edges are inserted
-/// with `OR IGNORE`: if the item at the other end was itself deleted and not restored, that
-/// edge simply cannot come back, and skipping it is better than failing the whole undo.
+/// The item is inserted **first** so the children's foreign keys resolve. An edge or containment
+/// row whose other endpoint was itself deleted and not restored simply cannot come back, and
+/// skipping it is better than failing the whole undo — which is what the `WHERE EXISTS` guards in
+/// [`restore_children`] are for, and they are the only sanctioned way a restore here reports zero.
 fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
     let item = snapshot
         .get("item")
@@ -973,16 +1121,28 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
     // of them — one here and one in `item::snapshot` — and the next column added to the schema
     // would have been dropped by both on every restore, in silence. Now the columns come from
     // the payload and `check_restorable` requires the payload to name all of them.
-    let mut restored = reinsert_row(conn, DELETE, Entity::Items.as_str(), Some(snapshot))?;
+    let mut put_back = reinsert_row(conn, DELETE, Entity::Items.as_str(), Some(snapshot))?;
 
-    restored += restore_children(conn, snapshot, id)?;
-    Ok(restored)
+    put_back += restore_children(conn, snapshot, id)?;
+    Ok(put_back)
 }
 
 /// Restore the rows that `ON DELETE CASCADE` took with an item: its placements, tag
-/// applications, edges, and binding. Split out of `restore_item` so each table's column list
-/// stays readable. All inserts are `OR IGNORE` — re-running an undo must not fail on rows a
-/// previous attempt already put back.
+/// applications, edges, containment and binding. Split out of `restore_item` so each table's
+/// column list stays readable.
+///
+/// **The `WHERE EXISTS` guards are the one sanctioned way a restore in this module reports zero**,
+/// and they say exactly what they skip: a row whose *other* endpoint is not there to point at.
+/// Two items removed in one transaction produce two snapshots naming the same edge, and whichever
+/// is restored first cannot have it — so the guard is also what stops the second restore
+/// duplicating the first's row.
+///
+/// Every insert here was `OR IGNORE`, on the rationale that "re-running an undo must not fail on
+/// rows a previous attempt already put back". A *completed* undo is refused by [`already_undone`]
+/// and a rolled-back one left nothing behind, so what the clause actually did was hide a UNIQUE
+/// conflict as a silent zero — and it never did the foreign-key job the edge comment credited it
+/// with, because `SQLite`'s ON CONFLICT clauses do not apply to FOREIGN KEY constraints at all.
+/// Plain `INSERT`s now, so a conflict leaves through [`undo`]'s funnel as a named refusal.
 fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usize> {
     let rows = |key: &str| -> Vec<&Value> {
         snapshot
@@ -991,12 +1151,12 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             .map(|a| a.iter().collect())
             .unwrap_or_default()
     };
-    let mut restored = 0;
+    let mut put_back = 0;
 
     for placement in rows("placements") {
-        restored += conn
+        put_back += conn
             .prepare_cached(
-                "INSERT OR IGNORE INTO placements (item_id, namespace_id, role, position, metadata)
+                "INSERT INTO placements (item_id, namespace_id, role, position, metadata)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )?
             .execute(params![
@@ -1014,9 +1174,9 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             ])?;
     }
     for tag in rows("tags") {
-        restored += conn
+        put_back += conn
             .prepare_cached(
-                "INSERT OR IGNORE INTO tag_applications (item_id, facet, value, props)
+                "INSERT INTO tag_applications (item_id, facet, value, props)
                  VALUES (?1, ?2, ?3, ?4)",
             )?
             .execute(params![
@@ -1027,11 +1187,12 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             ])?;
     }
     for edge in rows("edges") {
-        // The `EXISTS` guards skip an edge whose other endpoint is gone — better than
-        // failing the whole undo on a foreign key.
-        restored += conn
+        // The `EXISTS` guards skip an edge whose other endpoint is gone — better than failing the
+        // whole undo on a foreign key. They, not the removed `OR IGNORE`, are what does that: an
+        // ON CONFLICT clause never applied to a FOREIGN KEY constraint.
+        put_back += conn
             .prepare_cached(
-                "INSERT OR IGNORE INTO edges
+                "INSERT INTO edges
                      (src_item_id, dst_item_id, type, props, weight, created_at)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6
                  WHERE EXISTS (SELECT 1 FROM items WHERE id = ?1)
@@ -1048,12 +1209,12 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
     }
     // Containment, both directions. `child_item_id` is the PRIMARY KEY, so re-inserting the
     // row that named this item's container is one statement; the rows for the items it
-    // contained are one each. `OR IGNORE` plus the `EXISTS` guard skips a row whose other
-    // endpoint is gone, exactly as the edges above do.
+    // contained are one each. The `EXISTS` guard skips a row whose other endpoint is gone,
+    // exactly as the edges above do.
     if let Some(c) = snapshot.get("contained_by").filter(|c| !c.is_null()) {
-        restored += conn
+        put_back += conn
             .prepare_cached(
-                "INSERT OR IGNORE INTO containment (child_item_id, parent_item_id, position)
+                "INSERT INTO containment (child_item_id, parent_item_id, position)
                  SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM items WHERE id = ?2)",
             )?
             .execute(params![
@@ -1063,9 +1224,9 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             ])?;
     }
     for c in rows("contains") {
-        restored += conn
+        put_back += conn
             .prepare_cached(
-                "INSERT OR IGNORE INTO containment (child_item_id, parent_item_id, position)
+                "INSERT INTO containment (child_item_id, parent_item_id, position)
                  SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM items WHERE id = ?1)",
             )?
             .execute(params![
@@ -1075,9 +1236,9 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             ])?;
     }
     if let Some(binding) = snapshot.get("binding").filter(|b| !b.is_null()) {
-        restored += conn
+        put_back += conn
             .prepare_cached(
-                "INSERT OR IGNORE INTO bindings
+                "INSERT INTO bindings
                      (item_id, uri, sync_mode, serializer, last_synced_hash, last_synced_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
@@ -1090,7 +1251,7 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
                 binding.get("last_synced_at").and_then(Value::as_str),
             ])?;
     }
-    Ok(restored)
+    Ok(put_back)
 }
 
 /// Undo the most recent transaction containing **work** that has not already been undone, and
@@ -2469,6 +2630,134 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "`jkb undo <older>`, the way out the refusal advertises, did nothing"
+        );
+    }
+
+    /// A re-insert whose key an **unlogged** writer has re-taken refuses, and the retry works
+    /// once the obstruction is cleared.
+    ///
+    /// The finding's exact sequence: `jkb ns mk probe/zone` → `jkb ns rm probe/zone` (logging the
+    /// whole row) → `jkb ns mk probe/zone` again — `ns::ensure` takes no `WriteMeta`, logs nothing,
+    /// and re-takes the UNIQUE `namespaces.path` — → `jkb undo`. The reinsert was
+    /// `INSERT OR IGNORE`, so the conflict vanished, the arm answered `Ok(0)`, and the CLI printed
+    /// "reverted 0 change(s)" and exited 0. **The marker was then written**, so clearing the
+    /// conflicting namespace and re-running the documented recovery met "it has already been
+    /// undone" and the original row's `metadata` — its type, a file's sync structure, a repo's
+    /// gate — was gone for good.
+    ///
+    /// Both halves are asserted, and the second is the one that shows recoverability came back:
+    /// a refusal that still marked the transaction would pass the first assertion alone.
+    #[test]
+    fn a_reinsert_whose_key_was_re_taken_refuses_and_the_retry_works_once_it_is_cleared() {
+        use crate::ns;
+        use serde_json::json;
+
+        let db = Db::open_in_memory().unwrap();
+        let zone = db
+            .write_txn("t", |c, _| ns::ensure(c, "probe/zone"))
+            .unwrap();
+        // Something worth losing, on the row the delete snapshots.
+        db.write_txn("t", move |c, m| {
+            ns::set_metadata(c, m, zone, &json!({ "gate": "scripts/check.sh" }))
+        })
+        .unwrap();
+        let removed = db
+            .write_txn("t", |c, m| {
+                ns::remove(c, m, "probe/zone")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // …and the unlogged writer takes the path back. No changelog entry, so nothing about the
+        // log foresees the conflict.
+        db.write_txn("t", |c, _| ns::ensure(c, "probe/zone"))
+            .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect_err("a swallowed UNIQUE conflict was reported as a successful undo")
+            .to_string();
+        assert!(
+            err.contains(&format!("transaction {removed} cannot be undone"))
+                && err.contains("Nothing was changed.")
+                && err.contains("UNIQUE"),
+            "the swallowed conflict is not a named refusal naming the constraint: {err}"
+        );
+
+        // The user clears what is in the way and runs the documented recovery again.
+        db.write_txn("t", |c, m| ns::remove(c, m, "probe/zone"))
+            .unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect("the retry was refused, so the refused undo had marked the transaction anyway");
+
+        let restored = db
+            .read(|c| ns::get(c, "probe/zone"))
+            .unwrap()
+            .expect("the namespace did not come back");
+        assert_eq!(
+            restored, zone,
+            "the namespace came back under a different id, so nothing that referenced it resolves"
+        );
+        assert_eq!(
+            db.read(move |c| ns::get_metadata(c, zone)).unwrap(),
+            Some(json!({ "gate": "scripts/check.sh" })),
+            "the row came back without the metadata the delete had snapshotted"
+        );
+    }
+
+    /// A partially-applied undo is **rolled back**, and the failing entry is not the first applied.
+    ///
+    /// `an_inverse_the_database_refuses_is_a_named_refusal_not_a_wedge` above cannot show this:
+    /// `tag::rename_facet` logs its `tag_applications` entries *before* its `tag_defs` entry and
+    /// the loop applies `ORDER BY id DESC`, so the entry that fails is the **first** one applied —
+    /// nothing has been applied to roll back, and its "the refused undo moved something" assertion
+    /// would hold with `write_txn`'s rollback disabled. Round 8's funnel is the first mechanism
+    /// under which a partially-applied undo exists at all.
+    ///
+    /// So: one transaction whose highest-id entry (`item::set_content`, applied first) inverts
+    /// cleanly and whose next entry (the rename's `tag_defs` row) hits the UNIQUE index. The
+    /// content must be back at its **post-transaction** value afterwards.
+    #[test]
+    fn a_partly_applied_undo_is_rolled_back_whole() {
+        use crate::{item, tag};
+
+        let db = Db::open_in_memory().unwrap();
+        let a = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                tag::apply(c, m, a, "size", "small")?;
+                item::set_content(c, m, a, "before the change", None)?;
+                Ok(a)
+            })
+            .unwrap();
+        // ONE transaction, two invertible entries. The content edit is logged last, so `ORDER BY
+        // id DESC` applies its inverse first — cleanly — and the rename's `tag_defs` row second.
+        let mixed = db
+            .write_txn("t", move |c, m| {
+                tag::rename_facet(c, m, "size", "scale")?;
+                item::set_content(c, m, a, "after the change", None)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // The unlogged re-declaration that makes the rename's inverse violate the UNIQUE index.
+        db.write_txn("t", |c, m| {
+            let b = upsert(c, m, &note("b"))?;
+            tag::apply(c, m, b, "size", "tiny")
+        })
+        .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, mixed))
+            .expect_err("the mixed transaction was undone despite an inverse the database refuses")
+            .to_string();
+        assert!(
+            err.contains("Nothing was changed."),
+            "the refusal does not claim nothing moved: {err}"
+        );
+        assert_eq!(
+            db.read(move |c| item::get_content(c, a)).unwrap(),
+            Some("after the change".to_owned()),
+            "the inverse that ran before the failing one was left applied, so `Nothing was \
+             changed.` is false and half the transaction is undone"
         );
     }
 
