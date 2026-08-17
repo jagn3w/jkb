@@ -117,6 +117,22 @@ pub(crate) enum Advice {
     /// carried away — fast-forwarded into a batch, squashed into trunk, or rebased. Anything
     /// measurable here is its tip, and `cut_point == tip` freezes the task for good.
     TooLate,
+    /// The branch has no commits of its own and the **ref journal cannot say** whether it was ever
+    /// started — so which of [`Self::Measure`] and [`Self::TooLate`] applies is unknown.
+    ///
+    /// Its own variant because the two answers have opposite consequences and the difference is
+    /// visible to the reader. Folded into `TooLate`, this state told the reader as **fact** that
+    /// the branch "has moved since it was cut … so its work was carried away", and offered closing
+    /// the task — about a branch that may be untouched and unstarted. Reached by
+    /// `core.logAllRefUpdates=false`, reflog expiry, a reftable repository, and a branch that
+    /// exists only as `origin/<b>` (the ordinary state after a merged PR deletes the local copy),
+    /// so it is not a corner.
+    ///
+    /// It still withholds the measuring verb, and that is deliberate rather than an oversight:
+    /// with the journal unreadable, "never started" and "merged away" present one identical
+    /// signature (D34.4), and measuring an untouched-*looking* branch records its tip. Not
+    /// knowing is a reason to say so, not a reason to act.
+    Unverifiable,
     /// The branch does not exist in this repository.
     Gone,
     /// Git could not walk the repository's refs, so nothing about the branch can be established.
@@ -142,6 +158,16 @@ impl Advice {
                  lands. If this work did land, close the task directly (`jkb task set <uid> \
                  --status done`)"
             ),
+            // Names no verb either — but says what is unknown rather than asserting the worse of
+            // the two possibilities as fact.
+            Self::Unverifiable => format!(
+                "nothing here can measure it: {branch} has no commits of its own, and this \
+                 repository's ref journal for it cannot be read (reflogs disabled, expired, or a \
+                 branch that exists only on the remote), so whether it was never started or its \
+                 work was already carried away cannot be told apart here. Both look identical to \
+                 git, and measuring on the wrong one records the tip — which reads as \"nothing \
+                 has happened on this branch\" for ever. Check what landed before deciding"
+            ),
             Self::Gone => format!(
                 "{branch} does not exist in this repository, so nothing here can measure it — \
                  remove the stale record (`jkb task tag rm <uid> branch={branch}`), or close the \
@@ -166,8 +192,12 @@ impl Advice {
         match self {
             Self::Measure => 0,
             Self::CannotAsk => 1,
-            Self::Gone => 2,
-            Self::TooLate => 3,
+            // Above `CannotAsk` (which is a repository fault, not a fact about this branch) and
+            // below the two that state something definite: given a choice of sentences, one that
+            // names what happened beats one that says it cannot be told.
+            Self::Unverifiable => 2,
+            Self::Gone => 3,
+            Self::TooLate => 4,
         }
     }
 }
@@ -219,11 +249,18 @@ pub(crate) fn advice(repo_root: &std::path::Path, branch: &str) -> jkb_core::Res
         // revision, so its tip provably *is* its fork point and recording it is right. A branch
         // that has moved and yet has nothing of its own had its work taken elsewhere.
         //
-        // Absent or truncated journal → `TooLate`, the conservative side: withholding the verb
+        // Absent or truncated journal → withhold the verb, the conservative side: withholding it
         // costs a sentence, naming it on a merged-away branch costs the task permanently.
+        //
+        // But "the journal says it moved" and "the journal could not be read" are two states, and
+        // they were spelled the same. Only the first is evidence that the work was carried away;
+        // saying so about the second told a reader with reflogs disabled — or with a branch that
+        // exists only as `origin/<b>`, which never has a local journal — that their untouched
+        // branch's work had already landed, and offered to close the task.
         Untouched::At(tip) => match git(gitrepo::ref_journal(repo_root, branch))? {
             Some(journal) if journal.anchor_sha == tip => Advice::Measure,
-            _ => Advice::TooLate,
+            Some(_) => Advice::TooLate,
+            None => Advice::Unverifiable,
         },
         Untouched::Unknown => Advice::CannotAsk,
     })
@@ -241,10 +278,12 @@ pub(crate) fn advice(repo_root: &std::path::Path, branch: &str) -> jkb_core::Res
 ///
 /// 40 hex digits for sha-1, 64 for a sha-256 repository.
 ///
-/// The **invariant** is the schema's — `branch_records` has the same rule as a CHECK, so a value
-/// that reached the store by any route passed it. This copy exists so a refusal is a sentence
-/// rather than a constraint violation, and is read on the reader's side too
-/// ([`crate::repo::base_is_usable`]) for values that predate the table.
+/// **This is not the guard on the write.** `branch_records`' CHECK is, and it is the only one:
+/// nothing calls this before a cut point is stored, so a symbolic revision fails as a constraint
+/// violation. What this is for is the two questions git cannot be asked — whether a value
+/// *recorded before that CHECK existed* still has the right form ([`crate::repo::base_is_usable`]),
+/// and whether a landing's `landed_head` is a commit id at all, since one that is not can never be
+/// credited and recording it would mean "never credited" while reading as "recorded".
 pub(crate) fn is_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit())
 }

@@ -286,17 +286,48 @@ pub(crate) fn record_land_target(
     Ok(())
 }
 
+/// Record that `branch`'s work reached `onto`, with `head` the tip that landed — the **one**
+/// writer of a landing event.
+///
+/// It is a separate function for the reason the land target is: both columns hold a *branch name*
+/// that a reader looks a record up by, and a spelling no reader resolves is silent. Round 3 fixed
+/// exactly that for `land_target` and its commit called [`record_land_target`] "the single
+/// writer"; it was not — `jkb task landed` writes `landed_onto` and was never routed through it,
+/// so `--onto batch-tag` (a tag on the batch commit, which `is_merged` resolves perfectly well)
+/// stored a key `branch_record` misses, holding every task on that branch for ever with no repair
+/// verb. Now `jkb_core::branch::record_landing` has exactly one caller outside its own tests.
+///
+/// Both names are canonicalized, not just the target: `branch` is what the record is keyed by, so
+/// storing `origin/grp` there would make the row unreachable from the task that names `grp`.
+///
+/// # Errors
+/// Returns an error if git cannot be run, if either name is not a branch in this repository, or if
+/// the write fails.
+pub(crate) fn record_landing(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    repo_root: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    onto: &str,
+    head: &str,
+) -> jkb_core::Result<()> {
+    let branch = canonical_branch(repo_root, branch)?;
+    let onto = canonical_branch(repo_root, onto)?;
+    jkb_core::branch::record_landing(conn, meta, repo, &branch, &onto, head)
+}
+
 /// The bare branch name `target` refers to here, or a refusal naming what it actually is.
 ///
-/// The refusal is the point: a value that is not a branch cannot be *stored* as a land target,
-/// whichever flag it arrived through, because every reader looks the target up by branch name and
-/// a miss there is silent.
+/// The refusal is the point: a value that is not a branch cannot be *stored* in a column readers
+/// look branches up by — a land target or either half of a landing event — whichever flag it
+/// arrived through, because a miss there is silent.
 fn canonical_branch(root: &std::path::Path, target: &str) -> jkb_core::Result<String> {
     let refuse = |what: &str| {
         Err(jkb_types::Error::Validation(format!(
-            "`{target}` {what}, so it cannot be recorded as a land target — `jkb staging ls` \
-             looks batches up by branch name, and a task whose target is not one simply \
-             disappears from it"
+            "`{target}` {what}, so it cannot be recorded as a branch — `jkb staging ls` and \
+             `jkb task close-merged` look branches up by name, and a task whose record names \
+             something else simply disappears from them"
         ))
         .into())
     };
@@ -659,6 +690,33 @@ pub(crate) fn landed_for_action(
         if landing.onto == trunk_ref {
             return Ok((crate::gitrepo::MergeState::Merged, false));
         }
+        // FOLLOWING THE HOP MUST NOT MAKE THE ANSWER WORSE. Deleting a batch branch once it has
+        // landed is ordinary cleanup — `batch_is_spent`/`release_base_worktree` exist to do it —
+        // and asking `is_merged` about a branch that is gone answers `BranchMissing`. That state
+        // then travelled back to `close-merged` as if it were about one of the *task's own*
+        // branches: it held the task for ever and printed `jkb task tag rm <uid> branch=<name>`,
+        // naming the live branch, which is the only record of the work that actually landed. With
+        // no landing event at all and the identical git state, the same task closes.
+        //
+        // So a target that no longer resolves means the event **cannot decide**, and we fall back
+        // to the inference for the branch we are standing on — which is what answered before the
+        // event existed. That is the conservative direction in both cases: a batch deleted after
+        // reaching trunk leaves this branch's commits in trunk (closes, correctly), and one
+        // deleted while abandoned leaves them out of it (holds, correctly).
+        match crate::gitrepo::branch_ref(cwd, &landing.onto, prefer) {
+            Ok(Some(_)) => {}
+            // Gone, or git could not say — neither is a licence to attribute the target's state
+            // to this branch.
+            Ok(None) | Err(_) => {
+                return landed_with_base(
+                    cwd,
+                    &asking,
+                    trunk_ref,
+                    record.cut_point.as_deref(),
+                    prefer,
+                )
+            }
+        }
         asking = landing.onto.clone();
     }
     Ok((crate::gitrepo::MergeState::NothingToMerge, false))
@@ -745,9 +803,9 @@ pub(crate) fn landed_with_base(
     // question and deliberately falls through when it has no usable base. The routes it once
     // caught are gone — no verb takes a commit id, and `base=` is an ordinary facet nothing reads
     // — but a value can still be unresolvable *here*: a record made in another clone of the
-    // repository, or one whose commit has since been garbage-collected. The schema's CHECK
-    // (`branch_records`, mirrored by `base::is_object_id`) governs the value's **form**; only git
-    // can answer whether this checkout has the object.
+    // repository, or one whose commit has since been garbage-collected. The value's **form** is
+    // governed by the `branch_records` CHECK, which is the only thing enforcing it — nothing in
+    // Rust checks before the write; only git can answer whether this checkout has the object.
     if !base_is_usable(cwd, Some(base))? {
         return Ok((crate::gitrepo::MergeState::NothingToMerge, false));
     }

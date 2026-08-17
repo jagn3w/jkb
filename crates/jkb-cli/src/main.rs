@@ -4789,14 +4789,18 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
             advice.sentence("<uid>", branch)
         );
     }
-    let (key, b, o, h) = (
+    let (key, root, b, o, h) = (
         ctx.key.clone(),
+        ctx.root.clone(),
         branch.to_owned(),
         onto.to_owned(),
         head.clone(),
     );
+    // Through `repo::record_landing`, which canonicalizes both names. `valid_ref` above rejects
+    // only an unusable *string*; a tag, an object id or `origin/<batch>` all pass it and all
+    // resolve for `is_merged`, then store a `landed_onto` no reader looks up.
     db.write_txn("cli", move |conn, meta| {
-        jkb_core::branch::record_landing(conn, meta, &key, &b, &o, &h)
+        repo::record_landing(conn, meta, &root, &key, &b, &o, &h)
     })?;
     // Whether the event can ever be *credited* — reported, because it cannot be repaired from
     // here. `close-merged` follows a landing to its target and then asks whether that target
@@ -5729,15 +5733,28 @@ fn settle_landing(
     // After the gate, deliberately: a land that rolled back must leave no event. Before the
     // session-disposal guard below, equally deliberately: the commits are on the target by this
     // point, so the event is true whatever happens to the worktree.
+    //
+    // WHAT IS RECORDED IS WHERE THE BRANCH WILL POINT WHEN THIS COMMAND EXITS. `credited` compares
+    // the branch's tip against `landed_head`, and the `--keep-worktree` arm below re-points the
+    // branch to the grafted commit — so recording the pre-graft tip there wrote an event that
+    // could never match, silently discarding the one piece of evidence jkb had about a landing it
+    // performed itself. The ordinary arm deletes the branch, and a gone branch is credited
+    // outright, so its `head` is only ever read if the deletion fails.
     if let Some(head) = landed.head {
-        let (key, branch, onto, head) = (
+        let recorded = if landed.keep_worktree {
+            landed.grafted
+        } else {
+            head
+        };
+        let (key, root, branch, onto, recorded) = (
             ctx.key.clone(),
+            ctx.root.clone(),
             landed.branch.to_owned(),
             landed.onto.to_owned(),
-            head.to_owned(),
+            recorded.to_owned(),
         );
         db.write_txn("cli", move |conn, meta| {
-            jkb_core::branch::record_landing(conn, meta, &key, &branch, &onto, &head)
+            repo::record_landing(conn, meta, &root, &key, &branch, &onto, &recorded)
         })?;
     }
 
@@ -6414,6 +6431,7 @@ fn cmd_task_close_merged(
     let mut pending = Vec::new();
     let mut undecidable = Vec::new();
     let mut unresolvable = Vec::new();
+    let mut stale_record = Vec::new();
     let mut warned_fallback = false;
     // Every branch record in the repo, in one read — the buckets below ask about a task's
     // branches once per task, and this also runs from `scripts/hooks/post-merge`.
@@ -6470,58 +6488,30 @@ fn cmd_task_close_merged(
             // branch and one unusable cut point would otherwise be labelled by whichever sorted
             // lower. The decision to hold was never in doubt either way; the explanation was.
             gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
-                // Two different faults, two different remedies: a branch with NO cut point
-                // needs one measured (`task start --onto`), while one whose recorded value this
-                // repo cannot resolve needs that value *dropped* first. Collapsed into one bucket,
-                // the message could only name one verb.
-                //
-                // Bucketed per **branch**, not per task. A task may legitimately record two
-                // (`BranchWrite::Add`, the quick-add modifier, `task tag add`), and folding them
-                // with an AND over "usable" and an OR over "recorded" mislabelled every task whose
-                // branches differ in fault: one branch with a good cut point beside one with none
-                // routed to "its recorded cut point does not resolve", which was true of neither
-                // half, and named a repair that would do nothing. A task in both states now
-                // appears under both, each naming only the branches that are actually in it.
-                let mut no_cut_point = Vec::new();
-                let mut unusable_cut_point = Vec::new();
-                for b in &branches {
-                    let recorded = records.get(b).and_then(|r| r.cut_point.as_deref());
-                    match recorded {
-                        None => no_cut_point.push(b.clone()),
-                        Some(v) if !repo::base_is_usable(&cwd, Some(v))? => {
-                            unusable_cut_point.push(b.clone());
-                        }
-                        Some(_) => {}
-                    }
-                }
-                let gone = gone_branches(&cwd, &branches)?;
-                // A vanished branch keeps its own message. Hoisting the base check above
-                // `is_merged` meant `landed_with_base` short-circuits before branch existence is
-                // ever probed, so a task that was BOTH gone and missing a cut point stopped
-                // reporting `BranchMissing` and told the user to record a cut point — advice that
-                // changes nothing except which problem the next run names.
-                if !gone.is_empty() {
-                    blocked.push((
+                match hold_reason(&cwd, &branches, &records)? {
+                    Hold::Gone(b) => blocked.push((
                         uid,
-                        format!(
-                            "{} gone — `jkb task tag rm <uid> branch=<name>` if stale",
-                            gone.join(", ")
-                        ),
-                    ));
-                } else if no_cut_point.is_empty() && unusable_cut_point.is_empty() {
-                    pending.push((uid, branch));
-                } else {
-                    // The remedy is asked of git here, where the branch names are still separate,
-                    // and carried into the report — `report_close_merged` cannot know whether
-                    // measuring is safe for these branches, and a branch that reaches this bucket
-                    // *after* its work landed is exactly the one where it is not (`base::advice`).
-                    if !no_cut_point.is_empty() {
-                        let remedy = base::advice_for_any(&cwd, &uid, &no_cut_point)?;
-                        undecidable.push((uid.clone(), no_cut_point.join(", "), remedy));
-                    }
-                    if !unusable_cut_point.is_empty() {
-                        let remedy = base::advice_for_any(&cwd, &uid, &unusable_cut_point)?;
-                        unresolvable.push((uid, unusable_cut_point.join(", "), remedy));
+                        format!("{b} gone — `jkb task tag rm <uid> branch=<name>` if stale"),
+                    )),
+                    Hold::StaleRecord(b) => stale_record.push((uid, b)),
+                    Hold::InFlight => pending.push((uid, branch)),
+                    Hold::NoUsableCutPoint {
+                        no_cut_point,
+                        unusable,
+                    } => {
+                        // The remedy is asked of git here, where the branch names are still
+                        // separate, and carried into the report — `report_close_merged` cannot know
+                        // whether measuring is safe for these branches, and a branch that reaches
+                        // this bucket *after* its work landed is exactly the one where it is not
+                        // (`base::advice`).
+                        if !no_cut_point.is_empty() {
+                            let remedy = base::advice_for_any(&cwd, &uid, &no_cut_point)?;
+                            undecidable.push((uid.clone(), no_cut_point.join(", "), remedy));
+                        }
+                        if !unusable.is_empty() {
+                            let remedy = base::advice_for_any(&cwd, &uid, &unusable)?;
+                            unresolvable.push((uid, unusable.join(", "), remedy));
+                        }
                     }
                 }
             }
@@ -6561,9 +6551,89 @@ fn cmd_task_close_merged(
             pending: &pending,
             undecidable: &undecidable,
             unresolvable: &unresolvable,
+            stale_record: &stale_record,
         },
         json,
     )
+}
+
+/// Why an unmerged task is held — decided per **branch**, since a task may record several and
+/// they can be in different states.
+///
+/// "Still working on it" and "we declined to decide" are different answers and only some of them
+/// have a remedy; reported alike, a task that can *never* close looks exactly like one that simply
+/// has not yet. Split out of `cmd_task_close_merged` so each state is named once.
+enum Hold {
+    /// One or more recorded branches do not exist here. Ambiguous — merged-and-deleted, or a typo.
+    Gone(String),
+    /// The record was measured on a different branch of the same name (`base::stale_instance`).
+    StaleRecord(String),
+    /// Nothing is wrong; the work is not in trunk yet.
+    InFlight,
+    /// No cut point this repository can act on. Two faults with two different remedies: one needs
+    /// a cut point *measured*, the other needs an unusable one *dropped* first — collapsed into
+    /// one bucket, the message could only name one verb.
+    NoUsableCutPoint {
+        no_cut_point: Vec<String>,
+        unusable: Vec<String>,
+    },
+}
+
+/// Classify why `branches` are held, in the order the reasons dominate each other.
+///
+/// # Errors
+/// Returns an error if git cannot be run.
+fn hold_reason(
+    cwd: &Path,
+    branches: &[String],
+    records: &BTreeMap<String, jkb_core::branch::BranchRecord>,
+) -> Result<Hold> {
+    // A vanished branch first. Hoisting the base check above `is_merged` meant `landed_with_base`
+    // short-circuits before branch existence is ever probed, so a task that was BOTH gone and
+    // missing a cut point stopped reporting `BranchMissing` and told the user to record a cut
+    // point — advice that changes nothing except which problem the next run names.
+    let gone = gone_branches(cwd, branches)?;
+    if !gone.is_empty() {
+        return Ok(Hold::Gone(gone.join(", ")));
+    }
+    // Then recycling, which is proof about the *record* rather than about the value in it:
+    // `landed_for_action` returns on the anchor mismatch without ever consulting the cut point, so
+    // "this record is a different branch's" is the reason and "its cut point does not resolve"
+    // would only be a symptom. This is the one hold state the branch-records change introduced and
+    // the only one that had no explanation at all — it fell through to "still in flight", which is
+    // what a task genuinely being worked on looks like.
+    let mut recycled = Vec::new();
+    for b in branches {
+        if let Some(record) = records.get(b) {
+            if base::stale_instance(cwd, b, record)? {
+                recycled.push(b.clone());
+            }
+        }
+    }
+    if !recycled.is_empty() {
+        return Ok(Hold::StaleRecord(recycled.join(", ")));
+    }
+    // Then the cut point, per branch. A task may legitimately record two (`BranchWrite::Add`, the
+    // quick-add modifier, `task tag add`), and folding them with an AND over "usable" and an OR
+    // over "recorded" mislabelled every task whose branches differ in fault: one branch with a
+    // good cut point beside one with none routed to "its recorded cut point does not resolve",
+    // which was true of neither half, and named a repair that would do nothing.
+    let mut no_cut_point = Vec::new();
+    let mut unusable = Vec::new();
+    for b in branches {
+        match records.get(b).and_then(|r| r.cut_point.as_deref()) {
+            None => no_cut_point.push(b.clone()),
+            Some(v) if !repo::base_is_usable(cwd, Some(v))? => unusable.push(b.clone()),
+            Some(_) => {}
+        }
+    }
+    if no_cut_point.is_empty() && unusable.is_empty() {
+        return Ok(Hold::InFlight);
+    }
+    Ok(Hold::NoUsableCutPoint {
+        no_cut_point,
+        unusable,
+    })
 }
 
 /// What one `close-merged` run decided, split by what the user can do about it.
@@ -6596,6 +6666,12 @@ struct CloseMergedReport<'a> {
     /// `(uid, branches, remedy)`. The remedy is computed where the branches are known and git can
     /// be asked, never here: see `base::MEASURE_VERB`.
     unresolvable: &'a [(String, String, String)],
+    /// Held because the record was measured on a **different branch of the same name**, proved by
+    /// an anchor mismatch. Its own bucket because it is the one hold with no other symptom: the
+    /// branch exists and its cut point resolves, so every other bucket passes it through and it
+    /// was reported as ordinary work in progress. `(uid, branches)` — the remedy is fixed
+    /// (`base::FORGET_VERB`) and needs nothing asked of git.
+    stale_record: &'a [(String, String)],
 }
 
 /// Print what a `close-merged` run decided.
@@ -6624,6 +6700,7 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
                 "pending": rows(r.pending),
                 "undecidable": held_rows(r.undecidable),
                 "unresolvable": held_rows(r.unresolvable),
+                "stale_record": rows(r.stale_record),
             }))?
         );
         return Ok(());
@@ -6653,6 +6730,14 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
             base::FORGET_VERB
         );
     }
+    for (uid, branch) in r.stale_record {
+        println!(
+            "unknown {uid} ({branch}) — the recorded cut point was measured on a different branch \
+             of that name (deleted and recreated since), so nothing here may act on it: drop it \
+             with `{}`, then re-measure when the branch is next cut",
+            base::FORGET_VERB
+        );
+    }
     // Independent of the other buckets. Gated on them, the count vanished in exactly the runs
     // where something else printed — so a run showing two `unknown` lines silently stopped
     // accounting for the tasks that are simply still being worked on.
@@ -6663,6 +6748,7 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
         && r.blocked.is_empty()
         && r.undecidable.is_empty()
         && r.unresolvable.is_empty()
+        && r.stale_record.is_empty()
         && r.pending.is_empty()
     {
         println!("nothing to close");

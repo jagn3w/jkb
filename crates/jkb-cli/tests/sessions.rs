@@ -129,6 +129,19 @@ impl Fixture {
             .and_then(|r| r.cut_point)
     }
 
+    /// The `landed_head` recorded for `branch`, read back through core.
+    ///
+    /// Not reachable from any CLI read, and it is the value `repo::credited` compares against the
+    /// branch's tip — so a landing recorded with the wrong one is invisible from outside.
+    fn landed_head_of(&self, branch: &str) -> Option<String> {
+        let db = jkb_core::Db::open(self.db.to_str().unwrap()).unwrap();
+        let (repo, branch) = (self.repo_key(), branch.to_owned());
+        db.read(move |conn| jkb_core::branch::get(conn, &repo, &branch))
+            .unwrap()
+            .and_then(|r| r.landed)
+            .map(|l| l.head)
+    }
+
     /// The repo key the records are stored under — the basename of the fixture's checkout.
     fn repo_key(&self) -> String {
         self.repo
@@ -646,6 +659,17 @@ fn keeping_the_worktree_moves_its_branch_to_what_landed() {
         ),
         "0",
         "the kept session must sit on what landed, not on its pre-rebase commits"
+    );
+    // …and the landing event must describe the branch as it now is. `repo::credited` compares the
+    // branch's tip against `landed_head`, so recording the *pre-graft* tip here — which is what
+    // `settle_landing` did, forty-five lines before the reset below moved the branch — wrote an
+    // event that could never match: the one piece of evidence jkb had about a landing it
+    // performed itself, discarded by the same command that produced it.
+    assert_eq!(
+        f.landed_head_of(&branch).as_deref(),
+        Some(git(&f.repo, &["rev-parse", &branch]).as_str()),
+        "the landing was recorded against a commit the branch no longer points at, so nothing \
+         will ever credit it"
     );
 }
 
@@ -3859,6 +3883,121 @@ fn a_jkb_landed_branch_closes_when_its_batch_reaches_trunk() {
         "the batch reached trunk and the recorded landing was not followed — with no cut point of \
          its own, nothing but the landing event can decide this branch"
     );
+}
+
+/// A batch deleted after it landed must not make the landing event **worse** than the inference
+/// it replaced.
+///
+/// Deleting a spent batch is ordinary cleanup — `batch_is_spent`/`release_base_worktree` exist to
+/// do it — and `close-merged` follows the landing event to that branch, where `is_merged` answers
+/// `BranchMissing` about the *target*. That state travelled back as if it were about one of the
+/// task's own branches: the task was held for ever and the message named the live group branch,
+/// telling the user to run `jkb task tag rm <uid> branch=grp` — deleting the only record of the
+/// work that actually landed. With the identical git state and no landing recorded at all, the
+/// same task closes, which is implementation-note 4.1's rule broken exactly.
+#[test]
+fn a_landing_whose_target_was_deleted_falls_back_to_the_branch_itself() {
+    let f = Fixture::new();
+    let (uid, branch) = a_group_landing_on_an_integration_branch(&f);
+
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", "integration"])
+        .assert()
+        .success();
+    git(&f.repo, &["merge", "-q", "--ff-only", "integration"]);
+    // The batch is spent: its commits are in trunk and the branch is deleted.
+    git(&f.repo, &["branch", "-D", "integration"]);
+
+    let out = f
+        .jkb()
+        .args(["task", "close-merged", "--dry-run"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !stdout.contains("branch=grp"),
+        "the report told the user to delete the record of the branch that landed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("would close {uid}")),
+        "a landing onto a deleted batch held the task, though the branch's own inference — the \
+         answer before the event existed — says its work is in trunk:\n{stdout}"
+    );
+}
+
+/// `jkb task landed --onto` must store a **branch name**, not whatever spelling resolves.
+///
+/// `valid_ref` rejects only an unusable string, and `is_merged` resolves a tag perfectly well — so
+/// `--onto <tag>` used to write a `landed_onto` no reader looks up, holding every task on that
+/// branch for ever with no repair verb (`task base --forget` clears a cut point, not a landing).
+/// Round 3 fixed this at `repo::record_land_target` and called it "the single writer"; this verb
+/// was the second one.
+#[test]
+fn a_landing_target_that_is_not_a_branch_is_refused() {
+    let f = Fixture::new();
+    let (uid, branch) = a_group_landing_on_an_integration_branch(&f);
+    git(&f.repo, &["checkout", "-q", "integration"]);
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    git(&f.repo, &["checkout", "-q", "main"]);
+    // A tag on the batch commit: `rev-parse` resolves it, `is_merged` is happy, no reader is.
+    git(&f.repo, &["tag", "batch-tag", "integration"]);
+
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", "batch-tag"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be recorded as a branch"));
+
+    // Nothing was written, so the branch is still decidable.
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed on").not());
+}
+
+/// A task held because its record belongs to a **different branch of the same name** must be told
+/// so, and told what to do about it.
+///
+/// This is the one hold state the branch-records change introduced, and it was the only one with
+/// no explanation: the branch exists, its cut point resolves, so every bucket in `close-merged`
+/// passed it through to "still in flight" — which is what a task genuinely being worked on looks
+/// like. Holding is the safe direction; being unable to see why is not.
+#[test]
+fn a_recycled_branch_says_why_it_is_held_and_how_to_repair_it() {
+    let f = Fixture::new();
+    let uid = f.add_task("recycled branch task");
+    git(&f.repo, &["checkout", "-q", "-b", "feature", "main"]);
+    commit_in(&f.repo, "r.txt", "r\n", "r");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    f.jkb()
+        .args([
+            "task", "start", &uid, "--branch", "feature", "--onto", "main",
+        ])
+        .assert()
+        .success();
+    // Deleted and re-cut by hand under the same name: the anchor no longer matches.
+    git(&f.repo, &["branch", "-D", "feature"]);
+    git(&f.repo, &["branch", "feature", "main"]);
+
+    let out = f
+        .jkb()
+        .args(["task", "close-merged", "--dry-run"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains("different branch of that name"),
+        "the hold is reported as ordinary work in flight, with no way to see why:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("jkb task base --forget"),
+        "the one hold state with no remedy still has none:\n{stdout}"
+    );
+    assert_ne!(f.status_of(&uid), "done", "a recycled branch closed a task");
 }
 
 /// Naming a batch as a land target never **replaces** the batch's cut point — only fills it.
