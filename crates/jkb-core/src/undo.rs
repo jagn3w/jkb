@@ -346,11 +346,16 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
 /// undo is not something this module does, and treating the marker as work would make every
 /// `jkb undo` after the first refuse.
 fn is_work(op: &str, table: &str) -> bool {
-    !matches!(
-        (op, table),
-        ("update", "sync_state") | ("undo", "changelog")
-    )
+    !BOOKKEEPING.contains(&(op, table))
 }
+
+/// The entries [`is_work`] excludes — **the list, spelled once**, because `undo_last`'s selection
+/// query needs the same pairs and a `matches!` in Rust cannot be handed to `SQLite`.
+///
+/// It was written out twice, and the two copies did not do the same job: mutating the predicate
+/// changed nothing about which transaction a bare `jkb undo` picked, because the query had its own
+/// copy. Two spellings of one rule is the shape this whole module is a correction of.
+const BOOKKEEPING: &[(&str, &str)] = &[("update", "sync_state"), ("undo", "changelog")];
 
 /// The inversion for a changelog entry, or `None` if this module cannot reverse it.
 ///
@@ -818,25 +823,33 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
 /// # Errors
 /// Propagates any error from [`undo`], including its refusal.
 pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
-    // Bookkeeping-only transactions are skipped, and nothing else is. `is_work`'s two members
-    // are spelled out as bound parameters rather than interpolated; keeping them in step with
-    // `is_work` is what `tests::the_selection_skips_exactly_what_is_work_calls_bookkeeping`
-    // checks.
+    // Bookkeeping-only transactions are skipped, and nothing else is. The clauses are generated
+    // from `BOOKKEEPING`, the same list `is_work` answers from, and every op and table name is
+    // *bound* rather than interpolated — so this stays a parameterized query and cannot come to
+    // disagree with the predicate about which entries are the user's work.
+    let mut args: Vec<SqlValue> = Vec::with_capacity(BOOKKEEPING.len() * 2 + 1);
+    for (op, table) in BOOKKEEPING {
+        args.push(SqlValue::Text((*op).to_owned()));
+        args.push(SqlValue::Text((*table).to_owned()));
+    }
+    args.push(SqlValue::Integer(meta.txn_id));
+    let sql = format!(
+        "SELECT MAX(txn_id) FROM changelog c
+          WHERE {}
+            AND c.txn_id < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM changelog u
+                WHERE u.op = 'undo' AND u.entity_id = CAST(c.txn_id AS TEXT)
+            )",
+        BOOKKEEPING
+            .iter()
+            .map(|_| "NOT (c.op = ? AND c.entity_type = ?)".to_owned())
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    );
     let target: Option<i64> = conn
-        .prepare_cached(
-            "SELECT MAX(txn_id) FROM changelog c
-              WHERE NOT (c.op = ?1 AND c.entity_type = ?2)
-                AND NOT (c.op = ?3 AND c.entity_type = ?4)
-                AND c.txn_id < ?5
-                AND NOT EXISTS (
-                    SELECT 1 FROM changelog u
-                    WHERE u.op = 'undo' AND u.entity_id = CAST(c.txn_id AS TEXT)
-                )",
-        )?
-        .query_row(
-            params!["update", "sync_state", "undo", "changelog", meta.txn_id],
-            |row| row.get(0),
-        )
+        .prepare_cached(&sql)?
+        .query_row(params_from_iter(args), |row| row.get(0))
         .optional()?
         .flatten();
 
@@ -1739,11 +1752,6 @@ mod selection_tests {
     #[test]
     fn a_bookkeeping_only_transaction_is_not_the_last_change() {
         for (op, entity) in [("update", Entity::SyncState), ("undo", Entity::Changelog)] {
-            assert!(
-                !is_work(op, entity.as_str()),
-                "{op}/{} is treated as the user's work",
-                entity.as_str()
-            );
             let db = Db::open_in_memory().unwrap();
             db.write_txn("t", |c, m| {
                 upsert(
@@ -1771,6 +1779,14 @@ mod selection_tests {
                     .is_none(),
                 "a transaction of nothing but {op}/{} was taken as the user's last change, so \
                  `jkb undo` rewound bookkeeping and left the real one standing",
+                entity.as_str()
+            );
+            // Asserted *after* the consequence, so a mutation to either half fails on the
+            // behaviour rather than on this line: the predicate agreeing with itself is not what
+            // the test is for.
+            assert!(
+                !is_work(op, entity.as_str()),
+                "{op}/{} is treated as the user's work",
                 entity.as_str()
             );
         }
