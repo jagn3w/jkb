@@ -79,30 +79,6 @@ enum Inverse {
     DeleteRow,
 }
 
-/// The key column [`Inverse::Columns`] addresses a row of each table by — the column `entity_id`
-/// holds for a non-insert entry.
-///
-/// Checked against the schema by
-/// [`tests::every_column_update_entity_is_addressable_by_the_key_this_list_names`], because a
-/// wrong key updates zero rows in silence, which is the failure the whole arm exists to stop.
-/// [`Inverse::ReinsertRow`] needs no entry: it inserts the row `before` describes and never has to
-/// find one.
-const ROW_KEYS: &[(&str, &str)] = &[
-    ("items", "id"),
-    ("bindings", "item_id"),
-    ("placements", "rowid"),
-    ("tag_applications", "rowid"),
-    ("namespaces", "id"),
-    ("branch_records", "id"),
-    ("ingestions", "id"),
-];
-
-/// The key column [`Inverse::Columns`] addresses a row of `table` by, or `None` if this table has
-/// no generic row inverse.
-fn row_key(table: &str) -> Option<(&'static str, &'static str)> {
-    ROW_KEYS.iter().copied().find(|(t, _)| *t == table)
-}
-
 /// Whether this entry's inverse is driven by a before-state made of column values — which is the
 /// question [`check_restorable`] validates and nothing else needs to ask.
 fn is_row_shaped(op: &str, table: &str) -> bool {
@@ -215,11 +191,11 @@ fn restore_columns(
     entity_id: &str,
     before: Option<&Value>,
 ) -> Result<usize> {
-    // The table and key names spliced into the SQL come from `Entity`/`ROW_KEYS`, never from the
-    // strings the log handed us — the same rule the `DeleteRow` arm follows.
-    let (Some(entity), Some((_, key))) = (Entity::parse(table), row_key(table)) else {
+    // The table name spliced into the SQL comes from `Entity`, never from the string the log
+    // handed us — the same rule the `DeleteRow` arm follows.
+    let Some(entity) = Entity::parse(table) else {
         return Err(TypeError::Validation(format!(
-            "no row key is recorded for `{table}`, so its columns cannot be restored"
+            "cannot restore columns of unknown table '{table}'"
         ))
         .into());
     };
@@ -234,8 +210,14 @@ fn restore_columns(
     })?;
     let mut args: Vec<SqlValue> = fields.iter().map(|(_, v)| v.clone()).collect();
     args.push(SqlValue::Integer(row));
+    // ADDRESSED BY `rowid`, always. Every entity with this inverse records `entity_id` as one —
+    // the same convention `InsertInverse::DeleteRow` relies on — so there is no per-table key
+    // column to keep in step with the schema. A list of them was tried and removed: `SQLite` reads
+    // a double-quoted identifier that resolves to no column as a **string literal**, so a wrong
+    // key in the `WHERE` matched nothing in perfect silence, and the test written to check the
+    // list passed with a fabricated column name in it.
     let sql = format!(
-        "UPDATE \"{}\" SET {} WHERE \"{key}\" = ?",
+        "UPDATE \"{}\" SET {} WHERE rowid = ?",
         entity.as_str(),
         fields
             .iter()
@@ -1578,26 +1560,52 @@ mod tests {
         );
     }
 
-    /// Every entity in `ROW_KEYS` is addressable by the key column listed beside it.
+    /// A **`branch_records`** update comes back too — the entity whose non-insert writes are all
+    /// upserts, so an undo of one has nothing to delete and everything to restore.
     ///
-    /// The list is the one thing about this inverse that is written out rather than derived, so
-    /// the claim it makes — "`entity_id` identifies a row of this table by *this* column" — is
-    /// checked against the schema rather than trusted. A wrong key updates zero rows silently,
-    /// which is the failure this whole arm exists to stop.
+    /// Its own test because `record_json` deliberately emits every column rather than the ones the
+    /// statement touched, and that is only load-bearing through this arm.
     #[test]
-    fn every_column_update_entity_is_addressable_by_the_key_this_list_names() {
+    fn undoing_a_land_target_write_restores_the_record_it_replaced() {
+        use crate::branch::{self, Cut, Supersede};
+
         let db = Db::open_in_memory().unwrap();
-        for (table, key) in super::ROW_KEYS {
-            let (table, key) = ((*table).to_owned(), (*key).to_owned());
-            db.read(move |c| {
-                // Runs the shape the inverse runs, against a row id that matches nothing: a
-                // missing table or column is a `SQLite` error here, and only that is being asked.
-                c.prepare(&format!("SELECT 1 FROM \"{table}\" WHERE \"{key}\" = 0"))
-                    .unwrap_or_else(|e| panic!("`{table}` has no addressable `{key}`: {e}"));
-                Ok(())
-            })
-            .unwrap();
-        }
+        db.write_txn("t", |c, m| {
+            branch::record_cut_point(
+                c,
+                m,
+                "jkb",
+                "task/x",
+                &Cut::Fork("a".repeat(40)),
+                None,
+                Supersede::default(),
+            )
+        })
+        .unwrap();
+        db.write_txn("t", |c, m| {
+            branch::set_land_target(c, m, "jkb", "task/x", Some("batch-1"))
+        })
+        .unwrap();
+        db.write_txn("t", |c, m| {
+            branch::set_land_target(c, m, "jkb", "task/x", Some("batch-2"))
+        })
+        .unwrap();
+
+        db.write_txn("t", undo_last).unwrap();
+        let record = db
+            .read(|c| branch::get(c, "jkb", "task/x"))
+            .unwrap()
+            .expect("the record must survive: the edit is what was undone");
+        assert_eq!(
+            record.land_target.as_deref(),
+            Some("batch-1"),
+            "undoing a land-target edit did not restore the target it replaced"
+        );
+        assert_eq!(
+            record.cut_point.as_deref(),
+            Some("a".repeat(40).as_str()),
+            "the cut point was disturbed by undoing an unrelated column"
+        );
     }
 
     /// Re-parenting is an upsert, so undoing it must put the previous container back — not
