@@ -348,6 +348,13 @@ pub fn set_land_target(
     target: Option<&str>,
 ) -> Result<()> {
     let before = get(conn, repo, branch)?;
+    // CLEARING A TARGET NOTHING RECORDS IS A NO-OP, not an all-NULL row. `jkb task abandon
+    // --delete-branch` calls `forget` (which deletes the row, taking the cut point with it) and
+    // then `clear_land_targets`, which reached here — re-inserting a row for a branch that no
+    // longer exists and contradicting the delete that had just run.
+    if before.is_none() && target.is_none() {
+        return Ok(());
+    }
     let id: i64 = conn
         .prepare_cached(
             "INSERT INTO branch_records (repo, branch, land_target, created_at)
@@ -527,6 +534,43 @@ mod tests {
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    /// Clearing a land target on a branch nothing records writes **nothing**.
+    ///
+    /// `jkb task abandon --delete-branch` calls `forget` — which deletes the row, taking the cut
+    /// point with it, because the branch is gone — and then `clear_land_targets`, which reached
+    /// here for the same branch and re-inserted an all-NULL row. Inert today, and a direct
+    /// contradiction of the delete that had just run.
+    #[test]
+    fn clearing_a_land_target_nothing_records_does_not_resurrect_the_row() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            set_land_target(conn, meta, "jkb", "task/gone", None)
+        })
+        .unwrap();
+        assert_eq!(
+            db.read(|conn| get(conn, "jkb", "task/gone")).unwrap(),
+            None,
+            "clearing a target on an unrecorded branch created a record for it"
+        );
+
+        // …and it is still an ordinary clear where a record exists.
+        db.write_txn("t", |conn, meta| {
+            set_land_target(conn, meta, "jkb", "task/live", Some("batch"))
+        })
+        .unwrap();
+        db.write_txn("t", |conn, meta| {
+            set_land_target(conn, meta, "jkb", "task/live", None)
+        })
+        .unwrap();
+        assert_eq!(
+            db.read(|conn| get(conn, "jkb", "task/live"))
+                .unwrap()
+                .and_then(|r| r.land_target),
+            None,
+            "an existing target was not cleared"
+        );
+    }
 
     /// `record_cut_point` through the writer-actor, returning whether it wrote.
     fn record(db: &Db, branch: &str, cut: &Cut, sup: Supersede) -> bool {

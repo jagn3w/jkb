@@ -233,24 +233,56 @@ pub fn items_with(conn: &Connection, facet: &str, value: &str) -> Result<Vec<Ite
 /// Rename a facet across its definition and every application. Returns the number
 /// of applications updated.
 ///
+/// **One entry per row it rewrites, keyed on that row's `rowid`.** It used to log a single
+/// entry against `tag_defs` keyed on the facet *name*, which is not a row id and describes none
+/// of the applications — so `undo` had no inverse for it, and one `jkb tag rename` made every
+/// later bare `jkb undo` refuse that transaction for good. A rename is trivially reversible: what
+/// it needs is what every other column write supplies, the previous value under the column's own
+/// name, against a key `undo` can address. `ns::move_subtree` is the precedent — it had exactly
+/// this defect, one entry naming the root's old path, and the fix was to log what actually
+/// changed rather than to hand-write an inverse.
+///
 /// # Errors
 /// Returns an error if a statement fails (e.g. the new facet collides with an
 /// existing application on the same item and value).
 pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -> Result<usize> {
+    // Read the row ids BEFORE the update: afterwards nothing selects them by `old`.
+    let rowids = |table: &str| -> Result<Vec<i64>> {
+        let sql = if table == "tag_defs" {
+            "SELECT rowid FROM tag_defs WHERE facet = ?1"
+        } else {
+            "SELECT rowid FROM tag_applications WHERE facet = ?1"
+        };
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(params![old], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    };
+    let applications = rowids("tag_applications")?;
+    let definitions = rowids("tag_defs")?;
+
     let updated = conn
         .prepare_cached("UPDATE tag_applications SET facet = ?1 WHERE facet = ?2")?
         .execute(params![new, old])?;
     conn.prepare_cached("UPDATE tag_defs SET facet = ?1 WHERE facet = ?2")?
         .execute(params![new, old])?;
-    changelog::append(
-        conn,
-        meta,
-        "update",
-        Entity::TagDefs,
-        old,
-        Some(&json!({ "facet": old })),
-        Some(&json!({ "facet": new })),
-    )?;
+
+    let (before, after) = (json!({ "facet": old }), json!({ "facet": new }));
+    for (entity, rows) in [
+        (Entity::TagApplications, &applications),
+        (Entity::TagDefs, &definitions),
+    ] {
+        for rowid in rows {
+            changelog::append(
+                conn,
+                meta,
+                "update",
+                entity,
+                &rowid.to_string(),
+                Some(&before),
+                Some(&after),
+            )?;
+        }
+    }
     Ok(updated)
 }
 
