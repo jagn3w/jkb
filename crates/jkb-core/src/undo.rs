@@ -2704,6 +2704,61 @@ mod tests {
         );
     }
 
+    /// A column restore whose target row is **gone** refuses, and the retry works once the row is
+    /// back.
+    ///
+    /// The other half of the same lie. `UPDATE … SET … WHERE rowid = ?` matching nothing wrote the
+    /// before-state nowhere, and `Ok(0)` said it had — so `jkb undo` reported success, marked the
+    /// transaction undone, and the edit was unrecoverable even after the deleted item was itself
+    /// restored. The order matters and is the ordinary one: you undo the delete first, *then* the
+    /// edit before it.
+    #[test]
+    fn a_column_restore_whose_row_is_gone_refuses_and_the_retry_works_once_it_is_back() {
+        use crate::item;
+
+        let db = Db::open_in_memory().unwrap();
+        let a = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                item::set_content(c, m, a, "the original body", Some("b3:original"))?;
+                Ok(a)
+            })
+            .unwrap();
+        let edited = db
+            .write_txn("t", move |c, m| {
+                item::set_content(c, m, a, "the edited body", Some("b3:edited"))?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let deleted = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, edited))
+            .expect_err("an update whose row is gone was reported as a successful undo")
+            .to_string();
+        assert!(
+            err.contains(&format!("transaction {edited} cannot be undone"))
+                && err.contains("restored nothing"),
+            "the vanished row is not a named refusal: {err}"
+        );
+
+        // Put the row back the ordinary way, then reach the edit behind it.
+        db.write_txn("t", move |c, m| super::undo(c, m, deleted))
+            .unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, edited))
+            .expect("the retry was refused, so the refused undo had marked the transaction anyway");
+        assert_eq!(
+            db.read(move |c| item::get_content(c, a)).unwrap(),
+            Some("the original body".to_owned()),
+            "the edit was not reverted once its row was back"
+        );
+    }
+
     /// A partially-applied undo is **rolled back**, and the failing entry is not the first applied.
     ///
     /// `an_inverse_the_database_refuses_is_a_named_refusal_not_a_wedge` above cannot show this:
