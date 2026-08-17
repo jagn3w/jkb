@@ -816,7 +816,10 @@ pub fn set_content(
         Entity::Items,
         &item.get().to_string(),
         Some(&json!({ "content": before_content, "content_hash": before_hash })),
-        Some(&json!({ "content": content, "content_hash": content_hash })),
+        // The *after* side stays a summary. Only `before` is read — it is what `undo` writes back —
+        // and a file sync calls this on every disk edit, so keeping the new body here too would
+        // store a second copy of every document per edit for nobody's benefit.
+        Some(&json!({ "content_hash": content_hash, "content_len": content.len() })),
     )?;
     Ok(())
 }

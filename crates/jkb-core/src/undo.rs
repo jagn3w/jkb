@@ -1424,6 +1424,48 @@ mod tests {
         );
     }
 
+    /// Undoing a **re-home** puts the item back in the namespace it came from, at its old
+    /// position.
+    ///
+    /// `placement::set_primary` deletes the old primary and inserts the new one, so this exercises
+    /// the delete inverse and the column restore in one transaction. The position matters: a
+    /// placement put back in the right namespace at the wrong ordinal is a different placement,
+    /// and it is what `jkb ls` orders by.
+    #[test]
+    fn undoing_a_re_home_restores_the_previous_placement() {
+        use crate::{ns, placement};
+
+        let db = Db::open_in_memory().unwrap();
+        let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
+        let (from, to) = db
+            .write_txn("t", |c, _| {
+                Ok((ns::ensure(c, "x/from")?, ns::ensure(c, "x/to")?))
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| placement::set_primary(c, m, id, from, 7))
+            .unwrap();
+        db.write_txn("t", move |c, m| placement::set_primary(c, m, id, to, 0))
+            .unwrap();
+
+        db.write_txn("t", undo_last).unwrap();
+        let placed: Vec<(i64, i64)> = db
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT namespace_id, position FROM placements
+                      WHERE item_id = ?1 AND role = 'primary'",
+                )?;
+                let rows = stmt.query_map([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            placed,
+            vec![(from.get(), 7)],
+            "the re-home was not undone: the item should be back in its old namespace, at the \
+             position it had"
+        );
+    }
+
     /// Undoing a transaction that **removed** a tag application puts it back, with its props.
     ///
     /// A delete is inverted by re-inserting the row its before-state describes, which is the
