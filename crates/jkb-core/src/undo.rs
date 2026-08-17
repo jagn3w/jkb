@@ -20,19 +20,31 @@
 //! **What actually refuses is [`INVERSES`] and the pre-flight in [`undo`], not a list of flows.**
 //! Naming flows here went stale within the commit that wrote it: `ns mv`, the claim, the status
 //! change and the tag/placement/edge removals a file sync performs were all listed as newly
-//! refused and all gained inverses in that same change. Ask the two symbols instead — a flow
-//! refuses exactly when one of its entries has no row in [`INVERSES`] or [`blocker`] says its
-//! inverse could not run — and note the third refusal, which is neither: everything at or below
-//! the [`watermark`] predates undo history.
+//! refused and all gained inverses in that same change. Ask the symbols instead — a flow refuses
+//! exactly when one of its entries has no row in [`INVERSES`], [`blocker`] says its inverse could
+//! not run, or the inverse fails when [`undo`] applies it — and note the two refusals that are
+//! none of those: everything at or below the [`watermark`] predates undo history, and a
+//! transaction [`already_undone`] is not undone twice.
 //!
-//! ## The pre-flight asks whether the inverse can **run**, not only whether it exists
+//! ## Refusal is total; the pre-flight only makes it better worded
 //!
-//! An entry can have an inverse and still be unrunnable — a payload that names no column, an
-//! absent before-state, a changelog key that is not a row id. Asked only at apply time, that is
-//! a hard error part-way through the transaction; and because a hard error rolls back without
-//! writing an `undo` marker, the same transaction is re-selected by the next `jkb undo`, and the
-//! next. [`blocker`] asks all of it during the scan, so the answer is a refusal that has written
-//! nothing, and every refusal names the transaction and the next older one to try instead.
+//! Two mechanisms, and only the second is the guarantee.
+//!
+//! [`blocker`] runs during the scan and asks what can be answered by **inspection**: is there an
+//! inverse, does the before-state parse, does it name columns the table has, is the changelog key
+//! a row id. Those produce a refusal that names the offending entry, so they are worth asking
+//! before anything is attempted, and they are cheap. They are **not** exhaustive and cannot be —
+//! an inverse that is well-formed in every way `blocker` can see still has to be accepted by the
+//! database, and a UNIQUE or CHECK constraint answers that only at apply time.
+//!
+//! So [`undo`] wraps the apply loop: **any** error out of [`invert_entry`] becomes the same
+//! [`refusal`] — the transaction named, nothing changed (the enclosing `write_txn` rolls back,
+//! which is why a `&WriteMeta` is required to get here at all), and the next older work
+//! transaction to try instead. That covers constraint violations, unreadable payloads, and the
+//! entries the `is_work`-filtered scan never pre-flighted at all. Every previous round of this
+//! family tried to *predict* one more kind of unrunnable entry; this stops predicting, and a kind
+//! nobody has taught this module about is a named refusal rather than a transaction that fails
+//! identically for ever.
 //!
 //! ## The inverses
 //!
@@ -112,10 +124,20 @@ const DELETE: &str = "delete";
 /// unwrapping rule, so the validator and the restorer cannot come to disagree about which object
 /// the columns are in.
 fn column_map<'a>(op: &str, table: &str, before: Option<&'a Value>) -> Option<&'a Value> {
-    if op == DELETE && table == Entity::Items.as_str() {
+    if is_cascade_snapshot(op, table) {
         return before.and_then(|b| b.get("item"));
     }
     before
+}
+
+/// Whether this entry's before-state is a **cascade snapshot** rather than a plain column map.
+///
+/// The one pair, asked in one place. [`column_map`] unwraps on it and [`check_restorable`]
+/// dispatches on it, and those two disagreeing about which object holds the columns is a failure
+/// this module has already had once — so they read the answer from here rather than each
+/// re-spelling the test.
+fn is_cascade_snapshot(op: &str, table: &str) -> bool {
+    op == DELETE && table == Entity::Items.as_str()
 }
 
 /// The column names `table` has, straight from the schema.
@@ -156,7 +178,7 @@ pub(crate) fn check_restorable(
     // Without this, `items` had **two** hand-written 15-column lists (`item::snapshot`'s SELECT
     // and this module's restore) and the next column added to the table would have been dropped
     // by both, silently, on every restore.
-    if op == DELETE && table == Entity::Items.as_str() {
+    if is_cascade_snapshot(op, table) {
         return check_columns(conn, op, table, column_map(op, table, before), true);
     }
     let Some(inverse) = row_shaped(op, table) else {
@@ -646,17 +668,21 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
         ])?)
 }
 
-/// Why this entry's inverse could not be **run**, or `None` if it can be.
+/// Why this entry's inverse could not be **run**, judged by inspection alone — or `None` if
+/// nothing visible from here stops it.
 ///
-/// The pre-flight used to ask only whether an inverse *existed*. That is half the question: an
-/// entry written under the old, unvalidated contract — `item::set_content`'s `{"content_len": 12}`,
+/// It used to ask only whether an inverse *existed*, which is half the question: an entry written
+/// under the old, unvalidated contract — `item::set_content`'s `{"content_len": 12}`,
 /// `binding::mark_synced`'s absent before-state — has an inverse, passes an existence check, and
-/// then dies inside [`restore_columns`] part-way through applying the transaction. Because a hard
-/// error rolls back without writing an `undo` marker, the same transaction is re-selected by the
-/// **next** `jkb undo`, and the next, for ever.
+/// then dies inside [`restore_columns`]. Asking here instead turns that into a refusal that names
+/// the entry and its reason, which is worth having and is why this function exists.
 ///
-/// So everything [`invert_entry`] can fail on is asked here instead, where the answer costs a
-/// named refusal that has written nothing.
+/// **It is deliberately not exhaustive, and must not be made to try.** Whether the database will
+/// accept a well-formed inverse is knowable only by running it — a restored `tag_defs.facet`
+/// whose old name an unlogged `tag::define_facet` has since re-taken violates a UNIQUE index, and
+/// no amount of payload inspection sees that coming. What makes refusal *total* is [`undo`]'s
+/// wrapper around [`invert_entry`], not this scan; this one only makes the common cases read
+/// better. Adding a predicted constraint check here would be the fifth round of predicting.
 fn blocker(
     conn: &Connection,
     op: &str,
@@ -731,6 +757,27 @@ fn watermark(conn: &Connection) -> Result<i64> {
         .unwrap_or(0))
 }
 
+/// "This transaction has already been undone", as `SQL`, spelled **once**.
+///
+/// Two callers need it against different operands — [`select_work_txn`] correlates it with each
+/// row it scans, [`already_undone`] asks it of one bound id — so the operand is the only hole,
+/// and it is an identifier or a placeholder this module writes, never a value. Written out twice
+/// the copies would answer differently, and the answer decides whether `DeleteRow` runs a second
+/// time against row ids `SQLite` has since reissued.
+fn undone_sql(operand: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM changelog u
+                  WHERE u.op = 'undo' AND u.entity_id = CAST({operand} AS TEXT))"
+    )
+}
+
+/// Whether `txn_id` already has an `undo` marker against it.
+fn already_undone(conn: &Connection, txn_id: i64) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(&format!("SELECT {}", undone_sql("?1")))?
+        .query_row([txn_id], |row| row.get(0))?)
+}
+
 /// The newest transaction containing **work**, below `below`, above the watermark, not already
 /// undone — or `None`.
 ///
@@ -738,6 +785,16 @@ fn watermark(conn: &Connection) -> Result<i64> {
 /// They must agree, because the escape is an instruction to run the command the selection would
 /// have run had the refused transaction not been in the way.
 fn select_work_txn(conn: &Connection, below: i64) -> Result<Option<i64>> {
+    work_txn_after(conn, below, watermark(conn)?)
+}
+
+/// The same selection with the lower bound stated rather than taken from the [`watermark`].
+///
+/// The only caller that passes anything else is [`undo_last`], asking one question the watermark
+/// makes unanswerable otherwise: *is there nothing to undo, or is everything there is below the
+/// line?* Both come back as `None` from [`select_work_txn`], and "reverted 0 change(s)" on a
+/// database with thousands of transactions reads as an empty one.
+fn work_txn_after(conn: &Connection, below: i64, after: i64) -> Result<Option<i64>> {
     // Bookkeeping-only transactions are skipped, and nothing else is. The clauses are generated
     // from `BOOKKEEPING`, the same list `is_work` answers from, and every op and table name is
     // *bound* rather than interpolated — so this stays a parameterized query and cannot come to
@@ -748,21 +805,19 @@ fn select_work_txn(conn: &Connection, below: i64) -> Result<Option<i64>> {
         args.push(SqlValue::Text((*table).to_owned()));
     }
     args.push(SqlValue::Integer(below));
-    args.push(SqlValue::Integer(watermark(conn)?));
+    args.push(SqlValue::Integer(after));
     let sql = format!(
         "SELECT MAX(txn_id) FROM changelog c
           WHERE {}
             AND c.txn_id < ?
             AND c.txn_id > ?
-            AND NOT EXISTS (
-                SELECT 1 FROM changelog u
-                WHERE u.op = 'undo' AND u.entity_id = CAST(c.txn_id AS TEXT)
-            )",
+            AND NOT {}",
         BOOKKEEPING
             .iter()
             .map(|_| "NOT (c.op = ? AND c.entity_type = ?)".to_owned())
             .collect::<Vec<_>>()
-            .join(" AND ")
+            .join(" AND "),
+        undone_sql("c.txn_id")
     );
     Ok(conn
         .prepare_cached(&sql)?
@@ -794,6 +849,21 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
                  restore anything, so reversing one would restore some of it and silently drop \
                  the rest"
             ),
+        )?)
+        .into());
+    }
+    // ONCE, AND THE SELECTION ALREADY KNEW IT. `select_work_txn` has never handed back a
+    // transaction that has been undone; this form did not ask, so re-running `jkb undo <txn>`
+    // re-executed the whole inversion — and `DeleteRow` addresses a row id, which `SQLite`
+    // reissues for every table here except `items` (`AUTOINCREMENT` since D40). The second run
+    // therefore unplaced, untagged or unlinked whatever now holds that id. It became reachable
+    // when refusals started printing transaction ids and recommending the explicit form.
+    if already_undone(conn, txn_id)? {
+        return Err(TypeError::Validation(refusal(
+            conn,
+            txn_id,
+            "it has already been undone; reversing it a second time would address row ids that \
+             belong to other rows now",
         )?)
         .into());
     }
@@ -835,9 +905,38 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         .into());
     }
 
+    // THE BACKSTOP THAT MAKES REFUSAL TOTAL. `blocker` above answers the questions that can be
+    // answered by inspection; whether the database will *accept* an inverse is not one of them.
+    // A well-formed `UPDATE tag_defs SET facet = 'size' WHERE rowid = ?` is refused by
+    // `tag_defs.facet` when an unlogged `tag::define_facet` has re-taken the name since, and the
+    // same shape exists on `namespaces.path` — an unlogged writer re-taking a UNIQUE value a
+    // logged `Inverse::Columns` restore writes back. As a bare `?` that was a raw `SQLite` error
+    // with no transaction id, no statement that nothing had moved and nothing to try instead;
+    // and because it writes no `undo` marker the transaction is re-selected by the next
+    // `jkb undo`, and the next, for ever.
+    //
+    // So every apply-time failure — UNIQUE, CHECK, foreign key, an unreadable payload, anything a
+    // future inverse can hit — leaves through one funnel and reads as the refusal the pre-flight
+    // would have produced. This covers the entries the scan never looked at as well: `blocker`
+    // runs behind an `is_work` filter, so `sync_state` reaches `invert_entry` unexamined.
+    // Extending `blocker` to predict constraint violations instead would mean re-implementing
+    // the constraint checker, which is the prediction game the previous four rounds lost.
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
-        reverted += invert_entry(conn, &op, &table, &entity_id, before.as_deref())?;
+        match invert_entry(conn, &op, &table, &entity_id, before.as_deref()) {
+            Ok(rows) => reverted += rows,
+            Err(e) => {
+                let why = format!("reversing `{op}` on `{table}` failed: {e}");
+                // …and the funnel does not depend on the connection still being usable. If the
+                // failure aborted the transaction, `refusal`'s own lookup for the escape hatch
+                // fails too; say what happened plainly rather than replacing the original error
+                // with a second one about the query that tried to describe it.
+                let message = refusal(conn, txn_id, &why).unwrap_or_else(|_| {
+                    format!("transaction {txn_id} cannot be undone: {why}. Nothing was changed.")
+                });
+                return Err(TypeError::Validation(message).into());
+            }
+        }
     }
 
     changelog::append(
@@ -1020,12 +1119,29 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
 /// rather than fixed here.
 ///
 /// # Errors
-/// Propagates any error from [`undo`], including its refusal.
+/// Propagates any error from [`undo`], including its refusal; and says so rather than answering
+/// 0 when there is work but all of it is at or below the [`watermark`].
 pub fn undo_last(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
-    match select_work_txn(conn, meta.txn_id)? {
-        Some(txn_id) => undo(conn, meta, txn_id),
-        None => Ok(0),
+    if let Some(txn_id) = select_work_txn(conn, meta.txn_id)? {
+        return undo(conn, meta, txn_id);
     }
+    // NOTHING TO UNDO, OR NOTHING UNDOABLE? Both are `None` above, and they are not the same
+    // news: on a database whose whole history predates `V014`, "reverted 0 change(s)" is exactly
+    // what an empty database prints. The difference between the two answers *is* the watermark,
+    // so the same selection is re-run without it. No `mark > 0` short-circuit: with the watermark
+    // at 0 the two queries are the same query, so it could never change the answer — and a
+    // condition that cannot fire is a second model of the world rather than a saving.
+    let mark = watermark(conn)?;
+    if work_txn_after(conn, meta.txn_id, 0)?.is_some() {
+        return Err(TypeError::Validation(format!(
+            "nothing to undo: undo history begins after transaction {mark}, and every change on \
+             this database that has not already been reverted was recorded before that. Entries \
+             written then were not required to carry a before-state that could restore anything, \
+             so reversing one would restore some of it and silently drop the rest"
+        ))
+        .into());
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -2236,6 +2352,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         // A fresh database excludes nothing: the seed is `MAX(txn_id)` over an empty changelog.
         assert_eq!(db.read(super::watermark).unwrap(), 0);
+        // …and with nothing recorded at all, nothing to undo is simply that.
+        assert_eq!(db.write_txn("t", undo_last).unwrap(), 0);
 
         let txn = db
             .write_txn("t", |c, m| {
@@ -2249,10 +2367,17 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
-            db.write_txn("t", undo_last).unwrap(),
-            0,
-            "a bare `jkb undo` reached below the watermark"
+        // A BARE `jkb undo` DOES NOT REACH BELOW THE LINE — and says which of the two silences
+        // this is. Answering 0 here prints "reverted 0 change(s)", which is what an empty
+        // database prints, on a database that may hold thousands of transactions.
+        let hidden = db
+            .write_txn("t", undo_last)
+            .expect_err("a bare `jkb undo` reached below the watermark")
+            .to_string();
+        assert!(
+            hidden.contains("nothing to undo")
+                && hidden.contains(&format!("undo history begins after transaction {txn}")),
+            "a database whose whole history predates the watermark reads as an empty one: {hidden}"
         );
         let err = db
             .write_txn("t", move |c, m| super::undo(c, m, txn))
@@ -2267,6 +2392,141 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the pre-watermark transaction was reverted anyway"
+        );
+    }
+
+    /// An inverse the **database** refuses is a named refusal, and stays one on the next attempt.
+    ///
+    /// The pre-flight passes this entry on every question it can ask: `("update", "tag_defs")` has
+    /// an inverse, the entity resolves, the before-state `{"facet":"size"}` names a real column,
+    /// the key is a row id. Then `UPDATE tag_defs SET facet = 'size' WHERE rowid = ?` meets a
+    /// UNIQUE index, because `tag::define_facet` re-declared `size` in a later transaction and
+    /// **logs nothing** — so no amount of reading the log foresees it. As a bare `?` that was a
+    /// raw `SQLite` error, and since a hard error writes no `undo` marker the same transaction was
+    /// re-selected and failed identically for ever. The same shape exists on `namespaces.path`.
+    #[test]
+    fn an_inverse_the_database_refuses_is_a_named_refusal_not_a_wedge() {
+        use crate::tag;
+
+        let db = Db::open_in_memory().unwrap();
+        let (oldest, a) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                tag::apply(c, m, a, "size", "small")?;
+                Ok((m.txn_id, a))
+            })
+            .unwrap();
+        let renamed = db
+            .write_txn("t", |c, m| {
+                tag::rename_facet(c, m, "size", "scale")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // Re-takes the old name. `define_facet` writes no changelog entry, so the log still says
+        // `size` is free.
+        db.write_txn("t", |c, m| {
+            let b = upsert(c, m, &note("b"))?;
+            tag::apply(c, m, b, "size", "tiny")
+        })
+        .unwrap();
+
+        // The newest change reverts normally; `size` survives it, unlogged.
+        db.write_txn("t", undo_last).unwrap();
+
+        let first = db
+            .write_txn("t", undo_last)
+            .expect_err("an inverse the database refuses was applied rather than refused")
+            .to_string();
+        assert!(
+            first.contains(&format!("transaction {renamed} cannot be undone"))
+                && first.contains("Nothing was changed."),
+            "an apply-time constraint failure is a raw error, not a named refusal: {first}"
+        );
+        assert!(
+            first.contains("`update` on `tag_defs`") && first.contains("UNIQUE"),
+            "the refusal does not name the entry that failed, or why: {first}"
+        );
+        assert!(
+            first.contains(&format!("`jkb undo {oldest}`")),
+            "the refusal names no older transaction to revert instead: {first}"
+        );
+        assert_eq!(
+            db.read(move |c| tag::applications(c, a)).unwrap(),
+            vec![("scale".to_owned(), "small".to_owned())],
+            "the refused undo moved something before it failed"
+        );
+        // …and it is a refusal every time, not something that degrades on the second run.
+        let second = db
+            .write_txn("t", undo_last)
+            .expect_err("the second attempt did something")
+            .to_string();
+        assert_eq!(first, second, "the refusal is not stable across attempts");
+        // The way out it advertises works.
+        db.write_txn("t", move |c, m| super::undo(c, m, oldest))
+            .unwrap();
+        assert!(
+            db.read(move |c| tag::applications(c, a))
+                .unwrap()
+                .is_empty(),
+            "`jkb undo <older>`, the way out the refusal advertises, did nothing"
+        );
+    }
+
+    /// A transaction is undone **once**. Asked again, it refuses.
+    ///
+    /// `select_work_txn` has never handed back a transaction carrying an `undo` marker, so a bare
+    /// `jkb undo` could not reach one; the explicit form did not ask at all, and refusals now
+    /// print transaction ids and recommend it. Every table an insert is inverted on except
+    /// `items` is a plain rowid table, so `SQLite` reissues the id — and the second run deletes
+    /// whatever holds it now.
+    #[test]
+    fn a_transaction_is_not_undone_twice() {
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let ns = db
+            .write_txn("t", |c, _| crate::ns::ensure(c, "x/y"))
+            .unwrap();
+        let mine = db
+            .write_txn("t", |c, m| upsert(c, m, &note("mine")))
+            .unwrap();
+        let placed = db
+            .write_txn("t", move |c, m| {
+                crate::placement::place(c, m, mine, ns, PlacementRole::Primary, 0)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, placed))
+            .unwrap();
+
+        // Somebody else's placement takes the row id the undone one gave up.
+        let yours = db
+            .write_txn("t", |c, m| upsert(c, m, &note("yours")))
+            .unwrap();
+        db.write_txn("t", move |c, m| {
+            crate::placement::place(c, m, yours, ns, PlacementRole::Primary, 0)
+        })
+        .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, placed))
+            .expect_err("a transaction was undone a second time")
+            .to_string();
+        assert!(
+            err.contains("already been undone") && err.contains(&format!("transaction {placed}")),
+            "the second undo does not say the transaction was already undone: {err}"
+        );
+        let survivors: Vec<i64> = db
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT item_id FROM placements")?;
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            survivors,
+            vec![yours.get()],
+            "undoing the same transaction twice unplaced a row that reused the deleted row id"
         );
     }
 
