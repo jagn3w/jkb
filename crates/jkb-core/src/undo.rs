@@ -1798,13 +1798,18 @@ mod tests {
         );
     }
 
-    /// A before-state that cannot restore anything fails **at the writer**, not at a later undo.
+    /// A before-state that could not restore the row fails **at the writer**, not at a later undo.
     ///
-    /// `item::set_content` logged `{"content_len": 12}` — a payload that reads like a before-state
-    /// and names no column, so the inverse would have run, restored nothing and reported success.
-    /// This is the property that makes `Inverse::Columns` safe to apply generically.
+    /// Three ways to get it wrong, all silent if they reach the log. `item::set_content` logged
+    /// `{"content_len": 12}` — a payload that reads like a before-state and names no column, so
+    /// the inverse would have run, restored nothing and reported success. An absent one is the
+    /// same thing one step further along. And a *deleted* row logged with only some of its columns
+    /// is worse still, because there is no surviving row for the rest to keep their values in.
+    ///
+    /// This is the property that makes the generic inverses safe to apply without a hand-written
+    /// statement per writer.
     #[test]
-    fn a_before_state_that_names_no_column_is_refused_at_the_writer() {
+    fn a_before_state_that_could_not_restore_the_row_is_refused_at_the_writer() {
         use crate::changelog::{self, Entity};
 
         let db = Db::open_in_memory().unwrap();
@@ -1824,6 +1829,32 @@ mod tests {
         assert!(
             err.to_string().contains("`content_len` is not a column"),
             "the refusal does not name the offending key: {err}"
+        );
+
+        // A DELETED row's before-state must be the WHOLE row, not merely column-shaped: an
+        // update leaves the row in place so its unnamed columns keep their values, but a delete
+        // leaves nothing behind for them to keep. Refused by naming the missing column, because
+        // the alternative is silent twice over — the reinsert is `OR IGNORE`, so a `NOT NULL`
+        // column with no default (`branch_records.created_at`) makes it restore nothing at all
+        // and report success.
+        let err = db
+            .write_txn("t", |c, m| {
+                changelog::append(
+                    c,
+                    m,
+                    "delete",
+                    Entity::TagApplications,
+                    "1",
+                    Some(&serde_json::json!({
+                        "item_id": 1, "facet": "size", "value": "small",
+                    })),
+                    None,
+                )
+            })
+            .expect_err("a deleted row was logged without every column of its table");
+        assert!(
+            err.to_string().contains("does not name props"),
+            "the refusal does not name the column that would not come back: {err}"
         );
 
         // …and an absent one is refused too: it is the same silent no-op one step further along.
