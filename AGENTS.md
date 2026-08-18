@@ -87,9 +87,11 @@ only when the branch was made some other way (a swarm run, a branch you cut by h
   contradiction, and a reader collapsing the multi-map picks one at random.
 - `onto=` is **refused** by `tag add`/`tag set` and by `#onto=` in quick-add, and says so: where a
   branch lands is a fact about the *branch*, so it lives in that branch's record and a facet of
-  that name reaches no reader. Use `task work --onto` / `task start --onto`. `base=` is refused by
-  `tag add`/`tag set` too, and names `jkb task base` — the cut point is keyed per branch, so
-  replacing the facet's other values would delete another branch's record.
+  that name reaches no reader. Use `task work --onto` / `task start --onto`. `base=` is **not**
+  refused, and it is not inert either: nothing reads it (a cut point is a row in the branch record,
+  written by `jkb task start` / `jkb task base`), but on a *file-backed* task the `tasks`
+  serializer renders every facet, so a stray one is written back into your `tasks.md`. Remove it
+  with `jkb task tag rm <uid> base=<value>`.
 - **No verb takes a commit id.** The sha nearest your hand is the branch tip, and a cut point
   equal to the tip reads as "nothing has happened on this branch" forever — the task can then
   neither be credited by a review nor land. If a branch's cut point is wrong,

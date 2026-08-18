@@ -1316,9 +1316,15 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 ///
 /// **The `WHERE EXISTS` guards are the one sanctioned way a restore in this module reports zero**,
 /// and they say exactly what they skip: a row whose *other* endpoint is not there to point at.
-/// Two items removed in one transaction produce two snapshots naming the same edge, and whichever
-/// is restored first cannot have it — so the guard is also what stops the second restore
-/// duplicating the first's row.
+/// They are reached by undoing an older transaction **out of order** — `jkb undo <txn>`, the form
+/// every refusal here recommends — where the endpoint was removed by a later transaction that has
+/// not been undone. Without them that is a foreign-key failure taking the whole undo with it.
+///
+/// The scenario this doc used to give — "two items removed in one transaction produce two
+/// snapshots naming the same edge" — is **false**, and a test built on it stayed green with the
+/// edge guards emptied. `item::remove` snapshots and *then* deletes, so the first delete cascades
+/// the edge away before the second item is snapshotted: only one snapshot ever names it, and it
+/// is the one restored last.
 ///
 /// Every insert here was `OR IGNORE`, on the rationale that "re-running an undo must not fail on
 /// rows a previous attempt already put back". A *completed* undo is refused by [`already_undone`]
@@ -1734,12 +1740,15 @@ mod tests {
 
     /// Two items removed in ONE transaction come back with the edge between them, exactly once.
     ///
-    /// Both snapshots name that edge, and whichever item is restored first cannot have it — its
-    /// other endpoint is not back yet, and a plain `INSERT` would fail the whole undo on a
-    /// foreign key. The `WHERE EXISTS` guards skip it there; the second restore, with both
-    /// endpoints present, puts it back. The guards are also what stops the second restore
-    /// duplicating the first's row, which is why this asserts the edge count and not merely that
-    /// the undo succeeded.
+    /// Only ONE snapshot names that edge — `item::remove` snapshots and then deletes, so the
+    /// first delete cascades it away before the second item is snapshotted — and entries are
+    /// inverted newest-first, so the snapshot holding it is applied last, with both endpoints
+    /// already back. This asserts the edge count rather than merely that the undo succeeded,
+    /// because "restored twice" and "restored once" both leave it present.
+    ///
+    /// It is deliberately **not** the endpoint guards' test: emptying `CASCADE`'s edge endpoints
+    /// leaves this green. See
+    /// `an_edge_whose_other_endpoint_is_still_deleted_is_skipped_not_a_failure`.
     #[test]
     fn two_items_removed_together_come_back_with_one_edge_between_them() {
         use crate::edge;
@@ -1774,6 +1783,82 @@ mod tests {
         );
     }
 
+    /// The names spliced into a restore's SQL are checked **where they are spliced**.
+    ///
+    /// `check_restorable` answers a *policy* question and legitimately returns `Ok` without
+    /// looking at anything, for every pair `row_shaped` does not cover — which includes the
+    /// cascaded `containment` and `bindings` rows, since `INVERSES` has no row-shaped entry for
+    /// either. Their column names still reach a `format!` into `INSERT INTO … (…)` a line later,
+    /// so "these came from `pragma_table_info`" has to be true at the moment they are used and
+    /// not merely when somebody else validated the payload they came in.
+    #[test]
+    fn a_cascaded_row_naming_a_column_the_table_lacks_is_refused_where_it_is_spliced() {
+        let db = Db::open_in_memory().unwrap();
+        let bogus = serde_json::json!({
+            "child_item_id": 1, "parent_item_id": 2, "position": 0, "no_such_column": 3,
+        });
+        let err = db
+            .read(move |c| {
+                Ok(
+                    super::restorable_fields(c, super::DELETE, "containment", Some(&bogus))
+                        .err()
+                        .map(|e| e.to_string()),
+                )
+            })
+            .unwrap()
+            .expect("a column `containment` does not have was spliced into a restore's SQL");
+        assert!(
+            err.contains("no_such_column"),
+            "the refusal does not name the column: {err}"
+        );
+    }
+
+    /// A restore skips an edge whose **other endpoint** is not there, rather than failing.
+    ///
+    /// Reached by undoing an older transaction out of order — `jkb undo <txn>` is the only form
+    /// that can, and every refusal in this module recommends it. `b`'s snapshot names the edge
+    /// (it was still there when `b` was removed); `a` is deleted by a later transaction that has
+    /// not been undone, so the edge cannot come back, and a plain `INSERT` would fail the whole
+    /// undo on a foreign key, taking `b` with it.
+    #[test]
+    fn an_edge_whose_other_endpoint_is_still_deleted_is_skipped_not_a_failure() {
+        use crate::edge;
+        use crate::item;
+        use jkb_types::EdgeType;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                edge::link(c, m, a, b, EdgeType::References, None)?;
+                Ok((a, b))
+            })
+            .unwrap();
+        let removed_b = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, b, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| item::remove(c, m, a, true).map(|_| ()))
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed_b))
+            .expect("restoring an item raised on an edge whose other endpoint is still deleted");
+
+        assert!(
+            db.read(|c| item::id_for_uid(c, "b")).unwrap().is_some(),
+            "the item was not restored"
+        );
+        assert!(
+            db.read(move |c| edge::edges_from(c, a, EdgeType::References))
+                .unwrap()
+                .is_empty(),
+            "an edge came back pointing at an item that is still deleted"
+        );
+    }
+
     /// An edge restored with its item keeps its **row id**, so a later undo can still address it.
     ///
     /// The cascade snapshot named `edges` under invented keys and captured no `id` at all, so the
@@ -1787,18 +1872,26 @@ mod tests {
         use jkb_types::EdgeType;
 
         let db = Db::open_in_memory().unwrap();
+        // A SECOND edge that survives the delete, so the id `SQLite` would issue to a restore
+        // that ignored the logged one differs from the original. Without it the deleted edge is
+        // the only row, `max(rowid) + 1` lands back on the same number, and the assertion below
+        // cannot tell a restored id from a reissued one — verified by mutation.
         let (src, dst) = db
             .write_txn("t", |c, m| {
                 let src = upsert(c, m, &note("src"))?;
                 let dst = upsert(c, m, &note("dst"))?;
+                let other = upsert(c, m, &note("other"))?;
                 edge::link_weighted(c, m, src, dst, EdgeType::Supports, Some(1.0), None)?;
+                edge::link(c, m, src, other, EdgeType::References, None)?;
                 Ok((src, dst))
             })
             .unwrap();
         let edge_row = |db: &Db| {
             db.read(move |c| {
-                Ok(c.prepare("SELECT id FROM edges WHERE src_item_id = ?1")?
-                    .query_row([src.get()], |r| r.get::<_, i64>(0))?)
+                Ok(
+                    c.prepare("SELECT id FROM edges WHERE src_item_id = ?1 AND dst_item_id = ?2")?
+                        .query_row([src.get(), dst.get()], |r| r.get::<_, i64>(0))?,
+                )
             })
             .unwrap()
         };
@@ -2772,14 +2865,10 @@ mod tests {
         // `first + 1` and the next real change lands on exactly this id.
         let unissued = first + 2;
 
-        let err = db
-            .write_txn("t", move |c, m| super::undo(c, m, unissued))
-            .expect_err("an id with no changelog entries was accepted and marked undone")
-            .to_string();
-        assert!(
-            err.contains("recorded no changes") && err.contains(&format!("transaction {unissued}")),
-            "the refusal does not say the id names no transaction: {err}"
-        );
+        // The attempt's own result is checked LAST, after the harm. Asserting the refusal first
+        // would make a build with the guard removed fail on `expect_err` — true, but it is the
+        // wrong sentence: what matters is which transaction the next `jkb undo` reverts.
+        let attempt = db.write_txn("t", move |c, m| super::undo(c, m, unissued));
 
         db.write_txn("t", |c, m| upsert(c, m, &note("new")).map(|_| ()))
             .unwrap();
@@ -2793,6 +2882,14 @@ mod tests {
         assert!(
             db.read(|c| item::id_for_uid(c, "old")).unwrap().is_some(),
             "`jkb undo` reverted an older, unrelated change instead"
+        );
+
+        let err = attempt
+            .expect_err("an id with no changelog entries was accepted and marked undone")
+            .to_string();
+        assert!(
+            err.contains("recorded no changes") && err.contains(&format!("transaction {unissued}")),
+            "the refusal does not say the id names no transaction: {err}"
         );
     }
 
