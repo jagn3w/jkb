@@ -1034,6 +1034,29 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // A MARKER IS A RECORD THAT SOMETHING WAS REVERTED, SO THERE MUST BE SOMETHING. An id with no
+    // entries at all is the one way through this function that reached the marker append having
+    // touched nothing — and `jkb undo <n>` is what every refusal in this module recommends, so a
+    // mistyped id is the expected way in. The marker is keyed on the id, not on a row that exists,
+    // so one written for an id `SQLite` has not issued yet lies in wait: when the id is finally
+    // used, `select_work_txn`'s `NOT undone_sql(...)` skips that transaction, a bare `jkb undo`
+    // reverts the one before it, and the explicit form answers "already undone". That is the
+    // silent retarget this module was rewritten to delete, arriving from the other end.
+    //
+    // It covers the harmless-looking case too: an id that *was* issued by a writer logging nothing
+    // (`ns::ensure`, see [`undo_last`]). Nothing is there to revert either way, and the answer to
+    // "revert nothing" is to say so, not to record a reversal.
+    if entries.is_empty() {
+        return Err(TypeError::Validation(refusal(
+            conn,
+            txn_id,
+            "it recorded no changes — either nothing has that id yet, or whatever made it logged \
+             nothing, and marking an id undone before it exists would make `jkb undo` skip the \
+             real transaction later",
+        )?)
+        .into());
+    }
+
     let blocked: Vec<String> = entries
         .iter()
         .filter(|(op, table, _, _)| is_work(op, table))
@@ -2558,6 +2581,54 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the pre-watermark transaction was reverted anyway"
+        );
+    }
+
+    /// An id that names no transaction is refused, so no marker lies in wait for it.
+    ///
+    /// Every refusal in this module recommends `jkb undo <n>`, so a mistyped id is the expected
+    /// user error — and the marker is keyed on the id, not on a row that exists. Written for an id
+    /// `SQLite` has not issued yet, it makes `select_work_txn` skip that transaction once the id is
+    /// finally used: the bare form reverts somebody's earlier work instead and the explicit form
+    /// answers "already undone". Here that is `old`, which nobody asked about, being deleted while
+    /// `new` — the change the user actually made last — survives.
+    #[test]
+    fn an_id_that_names_no_transaction_is_refused_rather_than_marked_undone() {
+        use crate::item;
+
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .write_txn("t", |c, m| {
+                upsert(c, m, &note("old"))?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // `txn_id` is `MAX(txn_id) + 1` over the changelog, so a marker-only transaction consumes
+        // `first + 1` and the next real change lands on exactly this id.
+        let unissued = first + 2;
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, unissued))
+            .expect_err("an id with no changelog entries was accepted and marked undone")
+            .to_string();
+        assert!(
+            err.contains("recorded no changes")
+                && err.contains(&format!("transaction {unissued}")),
+            "the refusal does not say the id names no transaction: {err}"
+        );
+
+        db.write_txn("t", |c, m| upsert(c, m, &note("new")).map(|_| ()))
+            .unwrap();
+        db.write_txn("t", undo_last).unwrap();
+
+        assert!(
+            db.read(|c| item::id_for_uid(c, "new")).unwrap().is_none(),
+            "a bare `jkb undo` skipped the user's last change, because a marker had been written \
+             for the id it was about to be given"
+        );
+        assert!(
+            db.read(|c| item::id_for_uid(c, "old")).unwrap().is_some(),
+            "`jkb undo` reverted an older, unrelated change instead"
         );
     }
 

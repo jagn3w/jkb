@@ -116,16 +116,22 @@ pub(crate) enum InsertInverse {
     /// which is what turns a future writer's wrong assumption into an immediate, named failure
     /// instead of a bare `jkb undo` silently reverting an unrelated transaction.
     ///
-    /// Both current members are keyed by something that is **not** a rowid — a file uri, a
-    /// transaction id — so the generic inverse would address the wrong row entirely. What each
-    /// owes instead differs, and the answer for both is in [`crate::undo`]'s `INVERSES` rather
-    /// than restated here:
+    /// Every current member is keyed by something that is **not** a rowid — a file uri, a
+    /// transaction id, a content hash — so the generic inverse would address the wrong row
+    /// entirely. What each owes instead differs, and the answer is in [`crate::undo`]'s
+    /// `INVERSES` rather than restated here:
     ///
     ///  * [`Entity::SyncState`] is logged as an `update` and inverted by hand
     ///    (`Inverse::SyncStateRow`), because a sync transaction's journal row must rewind with the
     ///    items it describes.
     ///  * [`Entity::Changelog`] carries `undo` markers. `INVERSES` has no `undo` entry at all, so
     ///    it is deliberately never inverted — undoing an undo is not something this module does.
+    ///  * [`Entity::Blobs`] is content-addressed and has no changelogged writer at all
+    ///    (`blob::store` is a dedupe `INSERT OR IGNORE`: the same hash is always the same bytes,
+    ///    so there is nothing to take back). The first author to changelog one will reach for the
+    ///    hash as `entity_id`, which is what makes `DeleteRow` the wrong declared answer — it
+    ///    would compile, ship, and fail at some user's `jkb undo` with "bad entity id" instead of
+    ///    on that author's first write.
     Never,
 }
 
@@ -153,13 +159,12 @@ impl Entity {
             | Self::TagApplications
             | Self::Bindings
             | Self::Mounts
-            | Self::Blobs
             | Self::Ingestions
             | Self::Containment
             | Self::BranchRecords => InsertInverse::DeleteRow,
-            // Keyed by uri and by transaction id respectively, so a rowid delete would address
-            // some other row; neither is ever logged with op `insert`.
-            Self::SyncState | Self::Changelog => InsertInverse::Never,
+            // Keyed by a uri, a transaction id and a content hash respectively, so a rowid
+            // delete would address some other row; none is ever logged with op `insert`.
+            Self::SyncState | Self::Changelog | Self::Blobs => InsertInverse::Never,
         }
     }
 }
