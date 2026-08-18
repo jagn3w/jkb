@@ -12,7 +12,9 @@
 #       FILE view: for one code-review tasks.md, each task's disk checkbox marker
 #       vs its KB item status + binding, plus the file's sync_state health.
 #
-# Read-only: reads journals, git, jkb, and the SQLite DB; never writes anything.
+# Read-only where it matters: it reads journals, git, jkb and the SQLite DB and mutates none of
+# them. It does write two scratch files (.swarm-base, .swarm-scope) into the run directory to
+# hand values from the embedded python back to bash, and deletes them again as it consumes them.
 set -euo pipefail
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"

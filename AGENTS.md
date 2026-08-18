@@ -76,8 +76,10 @@ only when the branch was made some other way (a swarm run, a branch you cut by h
 
 - `jkb task start <uid> [--branch B] [--onto S]` — claim the task and record, in one write, the
   branch, the repo, the branch it lands on, and the commit `B` was **cut from**. Prefer it to
-  tagging `branch=` by hand: it is the only writer that measures the cut point, and it can only
-  measure one if you name the parent with `--onto`.
+  tagging `branch=` by hand — that records a cut point too, but this is the writer you can tell
+  the parent branch. Without `--onto` only a branch with no commits of its own can be measured
+  (its own tip is provably its fork point); one that already has commits gets nothing recorded,
+  and says so.
 - `jkb task tag set <uid> <facet>=<value>` — make `<value>` the facet's **only** value. `add` is
   additive and stays that way (an open-ended facet legitimately holds several values); `set` is
   for the single-answer ones, `repo=` being the one left. A second value there is a
@@ -145,7 +147,8 @@ been ruled out?) and `jkb related <uid>` (how does it connect to the goal?).
 killed it (`refutes`, `rules_out`). A dead end with no edge saying *why* teaches the next
 agent nothing; a deleted one costs them the day it took you to rule it out.
 
-Starting one: `jkb inv ls` lists yours and the available strategy types;
+Starting one: `jkb inv ls` lists your investigations and their strategy types (with none yet,
+it lists the available types instead);
 `jkb inv new <type> <name> --goal "…"` creates one (homed under `memory/<repo>/<name>`
 inside a repo). `jkb inv digest` again at the end of a session so the next agent lands on
 current state.

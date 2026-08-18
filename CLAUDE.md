@@ -2,7 +2,9 @@
 
 jkb is a Rust Cargo workspace (crates under `crates/`) building a local-first,
 agent-native knowledge base. The full plan lives in `openspec/` (local only, not
-committed): `design.md` holds the decisions (D1–D25), `tasks.md` is the numbered
+committed), one folder per change under `openspec/changes/<name>/`: each holds the
+`design.md` for its decisions (the D-series, which runs to D47, plus the per-change
+series such as `Dmem` and the branch-records `B`) and a `tasks.md`, the numbered
 implementation checklist and the **source of truth for what's done**.
 
 ## Current status
@@ -218,17 +220,19 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 
 ## Build / verify
 
-Always `source ~/.cargo/env` first (rustup installs the pinned 1.96.1 toolchain).
+Raw `cargo build|test|clippy|fmt|check` is denied by a PreToolUse hook
+(`.claude/hooks/block-raw-cargo.sh`) — go through the wrappers, which self-source
+`~/.cargo/env` (rustup installs the pinned 1.96.1 toolchain) and pass args through.
 
 ```sh
-cargo build
-cargo test --all
-./scripts/check.sh      # fmt --check + clippy -D warnings + test + cargo-deny
+./scripts/build.sh
+./scripts/test.sh       # e.g. ./scripts/test.sh -p jkb-core
+./scripts/check.sh      # fmt --check + clippy -D warnings + test + cargo-deny + the ui build
 ```
 
-`cargo-deny` isn't installed yet (`cargo install cargo-deny`); the script skips it
-gracefully. Update `tasks.md` checkboxes (`[x]` done, `[~]` partial + inline note,
-`[ ]` todo) as each item lands.
+`check.sh` skips `cargo-deny` gracefully when it is not installed
+(`cargo install cargo-deny`). Update `tasks.md` checkboxes (`[x]` done, `[~]` partial +
+inline note, `[ ]` todo) as each item lands.
 
 ## Sections 5–6 — jkb-embed & jkb-index (DONE, for reference)
 
@@ -392,7 +396,8 @@ scoping: `apply_ambient` rewrites an unscoped `Query` to the cwd mount's subtree
 canonicalizes dir → `file://`; `ls` lists mounts), `sync [ns] [--watch]` (ns optional → all mounts; ctrl-c → shared stop flag),
 `service print|install|uninstall` (launchd/systemd unit for the watcher), `task add` (quick-add → slug+nanos
 uid) / `task next` (trailing DSL → scope+tags), `view save|ls|run`, `undo [txn]`,
-`doctor [--backup]`, `mcp` (stub → "Section 13" error). Embedder is the ollama default,
+`doctor [--backup]`, `mcp` (a stub in this section; wired to `jkb_mcp::run_stdio` by
+Section 13 below). Embedder is the ollama default,
 built lazily only where needed so read/task/query/sync/undo work fully offline; ingest
 captures (FTS-searchable) even when the embedder is down. Errors use `anyhow` at this
 edge. Tests: `tests/cli.rs` via `assert_cmd`, all offline.
@@ -926,8 +931,11 @@ git repo, and project context is used when found and skipped when absent.
 - **Skeptics are batched by file.** Loading the code around a finding is the expensive part;
   judging a second finding a few lines away is nearly free once it is in hand. So a skeptic gets
   every finding in one file, ordered by line, and returns a verdict on each — cost scales with
-  how many *files* carry findings, not how many findings there are, and because each batch faces
-  all three angles the vote is a true 2-of-3. Skeptics **default to refuted when uncertain** and
+  how many *files* carry findings, not how many findings there are, and because each **defect**
+  batch faces all three angles the vote there is a true 2-of-3. (A *quality* batch faces the one
+  angle that can kill a restructuring suggestion — the defect angles would refute every one of
+  them by construction, since a suggestion has no reproduction to walk.) Skeptics **default to
+  refuted when uncertain** and
   the burden of proof is on the finding: `refuted=false` requires writing the verified chain,
   since "I could not find a guard" is not "I confirmed there is none on any path".
 - **Severity is assigned once, at the end.** Finders each see only their own findings, so their

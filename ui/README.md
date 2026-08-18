@@ -50,8 +50,10 @@ Settings: `jkb.cliPath` (default `jkb`) and `jkb.dbPath` (blank = `$JKB_DB` / `~
 
 - **Lazy tree** of the VFS (namespaces + items homed under them, and containers expanded
   into what they contain — a document into its chunks, a task into its subtasks).
-  Sub-namespaces first, then the items homed there in placement order — the same order
-  `jkb ls` prints. Completed / cancelled items are hidden by default (toggle in the view
+  Sub-namespaces first, then tasks by importance, then everything else by label — the tree
+  does no sorting of its own, it prints the order `jkb ls` returns. (Expanding a *container*
+  is different: its children come back in containment order, so a document's chunks read in
+  document order.) Completed / cancelled items are hidden by default (toggle in the view
   title, like ignored files).
 - **Row colours + badges**: tasks coloured by importance (p1 danger → p3+ notice, with a
   `p1`/`p2`/`p3` badge), items by kind. The colour policy is portable (`@jkb/core`); the VS Code adapter
