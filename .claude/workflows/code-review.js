@@ -3,7 +3,7 @@ export const meta = {
   description:
     'Reviews a diff and returns ranked, structured findings. At the default effort "low", up to three reviewers split the change by feature area and each asks every lens question against one reading of its code. "medium" fans the lenses out instead — nine specialists plus one holistic reviewer per functional unit. "high" adds adversarial skeptics, batched by file — three angles per defect finding, one per quality finding — with each surviving on a majority of the verdicts cast about it.',
   whenToUse:
-    'Called by /review (prints findings) and /review-log (writes them as jkb tasks). Works in any git repo; project conventions, design docs and review history are used when present and skipped when absent.',
+    'Called by /jkb-review (prints findings) and /jkb-review-log (writes them as jkb tasks). Works in any git repo; project conventions, design docs and review history are used when present and skipped when absent.',
   phases: [
     { title: 'Scout' },
     { title: 'Review' },

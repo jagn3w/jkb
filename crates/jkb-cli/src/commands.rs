@@ -11,10 +11,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Filename prefix for installed commands, so `/jkb-<name>` is unambiguous and a later
-/// `uninstall` knows exactly which files are ours. Workflows are launched by path, so
-/// they keep their bare name for a predictable `scriptPath`.
-const CMD_PREFIX: &str = "jkb-";
+/// Filename prefix for **every** installed asset, so `/jkb-<name>` is unambiguous and a later
+/// `uninstall` knows exactly which files are ours.
+///
+/// **Workflows carry it too, and that is the whole guard.** `~/.claude/workflows/` is shared with
+/// everything else the user runs, and both writers here are unconditional — `try_ensure` fires on
+/// any `jkb` invocation whose stamp does not match and `fs::write`s the set with no existence
+/// check, no prompt and no backup, while `uninstall` `remove_file`s it and prints "removed"
+/// having never checked it wrote that file. Under a bare stem that destroys a user's own
+/// `code-review.js`, a name far likelier to be taken than `task-swarm`. A prefixed name is just
+/// as predictable for a `scriptPath` — which is the only reason the bare one was kept — and it
+/// cannot collide, so there is nothing left to guard against per call site.
+const ASSET_PREFIX: &str = "jkb-";
 
 /// Bundled slash commands as `(invocation stem, embedded markdown)`.
 ///
@@ -130,12 +138,18 @@ pub fn install() -> Result<()> {
     let base = base_dir()?;
     write_set(
         &base.join("commands"),
-        CMD_PREFIX,
+        ASSET_PREFIX,
         "md",
         BUNDLED_COMMANDS,
         true,
     )?;
-    write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS, true)?;
+    write_set(
+        &base.join("workflows"),
+        ASSET_PREFIX,
+        "js",
+        BUNDLED_WORKFLOWS,
+        true,
+    )?;
     std::fs::write(stamp_path(&base), fingerprint()).context("writing asset stamp")?;
     println!(
         "installed {} command(s) and {} workflow(s).",
@@ -146,7 +160,7 @@ pub fn install() -> Result<()> {
         "commands: {}",
         BUNDLED_COMMANDS
             .iter()
-            .map(|(s, _)| format!("/{CMD_PREFIX}{s}"))
+            .map(|(s, _)| format!("/{ASSET_PREFIX}{s}"))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -160,8 +174,13 @@ pub fn install() -> Result<()> {
 /// Returns an error if `HOME` is unset or an asset can't be removed.
 pub fn uninstall() -> Result<()> {
     let base = base_dir()?;
-    remove_set(&base.join("commands"), CMD_PREFIX, "md", BUNDLED_COMMANDS)?;
-    remove_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS)?;
+    remove_set(&base.join("commands"), ASSET_PREFIX, "md", BUNDLED_COMMANDS)?;
+    remove_set(
+        &base.join("workflows"),
+        ASSET_PREFIX,
+        "js",
+        BUNDLED_WORKFLOWS,
+    )?;
     if base.exists() {
         // Mark the current bundle reconciled so auto-install won't re-add these until the
         // binary ships a different set.
@@ -199,12 +218,18 @@ fn try_ensure() -> Result<()> {
     }
     write_set(
         &base.join("commands"),
-        CMD_PREFIX,
+        ASSET_PREFIX,
         "md",
         BUNDLED_COMMANDS,
         false,
     )?;
-    write_set(&base.join("workflows"), "", "js", BUNDLED_WORKFLOWS, false)?;
+    write_set(
+        &base.join("workflows"),
+        ASSET_PREFIX,
+        "js",
+        BUNDLED_WORKFLOWS,
+        false,
+    )?;
     std::fs::write(&stamp, want).context("writing asset stamp")?;
     Ok(())
 }
@@ -220,13 +245,13 @@ pub fn list() -> Result<()> {
     println!("config directory: {}", base.display());
     println!("commands ({}):", commands.display());
     for (stem, _) in BUNDLED_COMMANDS {
-        let mark = mark(&commands.join(format!("{CMD_PREFIX}{stem}.md")));
-        println!("  /{CMD_PREFIX}{stem}  ({mark})");
+        let mark = mark(&commands.join(format!("{ASSET_PREFIX}{stem}.md")));
+        println!("  /{ASSET_PREFIX}{stem}  ({mark})");
     }
     println!("workflows ({}):", workflows.display());
     for (stem, _) in BUNDLED_WORKFLOWS {
-        let mark = mark(&workflows.join(format!("{stem}.js")));
-        println!("  {stem}  ({mark})");
+        let mark = mark(&workflows.join(format!("{ASSET_PREFIX}{stem}.js")));
+        println!("  {ASSET_PREFIX}{stem}  ({mark})");
     }
     Ok(())
 }
@@ -242,7 +267,7 @@ fn mark(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUNDLED_COMMANDS, BUNDLED_WORKFLOWS};
+    use super::{ASSET_PREFIX, BUNDLED_COMMANDS, BUNDLED_WORKFLOWS};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -266,19 +291,31 @@ mod tests {
             .collect()
     }
 
-    /// Every `{dir}/<stem>.{ext}` path `body` names.
-    fn path_refs(body: &str, dir: &str, ext: &str) -> BTreeSet<String> {
+    /// Every `{dir}/<stem>.{ext}` path `body` names, as `(repo_local, stem)`.
+    ///
+    /// `repo_local` is true only for a `./.claude/{dir}/…` reference — the in-repo fallback every
+    /// launcher lists last, which reads this repo's own working tree and therefore uses the bare
+    /// stem. Every other reference resolves inside the user's config directory, where the file is
+    /// whatever [`super::install`] wrote it as; the two are told apart here so the test below can
+    /// hold each to the name that actually exists at that path.
+    fn path_refs(body: &str, dir: &str, ext: &str) -> BTreeSet<(bool, String)> {
         let suffix = format!(".{ext}");
-        body.split(&format!("{dir}/"))
-            .skip(1)
-            .filter_map(|tail| {
-                let stem: String = tail
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                    .collect();
-                (!stem.is_empty() && tail[stem.len()..].starts_with(&suffix)).then_some(stem)
-            })
-            .collect()
+        let marker = format!("{dir}/");
+        let mut out = BTreeSet::new();
+        let mut from = 0;
+        while let Some(offset) = body[from..].find(&marker) {
+            let at = from + offset;
+            let tail = &body[at + marker.len()..];
+            let stem: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !stem.is_empty() && tail[stem.len()..].starts_with(&suffix) {
+                out.insert((body[..at].ends_with("./.claude/"), stem));
+            }
+            from = at + marker.len();
+        }
+        out
     }
 
     /// Whether `body` names the slash command `stem` — `/stem` on both word boundaries, so
@@ -302,38 +339,60 @@ mod tests {
         false
     }
 
-    /// **The bundle is closed under the paths it names.** `jkb commands install` is the whole
-    /// point of `.claude/` being embedded — an asset that reaches for a sibling the installer did
-    /// not write dead-ends on every machine that is not this repo, and does so silently, because
-    /// the command itself installs and runs.
+    /// **The bundle is closed under the paths it names, under the names it is installed as.**
+    /// `jkb commands install` is the whole point of `.claude/` being embedded — an asset that
+    /// reaches for a sibling the installer did not write dead-ends on every machine that is not
+    /// this repo, and does so silently, because the command itself installs and runs.
+    ///
+    /// Both halves of that are checked, because being in the bundle is not enough: the installer
+    /// writes `{ASSET_PREFIX}<stem>`, so a config-directory path spelled with the bare stem names
+    /// a file nothing puts there. Only the trailing `./.claude/…` fallback, which reads this
+    /// repo's own working tree, may use it.
     #[test]
     fn a_bundled_asset_names_no_workflow_or_command_the_bundle_omits() {
-        let commands = stems(BUNDLED_COMMANDS);
-        let workflows = stems(BUNDLED_WORKFLOWS);
+        let sets: [(&str, &str, BTreeSet<&str>); 2] = [
+            ("workflows", "js", stems(BUNDLED_WORKFLOWS)),
+            ("commands", "md", stems(BUNDLED_COMMANDS)),
+        ];
         for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
-            for named in path_refs(body, "workflows", "js") {
-                assert!(
-                    workflows.contains(named.as_str()),
-                    "`{stem}` reaches for `workflows/{named}.js`, which \
-                     `jkb commands install` does not write — add it to BUNDLED_WORKFLOWS"
-                );
-            }
-            for named in path_refs(body, "commands", "md") {
-                assert!(
-                    commands.contains(named.as_str()),
-                    "`{stem}` reaches for `commands/{named}.md`, which \
-                     `jkb commands install` does not write — add it to BUNDLED_COMMANDS"
-                );
+            for (dir, ext, bundled) in &sets {
+                for (repo_local, named) in path_refs(body, dir, ext) {
+                    let want = if repo_local {
+                        Some(named.as_str())
+                    } else {
+                        named.strip_prefix(ASSET_PREFIX)
+                    };
+                    let Some(want) = want else {
+                        panic!(
+                            "`{stem}` reaches for `{dir}/{named}.{ext}` outside this repo, but \
+                             `jkb commands install` writes `{ASSET_PREFIX}{named}.{ext}` — spell \
+                             the installed name"
+                        );
+                    };
+                    assert!(
+                        bundled.contains(want),
+                        "`{stem}` reaches for `{dir}/{named}.{ext}`, which `jkb commands install` \
+                         does not write — add `{want}` to the bundle"
+                    );
+                }
             }
         }
     }
 
-    /// …and under the slash commands it names. `/jkb-review-log` deferred its central step to
-    /// `/review`, which was not bundled; the reference is by name rather than by path, so the
-    /// check above cannot see it. Which names are *ours* comes from the repo's own
-    /// `.claude/commands/`, so a host command like `/security-review` is not claimed.
+    /// …and under the slash commands it names, **as the user will be able to type them**.
+    ///
+    /// `/jkb-review-log` deferred its central step to `/review`, which was not bundled; the
+    /// reference is by name rather than by path, so the check above cannot see it. Which names are
+    /// *ours* comes from the repo's own `.claude/commands/`, so a host command like
+    /// `/security-review` is not claimed.
+    ///
+    /// The bare stem is a **failure**, not merely an unbundled name. `install` writes
+    /// `{ASSET_PREFIX}<stem>.md`, so `/design-pass` resolves on exactly one machine in the world —
+    /// this repo's checkout — while the command telling you to run it ships everywhere. Checking
+    /// the repo-side stem is what let five of those through: the name was in the list, so the
+    /// assertion held, and its own message named a file the installer does not write.
     #[test]
-    fn a_bundled_command_names_no_sibling_slash_command_the_bundle_omits() {
+    fn a_bundled_command_names_the_slash_commands_the_installer_writes() {
         let bundled = stems(BUNDLED_COMMANDS);
         let ours = repo_stems("commands", "md");
         assert!(
@@ -343,9 +402,15 @@ mod tests {
         for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
             for named in &ours {
                 assert!(
-                    !names_command(body, named) || bundled.contains(named.as_str()),
-                    "`{stem}` tells the reader to use `/{named}`, which \
-                     `jkb commands install` does not write — add it to BUNDLED_COMMANDS"
+                    !names_command(body, named),
+                    "`{stem}` tells the reader to run `/{named}`, which exists only inside this \
+                     repo — `jkb commands install` writes it as `/{ASSET_PREFIX}{named}`"
+                );
+                let installed = format!("{ASSET_PREFIX}{named}");
+                assert!(
+                    !names_command(body, &installed) || bundled.contains(named.as_str()),
+                    "`{stem}` tells the reader to run `/{installed}`, which \
+                     `jkb commands install` does not write — add `{named}` to BUNDLED_COMMANDS"
                 );
             }
         }

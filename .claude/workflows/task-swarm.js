@@ -3,7 +3,7 @@ export const meta = {
   description:
     'SCHEDULER groups overlapping ready jkb tasks into work-groups; one IMPLEMENTER builds each group on a clean branch; a fresh REVIEWER checks the whole group; a deterministic merge queue (no agent) rebase/fast-forwards approved branches into one feature branch and marks the group done. Pipelined (no per-round barrier), claim-guarded, looping as dependents unblock.',
   whenToUse:
-    'Launched by the /task-swarm command after it scouts the jkb task set and creates the integration branch + worktree.',
+    'Launched by the /jkb-task-swarm command after it scouts the jkb task set and creates the integration branch + worktree.',
   phases: [
     { title: 'Schedule' },
     { title: 'Claim' },
@@ -14,7 +14,7 @@ export const meta = {
 }
 
 // ---------------------------------------------------------------------------
-// Config — supplied by the /task-swarm command via `args`. All git/branch setup
+// Config — supplied by the /jkb-task-swarm command via `args`. All git/branch setup
 // (integration branch + its worktree) is done by the command BEFORE launch; this
 // script only orchestrates agents. Roles (design D27):
 //   SCHEDULER   — clusters overlapping ready tasks into work-groups (≤~4 each).
@@ -35,7 +35,7 @@ const QUEUE_ENV = [`JKB='${JKB}'`, cfg.db ? `JKB_DB='${cfg.db}'` : ''].filter(Bo
 const SCOPE = cfg.scope || '' // a jkb DSL scope, e.g. "ns:codereviews/**"
 const TASKS = Array.isArray(cfg.tasks) ? cfg.tasks : null // or explicit task uids
 // Design gate (D28): in scope mode the swarm only touches tasks whose design has been
-// approved (tag `design=approved`, set by /design-pass). `cfg.designGate:false` disables
+// approved (tag `design=approved`, set by /jkb-design-pass). `cfg.designGate:false` disables
 // it. Explicit-uid mode (TASKS) is a deliberate hand-pick and always bypasses the gate.
 const DESIGN_GATE = cfg.designGate === false || TASKS ? '' : 'tag:design=approved'
 const GLOBAL = cfg.global === false ? '' : ' --global' // ignore ambient cwd scoping
@@ -46,14 +46,14 @@ const RETRY_CAP = cfg.retryCap || 3 // per-GROUP feedback attempts (review + eje
 const ROUND_CAP = cfg.roundCap || 40 // safety bound on scheduler passes
 const GROUP_CAP = cfg.groupCap || 4 // hard cap on tasks per work-group (D27.8)
 // The run's claim owner (design D27.1): a liveness-checkable id for THIS run. Ideally
-// `host:pid` of a process alive for the run; the /task-swarm command supplies it. Any
+// `host:pid` of a process alive for the run; the /jkb-task-swarm command supplies it. Any
 // owner the reclaim scan can't prove alive is treated dead by a *later* run (crash net) —
 // but this run always passes OWNER to `task reclaim --keep`, so it never reclaims its own.
 const OWNER = cfg.owner || `swarm:${INTEGRATION}`
 
 if (!INTEGRATION || !INTEGRATION_WT) {
   throw new Error(
-    'task-swarm requires args.integration and args.integrationWorktree — the /task-swarm command sets these up before launching.',
+    'task-swarm requires args.integration and args.integrationWorktree — the /jkb-task-swarm command sets these up before launching.',
   )
 }
 
@@ -331,7 +331,7 @@ function reclaimPrompt() {
 
 ${JKB}${DB} task reclaim --keep '${OWNER}'
 
-This clears claims left by CRASHED PRIOR runs (owner pid gone) before the first frontier read, while preserving THIS run's own claims (owner '${OWNER}' is kept). The ONGOING ~60s reclaim is handled by the /task-swarm command's sidecar, not here. Return ok=true with the reclaimed count. Change no code, touch no git.`
+This clears claims left by CRASHED PRIOR runs (owner pid gone) before the first frontier read, while preserving THIS run's own claims (owner '${OWNER}' is kept). The ONGOING ~60s reclaim is handled by the /jkb-task-swarm command's sidecar, not here. Return ok=true with the reclaimed count. Change no code, touch no git.`
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +497,7 @@ async function schedule() {
   round++
   // Startup crash-recovery scan (D27.6.6b), first pass only: clear claims left by dead
   // PRIOR runs before the first frontier read, keeping our own owner. The ONGOING ~60s
-  // periodic reclaim is a true wall-clock timer owned by the /task-swarm command's sidecar
+  // periodic reclaim is a true wall-clock timer owned by the /jkb-task-swarm command's sidecar
   // process (workflow JS has no clock/background timer), so we do NOT repeat it each pass.
   if (round === 1) {
     await agent(reclaimPrompt(), { label: 'reclaim#startup', phase: 'Schedule', schema: ACK, model: 'haiku' })

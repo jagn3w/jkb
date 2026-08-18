@@ -1,5 +1,5 @@
 ---
-description: Review the current change. By default up to three reviewers split it by feature area and each asks every lens question; `medium` fans the nine lenses out instead, `high` adds adversarial skeptics. Prints findings; use /review-log to file them as tasks.
+description: Review the current change. By default up to three reviewers split it by feature area and each asks every lens question; `medium` fans the nine lenses out instead, `high` adds adversarial skeptics. Prints findings; use /jkb-review-log to file them as tasks.
 argument-hint: "[range]  [low|medium|high]  [-- anything to focus on]"
 ---
 
@@ -13,7 +13,7 @@ Arguments given: `$ARGUMENTS`
 
 The reviewer costs a dozen or more agents and millions of tokens per run, so it has to be spent
 on what is hard to spot rather than on what a careful reading catches. Read your own diff first
-and check the seven points in `/review-log` step 0 — edits landed, comments match the code, new
+and check the seven points in `/jkb-review-log` step 0 — edits landed, comments match the code, new
 branches reachable, the same rule honoured at its other call sites, the changed path covered by a
 test, new parameters supplied everywhere, and the thing actually run. Then run the repo's verify
 command, and say what the self-review caught.
@@ -53,7 +53,7 @@ If the resolved range has no changes, say so and stop.
 ## 2. Run the reviewer
 
 Call the **Workflow** tool with `scriptPath` set to the first of these that exists —
-`"$CLAUDE_CONFIG_DIR/workflows/code-review.js"`, `"$HOME/.claude/workflows/code-review.js"`,
+`"$CLAUDE_CONFIG_DIR/workflows/jkb-code-review.js"`, `"$HOME/.claude/workflows/jkb-code-review.js"`,
 `./.claude/workflows/code-review.js` — and `args` as an **actual JSON object** (a stringified
 one makes every field `undefined`):
 
@@ -98,5 +98,5 @@ Do not re-review, re-rank or add findings of your own — they have already been
 verification and calibration. If you disagree with one, say so as a comment rather than editing
 the list.
 
-Then offer, without doing it: `/review-log` files these as jkb tasks under
+Then offer, without doing it: `/jkb-review-log` files these as jkb tasks under
 `.codereviews/<datetime>-<branch>-<N>/`.

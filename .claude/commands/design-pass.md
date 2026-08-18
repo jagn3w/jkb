@@ -3,7 +3,7 @@ description: Walk open, un-triaged jkb tasks under a path and settle each task's
 argument-hint: "<jkb-path>  (a namespace/directory; omit to triage tasks/inbox)"
 ---
 
-You are running a **design pass**. The swarm (`/task-swarm`) will only implement tasks
+You are running a **design pass**. The swarm (`/jkb-task-swarm`) will only implement tasks
 tagged `design=approved` (the design gate, D28) — because its implementers run headless and
 **cannot ask the user** about undecided architecture. Your job here, in this interactive
 session, is to be the place where the user weighs in: walk the open tasks that have **not**
@@ -13,7 +13,7 @@ implementer will find it, and tag the task `design=approved`.
 Path given: `$ARGUMENTS` (if empty, default `PATH=tasks/inbox`).
 
 Use the `jkb` binary on PATH (fall back to `./target/debug/jkb`). Normalize `$ARGUMENTS`
-into `PATH` as in `/next-task` (trim, strip leading/trailing `/` and a trailing `/**`).
+into `PATH` as in `/jkb-next-task` (trim, strip leading/trailing `/` and a trailing `/**`).
 
 ## 1. Find the un-triaged tasks
 
@@ -135,5 +135,5 @@ confirming trivial).
 Summarize the pass: how many tasks you triaged, how many were **approved trivially** vs
 **designed** (with the `D<N>` numbers you added), and any you **left un-tagged** (and why —
 e.g. the user deferred the decision). Remind the user that only the now-approved tasks are
-visible to `/task-swarm <PATH>`; anything still un-tagged will be held back until a future
+visible to `/jkb-task-swarm <PATH>`; anything still un-tagged will be held back until a future
 design pass.
