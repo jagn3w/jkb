@@ -936,8 +936,24 @@ log(
 // no reviewer opens, which reads exactly like a clean review of it. Leftovers are therefore
 // assigned to the smallest area rather than dropped, and the count is logged.
 function buildAreas(scout) {
+  // A unit's paths are matched to the diff by PREFIX, not by equality. The survey is told to
+  // print the file list "exactly as git prints them" but a unit's `paths` carries no such
+  // constraint, and a directory (`crates/jkb-cli/src/`) or a brace form is the spelling this
+  // project's own prose uses. Under equality every unit then matched nothing, every area was
+  // empty, every file fell to the orphan branch and into ONE area — a run that reports "1
+  // reviewer" and otherwise reads like a normal clean review, with one agent holding a diff and
+  // a finding cap sized for a third of it.
+  const match = (p) =>
+    scout.files.filter((f) => f === p || f.startsWith(p.endsWith('/') ? p : `${p}/`))
   const units = scout.features.length
-    ? scout.features.map((f) => ({ name: f.name, files: (f.paths || []).filter((p) => scout.files.includes(p)) }))
+    ? scout.features.map((f) => {
+        const files = [...new Set((f.paths || []).flatMap(match))]
+        // A unit whose paths matched nothing is a survey failure, not an empty unit, and it is
+        // said out loud: its files are still reviewed (the orphan branch below), but by whoever
+        // happens to get them rather than by the reviewer that was meant to own the capability.
+        if (!files.length) log(`NOTE: functional unit "${f.name}" named ${(f.paths || []).length} path(s), none of which match a changed file`)
+        return { name: f.name, files }
+      })
     : [{ name: 'the change', files: [...scout.files] }]
 
   // Largest first, then greedily into the emptiest bucket: balances reading load without
