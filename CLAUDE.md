@@ -100,7 +100,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **486 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **553 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -156,7 +156,7 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   write, not a line in the reviewer's focus argument** — the focus is for perspectives you lack,
   and a finding that merely confirms a doubt you already held is a review spent on work you owed
   it. **Anything short of high confidence is a blocker, not a disclosure**: what you are unsure of is exactly what to
-  test, and the reviewer's budget must not be spent rediscovering a gap you could already name. `staging-workflow` needed 19 passes, and a large share of
+  test, and the reviewer's budget must not be spent rediscovering a gap you could already name. `staging-workflow` needed 41 passes, and a large share of
   the findings were self-catchable. **A rule every call site must remember is the defect** — the
   four vector sweeps, the seven layout guards, the retry debt, the write-seam snapshot were all
   one shape. Put it in the callee, a type, or the schema instead.
@@ -174,11 +174,22 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   compile once and are reused across the long-lived writer connection. To get a
   new-or-existing row id in one statement, use
   `INSERT … ON CONFLICT(…) DO UPDATE SET <no-op> RETURNING id|rowid`.
-- **Changelog on every mutation:**
-  `changelog::append(conn, meta, op, entity_type, entity_id, before, after)`
-  where `entity_type` = the table name and `entity_id` = the row's rowid, so
-  `undo` can `DELETE FROM {table} WHERE rowid = ?`. Use op `"insert"` for creates
-  (the only op `undo` currently inverts).
+- **Changelog on every mutation**, and the op is **derived, never chosen** (D47).
+  A row-writing mutation calls
+  `changelog::upsert(conn, meta, Entity::Foo, entity_id, before, after)` — it records
+  `insert` when `before` is `None` and `update` otherwise. `changelog::append` takes
+  an op for everything else (`delete`, `claim`, `release`, …) and **refuses `insert`
+  outright**. `Entity` is a closed enum, so `entity_type` cannot be a typo'd table.
+  `entity_id` is the row's rowid wherever the inverse is keyed by one.
+  `undo::INVERSES` covers ~20 `(op, table)` pairs and **refuses** anything it does
+  not, so a gap is a named refusal rather than an unrelated transaction being
+  reverted instead.
+- **A before-state must be able to restore something.** `changelog::write` calls
+  `undo::check_restorable` on every entry: the before-state must be a non-empty
+  object naming only real columns of the table, and for a **`delete`** it must name
+  **every** column — an unnamed column would come back as its default. Checked
+  against the live schema, so adding a column makes every deleter of that table fail
+  at its next write until the column is logged.
 - **Enums** in `jkb_types` carry `as_str()` returning the snake_case DB string
   (matches their serde form). IDs: `.new(i64)` / `.get() -> i64`.
 - **Migrations:** add `V00N__<name>.sql` under `crates/jkb-core/src/migrations/`
@@ -789,7 +800,9 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   refusing a session state file.
 - **`jkb staging ls [--all]` is the ONE read** behind both the explorer's branch picker and
   its In Flight view, so the two cannot disagree about what is live. Each task carries a
-  derived `state`: `implementing` / `review` / `landed`. A branch adding nothing to trunk is
+  derived `state`: `implementing` / `review` / `landed` / `dropped` — `dropped` being a
+  **cancelled** task that was on the branch, kept apart from `landed` because reporting the two
+  as one would say a dropped task shipped. A branch adding nothing to trunk is
   either landed *or* freshly cut and still empty, and refs cannot tell those apart — **live
   work is the tie-break**, or the branch cut by the very first `task work` is hidden from the
   picker that exists to offer it.
@@ -1186,8 +1199,14 @@ Design in `openspec/changes/jkb-staging-pr/`.
   both pass-9 sync must-fixes), `set_layout`, `read_layout`, `legacy_layout`, `collect_legacy_prose`.
 - **Still open, filed not fixed:** the import direction is unvalidated (`parse_text` is lenient, so
   a truncated file imports cleanly and cancels every task below the cut) — now the largest
-  remaining data-loss path; `ns mv`/`ns rm` are unguarded on synced namespaces; a first-sight
-  export can overwrite an unimported file; `finish_export` does not blob the losing bytes.
+  remaining data-loss path; and `ns mv`/`ns rm` are unguarded on synced namespaces, though D45
+  took the teeth out of that one by moving a file's structure off the namespace tree.
+  - **Two of the four have since landed.** A *first-sight export over an unimported file* is
+    refused by `export_blocker`'s second condition — content on disk with no recorded structure —
+    on any mount that can import. And the *losing bytes are blobbed*: `archive_current_bytes` moved
+    up into `reconcile_file`, above the direction dispatch, so it covers all four sites that
+    overwrite a synced file rather than the one that used to carry the rule, and a failed archive
+    stops that file instead of degrading to best-effort.
 
 ## A synced file owns its own namespace (D39) — the collapse, fixed at the root
 
@@ -1217,10 +1236,10 @@ The `Collided` refusal above was a guard around a modelling error, and the error
 - **A directory may now hold many synced files.** That is the user-visible gain, and why this
   was worth a re-home rather than an eighth guard.
 
-## An item id is never reused (D40)
+## An item id is never reused (D40), and a vector row goes with its item (D42)
 
-`items.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` (migration `V010`). Design in
-`openspec/changes/jkb-item-id-stability/`.
+`items.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` (migration `V010`, **repaired by `V011`**).
+Designs in `openspec/changes/jkb-item-id-stability/` and `openspec/changes/jkb-vector-liveness/`.
 
 - **The hazard was rowid reuse.** `vec_items_<dim>` is a `vec0` virtual table and cannot carry a
   foreign key, so a deleted item left its vector behind — keyed on an id SQLite then handed to
@@ -1230,13 +1249,80 @@ The `Collided` refusal above was a guard around a modelling error, and the error
   ingest's fresh-capture arm) across review passes 5–8. Each fix was correct and incomplete,
   because the enforcement was procedural: every present and future deleter had to remember.
   Prefer an invariant the **schema** enforces over one every caller must uphold.
-- **All four in-transaction sweeps are removed.** A stale row is now inert, so cleanup is
-  housekeeping: `jkb_index::count_stale` / `sweep_stale`, surfaced as **`jkb index --sweep`**
-  and `jkb doctor [--fix]`. Removing them is the point — it deletes the question *which call
-  sites sweep?*, which is what produced four passes of findings.
-- Pinned by `item::tests::a_deleted_items_id_is_never_reused` (verified to fail without the
-  migration). **Note:** `V010` rebuilds `items`, so an older branch's binary cannot open a
-  database this one has migrated — the usual shared-`jkb.db` divergence.
+- **All four in-transaction sweeps are removed.** Removing them is the point — it deletes the
+  question *which call sites sweep?*, which is what produced four passes of findings. Cleanup is
+  housekeeping now: `jkb_index::count_stale` / `sweep_stale`, surfaced as **`jkb index --sweep`**
+  and `jkb doctor [--fix]`.
+- **But `V010` did not work, and D40's "a stale row is now inert" was false for two more passes.**
+  Its `INSERT OR IGNORE` into `sqlite_sequence` **cannot ignore** — that table has no primary key
+  and no unique index, so there is no conflict to ignore and it always inserted a second
+  `('items', …)` row. And it seeded from `MAX(id) FROM items`, the maximum *surviving* id, which
+  resets the high-water mark **below** every id freed at the top of the range. So `AUTOINCREMENT`
+  protected ids freed after the migration and did nothing for the orphans D40 had just stopped
+  sweeping. Reproduced against real SQLite with the migration's exact body.
+- **`V011` recomputes the sequence from the changelog**, which records every item insert and is
+  never pruned, so it remembers ids the table no longer holds — and it `DELETE`s the row before
+  inserting, which also clears `V010`'s duplicate. `V010` is **not edited, not even its misleading
+  comment**: refinery hashes a migration's entire SQL text, comments included, so a comment-only
+  edit reports a divergent migration on every database that already applied it.
+- **The invariant that actually holds is a `DELETE` trigger** (`vector.rs::ensure_gc_trigger`,
+  created beside each `vec_items_<dim>` table). A trigger lives in the database file, so it fires
+  for every connection, every process and every future call site — the objection that killed an
+  `ItemDeleteHook` seam does not apply to it. Cost, stated: a connection without the `sqlite-vec`
+  extension cannot resolve the virtual table, so an item delete on one fails loudly. Every binary
+  here opens with `Db::open_with(&[jkb_index::register])`.
+- **Reads filter too, as defence in depth with a named budget.** `VectorIndexer::knn_live` drops
+  rows whose item is gone and **also returns whether the index was exhausted**, so `jkb-search`'s
+  growth loop can tell that from "live rows ran out inside knn's budget" — its `hits.len() < fetch`
+  test is wrong once filtering happens inside. The filter is applied in Rust, not as a join
+  (`sqlite-vec` needs a `k` and rejects `ORDER BY` on anything but distance), and the internal
+  fetch never exceeds **4096** — `sqlite-vec` hard-errors above that, and `vector_ranked` already
+  over-fetches to 2048.
+- **A liveness join alone could never have fixed it**: under reuse the `item_id` names a live
+  item — the wrong one. That is also why `jkb doctor` reported `ok` for an affected database.
+  D42.1 is the load-bearing fix; the trigger and the read filter are what make it hold.
+- Pinned by `item::tests::a_deleted_items_id_is_never_reused` and, for the migration itself, a
+  test inside `src/migrate.rs` (the runner is private) that builds a `V010`-era database with
+  `Target::Version(10)` and asserts the next ids exceed every id ever used. **Note:** `V010`
+  rebuilds `items`, so an older branch's binary cannot open a database this one has migrated —
+  the usual shared-`jkb.db` divergence.
+
+## The changelog is an audit log; `undo` reads it as an undo log (D47)
+
+Three consecutive review passes each found a defect *inside the previous pass's fix* — round 4
+`branch_records` missing from the undoable set (**which tables**), round 5 four upserts logging
+the op `insert` (**which op**), round 6 derived-correctly `update` entries nothing could invert
+(**invertibility**). Three axes of one question, because the mechanism underneath was untouched:
+*cannot invert this? revert something else.* The diagnosis is that the two logs have different
+contracts — an audit entry says what happened, an undo entry has to carry enough to put it back —
+and nothing ever held an entry to the second.
+
+- **The entity is a type, not a string.** `changelog::Entity` is a closed enum whose variants and
+  `Entity::ALL` are generated together by one macro, and `Entity::insert_inverse` is an exhaustive
+  match — so a new table cannot reach a writer without saying how an insert into it comes back.
+  The allowlist is **derived** from that match rather than hand-maintained beside it.
+- **The op is derived, never chosen.** `changelog::upsert(…, before, after)` records `insert` only
+  when `before` is `None`; `changelog::append` **refuses** the op `insert` outright. Choosing it is
+  how four upserts (`view::save`, `placement::place`, `binding::set`, `tag::apply`) logged `insert`
+  for `ON CONFLICT` arms that updated pre-existing rows, after which `undo` deleted them.
+- **A before-state that could not restore anything is refused at the write** (`undo::check_restorable`,
+  called from `changelog::write`): non-empty, naming only real columns, and for a `delete` naming
+  **every** column — checked against the live schema, so adding a column fails every deleter of
+  that table at its next write.
+- **Refuse rather than retarget.** `undo_last` selects the newest transaction containing any
+  *work*, not the newest it can invert, and `undo` wraps the whole apply loop so **any** error
+  becomes one named refusal that writes nothing. It stops predicting which entries are unrunnable;
+  a kind nobody taught it about is a refusal, not a silently reverted stranger.
+- **A restore that restored nothing is an error.** `restored()` is the one place a row count is
+  judged, and zero is honest only where a named guard says the row was deliberately skipped. Arms
+  answering `Ok(0)` for work they had not done were worse than raising: `undo` wrote its marker on
+  the strength of it, so clearing the obstruction and retrying met "already undone".
+- **User-visible: `V014` draws a date line.** A write-time guard cannot reach backwards, and
+  inferring whether a legacy payload happens to be invertible is the same mistake one level along.
+  So `undo_watermark` is seeded to `MAX(txn_id)` at upgrade: **`jkb undo` cannot reach anything
+  from before the upgrade**. `undo_last` never selects below it, and an explicit `jkb undo <txn>`
+  below it is told the transaction predates undo history rather than dying part-way through.
+  A fresh database has an empty changelog, so the mark is 0 and nothing is excluded.
 
 ## Sync: prose is not an item (the `memory/sync-export-wins` fix)
 
