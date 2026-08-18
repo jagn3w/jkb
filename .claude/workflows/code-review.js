@@ -1,7 +1,7 @@
 export const meta = {
   name: 'code-review',
   description:
-    'Reviews a diff and returns ranked, structured findings. At the default effort "low", up to three reviewers split the change by feature area and each asks every lens question against one reading of its code. "medium" fans the lenses out instead — nine specialists plus one holistic reviewer per functional unit. "high" adds three adversarial skeptics per finding, batched by file, surviving on a majority.',
+    'Reviews a diff and returns ranked, structured findings. At the default effort "low", up to three reviewers split the change by feature area and each asks every lens question against one reading of its code. "medium" fans the lenses out instead — nine specialists plus one holistic reviewer per functional unit. "high" adds adversarial skeptics, batched by file — three angles per defect finding, one per quality finding — with each surviving on a majority of the verdicts cast about it.',
   whenToUse:
     'Called by /review (prints findings) and /review-log (writes them as jkb tasks). Works in any git repo; project conventions, design docs and review history are used when present and skipped when absent.',
   phases: [
@@ -24,7 +24,8 @@ const RANGE = cfg.range || '' // e.g. "main...HEAD"; empty = working tree vs HEA
 //           question in one prompt. Unverified.
 //   medium  the previous default: 9 lens reviewers (one question, whole diff) plus one holistic
 //           reviewer per functional unit. Unverified.
-//   high    medium, plus every finding put to three adversarial skeptics, batched by file.
+//   high    medium, plus every finding put to adversarial skeptics, batched by file: three
+//           angles for a defect finding, one ("is it worth the churn?") for a quality one.
 //
 // `low` is the default because `medium` was costing ~3M tokens and an hour per run, and the
 // reviewers overlapped heavily: nine agents each read the same diff, so the same file was loaded
@@ -220,7 +221,11 @@ ${
        does not keep (a name, a doc, an error message, a test).
   OUT  Naming, formatting, "consider extracting", missing comments, hypothetical futures with
        no path to them, and anything whose only argument is taste. Do not report these at all
-       — not even as nits. Another reviewer owns structure, and these crowd out real findings.`
+       — not even as nits. ${
+         FAN_OUT_LENSES
+           ? 'Another reviewer owns structure, and these'
+           : 'Structure is a separate question with its own evidence bar — see it below; these'
+       } crowd out real findings.`
 }
 
 For each finding give:
@@ -248,8 +253,13 @@ returning none is better still when there is nothing. The bar for each is: **wou
 this with the author face to face, and be confident it was worth their time?** If you would
 soften it to "you might want to consider…", it does not clear the bar. If you have more
 candidates than the cap, report the ones you would defend first and say in \`coverage\` how many
-you set aside and what they were. Every finding is independently re-verified by other agents
-reading the code, so padding costs real money as well as attention.
+you set aside and what they were. ${
+    VERIFY
+      ? `Every finding is independently re-verified by other agents
+reading the code, so padding costs real money as well as attention.`
+      : `Nothing here is verified before it is filed: whoever picks a
+finding up is the verification, so a padded one costs a reader their attention, not an agent.`
+  }
 
 READING BUDGET. Some files here are thousands of lines. Locate what you need with \`grep -n\`
 and read bounded ranges around it; do not read a large file end to end. Read *widely* — many
@@ -755,16 +765,16 @@ function rankPrompt(findings) {
 
 ${
   VERIFY
-    ? `Every finding below survived adversarial verification by a majority of three skeptics.`
-    : `These findings are UNVERIFIED — no skeptic has read the code to check them. They were found by specialist reviewers and filed as-is, on the reasoning that whoever picks one up finds out cheaply whether it is real. Weigh them accordingly: where a finding's own scenario is vague or its reasoning does not hold together on its face, say so in the summary rather than presenting it with unearned confidence. You still must not re-review the code.`
-}
+    ? `Every finding below survived adversarial verification: a defect finding faced three skeptics and a quality finding one, and it is here because a majority of the verdicts cast about it failed to refute it.
 
 Each finding carries \`skeptics\`: what the skeptics who failed to refute it actually verified.
 Read those. A skeptic that let a finding stand often still corrected part of it — narrowed its
 scope, disproved one of its supporting claims, or said the severity is overstated. That is the
 most reliable evidence you have, because it came from someone who read the code trying to kill
 the finding. Apply those corrections: narrow the summary, drop a scenario detail the skeptic
-disproved, move the severity. Where a skeptic contradicts the finder, believe the skeptic.
+disproved, move the severity. Where a skeptic contradicts the finder, believe the skeptic.`
+    : `These findings are UNVERIFIED — no skeptic has read the code to check them, and they carry no \`skeptics\` field. They were found by specialist reviewers and filed as-is, on the reasoning that whoever picks one up finds out cheaply whether it is real. Weigh them accordingly: where a finding's own scenario is vague or its reasoning does not hold together on its face, say so in the summary rather than presenting it with unearned confidence. You still must not re-review the code.`
+}
 
 FINDINGS
 ${JSON.stringify(findings, null, 2)}
@@ -868,7 +878,9 @@ log(
       ? `${LENSES.length + 1} lens reviewers + up to ${FEATURE_CAP} feature reviewers`
       : `up to ${AREA_CAP} area reviewers, every lens question each`) +
     ' · ' +
-    (VERIFY ? `verified by vote (3 angles, batched by file)` : `unverified — findings filed as found`),
+    (VERIFY
+      ? `verified by vote (3 angles per defect, 1 per quality finding, batched by file)`
+      : `unverified — findings filed as found`),
 )
 
 phase('Scout')
@@ -1040,8 +1052,9 @@ if (deduped.length > 3) {
   }
 }
 
-// VERIFY. Each batch faces all three angles; a finding survives on a majority of the verdicts
-// cast about it failing to refute it — a true 2-of-3 (design D37.3).
+// VERIFY. A defect batch faces all three angles, so its findings survive on a true 2-of-3; a
+// quality batch faces the one angle that can kill a restructuring suggestion. Either way a
+// finding survives on a majority of the verdicts actually cast about it (design D37.3).
 // At `low` nothing is verified: the findings are filed as they are, and whoever picks one up
 // discovers cheaply whether it is real. The measured per-finding kill rate was 6%, which does
 // not pay for three skeptics per finding up front (design D37.9).
@@ -1054,7 +1067,7 @@ if (!VERIFY) {
 // Verification dominates the cost of a review — it is the one stage multiplied by findings — so
 // skeptics are BATCHED BY FILE. Loading the code around a finding is the expensive part; a
 // second finding a few lines away costs almost nothing more to judge once that context is in
-// hand. Each batch faces all three angles, so the vote is a true 2-of-3.
+// hand. A defect batch faces all three angles, so the vote there is a true 2-of-3.
 const toVerify = candidates.slice(0, VERIFY_CAP)
 const unverified = candidates.slice(VERIFY_CAP)
 if (unverified.length) {

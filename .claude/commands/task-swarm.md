@@ -122,7 +122,7 @@ RUN_OWNER_FILE="$(mktemp)"                 # the sidecar reads the run owner fro
 # always --keep-ing THIS run's owner so it never touches our own in-flight claims.
 ( while :; do sleep 60; jkb task reclaim --keep "$(cat "$RUN_OWNER_FILE")" >/dev/null 2>&1; done ) &
 RECLAIMER_PID=$!                           # a real, live pid for the whole run
-OWNER="$HOST:$RECLAIMER_PID"               # host:pid — liveness-checkable via `kill -0`
+OWNER="$HOST:$RECLAIMER_PID"               # host:pid — liveness-checkable via `ps -p`
 printf '%s' "$OWNER" > "$RUN_OWNER_FILE"
 ```
 

@@ -38,9 +38,10 @@ thing to test, and naming a gap in the report does not substitute for closing it
   - `medium` — the previous default: nine lens reviewers (one question, whole diff) plus one
     holistic reviewer per functional unit. Nine independent readings catch things one reader
     misses, at several times the cost. Reach for it on a large or unfamiliar change.
-  - `high` — `medium` plus adversarial verification. Every finding faces three angles and
-    survives on a majority; skeptics are batched by file, so findings in one region share the
-    cost of reading it. Use before merging something risky.
+  - `high` — `medium` plus adversarial verification. A defect finding faces three angles, a
+    quality one faces the single "is it worth the churn?" angle, and each survives on a majority
+    of the verdicts cast about it; skeptics are batched by file, so findings in one region share
+    the cost of reading it. Use before merging something risky.
   - Findings are unverified at `low` and `medium`. Measured, only ~6% were ever refuted, which
     does not pay for skeptics up front — whoever picks one up finds out cheaply whether it is
     real.

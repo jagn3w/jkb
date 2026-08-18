@@ -65,7 +65,7 @@ calling it done:
 
 ```sh
 ./scripts/fix.sh      # fmt + check
-./scripts/test.sh     # or a targeted `cargo test -p <crate>`
+./scripts/test.sh     # args pass through, e.g. ./scripts/test.sh -p jkb-core
 ./scripts/clippy.sh   # clippy -D warnings
 ```
 
