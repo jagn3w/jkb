@@ -368,25 +368,91 @@ pub struct Removed {
 fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
     let id = item.get();
     let row = conn
-        .prepare_cached("SELECT * FROM items WHERE id = ?1")?
-        .query_row([id], row_json)
+        .prepare_cached(
+            "SELECT uid, kind, content, content_hash, mime, status, resolution, priority, due,
+                    metadata, created_at, updated_at, claimant_id, claimed_at
+             FROM items WHERE id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "id": id,
+                "uid": r.get::<_, String>(0)?,
+                "kind": r.get::<_, String>(1)?,
+                "content": r.get::<_, Option<String>>(2)?,
+                "content_hash": r.get::<_, Option<String>>(3)?,
+                "mime": r.get::<_, Option<String>>(4)?,
+                "status": r.get::<_, Option<String>>(5)?,
+                "resolution": r.get::<_, Option<String>>(6)?,
+                "priority": r.get::<_, Option<i64>>(7)?,
+                "due": r.get::<_, Option<String>>(8)?,
+                "metadata": r.get::<_, String>(9)?,
+                "created_at": r.get::<_, String>(10)?,
+                "updated_at": r.get::<_, String>(11)?,
+                "claimant_id": r.get::<_, Option<String>>(12)?,
+                "claimed_at": r.get::<_, Option<String>>(13)?,
+            }))
+        })
         .optional()?
         .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
 
-    let placements = rows_json(conn, "SELECT * FROM placements WHERE item_id = ?1", id)?;
-    let tags = rows_json(
-        conn,
-        "SELECT * FROM tag_applications WHERE item_id = ?1",
-        id,
-    )?;
-    let edges = rows_json(
-        conn,
-        "SELECT * FROM edges WHERE src_item_id = ?1 OR dst_item_id = ?1",
-        id,
-    )?;
+    let placements = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT namespace_id, role, position, metadata FROM placements WHERE item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "namespace_id": r.get::<_, i64>(0)?,
+                "role": r.get::<_, String>(1)?,
+                "position": r.get::<_, i64>(2)?,
+                "metadata": r.get::<_, String>(3)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tags = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT facet, value, props FROM tag_applications WHERE item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "facet": r.get::<_, String>(0)?,
+                "value": r.get::<_, String>(1)?,
+                "props": r.get::<_, String>(2)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let edges = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT src_item_id, dst_item_id, type, props, weight, created_at FROM edges
+             WHERE src_item_id = ?1 OR dst_item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "src": r.get::<_, i64>(0)?,
+                "dst": r.get::<_, i64>(1)?,
+                "type": r.get::<_, String>(2)?,
+                "props": r.get::<_, String>(3)?,
+                "weight": r.get::<_, Option<f64>>(4)?,
+                "created_at": r.get::<_, String>(5)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     let binding = conn
-        .prepare_cached("SELECT * FROM bindings WHERE item_id = ?1")?
-        .query_row([id], row_json)
+        .prepare_cached(
+            "SELECT uri, sync_mode, serializer, last_synced_hash, last_synced_at
+             FROM bindings WHERE item_id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "uri": r.get::<_, String>(0)?,
+                "sync_mode": r.get::<_, Option<String>>(1)?,
+                "serializer": r.get::<_, Option<String>>(2)?,
+                "last_synced_hash": r.get::<_, Option<String>>(3)?,
+                "last_synced_at": r.get::<_, Option<String>>(4)?,
+            }))
+        })
         .optional()?;
 
     let (contained_by, contains) = containment_snapshot(conn, id)?;
@@ -414,61 +480,29 @@ fn containment_snapshot(
     id: i64,
 ) -> Result<(Option<serde_json::Value>, Vec<serde_json::Value>)> {
     let contained_by = conn
-        .prepare_cached("SELECT * FROM containment WHERE child_item_id = ?1")?
-        .query_row([id], row_json)
+        .prepare_cached(
+            "SELECT parent_item_id, position FROM containment WHERE child_item_id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "parent_item_id": r.get::<_, i64>(0)?,
+                "position": r.get::<_, i64>(1)?,
+            }))
+        })
         .optional()?;
-    let contains = rows_json(
-        conn,
-        "SELECT * FROM containment WHERE parent_item_id = ?1",
-        id,
-    )?;
+    let contains = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT child_item_id, position FROM containment WHERE parent_item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "child_item_id": r.get::<_, i64>(0)?,
+                "position": r.get::<_, i64>(1)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     Ok((contained_by, contains))
-}
-
-/// One row as a JSON object keyed by the **real column names** the statement returned.
-///
-/// Every cascaded row in a snapshot goes through here, against a `SELECT *`, so the payload is
-/// the row — not a hand-written subset of it under invented key names. That is what lets
-/// [`crate::undo`] put each one back through the same generic reinsert the `item` row uses, and
-/// what lets `check_restorable`'s whole-row rule read the schema and see the whole snapshot
-/// rather than a fifth of it. The lists it replaces had already drifted: `edges.id` was captured
-/// nowhere and restored nowhere, so an edge that came back with its item came back under a new
-/// row id and every changelog entry keyed on the old one addressed a row that no longer existed.
-fn row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
-    use rusqlite::types::ValueRef;
-    let names: Vec<String> = row
-        .as_ref()
-        .column_names()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect();
-    let mut object = serde_json::Map::with_capacity(names.len());
-    for (index, name) in names.into_iter().enumerate() {
-        let value = match row.get_ref(index)? {
-            ValueRef::Null => serde_json::Value::Null,
-            ValueRef::Integer(i) => serde_json::Value::from(i),
-            ValueRef::Real(f) => serde_json::Value::from(f),
-            ValueRef::Text(_) => serde_json::Value::from(row.get::<_, String>(index)?),
-            // No cascaded table has one, and a blob has no faithful JSON form — so this is a
-            // refusal at the delete rather than a snapshot that silently cannot restore the row.
-            ValueRef::Blob(_) => {
-                return Err(rusqlite::Error::InvalidColumnType(
-                    index,
-                    name,
-                    rusqlite::types::Type::Blob,
-                ))
-            }
-        };
-        object.insert(name, value);
-    }
-    Ok(serde_json::Value::Object(object))
-}
-
-/// Every row `sql` returns for item `id`, as [`row_json`] objects.
-fn rows_json(conn: &Connection, sql: &str, id: i64) -> Result<Vec<serde_json::Value>> {
-    let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map([id], row_json)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Whether `item` carries investigation **memory** that a delete would destroy: a tombstone
