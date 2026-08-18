@@ -767,11 +767,11 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
 
 /// Every **file** the KB already syncs under this mount, deduplicated.
 ///
-/// The one place binding uris are turned into paths. There were three verbatim copies — here,
-/// in `colliding_paths` and in `settle_out_of_scope` — each running its own read and its own
+/// The one place binding uris are turned into paths. There were verbatim copies at each call
+/// site — [`discover`] and [`settle_out_of_scope`] today — each running its own read and its own
 /// `strip_prefix`/`split_once` parsing, so whoever adds percent-encoding or a second fragment
-/// form would have to find all three, and a miss in `colliding_paths` is the difference
-/// between refusing a collision and collapsing two files onto one namespace.
+/// form would have to find every one of them, and a caller left behind sees a different set of
+/// synced files from the rest of the engine.
 ///
 /// Deduplicated per file, not per binding: the `tasks` serializer binds one uri per checkbox
 /// line, so a file with 262 tasks yielded 262 identical paths to whatever came next.
@@ -1880,7 +1880,8 @@ fn read_document(stored: Option<&str>) -> (Vec<SyncBlock>, Vec<SyncSection>) {
     (layout, sections)
 }
 
-/// Serialize a document's layout for storage on the file's namespace.
+/// Serialize a document's layout for the structure stored on the file's journal row
+/// ([`document_json`], design D45.2).
 fn layout_json(doc: &SyncDoc) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = doc
         .layout
