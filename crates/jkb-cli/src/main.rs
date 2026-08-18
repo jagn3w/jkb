@@ -167,7 +167,7 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
-    /// Run the MCP server (Section 13, not yet available).
+    /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
     /// List the direct children of a namespace (sub-namespaces + items homed there) —
     /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
@@ -3049,10 +3049,13 @@ fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
     }
 }
 
-/// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
-fn cmd_guide() {
-    print!(
-        r#"jkb — agent quickstart
+/// The cheat-sheet itself. A constant rather than a literal inside [`cmd_guide`], because it is
+/// **data**: as a function body it counted against `clippy::too_many_lines`, so every line added
+/// to the guide was priced against a limit that has nothing to say about a block of text.
+///
+/// Mirrored by the root `AGENTS.md`. Keep the two in step — an agent reads whichever it meets
+/// first, and a command documented in only one of them is a command half the readers never learn.
+const GUIDE: &str = r#"jkb — agent quickstart
 
 CONVENTIONS
   --json      every read command emits machine-readable JSON; parse that, not the text.
@@ -3070,6 +3073,8 @@ ORIENT (read-only)
   jkb grep <pat> [path] [-i -l -c]   literal-substring content search; exit 1 on no match.
   jkb query "<DSL>"           full query DSL (kind: tag: status: ns: is:ready due<= …).
   jkb search "<terms>" --route hybrid   ranked vector/FTS retrieval (needs the embedder).
+      Pick by what you already know: `find`/`query` when you know the KIND/TAG/STATUS,
+      `grep` for a LITERAL string in content, `search` for fuzzy/semantic ranking.
 
 READ ONE ITEM
   jkb cat <uid>               the raw body to stdout (pipe it, no metadata).
@@ -3092,7 +3097,8 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               on green mark the task done and remove the session. Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
                               REFUSES a task with no recorded review, or whose review left a
-                              must-fix (!p1) finding open. --no-review records a waiver.
+                              must-fix finding open — anything at priority <= 1, so !p0 blocks
+                              as well as !p1. --no-review records a waiver.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
   jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
@@ -3100,8 +3106,9 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
 
 STAGING BRANCHES (where a batch lands before trunk — the swarm's integration branch)
   jkb staging ls [--all]      every staging branch and the tasks landing on it: each task's state
-                              (implementing / review / landed), its commits, and how many
-                              must-fix findings its review left open. --all shows merged ones.
+                              (implementing / review / landed / dropped), its commits, and how
+                              many must-fix findings its review left open. `dropped` is a
+                              cancelled task, never folded into `landed`. --all shows merged ones.
   jkb task review record --findings <ns>
                               record that a review ran against the current branch, so `land`
                               can require one. /review-log does this for you.
@@ -3155,13 +3162,17 @@ WRITE (all audited + undoable)
   jkb item edit <uid> [--append] <text>   replace/append an item's content.
   jkb item rm <uid> [--force]             delete an item + its cascade; `jkb undo` restores
                                           it. Refuses tombstones and synced-file items.
-  jkb task tag add <uid> facet=value      apply a tag.
+  jkb task tag add <uid> facet=value      apply a tag (additive; `tag set` replaces).
+  jkb task depend <uid> <dep-uid>         add a dependency edge (`undepend` removes it).
   jkb undo                                revert the last change.
 
 Tips: prefer `find`/`query` (structured) over `grep` when you know the kind/tag; add
 `--json` and parse; scope with a path or rely on the ambient cwd namespace.
-"#
-    );
+"#;
+
+/// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
+fn cmd_guide() {
+    print!("{GUIDE}");
 }
 
 /// The item's primary (home) namespace path, if placed.

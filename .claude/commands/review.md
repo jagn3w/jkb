@@ -1,5 +1,5 @@
 ---
-description: Review the current change with nine specialized reviewers plus one holistic reviewer per functional unit. Prints findings; use /review-log to file them as tasks.
+description: Review the current change. By default up to three reviewers split it by feature area and each asks every lens question; `medium` fans the nine lenses out instead, `high` adds adversarial skeptics. Prints findings; use /review-log to file them as tasks.
 argument-hint: "[range]  [low|medium|high]  [-- anything to focus on]"
 ---
 

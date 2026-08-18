@@ -84,12 +84,14 @@ Only after the work is complete and verified:
   jkb sync            # reconciles every mount; or `jkb sync <mount-root-ns>` for just one
   ```
 
-- **Managed task (no backing file):** the `jkb` CLI has no status-setter (only `task add`
-  / `task next`). Leave the status as-is and tell the user it must be closed via the MCP
-  `task_update` tool or by editing its source; do not fabricate a status change.
+- **Managed task (no backing file):** close it on the CLI, which is audited and undoable:
+
+  ```sh
+  jkb task set <uid> --status done
+  ```
 
 ## 6. Report
 
 Summarize in a few lines: which task you worked (`id`, priority, one-line title), what you
 changed (files touched, tests/clippy result), and how you marked it done (checkbox+sync, or
-that it couldn't be closed via CLI). If you intentionally left it open, say why.
+`jkb task set`). If you intentionally left it open, say why.

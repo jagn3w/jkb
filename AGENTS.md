@@ -64,16 +64,37 @@ run — starts the same one.
 - `jkb task sessions` — what is in flight, with uncommitted work and commits ahead.
 - `jkb task gate ["<cmd>"]` — the command that verifies a landing here (remembered per repo).
 - `jkb staging ls [--all]` — the staging branches in this repo and what is landing on each:
-  every task's state (`implementing` / `review` / `landed`), its commits, and whether its
-  review left anything must-fix open. A staging branch is the same thing `/task-swarm` calls
-  its integration branch, and both paths show up here.
+  every task's state (`implementing` / `review` / `landed` / `dropped`), its commits, and
+  whether its review left anything must-fix open. A staging branch is the same thing
+  `/task-swarm` calls its integration branch, and both paths show up here. `dropped` is a
+  cancelled task that was on the branch — the opposite outcome to `landed`, never folded into it.
 - `jkb task review record --findings <ns>` — record that a review ran against the current
   branch. `/review-log` does this for you; `jkb task land` requires it.
 
+**Recording where a task is being worked.** `jkb task work` does this for you; do it explicitly
+only when the branch was made some other way (a swarm run, a branch you cut by hand).
+
+- `jkb task start <uid> [--branch B] [--onto S]` — claim the task and record, in one write, the
+  branch, the repo, the branch it lands on, and the commit `B` was **cut from**. Prefer it to
+  tagging `branch=` by hand: it is the only writer that measures the cut point, and it can only
+  measure one if you name the parent with `--onto`.
+- `jkb task tag set <uid> <facet>=<value>` — make `<value>` the facet's **only** value. `add` is
+  additive and stays that way (an open-ended facet legitimately holds several values); `set` is
+  for the single-answer ones, `repo=` being the one left. A second value there is a
+  contradiction, and a reader collapsing the multi-map picks one at random.
+- `onto=` is **refused** by `tag add`/`tag set` and by `#onto=` in quick-add, and says so: where a
+  branch lands is a fact about the *branch*, so it lives in that branch's record and a facet of
+  that name reaches no reader. Use `task work --onto` / `task start --onto`. (`base=` is not
+  refused, merely inert — nothing reads that name either.)
+- **No verb takes a commit id.** The sha nearest your hand is the branch tip, and a cut point
+  equal to the tip reads as "nothing has happened on this branch" forever — the task can then
+  neither be credited by a review nor land. If a branch's cut point is wrong,
+  `jkb task base --forget <branch>` drops it and prints what can be recorded next.
+
 **Landing is review-gated.** `jkb task land` refuses a task with no recorded review, or whose
-review left a `!p1` must-fix finding open (concerns and nits never block). Fix or
-`jkb task set <uid> --status cancelled` each one, then land. `--no-review` overrides and
-records a visible `review-waived=` on the task.
+review left a must-fix finding open — anything at `priority <= 1`, so `!p0` blocks as well as
+`!p1` (concerns and nits never block). Fix or `jkb task set <uid> --status cancelled` each one,
+then land. `--no-review` overrides and records a visible `review-waived=` on the task.
 
 If you are working *inside* a session, landing is the human's call: commit your work and say
 so. Do not mark the task done, and do not merge or rebase onto the target yourself.
@@ -136,7 +157,10 @@ current state.
   `jkb undo` restores all of it. Refuses investigation memory (a `dead_end`/`superseded`
   tombstone, or a unit an edge records as killed) and synced-file items sync would recreate;
   `--force` overrides.
-- `jkb task tag add <uid> facet=value` — apply a tag; `jkb task depend <uid> <dep-uid>` — add a dep.
+- `jkb task tag add <uid> facet=value` — apply a tag (additive); `jkb task tag set` replaces the
+  facet's other values. Neither can set `onto=`, and a cut point is not a tag at all — see
+  *Recording where a task is being worked* above. `jkb task depend <uid> <dep-uid>` — add a
+  dependency edge.
 - `jkb undo` — revert the last change (yours or another agent's).
 
 Prefer structured reads (`find`/`query`) over scraping text, always add `--json`, and scope
