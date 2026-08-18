@@ -30,8 +30,28 @@ struct Fixture {
 /// `core.hooksPath` and commit signing globally; either would fail the fixture for reasons
 /// that have nothing to do with sessions.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
+    run_git(git_cmd(dir, args), args)
+}
+
+/// Run `git` in `dir` as [`git`] does, but with the committer date pinned — which is what git
+/// stamps on the **reflog entry** it writes, not only on a commit.
+///
+/// Needed wherever a fixture recycles a branch name: an instance anchor is
+/// `(creation entry's revision, that entry's own timestamp)`, and a branch re-cut from the same
+/// start point has an identical revision, so the timestamp is the only field that can separate the
+/// two instances. It has one-second resolution, so a fixture that merely deletes and re-cuts is
+/// racing the wall clock rather than establishing the condition it depends on.
+fn git_at(dir: &Path, args: &[&str], committer_date: &str) -> String {
+    let mut cmd = git_cmd(dir, args);
+    cmd.env("GIT_COMMITTER_DATE", committer_date);
+    run_git(cmd, args)
+}
+
+/// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into
+/// running against different configuration.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -39,11 +59,42 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .unwrap();
+        .env("GIT_COMMITTER_EMAIL", "t@t");
+    cmd
+}
+
+fn run_git(mut cmd: Command, args: &[&str]) -> String {
+    let out = cmd.output().unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The instance anchor git itself recorded for `branch` — `(creation entry's revision, that
+/// entry's timestamp)`, read from the same log file `gitrepo::ref_journal` reads.
+///
+/// There is no porcelain for this: the reflog pretty formats expose the new revision and the entry
+/// date but never the `old` field, and `old = zeros` is what identifies a creation entry. A test
+/// that asserts a recycled branch is *detected* has to be able to say why it is detectable, or the
+/// day the two anchors coincide it reports the production behaviour as broken.
+fn creation_anchor(repo: &Path, branch: &str) -> (String, String) {
+    let path = repo.join(".git/logs/refs/heads").join(branch);
+    let log = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let line = log
+        .lines()
+        .next()
+        .expect("a branch's reflog opens with its creation entry");
+    let (head, _) = line.split_once('\t').expect("a reflog entry has a message");
+    let fields: Vec<&str> = head.split_whitespace().collect();
+    // `<old> <new> <who…> <unix-ts> <tz>`; the identity contains spaces, so the timestamp is
+    // counted from the end — exactly as `gitrepo::parse_reflog_entry` does.
+    let rev = (*fields.get(1).expect("a reflog entry has a new revision")).to_owned();
+    let ts = (*fields
+        .len()
+        .checked_sub(2)
+        .and_then(|i| fields.get(i))
+        .expect("a reflog entry has a timestamp"))
+    .to_owned();
+    (rev, ts)
 }
 
 impl Fixture {
@@ -4038,8 +4089,34 @@ fn a_recycled_branch_says_why_it_is_held_and_how_to_repair_it() {
         .assert()
         .success();
     // Deleted and re-cut by hand under the same name: the anchor no longer matches.
+    //
+    // `main` has not moved, so the re-cut branch's creation entry names the **same revision** as
+    // the original's — which is the whole point of this case, and what makes the entry's own
+    // timestamp the only field able to separate the two instances. That timestamp is whole
+    // seconds, so deleting and re-cutting back to back leaves the two anchors byte-identical and
+    // nothing anywhere can tell them apart. This fixture used to do exactly that and passed only
+    // when the preceding `task start` happened to straddle a second boundary — a coin flip, and
+    // the reported failure was production behaviour being correct. So the recycling is dated an
+    // hour on, which is what recycling a name looks like anyway.
+    let (before_rev, before_ts) = creation_anchor(&f.repo, "feature");
     git(&f.repo, &["branch", "-D", "feature"]);
-    git(&f.repo, &["branch", "feature", "main"]);
+    let later: i64 = before_ts.parse::<i64>().unwrap() + 3600;
+    git_at(
+        &f.repo,
+        &["branch", "feature", "main"],
+        &format!("{later} +0000"),
+    );
+    let (after_rev, after_ts) = creation_anchor(&f.repo, "feature");
+    assert_eq!(
+        before_rev, after_rev,
+        "setup: the re-cut branch must start from the same commit, or its creation revision \
+         differs and the timestamp this test is about is never consulted"
+    );
+    assert_ne!(
+        before_ts, after_ts,
+        "setup: the two instances are indistinguishable, so a correct implementation cannot \
+         detect the recycling and the assertions below would blame it"
+    );
 
     let out = f
         .jkb()
