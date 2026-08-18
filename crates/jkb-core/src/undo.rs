@@ -74,11 +74,12 @@
 //! promise that every mutation is reversible.
 //!
 //! A **column update** ([`Inverse::Columns`]) is reversed by writing the `before` object's fields
-//! back to the columns they name. That is not a convention a writer has to remember: for the
-//! entities in [`COLUMN_UPDATES`], [`crate::changelog`] refuses at the *write* a before-state that
-//! is absent, empty, or names anything that is not a column of the table — so a payload like
-//! `{"content_len": 12}`, which reads as a before-state and restores nothing, fails at its own
-//! writer instead of at somebody's later `jkb undo`.
+//! back to the columns they name. That is not a convention a writer has to remember: wherever
+//! [`row_shaped`] says an entry's inverse is driven by a column map, [`crate::changelog`] refuses
+//! at the *write* a before-state that is absent, empty, or names anything that is not a column of
+//! the table ([`check_restorable`]) — so a payload like `{"content_len": 12}`, which reads as a
+//! before-state and restores nothing, fails at its own writer instead of at somebody's later
+//! `jkb undo`.
 //!
 //! The row's `rowid` is stored as the changelog `entity_id` and `entity_type` is the table name.
 
@@ -236,9 +237,13 @@ fn check_columns(
     }
     // A DELETED ROW'S BEFORE-STATE MUST BE THE WHOLE ROW. An update leaves the row in place, so
     // the columns it does not name keep their values; a delete leaves nothing, so an unnamed
-    // column is a value that cannot come back. The failure is silent in the worst way — the
-    // reinsert is `OR IGNORE`, so omitting a `NOT NULL` column with no default (`branch_records`
-    // has one) makes undoing the delete restore *nothing at all* and report success.
+    // column is a value that cannot come back.
+    //
+    // The rule earns its place on the columns the reinsert does NOT complain about. `reinsert_row`
+    // issues a plain `INSERT` (see there), so omitting a `NOT NULL` column with no default
+    // (`branch_records.created_at`) raises and leaves through `undo`'s funnel as a named refusal —
+    // loud, and no worse than this check. An omitted *nullable* column is the silent case: the row
+    // comes back, reported as restored, holding the column's default in place of what was there.
     //
     // Checked against the schema rather than a list, so adding a column to a table makes every
     // deleter of it fail at its next write until the column is logged. That is the property a
@@ -648,9 +653,9 @@ fn invert_entry(
             rows +=
                 restore_containment_row(conn, rowid()?, &required("containment before-state")?)?;
         }
-        // Every write that changed an existing row, for the entities in `COLUMN_UPDATES`: put
-        // the columns named in `before` back. Nothing is hand-written per statement, so a new
-        // `UPDATE items SET …` gains an inverse by supplying its before-state — which
+        // Every write that changed an existing row, for the `(op, table)` pairs `INVERSES` maps
+        // here: put the columns named in `before` back. Nothing is hand-written per statement,
+        // so a new `UPDATE items SET …` gains an inverse by supplying its before-state — which
         // `changelog::write` requires of it anyway.
         Inverse::Columns => {
             let snap = snapshot("column before-state")?;
@@ -2273,9 +2278,9 @@ mod tests {
         // A DELETED row's before-state must be the WHOLE row, not merely column-shaped: an
         // update leaves the row in place so its unnamed columns keep their values, but a delete
         // leaves nothing behind for them to keep. Refused by naming the missing column, because
-        // the alternative is silent twice over — the reinsert is `OR IGNORE`, so a `NOT NULL`
-        // column with no default (`branch_records.created_at`) makes it restore nothing at all
-        // and report success.
+        // the reinsert is a plain `INSERT`: a missing `NOT NULL` column raises loudly, but a
+        // missing *nullable* one restores the row with the column's default silently substituted
+        // for the value that was there, and reports success.
         let err = db
             .write_txn("t", |c, m| {
                 changelog::append(
