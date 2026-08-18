@@ -1732,9 +1732,54 @@ mod tests {
         );
     }
 
-    /// Re-linking an existing edge to change its weight is an UPDATE, not an insert. Undoing
-    /// it must restore the old weight — not delete an edge that existed beforehand, taking
-    /// the knowledge it carried with it.
+    /// Two items removed in ONE transaction come back with the edge between them, exactly once.
+    ///
+    /// Both snapshots name that edge, and whichever item is restored first cannot have it — its
+    /// other endpoint is not back yet, and a plain `INSERT` would fail the whole undo on a
+    /// foreign key. The `WHERE EXISTS` guards skip it there; the second restore, with both
+    /// endpoints present, puts it back. The guards are also what stops the second restore
+    /// duplicating the first's row, which is why this asserts the edge count and not merely that
+    /// the undo succeeded.
+    #[test]
+    fn two_items_removed_together_come_back_with_one_edge_between_them() {
+        use crate::edge;
+        use crate::item;
+        use jkb_types::EdgeType;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                edge::link(c, m, a, b, EdgeType::References, None)?;
+                Ok((a, b))
+            })
+            .unwrap();
+        // ONE transaction removing both, so BOTH snapshots name the same edge.
+        db.write_txn("t", move |c, m| {
+            item::remove(c, m, a, true)?;
+            item::remove(c, m, b, true)?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.write_txn("t", undo_last)
+            .expect("restoring the first item raised on the edge whose other endpoint is not back");
+
+        assert_eq!(
+            db.read(move |c| edge::edges_from(c, a, EdgeType::References))
+                .unwrap(),
+            vec![b],
+            "the edge between two items removed together did not come back exactly once"
+        );
+    }
+
+    /// An edge restored with its item keeps its **row id**, so a later undo can still address it.
+    ///
+    /// The cascade snapshot named `edges` under invented keys and captured no `id` at all, so the
+    /// restored edge took whatever id `SQLite` issued next. `edge::link_weighted` logs
+    /// `entity_id = edges.id`, so undoing a weight change on that edge then addressed a row that
+    /// no longer existed — `restored()` raises, and the transaction is refused for good.
     #[test]
     fn an_edge_restored_with_its_item_keeps_the_row_id_a_later_undo_addresses() {
         use crate::edge;
@@ -1785,6 +1830,9 @@ mod tests {
         );
     }
 
+    /// Re-linking an existing edge to change its weight is an UPDATE, not an insert. Undoing
+    /// it must restore the old weight — not delete an edge that existed beforehand, taking
+    /// the knowledge it carried with it.
     #[test]
     fn undoing_a_weight_change_restores_it_instead_of_deleting_the_edge() {
         use crate::edge;
