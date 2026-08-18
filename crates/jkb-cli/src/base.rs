@@ -347,7 +347,7 @@ impl Missing {
     /// past `measure`'s untouched check, i.e. only for a branch that provably has commits of its
     /// own — which is exactly [`Advice::Measure`]'s condition. A new variant reachable on an
     /// untouched branch must not join that arm; call [`advice`] instead.
-    pub(crate) fn remedy(&self, uid: &str, branch: &str, _repo: &str) -> String {
+    pub(crate) fn remedy(&self, uid: &str, branch: &str) -> String {
         match self {
             Self::NotThisRepo(wanted) => {
                 format!("run it again from {wanted}, the repository {branch} lives in")
@@ -392,8 +392,11 @@ enum Measurement {
 /// *different branch of the same name* ([`Supersede`]); that decision is made inside the one
 /// statement rather than here, so it cannot be dropped or mis-ordered by a caller.
 ///
-/// `onto` is the branch this one was cut from, **as the caller states it in this call** — never
-/// read back from the stored land target, which records an earlier moment. A task carrying a land
+/// `cut_from` is the branch this one forked off, **as the caller states it in this call** —
+/// never read back from the stored land target, which records an earlier moment. It is
+/// deliberately not called `onto`: inside this module `onto` would mean the measurement parent
+/// while everywhere else it means the *land target*, and the two come apart at trunk, which is a
+/// fine parent and an unacceptable land target (D34.3). A task carrying a land
 /// target from a previous batch, given a new branch cut from trunk, would otherwise measure their
 /// merge-base — well behind the new branch's tip — and an empty branch identical to trunk would
 /// then skip the freshly-cut guard and close as merged. Naming the parent is a fact the caller
@@ -408,7 +411,7 @@ pub(crate) fn ensure_recorded(
     repo_root: &std::path::Path,
     repo: &str,
     branch: &str,
-    onto: Option<&str>,
+    cut_from: Option<&str>,
 ) -> jkb_core::Result<Option<Missing>> {
     let root = repo_root;
     let stored = branch::get(conn, repo, branch)?;
@@ -426,7 +429,7 @@ pub(crate) fn ensure_recorded(
     });
     let had_record = stored.as_ref().is_some_and(|r| r.cut_point.is_some());
 
-    let why = match measure(root, branch, onto)? {
+    let why = match measure(root, branch, cut_from)? {
         Measurement::At(cut) => {
             // **The retain-license.** "No commits of its own" is also true of a branch whose work
             // was *merged away* — fast-forwarded into its batch, or carried into trunk by a merge
@@ -504,7 +507,7 @@ pub(crate) fn fill_for_reference(
     repo_root: &std::path::Path,
     repo: &str,
     branch: &str,
-    onto: Option<&str>,
+    cut_from: Option<&str>,
 ) -> jkb_core::Result<()> {
     if branch::get(conn, repo, branch)?.is_some_and(|r| r.cut_point.is_some()) {
         return Ok(());
@@ -512,7 +515,7 @@ pub(crate) fn fill_for_reference(
     if advice(repo_root, branch)? != Advice::Measure {
         return Ok(());
     }
-    let Measurement::At(cut) = measure(repo_root, branch, onto)? else {
+    let Measurement::At(cut) = measure(repo_root, branch, cut_from)? else {
         return Ok(());
     };
     if rejected(Some(repo_root), branch, cut.sha())?.is_some() {
@@ -691,16 +694,16 @@ fn untouched_tip_git(repo_root: &std::path::Path, branch: &str) -> anyhow::Resul
 fn measure(
     repo_root: &std::path::Path,
     branch: &str,
-    onto: Option<&str>,
+    cut_from: Option<&str>,
 ) -> jkb_core::Result<Measurement> {
-    git(measure_git(repo_root, branch, onto))
+    git(measure_git(repo_root, branch, cut_from))
 }
 
 /// [`measure`] in `anyhow`'s error type, so the git calls compose with `?`.
 fn measure_git(
     repo_root: &std::path::Path,
     branch: &str,
-    onto: Option<&str>,
+    cut_from: Option<&str>,
 ) -> anyhow::Result<Measurement> {
     use crate::gitrepo::{branch_ref, is_ancestor, merge_base, trunk, Prefer};
     let Some(here) = branch_ref(repo_root, branch, Prefer::Local)? else {
@@ -718,10 +721,10 @@ fn measure_git(
 
     // From here the branch has commits of its own, so its tip is certainly NOT its fork point and
     // must never be recorded. Either a reference point yields one, or nothing is recorded.
-    let Some(onto) = onto else {
+    let Some(cut_from) = cut_from else {
         return Ok(Measurement::Missing(Missing::NoParentNamed));
     };
-    let Some(target) = branch_ref(repo_root, onto, Prefer::Local)? else {
+    let Some(target) = branch_ref(repo_root, cut_from, Prefer::Local)? else {
         return Ok(Measurement::Missing(Missing::ParentNotFound));
     };
 

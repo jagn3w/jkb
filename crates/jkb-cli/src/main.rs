@@ -3084,7 +3084,7 @@ READ ONE ITEM
 TASKS
   jkb task add "text !p1 @2026-07-15 +ns #facet=value"   quick-add.
   jkb task next [DSL]         the ready frontier (unblocked, by priority then due).
-  jkb task set <uid> --status done|open|in_progress|needs_review
+  jkb task set <uid> --status open|in_progress|needs_review|done|cancelled
   jkb task show <uid>         the full task body.
 
 WORKING A TASK IN PARALLEL (each session is its own git worktree)
@@ -4118,7 +4118,7 @@ fn cmd_task_add(
                     println!(
                         "  note: no cut point was recorded for {branch}, so this task will not \
                          auto-close — {}.",
-                        why.remedy(&uid, branch, "its repo")
+                        why.remedy(&uid, branch)
                     );
                 }
             }
@@ -4657,7 +4657,7 @@ fn report_started(db: &Db, s: &Started<'_>, json: bool) -> Result<()> {
     if let (None, Some(why)) = (&recorded, missing) {
         println!(
             "  note: no cut point was recorded, so this task will not auto-close — {}.",
-            why.remedy(uid, branch, repo)
+            why.remedy(uid, branch)
         );
     }
     Ok(())
@@ -4962,14 +4962,14 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
         }
         println!("tagged: {uid}");
         if let Some(why) = missing {
-            // The repo comes from `Missing` itself, not from `repo_ctx()`. Passing the checkout we
-            // are standing in told the user to re-run from the repository that had just refused
-            // them — the same `remedy` reads correctly at `task start`, which passes the key it is
-            // recording, so the message was fine and one of its two callers was not.
+            // The repository the message names comes from `Missing::NotThisRepo` itself. It used
+            // to be an argument, and this caller had none to give: passing the checkout we are
+            // standing in told the user to re-run from the repository that had just refused them.
+            // The parameter is gone rather than documented, so there is nothing left to give.
             println!(
                 "  note: no cut point was recorded for {branch}, so this task will not \
                  auto-close — {}.",
-                why.remedy(&uid, &branch, "its repo")
+                why.remedy(&uid, &branch)
             );
         }
         return Ok(());
@@ -6504,7 +6504,16 @@ fn cmd_task_close_merged(
                         uid,
                         format!("{b} gone — `jkb task tag rm <uid> branch=<name>` if stale"),
                     )),
-                    Hold::StaleRecord(b) => stale_record.push((uid, b)),
+                    Hold::StaleRecord(b) => {
+                        // Built here, once, and handed to both renderers. The JSON arm used to
+                        // emit `{uid, branch}` for this bucket and drop the remedy the human arm
+                        // printed, so a consumer saw a hold with no way out.
+                        let remedy = format!(
+                            "drop it with `{}`, then re-measure when the branch is next cut",
+                            base::FORGET_VERB
+                        );
+                        stale_record.push((uid, b, remedy));
+                    }
                     Hold::InFlight => pending.push((uid, branch)),
                     Hold::NoUsableCutPoint {
                         no_cut_point,
@@ -6520,7 +6529,18 @@ fn cmd_task_close_merged(
                             undecidable.push((uid.clone(), no_cut_point.join(", "), remedy));
                         }
                         if !unusable.is_empty() {
-                            let remedy = base::advice_for_any(&cwd, &uid, &unusable)?;
+                            // The `--forget` step is part of the remedy, not decoration the
+                            // human renderer adds. It is the load-bearing half: a task reaches
+                            // this bucket only when `stale_instance` was false, so
+                            // `ensure_recorded` computes no anchor mismatch and
+                            // `record_cut_point`'s `WHERE cut_point IS NULL OR SUPERSEDED`
+                            // matches nothing — a consumer following the advice alone re-runs a
+                            // command that changes nothing and stays in this bucket for ever.
+                            let remedy = format!(
+                                "drop it with `{}`; {}",
+                                base::FORGET_VERB,
+                                base::advice_for_any(&cwd, &uid, &unusable)?
+                            );
                             unresolvable.push((uid, unusable.join(", "), remedy));
                         }
                     }
@@ -6680,9 +6700,10 @@ struct CloseMergedReport<'a> {
     /// Held because the record was measured on a **different branch of the same name**, proved by
     /// an anchor mismatch. Its own bucket because it is the one hold with no other symptom: the
     /// branch exists and its cut point resolves, so every other bucket passes it through and it
-    /// was reported as ordinary work in progress. `(uid, branches)` — the remedy is fixed
-    /// (`base::FORGET_VERB`) and needs nothing asked of git.
-    stale_record: &'a [(String, String)],
+    /// was reported as ordinary work in progress. `(uid, branches, remedy)` — the remedy is fixed
+    /// (`base::FORGET_VERB`) and needs nothing asked of git, but it is carried like every other
+    /// bucket's so both renderers print the same string.
+    stale_record: &'a [(String, String, String)],
 }
 
 /// Print what a `close-merged` run decided.
@@ -6711,7 +6732,7 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
                 "pending": rows(r.pending),
                 "undecidable": held_rows(r.undecidable),
                 "unresolvable": held_rows(r.unresolvable),
-                "stale_record": rows(r.stale_record),
+                "stale_record": held_rows(r.stale_record),
             }))?
         );
         return Ok(());
@@ -6737,16 +6758,13 @@ fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
     for (uid, branch, remedy) in r.unresolvable {
         println!(
             "unknown {uid} ({branch}) — its recorded cut point does not resolve in this repo, so \
-             whether it landed cannot be decided: drop it with `{}`; {remedy}",
-            base::FORGET_VERB
+             whether it landed cannot be decided: {remedy}"
         );
     }
-    for (uid, branch) in r.stale_record {
+    for (uid, branch, remedy) in r.stale_record {
         println!(
             "unknown {uid} ({branch}) — the recorded cut point was measured on a different branch \
-             of that name (deleted and recreated since), so nothing here may act on it: drop it \
-             with `{}`, then re-measure when the branch is next cut",
-            base::FORGET_VERB
+             of that name (deleted and recreated since), so nothing here may act on it: {remedy}"
         );
     }
     // Independent of the other buckets. Gated on them, the count vanished in exactly the runs
@@ -7192,8 +7210,9 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
     }
 
     // Stale task claims: owner-existence reclaim (design D27.2). For each claimed task
-    // probe whether the recorded owner still exists (`kill -0`); a claim whose owner is
-    // gone is orphaned (no time-based staleness — a paused-but-alive owner is retained).
+    // probe whether the recorded owner still exists (`ps -p`, see `owner::is_alive`); a claim
+    // whose owner is gone is orphaned (no time-based staleness — a paused-but-alive owner is
+    // retained).
     // A bare run reports; `--fix` clears orphaned claims so their tasks return to the
     // ready frontier.
     // One `reclaim_orphaned(.., false)` computes the report (shared with `task reclaim`,
@@ -7512,4 +7531,40 @@ fn truncate(s: &str, n: usize) -> String {
     }
     let head: String = s.chars().take(n.saturating_sub(1)).collect();
     format!("{head}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GUIDE;
+    use jkb_types::TaskStatus;
+
+    /// Both `--status` enumerations name every status the CLI accepts.
+    ///
+    /// `GUIDE` declares `AGENTS.md` its mirror and nothing held the two in step: both omitted
+    /// `cancelled`, while AGENTS.md's own landing section tells you to set exactly that to clear
+    /// a must-fix and land. The set comes from `TaskStatus::ALL`, generated with the enum, so
+    /// adding a status fails here rather than shipping a verb an agent never learns about.
+    #[test]
+    fn both_status_enumerations_name_every_status_the_cli_accepts() {
+        let agents = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"),
+        )
+        .expect("AGENTS.md sits at the repo root");
+        for (surface, text) in [("jkb guide", GUIDE), ("AGENTS.md", agents.as_str())] {
+            // Anchored on the verb, not on `--status`: `jkb find --status S` is a different line
+            // in both files and matching it first would make this test pass against nothing.
+            let line = text
+                .lines()
+                .find(|l| l.contains("task set <uid> --status"))
+                .unwrap_or_else(|| panic!("{surface} has no `task set <uid> --status` line"));
+            for status in TaskStatus::ALL {
+                assert!(
+                    line.contains(status.as_str()),
+                    "{surface} omits `{}` from `{line}`, so an agent reading it never learns \
+                     that the status exists",
+                    status.as_str()
+                );
+            }
+        }
+    }
 }

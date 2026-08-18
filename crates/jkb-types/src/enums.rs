@@ -170,6 +170,7 @@ db_enum! {
     }
 }
 
+db_enum! {
 /// The lifecycle state of a task.
 ///
 /// Note: `blocked` is intentionally absent — it is *derived* from `depends_on`
@@ -178,21 +179,20 @@ db_enum! {
 /// branch" — transient, and it does **not** unblock dependents (design D27.7): a task
 /// under review is not yet landed and may bounce back (see
 /// [`TaskStatus::unblocks_dependents`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Not started.
-    Open,
+    Open => "open",
     /// Actively being worked.
-    InProgress,
+    InProgress => "in_progress",
     /// A reviewer is reviewing the branch (design D27.5) — transient and re-enterable.
     /// It does **not** unblock dependents and is **not** `done`: the work is not yet on
     /// the feature branch and may bounce back to the implementer.
-    NeedsReview,
+    NeedsReview => "needs_review",
     /// Completed.
-    Done,
+    Done => "done",
     /// Abandoned.
-    Cancelled,
+    Cancelled => "cancelled",
+}
 }
 
 /// How a unit of an investigation **ended** — the outcome axis, orthogonal to
@@ -285,18 +285,6 @@ impl PlacementRole {
 }
 
 impl TaskStatus {
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::InProgress => "in_progress",
-            Self::NeedsReview => "needs_review",
-            Self::Done => "done",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
     /// Whether this is a terminal status (`done`/`cancelled`): no further work is
     /// expected. `needs_review` is deliberately **not** terminal — the work still needs
     /// operator approval before it is `done`.
@@ -332,20 +320,18 @@ impl TaskStatus {
 
     /// Parse a *manually settable* status string into a [`TaskStatus`].
     ///
-    /// Returns `None` for unknown strings **and** for `blocked`, which is a derived
-    /// state (a `depends_on` edge to a non-`done` task) and never set by hand — so
-    /// there is a single source of truth (design D19). Callers turn `None` into an
-    /// actionable rejection.
+    /// Every variant is settable by name, so this is [`Self::from_db_str`] under the name that
+    /// carries the rule: what it returns `None` for is `blocked`, which is not a variant at all
+    /// — it is *derived* from `depends_on` edges (design D19) and never stored, so there is one
+    /// source of truth. Callers turn `None` into an actionable rejection.
+    ///
+    /// It was a third hand-written match over the same five strings, beside `as_str` and the
+    /// enum. `ALL` and both spellings are generated together now, so the set a command accepts
+    /// and the set the enum has cannot come apart — which is what the `--status` enumerations in
+    /// `jkb guide` and `AGENTS.md` are checked against.
     #[must_use]
     pub fn from_manual_str(s: &str) -> Option<Self> {
-        match s {
-            "open" => Some(Self::Open),
-            "in_progress" => Some(Self::InProgress),
-            "needs_review" => Some(Self::NeedsReview),
-            "done" => Some(Self::Done),
-            "cancelled" => Some(Self::Cancelled),
-            _ => None,
-        }
+        Self::from_db_str(s)
     }
 }
 

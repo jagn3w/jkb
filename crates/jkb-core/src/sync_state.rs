@@ -10,7 +10,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
-use crate::changelog::Entity;
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -151,7 +151,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
     changelog::append(
         conn,
         meta,
-        "update",
+        Op::Update,
         Entity::SyncState,
         w.uri,
         before.as_ref(),

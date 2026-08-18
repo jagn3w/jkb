@@ -7,7 +7,7 @@ use serde_json::json;
 
 use jkb_types::{Error as TypeError, ItemId, Resolution};
 
-use crate::changelog::Entity;
+use crate::changelog::{Entity, Op};
 use crate::sql::like_escape;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
@@ -312,7 +312,7 @@ pub fn set_resolution(
     changelog::append(
         conn,
         meta,
-        "update",
+        Op::Update,
         Entity::Items,
         &item.get().to_string(),
         Some(&json!({ "resolution": before })),
@@ -374,7 +374,11 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
         .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
 
     let placements = rows_json(conn, "SELECT * FROM placements WHERE item_id = ?1", id)?;
-    let tags = rows_json(conn, "SELECT * FROM tag_applications WHERE item_id = ?1", id)?;
+    let tags = rows_json(
+        conn,
+        "SELECT * FROM tag_applications WHERE item_id = ?1",
+        id,
+    )?;
     let edges = rows_json(
         conn,
         "SELECT * FROM edges WHERE src_item_id = ?1 OR dst_item_id = ?1",
@@ -413,7 +417,11 @@ fn containment_snapshot(
         .prepare_cached("SELECT * FROM containment WHERE child_item_id = ?1")?
         .query_row([id], row_json)
         .optional()?;
-    let contains = rows_json(conn, "SELECT * FROM containment WHERE parent_item_id = ?1", id)?;
+    let contains = rows_json(
+        conn,
+        "SELECT * FROM containment WHERE parent_item_id = ?1",
+        id,
+    )?;
     Ok((contained_by, contains))
 }
 
@@ -562,7 +570,7 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) ->
     changelog::append(
         conn,
         meta,
-        "delete",
+        Op::Delete,
         Entity::Items,
         &item.get().to_string(),
         Some(&before),
@@ -770,7 +778,7 @@ pub fn set_content(
     changelog::append(
         conn,
         meta,
-        "update",
+        Op::Update,
         Entity::Items,
         &item.get().to_string(),
         Some(&json!({ "content": before_content, "content_hash": before_hash })),

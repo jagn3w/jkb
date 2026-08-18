@@ -8,7 +8,7 @@ use serde_json::json;
 
 use jkb_types::{ItemId, NamespaceId, PlacementRole};
 
-use crate::changelog::Entity;
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -120,7 +120,7 @@ pub fn set_primary(
         changelog::append(
             conn,
             meta,
-            "delete",
+            Op::Delete,
             Entity::Placements,
             &rowid.to_string(),
             Some(&json!({
@@ -177,7 +177,7 @@ pub fn unplace(
         changelog::append(
             conn,
             meta,
-            "delete",
+            Op::Delete,
             Entity::Placements,
             &rowid.to_string(),
             // The whole row — see `set_primary`.

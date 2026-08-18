@@ -44,7 +44,8 @@ exact); `grep` for a *literal string* in content; `search` for *fuzzy/semantic* 
 - `jkb task add "text !p1 @2026-07-15 +ns #facet=value"` — quick-add (priority / due / place / tag).
 - `jkb task next [DSL]` — the ready frontier (unblocked tasks, by priority then due).
 - `jkb task show <uid>` — the full task body.
-- `jkb task set <uid> --status open|in_progress|needs_review|done` (`blocked` is derived, never set).
+- `jkb task set <uid> --status open|in_progress|needs_review|done|cancelled` (`blocked` is derived,
+  never set).
 
 ## Working tasks in parallel (a session is a git worktree)
 
@@ -86,8 +87,9 @@ only when the branch was made some other way (a swarm run, a branch you cut by h
   contradiction, and a reader collapsing the multi-map picks one at random.
 - `onto=` is **refused** by `tag add`/`tag set` and by `#onto=` in quick-add, and says so: where a
   branch lands is a fact about the *branch*, so it lives in that branch's record and a facet of
-  that name reaches no reader. Use `task work --onto` / `task start --onto`. (`base=` is not
-  refused, merely inert — nothing reads that name either.)
+  that name reaches no reader. Use `task work --onto` / `task start --onto`. `base=` is refused by
+  `tag add`/`tag set` too, and names `jkb task base` — the cut point is keyed per branch, so
+  replacing the facet's other values would delete another branch's record.
 - **No verb takes a commit id.** The sha nearest your hand is the branch tip, and a cut point
   equal to the tip reads as "nothing has happened on this branch" forever — the task can then
   neither be credited by a review nor land. If a branch's cut point is wrong,

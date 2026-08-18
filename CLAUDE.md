@@ -151,8 +151,8 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 - **Indexes are derived** — anything in an index must be rebuildable from the VFS.
 - **Tests:** unit + integration + `proptest` for load-bearing invariants.
 - **Self-review before the reviewer, and reach high confidence first.** `/review` and
-  `/review-log` cost ~16 agents, ~3M tokens and an hour per run. Run step 0 of `/review-log` — did
-  every edit land, does each comment match its code, can each guard fire, who else implements this
+  `/review-log` cost ~6 agents per run at the default `low` tier, and ~15 at `medium`. Run step 0
+  of `/review-log` — did every edit land, does each comment match its code, can each guard fire, who else implements this
   rule, does any test cover this mode, does every call site pass the new argument, did you
   actually run it — then `./scripts/check.sh`, and only then launch the workflow. **A doubt you can name is a test to
   write, not a line in the reviewer's focus argument** — the focus is for perspectives you lack,
@@ -465,7 +465,9 @@ The robustness pass on the agent swarm that drives jkb task execution (design
 - **CLI mutate surface + reclaim (D27.2/D27.3, `jkb-cli`).** `task
   show`/`set`/`edit`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/`release`/`reclaim` cover
   every read/write over existing audited core seams; owner ids are `host:pid`
-  (`owner.rs`, `kill -0` liveness probe). `doctor` reports orphaned claims (owner gone);
+  (`owner.rs`, `ps -p` liveness probe — `kill -0` exits non-zero on `EPERM` for a foreign-owned
+  but live process, so it would reclaim a running agent's claim). `doctor` reports orphaned
+  claims (owner gone);
   `doctor --fix` and `task reclaim --keep <owner>` run the owner-existence reclaim.
 - **Four-state lifecycle (D27.7).** `open → in_progress → needs_review → done` reusing the
   existing `TaskStatus` (no new variant). **`needs_review` no longer unblocks dependents** —
@@ -618,7 +620,51 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   that collapse the multi-map pick one and mint a second session for a task that already has one.
   `task_tags` therefore returns **all** values per facet, and the session lookup matches a task's
   recorded branches against the worktrees that actually exist.
-- **A branch is a record, not a tag value (D46, re-founded by the B-series).** "Branch X was cut
+- **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
+  whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
+  would wedge landing until the directory was deleted by hand), and it is removed once its batch
+  has merged — otherwise it both attracts new sessions onto a dead branch and stops
+  `git branch -d` from deleting it.
+- **The land lock is taken before the checks, not just before the graft** — which is what lets
+  "is the target checkout dirty?" be asked **once**, by `staging::target_dirty_reason`, the same
+  function the In Flight row renders. It used to be asked twice, in two wordings, on either side of
+  the lock; the second copy did not close the window it justified itself with (it has the same gap
+  to the graft) and, because both wordings shared a phrase, the test asserting on that phrase
+  stayed green with *either* one disabled. A redundant guard that reads as protection is worse than
+  none. `land_dir_for` keeps a dirty check of its own: that one guards the `git switch` it is about
+  to perform across branches, with its own remedy, and is not a second copy of the land rule.
+- **Which recorded branch a task's work is on is one rule** (`repo::work_branch`), shared by the In
+  Flight row and `jkb task land`. Sharing the existence *predicate* was not enough: the row
+  preferred a branch that resolves while the command took whichever `tag::applications` returned
+  first — the lexicographically smallest — so a task carrying a stale `a-gone` beside a live
+  `z-live` got two opposite explanations from the one shared blocker, and the command's advice for
+  the branch it picked (`jkb task work`) cuts a *second* branch and detaches the task from its
+  batch. A live session still wins outright: it is the branch with a checkout on disk.
+  **It is asked through `repo::work_for`**, which returns the session *and* the branch together, so
+  a caller cannot take one and pick the other for itself — which is what `jkb task abandon` did as
+  a third implementation, taking the first `branch=` value (`tag::applications` orders by value) and
+  deleting a stale sibling under `--delete-branch` while the row the user clicked named the live
+  one. The batched listing still calls `work_branch` directly with the sessions and refs it has
+  already read once: same rule, not a second one.
+- **A land target is a *branch*, not a revision that resolves** (`gitrepo::branch_name` →
+  `Is`/`Unknown`/`NotABranch`). `branch_ref` maps a branch name to a ref you may hand to git;
+  this maps an arbitrary string to the **key** `branch_refs` uses, and the two come apart on
+  exactly the values that hurt — `origin/<batch>` and a tag both `rev-parse` fine, and both were
+  accepted and stored, the first under a key `jkb staging ls` cannot look up. The canonicalization
+  and the refusal live at `repo::record_land_target`, the single writer, so the next flag that
+  accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
+  of a sentence the user can act on. Trunk is compared against the canonical name, not against two
+  spellings guessed by hand.
+- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner, with **one**
+  knowledge-base call: after a genuine fast-forward it runs `jkb task landed <branch> --onto
+  <target>` to record the landing event (D46). That makes it a jkb client, so its caller must
+  export `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script
+  header states the contract. `jkb task land` is the same algorithm in Rust for the human path
+  (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
+
+## A branch is a record, not a tag value (D46)
+
+- **Re-founded by the B-series.** "Branch X was cut
   from commit Y", "X lands on Y", and "jkb merged X into Y" are facts about a *branch*. They lived
   as tag applications on whichever tasks happened to name the branch, and tag applications are
   **item-keyed, multi-valued, untyped and writable from any route**. Each of those four properties
@@ -748,48 +794,6 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     Writing `.git/config` locally is judged differently — like `.git/info/exclude` (D36) it is
     local, unpushed, and cannot leak via push.
 
-- **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
-  whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
-  would wedge landing until the directory was deleted by hand), and it is removed once its batch
-  has merged — otherwise it both attracts new sessions onto a dead branch and stops
-  `git branch -d` from deleting it.
-- **The land lock is taken before the checks, not just before the graft** — which is what lets
-  "is the target checkout dirty?" be asked **once**, by `staging::target_dirty_reason`, the same
-  function the In Flight row renders. It used to be asked twice, in two wordings, on either side of
-  the lock; the second copy did not close the window it justified itself with (it has the same gap
-  to the graft) and, because both wordings shared a phrase, the test asserting on that phrase
-  stayed green with *either* one disabled. A redundant guard that reads as protection is worse than
-  none. `land_dir_for` keeps a dirty check of its own: that one guards the `git switch` it is about
-  to perform across branches, with its own remedy, and is not a second copy of the land rule.
-- **Which recorded branch a task's work is on is one rule** (`repo::work_branch`), shared by the In
-  Flight row and `jkb task land`. Sharing the existence *predicate* was not enough: the row
-  preferred a branch that resolves while the command took whichever `tag::applications` returned
-  first — the lexicographically smallest — so a task carrying a stale `a-gone` beside a live
-  `z-live` got two opposite explanations from the one shared blocker, and the command's advice for
-  the branch it picked (`jkb task work`) cuts a *second* branch and detaches the task from its
-  batch. A live session still wins outright: it is the branch with a checkout on disk.
-  **It is asked through `repo::work_for`**, which returns the session *and* the branch together, so
-  a caller cannot take one and pick the other for itself — which is what `jkb task abandon` did as
-  a third implementation, taking the first `branch=` value (`tag::applications` orders by value) and
-  deleting a stale sibling under `--delete-branch` while the row the user clicked named the live
-  one. The batched listing still calls `work_branch` directly with the sessions and refs it has
-  already read once: same rule, not a second one.
-- **A land target is a *branch*, not a revision that resolves** (`gitrepo::branch_name` →
-  `Is`/`Unknown`/`NotABranch`). `branch_ref` maps a branch name to a ref you may hand to git;
-  this maps an arbitrary string to the **key** `branch_refs` uses, and the two come apart on
-  exactly the values that hurt — `origin/<batch>` and a tag both `rev-parse` fine, and both were
-  accepted and stored, the first under a key `jkb staging ls` cannot look up. The canonicalization
-  and the refusal live at `repo::record_land_target`, the single writer, so the next flag that
-  accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
-  of a sentence the user can act on. Trunk is compared against the canonical name, not against two
-  spellings guessed by hand.
-- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner, with **one**
-  knowledge-base call: after a genuine fast-forward it runs `jkb task landed <branch> --onto
-  <target>` to record the landing event (D46). That makes it a jkb client, so its caller must
-  export `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script
-  header states the contract. `jkb task land` is the same algorithm in Rust for the human path
-  (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
-
 ## Staging branches and review-gated landing (D38)
 
 The branch a batch of tasks lands on before trunk. It is the **same thing** `/task-swarm`
@@ -857,7 +861,7 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   hand-driven work in one view rather than the half it was told about. `/review-log` calls
   `jkb task review record` after mounting its findings, and says whether the branch can land.
 - **No review gate in `scripts/merge-queue.sh`** — deliberately, and that is the only sense in
-  which D38 left it alone (it gained a `jkb task landed` call under D46; see the D36 note above).
+  which D38 left it alone (it gained a `jkb task landed` call under D46).
   The swarm already runs a fresh REVIEWER before a group reaches the queue (D27.6) — that *is* its
   gate, and stricter.
   Requiring `reviewed=` there would make the REVIEWER write facets to satisfy a check its own
@@ -959,8 +963,8 @@ git repo, and project context is used when found and skipped when absent.
   forced to pick five, a reviewer reports its five best rather than padding), batching by file,
   and bounded reading (`grep -n` the enclosing function, never a large file end to end). Findings
   past the verify cap are reported `unverified`, never dropped, or a budget limit would look like
-  a clean review. Roughly, on a 1,000-line diff: **`low` ≈ 15 agents**, `high` adds three agents
-  per file carrying findings. Above ~2,000 changed lines, several smaller ranges are both cheaper
+  a clean review. Roughly, on a 1,000-line diff: **`low` ≈ 6 agents**, `medium` ≈ 15, and `high`
+  adds three agents per file carrying findings. Above ~2,000 changed lines, several smaller ranges are both cheaper
   and a better review — a reviewer reasoning about 3,000 lines at once reasons worse about each.
 
 ## Design gate (D28) — human design, swarm implementation

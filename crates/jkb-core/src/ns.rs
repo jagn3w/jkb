@@ -10,7 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use jkb_types::{Error as TypeError, NamespaceId};
 
-use crate::changelog::Entity;
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -343,7 +343,7 @@ pub fn set_metadata(
     changelog::append(
         conn,
         meta,
-        "update",
+        Op::Update,
         Entity::Namespaces,
         &id.get().to_string(),
         Some(&json!({ "metadata": before })),
@@ -538,7 +538,7 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
         changelog::append(
             conn,
             meta,
-            "update",
+            Op::Update,
             Entity::Namespaces,
             &id.get().to_string(),
             Some(&before),
@@ -603,7 +603,7 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
     changelog::append(
         conn,
         meta,
-        "delete",
+        Op::Delete,
         Entity::Namespaces,
         &id.get().to_string(),
         Some(&row),

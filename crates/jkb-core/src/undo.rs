@@ -91,7 +91,7 @@ use serde_json::Value;
 
 use jkb_types::Error as TypeError;
 
-use crate::changelog::{Entity, InsertInverse};
+use crate::changelog::{Entity, InsertInverse, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -220,7 +220,10 @@ const CASCADE: &[Cascaded] = &[
 fn cascaded_rows(snapshot: Option<&Value>) -> Vec<(&'static Cascaded, &Value)> {
     let mut out = Vec::new();
     for child in CASCADE {
-        let Some(held) = snapshot.and_then(|s| s.get(child.key)).filter(|v| !v.is_null()) else {
+        let Some(held) = snapshot
+            .and_then(|s| s.get(child.key))
+            .filter(|v| !v.is_null())
+        else {
             continue;
         };
         match held.as_array() {
@@ -571,9 +574,7 @@ fn reinsert_row(
     // raises, so a zero here is not a state. It is `OR IGNORE` that makes zero reachable, which is
     // the whole reason it is gone. A *guarded* insert is the one sanctioned zero (see
     // [`restore_children`]), and the guard says in the statement itself what it skipped.
-    Ok(conn
-        .prepare_cached(&sql)?
-        .execute(params_from_iter(args))?)
+    Ok(conn.prepare_cached(&sql)?.execute(params_from_iter(args))?)
 }
 
 /// **The** list of inversions this module implements, as data: `(op, entity_type, inverse)`,
@@ -584,14 +585,18 @@ fn reinsert_row(
 /// once: the `update`+`mounts` inverse was added to `undo` alone, and a bare `jkb undo` — which
 /// is the only form any surface offers, since nothing prints txn ids — walked straight past a
 /// mount edit and reverted an older transaction, deleting the mount it had been asked to restore.
-const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
+const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     // The hand-written ones come first: `inverse_for` is first-match-wins, and each of these is a
     // table whose before-state is NOT a plain column map (an item delete carries a whole cascade
     // snapshot) or whose row is keyed by something `entity_id` does not hold.
-    ("delete", Some("items"), Inverse::ItemSnapshot),
-    ("update", Some("edges"), Inverse::EdgeWeight),
-    ("update", Some("mounts"), Inverse::MountConfig),
-    ("update", Some("containment"), Inverse::ContainmentRow),
+    (Op::Delete, Some(Entity::Items), Inverse::ItemSnapshot),
+    (Op::Update, Some(Entity::Edges), Inverse::EdgeWeight),
+    (Op::Update, Some(Entity::Mounts), Inverse::MountConfig),
+    (
+        Op::Update,
+        Some(Entity::Containment),
+        Inverse::ContainmentRow,
+    ),
     // (`insert` is deliberately absent from these table-specific entries and handled by the
     // wildcard below, whose membership is DERIVED from `Entity::insert_inverse`.)
     // A sync transaction deletes items AND advances the file's journal. With no inverse here
@@ -602,37 +607,45 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
     // watcher running.
     // NOT work — see `is_work`. This inverse exists to accompany a sync transaction that also
     // touched items; on its own the journal is bookkeeping, not the user's change.
-    ("update", Some("sync_state"), Inverse::SyncStateRow),
+    (Op::Update, Some(Entity::SyncState), Inverse::SyncStateRow),
     // …then the generic pair, which is where a new table should go. Both are driven by the
     // before-state the writer already records, and `changelog::write` refuses one that could not
     // restore anything — so adding a row here is a claim the compiler and the writer's own first
     // write both check, rather than a promise to have written the right SQL somewhere else.
-    ("update", Some("items"), Inverse::Columns),
+    (Op::Update, Some(Entity::Items), Inverse::Columns),
     // The claim ops write `items` columns like any other write; naming them keeps `jkb undo`
     // after a `jkb task start` working instead of refusing on the claim that came with it.
-    ("claim", Some("items"), Inverse::Columns),
-    ("release", Some("items"), Inverse::Columns),
-    ("reclaim", Some("items"), Inverse::Columns),
-    ("update", Some("bindings"), Inverse::Columns),
-    ("update", Some("placements"), Inverse::Columns),
-    ("update", Some("tag_applications"), Inverse::Columns),
+    (Op::Claim, Some(Entity::Items), Inverse::Columns),
+    (Op::Release, Some(Entity::Items), Inverse::Columns),
+    (Op::Reclaim, Some(Entity::Items), Inverse::Columns),
+    (Op::Update, Some(Entity::Bindings), Inverse::Columns),
+    (Op::Update, Some(Entity::Placements), Inverse::Columns),
+    (Op::Update, Some(Entity::TagApplications), Inverse::Columns),
     // `tag::rename_facet` rewrites `tag_defs.facet` and every application's, one logged entry per
     // row. Before that it logged one entry keyed on the facet *name* — not a row id, describing
     // none of the applications — so `jkb tag rename` left every later bare `jkb undo` refusing
     // that transaction, with no surface printing a txn id to escape it with.
-    ("update", Some("tag_defs"), Inverse::Columns),
-    ("update", Some("namespaces"), Inverse::Columns),
-    ("update", Some("branch_records"), Inverse::Columns),
-    ("update", Some("ingestions"), Inverse::Columns),
-    ("delete", Some("placements"), Inverse::ReinsertRow),
-    ("delete", Some("tag_applications"), Inverse::ReinsertRow),
-    ("delete", Some("edges"), Inverse::ReinsertRow),
-    ("delete", Some("namespaces"), Inverse::ReinsertRow),
-    ("delete", Some("branch_records"), Inverse::ReinsertRow),
+    (Op::Update, Some(Entity::TagDefs), Inverse::Columns),
+    (Op::Update, Some(Entity::Namespaces), Inverse::Columns),
+    (Op::Update, Some(Entity::BranchRecords), Inverse::Columns),
+    (Op::Update, Some(Entity::Ingestions), Inverse::Columns),
+    (Op::Delete, Some(Entity::Placements), Inverse::ReinsertRow),
+    (
+        Op::Delete,
+        Some(Entity::TagApplications),
+        Inverse::ReinsertRow,
+    ),
+    (Op::Delete, Some(Entity::Edges), Inverse::ReinsertRow),
+    (Op::Delete, Some(Entity::Namespaces), Inverse::ReinsertRow),
+    (
+        Op::Delete,
+        Some(Entity::BranchRecords),
+        Inverse::ReinsertRow,
+    ),
     // Any table whose inserts delete by rowid; an insert into anything else is uninvertible, not
     // deleted on a guess. The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so
     // a table-specific `insert` inverse placed after it would never be reached.
-    ("insert", None, Inverse::DeleteRow),
+    (Op::Insert, None, Inverse::DeleteRow),
 ];
 
 /// Whether an entry is the user's **work**, as opposed to bookkeeping that rides along with it.
@@ -651,6 +664,12 @@ const INVERSES: &[(&str, Option<&str>, Inverse)] = &[
 /// undo is not something this module does, and treating the marker as work would make every
 /// `jkb undo` after the first refuse.
 fn is_work(op: &str, table: &str) -> bool {
+    // A pair this build cannot name is not bookkeeping — an entry from a newer binary is the
+    // user's work until something here says otherwise, and the alternative (unknown = skip) is
+    // the silent retarget this module exists to delete.
+    let Some((op, table)) = Op::parse(op).zip(Entity::parse(table)) else {
+        return true;
+    };
     !BOOKKEEPING.contains(&(op, table))
 }
 
@@ -660,7 +679,10 @@ fn is_work(op: &str, table: &str) -> bool {
 /// It was written out twice, and the two copies did not do the same job: mutating the predicate
 /// changed nothing about which transaction a bare `jkb undo` picked, because the query had its own
 /// copy. Two spellings of one rule is the shape this whole module is a correction of.
-const BOOKKEEPING: &[(&str, &str)] = &[("update", "sync_state"), ("undo", "changelog")];
+const BOOKKEEPING: &[(Op, Entity)] = &[
+    (Op::Update, Entity::SyncState),
+    (Op::Undo, Entity::Changelog),
+];
 
 /// The inversion for a changelog entry, or `None` if this module cannot reverse it.
 ///
@@ -670,13 +692,18 @@ const BOOKKEEPING: &[(&str, &str)] = &[("update", "sync_state"), ("undo", "chang
 /// enforces at the writer. A row naming any other table — from a hand-edited log, or a binary
 /// that knows tables this one does not — is uninvertible, not deleted on a guess.
 fn inverse_for(op: &str, table: &str) -> Option<Inverse> {
+    // THE STRINGS STOP HERE. A changelog row is read back as two strings — a row a *newer* binary
+    // wrote can name an op or a table this build does not know, which is a refusal, not a guess —
+    // but they are turned into the closed types at this one door, so [`INVERSES`] holds no
+    // literal anyone can mistype. A typo in the table half used to be worse than a missing
+    // inverse: `check_restorable`'s gate runs through this lookup, so the same typo silently
+    // switched off the write-time before-state validation for that table as well.
+    let (op, table) = Op::parse(op).zip(Entity::parse(table))?;
     let inverse = INVERSES
         .iter()
         .find(|(o, t, _)| *o == op && t.is_none_or(|t| t == table))
         .map(|(_, _, inv)| *inv)?;
-    if inverse == Inverse::DeleteRow
-        && Entity::parse(table).map(Entity::insert_inverse) != Some(InsertInverse::DeleteRow)
-    {
+    if inverse == Inverse::DeleteRow && table.insert_inverse() != InsertInverse::DeleteRow {
         return None;
     }
     Some(inverse)
@@ -1077,8 +1104,8 @@ fn work_txn_after(conn: &Connection, below: i64, after: i64) -> Result<Option<i6
     // disagree with the predicate about which entries are the user's work.
     let mut args: Vec<SqlValue> = Vec::with_capacity(BOOKKEEPING.len() * 2 + 2);
     for (op, table) in BOOKKEEPING {
-        args.push(SqlValue::Text((*op).to_owned()));
-        args.push(SqlValue::Text((*table).to_owned()));
+        args.push(SqlValue::Text(op.as_str().to_owned()));
+        args.push(SqlValue::Text(table.as_str().to_owned()));
     }
     args.push(SqlValue::Integer(below));
     args.push(SqlValue::Integer(after));
@@ -1241,7 +1268,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     changelog::append(
         conn,
         meta,
-        "undo",
+        Op::Undo,
         Entity::Changelog,
         &txn_id.to_string(),
         None,
@@ -1936,15 +1963,24 @@ mod tests {
     /// else's work — and that has to survive the list growing.
     #[test]
     fn work_with_no_inverse_is_refused_rather_than_swapped_for_an_older_change() {
-        use crate::changelog::{self, Entity};
+        use crate::changelog::Entity;
         use crate::item;
 
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |c, m| upsert(c, m, &note("keep-me")))
             .unwrap();
+        // Written with raw SQL, because `changelog::append` takes a closed `Op` and cannot
+        // express this any more — which is the point: the entry being simulated is one a
+        // **newer binary** wrote, exactly as `Entity::parse` handles a table this build does not
+        // know. That is the state the policy is about, and it is still reachable at read time.
         db.write_txn("t", |c, m| {
             upsert(c, m, &note("newer"))?;
-            changelog::append(c, m, "transmute", Entity::Items, "1", None, None)
+            c.execute(
+                "INSERT INTO changelog (txn_id, op, entity_type, entity_id, actor)
+                 VALUES (?1, 'transmute', ?2, '1', 't')",
+                rusqlite::params![m.txn_id, Entity::Items.as_str()],
+            )?;
+            Ok(())
         })
         .unwrap();
 
@@ -2358,7 +2394,7 @@ mod tests {
     /// statement per writer.
     #[test]
     fn a_before_state_that_could_not_restore_the_row_is_refused_at_the_writer() {
-        use crate::changelog::{self, Entity};
+        use crate::changelog::{self, Entity, Op};
 
         let db = Db::open_in_memory().unwrap();
         let err = db
@@ -2366,7 +2402,7 @@ mod tests {
                 changelog::append(
                     c,
                     m,
-                    "update",
+                    Op::Update,
                     Entity::Items,
                     "1",
                     Some(&serde_json::json!({ "content_len": 12 })),
@@ -2390,7 +2426,7 @@ mod tests {
                 changelog::append(
                     c,
                     m,
-                    "delete",
+                    Op::Delete,
                     Entity::TagApplications,
                     "1",
                     Some(&serde_json::json!({
@@ -2408,7 +2444,7 @@ mod tests {
         // …and an absent one is refused too: it is the same silent no-op one step further along.
         let err = db
             .write_txn("t", |c, m| {
-                changelog::append(c, m, "update", Entity::Items, "1", None, None)
+                changelog::append(c, m, Op::Update, Entity::Items, "1", None, None)
             })
             .expect_err("an update with no before-state at all was accepted");
         assert!(
@@ -2693,8 +2729,7 @@ mod tests {
             .expect_err("an id with no changelog entries was accepted and marked undone")
             .to_string();
         assert!(
-            err.contains("recorded no changes")
-                && err.contains(&format!("transaction {unissued}")),
+            err.contains("recorded no changes") && err.contains(&format!("transaction {unissued}")),
             "the refusal does not say the id names no transaction: {err}"
         );
 
@@ -3084,8 +3119,65 @@ mod tests {
     /// carried **two** hand-written column lists as a result. The next column added to the schema
     /// would have been dropped by both, on every restore, in silence.
     #[test]
+    fn a_cascaded_row_missing_a_column_is_refused_at_the_writer() {
+        use crate::changelog::{self, Entity, Op};
+
+        // A whole, valid item row, so the only thing wrong is the edge beside it — which is
+        // missing `id`, exactly as the old hand-written snapshot was. The restore re-inserts each
+        // cascaded row from what is logged, so an unnamed column comes back as its default: the
+        // edge takes a NEW row id, and every changelog entry keyed on the old one (a weight
+        // change, say) then addresses a row that does not exist and is refused for good.
+        let mut item = serde_json::Map::new();
+        for column in [
+            "uid",
+            "kind",
+            "content",
+            "content_hash",
+            "mime",
+            "status",
+            "resolution",
+            "priority",
+            "due",
+            "metadata",
+            "created_at",
+            "updated_at",
+            "claimant_id",
+            "claimed_at",
+        ] {
+            item.insert(column.to_owned(), serde_json::Value::Null);
+        }
+        item.insert("id".to_owned(), serde_json::json!(1));
+
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .write_txn("t", move |c, m| {
+                changelog::append(
+                    c,
+                    m,
+                    Op::Delete,
+                    Entity::Items,
+                    "1",
+                    Some(&serde_json::json!({
+                        "item": item,
+                        "edges": [{
+                            "src_item_id": 1, "dst_item_id": 2, "type": "supports",
+                            "props": "{}", "weight": null, "created_at": "now",
+                        }],
+                    })),
+                    None,
+                )
+            })
+            .expect_err("a cascaded edge logged without its row id was accepted")
+            .to_string();
+        assert!(
+            err.contains("`edges`") && err.contains("does not name id"),
+            "the whole-row rule reaches only the `item` object, not the cascade beside it: {err}"
+        );
+    }
+
+    #[test]
     fn an_item_snapshot_missing_a_column_is_refused_at_the_writer() {
-        use crate::changelog::{self, Entity};
+        use crate::changelog::{self, Entity, Op};
 
         let db = Db::open_in_memory().unwrap();
         let err = db
@@ -3093,7 +3185,7 @@ mod tests {
                 changelog::append(
                     c,
                     m,
-                    "delete",
+                    Op::Delete,
                     Entity::Items,
                     "1",
                     Some(&serde_json::json!({ "item": { "id": 1, "uid": "x", "kind": "note" } })),
@@ -3164,7 +3256,7 @@ mod tests {
 #[cfg(test)]
 mod selection_tests {
     use super::{is_work, undo_last};
-    use crate::changelog::{self, Entity};
+    use crate::changelog::{self, Entity, Op};
     use crate::item::{self, upsert, NewItem};
     use crate::Db;
 
@@ -3185,7 +3277,10 @@ mod selection_tests {
     /// (nothing inverts an undo), which is a stuck command rather than a wrong one.
     #[test]
     fn a_bookkeeping_only_transaction_is_not_the_last_change() {
-        for (op, entity) in [("update", Entity::SyncState), ("undo", Entity::Changelog)] {
+        for (op, entity) in [
+            (Op::Update, Entity::SyncState),
+            (Op::Undo, Entity::Changelog),
+        ] {
             let db = Db::open_in_memory().unwrap();
             db.write_txn("t", |c, m| {
                 upsert(
@@ -3211,16 +3306,18 @@ mod selection_tests {
                 db.read(|c| item::id_for_uid(c, "target"))
                     .unwrap()
                     .is_none(),
-                "a transaction of nothing but {op}/{} was taken as the user's last change, so \
+                "a transaction of nothing but {}/{} was taken as the user's last change, so \
                  `jkb undo` rewound bookkeeping and left the real one standing",
+                op.as_str(),
                 entity.as_str()
             );
             // Asserted *after* the consequence, so a mutation to either half fails on the
             // behaviour rather than on this line: the predicate agreeing with itself is not what
             // the test is for.
             assert!(
-                !is_work(op, entity.as_str()),
-                "{op}/{} is treated as the user's work",
+                !is_work(op.as_str(), entity.as_str()),
+                "{}/{} is treated as the user's work",
+                op.as_str(),
                 entity.as_str()
             );
         }

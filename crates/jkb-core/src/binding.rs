@@ -10,7 +10,7 @@ use serde_json::json;
 
 use jkb_types::{ItemId, SyncMode};
 
-use crate::changelog::Entity;
+use crate::changelog::{Entity, Op};
 use crate::sql::like_escape;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
@@ -187,7 +187,7 @@ pub fn mark_synced(conn: &Connection, meta: &WriteMeta, item: ItemId, hash: &str
     changelog::append(
         conn,
         meta,
-        "update",
+        Op::Update,
         Entity::Bindings,
         &item.get().to_string(),
         Some(&json!({ "last_synced_hash": before_hash, "last_synced_at": before_at })),

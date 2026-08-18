@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
-use crate::changelog::Entity;
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -454,7 +454,7 @@ pub fn forget_cut_point(
     changelog::append(
         conn,
         meta,
-        "update",
+        Op::Update,
         Entity::BranchRecords,
         &id.to_string(),
         Some(&record_json(&before)),
@@ -499,7 +499,7 @@ pub fn forget(conn: &Connection, meta: &WriteMeta, repo: &str, branch: &str) -> 
     changelog::append(
         conn,
         meta,
-        "delete",
+        Op::Delete,
         Entity::BranchRecords,
         &format!("{repo}:{branch}"),
         Some(&row),

@@ -73,7 +73,7 @@ jkb query "kind:task is:ready ns:tasks/**"
 
 # Tasks: quick-add DSL (the first +<ns> is the task's home, the rest are mirrors),
 # then the ready frontier (ordered by priority then due)
-jkb task add "fix the flaky test" !p1 @2026-07-15 +tasks/app #size=small
+jkb task add "fix the flaky test !p1 @2026-07-15 +tasks/app #size=small"
 jkb task add "triage this later" --backlog   # home in the ambient repo's backlog
 jkb task next                                # ready tasks; scoped to the repo when inside one
 

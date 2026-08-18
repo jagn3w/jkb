@@ -4132,6 +4132,23 @@ fn a_recycled_branch_says_why_it_is_held_and_how_to_repair_it() {
         stdout.contains("jkb task base --forget"),
         "the one hold state with no remedy still has none:\n{stdout}"
     );
+    // …and the JSON consumer gets the same string. It used to get `{uid, branch}` and no remedy
+    // at all for this bucket while the human arm printed the working one, so a UI or a workflow
+    // reading the machine output saw a hold with no way out.
+    let json = f
+        .jkb()
+        .args(["task", "close-merged", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("close-merged --json is JSON");
+    let remedy = report["stale_record"][0]["remedy"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        remedy.contains("jkb task base --forget"),
+        "the JSON bucket carries no remedy, or not the one the human arm prints: {report}"
+    );
     assert_ne!(f.status_of(&uid), "done", "a recycled branch closed a task");
 }
 
