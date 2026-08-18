@@ -8,7 +8,7 @@
 //! state is a fact about the *task*, so it stays here.)
 //!
 //! It deliberately does **not** live on the review folder's namespace: that object's metadata
-//! is owned by the sync engine (`layout`, `header_line`, `position`, `prose`), and adding a
+//! is owned by the sync engine (`header_line`, `sync_section`), and adding a
 //! second writer to it is the class of bug that collapsed `openspec/`.
 
 use std::collections::BTreeMap;

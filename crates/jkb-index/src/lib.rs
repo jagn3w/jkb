@@ -12,9 +12,10 @@
 //! relies on *do* live in `jkb-types` ([`jkb_types::ensure_compatible`]).
 //!
 //! ## `sqlite-vec` registration
-//! [`vector::register`] must be called once, before opening the database whose
-//! connections will use vectors (before `jkb_core::Db::open`). It is the only
-//! `unsafe` in the workspace and is isolated to [`vector`].
+//! [`vector::register`] is handed to `jkb_core::Db::open_with(path,
+//! &[jkb_index::register])`, which runs it before opening the connection — core owns the
+//! sequencing (design D15), so nothing calls it directly. It is the only `unsafe` in the
+//! workspace and is isolated to [`vector`].
 
 mod error;
 pub mod fts;

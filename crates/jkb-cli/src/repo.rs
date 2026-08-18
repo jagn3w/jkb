@@ -1,8 +1,10 @@
 //! The repo + facet vocabulary the session, staging and review surfaces share.
 //!
-//! Where a task is being worked — which repo, which branch, which staging branch it lands on
-//! — is recorded as plain facet tags (design D34.1/D36), and several modules need to read and
-//! write them. They lived in `main.rs` beside the clap surface, which made `staging.rs` and
+//! Where a task is being worked — which repo, which branch — is recorded as plain facet tags
+//! (design D34.1/D36), and several modules need to read and write them. (Where that branch
+//! lands is a fact about the *branch*, not the task, and lives in `branch_records`; see the
+//! note on `FACET_BRANCH` below.) They lived in `main.rs` beside the clap surface, which made
+//! `staging.rs` and
 //! `review.rs` depend *inward* on the binary root while every other module depends sideways,
 //! and forced eleven items to be `pub(crate)` in an already very large file.
 

@@ -1,11 +1,13 @@
 //! Claim-owner identity and the deterministic liveness probe (design D27.1/D27.2).
 //!
-//! A claim's `claimant_id` is a **liveness-checkable owner id** of the form
-//! `host:pid` (the coordinator may append a run segment, `host:pid:run`; subagents
-//! share their coordinator's pid, so the pid is the liveness signal). [`self_owner`]
-//! mints this process's id; [`is_alive`] probes an owner by `kill -0`-ing its pid —
-//! the process either exists (alive, keep the claim) or does not (reclaimable). There
-//! is deliberately **no** time component: a paused-but-alive owner passes the probe.
+//! A claim's `claimant_id` is a **liveness-checkable owner id** in one of two shapes.
+//! `host:pid` is a *process* owner (the coordinator may append a run segment,
+//! `host:pid:run`; subagents share their coordinator's pid, so the pid is the liveness
+//! signal); `session:<pid>:<worktree>` is a *session* owner (design D36.6), judged
+//! **only** by whether its worktree still exists — its pid is provenance, never
+//! consulted. [`self_owner`] mints this process's id; [`is_alive`] picks the right
+//! probe, and for a process owner that probe is `ps -p`, not `kill -0` (see its doc for
+//! why). There is deliberately **no** time component: a paused-but-alive owner passes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

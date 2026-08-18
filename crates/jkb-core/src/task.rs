@@ -1,8 +1,9 @@
 //! Task DAG: first-class task ergonomics on the item substrate (design D5/D19).
 //!
 //! A task is an item of `kind = 'task'` whose lifecycle lives in the real `status`
-//! column (`open`/`in_progress`/`done`/`cancelled`); `blocked` is **derived** — a
-//! task with a `depends_on` edge to a non-`done` task — never stored, so there is a
+//! column (`open`/`in_progress`/`needs_review`/`done`/`cancelled`); `blocked` is
+//! **derived** — a task with a `depends_on` edge to a non-**terminal** task (`done` and
+//! `cancelled` both unblock; `needs_review` does not) — never stored, so there is a
 //! single source of truth. `priority` and `due` are indexed columns (not tags), so
 //! the ready frontier can order by them cheaply.
 //!
@@ -558,7 +559,7 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
 }
 
 /// The **ready frontier**: tasks (`kind = 'task'`) whose status is non-terminal and
-/// which have no `depends_on` edge to a non-`done` task, optionally narrowed to a
+/// which have no `depends_on` edge to a non-terminal task, optionally narrowed to a
 /// `scope` and `tags`. Ordered by priority (ascending, nulls last) then due date
 /// (ascending, nulls last).
 ///

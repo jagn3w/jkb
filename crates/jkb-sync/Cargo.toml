@@ -1,6 +1,6 @@
 [package]
 name = "jkb-sync"
-description = "Bidirectional file:// mounts with pluggable serializers (v1: document)."
+description = "Bidirectional file:// mounts with pluggable serializers (document, tasks)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

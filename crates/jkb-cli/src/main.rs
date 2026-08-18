@@ -1758,9 +1758,6 @@ fn item_label(meta: &item::ItemMeta) -> String {
     truncate(&title, 80)
 }
 
-/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
-/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
-/// tasks are hidden unless `all`.
 /// The children of any item that contains others — the container behaviour a node takes on
 /// (design D35).
 ///
@@ -1805,6 +1802,9 @@ fn contained_children(
     Ok(out)
 }
 
+/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
+/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
+/// tasks are hidden unless `all`.
 fn list_children(
     conn: &rusqlite::Connection,
     path: Option<&str>,
@@ -5979,8 +5979,8 @@ fn cmd_task_abandon(
     } = repo::work_for(&ctx, &tags)?;
     let branch = branch.with_context(|| format!("{uid} has no session"))?;
 
-    // Abandoning is for **this** session's work. Since the swarm now tags its tasks with
-    // `branch=`/`onto=` so they appear in the same views (D38), a task another IMPLEMENTER is
+    // Abandoning is for **this** session's work. Since the swarm now records `branch=` and its
+    // branch's land target so its tasks appear in the same views (D38), a task another IMPLEMENTER is
     // actively building is one right-click away — and `claim::clear` has no owner CAS, so it
     // would free a live claim and let the next SCHEDULER pass dispatch a second builder while
     // the first keeps going. Refuse a claim this session does not hold unless forced.
@@ -6058,7 +6058,7 @@ fn cmd_task_abandon(
         // Also covers the case the guard above missed: no claim was observed before the git
         // subprocesses, but one exists now. `set_status(Open)` is non-terminal so `task.rs:446`
         // does not fire and the new owner's claim survives either way — the harm is a cleared
-        // `onto=` and a `"reopened": true` that is not true, rather than two builders on one
+        // land target and a `"reopened": true` that is not true, rather than two builders on one
         // task, since `ready` requires `claimant_id IS NULL`.
         if observed.is_none() && claim::claimed(conn)?.iter().any(|c| c.id == id) {
             let current = item::get(conn, id)?
@@ -6070,7 +6070,7 @@ fn cmd_task_abandon(
             if !claim::clear_if(conn, meta, id, prev)? {
                 // The claim changed hands while the worktrees were being removed. Whoever
                 // holds it now was never judged by this command, so reopening the task and
-                // clearing `onto=` would take work off a live worker — the same reasoning
+                // clearing its land target would take work off a live worker — the same reasoning
                 // that makes the clear itself a CAS. Report what is true and change nothing.
                 let current = item::get(conn, id)?
                     .and_then(|m| m.status)

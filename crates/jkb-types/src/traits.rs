@@ -6,10 +6,10 @@
 //!
 //! `Indexer` is the exception: it operates on a `rusqlite::Connection`, so it lives
 //! in `jkb-index` rather than here — pulling `SQLite` into this dependency-light
-//! crate would drag it into `jkb-embed` too. The remaining seams — `SourceAdapter`
-//! and `SyncSerializer` — will live here, added alongside the domain value types
-//! they exchange (parsed documents, serialized units) in Sections 7/11; defining
-//! their signatures now would mean inventing those types speculatively.
+//! crate would drag it into `jkb-embed` too. `SourceAdapter` and `SyncSerializer` went
+//! the same way for the same reason and are **not** here: each lives in the crate that
+//! owns the domain value type it exchanges — `SourceAdapter` in `jkb-ingest`
+//! (`ParsedDocument`), `SyncSerializer` in `jkb-sync` (`SyncDoc`).
 
 use crate::Result;
 
