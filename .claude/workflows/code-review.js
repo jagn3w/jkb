@@ -219,13 +219,19 @@ ${
     : `  IN   Something that is wrong now, wrong on the second run, wrong on real data, or wrong on
        the error path. Two copies of one rule that can disagree. A claim the code makes and
        does not keep (a name, a doc, an error message, a test).
-  OUT  Naming, formatting, "consider extracting", missing comments, hypothetical futures with
+  OUT  ${
+    FAN_OUT_LENSES
+      ? `Naming, formatting, "consider extracting", missing comments, hypothetical futures with
        no path to them, and anything whose only argument is taste. Do not report these at all
-       — not even as nits. ${
-         FAN_OUT_LENSES
-           ? 'Another reviewer owns structure, and these'
-           : 'Structure is a separate question with its own evidence bar — see it below; these'
-       } crowd out real findings.`
+       — not even as nits. Another reviewer owns structure, and these crowd out real findings.`
+      : `Formatting and whitespace. Missing comments. Hypothetical futures with no path to them.
+       An abstraction for a single use. A redesign of code the change did not touch. A rename or
+       an extraction whose only argument is taste — "this would be better" with no cost attached.
+       Do not report those at all, not even as nits; they crowd out real findings. Naming and
+       factoring themselves are NOT out of scope here: you also own question 9 below, which asks
+       exactly that and states the evidence each severity demands. What is banned is the
+       taste-only form of it, not the category.`
+  }`
 }
 
 For each finding give:
@@ -234,13 +240,22 @@ For each finding give:
   scenario     CONCRETE inputs or state, then the wrong result. If you cannot write this, you
                do not have a finding yet — either find the concrete case or drop it.
   fix          the direction in a sentence. Not a patch.
-  severity     must-fix · concern · nit. The test for must-fix is **would you hold the merge
-               for this?** — ask it of each finding individually and answer honestly; on a
-               healthy change that is a small handful at most. nit is small or local, and you
-               should be using it: a run where nearly everything is "concern" has told the
-               reader nothing and left them to prioritize unaided. Severity is earned by how
-               concrete and inevitable the harm is, never by how strongly you hold the view.
-  kind         defect or quality.
+  severity     must-fix · concern · nit — each earned by ITS OWN test, asked of the finding on
+               its own. Never by distribution: there is no target shape for a run. If every
+               finding you have honestly answers the same test, they all take that severity,
+               and a run with no must-fix in it is a good result rather than a missing one.
+                 must-fix  would you hold the merge for this? You can name the harm and a path
+                           that reaches it.
+                 concern   real, with a cost you can point at, but shipping it today is a
+                           decision somebody can reasonably take.
+                 nit       small, local, cheap to leave. Say so plainly rather than inflating
+                           it to make sure it gets read.
+               Severity is earned by how concrete and inevitable the harm is, never by how
+               strongly you hold the view.
+  kind         \`quality\` if the finding is about how the code is BUILT — its structure,
+               factoring, naming or placement — and \`defect\` if it is about the code being
+               WRONG. The ranking pass demotes an unevidenced quality finding to a nit, so it
+               needs to be able to tell the two apart.
 
 Report NOTHING you are not prepared to defend against a skeptic reading the real code. A
 finding that turns out to be already handled costs the reader exactly as much attention as a
@@ -797,15 +812,17 @@ ${JSON.stringify(findings, null, 2)}
    concept) or show the mechanism by which a coming change is forced to go wrong. A quality
    finding above nit whose argument reduces to "this would be better" — however well argued —
    is a nit. **Demote it.**
-   Be willing to move things DOWN generally. If everything is must-fix, nothing is.
+   Move a finding DOWN when its own test does not carry it — never because its tier is getting
+   crowded.
 
    THE TEST FOR must-fix IS: **would you hold the merge for this?** Ask it of each one
-   individually and answer honestly. On a healthy change the answer is yes for a handful at
-   most — if you are marking more than about a fifth of the set must-fix, you are not
-   calibrating, you are relaying. The previous run of this reviewer put 34 of 45 findings on
-   "concern", which is the same failure one tier down: a severity every finding shares carries
-   no information and leaves the reader to prioritize unaided, which is the job you are here to
-   do.
+   individually and answer honestly — of that finding alone, and not of how many already carry
+   the tier. **There is no target proportion and no shape a run is supposed to have.** Severity
+   records what the harm is; step 3's strict order, not the spread across tiers, is what tells
+   the reader where to start, and it works just as well on a set that is all one severity. The
+   two failures here are symmetric and both are relaying rather than calibrating: inflating a
+   finding so that it gets read, and deflating one because the set already has enough of its
+   tier.
 
 3. ORDER STRICTLY, most damaging first — a total order across the whole set, not just grouped by
    tier. The reader works down this list and stops when they run out of time, so position 1 must

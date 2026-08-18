@@ -942,8 +942,12 @@ git repo, and project context is used when found and skipped when absent.
   severities are not comparable. One ranking pass merges near-duplicates and puts everything on
   one scale: `must-fix`/`concern`/`nit` → `!p1`/`!p2`/`!p3`, and orders the whole set strictly,
   since the reader works down it and stops when time runs out. The test for `must-fix` is **would
-  you hold the merge for this** — a previous run put 34 of 45 findings on `concern`, a severity
-  every finding shares and which therefore tells the reader nothing.
+  you hold the merge for this**, asked of each finding on its own. **There is no target
+  proportion**: an earlier version of the prompt priced `concern` as meaningless when most of a
+  run shared it and capped `must-fix` at "about a fifth", which is a rule about the shape of the
+  set rather than about any finding in it — and it pushes both ways, inflating one finding so it
+  gets read and deflating another because its tier is crowded. What prioritizes is the **strict
+  order**, which works just as well on a set that is all one severity.
 - **Accuracy is measured, never fed back.** Findings are tasks, so `done` vs `cancelled` gives an
   acceptance rate, reported per run. It is deliberately not used to suppress a class: a class
   that keeps being dismissed may be a real problem the team keeps deciding not to fix, and
