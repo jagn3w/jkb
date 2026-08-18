@@ -202,7 +202,8 @@ undoable with `jkb undo`. Point an MCP client at it, e.g.:
 ```
 
 `jkb commands install` additionally writes jkb's bundled Claude Code slash commands
-(`/jkb-next-task`, `/jkb-review-log`, `/jkb-task-swarm`) into your Claude Code config, so
+(`/jkb-design-pass`, `/jkb-next-task`, `/jkb-review`, `/jkb-review-log`,
+`/jkb-task-swarm`) and the workflow scripts they launch into your Claude Code config, so
 they travel with the binary rather than only existing inside this repo; `list` is a dry
 run and `uninstall` removes them.
 

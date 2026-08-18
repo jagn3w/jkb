@@ -84,7 +84,8 @@ belong to the main copy, which outlives the session.
 ## 2. Run the reviewer
 
 Resolve the range, effort and focus, then launch the workflow **exactly as `/review` steps 1–2
-describe** — same resolution rules, same `scriptPath` lookup, same `args` object. The reviewer
+describe** (installed by `jkb commands install` as `/jkb-review`) — same resolution rules, same
+`scriptPath` lookup, same `args` object. The reviewer
 is one workflow with two thin callers precisely so that "what counts as a finding" cannot differ
 between them (design D37.7).
 

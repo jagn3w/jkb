@@ -17,10 +17,25 @@ use anyhow::{Context, Result};
 const CMD_PREFIX: &str = "jkb-";
 
 /// Bundled slash commands as `(invocation stem, embedded markdown)`.
+///
+/// **The set is closed under its own references**, and the two tests below are what hold it that
+/// way: a command that names a workflow by path, or another command by slash name, is useless
+/// without it. `/jkb-review-log` shipped for a release defering its central step to `/review` —
+/// which was not bundled, and whose `code-review.js` was not either, so all three of its fallback
+/// paths missed on every machine outside this repo and the command dead-ended at the step it
+/// exists for.
 const BUNDLED_COMMANDS: &[(&str, &str)] = &[
+    (
+        "design-pass",
+        include_str!("../../../.claude/commands/design-pass.md"),
+    ),
     (
         "next-task",
         include_str!("../../../.claude/commands/next-task.md"),
+    ),
+    (
+        "review",
+        include_str!("../../../.claude/commands/review.md"),
     ),
     (
         "review-log",
@@ -33,10 +48,16 @@ const BUNDLED_COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Bundled workflows as `(script stem, embedded JavaScript)`.
-const BUNDLED_WORKFLOWS: &[(&str, &str)] = &[(
-    "task-swarm",
-    include_str!("../../../.claude/workflows/task-swarm.js"),
-)];
+const BUNDLED_WORKFLOWS: &[(&str, &str)] = &[
+    (
+        "code-review",
+        include_str!("../../../.claude/workflows/code-review.js"),
+    ),
+    (
+        "task-swarm",
+        include_str!("../../../.claude/workflows/task-swarm.js"),
+    ),
+];
 
 /// The Claude Code config base: `$CLAUDE_CONFIG_DIR` if set, else `$HOME/.claude`.
 fn base_dir() -> Result<PathBuf> {
@@ -222,6 +243,113 @@ fn mark(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{BUNDLED_COMMANDS, BUNDLED_WORKFLOWS};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn stems(set: &'static [(&'static str, &'static str)]) -> BTreeSet<&'static str> {
+        set.iter().map(|(stem, _)| *stem).collect()
+    }
+
+    /// The stems of every `*.{ext}` asset in the repo's `.claude/{kind}/`.
+    ///
+    /// Read from the directory rather than listed here: a second hand-written list would drift
+    /// from the first, which is the failure these tests exist to catch one level up.
+    fn repo_stems(kind: &str, ext: &str) -> BTreeSet<String> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.claude")
+            .join(kind);
+        std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some(ext))
+            .filter_map(|path| Some(path.file_stem()?.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    /// Every `{dir}/<stem>.{ext}` path `body` names.
+    fn path_refs(body: &str, dir: &str, ext: &str) -> BTreeSet<String> {
+        let suffix = format!(".{ext}");
+        body.split(&format!("{dir}/"))
+            .skip(1)
+            .filter_map(|tail| {
+                let stem: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                (!stem.is_empty() && tail[stem.len()..].starts_with(&suffix)).then_some(stem)
+            })
+            .collect()
+    }
+
+    /// Whether `body` names the slash command `stem` — `/stem` on both word boundaries, so
+    /// `workflows/code-review.js` is not read as a reference to `/code-review` and `/review-log`
+    /// is not read as one to `/review`.
+    fn names_command(body: &str, stem: &str) -> bool {
+        let needle = format!("/{stem}");
+        let mut from = 0;
+        while let Some(offset) = body[from..].find(&needle) {
+            let at = from + offset;
+            let before = body[..at].chars().next_back();
+            let after = body[at + needle.len()..].chars().next();
+            let ident = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+            if !matches!(before, Some(c) if ident(c) || c == '/' || c == '.')
+                && !matches!(after, Some(c) if ident(c))
+            {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    /// **The bundle is closed under the paths it names.** `jkb commands install` is the whole
+    /// point of `.claude/` being embedded — an asset that reaches for a sibling the installer did
+    /// not write dead-ends on every machine that is not this repo, and does so silently, because
+    /// the command itself installs and runs.
+    #[test]
+    fn a_bundled_asset_names_no_workflow_or_command_the_bundle_omits() {
+        let commands = stems(BUNDLED_COMMANDS);
+        let workflows = stems(BUNDLED_WORKFLOWS);
+        for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
+            for named in path_refs(body, "workflows", "js") {
+                assert!(
+                    workflows.contains(named.as_str()),
+                    "`{stem}` reaches for `workflows/{named}.js`, which \
+                     `jkb commands install` does not write — add it to BUNDLED_WORKFLOWS"
+                );
+            }
+            for named in path_refs(body, "commands", "md") {
+                assert!(
+                    commands.contains(named.as_str()),
+                    "`{stem}` reaches for `commands/{named}.md`, which \
+                     `jkb commands install` does not write — add it to BUNDLED_COMMANDS"
+                );
+            }
+        }
+    }
+
+    /// …and under the slash commands it names. `/jkb-review-log` deferred its central step to
+    /// `/review`, which was not bundled; the reference is by name rather than by path, so the
+    /// check above cannot see it. Which names are *ours* comes from the repo's own
+    /// `.claude/commands/`, so a host command like `/security-review` is not claimed.
+    #[test]
+    fn a_bundled_command_names_no_sibling_slash_command_the_bundle_omits() {
+        let bundled = stems(BUNDLED_COMMANDS);
+        let ours = repo_stems("commands", "md");
+        assert!(
+            ours.contains("review"),
+            "the repo's command directory was not found, so this test would pass vacuously: {ours:?}"
+        );
+        for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
+            for named in &ours {
+                assert!(
+                    !names_command(body, named) || bundled.contains(named.as_str()),
+                    "`{stem}` tells the reader to use `/{named}`, which \
+                     `jkb commands install` does not write — add it to BUNDLED_COMMANDS"
+                );
+            }
+        }
+    }
 
     #[test]
     fn bundled_commands_carry_frontmatter() {
