@@ -1308,6 +1308,22 @@ core emits before the adapter checks. `check.sh` skips the UI when pnpm is missi
 under `PNPM_HOME`, which `~/.zshrc` only exports for interactive shells); the CI job never
 skips.
 
+**A session is worked in its own VS Code window, in the Claude Code extension.** "Work this
+task with Claude" used to run `claude <prompt>` in a terminal — a terminal is where the whole
+UX then lived. The extension is the better surface, and it forces the window: its panel
+derives a cwd from **`workspaceFolders[0]`** and takes no directory argument, so a chat opened
+from the repo's window would work the **main checkout** — the one thing a session exists to
+keep apart (D36). So the worktree has to *be* the window's folder. `vscode.openFolder` carries
+no payload and the new window is a different extension host, so the prompt is handed over
+through a one-file queue in global storage (`ui/vscode/src/claude.ts`), keyed by worktree:
+click writes it, the opened window takes it on activation — which is why the extension now
+activates `onStartupFinished` rather than when its view is first shown. An entry expires when
+its worktree is gone, which is exactly the set that can never be delivered; no clock decides
+it. Without the Claude Code extension installed the terminal remains the fallback, where it is
+still the whole feature rather than a degraded one. The prompt lands in the chat input and is
+not sent — the extension offers no way to submit it, and seeing what is about to be asked is
+the better half of that trade.
+
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.
 
