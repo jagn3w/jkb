@@ -15,7 +15,9 @@
 //! Liveness is by **owner-existence**, never by a claim's age: there is no TTL and no
 //! agent heartbeat, precisely so a paused-but-alive agent (e.g. blocked on a permission
 //! prompt) is never reclaimed. The `claimant_id` is a liveness-checkable owner id
-//! (`host:pid`+run); the probe (`kill -0`) lives at the CLI/coordinator edge — this
+//! (`host:pid`+run, or `session:<pid>:<worktree>`); the probe lives at the CLI/coordinator
+//! edge (`owner::is_alive` — `ps -p` for a process owner, worktree existence for a
+//! session owner) — this
 //! module only records who holds what. All three seams are **changelogged** (op
 //! `claim`/`release`/`reclaim`) for audit; they are not auto-reverted by undo (which
 //! inverts only `insert` ops).
@@ -27,6 +29,7 @@ use serde_json::json;
 
 use jkb_types::{Error as TypeError, ItemId};
 
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -118,8 +121,8 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
     changelog::append(
         conn,
         meta,
-        "claim",
-        "items",
+        Op::Claim,
+        Entity::Items,
         &item.get().to_string(),
         Some(&json!({
             "status": before.status,
@@ -135,6 +138,35 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
     Ok(true)
 }
 
+/// Clear a claim **only** when it is still held by `expected_owner`, returning whether it was.
+///
+/// The compare-and-set half of a takeover. Whether an owner may be displaced is decided by
+/// probing it (`owner::is_alive`, which forks `ps`) or by removing its worktree — work that
+/// happens outside the write transaction, so between reading the owner and clearing it
+/// somebody else can claim the task. A bare [`clear`] would then discard a claim nobody
+/// examined, which is how a live session's claim gets replaced by a process about to exit and
+/// its task freed by the next `doctor --fix`. Naming the owner you judged makes that
+/// impossible.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn clear_if(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    expected_owner: &str,
+) -> Result<bool> {
+    let before = read_before(conn, item)?;
+    if before
+        .as_ref()
+        .and_then(|b| b.claimant_id.as_deref())
+        .is_none_or(|owner| owner != expected_owner)
+    {
+        return Ok(false);
+    }
+    clear(conn, meta, item)
+}
+
 /// Clear `item`'s claim regardless of who holds it, returning whether one was cleared.
 ///
 /// [`release`] is owner-scoped on purpose — one agent must not drop another's claim while
@@ -142,6 +174,8 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
 /// live*, where the holder is irrelevant because there is nothing left to hand out. Called
 /// from `task::set_status` when a task reaches a terminal status, so a completed task never
 /// keeps a claim that `doctor` would later report as orphaned.
+///
+/// Prefer [`clear_if`] whenever the decision to clear was taken outside this transaction.
 ///
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
@@ -160,8 +194,8 @@ pub fn clear(conn: &Connection, meta: &WriteMeta, item: ItemId) -> Result<bool> 
         changelog::append(
             conn,
             meta,
-            "release",
-            "items",
+            Op::Release,
+            Entity::Items,
             &item.get().to_string(),
             Some(&json!({
                 "claimant_id": before.claimant_id,
@@ -200,8 +234,8 @@ pub fn release(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -
         changelog::append(
             conn,
             meta,
-            "release",
-            "items",
+            Op::Release,
+            Entity::Items,
             &item.get().to_string(),
             Some(&json!({
                 "claimant_id": before.claimant_id,
@@ -287,8 +321,8 @@ pub fn reclaim_dead(
         changelog::append(
             conn,
             meta,
-            "reclaim",
-            "items",
+            Op::Reclaim,
+            Entity::Items,
             &c.id.get().to_string(),
             Some(&json!({ "claimant_id": c.owner, "claimed_at": c.claimed_at })),
             Some(&json!({ "claimant_id": null, "claimed_at": null })),

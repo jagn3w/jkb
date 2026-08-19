@@ -5,39 +5,191 @@
   "version": "0.1.0",
   "private": true,
   "publisher": "jkb",
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Other"],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
-        { "id": "jkb", "title": "jkb", "icon": "media/jkb.svg" }
+        {
+          "id": "jkb",
+          "title": "jkb",
+          "icon": "media/jkb.svg"
+        }
       ]
     },
     "views": {
       "jkb": [
-        { "id": "jkb.explorer", "name": "Explorer" }
+        {
+          "id": "jkb.explorer",
+          "name": "Explorer"
+        },
+        {
+          "id": "jkb.inflight",
+          "name": "In Flight"
+        }
       ]
     },
     "commands": [
-      { "command": "jkb.refresh", "title": "jkb: Refresh Explorer", "icon": "$(refresh)" },
-      { "command": "jkb.toggleTerminal", "title": "jkb: Show/Hide Completed Tasks", "icon": "$(eye)" },
-      { "command": "jkb.search", "title": "jkb: Search", "icon": "$(search)" },
-      { "command": "jkb.openDetails", "title": "jkb: Open Details" },
-      { "command": "jkb.workTask", "title": "jkb: Work this task with Claude", "icon": "$(sparkle)" },
-      { "command": "jkb.landTask", "title": "jkb: Land this task", "icon": "$(git-merge)" }
+      {
+        "command": "jkb.refresh",
+        "title": "jkb: Refresh Explorer",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "jkb.toggleTerminal",
+        "title": "jkb: Show/Hide Completed Tasks",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "jkb.search",
+        "title": "jkb: Search",
+        "icon": "$(search)"
+      },
+      {
+        "command": "jkb.openDetails",
+        "title": "jkb: Open Details"
+      },
+      {
+        "command": "jkb.workTask",
+        "title": "jkb: Work this task with Claude",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "jkb.landTask",
+        "title": "jkb: Land this task",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "jkb.newTask",
+        "title": "jkb: New Task Here\u2026",
+        "icon": "$(add)"
+      },
+      {
+        "command": "jkb.newSubtask",
+        "title": "jkb: New Subtask\u2026",
+        "icon": "$(add)"
+      },
+      {
+        "command": "jkb.inflight.refresh",
+        "title": "jkb: Refresh In Flight",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "jkb.inflight.toggleMerged",
+        "title": "jkb: Show/Hide Merged Staging Branches",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "jkb.inflight.openSession",
+        "title": "jkb: Open Session Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "jkb.inflight.land",
+        "title": "jkb: Land this task (In Flight)",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "jkb.inflight.abandon",
+        "title": "jkb: Abandon this session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "jkb.inflight.openFindings",
+        "title": "jkb: Open Review Findings",
+        "icon": "$(checklist)"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "jkb.search", "when": "view == jkb.explorer", "group": "navigation@1" },
-        { "command": "jkb.refresh", "when": "view == jkb.explorer", "group": "navigation@2" },
-        { "command": "jkb.toggleTerminal", "when": "view == jkb.explorer", "group": "navigation@3" }
+        {
+          "command": "jkb.search",
+          "when": "view == jkb.explorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "jkb.refresh",
+          "when": "view == jkb.explorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "jkb.toggleTerminal",
+          "when": "view == jkb.explorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "jkb.inflight.refresh",
+          "when": "view == jkb.inflight",
+          "group": "navigation@1"
+        },
+        {
+          "command": "jkb.inflight.toggleMerged",
+          "when": "view == jkb.inflight",
+          "group": "navigation@2"
+        }
       ],
       "view/item/context": [
-        { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "inline" },
-        { "command": "jkb.workTask", "when": "view == jkb.explorer && viewItem == task", "group": "jkb@1" },
-        { "command": "jkb.landTask", "when": "view == jkb.explorer && viewItem == task", "group": "jkb@2" }
+        {
+          "command": "jkb.workTask",
+          "when": "view == jkb.explorer && viewItem == task",
+          "group": "inline"
+        },
+        {
+          "command": "jkb.newTask",
+          "when": "view == jkb.explorer && viewItem == namespace",
+          "group": "inline"
+        },
+        {
+          "command": "jkb.newTask",
+          "when": "view == jkb.explorer && viewItem == namespace",
+          "group": "jkb@1"
+        },
+        {
+          "command": "jkb.workTask",
+          "when": "view == jkb.explorer && viewItem == task",
+          "group": "jkb@1"
+        },
+        {
+          "command": "jkb.landTask",
+          "when": "view == jkb.explorer && viewItem == task",
+          "group": "jkb@2"
+        },
+        {
+          "command": "jkb.newSubtask",
+          "when": "view == jkb.explorer && viewItem == task",
+          "group": "jkb@3"
+        },
+        {
+          "command": "jkb.inflight.openSession",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
+          "group": "inline"
+        },
+        {
+          "command": "jkb.inflight.openSession",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
+          "group": "flight@1"
+        },
+        {
+          "command": "jkb.inflight.land",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
+          "group": "flight@2"
+        },
+        {
+          "command": "jkb.inflight.openFindings",
+          "when": "view == jkb.inflight && viewItem =~ /^stagingTask/",
+          "group": "flight@3"
+        },
+        {
+          "command": "jkb.inflight.abandon",
+          "when": "view == jkb.inflight && viewItem == stagingTaskSession",
+          "group": "flight@4"
+        }
       ]
     },
     "configuration": {

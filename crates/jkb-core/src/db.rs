@@ -83,8 +83,13 @@ mod tests {
         // Bumped with each migration: V001 init, V002 fts, V003 embeddings_meta version,
         // V004 sync journal, V005 task claims, V006 items.status CHECK,
         // V007 memory core (items.resolution + edges.weight),
-        // V008 reserved namespace types, V009 placement containment.
-        assert_eq!(user_version, 9);
+        // V008 reserved namespace types, V009 placement containment,
+        // V010 items.id AUTOINCREMENT, V011 the id high-water mark V010 lost,
+        // V012 sync_state.document (a file's structure leaves the namespace tree),
+        // V013 branch_records (a branch is a record, not a tag value),
+        // V014 the undo watermark (undo history begins after the entries written under the
+        // audit-only contract).
+        assert_eq!(user_version, 14);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -156,7 +161,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 9);
+        assert_eq!(user_version, 14);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

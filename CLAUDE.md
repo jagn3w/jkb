@@ -2,7 +2,9 @@
 
 jkb is a Rust Cargo workspace (crates under `crates/`) building a local-first,
 agent-native knowledge base. The full plan lives in `openspec/` (local only, not
-committed): `design.md` holds the decisions (D1–D25), `tasks.md` is the numbered
+committed), one folder per change under `openspec/changes/<name>/`: each holds the
+`design.md` for its decisions (the D-series, which runs to D47, plus the per-change
+series such as `Dmem` and the branch-records `B`) and a `tasks.md`, the numbered
 implementation checklist and the **source of truth for what's done**.
 
 ## Current status
@@ -100,9 +102,9 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **342 tests** green (132 core = 104 unit + 12 query + 16 investigation; 15 embed + 17 types
-  + 9 index + 25 ingest + 7 search + 40 sync + 91 cli/e2e/sessions + 6 mcp; +2 `#[ignore]`:
-  live-ollama, live-URL); `clippy -D warnings` clean
+- **553 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+  external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
+  goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
   `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
@@ -148,6 +150,18 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   at the edges (ollama HTTP, file-watching, MCP).
 - **Indexes are derived** — anything in an index must be rebuildable from the VFS.
 - **Tests:** unit + integration + `proptest` for load-bearing invariants.
+- **Self-review before the reviewer, and reach high confidence first.** `/review` and
+  `/review-log` cost ~6 agents per run at the default `low` tier, and ~15 at `medium`. Run step 0
+  of `/review-log` — did every edit land, does each comment match its code, can each guard fire, who else implements this
+  rule, does any test cover this mode, does every call site pass the new argument, did you
+  actually run it — then `./scripts/check.sh`, and only then launch the workflow. **A doubt you can name is a test to
+  write, not a line in the reviewer's focus argument** — the focus is for perspectives you lack,
+  and a finding that merely confirms a doubt you already held is a review spent on work you owed
+  it. **Anything short of high confidence is a blocker, not a disclosure**: what you are unsure of is exactly what to
+  test, and the reviewer's budget must not be spent rediscovering a gap you could already name. `staging-workflow` needed 41 passes, and a large share of
+  the findings were self-catchable. **A rule every call site must remember is the defect** — the
+  four vector sweeps, the seven layout guards, the retry debt, the write-seam snapshot were all
+  one shape. Put it in the callee, a type, or the schema instead.
 
 ## Implementation conventions (follow for consistency)
 
@@ -162,11 +176,22 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   compile once and are reused across the long-lived writer connection. To get a
   new-or-existing row id in one statement, use
   `INSERT … ON CONFLICT(…) DO UPDATE SET <no-op> RETURNING id|rowid`.
-- **Changelog on every mutation:**
-  `changelog::append(conn, meta, op, entity_type, entity_id, before, after)`
-  where `entity_type` = the table name and `entity_id` = the row's rowid, so
-  `undo` can `DELETE FROM {table} WHERE rowid = ?`. Use op `"insert"` for creates
-  (the only op `undo` currently inverts).
+- **Changelog on every mutation**, and the op is **derived, never chosen** (D47).
+  A row-writing mutation calls
+  `changelog::upsert(conn, meta, Entity::Foo, entity_id, before, after)` — it records
+  `insert` when `before` is `None` and `update` otherwise. `changelog::append` takes
+  an op for everything else (`delete`, `claim`, `release`, …) and **refuses `insert`
+  outright**. `Entity` is a closed enum, so `entity_type` cannot be a typo'd table.
+  `entity_id` is the row's rowid wherever the inverse is keyed by one.
+  `undo::INVERSES` covers ~20 `(op, table)` pairs and **refuses** anything it does
+  not, so a gap is a named refusal rather than an unrelated transaction being
+  reverted instead.
+- **A before-state must be able to restore something.** `changelog::write` calls
+  `undo::check_restorable` on every entry: the before-state must be a non-empty
+  object naming only real columns of the table, and for a **`delete`** it must name
+  **every** column — an unnamed column would come back as its default. Checked
+  against the live schema, so adding a column makes every deleter of that table fail
+  at its next write until the column is logged.
 - **Enums** in `jkb_types` carry `as_str()` returning the snake_case DB string
   (matches their serde form). IDs: `.new(i64)` / `.get() -> i64`.
 - **Migrations:** add `V00N__<name>.sql` under `crates/jkb-core/src/migrations/`
@@ -195,17 +220,19 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 
 ## Build / verify
 
-Always `source ~/.cargo/env` first (rustup installs the pinned 1.96.1 toolchain).
+Raw `cargo build|test|clippy|fmt|check` is denied by a PreToolUse hook
+(`.claude/hooks/block-raw-cargo.sh`) — go through the wrappers, which self-source
+`~/.cargo/env` (rustup installs the pinned 1.96.1 toolchain) and pass args through.
 
 ```sh
-cargo build
-cargo test --all
-./scripts/check.sh      # fmt --check + clippy -D warnings + test + cargo-deny
+./scripts/build.sh
+./scripts/test.sh       # e.g. ./scripts/test.sh -p jkb-core
+./scripts/check.sh      # fmt --check + clippy -D warnings + test + cargo-deny + the ui build
 ```
 
-`cargo-deny` isn't installed yet (`cargo install cargo-deny`); the script skips it
-gracefully. Update `tasks.md` checkboxes (`[x]` done, `[~]` partial + inline note,
-`[ ]` todo) as each item lands.
+`check.sh` skips `cargo-deny` gracefully when it is not installed
+(`cargo install cargo-deny`). Update `tasks.md` checkboxes (`[x]` done, `[~]` partial +
+inline note, `[ ]` todo) as each item lands.
 
 ## Sections 5–6 — jkb-embed & jkb-index (DONE, for reference)
 
@@ -369,7 +396,8 @@ scoping: `apply_ambient` rewrites an unscoped `Query` to the cwd mount's subtree
 canonicalizes dir → `file://`; `ls` lists mounts), `sync [ns] [--watch]` (ns optional → all mounts; ctrl-c → shared stop flag),
 `service print|install|uninstall` (launchd/systemd unit for the watcher), `task add` (quick-add → slug+nanos
 uid) / `task next` (trailing DSL → scope+tags), `view save|ls|run`, `undo [txn]`,
-`doctor [--backup]`, `mcp` (stub → "Section 13" error). Embedder is the ollama default,
+`doctor [--backup]`, `mcp` (a stub in this section; wired to `jkb_mcp::run_stdio` by
+Section 13 below). Embedder is the ollama default,
 built lazily only where needed so read/task/query/sync/undo work fully offline; ingest
 captures (FTS-searchable) even when the embedder is down. Errors use `anyhow` at this
 edge. Tests: `tests/cli.rs` via `assert_cmd`, all offline.
@@ -437,7 +465,9 @@ The robustness pass on the agent swarm that drives jkb task execution (design
 - **CLI mutate surface + reclaim (D27.2/D27.3, `jkb-cli`).** `task
   show`/`set`/`edit`/`tag`/`depend`/`undepend`/`place`/`bind`/`claim`/`release`/`reclaim` cover
   every read/write over existing audited core seams; owner ids are `host:pid`
-  (`owner.rs`, `kill -0` liveness probe). `doctor` reports orphaned claims (owner gone);
+  (`owner.rs`, `ps -p` liveness probe — `kill -0` exits non-zero on `EPERM` for a foreign-owned
+  but live process, so it would reclaim a running agent's claim). `doctor` reports orphaned
+  claims (owner gone);
   `doctor --fix` and `task reclaim --keep <owner>` run the owner-existence reclaim.
 - **Four-state lifecycle (D27.7).** `open → in_progress → needs_review → done` reusing the
   existing `TaskStatus` (no new variant). **`needs_review` no longer unblocks dependents** —
@@ -471,7 +501,8 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   parent's home); `jkb task show` lists them and says why the parent is held. Deliberately no
   status rollup: auto-close is a separate, git-triggered decision, and two mechanisms racing
   to close one task is how it closes for the wrong reason.
-- **`jkb task start <uid>`** claims the task *and* tags `branch=`/`repo=`/`base=` from the
+- **`jkb task start <uid>`** claims the task *and* records `branch=`/`repo=`, its land target and
+  its measured cut point, from the
   ambient git repo — one moment, one command, so the tag is never missing on exactly the
   tasks that needed it. It refuses the trunk branch (which would auto-close instantly).
 - **Merge detection is strategy-agnostic** (`jkb-cli/src/gitrepo.rs`). `--is-ancestor` and
@@ -479,7 +510,7 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   it rewrites the branch into one new commit. The check that works for all three asks a
   different question — `git merge-tree --write-tree trunk branch` equalling trunk's own tree
   means the branch **adds nothing**, however it landed. Falls back to `--is-ancestor` on git
-  <2.38 and *says so*. `base=` exists because refs alone cannot separate a rebase-merged
+  <2.38 and *says so*. A recorded cut point exists because refs alone cannot separate a rebase-merged
   branch (GitHub fast-forwards, leaving it byte-identical to trunk) from one just created.
 - **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
   is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
@@ -556,7 +587,7 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
 - **The land target** is the branch you started from — unless that is trunk, in which case a
   branch is cut from trunk named after the first task and sessions hang off *that* (landing on
   trunk would make every task read as merged, D34.3). Later sessions join the batch the live
-  ones share. Recorded as the `onto=` tag beside D34's `branch=`/`repo=`/`base=`.
+  ones share. Recorded as `branch_records.land_target`, beside the branch's measured cut point.
 - **The gate is remembered per repo** in `namespaces.metadata.gate` on `repos/<repo>`:
   `--gate` wins, then the stored command, then autodetect (`scripts/check.sh`, `scripts/test.sh`,
   `make test`) — and a flag or a detection is *stored*, so the guess is made once. The chosen
@@ -573,20 +604,270 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   tell a session you are sitting in from one you walked away from, and a flag built on that pid
   labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
   is observable — uncommitted work and commits ahead.
-- **Location facets are set, not added.** `branch=`/`repo=`/`onto=`/`base=` go through
-  `set_facet`, which clears the facet's other values first. `tag::apply` is additive, which is
-  right for open-ended facets and wrong here: a second `branch=` is a contradiction, not extra
-  information, and readers that collapse the multi-map pick one and mint a second session for a
-  task that already has one. `task_tags` therefore returns **all** values per facet, and the
-  session lookup matches a task's recorded branches against the worktrees that actually exist.
+- **Branch existence counts the remote-tracking copy, and creating is not adopting.**
+  `gitrepo::branch_ref(dir, branch, prefer)` is the one answer to "does this branch exist, and
+  under what name" — `is_merged` and `close-merged` both ask it, because a branch living only on
+  `origin/` is the ordinary state after a merged PR deletes the local copy, and a bare
+  `refs/heads/` probe called that gone and advised deleting the tag tracking live work. The
+  create-side is deliberately **two** functions, chosen per caller: `ensure_branch` prefers an
+  existing remote copy (the caller is *referring to* a branch — an explicit `--onto <batch>`, a
+  session branch whose commits may be pushed), `create_branch` takes `start` literally (the caller
+  is *making* one, and a stale namesake on the remote must not be adopted in its place). Folding
+  both into the primitive made it ignore its own `start` argument.
+- **Location facets are set, not added.** `branch=`/`repo=` go through `set_facet`, which
+  clears the facet's other values first. `tag::apply` is additive, which is right for open-ended
+  facets and wrong here: a second `branch=` is a contradiction, not extra information, and readers
+  that collapse the multi-map pick one and mint a second session for a task that already has one.
+  `task_tags` therefore returns **all** values per facet, and the session lookup matches a task's
+  recorded branches against the worktrees that actually exist.
 - **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
   whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
   would wedge landing until the directory was deleted by hand), and it is removed once its batch
   has merged — otherwise it both attracts new sessions onto a dead branch and stops
   `git branch -d` from deleting it.
-- `scripts/merge-queue.sh` is unchanged and still the swarm's queue; `jkb task land` is the same
-  algorithm in Rust for the human path (D36.1). The CLI is the home because the UI calls it
-  directly and it must work in any repo.
+- **The land lock is taken before the checks, not just before the graft** — which is what lets
+  "is the target checkout dirty?" be asked **once**, by `staging::target_dirty_reason`, the same
+  function the In Flight row renders. It used to be asked twice, in two wordings, on either side of
+  the lock; the second copy did not close the window it justified itself with (it has the same gap
+  to the graft) and, because both wordings shared a phrase, the test asserting on that phrase
+  stayed green with *either* one disabled. A redundant guard that reads as protection is worse than
+  none. `land_dir_for` keeps a dirty check of its own: that one guards the `git switch` it is about
+  to perform across branches, with its own remedy, and is not a second copy of the land rule.
+- **Which recorded branch a task's work is on is one rule** (`repo::work_branch`), shared by the In
+  Flight row and `jkb task land`. Sharing the existence *predicate* was not enough: the row
+  preferred a branch that resolves while the command took whichever `tag::applications` returned
+  first — the lexicographically smallest — so a task carrying a stale `a-gone` beside a live
+  `z-live` got two opposite explanations from the one shared blocker, and the command's advice for
+  the branch it picked (`jkb task work`) cuts a *second* branch and detaches the task from its
+  batch. A live session still wins outright: it is the branch with a checkout on disk.
+  **It is asked through `repo::work_for`**, which returns the session *and* the branch together, so
+  a caller cannot take one and pick the other for itself — which is what `jkb task abandon` did as
+  a third implementation, taking the first `branch=` value (`tag::applications` orders by value) and
+  deleting a stale sibling under `--delete-branch` while the row the user clicked named the live
+  one. The batched listing still calls `work_branch` directly with the sessions and refs it has
+  already read once: same rule, not a second one.
+- **A land target is a *branch*, not a revision that resolves** (`gitrepo::branch_name` →
+  `Is`/`Unknown`/`NotABranch`). `branch_ref` maps a branch name to a ref you may hand to git;
+  this maps an arbitrary string to the **key** `branch_refs` uses, and the two come apart on
+  exactly the values that hurt — `origin/<batch>` and a tag both `rev-parse` fine, and both were
+  accepted and stored, the first under a key `jkb staging ls` cannot look up. The canonicalization
+  and the refusal live at `repo::record_land_target`, the single writer, so the next flag that
+  accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
+  of a sentence the user can act on. Trunk is compared against the canonical name, not against two
+  spellings guessed by hand.
+- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner, with **one**
+  knowledge-base call: after a genuine fast-forward it runs `jkb task landed <branch> --onto
+  <target>` to record the landing event (D46). That makes it a jkb client, so its caller must
+  export `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script
+  header states the contract. `jkb task land` is the same algorithm in Rust for the human path
+  (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
+
+## A branch is a record, not a tag value (D46)
+
+- **Re-founded by the B-series.** "Branch X was cut
+  from commit Y", "X lands on Y", and "jkb merged X into Y" are facts about a *branch*. They lived
+  as tag applications on whichever tasks happened to name the branch, and tag applications are
+  **item-keyed, multi-valued, untyped and writable from any route**. Each of those four properties
+  produced its own family of defects across fifteen review passes — 47 findings, 100 in the wider
+  cluster, 20 must-fix:
+  - item-keyed → the per-branch fact had to be encoded into the value (`base=<branch>:<sha>`), and
+    that encoding leaked to ~12 sites with their own attribution rules;
+  - multi-valued → the documented repair (`jkb task tag set base=`) **deleted other branches'
+    records**, and records otherwise accumulated;
+  - untyped → `HEAD` stored verbatim; a 40-hex string that is no commit accepted;
+  - open-write → five write routes had to be taught the rule one at a time, the fifth found *after*
+    a store-side reservation was added for the other four, and the reservation's own asymmetry was
+    itself a must-fix.
+  Six ascending choke points did not close it. The fix is the one D40 and D45 already made twice:
+  **prefer an invariant the schema enforces over one every caller must uphold.** `branch_records`
+  (migration `V013`, `jkb_core::branch`) is keyed `(repo, branch)`, so the encoding, the
+  attribution rules and the question *"which branch does this value belong to?"* stop existing.
+  Design: `openspec/changes/jkb-branch-records/`.
+  - **D38.1's "no table" clause is repealed, openly — its *argument* is kept.** Branch **existence**
+    is still derived from refs (`gitrepo::branch_ref(s)`), and no row is ever evidence a branch
+    exists. What is stored is only the facts git does not own. The argument against a stored entity
+    was always about copying a git-owned fact and then needing to reconcile it.
+  - **`branch=` deliberately does **not** move.** "Which branch is this task on" is genuinely
+    item-keyed, legitimately multi-valued, and round-trips through a synced `tasks.md` line. The
+    findings there (`work_branch`, `close-merged`'s picker, `task abandon`) are **choice-rule**
+    defects; a table permits two rows just as a facet permits two values and fixes none of them.
+    `repo=` stays too, and is also the row's key column — that duplicates a *value*, not a fact.
+  - **`onto=` does move**, to `land_target`. It was branch-keyed by accident of having one writer:
+    two tasks on one branch could record different targets, and `None` could not be told from
+    "never recorded". Now NULL on an existing row means *lands on trunk / on no batch* and a
+    missing row means *unknown*. `reviewed=`/`review=` stay facets — nothing in the corpus is about
+    their cardinality.
+  - **Measurement is unchanged, and `jkb-cli/src/base.rs` still owns all of it.** Core owns storage
+    and the CHECK; core does not shell out to git. Every rule below survives verbatim.
+    - **The tip is a measurement result under exactly one condition, and never a fallback.** A
+      branch with no commits of its own forked at its own tip, provably (`untouched_tip`, the one
+      place that is turned into a value). Everywhere else a failed measurement records **nothing**
+      and says why (`base::Missing` → `base_missing_because`, `close-merged`'s `undecidable`
+      bucket): nothing is *reported and repairable*, a tip is silent and permanent.
+    - **What is measured is a merge-base, not a tip** — the same commit whenever it is taken, which
+      is why there is no longer a right moment to call the writer. `/task-swarm` can only name a
+      group's branch after an implementer has committed on it.
+    - **The parent is what the caller states in the call**, never a stored land target, which
+      records an earlier moment.
+    - **"Has this branch done anything?" is asked of git** (`has_own_commits`), so a stale, wrong,
+      unresolvable or *grandparent* parent cannot change the one thing readers ask of the record.
+      It answers `Option<bool>`, and the third state is load-bearing: `rev-list` exits non-zero on
+      a broken ref anywhere under `refs/heads`/`refs/remotes`, and "git could not answer" spelled
+      as *no* is the single worst value available — "untouched" is exactly the state in which the
+      tip becomes storable. Same rule as `ahead_count`. It is **not** safe by construction and
+      `base::rejected` is not its backstop, since `rejected` re-asks the same predicate and so
+      agrees with a wrong answer; what covers a mis-exclusion is a test that fails loudly.
+    - **The backstop:** the fork point is the later of `merge-base(branch, onto)` and
+      `merge-base(branch, trunk)`. Every way of getting the parent wrong degrades towards **holding
+      the task, never towards closing it**.
+  - **The staleness rule is the write's *shape*, not a step in it.** A branch name outlives the
+    branch that held it, so a recorded value on an untouched branch that is not its tip belongs to
+    whatever had the name before. That is no longer `forget` ∘ insert: it is the `WHERE` clause of
+    `branch::record_cut_point`'s single `INSERT … ON CONFLICT DO UPDATE`, which clears the
+    predecessor's `landed_*` in the same statement. A port cannot drop it by omission or
+    mis-sequence it — there is no sequence. What `base.rs` contributes is the *evidence*:
+    `Cut::UntouchedTip` versus `Cut::Fork`, constructed only from `untouched_tip`'s answer.
+  - **The instance anchor is the one sound read-time check, because it is not a signature.** Three
+    states present one identical observable signature — no commits of its own, record ≠ tip, adds
+    nothing to trunk: rebase-ff-merged externally, merge-commit-merged externally, and a recycled
+    name. D34.2 requires closing the first and D34.4 forbids closing the last, so **no signature
+    predicate evaluated at read time can be right**. A branch's *creation reflog entry* separates
+    them: written once per instance, destroyed by the deletion that ends it, forged by no verb
+    (`branch -f`/`checkout -B` append `Reset`-class entries), and its loss is structurally
+    detectable because expiry removes oldest-first and only a creation entry has `old = zeros`.
+    Stored as `(anchor_sha, anchor_ts)` — the pair, because recreating a branch from the same start
+    point yields the same sha. **Not the message text**, which varies (`from main` / `from HEAD` /
+    `from main~0`), and not `git log -g --format=%ct`, which prints the *commit's* time.
+    - A **mismatch** is positive proof of recycling: it supersedes on the write side and refuses to
+      act on the read side (`base::stale_instance`, `close-merged` and `review record`).
+    - A **match plus a `commit`-class-only journal** licenses *retaining* a record on an untouched
+      branch — the merged-away case, whose fork point discard-and-hold used to throw away. That
+      relaxes a previously pinned direction, knowingly; unknown entry classes fail **closed**.
+    - **Absent or truncated declines**, degrading to the untouched-tip predicate. Every failure
+      mode lands on the old behaviour, never on a new close. Coverage is *established*, not
+      assumed: `gc.refs/heads/<branch>.reflogExpire = never` is written beside the record (exact
+      ref, so no naming scheme is needed) and removed when the branch is forgotten; `jkb doctor`
+      reports entries for branches nothing records.
+    - Residual, stated rather than guaranteed over: recycling where the anchor is unverifiable
+      (reflogs off, hand-expired, or read in a different checkout), plus the remote-only path.
+  - **Landing is an event where jkb performs it** — `jkb task land` after its gate is green, and
+    `jkb task landed <branch> --onto <target>` for the merge queue, which is bash. It does not
+    replace the inference, it *shrinks its domain*: from one branch per task to one per batch, and
+    the survivor is the branch whose cut point is provable. `landed_head` — the branch's own tip at
+    that moment — is what stops the event re-creating the same name-staleness one column over; the
+    event is credited only while the branch still points there **or is gone**. The queue's verb is
+    a new write route for a trusted fact, so it refuses unless the work really is in the target,
+    judged by the same predicate readers use (**not** by ancestry: the queue rebases a detached
+    HEAD, so every entry after the first has rewritten commits and its tip is no ancestor of the
+    target).
+    - **A landing onto the branch you are asking about *is* the answer** — `landed_for_action`
+      stops there rather than walking on to ask "and is `S` contained in `S`?", which needs `S`'s
+      own cut point. `jkb task review record` passes the *reviewed branch*, so without this it
+      declined to credit work jkb had itself just grafted onto that branch. It is not the "landed
+      onto a batch with no record" state, which is still **held**: there the target is a different
+      branch, and whether it in turn reached trunk is a question the record genuinely cannot
+      answer.
+    - **The queue's verb reports, and deliberately does not measure.** The obvious fix for a
+      landing onto a target with no cut point is to record one there — and it is wrong: a cut point
+      is provable only while a branch is untouched, and a landing is exactly the moment the target
+      stops being one. The queue's first entry fast-forwards the target onto commits its source
+      branch still holds, so `has_own_commits` truthfully says "nothing of its own" and the **tip**
+      gets stored for the whole batch, which is permanent. The record has to be made when the batch
+      is *cut* (`--onto <batch>`); `jkb task landed` says so, on stderr and as `creditable: false`,
+      and `merge-queue.sh` no longer swallows that.
+  - **No verb anywhere accepts a commit id.** `jkb task base <uid> <branch> <sha>` produced three
+    findings across three passes, all the same shape — the sha nearest a user's hand is the branch
+    tip, and a cut point equal to the tip freezes the task at `NothingToMerge` with no repair path.
+    Each was fixed by rewording a message; there are only so many messages. It is now
+    **`jkb task base --forget <branch>`**, which drops the cut point (not the row: the branch still
+    exists, and taking its land target with it would drop the task out of `jkb staging ls` as a
+    side effect of repairing a commit id). `branch::forget` — the row delete — is
+    `abandon --delete-branch`'s verb, where the branch really is gone.
+  - **The transition deleted and back-filled nothing.** Back-filling imports exactly the values
+    five passes proved unreliable; leaving them inert was unsafe once the reserved-facet apparatus
+    went, since a surviving `base=` on a file-backed task would start exporting `#base=…` into
+    synced files. The rows and the reservation had to go together.
+  - **`V013` locks older binaries out of the global `~/.jkb/jkb.db`.** Accepted: `V012` already did
+    on this branch, so anything that can open the database today is built from `staging-workflow`.
+  - **A git ref (`refs/jkb/base/<branch>`) is still rejected.** jkb runs inside other people's
+    professional repositories and must not decorate them with refs the user never asked for.
+    Writing `.git/config` locally is judged differently — like `.git/info/exclude` (D36) it is
+    local, unpushed, and cannot leak via push.
+
+## Staging branches and review-gated landing (D38)
+
+The branch a batch of tasks lands on before trunk. It is the **same thing** `/task-swarm`
+calls its integration branch — cut from trunk, sub-branches rebase and fast-forward into it
+linearly, the gate runs on the integrated result — reached by hand instead of by a
+coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
+
+- **A staging branch is derived, never stored.** It is any git branch named by some task's
+  branch's `land_target` that still exists. There is no `kind='staging'` item: which branches
+  exist comes from git and which tasks are on them comes from the records, sessions live in git
+  worktrees, merge state comes from `gitrepo::is_merged` (squash-safe, D34.2). A staging
+  *item* would copy facts git owns and then need reconciling — the failure D36.2 avoided by
+  refusing a session state file.
+- **`jkb staging ls [--all]` is the ONE read** behind both the explorer's branch picker and
+  its In Flight view, so the two cannot disagree about what is live. Each task carries a
+  derived `state`: `implementing` / `review` / `landed` / `dropped` — `dropped` being a
+  **cancelled** task that was on the branch, kept apart from `landed` because reporting the two
+  as one would say a dropped task shipped. A branch adding nothing to trunk is
+  either landed *or* freshly cut and still empty, and refs cannot tell those apart — **live
+  work is the tie-break**, or the branch cut by the very first `task work` is hidden from the
+  picker that exists to offer it.
+- **"Does this branch exist" is answered with a ref, not a boolean** (`gitrepo::branch_refs`, one
+  `for-each-ref` over `refs/heads` + `refs/remotes/origin`, local winning). Counting the
+  remote-tracking copy admitted a pruned batch to the listing, and then every count was still taken
+  with its bare short name, which resolves to nothing: `rev-list` exited non-zero, the failure read
+  as **zero commits**, and the row refused a landing the command performed. Membership answers "may
+  I show this" but not "may I ask git about it", and the second question is the one every consumer
+  actually had. So `ahead_count` now **refuses** an operand it cannot resolve rather than returning
+  zero — zero is a load-bearing answer here ("nothing to land"), and a count that could not be
+  taken must not be spelled the same way. `land_preflight` asks `branch_ref` for the same reason:
+  it asked `has_branch` while the row asked remote-inclusively, so the one shared blocker printed
+  two opposite explanations of the same task.
+- **Review state is two facets on the task**: `reviewed=<sha>` and `review=<ns>`. It is the
+  one fact here with nowhere authoritative to live — git does not know, and the reviewer is a
+  Claude workflow the CLI cannot run, so the CLI can only *require a record*. It deliberately
+  does **not** live on the review folder's namespace metadata, which the sync engine owns
+  (`layout`, `header_line`, `prose`); a second writer there is the class of bug that collapsed
+  `openspec/`. Recording is keyed by **branch** — that is what a review knows — and a branch
+  no task claims is a note, not an error.
+- **The gate: reviewed, and no open must-fix.** `jkb task land` refuses a task with no
+  `reviewed=`, or whose review has a `!p1` finding that is neither `done` nor `cancelled`
+  (counted with `priority<=1`, terminal statuses filtered in Rust — `is:ready` is wrong
+  because a *blocked* must-fix must still block). Checked **before the graft**, so a refusal
+  has moved nothing. Concerns and nits never block: a previous run put 34 of 45 findings on
+  `concern`, and blocking on those would make the override the normal path within a week.
+  `--no-review` overrides and records `review-waived=<sha>` — an override nobody can see is
+  indistinguishable from a rule that does not exist.
+- **Status and the gate are not fused.** A task in `needs_review` with nothing outstanding
+  lands; one moved back to `in_progress` with an open must-fix does not. Fusing them would
+  make `jkb task set --status` the bypass. `needs_review` is the display state (D27.7);
+  the findings decide landing. Recording a review is the **only** author of that transition.
+- **`jkb task tag set`** is the sibling of `add`/`rm` that makes a value a facet's only one.
+  `add` stays additive, honest to its name — an open-ended facet legitimately holds several
+  values. `set` is for `branch=`/`repo=`, where a second value is a contradiction and a reader
+  collapsing the multi-map picks one at random (D36.6). Load-bearing because `/task-swarm` re-tags
+  a group on every pass. **It refuses `onto=`** — where a branch lands is a fact about the branch
+  and lives in its record, so a facet of that name would reach no reader; use
+  `jkb task work --onto` / `task start --onto`.
+- **The swarm records where it is working.** `/task-swarm` sets `repo=` at claim, and runs
+  `jkb task start --branch <group-branch> --onto <integration>` once the implementer has one —
+  which records `branch=`/`repo=`, the land target and the *measured* cut point in one write, so
+  the swarm supplies no value it could get wrong (see the measurement rules under D46). The land
+  target cannot be recorded at claim, because at that point the group has no branch and the target
+  is a fact about a branch. `staging ls` then shows swarm work and
+  hand-driven work in one view rather than the half it was told about. `/review-log` calls
+  `jkb task review record` after mounting its findings, and says whether the branch can land.
+- **No review gate in `scripts/merge-queue.sh`** — deliberately, and that is the only sense in
+  which D38 left it alone (it gained a `jkb task landed` call under D46).
+  The swarm already runs a fresh REVIEWER before a group reaches the queue (D27.6) — that *is* its
+  gate, and stricter.
+  Requiring `reviewed=` there would make the REVIEWER write facets to satisfy a check its own
+  approval already answered. **Review staleness** is recorded (`reviewed=<sha>`) but not
+  enforced: making every post-review fixup force a re-review is the fastest way to make people
+  reach for `--no-review` by reflex.
 
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
@@ -631,26 +912,46 @@ git repo, and project context is used when found and skipped when absent.
   not a ninth lens**: injection is `input`, authorization is `contract`, "this token proves that
   claim" is `inference`, and each of those three is told to cover its half; `/security-review`
   is the dedicated pass.
-- **Two tiers, and no middle (D37.9).** Measured, adversarial verification refuted **6% of
-  findings** while costing most of the run — so `low` is the **default** and files findings
+- **Verification is optional, and unverified is the default (D37.9).** Measured, adversarial
+  verification refuted **6% of findings** while costing most of the run — so findings are filed
   **unverified**: whoever picks one up is the verification, and discovering a false one while
   already in that code costs minutes. `high` adds the three-angle vote for before merging
-  something risky. There is deliberately no `medium`, because the natural middle — a single
-  skeptic — is neither cheap nor a vote, and verification's value lives in the disagreement
-  between angles.
+  something risky. There is no single-skeptic tier, because one skeptic is neither cheap nor a
+  vote, and verification's value lives in the disagreement between angles.
+- **Three tiers, and the axis is BREADTH OF FAN-OUT (D37.10).** Every lens question is asked at
+  every tier — a question skipped is a class of bug nobody looked for. What changes is whether
+  each question gets its own agent and its own reading of the diff. **`low` is the default**: up
+  to three reviewers, split by feature area, each asking all ten questions against **one** reading
+  of its code (~6 agents). `medium` is the old default — nine lens reviewers plus one holistic
+  reviewer per functional unit (~15 agents). `high` is `medium` plus skeptics. The old default
+  cost ~3M tokens and an hour per run, and its reviewers overlapped heavily: nine agents each
+  loaded the same file, then their near-duplicate findings had to be merged back together by a
+  consolidation pass that existed only because of the fan-out. Nine independent readings do catch
+  what one reader misses, which is why `medium` remains — it is a choice to spend, not the price
+  of admission. Two rules keep `low` honest: every changed file must land in exactly one area
+  (a file in no area is a file no reviewer opens, which reads exactly like a clean review of it),
+  and the per-reviewer finding cap **scales with what each reviewer owns**, or a cap meant to stop
+  padding silently becomes the budget.
 - **Skeptics are batched by file.** Loading the code around a finding is the expensive part;
   judging a second finding a few lines away is nearly free once it is in hand. So a skeptic gets
   every finding in one file, ordered by line, and returns a verdict on each — cost scales with
-  how many *files* carry findings, not how many findings there are, and because each batch faces
-  all three angles the vote is a true 2-of-3. Skeptics **default to refuted when uncertain** and
+  how many *files* carry findings, not how many findings there are, and because each **defect**
+  batch faces all three angles the vote there is a true 2-of-3. (A *quality* batch faces the one
+  angle that can kill a restructuring suggestion — the defect angles would refute every one of
+  them by construction, since a suggestion has no reproduction to walk.) Skeptics **default to
+  refuted when uncertain** and
   the burden of proof is on the finding: `refuted=false` requires writing the verified chain,
   since "I could not find a guard" is not "I confirmed there is none on any path".
 - **Severity is assigned once, at the end.** Finders each see only their own findings, so their
   severities are not comparable. One ranking pass merges near-duplicates and puts everything on
   one scale: `must-fix`/`concern`/`nit` → `!p1`/`!p2`/`!p3`, and orders the whole set strictly,
   since the reader works down it and stops when time runs out. The test for `must-fix` is **would
-  you hold the merge for this** — a previous run put 34 of 45 findings on `concern`, a severity
-  every finding shares and which therefore tells the reader nothing.
+  you hold the merge for this**, asked of each finding on its own. **There is no target
+  proportion**: an earlier version of the prompt priced `concern` as meaningless when most of a
+  run shared it and capped `must-fix` at "about a fifth", which is a rule about the shape of the
+  set rather than about any finding in it — and it pushes both ways, inflating one finding so it
+  gets read and deflating another because its tier is crowded. What prioritizes is the **strict
+  order**, which works just as well on a set that is all one severity.
 - **Accuracy is measured, never fed back.** Findings are tasks, so `done` vs `cancelled` gives an
   acceptance rate, reported per run. It is deliberately not used to suppress a class: a class
   that keeps being dismissed may be a real problem the team keeps deciding not to fix, and
@@ -662,8 +963,8 @@ git repo, and project context is used when found and skipped when absent.
   forced to pick five, a reviewer reports its five best rather than padding), batching by file,
   and bounded reading (`grep -n` the enclosing function, never a large file end to end). Findings
   past the verify cap are reported `unverified`, never dropped, or a budget limit would look like
-  a clean review. Roughly, on a 1,000-line diff: **`low` ≈ 15 agents**, `high` adds three agents
-  per file carrying findings. Above ~2,000 changed lines, several smaller ranges are both cheaper
+  a clean review. Roughly, on a 1,000-line diff: **`low` ≈ 6 agents**, `medium` ≈ 15, and `high`
+  adds three agents per file carrying findings. Above ~2,000 changed lines, several smaller ranges are both cheaper
   and a better review — a reviewer reasoning about 3,000 lines at once reasons worse about each.
 
 ## Design gate (D28) — human design, swarm implementation
@@ -783,6 +1084,261 @@ coordination lives in the *store* (items + typed edges), never in agent chat.
   software-swarm retrofit, bi-temporal validity, the scheduled reflection pass, and an MCP
   memory surface. Driving investigations at large fan-out is
   `task:scale-up-the-task-swarm-to-drive-18c6cc7853efc280`, not part of this change.
+
+## Sync: one directory, one synced file (the `openspec` collapse)
+
+A `tasks`-serializer mount over `openspec/` overwrote **62 of 63 files**: in each change
+folder `design.md`, `proposal.md` and `.openspec.yaml` were left byte-identical to one
+another, and every markdown header in the tree was stripped. Two independent defects lined up.
+
+- **`namespace_for` drops the filename.** A file's namespace is derived from its *containing
+  directory*, so every file in a directory shares one namespace — and with it the `layout`
+  that `assemble_kb_doc` reads and that `render` treats as the sole authority on document
+  order (see the prose note below). Items were correctly per-file, via
+  `binding::synced_uris_for_file`; the document *structure* was not. So each file rendered
+  whichever sibling last wrote the shared layout.
+- **`mount create` is a full-row replace that doubles as the update command.** Its SQL sets
+  every column from the arguments, so a re-run that omitted `--include` wrote NULL over the
+  stored glob. The mount had been restricted to `**/tasks.md`; one re-run to change the
+  conflict policy silently removed that restriction, and the next sync discovered the whole
+  tree.
+
+Three guards, each closing a different link:
+
+- **`Outcome::Collided`.** `colliding_paths` refuses — reads nothing, writes nothing — any
+  file sharing a namespace with another synced file. It checks both the current batch and the
+  bindings already in the KB, so a single watch event still sees the sibling it would collide
+  with. Gated on `SyncSerializer::requires_exclusive_namespace()`: `tasks` opts in, `document`
+  does not, because one item per whole file consults no layout and many of them share a
+  directory safely. Two files in a directory are not a merge to resolve — nothing in the store
+  says which file the shared layout belongs to — so refusing is the only correct answer.
+- **`mount create` preserves what you did not name.** It reads the existing mount and only
+  applies the flags actually passed (`FieldEdit::{Keep,Set,Clear}`); `--no-include` /
+  `--no-exclude` clear explicitly. It prints the resulting configuration every time, and
+  `mount ls` now shows mode/policy/globs — a mount whose glob had been dropped previously
+  looked identical to one that still had it.
+- **`jkb sync --conflict <policy>`** overrides the policy for one run. The only way to unstick
+  a conflicted file used to be re-creating the mount with a different `--policy`, which is
+  precisely the write that dropped the glob. The mount no longer has to be edited to get a
+  sync moving.
+
+**Superseded.** "A `tasks` mount can hold at most one synced file per directory" was true when
+this was written and is no longer: D39 below makes the filename part of the namespace, which is
+the migration and design pass this paragraph deferred. `Outcome::Collided` and the whole
+ownership guard are gone. The two defects above — `namespace_for` dropping the filename, and
+`mount create` being a full-row replace — are both closed, the first at the root.
+
+**Recovery, for next time.** `blobs` is content-addressed and never garbage-collected, and
+file sync stores the bytes of every version it settles — so the store is a complete history of
+every synced file. `jkb blob ls --contains "<a line you remember>"` finds the version, `jkb
+blob cat <hash>` writes it out. That is how all 62 files were recovered here; the originals
+were the import cohort, distinguishable from the damaged exports by still having headers.
+
+## A file's document lives on its journal row, not in the namespace tree (D45)
+
+The root fix for a class of data loss that produced a must-fix in eight of nine review passes.
+Design in `openspec/changes/jkb-staging-pr/`.
+
+- **One sentence covers every incident**: *an unverified KB render reached `write_file`.* The
+  openspec collapse, prose orphaning, layout ownership (seven guards), `retire_undeclared_sections`
+  retiring a neighbour's sections, `jkb ns mv` destroying a document — six **causes**, one
+  mechanism. D39 removed a cause; D41 tried to check the output. Neither touched *why* the render
+  can be wrong.
+- **The cause is storage.** A file's structure — its `##` headers, their order, its prose — sat in
+  `namespaces.metadata`: a shared, globally addressable, **user-mutable** hierarchy. A file's
+  structure is private to that file and must round-trip exactly. `jkb ns mv` and the VS Code
+  Rename button reach it; `namespace_for` then recomputes the path from the *file*, the layout is
+  unreachable, and the export arm writes a structureless render over your file.
+- **It moves to `sync_state.document`** (migration `V012`), keyed `uri TEXT PRIMARY KEY` — at most
+  one row per file, so two files sharing one structure is **unrepresentable**. `reconcile` already
+  loads that row first, so reading structure from it is free, and `decide_direction`'s byte fast
+  path and `Outcome::Normalized` both survive (deriving it from the base blob instead would have
+  cost a load + parse per file per sync and given up both).
+- **The property this buys:** `apply_doc` is the only writer of a file's structure, and the
+  `(false, true)` export arm does not call it — so **an export can change item lines but not
+  structure.** Two paths escape that (`missing_file`, and `kb_wins`, which incorporates disk
+  changes by design), which is what the guard below is for.
+- **Being a migration is load-bearing.** Refinery verifies every applied migration before running
+  any, so a binary older than this one fails at `Db::open` rather than silently reading namespace
+  metadata nothing refreshes any more and exporting from it. That ruled out a dual-write.
+- **One guard survives**, and it is a *different* harm: `assemble_kb_doc` skips a bound item with
+  no primary placement, so `jkb undo` after a re-home (`placement::set_primary`'s delete has no
+  inverse) silently deletes its line. `finish_export` now refuses — `Outcome::Refused`, journalled
+  `needs_attention`, nothing written — and recovery is any edit to the file, which imports
+  normally.
+- **`wholesale_loss` — one condition, judged on documents, decided above the direction dispatch
+  (D45.5).** The two routes D45 left open were each found and fixed *at the route* — pass 21 at
+  `finish_export`'s `(false, true)` arm, pass 22 at `three_way_resolve`'s `!ctx.imports()` arm.
+  Both fixes were correct and neither was the last, because a route is not a cause. The condition
+  is: **the KB contributes zero items to a file that declares some.** It compares two documents,
+  never the store, because the store is what these incidents damage — `jkb undo` of a sync deletes
+  a file's items **and their bindings** together, so `dropped_items`, which walks bindings,
+  truthfully reports nothing dropped; there is nothing left to walk. One condition covers undo,
+  `jkb item rm`, a half-applied migration, an emptied binding table, and the next thing with that
+  shape. Deliberately *not* a general "fewer items than disk" rule: on an export-only mount the
+  file is a projection and hand-added lines are legitimately removed.
+  - **An empty rendered document is not proof of an empty store.** `assemble_kb_doc` also omits an
+    item that is still *bound* and has merely lost its primary placement — what `jkb undo` after a
+    re-home leaves, which is D45's own motivating verb — and a `document` mount is one item per
+    file, so a single dropped placement empties the render. So the condition asks the store too:
+    anything still bound means the `dropped_items` refusal and its one-command re-home remedy, on
+    every mount mode; nothing bound means the items really are gone and re-reading the file is the
+    recovery. Without that split the guard turned a refusal into a silent import that overwrote
+    content, status and priority from disk.
+  - **Detecting it is not refusing it.** Pass 23: sited inside `export_blocker` the only available
+    answer was "refuse", and refusing is wrong on two of the three mount modes — it protected the
+    file and left the KB **permanently** empty, since a refusal never advances the base, so the
+    next sync re-entered the same arm forever and the message's own remedy ("edit the file") is
+    what routes it there. It now runs in `reconcile` **above the direction dispatch**, where it
+    dominates every arm, and the mount mode decides: a mount that can import **re-imports the
+    file** — the disk being the good copy is the condition's own premise — and only an export-only
+    mount, which cannot read the file back, refuses. Each arm below would otherwise have needed
+    its own gate, which is the shape this whole area keeps failing at.
+  - `finish_export` still takes the **`SyncDoc`** and renders it itself, so what was judged is
+    necessarily what gets written.
+- **The mount-mode axis is a test matrix, and it asserts BOTH sides.** Three consecutive passes
+  produced the same shape of must-fix — "this arm behaves differently on an export-only mount and
+  nothing tested that axis". `no_mount_mode_and_stage_loses_a_task_line` runs {import, export,
+  bidirectional} × {first sight, settled, disk-changed, kb-changed, both-changed, post-undo,
+  kb-emptied}. Its first version asserted only that the *file* keeps its lines and passed the very
+  bug it was written to catch: a refusal protects the file perfectly while leaving the KB empty.
+  So it also asserts that a mount which **can** import is never left holding nothing for a file
+  that declares work. `kb-emptied` is distinct from `post-undo` on purpose — undo also clears
+  `base_blob_hash`/`document`, and with no base the disk's items read as additions that a merge
+  keeps, so undo alone never produces an item-less merged document. It asserts the *harm*, not the
+  outcomes: those legitimately differ per mode, and pinning them would make it a change-detector.
+- **Section namespaces are now derived**, kept for browsing and `ns:` scoping, authoritative for
+  nothing. `retire_undeclared_sections` is **re-keyed on `sync_section`**: it was gated on
+  `header_line`, which no longer decides anything, so leaving it would have made it a silent
+  permanent no-op — invisible, because nothing renders from namespaces for a render test to catch.
+- **Deleted, not guarded:** `adopt_legacy_namespace` and its vacuous ownership gate (the source of
+  both pass-9 sync must-fixes), `set_layout`, `read_layout`, `legacy_layout`, `collect_legacy_prose`.
+- **Still open, filed not fixed:** the import direction is unvalidated (`parse_text` is lenient, so
+  a truncated file imports cleanly and cancels every task below the cut) — now the largest
+  remaining data-loss path; and `ns mv`/`ns rm` are unguarded on synced namespaces, though D45
+  took the teeth out of that one by moving a file's structure off the namespace tree.
+  - **Two of the four have since landed.** A *first-sight export over an unimported file* is
+    refused by `export_blocker`'s second condition — content on disk with no recorded structure —
+    on any mount that can import. And the *losing bytes are blobbed*: `archive_current_bytes` moved
+    up into `reconcile_file`, above the direction dispatch, so it covers all four sites that
+    overwrite a synced file rather than the one that used to carry the rule, and a failed archive
+    stops that file instead of degrading to best-effort.
+
+## A synced file owns its own namespace (D39) — the collapse, fixed at the root
+
+The `Collided` refusal above was a guard around a modelling error, and the error is now fixed:
+**`namespace_for` includes the filename**, so one namespace holds exactly one file. Design in
+`openspec/changes/jkb-sync-file-namespaces/`.
+
+- **The root cause was one dropped path segment.** A file's namespace came from its containing
+  *directory*, so every file there shared the `layout` that `render` treats as the sole
+  authority on document order — one layout describing two documents, last writer wins, and the
+  next export of the other file wrote its sibling's headers and prose over itself.
+- **Seven guards over eight review passes** tried to keep answering *whose layout is this?* —
+  `layout_uri`, `LayoutOwner`, `unclaimed_legacy`, `foreign_layout`, `refuse_foreign`,
+  `colliding_paths`, `shares_namespace_with_other_bound_file`. Every one was a **proxy for
+  authorship** (did it sync cleanly, is a sibling still bound, is there a journal row) and every
+  one was satisfied by the recovery step the refusal itself recommended: deleting the sibling.
+  On a legacy database the two files are indistinguishable claimants, so no proxy can work. All
+  of it is **deleted** — a guard that cannot fire is a second model of the world, not defence in
+  depth.
+- **The filename keeps its extension.** `tasks` reads better, but `tasks.md` beside `tasks.txt`
+  would collide again — the same defect, rarer, therefore worse.
+- **Adoption is gone** (it was `adopt_legacy_namespace` + `Outcome::Adopted`). Its ownership gate
+  was vacuous — it inspected only items placed *directly* in the directory namespace, and a
+  sectioned file has none there — and both of pass 9's sync must-fixes were in it. D45 deletes it:
+  with structure on the journal row there is nothing to adopt, and a legacy row is populated from
+  the file's own base blob.
+- **A directory may now hold many synced files.** That is the user-visible gain, and why this
+  was worth a re-home rather than an eighth guard.
+
+## An item id is never reused (D40), and a vector row goes with its item (D42)
+
+`items.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` (migration `V010`, **repaired by `V011`**).
+Designs in `openspec/changes/jkb-item-id-stability/` and `openspec/changes/jkb-vector-liveness/`.
+
+- **The hazard was rowid reuse.** `vec_items_<dim>` is a `vec0` virtual table and cannot carry a
+  foreign key, so a deleted item left its vector behind — keyed on an id SQLite then handed to
+  the next item created, which **inherited the dead embedding**, read as already-indexed to
+  `index_pending`, and made ingest fail on a UNIQUE collision forever after.
+- **It was fixed four times, once per call site** (`undo`, `item rm`, ingest's re-capture arm,
+  ingest's fresh-capture arm) across review passes 5–8. Each fix was correct and incomplete,
+  because the enforcement was procedural: every present and future deleter had to remember.
+  Prefer an invariant the **schema** enforces over one every caller must uphold.
+- **All four in-transaction sweeps are removed.** Removing them is the point — it deletes the
+  question *which call sites sweep?*, which is what produced four passes of findings. Cleanup is
+  housekeeping now: `jkb_index::count_stale` / `sweep_stale`, surfaced as **`jkb index --sweep`**
+  and `jkb doctor [--fix]`.
+- **But `V010` did not work, and D40's "a stale row is now inert" was false for two more passes.**
+  Its `INSERT OR IGNORE` into `sqlite_sequence` **cannot ignore** — that table has no primary key
+  and no unique index, so there is no conflict to ignore and it always inserted a second
+  `('items', …)` row. And it seeded from `MAX(id) FROM items`, the maximum *surviving* id, which
+  resets the high-water mark **below** every id freed at the top of the range. So `AUTOINCREMENT`
+  protected ids freed after the migration and did nothing for the orphans D40 had just stopped
+  sweeping. Reproduced against real SQLite with the migration's exact body.
+- **`V011` recomputes the sequence from the changelog**, which records every item insert and is
+  never pruned, so it remembers ids the table no longer holds — and it `DELETE`s the row before
+  inserting, which also clears `V010`'s duplicate. `V010` is **not edited, not even its misleading
+  comment**: refinery hashes a migration's entire SQL text, comments included, so a comment-only
+  edit reports a divergent migration on every database that already applied it.
+- **The invariant that actually holds is a `DELETE` trigger** (`vector.rs::ensure_gc_trigger`,
+  created beside each `vec_items_<dim>` table). A trigger lives in the database file, so it fires
+  for every connection, every process and every future call site — the objection that killed an
+  `ItemDeleteHook` seam does not apply to it. Cost, stated: a connection without the `sqlite-vec`
+  extension cannot resolve the virtual table, so an item delete on one fails loudly. Every binary
+  here opens with `Db::open_with(&[jkb_index::register])`.
+- **Reads filter too, as defence in depth with a named budget.** `VectorIndexer::knn_live` drops
+  rows whose item is gone and **also returns whether the index was exhausted**, so `jkb-search`'s
+  growth loop can tell that from "live rows ran out inside knn's budget" — its `hits.len() < fetch`
+  test is wrong once filtering happens inside. The filter is applied in Rust, not as a join
+  (`sqlite-vec` needs a `k` and rejects `ORDER BY` on anything but distance), and the internal
+  fetch never exceeds **4096** — `sqlite-vec` hard-errors above that, and `vector_ranked` already
+  over-fetches to 2048.
+- **A liveness join alone could never have fixed it**: under reuse the `item_id` names a live
+  item — the wrong one. That is also why `jkb doctor` reported `ok` for an affected database.
+  D42.1 is the load-bearing fix; the trigger and the read filter are what make it hold.
+- Pinned by `item::tests::a_deleted_items_id_is_never_reused` and, for the migration itself, a
+  test inside `src/migrate.rs` (the runner is private) that builds a `V010`-era database with
+  `Target::Version(10)` and asserts the next ids exceed every id ever used. **Note:** `V010`
+  rebuilds `items`, so an older branch's binary cannot open a database this one has migrated —
+  the usual shared-`jkb.db` divergence.
+
+## The changelog is an audit log; `undo` reads it as an undo log (D47)
+
+Three consecutive review passes each found a defect *inside the previous pass's fix* — round 4
+`branch_records` missing from the undoable set (**which tables**), round 5 four upserts logging
+the op `insert` (**which op**), round 6 derived-correctly `update` entries nothing could invert
+(**invertibility**). Three axes of one question, because the mechanism underneath was untouched:
+*cannot invert this? revert something else.* The diagnosis is that the two logs have different
+contracts — an audit entry says what happened, an undo entry has to carry enough to put it back —
+and nothing ever held an entry to the second.
+
+- **The entity is a type, not a string.** `changelog::Entity` is a closed enum whose variants and
+  `Entity::ALL` are generated together by one macro, and `Entity::insert_inverse` is an exhaustive
+  match — so a new table cannot reach a writer without saying how an insert into it comes back.
+  The allowlist is **derived** from that match rather than hand-maintained beside it.
+- **The op is derived, never chosen.** `changelog::upsert(…, before, after)` records `insert` only
+  when `before` is `None`; `changelog::append` **refuses** the op `insert` outright. Choosing it is
+  how four upserts (`view::save`, `placement::place`, `binding::set`, `tag::apply`) logged `insert`
+  for `ON CONFLICT` arms that updated pre-existing rows, after which `undo` deleted them.
+- **A before-state that could not restore anything is refused at the write** (`undo::check_restorable`,
+  called from `changelog::write`): non-empty, naming only real columns, and for a `delete` naming
+  **every** column — checked against the live schema, so adding a column fails every deleter of
+  that table at its next write.
+- **Refuse rather than retarget.** `undo_last` selects the newest transaction containing any
+  *work*, not the newest it can invert, and `undo` wraps the whole apply loop so **any** error
+  becomes one named refusal that writes nothing. It stops predicting which entries are unrunnable;
+  a kind nobody taught it about is a refusal, not a silently reverted stranger.
+- **A restore that restored nothing is an error.** `restored()` is the one place a row count is
+  judged, and zero is honest only where a named guard says the row was deliberately skipped. Arms
+  answering `Ok(0)` for work they had not done were worse than raising: `undo` wrote its marker on
+  the strength of it, so clearing the obstruction and retrying met "already undone".
+- **User-visible: `V014` draws a date line.** A write-time guard cannot reach backwards, and
+  inferring whether a legacy payload happens to be invertible is the same mistake one level along.
+  So `undo_watermark` is seeded to `MAX(txn_id)` at upgrade: **`jkb undo` cannot reach anything
+  from before the upgrade**. `undo_last` never selects below it, and an explicit `jkb undo <txn>`
+  below it is told the transaction predates undo history rather than dying part-way through.
+  A fresh database has an empty changelog, so the mark is 0 and nothing is excluded.
 
 ## Sync: prose is not an item (the `memory/sync-export-wins` fix)
 

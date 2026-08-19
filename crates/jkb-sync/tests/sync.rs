@@ -218,7 +218,10 @@ fn both_changed_disk_wins_imports_the_disk_copy() {
     kb_edit(&db, &uri, "kb loses");
 
     let report = sync(&db, "docs/repo").unwrap();
-    assert_eq!(report.count(Outcome::Imported), 1);
+    // A policy resolution is reported apart from an ordinary import: it threw the KB side
+    // away, and that must never look like a routine sync.
+    assert_eq!(report.count(Outcome::ResolvedFromDisk), 1);
+    assert_eq!(report.resolved().len(), 1);
     assert_eq!(content_for(&db, &uri).as_deref(), Some("disk wins"));
 }
 
@@ -246,8 +249,20 @@ fn failed_import_does_not_corrupt_sync_state() {
 
     // Corrupt the file with invalid UTF-8: the document serializer's parse fails, so
     // the import transaction rolls back.
+    //
+    // The failure is REPORTED, not propagated. It used to come back as `Err` from `sync`, which
+    // meant one unreadable file — a PNG dropped into a `document` mount — returned an error out
+    // of the watcher thread for that mount, after which `watch_all` blocked joining the others
+    // forever, launchd never restarted the still-live process, and the mount silently stopped
+    // syncing for good.
     fs::write(&file, [0xff, 0xfe, 0x00]).unwrap();
-    assert!(sync(&db, "docs/repo").is_err());
+    let report = sync(&db, "docs/repo").expect("one bad file must not end the run");
+    assert_eq!(report.count(Outcome::Failed), 1);
+    assert!(
+        report.failed()[0].1.contains("UTF-8"),
+        "the reason must survive to the report: {:?}",
+        report.failed()
+    );
 
     // The item content and last_synced_hash still reflect the previous good sync.
     assert_eq!(content_for(&db, &uri).as_deref(), Some("valid text"));
@@ -498,13 +513,14 @@ fn tasks_import_creates_items_sections_and_is_byte_stable() {
     assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
     assert_eq!(task_count(&db), 3);
 
-    // Section headers became namespaces under the file's mirror namespace.
+    // Section headers became namespaces under the file's own namespace — which since D39.1
+    // is named after the file, so a sibling document's sections cannot land beside these.
     assert!(db
-        .read(|conn| ns::get(conn, "docs/plan/backend"))
+        .read(|conn| ns::get(conn, "docs/plan/tasks.md/backend"))
         .unwrap()
         .is_some());
     assert!(db
-        .read(|conn| ns::get(conn, "docs/plan/frontend"))
+        .read(|conn| ns::get(conn, "docs/plan/tasks.md/frontend"))
         .unwrap()
         .is_some());
 
@@ -1159,6 +1175,7 @@ fn a_renderer_change_is_not_mistaken_for_a_content_change() {
                     base_blob_hash: Some(&hash),
                     parse_error: None,
                     quarantine_blob_hash: None,
+                    document: None,
                 },
             )
         }
@@ -1245,6 +1262,7 @@ fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
                     base_blob_hash: Some(&hash),
                     parse_error: None,
                     quarantine_blob_hash: None,
+                    document: None,
                 },
             )
         }
@@ -1271,4 +1289,1319 @@ fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
         assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
         assert_eq!(fs::read_to_string(&file).unwrap(), canonical);
     }
+}
+
+/// Two `tasks` files in one directory both sync, each keeping its own document (design D39.4).
+///
+/// This is the case that used to be **refused**. `namespace_for` derived a file's namespace
+/// from its containing directory and dropped the filename, so siblings shared the `layout`
+/// that `render` treats as the sole authority on document order — and syncing a directory
+/// holding `tasks.md` beside any other markdown file exported the *same* rendered bytes over
+/// both. Real damage, not hypothetical: 30 files collapsed onto 10 documents and 62 lost every
+/// markdown header.
+///
+/// Seven guards over eight review passes tried to keep answering "whose layout is this?".
+/// Giving each file its own namespace means there is nothing to answer.
+#[test]
+fn two_tasks_files_in_one_directory_each_keep_their_own_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let design = dir.path().join("design.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+    fs::write(&design, "## Notes\n\n- [ ] think about it !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Created), 2, "both files sync");
+
+    // Each document is intact and distinct — the collapse, asserted absent.
+    let tasks_text = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        tasks_text.starts_with("## Plan\n\n- [ ] ship it !p1 ^ship-it-"),
+        "tasks.md must keep its own section and item: {tasks_text}"
+    );
+    assert!(
+        fs::read_to_string(&design).unwrap().contains("## Notes"),
+        "design.md must keep its own header, not tasks.md's"
+    );
+    assert!(
+        !fs::read_to_string(&design).unwrap().contains("ship it"),
+        "design.md must not have been given tasks.md's items"
+    );
+
+    // Each file has its own namespace, named after it.
+    for name in ["tasks.md", "design.md"] {
+        let path = format!("docs/plan/{name}");
+        assert!(
+            db.read(move |conn| ns::get(conn, &path)).unwrap().is_some(),
+            "{name} must own a namespace"
+        );
+    }
+
+    // And a second run is a no-op, so nothing about this is oscillating.
+    let again = sync(&db, "docs/plan").unwrap();
+    assert_eq!(again.count(Outcome::UpToDate), 2);
+}
+
+/// Deleting a sibling must never overwrite the survivor with the dead file's content.
+///
+/// This is the pass-3/4/8 regression — the same failure found three times, each time with the
+/// guard moved to a different condition. It is now unreachable by construction rather than by
+/// a guard, and is asserted directly so a future change to `namespace_for` fails here.
+#[test]
+fn deleting_a_sibling_never_overwrites_the_survivor() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    let design = dir.path().join("design.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+    fs::write(&design, "## Design\n\n- [ ] decide the shape !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // The documented recovery procedure from the old collision refusal: delete one of them.
+    fs::remove_file(&design).unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let survivor = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        survivor.contains("## Plan") && survivor.contains("ship it"),
+        "the survivor must keep its own document: {survivor}"
+    );
+    assert!(
+        !survivor.contains("## Design") && !survivor.contains("decide the shape"),
+        "the survivor must NOT be given the deleted sibling's content: {survivor}"
+    );
+}
+
+/// A legacy journal row — structure still in the namespace tree, `document` NULL — is populated
+/// once from the file's own base blob, and the run after that is an ordinary no-op (D45.6).
+#[test]
+fn a_legacy_journal_row_is_populated_once_from_its_own_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\nSome prose.\n\n- [ ] ship it !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let settled = fs::read_to_string(&tasks).unwrap();
+
+    // Rewind to the pre-D45 shape: the journal knows the hashes but not the structure.
+    db.write_txn("t", |conn, _m| {
+        conn.execute("UPDATE sync_state SET document = NULL", [])?;
+        Ok(())
+    })
+    .unwrap();
+
+    // The file must be untouched, and the structure must come back.
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Refused),
+        0,
+        "a legacy row must repopulate, not refuse"
+    );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        settled,
+        "populating structure must not rewrite the file"
+    );
+
+    let doc: Option<String> = db
+        .read(|conn| Ok(conn.query_row("SELECT document FROM sync_state", [], |r| r.get(0))?))
+        .unwrap();
+    let doc = doc.expect("document populated");
+    assert!(doc.contains("Some prose."), "prose recovered: {doc}");
+    assert!(doc.contains("## Plan"), "header recovered: {doc}");
+
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+}
+
+/// Renaming a file's namespace must not let the next sync strip the file (D45.4).
+///
+/// `jkb ns mv` — and one click of the VS Code Rename button — used to make the structure
+/// unreachable, after which the export arm wrote a structureless render over the file. Structure
+/// now lives on the journal row, keyed by the file's uri, so the namespace tree cannot reach it.
+#[test]
+fn renaming_a_files_namespace_does_not_strip_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(
+        &tasks,
+        "## Plan\n\nProse that must survive.\n\n- [ ] ship it !p1\n",
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let before = fs::read_to_string(&tasks).unwrap();
+
+    // Move the file's whole namespace out from under it, the way `jkb ns mv` does.
+    db.write_txn("t", |conn, meta| {
+        ns::move_subtree(conn, meta, "docs/plan/tasks.md", "docs/elsewhere")?;
+        Ok(())
+    })
+    .unwrap();
+
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        before,
+        "the file must be byte-identical after its namespace was renamed away"
+    );
+}
+
+/// An export must refuse rather than delete the lines of items that are still bound (D45.5).
+///
+/// `assemble_kb_doc` skips a bound item with no primary placement, and the export arm then
+/// writes that render over the file — so `jkb undo` after a re-home silently deletes task lines.
+#[test]
+fn an_export_refuses_when_a_bound_items_line_would_vanish() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let before = fs::read_to_string(&tasks).unwrap();
+
+    // Strip one bound item's primary placement — exactly what `jkb undo` after a re-home leaves
+    // behind — and make a KB-side change so an export is attempted.
+    db.write_txn("t", |conn, _m| {
+        let victim: i64 = conn.query_row(
+            "SELECT i.id FROM items i JOIN bindings b ON b.item_id = i.id
+              WHERE i.content LIKE '%keep me%'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM placements WHERE item_id = ?1 AND role = 'primary'",
+            [victim],
+        )?;
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%and me%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Refused),
+        1,
+        "the export must refuse, not silently drop a line"
+    );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        before,
+        "a refusal writes nothing at all"
+    );
+    let (_, reason) = report.refused()[0];
+    assert!(
+        reason.contains("missing from the assembled document"),
+        "the refusal must say why: {reason}"
+    );
+}
+
+/// A legitimate KB-only edit still exports — the guard must not block the ordinary path.
+#[test]
+fn a_kb_only_status_change_still_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    db.write_txn("t", |conn, _m| {
+        conn.execute("UPDATE items SET status = 'done' WHERE kind = 'task'", [])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Exported),
+        1,
+        "the ordinary path works"
+    );
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("- [x]"),
+        "the status reached the file: {after}"
+    );
+    assert!(after.contains("## Plan"), "structure survived: {after}");
+}
+
+/// `jkb undo` after a sync must rewind structure and hashes **together** (D45.2).
+///
+/// The document now lives on the journal row beside the hashes, so restoring one without the
+/// other would undo a sync into a KB that disagrees with its own base — the state every export
+/// bug in this subsystem grew out of.
+#[test]
+fn undoing_a_sync_rewinds_structure_with_the_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## One\n\n- [ ] first !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    let read_row = || -> (Option<String>, Option<String>) {
+        db.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT document, last_synced_hash FROM sync_state",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .unwrap_or((None, None)))
+        })
+        .unwrap()
+    };
+    let (doc_v1, hash_v1) = read_row();
+    assert!(doc_v1.as_ref().is_some_and(|d| d.contains("## One")));
+
+    // A second sync with different structure.
+    fs::write(&tasks, "## Two\n\nNew prose.\n\n- [ ] first !p1\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    let (doc_v2, hash_v2) = read_row();
+    assert_ne!(doc_v1, doc_v2, "structure moved on");
+    assert_ne!(hash_v1, hash_v2);
+
+    db.write_txn("t", jkb_core::undo::undo_last).unwrap();
+
+    let (doc_after, hash_after) = read_row();
+    assert_eq!(
+        (doc_after, hash_after),
+        (doc_v1, hash_v1),
+        "structure and hashes must rewind together, not one without the other"
+    );
+}
+
+/// `kb_wins` writes the KB side over a disk that changed structurally — a path the export
+/// property does NOT cover (D45.4), so it is asserted on bytes rather than assumed.
+#[test]
+fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] shared !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::KbWins);
+    sync(&db, "docs/plan").unwrap();
+
+    // Both sides change: the disk gains a section, the KB closes the task.
+    fs::write(
+        &tasks,
+        "## Plan\n\n## Extra\n\n- [ ] shared !p1\n- [ ] disk only !p2\n",
+    )
+    .unwrap();
+    db.write_txn("t", |conn, _m| {
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%shared%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Refused),
+        0,
+        "a legitimate kb_wins resolution must not be refused"
+    );
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("[x] shared"),
+        "the KB side won, as kb_wins means: {after}"
+    );
+}
+
+/// Following the refusal's own advice must not destroy the data the refusal protected.
+///
+/// The refusal says "edit the file". That edit makes both sides differ, which routes the file
+/// into the **merge** arm — which had no item guard at all, so `apply_doc` cancelled the item and
+/// `write_file` dropped its line. The tool's instructions were the exploit.
+#[test]
+fn editing_a_refused_file_does_not_delete_the_protected_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // Break one item's primary placement, as `jkb undo` after a re-home does.
+    db.write_txn("t", |conn, _m| {
+        let victim: i64 = conn.query_row(
+            "SELECT i.id FROM items i JOIN bindings b ON b.item_id = i.id
+              WHERE i.content LIKE '%keep me%'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM placements WHERE item_id = ?1 AND role = 'primary'",
+            [victim],
+        )?;
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%and me%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Refused), 1);
+
+    // Now do exactly what the refusal tells the user to do: edit the file.
+    let current = fs::read_to_string(&tasks).unwrap();
+    fs::write(&tasks, format!("{current}- [ ] newly added !p3\n")).unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let after = fs::read_to_string(&tasks).unwrap();
+    assert!(
+        after.contains("keep me"),
+        "editing a refused file must not delete the line the refusal protected: {after}"
+    );
+
+    // …and the refusal must actually be CLEARABLE. Asserting only the first edit was the gap:
+    // the guard judged expectation from the base, so the item stayed "expected" no matter what
+    // the file said, every later reconcile refused again, and the edit above was never imported.
+    // Deleting the offending line is the remedy the message prints, so it has to work.
+    let text = fs::read_to_string(&tasks).unwrap();
+    let mut without = String::new();
+    for line in text.lines().filter(|l| !l.contains("keep me")) {
+        without.push_str(line);
+        without.push('\n');
+    }
+    fs::write(&tasks, &without).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Refused),
+        0,
+        "deleting the line must clear the refusal — the printed remedy has to take effect"
+    );
+    // Asserted against the KB, not against the bytes this test just wrote — re-reading the file
+    // would pass identically if the engine had done nothing at all.
+    let (added, detached): (i64, i64) = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT
+                   (SELECT count(*) FROM items i JOIN bindings b ON b.item_id = i.id
+                     WHERE i.content LIKE '%newly added%' AND b.uri LIKE 'file://%'),
+                   (SELECT count(*) FROM items i JOIN bindings b ON b.item_id = i.id
+                     WHERE i.content LIKE '%keep me%' AND b.uri = 'managed:')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        added, 1,
+        "the edit made while refused must finally IMPORT — bound as a real item, not just \
+         present in bytes the test wrote"
+    );
+    assert_eq!(
+        detached, 1,
+        "the item the user deleted must be detached to `managed:` by apply_doc"
+    );
+}
+
+/// A section the file stops declaring must stop being a section (`retire_undeclared_sections`).
+///
+/// Asserted on the **marker**, not the render: since D45 nothing renders from namespaces, so a
+/// render-based assertion passes even when retirement has become a no-op — which is exactly what
+/// re-keying it from `header_line` to `sync_section` risked.
+#[test]
+fn a_section_the_file_drops_stops_being_a_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Keep\n\n- [ ] a !p1\n\n## Drop\n\n- [ ] b !p2\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    let marked = |ns: &str| -> bool {
+        let ns = ns.to_owned();
+        db.read(move |conn| {
+            let Some(id) = ns::get(conn, &ns)? else {
+                return Ok(false);
+            };
+            Ok(ns::get_metadata(conn, id)?
+                .and_then(|m| m.get("sync_section").cloned())
+                .is_some())
+        })
+        .unwrap()
+    };
+    assert!(marked("docs/plan/tasks.md/keep"));
+    assert!(marked("docs/plan/tasks.md/drop"));
+
+    // The file stops declaring `## Drop`.
+    fs::write(&tasks, "## Keep\n\n- [ ] a !p1\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    assert!(marked("docs/plan/tasks.md/keep"), "the kept section stays");
+    assert!(
+        !marked("docs/plan/tasks.md/drop"),
+        "the dropped section must lose its marker, or retirement has silently become a no-op"
+    );
+}
+
+/// Whatever a sync overwrites is recoverable from the blob archive (design D25).
+///
+/// Asserted on the **merge** path, which never carried the rule: it was hand-placed at one of
+/// four `write_file` sites, so three could destroy bytes no blob held — and the one that had it
+/// archived inside the reconcile's own transaction, where a later failure rolled the archive
+/// back while the file stayed overwritten. The archive now happens once per reconcile, in its
+/// own committed transaction, before anything can write.
+#[test]
+fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] first !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::KbWins);
+    sync(&db, "docs/plan").unwrap();
+
+    // Both sides change, so the reconcile rewrites the file.
+    let settled = fs::read_to_string(&tasks).unwrap();
+    let doomed = settled.replace("## Plan\n", "## Plan\n\nProse the user typed.\n");
+    fs::write(&tasks, &doomed).unwrap();
+    db.write_txn("t", |conn, _m| {
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%first%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    // Whatever happened to the file, the bytes that were on disk beforehand are in the archive.
+    let hash = jkb_core::blob::hash_bytes(doomed.as_bytes());
+    let recovered = db
+        .read(move |conn| jkb_core::blob::load(conn, &hash))
+        .unwrap();
+    assert_eq!(
+        recovered.as_deref(),
+        Some(doomed.as_bytes()),
+        "the pre-sync bytes must be recoverable — `jkb blob ls --contains` is the whole story"
+    );
+}
+
+/// A file whose bytes cannot be archived is left alone, not overwritten (design D25).
+///
+/// This is the branch the previous commit existed to add and did not pin — the regression it
+/// keeps taking is `let _ = archive_current_bytes(...)`, which silently downgrades the
+/// "every overwrite is recoverable" guarantee to best-effort exactly when the database is
+/// contended. Forced here by making the file unreadable, which is the same class as a failed
+/// archive write: bytes we cannot copy must not be destroyed.
+#[cfg(unix)]
+#[test]
+fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::KbWins);
+    sync(&db, "docs/plan").unwrap();
+    let before = fs::read_to_string(&tasks).unwrap();
+
+    // A KB-side change, so the next reconcile wants to write the file…
+    db.write_txn("t", |conn, _m| {
+        conn.execute("UPDATE items SET status = 'done' WHERE kind = 'task'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    // …and the bytes become unreadable, so they cannot be archived first.
+    fs::set_permissions(&tasks, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    fs::set_permissions(&tasks, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        report.count(Outcome::Failed),
+        1,
+        "an unarchivable file must be reported as failed, not silently written"
+    );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        before,
+        "the file must be untouched when its bytes could not be archived"
+    );
+    let flagged = db.read(jkb_core::sync_state::needs_attention).unwrap();
+    assert!(
+        flagged.iter().any(|s| s
+            .parse_error
+            .as_deref()
+            .is_some_and(|e| e.contains("archive"))),
+        "and the journal must say why: {flagged:?}"
+    );
+}
+
+/// An export-only mount meeting a file that ALREADY EXISTS on disk, with no journal row yet.
+///
+/// This is the first sight of a file the mount will never import, so the KB is authoritative and
+/// the correct answer is to export over it. The engine routed this through the same helper as the
+/// genuinely-absent-file case, which told the write seam to expect no file at all — so the seam
+/// refused, reporting "changed on disk while it was being synced" about a file that had not
+/// changed at all. An export-only mount could therefore never write its first file, and said
+/// something false about why.
+#[test]
+fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("note.md");
+    fs::write(&file, "stale bytes on disk").unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/out",
+        dir.path(),
+        SyncMode::Export,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+
+    // A KB item bound to that path, created without ever importing the file.
+    let bound_uri = uri.clone();
+    db.write_txn("t", move |conn, meta| {
+        let ns_id = ns::ensure(conn, "docs/out")?;
+        let id = item::upsert(
+            conn,
+            meta,
+            &jkb_core::item::NewItem {
+                uid: "doc:note".to_owned(),
+                kind: "document".to_owned(),
+                content: Some("authored in the kb".to_owned()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        jkb_core::placement::place(conn, meta, id, ns_id, jkb_types::PlacementRole::Primary, 0)?;
+        binding::set(
+            conn,
+            meta,
+            id,
+            &bound_uri,
+            Some(SyncMode::Export),
+            Some("document"),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/out").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "an export-only mount refused its first export: {:?}",
+        report.failed()
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "authored in the kb",
+        "the KB side must overwrite a file this mount never imports"
+    );
+    // The disk side is never read back into the KB on an export-only mount.
+    assert_eq!(
+        content_for(&db, &uri).as_deref(),
+        Some("authored in the kb")
+    );
+}
+
+/// Read one task's status by uid.
+fn kb_status(db: &Db, uid: &str) -> Option<String> {
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let Some(id) = item::id_for_uid(conn, &uid)? else {
+            return Ok(None);
+        };
+        Ok(item::get(conn, id)?.and_then(|m| m.status))
+    })
+    .unwrap()
+}
+
+/// An export-only mount must never take item edits FROM disk — not even inside a three-way
+/// merge, where the disk and KB edits touch different tasks and so merge cleanly.
+///
+/// `finish_import` carried the `ctx.imports()` check and the `Merged` arm did not, so a hand
+/// edit deleting a line cancelled and detached the KB task behind it: the merged document
+/// simply lacked that item, and applying it to the KB is what cancels a removed task. The
+/// mount's whole contract is that the KB is authoritative and the file is an output.
+#[test]
+fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    // Import once, so the KB holds the tasks and the file is settled.
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        task_count(&db),
+        3,
+        "setup: the three tasks should have imported"
+    );
+
+    // From here the mount is export-only: the KB is authoritative, the file is an output.
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Export,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+
+    // Both sides change, on DIFFERENT items — which is exactly what merges cleanly and so
+    // reaches the `Merged` arm rather than a conflict.
+    let edited = TASKS_MD.replace("- [ ] Fix flaky test !p1 needs:^setup ^fix\n", "");
+    assert_ne!(edited, TASKS_MD, "setup: the disk edit must remove a line");
+    fs::write(&file, &edited).unwrap();
+    kb_set_status(&db, &format!("{uri}#ship"), "in_progress");
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the export-only reconcile failed: {:?}",
+        report.failed()
+    );
+
+    // The harm: the task behind the deleted line must still be open.
+    assert_eq!(
+        kb_status(&db, &format!("{uri}#fix")).as_deref(),
+        Some("open"),
+        "a hand edit to the file cancelled a KB task on a mount that does not import"
+    );
+    // And the KB is written back over the file, so the line returns.
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("^fix"),
+        "the export-only mount did not rewrite the file from the KB"
+    );
+}
+
+/// Undo, then sync, must never strip the file. This is the harm assertion the previous fix
+/// lacked: bytes on disk, not a journal field.
+///
+/// `jkb undo` of a sync removes the items. If the journal keeps describing them —
+/// `base_blob_hash` and `document` surviving while only `last_synced_hash` is cleared — the next
+/// reconcile finds the disk unchanged against that base and the KB now empty, takes the export
+/// arm, and writes an item-less render over the file. Undo is supposed to give work back.
+#[test]
+fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
+    assert_eq!(task_count(&db), 3, "setup: the tasks should have imported");
+
+    // Undo the sync the way a user reaching for `jkb undo` would: the trailing mirror
+    // transaction, then the reconcile itself. Not more — a third would start unwinding the mount
+    // and the test would be measuring something else.
+    for _ in 0..2 {
+        db.write_txn("cli", jkb_core::undo::undo_last)
+            .expect("undo should succeed");
+    }
+
+    // Whatever the undo did to the KB, the next reconcile must not damage the file.
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the reconcile after undo failed: {:?}",
+        report.failed()
+    );
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(
+        after.contains("Set up CI")
+            && after.contains("Fix flaky test")
+            && after.contains("Ship button"),
+        "syncing after an undo stripped task lines from the file:\n{after}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The mount-mode matrix.
+//
+// Two consecutive review passes found the same shape of must-fix — "this arm behaves differently
+// on an export-only mount and nothing tested that axis" — at two different arms. Every reconcile
+// arm branches on `ctx.imports()` or `ctx.exports()` somewhere below it, and until this table the
+// suite exercised `bidirectional` almost exclusively, so the export-only and import-only halves of
+// each arm were reached by a handful of hand-written cases and no rule.
+//
+// The invariant asserted in every cell is the one D45 is about: **a sync must not delete an item
+// line the KB knows about.** Not an outcome — outcomes legitimately differ per mode, and pinning
+// them would make this a change-detector. What must never differ is that the file keeps the work.
+// ---------------------------------------------------------------------------------------------
+
+/// What has happened to the file and the KB by the time the sync under test runs.
+#[derive(Clone, Copy, Debug)]
+enum Stage {
+    /// No journal row: this mount has never seen the file.
+    FirstSight,
+    /// Imported once and untouched since.
+    Settled,
+    /// Only the file moved.
+    DiskChanged,
+    /// Only the KB moved.
+    KbChanged,
+    /// Both moved, on different items — the arm that merges rather than conflicts.
+    BothChanged,
+    /// `jkb undo` of the import: the items and their bindings are gone, the file is not.
+    PostUndo,
+    /// The file's items are deleted with the journal row **intact** — `jkb item rm`, a
+    /// half-applied migration, an emptied binding table. Distinct from `PostUndo`, which also
+    /// clears `base_blob_hash`/`document`: with no base the disk's items read as additions and a
+    /// merge keeps them, so undo alone never produces an item-less merged document. This stage
+    /// does, and it is the state `wholesale_loss` was written for.
+    KbEmptied,
+    /// `KbEmptied`, and the file moved too. The cross matters because the emptiness check sits
+    /// *above* the direction dispatch: with the disk unchanged the reconcile would take the export
+    /// arm and with it changed the three-way arm, so covering only one leaves half the routes the
+    /// guard is supposed to pre-empt untested, and moving it back below the dispatch would fail
+    /// silently in the other half.
+    KbEmptiedAndDiskChanged,
+}
+
+/// The three ids `TASKS_MD` declares — the work the KB is holding on the file's behalf.
+const MATRIX_IDS: [&str; 3] = ["^setup", "^fix", "^ship"];
+
+fn mount_mode(db: &Db, dir: &Path, mode: SyncMode) {
+    mount_dir(
+        db,
+        "docs/plan",
+        dir,
+        mode,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+}
+
+/// Drive one cell and return what the file looked like before and after the sync under test.
+fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, String, i64) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    // Every stage but `FirstSight` needs the file already imported, which an export-only mount
+    // cannot do — so the setup import always runs bidirectional and the mode under test is
+    // applied afterwards. That is also how a real export-only mount comes to hold anything.
+    mount_mode(&db, dir.path(), SyncMode::Bidirectional);
+    if !matches!(stage, Stage::FirstSight) {
+        assert_eq!(
+            sync(&db, "docs/plan").unwrap().count(Outcome::Created),
+            1,
+            "setup: the import that seeds every non-first-sight stage"
+        );
+        assert_eq!(
+            task_count(&db),
+            3,
+            "setup: three tasks should have imported"
+        );
+    }
+    // Before the mode is applied, because `mount_dir` is itself a write transaction: undoing
+    // after it unwinds the mount re-creation instead of the sync, and the cell then quietly
+    // measures nothing. Not hypothetical — this test's first version did exactly that and
+    // reported `UpToDate` for a state that must be refused.
+    if matches!(stage, Stage::KbEmptiedAndDiskChanged) {
+        // Before the mode changes, for the same reason `PostUndo` is: `mount_dir` is a write.
+        let bare = uri_for(&file);
+        db.write_txn("cli", move |conn, meta| {
+            for u in jkb_core::binding::synced_uris_for_file(conn, &bare)? {
+                if let Some(id) = binding::item_for_uri(conn, &u)? {
+                    item::remove(conn, meta, id, true)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    if matches!(stage, Stage::PostUndo) {
+        // The trailing mirror transaction, then the reconcile itself — exactly what a user
+        // reaching for `jkb undo` after a sync unwinds.
+        for _ in 0..2 {
+            db.write_txn("cli", jkb_core::undo::undo_last)
+                .expect("undo should succeed");
+        }
+        assert_eq!(
+            task_count(&db),
+            0,
+            "setup: the undo should have removed the imported tasks"
+        );
+    }
+    mount_mode(&db, dir.path(), mode);
+
+    let disk_edit = |file: &Path| {
+        let edited = format!(
+            "{}- [ ] Added by hand ^added\n",
+            fs::read_to_string(file).unwrap()
+        );
+        fs::write(file, edited).unwrap();
+    };
+    match stage {
+        // `PostUndo` and the KB half of `KbEmptiedAndDiskChanged` are applied above, before the
+        // mount mode changed.
+        Stage::FirstSight | Stage::Settled | Stage::PostUndo => {}
+
+        Stage::KbEmptied => {
+            let bare = uri_for(&file);
+            db.write_txn("cli", move |conn, meta| {
+                for u in jkb_core::binding::synced_uris_for_file(conn, &bare)? {
+                    if let Some(id) = binding::item_for_uri(conn, &u)? {
+                        item::remove(conn, meta, id, true)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(task_count(&db), 0, "setup: the KB should hold no tasks now");
+        }
+        Stage::DiskChanged | Stage::KbEmptiedAndDiskChanged => disk_edit(&file),
+        Stage::KbChanged => kb_set_status(&db, &format!("{uri}#ship"), "in_progress"),
+        Stage::BothChanged => {
+            disk_edit(&file);
+            kb_set_status(&db, &format!("{uri}#ship"), "in_progress");
+        }
+    }
+
+    let before = fs::read_to_string(&file).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    let after = fs::read_to_string(&file).unwrap();
+    (report, before, after, task_count(&db))
+}
+
+/// Every (mode, stage) cell, asserted on **both** sides.
+///
+/// The file must keep every task the KB was holding for it — and, on a mount that can import,
+/// the KB must not be left empty for a file that still declares work. The first assertion alone
+/// is what this table had, and it is only half the invariant: a refusal protects the file
+/// perfectly while leaving the KB permanently empty, which reads as a pass. That is exactly the
+/// bug review pass 23 found, in a table written to cover this axis.
+#[test]
+fn no_mount_mode_and_stage_loses_a_task_line() {
+    for mode in [SyncMode::Import, SyncMode::Export, SyncMode::Bidirectional] {
+        for stage in [
+            Stage::FirstSight,
+            Stage::Settled,
+            Stage::DiskChanged,
+            Stage::KbChanged,
+            Stage::BothChanged,
+            Stage::PostUndo,
+            Stage::KbEmptied,
+            Stage::KbEmptiedAndDiskChanged,
+        ] {
+            let (report, before, after, tasks) = matrix_case(mode, stage);
+            assert!(
+                report.failed().is_empty(),
+                "{mode:?}/{stage:?}: the reconcile errored: {:?}",
+                report.failed()
+            );
+            for id in MATRIX_IDS {
+                assert!(
+                    before.contains(id),
+                    "{mode:?}/{stage:?}: setup lost {id} before the sync ran:\n{before}"
+                );
+                assert!(
+                    after.contains(id),
+                    "{mode:?}/{stage:?}: the sync deleted {id} from the file.\n\
+                     before:\n{before}\nafter:\n{after}\nrefused: {:?}",
+                    report.refused()
+                );
+            }
+            // The KB side. An export-only mount is exempt by definition: it has no way to read
+            // the file back, so an emptied KB stays empty and the guard's job is only to stop
+            // that emptiness reaching the file.
+            if matches!(mode, SyncMode::Import | SyncMode::Bidirectional) {
+                assert!(
+                    tasks > 0,
+                    "{mode:?}/{stage:?}: a mount that can import left the KB with no tasks for a \
+                     file declaring three, so nothing can heal it. refused: {:?}",
+                    report.refused()
+                );
+            }
+        }
+    }
+}
+
+/// The post-undo cell, stated as its own harm rather than as one row of the table.
+///
+/// `jkb undo` of a sync deletes the items **and their bindings** together, so every guard that
+/// walks bindings to decide whether an export is safe reports "nothing would be dropped" — there
+/// is nothing left to walk. On an export-only mount the reconcile then takes the export arm with
+/// an item-less render and strips the file. This is the shape D45 names: an unverified KB render
+/// reaching `write_file`. It must be refused, not written.
+#[test]
+fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() {
+    let (report, before, after, _) = matrix_case(SyncMode::Export, Stage::PostUndo);
+    assert_eq!(
+        after, before,
+        "the export wrote over a file whose items the KB had lost"
+    );
+    let refused = report.refused();
+    assert_eq!(
+        refused.len(),
+        1,
+        "the export was not refused, so nothing told the user why the file stopped syncing: \
+         {report:?}"
+    );
+    assert!(
+        refused[0].1.contains("the KB side of it has none"),
+        "the refusal did not name the wholesale loss: {}",
+        refused[0].1
+    );
+}
+
+/// The wholesale-loss rule is not a `tasks`-serializer rule, and its two halves differ by mount
+/// mode. A `document` mount is one item per file, so losing that item is the same total loss.
+///
+/// Worth its own case because every other test of this rule uses `tasks`, and "the check only ever
+/// ran on one serializer" is the shape of gap this pass exists to close.
+#[test]
+fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
+    for mode in [SyncMode::Bidirectional, SyncMode::Export] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("README.md");
+        fs::write(&file, "the good copy\n").unwrap();
+        let uri = uri_for(&file);
+
+        let db = Db::open_in_memory().unwrap();
+        let mount = |m| {
+            mount_dir(
+                &db,
+                "docs/repo",
+                dir.path(),
+                m,
+                "document",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            );
+        };
+        // Imported bidirectionally first: an export-only mount cannot seed itself.
+        mount(SyncMode::Bidirectional);
+        assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+
+        // Delete the item the file is bound to — what `jkb item rm` leaves behind.
+        let target = uri.clone();
+        db.write_txn("cli", move |conn, meta| {
+            let id = binding::item_for_uri(conn, &target)?.expect("bound item");
+            item::remove(conn, meta, id, true).map(|_| ())
+        })
+        .unwrap();
+        mount(mode);
+
+        let report = sync(&db, "docs/repo").unwrap();
+        assert!(
+            report.failed().is_empty(),
+            "{mode:?}: {:?}",
+            report.failed()
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "the good copy\n",
+            "{mode:?}: the export blanked a document whose KB item had been deleted"
+        );
+
+        match mode {
+            // It can read the file back, so it does — a refusal here would protect the file and
+            // leave the KB empty with no way out.
+            SyncMode::Bidirectional => assert_eq!(
+                content_for(&db, &uri).as_deref(),
+                Some("the good copy\n"),
+                "a mount that can import left the KB empty instead of re-reading the file"
+            ),
+            // It cannot, so it must refuse and say so.
+            SyncMode::Export => assert_eq!(
+                report.refused().len(),
+                1,
+                "nothing told the user why the file stopped syncing: {report:?}"
+            ),
+            SyncMode::Import => unreachable!(),
+        }
+    }
+}
+
+/// Wholesale loss overrides `conflict_policy`, including an explicit `kb_wins`, and that is a
+/// decision rather than an oversight — so it is pinned here.
+///
+/// `kb_wins` means "when both sides have edits, prefer the KB's". A KB holding *no items at all*
+/// for the file is not an edit anyone made — that premise is the whole basis of the rule — so
+/// there is no KB side to prefer. The previous behaviour also overrode `kb_wins` (it refused, and
+/// wrote nothing); this one at least recovers the work. Without a test the next reader finds
+/// `kb_wins` silently not honoured and has to guess whether that was meant.
+#[test]
+fn wholesale_loss_recovers_even_under_kb_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::KbWins,
+    );
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
+    assert_eq!(task_count(&db), 3, "setup");
+
+    let bare = uri_for(&file);
+    db.write_txn("cli", move |conn, meta| {
+        for u in jkb_core::binding::synced_uris_for_file(conn, &bare)? {
+            if let Some(id) = binding::item_for_uri(conn, &u)? {
+                item::remove(conn, meta, id, true)?;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(task_count(&db), 0, "setup: the KB now holds nothing");
+
+    // The disk must move too, or the reconcile takes the export arm and `conflict_policy` is never
+    // read at all — the first version of this test asserted the same thing under every policy and
+    // merely duplicated the matrix's bidirectional/kb-emptied cell.
+    fs::write(&file, format!("{TASKS_MD}- [ ] added on disk ^added\n")).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(report.failed().is_empty(), "{:?}", report.failed());
+    assert_eq!(
+        task_count(&db),
+        4,
+        "kb_wins was honoured over an empty KB, so the file's work was not recovered"
+    );
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("^setup"),
+        "the file lost its lines"
+    );
+}
+
+/// An empty rendered document is not proof of an empty store, and the two want opposite handling.
+///
+/// `assemble_kb_doc` also omits an item that is still bound and has merely lost its primary
+/// placement — what `jkb undo` after a re-home leaves, which is D45's own motivating verb. A
+/// `document` mount is one item per file, so a single dropped placement makes the render empty and
+/// indistinguishable from "the KB lost everything". Treated as wholesale loss the file is imported
+/// over the surviving item, and `update_item` overwrites its content, status and priority from
+/// disk — destroying un-exported KB edits, where the previous behaviour wrote nothing at all.
+///
+/// The refusal must survive on **every** mount mode, because the remedy is KB-side
+/// (`jkb task place <uid> <ns> --home`) and works regardless of direction.
+#[test]
+fn a_bound_item_that_lost_its_placement_is_refused_not_re_imported() {
+    for mode in [SyncMode::Bidirectional, SyncMode::Import, SyncMode::Export] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("README.md");
+        fs::write(&file, "on disk\n").unwrap();
+        let uri = uri_for(&file);
+
+        let db = Db::open_in_memory().unwrap();
+        let mount = |m| {
+            mount_dir(
+                &db,
+                "docs/repo",
+                dir.path(),
+                m,
+                "document",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            );
+        };
+        mount(SyncMode::Bidirectional);
+        assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+
+        // A KB edit that has not been exported yet, then the placement is stripped.
+        kb_edit(&db, &uri, "the KB's newer text\n");
+        db.write_txn("t", |conn, _m| {
+            conn.execute("DELETE FROM placements WHERE role = 'primary'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        mount(mode);
+
+        let report = sync(&db, "docs/repo").unwrap();
+        assert!(
+            report.failed().is_empty(),
+            "{mode:?}: {:?}",
+            report.failed()
+        );
+        // The invariant, on every mode: the un-exported KB edit survives and the disk copy is
+        // untouched. Being *re-imported* is the harm — it would overwrite both.
+        assert_eq!(
+            content_for(&db, &uri).as_deref(),
+            Some("the KB's newer text\n"),
+            "{mode:?}: the un-exported KB edit was overwritten from disk"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "on disk\n",
+            "{mode:?}: the file was written despite the item having no placement"
+        );
+
+        match mode {
+            // An export is attempted and stopped, naming the KB-side remedy.
+            SyncMode::Bidirectional | SyncMode::Export => {
+                assert_eq!(
+                    report.count(Outcome::Refused),
+                    1,
+                    "{mode:?}: treated as wholesale loss instead of refused: {report:?}"
+                );
+                assert!(
+                    report.refused()[0].1.contains("jkb task place"),
+                    "{mode:?}: the refusal must name the re-home remedy, not re-import: {}",
+                    report.refused()[0].1
+                );
+            }
+            // Only the KB moved and this mount cannot export, so no write is attempted and there
+            // is nothing to refuse. Skipping is the whole of the correct behaviour here.
+            SyncMode::Import => assert_eq!(
+                report.count(Outcome::Skipped),
+                1,
+                "{mode:?}: expected no write to be attempted at all: {report:?}"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The cut point is not a tag any more (design B-series)
+// ---------------------------------------------------------------------------
+
+/// The `(facet, value)` tags of the item bound to `uri`.
+fn tags_of(db: &Db, uri: &str) -> Vec<(String, String)> {
+    let uri = uri.to_owned();
+    db.read(move |conn| match binding::item_for_uri(conn, &uri)? {
+        Some(id) => jkb_core::tag::applications(conn, id),
+        None => Ok(Vec::new()),
+    })
+    .unwrap()
+}
+
+// Modifiers in the order `render` emits them (`tag::applications_for` is `ORDER BY facet, value`),
+// so a settled file is byte-identical rather than normalized on the first pass — otherwise the
+// export that reorders them is what this test would be measuring.
+const TASKS_WITH_BASE: &str = "\
+## Backend
+- [ ] Fix flaky test #base=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef #size=small ^fix
+";
+
+/// A `#base=` typed into a synced `tasks.md` is now an **ordinary tag**, and the file round-trips.
+///
+/// This replaces five tests that existed to make the facet invisible to sync in both directions —
+/// stripped by `render`, skipped by the tag reconcile, hidden from the assembled KB document. That
+/// apparatus was the largest surviving piece of the old model, and its own asymmetry (one consumer
+/// stripping while another did not) was a must-fix: an item holding the facet read as permanently
+/// KB-edited, so the next disk edit to its line came back a conflict.
+///
+/// Nothing needs protecting now — a cut point is a `branch_records` row, which no document can
+/// reach and no reconcile can erase — so the invariant that replaces all five is simply that
+/// `base` is a facet like any other: stored as typed, written back out, and **settled**. Two syncs
+/// with no edit between them must report `UpToDate`, which is what fails if any consumer of the
+/// document still treats the facet specially.
+#[test]
+fn a_cut_point_modifier_in_a_file_is_an_ordinary_tag_and_the_file_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_WITH_BASE).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(report.failed().is_empty(), "{:?}", report.failed());
+    assert_eq!(report.count(Outcome::Created), 1);
+    assert_eq!(
+        tags_of(&db, &format!("{uri}#fix")),
+        vec![
+            (
+                "base".to_owned(),
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned()
+            ),
+            ("size".to_owned(), "small".to_owned()),
+        ],
+        "a `#base=` modifier was treated as anything other than an ordinary tag"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        TASKS_WITH_BASE,
+        "the file was rewritten"
+    );
+    let second = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        second.count(Outcome::UpToDate),
+        1,
+        "the file did not settle — some consumer of the document still filters the facet: {second:?}"
+    );
+}
+
+/// An edit **beside** the modifier still imports, and the modifier survives it.
+///
+/// The edit is what makes this test able to fail: a modifier alone changes no document once it is
+/// parsed and re-rendered, so the direction machinery would see nothing and the assertion would
+/// hold vacuously. With a real edit the file imports, the tag reconcile runs over the line, and
+/// the facet has to come through it.
+#[test]
+fn editing_a_line_that_carries_a_cut_point_modifier_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_WITH_BASE).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    let edited = TASKS_WITH_BASE.replace("Fix flaky test", "Fix the flaky test");
+    assert_ne!(
+        edited, TASKS_WITH_BASE,
+        "setup: the edit must change the line"
+    );
+    fs::write(&file, &edited).unwrap();
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Imported), 1);
+
+    assert_eq!(
+        content_for(&db, &format!("{uri}#fix")).as_deref(),
+        Some("Fix the flaky test")
+    );
+    assert!(
+        tags_of(&db, &format!("{uri}#fix"))
+            .iter()
+            .any(|(f, _)| f == "base"),
+        "the modifier was dropped by the reconcile"
+    );
 }

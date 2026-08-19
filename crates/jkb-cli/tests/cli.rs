@@ -1965,6 +1965,87 @@ fn a_conjecture_investigation_seeds_its_predicate_and_gates_reopening() {
         .stdout(predicate::str::contains(route));
 }
 
+/// `--backup` is taken BEFORE `--fix` repairs anything, so the safety copy holds pre-repair
+/// state. Taken last it held the opposite of what its name and help promise, and no test
+/// combined the two flags — so reverting the ordering left the whole suite green.
+#[test]
+fn doctor_backup_captures_state_before_fix_repairs_it() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["--global", "task", "add", "orphaned work"])
+        .assert()
+        .success();
+    let uid = jkb(&db)
+        .args(["--global", "query", "kind:task", "--json"])
+        .output()
+        .unwrap();
+    let uid: serde_json::Value = serde_json::from_slice(&uid.stdout).unwrap();
+    let uid = uid[0]["uid"].as_str().unwrap().to_owned();
+    // A claim whose owner is provably gone, which `--fix` reclaims.
+    jkb(&db)
+        .args([
+            "--global",
+            "task",
+            "claim",
+            &uid,
+            "--owner",
+            "host:4294967290",
+        ])
+        .assert()
+        .success();
+
+    let backup = dir.path().join("pre-fix.db");
+    jkb(&db)
+        .args(["doctor", "--backup", backup.to_str().unwrap(), "--fix"])
+        .assert()
+        .success();
+
+    // `doctor` reports orphaned claims, so ask each database. Live: repaired. Backup: not yet.
+    let live = jkb(&db).args(["doctor"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&live.stdout).contains("4294967290"),
+        "--fix must have reclaimed the live claim: {}",
+        String::from_utf8_lossy(&live.stdout)
+    );
+    let copied = jkb(&backup).args(["doctor"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&copied.stdout).contains("4294967290"),
+        "the backup must predate the repair: {}",
+        String::from_utf8_lossy(&copied.stdout)
+    );
+}
+
+/// `jkb history` works for a file that has been DELETED, given a relative path.
+///
+/// This is the recovery path the archive exists to serve, and it was broken: `canonicalize`
+/// fails once the file is gone, which left a *relative* uri matching no journal row, so the
+/// command reported "no recorded history" and blamed the build version instead.
+#[test]
+fn history_finds_a_deleted_file_by_relative_path() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let backing = dir.path().join("backing");
+    std::fs::create_dir_all(&backing).unwrap();
+    std::fs::write(backing.join("tasks.md"), "## Plan\n\n- [ ] one !p1\n").unwrap();
+
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--serializer", "tasks"])
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "docs/m"]).assert().success();
+    std::fs::remove_file(backing.join("tasks.md")).unwrap();
+
+    // Relative, for a file that no longer exists.
+    jkb(&db)
+        .current_dir(&backing)
+        .args(["history", "tasks.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("jkb blob cat"));
+}
+
 /// The blob archive is the recovery path when a sync has already written a wrong version
 /// over a file: every settled version's bytes are stored and never deleted, so you can find
 /// the one carrying a line you remember and read it back.
@@ -2696,4 +2777,94 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
         .assert()
         .success()
         .stdout(predicate::str::contains("elsewhere"));
+}
+
+/// Re-running `mount create` must not reset the properties you did not name.
+///
+/// `mount create` doubles as the update command, and its SQL is a full-row replace. A re-run
+/// that omitted `--include` therefore wrote NULL over the stored glob — after which a `tasks`
+/// mount discovered every file in the tree. That is not hypothetical: it overwrote 62 files.
+#[test]
+fn re_running_mount_create_preserves_unnamed_properties() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let backing = dir.path().join("backing");
+    std::fs::create_dir_all(&backing).unwrap();
+
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--serializer", "tasks", "--include", "**/tasks.md"])
+        .args(["--policy", "manual"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include=**/tasks.md"));
+
+    // Change ONLY the policy. The glob and serializer must survive.
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--policy", "disk-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated mount"))
+        .stdout(predicate::str::contains("include=**/tasks.md"))
+        .stdout(predicate::str::contains("serializer=tasks"))
+        .stdout(predicate::str::contains("policy=disk_wins"));
+
+    // `mount ls` shows what the mount will actually do, so a dropped glob is visible.
+    jkb(&db)
+        .args(["mount", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include=**/tasks.md"));
+
+    // Clearing is possible, but only when asked for explicitly.
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--no-include"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include=(none)"));
+}
+
+/// Two `tasks` files in one directory both sync, each keeping its own content (design D39.4).
+///
+/// This used to be **refused**, because a file's namespace was derived from its containing
+/// directory and both files shared the `layout` that decides document order. Since D39.1 the
+/// filename is part of the namespace, so the ambiguity cannot arise and there is nothing to
+/// refuse. The assertion that design.md keeps its own bytes is the one that matters: that is
+/// the collapse, checked at the CLI boundary.
+#[test]
+fn sync_keeps_two_tasks_files_in_one_directory_apart() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let backing = dir.path().join("backing");
+    std::fs::create_dir_all(&backing).unwrap();
+    let tasks = backing.join("tasks.md");
+    let design = backing.join("design.md");
+    std::fs::write(&tasks, "## Plan\n\n- [ ] do it !p1\n").unwrap();
+    let design_body = "# Design\n\nProse belonging to design.md alone.\n";
+    std::fs::write(&design, design_body).unwrap();
+
+    jkb(&db)
+        .args(["mount", "create", "docs/m", backing.to_str().unwrap()])
+        .args(["--serializer", "tasks", "--include", "**/*.md"])
+        .assert()
+        .success();
+
+    jkb(&db)
+        .args(["sync", "docs/m"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 created"));
+
+    // design.md keeps its own prose — it must never be handed tasks.md's document.
+    let after = std::fs::read_to_string(&design).unwrap();
+    assert!(
+        after.contains("Prose belonging to design.md alone."),
+        "design.md lost its own content: {after}"
+    );
+    assert!(
+        !after.contains("do it"),
+        "design.md was given tasks.md's items: {after}"
+    );
 }

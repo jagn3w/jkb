@@ -97,30 +97,80 @@ pub enum PlacementRole {
     Reference,
 }
 
-/// Direction(s) in which a bound file and the KB are kept in sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncMode {
-    /// Disk is authoritative; changes flow disk -> KB.
-    Import,
-    /// KB is authoritative; changes flow KB -> disk.
-    Export,
-    /// Both directions, with conflict detection.
-    Bidirectional,
+/// Declare a database-facing enum **once**: the variant list, `ALL`, `as_str` and
+/// `from_db_str` are all generated from the same lines, so they cannot be one variant apart.
+///
+/// They were three hand-written lists, and every safeguard over them was escapable. A
+/// hand-written `ALL` could simply omit a variant; a test that walked it then proved nothing;
+/// and the `match` meant to force the issue only forced its *pattern* to be extended, which
+/// left the count and `ALL` untouched and the suite green. Meanwhile a missing `from_db_str`
+/// arm is not cosmetic: `cmd_mount_create` reads a stored value with
+/// `from_db_str(..).unwrap_or(default)`, so an unparseable one silently rewrites the mount —
+/// the exact silent reset this pair of functions exists to prevent.
+macro_rules! db_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident => $text:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order. Generated with the enum, so it is
+            /// complete by construction rather than by review.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
+
+            /// The `snake_case` string stored in the database (matches the serde form).
+            #[must_use]
+            pub fn as_str(self) -> &'static str {
+                match self { $( Self::$variant => $text, )+ }
+            }
+
+            /// The inverse of [`Self::as_str`], for reading a stored value back.
+            ///
+            /// It lives beside `as_str` (as [`TaskStatus::from_manual_str`] does) so the two
+            /// spellings cannot drift: hand-written parse sites in other crates were
+            /// catch-alls, so adding a variant compiled fine and silently reset a mount to
+            /// the default on the very path added to stop silent resets.
+            #[must_use]
+            pub fn from_db_str(s: &str) -> Option<Self> {
+                match s { $( $text => Some(Self::$variant), )+ _ => None }
+            }
+        }
+    };
 }
 
-/// What to do when both sides of a bidirectional binding changed since last sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConflictPolicy {
-    /// Take the on-disk version.
-    DiskWins,
-    /// Take the KB version.
-    KbWins,
-    /// Overwrite neither; report the conflict.
-    Manual,
+db_enum! {
+    /// Direction(s) in which a bound file and the KB are kept in sync.
+    pub enum SyncMode {
+        /// Disk is authoritative; changes flow disk -> KB.
+        Import => "import",
+        /// KB is authoritative; changes flow KB -> disk.
+        Export => "export",
+        /// Both directions, with conflict detection.
+        Bidirectional => "bidirectional",
+    }
 }
 
+db_enum! {
+    /// What to do when both sides of a bidirectional binding changed since last sync.
+    pub enum ConflictPolicy {
+        /// Take the on-disk version.
+        DiskWins => "disk_wins",
+        /// Take the KB version.
+        KbWins => "kb_wins",
+        /// Overwrite neither; report the conflict.
+        Manual => "manual",
+    }
+}
+
+db_enum! {
 /// The lifecycle state of a task.
 ///
 /// Note: `blocked` is intentionally absent — it is *derived* from `depends_on`
@@ -129,21 +179,20 @@ pub enum ConflictPolicy {
 /// branch" — transient, and it does **not** unblock dependents (design D27.7): a task
 /// under review is not yet landed and may bounce back (see
 /// [`TaskStatus::unblocks_dependents`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Not started.
-    Open,
+    Open => "open",
     /// Actively being worked.
-    InProgress,
+    InProgress => "in_progress",
     /// A reviewer is reviewing the branch (design D27.5) — transient and re-enterable.
     /// It does **not** unblock dependents and is **not** `done`: the work is not yet on
     /// the feature branch and may bounce back to the implementer.
-    NeedsReview,
+    NeedsReview => "needs_review",
     /// Completed.
-    Done,
+    Done => "done",
     /// Abandoned.
-    Cancelled,
+    Cancelled => "cancelled",
+}
 }
 
 /// How a unit of an investigation **ended** — the outcome axis, orthogonal to
@@ -236,24 +285,26 @@ impl PlacementRole {
 }
 
 impl TaskStatus {
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::InProgress => "in_progress",
-            Self::NeedsReview => "needs_review",
-            Self::Done => "done",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
     /// Whether this is a terminal status (`done`/`cancelled`): no further work is
     /// expected. `needs_review` is deliberately **not** terminal — the work still needs
     /// operator approval before it is `done`.
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Cancelled)
+    }
+
+    /// Whether a raw `items.status` string is terminal.
+    ///
+    /// The string-level spelling of [`TaskStatus::is_terminal`], for the callers that read a
+    /// status straight out of the database. `matches!(s, "done" | "cancelled")` was written by
+    /// hand in five places, including the two guards that stop a landing and an abandon from
+    /// reopening finished work — which are exactly the places where getting the set wrong is
+    /// most expensive, and the places least likely to be revisited when the set changes.
+    #[must_use]
+    pub fn is_terminal_str(status: Option<&str>) -> bool {
+        status
+            .and_then(Self::from_manual_str)
+            .is_some_and(Self::is_terminal)
     }
 
     /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents.
@@ -269,20 +320,18 @@ impl TaskStatus {
 
     /// Parse a *manually settable* status string into a [`TaskStatus`].
     ///
-    /// Returns `None` for unknown strings **and** for `blocked`, which is a derived
-    /// state (a `depends_on` edge to a non-`done` task) and never set by hand — so
-    /// there is a single source of truth (design D19). Callers turn `None` into an
-    /// actionable rejection.
+    /// Every variant is settable by name, so this is [`Self::from_db_str`] under the name that
+    /// carries the rule: what it returns `None` for is `blocked`, which is not a variant at all
+    /// — it is *derived* from `depends_on` edges (design D19) and never stored, so there is one
+    /// source of truth. Callers turn `None` into an actionable rejection.
+    ///
+    /// It was a third hand-written match over the same five strings, beside `as_str` and the
+    /// enum. `ALL` and both spellings are generated together now, so the set a command accepts
+    /// and the set the enum has cannot come apart — which is what the `--status` enumerations in
+    /// `jkb guide` and `AGENTS.md` are checked against.
     #[must_use]
     pub fn from_manual_str(s: &str) -> Option<Self> {
-        match s {
-            "open" => Some(Self::Open),
-            "in_progress" => Some(Self::InProgress),
-            "needs_review" => Some(Self::NeedsReview),
-            "done" => Some(Self::Done),
-            "cancelled" => Some(Self::Cancelled),
-            _ => None,
-        }
+        Self::from_db_str(s)
     }
 }
 
@@ -370,27 +419,25 @@ impl EdgeType {
     }
 }
 
-impl SyncMode {
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Import => "import",
-            Self::Export => "export",
-            Self::Bidirectional => "bidirectional",
-        }
-    }
-}
+#[cfg(test)]
+mod round_trip {
+    use super::{ConflictPolicy, SyncMode};
 
-impl ConflictPolicy {
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DiskWins => "disk_wins",
-            Self::KbWins => "kb_wins",
-            Self::Manual => "manual",
+    /// Every variant must survive `as_str` -> `from_db_str`.
+    ///
+    /// `ALL`, `as_str` and `from_db_str` are now generated together by `db_enum!`, so this
+    /// can no longer fail by omission — it is the check that the *generated* pair really is
+    /// a round trip, and the guard against a duplicated or mistyped stored string.
+    #[test]
+    fn db_strings_round_trip() {
+        for m in SyncMode::ALL {
+            assert_eq!(SyncMode::from_db_str(m.as_str()), Some(*m));
         }
+        for p in ConflictPolicy::ALL {
+            assert_eq!(ConflictPolicy::from_db_str(p.as_str()), Some(*p));
+        }
+        assert_eq!(SyncMode::from_db_str("nope"), None);
+        assert_eq!(ConflictPolicy::from_db_str("nope"), None);
     }
 }
 

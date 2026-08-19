@@ -7,6 +7,7 @@ use serde_json::json;
 
 use jkb_types::{ItemId, PlacementRole};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, ns, placement, query, Error, Result};
 
@@ -24,6 +25,13 @@ pub fn save(conn: &Connection, meta: &WriteMeta, name: &str, query_str: &str) ->
 
     let ns_id = ns::ensure(conn, VIEWS_NS)?;
     let uid = format!("view:{name}");
+    // Read what is there **before** the upsert: saving over an existing view updates its row, and
+    // logging that as an insert made `jkb undo` delete the view outright — reporting success while
+    // destroying a saved query the transaction had merely edited.
+    let before: Option<Option<String>> = conn
+        .prepare_cached("SELECT content FROM items WHERE uid = ?1")?
+        .query_row([&uid], |row| row.get(0))
+        .optional()?;
     let id: i64 = conn
         .prepare_cached(
             "INSERT INTO items (uid, kind, content) VALUES (?1, 'view', ?2)
@@ -34,14 +42,15 @@ pub fn save(conn: &Connection, meta: &WriteMeta, name: &str, query_str: &str) ->
         )?
         .query_row(params![uid, query_str], |row| row.get(0))?;
 
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
-        "items",
+        Entity::Items,
         &id.to_string(),
-        None,
-        Some(&json!({ "uid": uid, "kind": "view" })),
+        before
+            .map(|content| json!({ "uid": &uid, "kind": "view", "content": content }))
+            .as_ref(),
+        Some(&json!({ "uid": &uid, "kind": "view", "content": query_str })),
     )?;
     placement::place(
         conn,

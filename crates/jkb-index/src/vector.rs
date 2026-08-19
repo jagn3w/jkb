@@ -19,6 +19,164 @@ use jkb_types::{CatalogIdentity, Embedder, Error as TypesError, ItemId};
 
 use crate::{IndexItem, Indexer, Result};
 
+/// Delete vector rows whose item no longer exists, across **every** `vec_items_<dim>` table.
+///
+/// The vec tables are derived indexes (D9) but cannot carry a foreign key — they are virtual
+/// tables, so `ON DELETE CASCADE` is not available to them — which means a deleted item leaves
+/// its vector behind.
+///
+/// That used to be a **collision**, not just litter: `item_id` IS the rowid, and while
+/// `items.id` was a plain rowid alias `SQLite` handed a freed rowid to the next item created,
+/// which then inherited the dead embedding. `jkb ingest` -> `jkb undo` -> `jkb ingest` failed
+/// on the second ingest and on every ingest into that database afterwards, while a vector
+/// search for the deleted text returned the new document's chunks. Since D40 (`AUTOINCREMENT`)
+/// the id is never reissued, so this is housekeeping — called explicitly by `jkb index --sweep`
+/// and `jkb doctor --fix`, never implicitly by whichever path happened to delete.
+///
+/// A free function taking only a connection, because its callers have no embedder and must work
+/// offline; and it sweeps every dimension's table, because a database whose embedding model
+/// changed has more than one.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
+    let mut dropped = 0;
+    for table in vector_tables(conn)? {
+        // The name comes from `sqlite_master`, filtered to our own prefix — never from input.
+        dropped += conn
+            .prepare_cached(&format!(
+                "DELETE FROM {table} WHERE item_id NOT IN (SELECT id FROM items)"
+            ))?
+            .execute([])?;
+    }
+    Ok(dropped)
+}
+
+/// How many orphaned vector rows exist, without deleting any.
+///
+/// The read-only half of [`drop_orphan_vectors`] — the same predicate, minus the delete — so
+/// `jkb doctor` can report what `jkb doctor --fix` would remove and stay read-only. It lives
+/// here beside the delete because the two must agree on what counts as an orphan and on which
+/// tables are ours; the CLI previously carried its own copy of both queries, including the
+/// `vec0` shadow-table filter that is the non-obvious part.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
+    let mut total = 0;
+    for table in vector_tables(conn)? {
+        total += conn
+            .prepare_cached(&format!(
+                "SELECT count(*) FROM {table} WHERE item_id NOT IN (SELECT id FROM items)"
+            ))?
+            .query_row([], |row| row.get::<_, i64>(0))?;
+    }
+    Ok(total)
+}
+
+/// Rows in a derived index whose source item no longer exists.
+///
+/// Indexes are derived and rebuildable (D9), but the vector tables are `vec0` **virtual**
+/// tables and cannot carry a foreign key, so nothing deletes their rows for them. Since D40
+/// (`items.id AUTOINCREMENT`) a leftover row is no longer *dangerous* — the freed id is never
+/// reissued, so no new item can inherit its embedding — but it is still dead weight in an
+/// index that grows monotonically, so it is worth finding and removing on demand.
+///
+/// A struct rather than a bare count because the set of derived indexes is open: FTS is
+/// trigger-maintained today and a second vector backend is plausible, and a caller that
+/// pattern-matches on fields gets a compile error when one is added rather than a silently
+/// unreported total.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StaleRows {
+    /// Rows across every `vec_items_<dim>` table whose item is gone.
+    pub vectors: usize,
+}
+
+impl StaleRows {
+    /// Every stale row, across all derived indexes.
+    #[must_use]
+    pub fn total(self) -> usize {
+        self.vectors
+    }
+
+    /// Whether the derived indexes are clean.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Find stale derived-index rows without changing anything.
+///
+/// The detect half of the pair; [`sweep_stale`] is the clean half and uses the same
+/// predicates, so a report can never describe a different set from what a sweep would remove.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn count_stale(conn: &Connection) -> Result<StaleRows> {
+    Ok(StaleRows {
+        vectors: usize::try_from(count_orphan_vectors(conn)?).unwrap_or(usize::MAX),
+    })
+}
+
+/// Remove stale derived-index rows, returning what was removed.
+///
+/// # Errors
+/// Returns an error if a statement fails.
+pub fn sweep_stale(conn: &Connection) -> Result<StaleRows> {
+    // Install the guard while we are here. A database with orphan rows is BY DEFINITION one
+    // written before the trigger existed, so repairing it without installing the trigger fixes
+    // today's rows and leaves it generating more — and these two commands (`jkb index --sweep`,
+    // `jkb doctor --fix`) are the ones whose whole purpose is index hygiene. The trigger was
+    // created only by `ensure_ready`, which needs a live embedder to know its table name;
+    // `vector_tables` needs no embedder and finds every table, so repair can reach it.
+    for table in vector_tables(conn)? {
+        ensure_gc_trigger(conn, &table)?;
+    }
+    Ok(StaleRows {
+        vectors: drop_orphan_vectors(conn)?,
+    })
+}
+
+/// Create the delete-GC trigger for one `vec_items_<dim>` table, if it is not already there.
+///
+/// A trigger lives in the database file rather than in a process, so it fires for every
+/// connection, every process, and every call site written in future — including ones that never
+/// link `jkb-index`. That is why the obligation lives here instead of in each deleter (D42.2).
+///
+/// # Errors
+/// Returns an error if the statement fails.
+fn ensure_gc_trigger(conn: &Connection, table: &str) -> Result<()> {
+    // `table` comes from `sqlite_master` filtered to our own prefix, or from a `VectorIndexer`'s
+    // own dim — never from input.
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS {table}_gc AFTER DELETE ON items BEGIN
+             DELETE FROM {table} WHERE item_id = old.id;
+         END;"
+    ))?;
+    Ok(())
+}
+
+/// Every `vec_items_<dim>` table in this database — one per embedding dimension the store has
+/// ever used, so a database whose model changed has more than one.
+///
+/// `USING vec0` is what distinguishes the virtual table from the shadow tables vec0 creates
+/// beside it (`..._info`, `..._chunks`, `..._rowids`), which share the name prefix, have no
+/// `item_id` column, and must never be written to directly.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn vector_tables(conn: &Connection) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'table' AND name LIKE 'vec_items_%' AND sql LIKE '%vec0%'
+           ORDER BY name",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Registers the statically-linked `sqlite-vec` extension so every `SQLite`
 /// connection opened *afterwards* in this process gains the `vec0` virtual table
 /// and vector functions.
@@ -100,6 +258,26 @@ impl VectorIndexer {
             dim = self.dim
         ))?;
 
+        // A deleted item takes its vector with it, enforced by the **schema** (design D42.2).
+        //
+        // A vec0 table is virtual, so it can carry no foreign key and `ON DELETE CASCADE` is not
+        // available to it. That obligation was previously procedural — every path that deleted an
+        // item had to sweep — and it was discovered one missed call site at a time across four
+        // review passes (`undo`, `item rm`, and both of ingest's capture arms), because readers
+        // and deleters both outgrow any list of them.
+        //
+        // A trigger lives in the database file rather than in a process, so unlike the
+        // `ItemDeleteHook` seam D40 rejected it fires for every connection, every process, and
+        // every call site written in future — including ones that never link `jkb-index`. It is
+        // created here, beside the table it protects, because only this module knows the table's
+        // name (D9) and that the extension is loaded.
+        //
+        // Cost, accepted and tested: a connection that has NOT registered `sqlite-vec` cannot
+        // resolve the virtual table, so deleting an item there fails. Every binary in this
+        // workspace opens with `Db::open_with(&[jkb_index::register])`, and the trigger only
+        // exists in databases that have a vec table, which only this module creates.
+        ensure_gc_trigger(conn, &self.table)?;
+
         let existing: Option<(String, i64)> = conn
             .prepare_cached("SELECT model, dim FROM embeddings_meta WHERE table_name = ?1")?
             .query_row([&self.table], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -142,9 +320,15 @@ impl VectorIndexer {
             .into());
         }
         let bytes = embedding_to_bytes(embedding);
-        // `item_id` is the rowid, so INSERT OR REPLACE is an upsert keyed on it.
+        // Delete then insert, rather than `INSERT OR REPLACE`: vec0 is a virtual table and
+        // does **not** honour the conflict clause, so re-inserting an existing `item_id`
+        // raises `UNIQUE constraint failed` instead of replacing. The comment here used to
+        // claim otherwise, and the failure only surfaced when an id was reused — a rowid
+        // freed by `undo` and handed to the next ingest, which then failed permanently.
+        conn.prepare_cached(&format!("DELETE FROM {} WHERE item_id = ?1", self.table))?
+            .execute([id.get()])?;
         conn.prepare_cached(&format!(
-            "INSERT OR REPLACE INTO {} (item_id, embedding) VALUES (?1, ?2)",
+            "INSERT INTO {} (item_id, embedding) VALUES (?1, ?2)",
             self.table
         ))?
         .execute(params![id.get(), bytes])?;
@@ -199,6 +383,80 @@ impl VectorIndexer {
     /// Returns [`crate::Error`] if `query`'s length is not the table dim, or a
     /// statement fails.
     pub fn knn(&self, conn: &Connection, query: &[f32], k: usize) -> Result<Vec<(ItemId, f32)>> {
+        Ok(self.knn_live(conn, query, k)?.0)
+    }
+
+    /// KNN, with the neighbours whose item no longer exists removed — and a flag saying whether
+    /// the **index itself** ran out (design D42.3).
+    ///
+    /// The GC trigger stops new orphans, but a database that predates it still holds rows whose
+    /// item is gone, and `vec0` has no foreign key to notice. Returned unfiltered, those rows
+    /// displace real hits and reach the caller as ids that resolve to nothing — which is how
+    /// `jkb search` came to print nothing at all and exit 0.
+    ///
+    /// Filtered in **Rust, after the query**, never as a SQL join: `sqlite-vec` requires a
+    /// `LIMIT`/`k` constraint and rejects `ORDER BY` on anything but `distance`, and with `items`
+    /// chosen as the outer loop a join would re-run the KNN once per item row.
+    ///
+    /// The second return value distinguishes "the index has no more rows" from "live rows ran out
+    /// inside our budget". `jkb-search`'s growth loop tests `hits.len() < fetch` to decide it is
+    /// exhausted; once filtering happens in here that test is wrong, and the loop would stop
+    /// growing and return too few hits.
+    ///
+    /// # Errors
+    /// Returns an error if the query is the wrong length or a statement fails.
+    pub fn knn_live(
+        &self,
+        conn: &Connection,
+        query: &[f32],
+        k: usize,
+    ) -> Result<(Vec<(ItemId, f32)>, bool)> {
+        // `sqlite-vec` hard-errors above this (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111), so a
+        // caller that already over-fetches must not be multiplied into a raw extension error on
+        // the flagship read.
+        const VEC0_K_MAX: usize = 4096;
+        let mut fetch = k.min(VEC0_K_MAX);
+        loop {
+            let raw = self.knn_raw(conn, query, fetch)?;
+            let index_exhausted = raw.len() < fetch;
+            let live = Self::filter_live(conn, raw)?;
+            if live.len() >= k || index_exhausted || fetch >= VEC0_K_MAX {
+                // `index_exhausted` must mean "the caller has seen every live row", not merely
+                // "the table had no more rows to give". Truncating a full page withholds live
+                // neighbours, and `vector_ranked` reads this flag to decide whether to grow its
+                // own over-fetch — so reporting exhaustion after a truncation made a scoped
+                // search stop early and return fewer, often zero, in-scope hits.
+                let mut live = live;
+                let truncated = live.len() > k;
+                live.truncate(k);
+                return Ok((live, index_exhausted && !truncated));
+            }
+            fetch = (fetch * 2).min(VEC0_K_MAX);
+        }
+    }
+
+    /// Drop neighbours whose item row is gone, preserving distance order.
+    fn filter_live(conn: &Connection, hits: Vec<(ItemId, f32)>) -> Result<Vec<(ItemId, f32)>> {
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let placeholders = vec!["?"; hits.len()].join(", ");
+        let live: std::collections::HashSet<i64> = conn
+            .prepare(&format!(
+                "SELECT id FROM items WHERE id IN ({placeholders})"
+            ))?
+            .query_map(
+                params_from_iter(hits.iter().map(|(id, _)| Value::Integer(id.get()))),
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(hits
+            .into_iter()
+            .filter(|(id, _)| live.contains(&id.get()))
+            .collect())
+    }
+
+    fn knn_raw(&self, conn: &Connection, query: &[f32], k: usize) -> Result<Vec<(ItemId, f32)>> {
         if query.len() != self.dim {
             return Err(TypesError::Validation(format!(
                 "query length {} does not match vec table dim {}",

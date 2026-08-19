@@ -5,9 +5,12 @@
 //! (for three-way merge), and any unresolved `conflict` / `needs_attention` status
 //! with a parse error. Surfaced read-only as the `_sys/sync` view.
 
+use std::path::Path;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -28,6 +31,14 @@ pub struct SyncState {
     pub parse_error: Option<String>,
     /// `blobs.hash` of the failing bytes stashed on quarantine.
     pub quarantine_blob_hash: Option<String>,
+    /// The file's **document structure** as JSON — its block order and its section headers
+    /// (design D45.2). `None` means not yet populated; the sync engine fills it once from the
+    /// file's own base blob.
+    ///
+    /// This lives here, keyed one-per-file, rather than in `namespaces.metadata`, because the
+    /// namespace tree is shared and user-mutable while a file's structure is private to that
+    /// file. Two files sharing one namespace is what collapsed 62 of 63 markdown files.
+    pub document: Option<String>,
     /// Timestamp of the last journal write.
     pub updated_at: String,
 }
@@ -50,6 +61,8 @@ pub struct SyncStateWrite<'a> {
     pub parse_error: Option<&'a str>,
     /// `blobs.hash` of the failing bytes stashed on quarantine.
     pub quarantine_blob_hash: Option<&'a str>,
+    /// The file's document structure as JSON (see [`SyncState::document`]).
+    pub document: Option<&'a str>,
 }
 
 /// Fetch the journal row for `uri`, if one exists.
@@ -60,7 +73,7 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
     let state = conn
         .prepare_cached(
             "SELECT uri, serializer, status, last_synced_hash, base_blob_hash,
-                    parse_error, quarantine_blob_hash, updated_at
+                    parse_error, quarantine_blob_hash, document, updated_at
              FROM sync_state WHERE uri = ?1",
         )?
         .query_row([uri], |row| {
@@ -72,7 +85,8 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
                 base_blob_hash: row.get(4)?,
                 parse_error: row.get(5)?,
                 quarantine_blob_hash: row.get(6)?,
-                updated_at: row.get(7)?,
+                document: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })
         .optional()?;
@@ -85,17 +99,38 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
 pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result<()> {
+    // Read the row BEFORE writing, so the changelog carries something `undo` can restore.
+    // Without it a sync transaction was half-invertible: `undo` deleted the items and left
+    // `last_synced_hash` describing bytes that no longer had any, after which the next
+    // reconcile read "KB changed, disk did not" and exported an item-less render over the
+    // file. Same rule `mount::create` and `containment::contain` follow.
+    let before = get(conn, w.uri)?.map(|row| {
+        json!({
+            "status": row.status,
+            "serializer": row.serializer,
+            "last_synced_hash": row.last_synced_hash,
+            "base_blob_hash": row.base_blob_hash,
+            // EVERY restorable column, not a hand-picked subset. Structure and hashes must
+            // rewind together — leaving one forward is a KB that disagrees with its own base —
+            // and `parse_error`/`quarantine_blob_hash` had already fallen out of the earlier
+            // list, so undo restored `needs_attention` with no message explaining it.
+            "document": row.document,
+            "parse_error": row.parse_error,
+            "quarantine_blob_hash": row.quarantine_blob_hash,
+        })
+    });
     conn.prepare_cached(
         "INSERT INTO sync_state
              (uri, serializer, status, last_synced_hash, base_blob_hash,
-              parse_error, quarantine_blob_hash, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+              parse_error, quarantine_blob_hash, document, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(uri) DO UPDATE SET
              serializer = excluded.serializer, status = excluded.status,
              last_synced_hash = excluded.last_synced_hash,
              base_blob_hash = excluded.base_blob_hash,
              parse_error = excluded.parse_error,
              quarantine_blob_hash = excluded.quarantine_blob_hash,
+             document = excluded.document,
              updated_at = excluded.updated_at",
     )?
     .execute(params![
@@ -106,6 +141,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
         w.base_blob_hash,
         w.parse_error,
         w.quarantine_blob_hash,
+        w.document,
     ])?;
     // `base_blob_hash` is recorded here on purpose: the blob it names is the exact bytes of
     // this file at this sync, and blobs are never deleted. Journalling the hash turns the
@@ -115,15 +151,16 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
     changelog::append(
         conn,
         meta,
-        "update",
-        "sync_state",
+        Op::Update,
+        Entity::SyncState,
         w.uri,
-        None,
+        before.as_ref(),
         Some(&json!({
             "status": w.status,
             "serializer": w.serializer,
             "base_blob_hash": w.base_blob_hash,
             "last_synced_hash": w.last_synced_hash,
+            "document": w.document,
         })),
     )?;
     Ok(())
@@ -137,7 +174,7 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
 pub fn needs_attention(conn: &Connection) -> Result<Vec<SyncState>> {
     let mut stmt = conn.prepare_cached(
         "SELECT uri, serializer, status, last_synced_hash, base_blob_hash,
-                parse_error, quarantine_blob_hash, updated_at
+                parse_error, quarantine_blob_hash, document, updated_at
          FROM sync_state WHERE status != 'ok' ORDER BY uri",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -149,7 +186,8 @@ pub fn needs_attention(conn: &Connection) -> Result<Vec<SyncState>> {
             base_blob_hash: row.get(4)?,
             parse_error: row.get(5)?,
             quarantine_blob_hash: row.get(6)?,
-            updated_at: row.get(7)?,
+            document: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     })?;
     let mut out = Vec::new();
@@ -157,6 +195,66 @@ pub fn needs_attention(conn: &Connection) -> Result<Vec<SyncState>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Clear a file's non-`ok` status, keeping everything else the row holds.
+///
+/// Returns whether a row was actually settled. The hashes and the base blob are preserved
+/// deliberately: they are the three-way base, and dropping them would turn a later
+/// re-appearance of the file into a spurious conflict instead of a clean reconcile.
+///
+/// The one verb for "this flag no longer describes anything" — a file the mount stopped
+/// syncing, a refused ghost whose file the user deleted. Both callers had a hand-written copy
+/// of this write, each restating the full [`SyncStateWrite`] field list, so a new field would
+/// have had to be threaded through two places that nothing linked.
+///
+/// # Errors
+/// Returns an error if the read or the write fails.
+pub fn settle(conn: &Connection, meta: &WriteMeta, uri: &str) -> Result<bool> {
+    let Some(row) = get(conn, uri)? else {
+        return Ok(false);
+    };
+    if row.status == "ok" {
+        return Ok(false);
+    }
+    upsert(
+        conn,
+        meta,
+        &SyncStateWrite {
+            uri,
+            serializer: &row.serializer,
+            status: "ok",
+            last_synced_hash: row.last_synced_hash.as_deref(),
+            base_blob_hash: row.base_blob_hash.as_deref(),
+            parse_error: None,
+            quarantine_blob_hash: row.quarantine_blob_hash.as_deref(),
+            document: row.document.as_deref(),
+        },
+    )?;
+    Ok(true)
+}
+
+/// Every flagged row whose uri names a file under `dir`.
+///
+/// Driven off the **journal**, not off bindings: a file that failed to parse on its very
+/// first sync has a `needs_attention` row and no bindings at all, so a bindings-driven sweep
+/// could never reach it — and once that file was deleted, nothing could clear the flag.
+///
+/// Compared as **paths**, not as strings. `str::starts_with` made `/repos/openspec` match
+/// `/repos/openspec-archive/tasks.md`, so syncing one mount reached into a differently-named
+/// one and cleared its flags — and a cleared flag is indistinguishable from a fixed file.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn flagged_under(conn: &Connection, dir: &Path) -> Result<Vec<SyncState>> {
+    Ok(needs_attention(conn)?
+        .into_iter()
+        .filter(|s| {
+            s.uri
+                .strip_prefix("file://")
+                .is_some_and(|p| Path::new(p).starts_with(dir))
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -179,6 +277,7 @@ mod tests {
                     base_blob_hash: Some("b1"),
                     parse_error: None,
                     quarantine_blob_hash: None,
+                    document: None,
                 },
             )?;
             upsert(
@@ -192,6 +291,7 @@ mod tests {
                     base_blob_hash: Some("b2"),
                     parse_error: Some("bad token on line 3"),
                     quarantine_blob_hash: Some("q2"),
+                    document: None,
                 },
             )
         })
@@ -236,6 +336,7 @@ mod tests {
                         base_blob_hash: Some(hash),
                         parse_error: None,
                         quarantine_blob_hash: None,
+                        document: None,
                     },
                 )
             })

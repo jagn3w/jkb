@@ -39,7 +39,7 @@ steps in order and **do not spawn anything until after the cost preview and conf
   - one or more **task uids** (contain `:` or `#`, or a space-separated list) → collect them as `TASKS`.
 
 **Design gate (D28).** In **scope mode** the swarm only touches tasks whose design has been
-approved — tag `design=approved`, set by `/design-pass`. This keeps implementers from
+approved — tag `design=approved`, set by `/jkb-design-pass`. This keeps implementers from
 inventing architecture on undecided work (they run headless and can't ask you). So the
 scout and the workflow AND `GATE` into the scope. Un-triaged tasks are deliberately
 invisible to the swarm. Two bypasses: `--no-design-gate` (emergency), and **explicit-uid
@@ -66,7 +66,7 @@ jkb query    --global --json 'kind:task <SCOPE> <GATE>' --limit 1000   # all app
 
 Also run the **ungated** ready query once (`jkb task next --global --json '<SCOPE>'`) so you
 can report how many ready tasks are held back by the gate — if that count is high, tell the
-user to run `/design-pass <path>` first. In **explicit-uid mode** the gate is bypassed; check
+user to run `/jkb-design-pass <path>` first. In **explicit-uid mode** the gate is bypassed; check
 each named uid for `design=approved` (`jkb task show <uid> --json`) and warn about any that
 lack it before proceeding (they'll be built with un-approved designs).
 
@@ -122,7 +122,7 @@ RUN_OWNER_FILE="$(mktemp)"                 # the sidecar reads the run owner fro
 # always --keep-ing THIS run's owner so it never touches our own in-flight claims.
 ( while :; do sleep 60; jkb task reclaim --keep "$(cat "$RUN_OWNER_FILE")" >/dev/null 2>&1; done ) &
 RECLAIMER_PID=$!                           # a real, live pid for the whole run
-OWNER="$HOST:$RECLAIMER_PID"               # host:pid — liveness-checkable via `kill -0`
+OWNER="$HOST:$RECLAIMER_PID"               # host:pid — liveness-checkable via `ps -p`
 printf '%s' "$OWNER" > "$RUN_OWNER_FILE"
 ```
 
@@ -133,16 +133,16 @@ as `owner` below; the workflow's implementers claim with it and the sidecar keep
 
 ## 6. Launch the workflow
 
-Locate the installed workflow script (first that exists): `"$CLAUDE_CONFIG_DIR/workflows/task-swarm.js"`,
-`"$HOME/.claude/workflows/task-swarm.js"`, or `./.claude/workflows/task-swarm.js`.
+Locate the installed workflow script (first that exists): `"$CLAUDE_CONFIG_DIR/workflows/jkb-task-swarm.js"`,
+`"$HOME/.claude/workflows/jkb-task-swarm.js"`, or `./.claude/workflows/task-swarm.js`.
 
-Call the **Workflow** tool with `scriptPath` = that path (or `name: "task-swarm"` if your
+Call the **Workflow** tool with `scriptPath` = that path (or `name: "jkb-task-swarm"` if your
 setup resolves saved workflows), and `args`.
 
 > **Gotcha:** pass `args` as an **actual JSON object**, not a JSON-encoded string. The
 > script does `const cfg = args || {}` and reads `cfg.integration` etc.; a stringified
 > value makes `cfg` a string, so every field is `undefined` and the script throws
-> `task-swarm requires args.integration and args.integrationWorktree` on launch.
+> `jkb-task-swarm requires args.integration and args.integrationWorktree` on launch.
 
 ```json
 {

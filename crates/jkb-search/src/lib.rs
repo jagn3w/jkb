@@ -322,8 +322,11 @@ fn vector_ranked(
             let set: HashSet<i64> = ids.iter().map(|id| id.get()).collect();
             let mut fetch = (k * OVERFETCH_MULTIPLIER).min(OVERFETCH_CAP);
             loop {
-                let hits = vector.knn(conn, qv, fetch)?;
-                let exhausted = hits.len() < fetch;
+                // `knn_live` reports whether the INDEX ran out, which is not the same as
+                // `hits.len() < fetch` once it filters dead rows out for us (D42.3): a table
+                // full of orphans would otherwise read as exhausted on the first pass and this
+                // loop would stop growing and return too few in-scope hits.
+                let (hits, exhausted) = vector.knn_live(conn, qv, fetch)?;
                 let in_scope: Vec<(ItemId, f32)> = hits
                     .into_iter()
                     .filter(|(id, _)| set.contains(&id.get()))

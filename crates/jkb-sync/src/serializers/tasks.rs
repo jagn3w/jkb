@@ -7,8 +7,9 @@
 //!   → a `task` [`SyncItem`], with a checkbox status, quick-add-style modifiers, a
 //!   `needs:^id` dependency, indentation-driven `parent_of` hierarchy, and a stable
 //!   trailing `^id` (minted deterministically when absent);
-//! - **everything else** (prose, the legend comment, blanks) → a `text` [`SyncItem`],
-//!   preserved verbatim so the file round-trips.
+//! - **everything else** (prose, the legend comment, blanks) → an inline `SyncBlock::Prose`
+//!   in the document layout, preserved verbatim so the file round-trips. Prose is
+//!   deliberately **never** an item: it has no identity that survives an edit.
 //!
 //! Identity is the visible `^id`, carried in each item's binding uri as
 //! `file://<path>#<id>` by the engine. [`render`](TasksSerializer::render) normalizes:
@@ -383,6 +384,12 @@ fn render_task(
     if let Some(d) = &item.due {
         parts.push(format!("@{d}"));
     }
+    // Every facet round-trips. There used to be a filter here, dropping the reserved `base=`
+    // facet, and it had to be paired with a matching exclusion on the KB side — an asymmetry that
+    // was itself a must-fix, because the two universes have to be the same one or a task holding
+    // the facet reads as permanently KB-edited and its next disk edit comes back a conflict. The
+    // fact that needed protecting is a `branch_records` row now, so both sides draw from one
+    // universe and neither has to remember a rule.
     for (facet, value) in &item.tags {
         parts.push(format!("#{facet}={value}"));
     }

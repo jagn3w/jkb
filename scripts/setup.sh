@@ -6,6 +6,8 @@
 #   2. scaffolds the standard KB namespace roots (repos/ tasks/ media/ references/ memory/)
 #   3. builds + installs the VS Code extension (pnpm; skipped if VS Code/pnpm absent)
 #   4. installs + activates the file-sync watcher as an OS service (launchd/systemd)
+#   5. installs the repo's post-merge git hook into this repo's .git/hooks — and, when
+#      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #
 # Flags: --no-extension, --no-service, --no-scaffold, --db <path>, -h/--help.
 # Everything is best-effort per step: a missing optional tool warns and continues.
@@ -24,7 +26,7 @@ while [ "$#" -gt 0 ]; do
     --no-scaffold) do_scaffold=0 ;;
     --db) shift; db="$1" ;;
     -h|--help)
-      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac

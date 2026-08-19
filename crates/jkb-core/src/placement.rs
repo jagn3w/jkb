@@ -3,11 +3,12 @@
 //! An item may be placed under many namespaces (design D3) — e.g. a task under
 //! both its `tasks/…` home and a `repos/…` mirror.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{ItemId, NamespaceId, PlacementRole};
 
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -32,6 +33,18 @@ pub fn place(
     position: i64,
 ) -> Result<()> {
     crate::nstype::check_placement(conn, item, namespace)?;
+    // Whether this placement already existed, read before the upsert. The sync engine re-places
+    // every mirror on every `apply_doc`, so logging that as an insert had `jkb undo` of an
+    // ordinary file sync unplace mirrors that long predated it.
+    let existing: Option<i64> = conn
+        .prepare_cached(
+            "SELECT position FROM placements
+              WHERE item_id = ?1 AND namespace_id = ?2 AND role = ?3",
+        )?
+        .query_row(params![item.get(), namespace.get(), role.as_str()], |row| {
+            row.get(0)
+        })
+        .optional()?;
     let rowid: i64 = conn
         .prepare_cached(
             "INSERT INTO placements (item_id, namespace_id, role, position)
@@ -49,13 +62,21 @@ pub fn place(
         "role": role.as_str(),
         "position": position,
     });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
-        "placements",
+        Entity::Placements,
         &rowid.to_string(),
-        None,
+        existing
+            .map(|position| {
+                json!({
+                    "item_id": item.get(),
+                    "namespace_id": namespace.get(),
+                    "role": role.as_str(),
+                    "position": position,
+                })
+            })
+            .as_ref(),
         Some(&after),
     )?;
     Ok(())
@@ -75,26 +96,40 @@ pub fn set_primary(
     namespace: NamespaceId,
     position: i64,
 ) -> Result<()> {
-    let stale: Vec<(i64, i64)> = {
+    let stale: Vec<(i64, i64, i64, String)> = {
+        // The WHOLE row, not just the key: `undo` puts a deleted placement back from exactly the
+        // columns recorded here, and one restored without its `position` or `metadata` is a
+        // different placement in the same slot.
         let mut stmt = conn.prepare_cached(
-            "SELECT rowid, namespace_id FROM placements
+            "SELECT rowid, namespace_id, position, metadata FROM placements
              WHERE item_id = ?1 AND role = 'primary' AND namespace_id != ?2",
         )?;
         let rows = stmt.query_map([item.get(), namespace.get()], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (rowid, old_ns) in stale {
+    for (rowid, old_ns, old_position, old_metadata) in stale {
         conn.prepare_cached("DELETE FROM placements WHERE rowid = ?1")?
             .execute([rowid])?;
         changelog::append(
             conn,
             meta,
-            "delete",
-            "placements",
+            Op::Delete,
+            Entity::Placements,
             &rowid.to_string(),
-            Some(&json!({ "item_id": item.get(), "namespace_id": old_ns, "role": "primary" })),
+            Some(&json!({
+                "item_id": item.get(),
+                "namespace_id": old_ns,
+                "role": "primary",
+                "position": old_position,
+                "metadata": old_metadata,
+            })),
             None,
         )?;
     }
@@ -122,32 +157,41 @@ pub fn unplace(
     item: ItemId,
     namespace: NamespaceId,
 ) -> Result<usize> {
-    let rowids: Vec<i64> = {
+    let rows: Vec<(i64, i64, String)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT rowid FROM placements
+            "SELECT rowid, position, metadata FROM placements
              WHERE item_id = ?1 AND namespace_id = ?2 AND role = 'reference'",
         )?;
-        let rows = stmt.query_map([item.get(), namespace.get()], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map([item.get(), namespace.get()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for rowid in &rowids {
+    for (rowid, position, metadata) in &rows {
         conn.prepare_cached("DELETE FROM placements WHERE rowid = ?1")?
             .execute([rowid])?;
         changelog::append(
             conn,
             meta,
-            "delete",
-            "placements",
+            Op::Delete,
+            Entity::Placements,
             &rowid.to_string(),
+            // The whole row — see `set_primary`.
             Some(&json!({
                 "item_id": item.get(),
                 "namespace_id": namespace.get(),
                 "role": "reference",
+                "position": position,
+                "metadata": metadata,
             })),
             None,
         )?;
     }
-    Ok(rowids.len())
+    Ok(rows.len())
 }
 
 /// The items placed **directly** in `namespace` — those not contained by another item —

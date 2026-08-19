@@ -1,6 +1,6 @@
 ---
 description: Run this repo's code reviewer and log each finding as a task in .codereviews/<datetime>-<branch>-<N>/tasks.md, mounted into jkb
-argument-hint: "[range]  [low|high]  [-- anything to focus on]"
+argument-hint: "[range]  [low|medium|high]  [-- anything to focus on]"
 ---
 
 You are running a **logged code review**: run the reviewer, then persist every finding as an
@@ -8,26 +8,82 @@ actionable task in a per-run folder mounted into the KB. Do these steps in order
 
 Arguments given: `$ARGUMENTS`
 
-## 1. Create the review folder
+## 0. Self-review first — the workflow is expensive
 
-Run exactly this (from the repo root) and use the printed path as `REVIEW_DIR`:
+One run is roughly a dozen or more agents and millions of tokens. Spend it on what is hard to
+spot: feature-level gaps, cross-file contradictions, reasoning that needs a whole subsystem in
+view. Do not spend it on defects a careful reading catches — those cost a full extra pass to
+find, plus another to review the fix.
+
+**Any doubt you can put into words is a test to write, not a line in the focus argument.** If you
+can name the question — "what does this do on the other kind of mount", "what happens when this
+field is empty" — you can answer it yourself, usually in minutes, and answering it is cheaper and
+more certain than a reviewer rediscovering it. The focus argument is for what you *cannot* check:
+a perspective you lack. Findings should surprise you; one that merely confirms a doubt you
+already held means the review was spent on work you owed it.
+
+**Reach high confidence in every part of the change before launching.** Naming a shaky area in
+the report is not a substitute for resolving it — if you can already name the gap, the reviewer's
+budget should not be spent rediscovering it. Whatever you are unsure of is precisely the thing to
+test: write the test, run the path, or document the bound. Reasoning about a behaviour is not
+evidence of it, and a test you have not seen fail is not evidence either.
+
+So before launching the reviewer, read your own diff (`git diff <range>`) and check:
+
+1. **Did every edit actually land?** Verify against a re-read of the file, not against what you
+   believe you wrote. An edit that silently failed leaves a commit message describing behaviour
+   the code does not have.
+2. **Does each comment and doc match the code beside it?** Anything asserting a guarantee — trace
+   the path and confirm it holds. Stale or aspirational comments mislead the next reader and the
+   reviewer both.
+3. **Is every new branch and check reachable?** Name a concrete input that exercises it. If you
+   cannot, it is dead code wearing the costume of a safeguard.
+4. **Who else implements this rule?** Before fixing at the site you are looking at, search for the
+   other places that must obey the same rule. **A rule every call site has to remember is itself
+   the defect** — prefer moving it into the callee, a type, or the schema, so no site can forget.
+5. **Does any test exercise the path you changed?** A mode with no coverage is where defects live
+   longest. If you added a regression test, revert the fix and confirm it fails on the assertion
+   it is named for.
+6. **Did you add a parameter, field, or variant?** Check every construction and call site supplies
+   the right value — same-typed neighbours swap silently.
+7. **Did you run it?** Execute the path you changed rather than reasoning about it.
+
+Then run the repo's own verify command (its CI config or contributor docs name it). List each
+part of the change with your confidence in it; anything short of high gets resolved before the
+reviewer runs, not disclosed alongside its findings. Say in the report what this pass caught: a
+review that surfaces only subtle things is the goal.
+
+## 1. Resolve the repo, then create the review folder
+
+**Resolve everything against the MAIN working copy**, not against wherever you are standing.
+A `jkb task work` session is a git *worktree*, so inside one `git rev-parse --show-toplevel`
+returns the session directory — which would put the findings under `repos/<session-name>/`, a
+repo key nothing else uses, inside a directory `jkb task land` deletes when the session lands.
+`--git-common-dir` is the same rule `gitrepo::main_root` uses, and it is correct in the main
+copy too.
+
+Run exactly this and use the printed values as `REVIEW_DIR`, `repo` and `branch`:
 
 ```sh
-mkdir -p .codereviews
-b=$(git rev-parse --abbrev-ref HEAD | tr '/' '-')
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+repo=$(basename "$main")
+branch=$(git rev-parse --abbrev-ref HEAD)          # the branch under review — this checkout's
+b=$(printf '%s' "$branch" | tr '/' '-')
 d=$(date +%Y%m%d-%H%M%S)
-n=$(( $(ls -d .codereviews/*-"$b"-* 2>/dev/null | wc -l | tr -d ' ') + 1 ))
-dir=".codereviews/$d-$b-$n"
+n=$(( $(ls -d "$main"/.codereviews/*-"$b"-* 2>/dev/null | wc -l | tr -d ' ') + 1 ))
+dir="$main/.codereviews/$d-$b-$n"
 mkdir -p "$dir"
-echo "$dir"
+echo "REVIEW_DIR=$dir  repo=$repo  branch=$branch"
 ```
 
 The folder name is `<datetime>-<branch>-<reviewNumber>`, where `reviewNumber` is the count of
-prior reviews for this branch plus one.
+prior reviews for this branch plus one. `branch` is this checkout's — the session branch when
+you are in a session — and is what step 5 records the review against; `repo` and `REVIEW_DIR`
+belong to the main copy, which outlives the session.
 
 ## 2. Run the reviewer
 
-Resolve the range, effort and focus, then launch the workflow **exactly as `/review` steps 1–2
+Resolve the range, effort and focus, then launch the workflow **exactly as `/jkb-review` steps 1–2
 describe** — same resolution rules, same `scriptPath` lookup, same `args` object. The reviewer
 is one workflow with two thin callers precisely so that "what counts as a finding" cannot differ
 between them (design D37.7).
@@ -36,10 +92,12 @@ It returns `{findings, raw, refuted, reviewers, verified, features, context, not
 carries `severity` (`must-fix` / `concern` / `nit`), `file`, `line`, `summary`, `scenario`,
 `fix`, `kind`, and possibly `unverified`.
 
-At the default `low` effort nothing is skeptic-checked — findings are filed as found, because
-only ~6% were ever refuted and discovering a false one while fixing it is cheaper than three
-skeptics per finding up front. Note that in the doc's header line so a reader knows what they
-are looking at; do not annotate every task with it.
+At the default `low` effort up to three reviewers split the change by feature area, each asking
+every lens question against one reading of its code, and nothing is skeptic-checked — findings
+are filed as found, because only ~6% were ever refuted and discovering a false one while fixing
+it is cheaper than three skeptics per finding up front. `medium` fans the lenses out to one agent
+each instead; `high` adds the skeptics. Note the tier and whether it was verified in the doc's
+header line so a reader knows what they are looking at; do not annotate every task with it.
 
 ## 3. Log the findings as tasks
 
@@ -89,8 +147,10 @@ Each review gets its **own per-folder mount**: the `tasks` serializer maps `##` 
 namespaces under the mount, so one shared `.codereviews` mount would merge every review's
 `## Must-fix` into a single namespace.
 
+`repo` is the main copy's key from step 1 — never `basename $(git rev-parse --show-toplevel)`,
+which in a session is the session's name.
+
 ```sh
-repo=$(basename "$(git rev-parse --show-toplevel)")
 folder=$(basename "$REVIEW_DIR")
 ns="repos/$repo/codereviews/$folder"
 jkb mount create "$ns" "$REVIEW_DIR" --serializer tasks
@@ -100,9 +160,30 @@ jkb sync "$ns"
 Findings home under `repos/<repo>/codereviews/<folder>/…` and auto-mirror to
 `tasks/<repo>/codereviews/…` (D26/D32). A running `jkb sync --watch` will not see a
 just-created mount until it restarts, so the one-shot `jkb sync` is what lands them now.
-`mount create` is idempotent, so re-running a review is safe.
+`mount create` is idempotent, so re-running a review is safe. Pass every option you want
+kept — it is the update command too, and an omitted flag no longer resets the stored value,
+but restating `--serializer tasks` costs nothing and reads clearly.
 
-## 5. Report accuracy, then the findings
+## 5. Record the review against the branch
+
+The findings now exist, so point the branch's tasks at them (design D38.4). This is what lets
+`jkb task land` require a review instead of trusting that one happened:
+
+```sh
+jkb task review record --branch "$branch" --findings "$ns"
+```
+
+Pass `--branch` explicitly, using step 1's value. It defaults to the branch checked out where
+it runs, which is right in a session and ambiguous anywhere else: run from the main copy that
+default is the *staging* branch. `record` does now match a staging branch, via each branch's
+recorded land target, but only
+for tasks whose own work is already **in** it — so relying on the default silently reviews a
+different set from the one you are looking at. It tags every task carrying that `branch=` with
+`reviewed=<sha>` and `review=<ns>`, and moves `in_progress` tasks to `needs_review`. A branch
+no task claims — trunk, an ad-hoc range — matches nothing and says so; that is a note, not a
+failure, because reviewing an arbitrary range is a legitimate thing to do.
+
+## 6. Report accuracy, then the findings
 
 Before the findings, report how far this reviewer has earned trust here. Findings are tasks, so
 their status says whether they were acted on (design D37.6):
@@ -122,3 +203,10 @@ Then print the findings (severity · `file:line` · summary, most severe first) 
 summary: `N findings (H must-fix, M concern, L nit) from R raw, K refuted`. Say they are mounted
 at `repos/<repo>/codereviews/<folder>` (git-ignored on disk) and browsable under
 `tasks/<repo>/codereviews/…`.
+
+Finally, say whether the branch can now land. You already know — the reader should not have to
+discover it at `land` time:
+
+- **no must-fix findings** → "this branch is landable (`jkb task land <uid>`)".
+- **must-fix findings** → name them, and say landing is blocked until each is `done` or
+  `cancelled`. `jkb staging ls` shows the same count against the task.

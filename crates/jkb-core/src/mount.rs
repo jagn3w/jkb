@@ -8,6 +8,7 @@ use serde_json::json;
 
 use jkb_types::{ConflictPolicy, NamespaceId, SyncMode};
 
+use crate::changelog::Entity;
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -44,6 +45,12 @@ pub fn create(
     exclude_glob: Option<&str>,
     conflict_policy: ConflictPolicy,
 ) -> Result<()> {
+    // This is create-or-replace, and `jkb mount create` is also the update command — so
+    // whether this is an insert has to be established before writing, not assumed. Logging an
+    // update as an `insert` made `undo` take the generic insert inverse and
+    // `DELETE FROM mounts`, destroying a mount that existed before the transaction and
+    // leaving its `file://` bindings with nothing to sync them.
+    let before = get(conn, namespace)?;
     conn.prepare_cached(
         "INSERT INTO mounts
              (namespace_id, backing_uri, sync_mode, serializer, include_glob, exclude_glob, conflict_policy)
@@ -65,15 +72,31 @@ pub fn create(
     conn.prepare_cached("UPDATE namespaces SET kind = 'mount' WHERE id = ?1")?
         .execute([namespace.get()])?;
     let after = json!({
-        "namespace_id": namespace.get(), "backing_uri": backing_uri, "serializer": serializer,
+        "namespace_id": namespace.get(),
+        "backing_uri": backing_uri,
+        "sync_mode": sync_mode.as_str(),
+        "serializer": serializer,
+        "include_glob": include_glob,
+        "exclude_glob": exclude_glob,
+        "conflict_policy": conflict_policy.as_str(),
     });
-    changelog::append(
+    let before_json = before.as_ref().map(|m| {
+        json!({
+            "namespace_id": namespace.get(),
+            "backing_uri": m.backing_uri,
+            "sync_mode": m.sync_mode,
+            "serializer": m.serializer,
+            "include_glob": m.include_glob,
+            "exclude_glob": m.exclude_glob,
+            "conflict_policy": m.conflict_policy,
+        })
+    });
+    changelog::upsert(
         conn,
         meta,
-        "insert",
-        "mounts",
+        Entity::Mounts,
         &namespace.get().to_string(),
-        None,
+        before_json.as_ref(),
         Some(&after),
     )?;
     Ok(())

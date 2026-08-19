@@ -3,8 +3,8 @@
 //!
 //! A session is a git worktree holding one task's work on one branch, so N terminals can
 //! drive N tasks without sharing a checkout. Everything a session needs to be found again
-//! lives in git (the worktree and its branch) and the KB (the task's `branch=`/`onto=` tags
-//! and its claim) — there is no session state file to drift.
+//! lives in git (the worktree and its branch) and the KB (the task's `branch=` tag and claim,
+//! and that branch's own record) — there is no session state file to drift.
 
 use std::fs;
 use std::io::Write;
@@ -174,6 +174,15 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     canonical(a) == canonical(b)
 }
 
+/// Whether `inner` is `outer` or lives beneath it, comparing canonical paths.
+///
+/// Canonical because a session worktree under `/var/...` is reached as `/private/var/...` on
+/// macOS, so a raw `starts_with` answers "no" for a directory you are standing in.
+#[must_use]
+pub fn is_within(inner: &Path, outer: &Path) -> bool {
+    canonical(inner).starts_with(canonical(outer))
+}
+
 fn canonical(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
@@ -251,7 +260,16 @@ impl LandLock {
                          so its gate result stays meaningful; wait for it to finish",
                         holder.trim()
                     );
-                    let _ = fs::remove_file(&path);
+                    // Remove the stale lock only while it is still the one we judged. Two lands
+                    // seeing the same dead pid both reached this line, and an unconditional
+                    // unlink let the second delete the lock the FIRST had just created — leaving
+                    // both believing they held it, which is the one thing this file exists to
+                    // prevent. Re-reading narrows that to the instant between this check and the
+                    // unlink; it cannot close it without a real file lock, and the honest note is
+                    // that landing is serialised against ordinary use, not against a race.
+                    if fs::read_to_string(&path).unwrap_or_default() == holder {
+                        let _ = fs::remove_file(&path);
+                    }
                 }
                 Err(e) => return Err(e).context("taking the land lock"),
             }

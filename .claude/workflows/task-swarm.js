@@ -1,9 +1,9 @@
 export const meta = {
-  name: 'task-swarm',
+  name: 'jkb-task-swarm',
   description:
     'SCHEDULER groups overlapping ready jkb tasks into work-groups; one IMPLEMENTER builds each group on a clean branch; a fresh REVIEWER checks the whole group; a deterministic merge queue (no agent) rebase/fast-forwards approved branches into one feature branch and marks the group done. Pipelined (no per-round barrier), claim-guarded, looping as dependents unblock.',
   whenToUse:
-    'Launched by the /task-swarm command after it scouts the jkb task set and creates the integration branch + worktree.',
+    'Launched by the /jkb-task-swarm command after it scouts the jkb task set and creates the integration branch + worktree.',
   phases: [
     { title: 'Schedule' },
     { title: 'Claim' },
@@ -14,7 +14,7 @@ export const meta = {
 }
 
 // ---------------------------------------------------------------------------
-// Config — supplied by the /task-swarm command via `args`. All git/branch setup
+// Config — supplied by the /jkb-task-swarm command via `args`. All git/branch setup
 // (integration branch + its worktree) is done by the command BEFORE launch; this
 // script only orchestrates agents. Roles (design D27):
 //   SCHEDULER   — clusters overlapping ready tasks into work-groups (≤~4 each).
@@ -27,10 +27,15 @@ export const meta = {
 const cfg = (typeof args === 'string' ? JSON.parse(args) : args) || {}
 const JKB = cfg.jkb || 'jkb' // how to invoke the jkb binary
 const DB = cfg.db ? ` --db ${cfg.db}` : '' // optional --db flag
+// `scripts/merge-queue.sh` writes to the KB too (it records the landing), and it is bash, so it
+// cannot read `JKB`/`DB` above. The same two choices are handed to it through the environment:
+// `$JKB` is the binary, and `jkb` already falls back to `$JKB_DB` when no `--db` is given. Without
+// this the queue wrote a swarm run's landings into the user's production store.
+const QUEUE_ENV = [`JKB='${JKB}'`, cfg.db ? `JKB_DB='${cfg.db}'` : ''].filter(Boolean).join(' ') + ' '
 const SCOPE = cfg.scope || '' // a jkb DSL scope, e.g. "ns:codereviews/**"
 const TASKS = Array.isArray(cfg.tasks) ? cfg.tasks : null // or explicit task uids
 // Design gate (D28): in scope mode the swarm only touches tasks whose design has been
-// approved (tag `design=approved`, set by /design-pass). `cfg.designGate:false` disables
+// approved (tag `design=approved`, set by /jkb-design-pass). `cfg.designGate:false` disables
 // it. Explicit-uid mode (TASKS) is a deliberate hand-pick and always bypasses the gate.
 const DESIGN_GATE = cfg.designGate === false || TASKS ? '' : 'tag:design=approved'
 const GLOBAL = cfg.global === false ? '' : ' --global' // ignore ambient cwd scoping
@@ -41,14 +46,14 @@ const RETRY_CAP = cfg.retryCap || 3 // per-GROUP feedback attempts (review + eje
 const ROUND_CAP = cfg.roundCap || 40 // safety bound on scheduler passes
 const GROUP_CAP = cfg.groupCap || 4 // hard cap on tasks per work-group (D27.8)
 // The run's claim owner (design D27.1): a liveness-checkable id for THIS run. Ideally
-// `host:pid` of a process alive for the run; the /task-swarm command supplies it. Any
+// `host:pid` of a process alive for the run; the /jkb-task-swarm command supplies it. Any
 // owner the reclaim scan can't prove alive is treated dead by a *later* run (crash net) —
 // but this run always passes OWNER to `task reclaim --keep`, so it never reclaims its own.
 const OWNER = cfg.owner || `swarm:${INTEGRATION}`
 
 if (!INTEGRATION || !INTEGRATION_WT) {
   throw new Error(
-    'task-swarm requires args.integration and args.integrationWorktree — the /task-swarm command sets these up before launching.',
+    'jkb-task-swarm requires args.integration and args.integrationWorktree — the /jkb-task-swarm command sets these up before launching.',
   )
 }
 
@@ -208,7 +213,7 @@ Return the verdict, notes, and handoff. Change nothing.`
 function mergeRunnerPrompt(branch) {
   return `You are a MECHANICAL merge-queue runner — NO reasoning, NO conflict resolution. Run ONE script and report its result. Do all git work in the integration worktree at ${INTEGRATION_WT}.
 
-Run EXACTLY: \`cd ${INTEGRATION_WT} && ${REPO}/scripts/merge-queue.sh ${branch} ${INTEGRATION} ${INTEGRATION_WT}\` (use ./scripts/merge-queue.sh if that path is right for this repo).
+Run EXACTLY: \`cd ${INTEGRATION_WT} && ${QUEUE_ENV}${REPO}/scripts/merge-queue.sh ${branch} ${INTEGRATION} ${INTEGRATION_WT}\` (use ./scripts/merge-queue.sh if that path is right for this repo).
 
 The script rebases ${branch} onto the current ${INTEGRATION} tip, fast-forwards (linear, no merge commit), and runs the gate. Do NOT resolve conflicts, edit code, or retry — just run it once and read its exit code:
 - exit 0 → landed=true, detail = the script's "landed: …" line.
@@ -244,8 +249,27 @@ Return ok=true with a one-line confirmation. Do not fabricate changes.`
 }
 
 function claimPrompt(group, verb) {
-  const cmds = group.tasks
-    .map((t) => `${JKB}${DB} task ${verb} ${t.uid} --owner '${OWNER}'`)
+  // On claim, record which REPO the work is in. Where it *lands* is a fact about a branch, and
+  // at claim time the group has no branch yet — it is recorded a step later, by the one command
+  // that names the branch and its parent together (`jkb task start --branch … --onto …`, see
+  // `branchTagPrompt`). That is also what puts swarm work into `jkb staging ls` beside manual
+  // work, one view rather than the half it was told about (design D38.1/D38.2).
+  //
+  // `tag set` rather than `tag add`: a second `repo=` is a contradiction, and the swarm re-tags a
+  // group on every pass.
+  const locate =
+    verb === 'claim'
+      ? [`repo=$(basename "$(git -C ${REPO} rev-parse --show-toplevel)")`]
+          .concat(
+            group.tasks.map((t) => `${JKB}${DB} task tag set ${t.uid} repo="$repo"`),
+          )
+          .join(' && ')
+      : null
+  const cmds = [
+    group.tasks.map((t) => `${JKB}${DB} task ${verb} ${t.uid} --owner '${OWNER}'`).join(' && '),
+    locate,
+  ]
+    .filter(Boolean)
     .join(' && ')
   const flip = verb === 'claim' ? ' (claiming also flips each task to in_progress)' : ''
   return `Mechanical step — run these jkb commands in the main copy at ${REPO} and report. ${verb === 'claim' ? 'CLAIM' : 'RELEASE'} this work-group's tasks for owner '${OWNER}'${flip}:
@@ -253,6 +277,44 @@ function claimPrompt(group, verb) {
 ${cmds}
 
 Run them, then return ok=true (detail = any command that returned false/failed). This is bookkeeping — change no code, touch no git.`
+}
+
+// Record the implementer's branch on every task in the group, so `jkb staging ls` can show
+// the sub-branch and its commits exactly as it does for a hand-driven session (D38.2).
+//
+// The cut point is recorded with it, and is not optional bookkeeping: landing and review-recording
+// both refuse to act on a branch with no base, because without one an empty freshly-cut branch and
+// a landed one are indistinguishable. The swarm once wrote a land target, `branch=` and `repo=`
+// and no cut point,
+// so `jkb task review record` on the integration branch skipped every swarm task, reporting them
+// as "not merged into it yet" while they were fully contained in it.
+//
+// This is `jkb task start`, and the swarm passes NO commit id — that is the whole point of the
+// verb. Every previous attempt here had the swarm compute one, and each computed value was wrong
+// in its own way: the integration branch's tip named a commit the group's branch never sat on (it
+// moves under a pipelined run), and then the group branch's own tip made `base == tip` permanently,
+// so `is_merged` answered `NothingToMerge` and every task of every group was blocked from landing.
+//
+// What it does state is `--onto ${INTEGRATION}` — *which branch this one was cut from*, which the
+// swarm knows for certain because it told the implementer to branch off it. `task start` measures
+// the rest (their merge-base) and refuses to overwrite a cut point already recorded, so re-running
+// it on a retry pass is safe. It also sets `branch=`/`repo=` and the branch's land target, which
+// is why there is one
+// command here rather than three, and it is idempotent under this run's own claim.
+function branchTagPrompt(group, branch) {
+  const cmds = group.tasks
+    .map(
+      (t) =>
+        `${JKB}${DB} task start ${t.uid} --branch ${branch} --onto ${INTEGRATION} --owner '${OWNER}'`,
+    )
+    .join(' && ')
+  return `Mechanical step — record this group's working branch and the commit it was cut from.
+
+Run EXACTLY this, in the main copy at ${REPO}:
+
+cd ${REPO} && ${cmds}
+
+Return ok=true (detail = any that failed). Bookkeeping only — change no code, touch no git.`
 }
 
 function statusPrompt(group, status) {
@@ -269,7 +331,7 @@ function reclaimPrompt() {
 
 ${JKB}${DB} task reclaim --keep '${OWNER}'
 
-This clears claims left by CRASHED PRIOR runs (owner pid gone) before the first frontier read, while preserving THIS run's own claims (owner '${OWNER}' is kept). The ONGOING ~60s reclaim is handled by the /task-swarm command's sidecar, not here. Return ok=true with the reclaimed count. Change no code, touch no git.`
+This clears claims left by CRASHED PRIOR runs (owner pid gone) before the first frontier read, while preserving THIS run's own claims (owner '${OWNER}' is kept). The ONGOING ~60s reclaim is handled by the /jkb-task-swarm command's sidecar, not here. Return ok=true with the reclaimed count. Change no code, touch no git.`
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +398,16 @@ async function processGroup(group) {
         continue
       }
       branch = impl.branch
+
+      // Record the branch on the group's tasks so `jkb staging ls` shows the sub-branch and
+      // its commits, exactly as it does for a hand-driven session (D38.2). Set once the
+      // implementer has actually produced one — before that there is nothing true to record.
+      await agent(branchTagPrompt(group, branch), {
+        label: `tag:${label}#${attempt}`,
+        phase: 'Implement',
+        schema: ACK,
+        model: 'haiku',
+      })
 
       // Entering review: the WHOLE group is `needs_review` (transient — a reviewer is
       // reviewing; it no longer unblocks dependents, D27.7).
@@ -425,7 +497,7 @@ async function schedule() {
   round++
   // Startup crash-recovery scan (D27.6.6b), first pass only: clear claims left by dead
   // PRIOR runs before the first frontier read, keeping our own owner. The ONGOING ~60s
-  // periodic reclaim is a true wall-clock timer owned by the /task-swarm command's sidecar
+  // periodic reclaim is a true wall-clock timer owned by the /jkb-task-swarm command's sidecar
   // process (workflow JS has no clock/background timer), so we do NOT repeat it each pass.
   if (round === 1) {
     await agent(reclaimPrompt(), { label: 'reclaim#startup', phase: 'Schedule', schema: ACK, model: 'haiku' })

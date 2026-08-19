@@ -1,10 +1,13 @@
 //! Item repository: the atomic knowledge/graph node.
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{Error as TypeError, ItemId, Resolution};
 
+use crate::changelog::{Entity, Op};
 use crate::sql::like_escape;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
@@ -61,11 +64,10 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, item: &NewItem) -> Result<Ite
         "kind": item.kind.clone(),
         "mime": item.mime.clone(),
     });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
-        "items",
+        Entity::Items,
         &id.to_string(),
         None,
         Some(&after),
@@ -232,6 +234,53 @@ pub fn get(conn: &Connection, item: ItemId) -> Result<Option<ItemMeta>> {
     .map_err(Into::into)
 }
 
+/// Every row in `items`, keyed by id, in one query.
+///
+/// Batches [`get`] for callers holding a candidate set. A per-item `get` is a round-trip
+/// serialized on the writer thread, so a caller resolving N items pays N of them — fine for
+/// three, not for a view that redraws on every database write.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn get_many(conn: &Connection, items: &[ItemId]) -> Result<HashMap<ItemId, ItemMeta>> {
+    let mut out = HashMap::new();
+    if items.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; items.len()].join(", ");
+    let sql = format!(
+        "SELECT id, uid, kind, content, content_hash, mime, status, resolution, priority, due,
+                created_at, updated_at
+         FROM items WHERE id IN ({placeholders})"
+    );
+    let params: Vec<rusqlite::types::Value> = items
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(id.get()))
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok(ItemMeta {
+            id: ItemId::new(r.get(0)?),
+            uid: r.get(1)?,
+            kind: r.get(2)?,
+            content: r.get(3)?,
+            content_hash: r.get(4)?,
+            mime: r.get(5)?,
+            status: r.get(6)?,
+            resolution: r.get(7)?,
+            priority: r.get(8)?,
+            due: r.get(9)?,
+            created_at: r.get(10)?,
+            updated_at: r.get(11)?,
+        })
+    })?;
+    for row in rows {
+        let meta = row?;
+        out.insert(meta.id, meta);
+    }
+    Ok(out)
+}
+
 /// Set `item`'s [`Resolution`] — how the unit **ended** (design Dmem.3), orthogonal to
 /// its `status`. Recorded in the changelog like any other mutation.
 ///
@@ -263,8 +312,8 @@ pub fn set_resolution(
     changelog::append(
         conn,
         meta,
-        "update",
-        "items",
+        Op::Update,
+        Entity::Items,
         &item.get().to_string(),
         Some(&json!({ "resolution": before })),
         Some(&json!({ "resolution": resolution.as_str() })),
@@ -406,13 +455,54 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
         })
         .optional()?;
 
+    let (contained_by, contains) = containment_snapshot(conn, id)?;
+
     Ok(json!({
         "item": row,
         "placements": placements,
         "tags": tags,
         "edges": edges,
         "binding": binding,
+        "contained_by": contained_by,
+        "contains": contains,
     }))
+}
+
+/// The containment rows a delete takes with the item, both directions: the row saying which
+/// item contains this one, and the rows saying which items it contains.
+///
+/// Restoring only the `parent_of` edge put a parent task back with its subtask edge intact
+/// but no containment row — and `SUBTASK_CLAUSE`, the anti-join that holds a parent off the
+/// ready frontier, reads `containment`, not the edge. So the parent came back pickable with a
+/// live open child, and a restored document's chunks were unreachable from `jkb ls <doc>`.
+fn containment_snapshot(
+    conn: &Connection,
+    id: i64,
+) -> Result<(Option<serde_json::Value>, Vec<serde_json::Value>)> {
+    let contained_by = conn
+        .prepare_cached(
+            "SELECT parent_item_id, position FROM containment WHERE child_item_id = ?1",
+        )?
+        .query_row([id], |r| {
+            Ok(json!({
+                "parent_item_id": r.get::<_, i64>(0)?,
+                "position": r.get::<_, i64>(1)?,
+            }))
+        })
+        .optional()?;
+    let contains = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT child_item_id, position FROM containment WHERE parent_item_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(json!({
+                "child_item_id": r.get::<_, i64>(0)?,
+                "position": r.get::<_, i64>(1)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok((contained_by, contains))
 }
 
 /// Whether `item` carries investigation **memory** that a delete would destroy: a tombstone
@@ -514,8 +604,8 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) ->
     changelog::append(
         conn,
         meta,
-        "delete",
-        "items",
+        Op::Delete,
+        Entity::Items,
         &item.get().to_string(),
         Some(&before),
         None,
@@ -701,11 +791,18 @@ pub fn set_content(
     content: &str,
     content_hash: Option<&str>,
 ) -> Result<()> {
-    let before: Option<String> = conn
-        .prepare_cached("SELECT content FROM items WHERE id = ?1")?
-        .query_row([item.get()], |row| row.get::<_, Option<String>>(0))
-        .optional()?
-        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    // The previous body, under the column names it came from. It used to be logged as
+    // `{"content_len": n}`, which reads like a before-state and restores nothing: `jkb undo`
+    // of a sync import would have left the imported text in place. Both columns are needed —
+    // restoring the content while leaving `content_hash` describing the new text would make the
+    // item its own mismatch. `changelog::write` now refuses a payload that names anything but
+    // this table's columns, so the old shape cannot come back.
+    let before: Option<(Option<String>, Option<String>)> = conn
+        .prepare_cached("SELECT content, content_hash FROM items WHERE id = ?1")?
+        .query_row([item.get()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    let (before_content, before_hash) =
+        before.ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
     conn.prepare_cached(
         "UPDATE items SET content = ?2, content_hash = ?3,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -715,21 +812,54 @@ pub fn set_content(
     changelog::append(
         conn,
         meta,
-        "update",
-        "items",
+        Op::Update,
+        Entity::Items,
         &item.get().to_string(),
-        Some(&json!({ "content_len": before.map(|c| c.len()) })),
-        Some(&json!({ "content_len": content.len() })),
+        Some(&json!({ "content": before_content, "content_hash": before_hash })),
+        // The *after* side stays a summary. Only `before` is read — it is what `undo` writes back —
+        // and a file sync calls this on every disk edit, so keeping the new body here too would
+        // store a second copy of every document per edit for nobody's benefit.
+        Some(&json!({ "content_hash": content_hash, "content_len": content.len() })),
     )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{grep, upsert, NewItem};
+    use super::{grep, remove, upsert, NewItem};
     use crate::{ns, placement, Db};
     use jkb_types::PlacementRole;
     use proptest::prelude::*;
+
+    /// An id freed by a delete must never be handed to a later item (design D40).
+    ///
+    /// `items.id` is a rowid alias, and `SQLite` reissues the largest freed rowid — so before
+    /// `AUTOINCREMENT` a new item inherited a deleted item's row in every derived index that
+    /// cannot carry a foreign key. Concretely, it inherited its **embedding**: vector search
+    /// returned the new item for the deleted item's text, and `index_pending` considered it
+    /// already indexed, so it could never be re-embedded.
+    ///
+    /// This is the invariant, not the four call-site sweeps that preceded it. If the V010
+    /// migration is ever reverted or a rebuild of `items` drops the `AUTOINCREMENT`, this
+    /// fails immediately rather than surfacing as a wrong search result months later.
+    #[test]
+    fn a_deleted_items_id_is_never_reused() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .write_txn("t", |conn, meta| upsert(conn, meta, &note("gone", None)))
+            .unwrap();
+        db.write_txn("t", move |conn, meta| remove(conn, meta, first, true))
+            .unwrap();
+        let second = db
+            .write_txn("t", |conn, meta| upsert(conn, meta, &note("fresh", None)))
+            .unwrap();
+        assert!(
+            second.get() > first.get(),
+            "id {} was reissued after {} was deleted — a new item would inherit its vector",
+            second.get(),
+            first.get()
+        );
+    }
 
     fn note(uid: &str, hash: Option<&str>) -> NewItem {
         NewItem {

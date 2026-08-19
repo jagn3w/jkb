@@ -125,3 +125,108 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod high_water_tests {
+    use super::embedded;
+    use refinery::Target;
+    use rusqlite::Connection;
+
+    /// V010 claimed to stop `items.id` reuse and did not; V011 is the fix (design D42.1).
+    ///
+    /// This has to migrate a database **in two steps** — up to V010, populate it the way a real
+    /// store gets populated, then apply V011 — so it cannot use `Db::open`, which runs every
+    /// migration at once. `mod migrate` and `mod db` are private, so it also cannot live in
+    /// `tests/`; it belongs here, beside the runner it drives.
+    ///
+    /// Asserts the harm, not a counter: an id that was issued and freed must never be handed to
+    /// a later item, because a `vec_items_<dim>` row outlives its item and the new item would
+    /// inherit its embedding.
+    #[test]
+    fn v011_restores_the_high_water_mark_v010_lost() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // The harness owns this toggle because `PRAGMA foreign_keys` is a no-op inside the
+        // transaction refinery wraps each migration in, and V010 rebuilds a table with
+        // `ON DELETE CASCADE` children.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+
+        // 1. Migrate to V009 — BEFORE the AUTOINCREMENT rebuild. This ordering is the whole
+        //    fixture: V010 reseeds `sqlite_sequence` from the *surviving* maximum, so the ids
+        //    have to already exist and already be deleted when it runs. Populating after V010
+        //    instead sets the sequence via the explicit-id inserts themselves and masks the bug
+        //    entirely — which is exactly what an earlier version of this test did, leaving the
+        //    only regression pin for an id-reuse corruption passing against a no-op migration.
+        embedded::migrations::runner()
+            .set_target(Target::Version(9))
+            .run(&mut conn)
+            .unwrap();
+
+        // 2. Five items, then delete the top two — what `jkb ingest` + `jkb undo` leaves behind,
+        //    with vector rows for 4 and 5 still in `vec_items_<dim>`.
+        for i in 1..=5 {
+            conn.execute(
+                "INSERT INTO items (id, uid, kind) VALUES (?1, ?2, 'chunk')",
+                rusqlite::params![i, format!("u{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO changelog (txn_id, actor, op, entity_type, entity_id)
+                 VALUES (1, 't', 'insert', 'items', ?1)",
+                [i.to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM items WHERE id IN (4, 5)", [])
+            .unwrap();
+
+        // 3. Now V010 runs on that database and does its damage: it reseeds the counter to the
+        //    surviving maximum (3) and leaves a duplicate row behind.
+        embedded::migrations::runner()
+            .set_target(Target::Version(10))
+            .run(&mut conn)
+            .unwrap();
+        let seq_after_v010: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'items' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seq_after_v010, 3,
+            "the fixture must actually reproduce V010's damage, or this test pins nothing"
+        );
+
+        // 4. Apply V011.
+        embedded::migrations::runner().run(&mut conn).unwrap();
+
+        // 5. The HARM first, so a regression reports the thing that matters rather than a
+        //    bookkeeping detail: a new item must not land on 4 or 5.
+        conn.execute(
+            "INSERT INTO items (uid, kind) VALUES ('fresh', 'chunk')",
+            [],
+        )
+        .unwrap();
+        let fresh: i64 = conn
+            .query_row("SELECT id FROM items WHERE uid = 'fresh'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            fresh > 5,
+            "id {fresh} was reissued after 4 and 5 were freed — a new item would inherit a \
+             deleted item's embedding"
+        );
+
+        // Then the hygiene: exactly one sequence row, so V010's duplicate is gone.
+        let seq_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_sequence WHERE name = 'items'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seq_rows, 1,
+            "V011 must leave exactly one row, not add a third"
+        );
+    }
+}

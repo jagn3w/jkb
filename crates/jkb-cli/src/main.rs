@@ -6,14 +6,19 @@
 //! Read/task/query commands default their namespace scope to the mount covering the
 //! current directory (design D19), overridable with `--global`.
 
+mod base;
 mod commands;
 mod gitrepo;
 mod output;
 mod owner;
+mod repo;
+mod review;
 mod service;
 mod session;
+mod staging;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -107,6 +112,19 @@ enum Command {
         /// Keep watching for changes until interrupted (Ctrl-C).
         #[arg(long)]
         watch: bool,
+        /// Override the mount's conflict policy for THIS RUN only, to get a stuck file
+        /// moving without editing the mount.
+        #[arg(long, value_enum, conflicts_with = "watch")]
+        conflict: Option<PolicyArg>,
+    },
+    /// Staging branches: what is in flight, and where it will land.
+    ///
+    /// A staging branch is the branch a batch of tasks lands on before it reaches trunk —
+    /// the same thing `/task-swarm` calls its integration branch. It is derived from the land
+    /// targets recorded for branches, plus git; the branch itself is never stored (D38.1).
+    Staging {
+        #[command(subcommand)]
+        cmd: StagingCmd,
     },
     /// Install/print the sync watcher as an OS service (launchd/systemd).
     Service {
@@ -134,17 +152,22 @@ enum Command {
         txn: Option<i64>,
     },
     /// Embed content-bearing items not yet in the vector index (needs the embedder).
-    Index,
+    Index {
+        /// Remove derived-index rows whose item is gone, instead of embedding. Needs no
+        /// embedder, so it works offline.
+        #[arg(long)]
+        sweep: bool,
+    },
     /// Health checks, integrity, and backup.
     Doctor {
-        /// Also write a checkpointed backup to this path.
+        /// Write a consistent copy of the database to this path first (replaced if it exists).
         #[arg(long)]
         backup: Option<PathBuf>,
         /// Apply repairs: clear claims whose owner process no longer exists.
         #[arg(long)]
         fix: bool,
     },
-    /// Run the MCP server (Section 13, not yet available).
+    /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
     /// List the direct children of a namespace (sub-namespaces + items homed there) —
     /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
@@ -530,24 +553,42 @@ enum MountCmd {
         ns: String,
         /// Backing directory.
         dir: PathBuf,
-        /// Sync direction.
-        #[arg(long, value_enum, default_value_t = ModeArg::Bidirectional)]
-        mode: ModeArg,
-        /// File-format serializer.
-        #[arg(long, default_value = "document")]
-        serializer: String,
-        /// Include glob (e.g. `**/*.md`).
+        /// Sync direction (default `bidirectional`; kept as-is when re-running).
+        #[arg(long, value_enum)]
+        mode: Option<ModeArg>,
+        /// File-format serializer (default `document`; kept as-is when re-running).
         #[arg(long)]
+        serializer: Option<String>,
+        /// Include glob (e.g. `**/*.md`). Kept as-is when re-running; clear with
+        /// `--no-include`.
+        #[arg(long, conflicts_with = "no_include")]
         include: Option<String>,
-        /// Exclude glob.
+        /// Drop the stored include glob, syncing every file under the directory.
         #[arg(long)]
+        no_include: bool,
+        /// Exclude glob. Kept as-is when re-running; clear with `--no-exclude`.
+        #[arg(long, conflicts_with = "no_exclude")]
         exclude: Option<String>,
-        /// Conflict policy.
-        #[arg(long, value_enum, default_value_t = PolicyArg::Manual)]
-        policy: PolicyArg,
+        /// Drop the stored exclude glob.
+        #[arg(long)]
+        no_exclude: bool,
+        /// Conflict policy (default `manual`; kept as-is when re-running).
+        #[arg(long, value_enum)]
+        policy: Option<PolicyArg>,
     },
     /// List all mounts (namespace → serializer → backing directory).
     Ls,
+}
+
+#[derive(Subcommand)]
+enum StagingCmd {
+    /// List staging branches and the tasks landing on each.
+    Ls {
+        /// Include branches already merged into trunk (hidden by default: a spent batch
+        /// must never be offered as a land target).
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -611,6 +652,15 @@ enum TaskCmd {
         /// that get worked. Defaults the new task's home to the parent's.
         #[arg(long)]
         under: Option<String>,
+        /// Home the task in this namespace, taken **verbatim**.
+        ///
+        /// The quick-add `+<ns>` form is re-tokenized on whitespace along with the rest of
+        /// the line, so a namespace containing a space (which `ns::normalize` permits, and
+        /// which a synced directory named `my change` produces) creates a different, wrong
+        /// namespace and swallows the remainder into the title. Pass the path here when it
+        /// comes from a picker rather than from a person typing.
+        #[arg(long)]
+        home: Option<String>,
     },
     /// List the ready frontier (optionally scoped/filtered by DSL terms).
     Next {
@@ -718,6 +768,23 @@ enum TaskCmd {
         #[arg(short = 'a', long)]
         all: bool,
     },
+    /// Drop a branch's recorded cut point, so the next `task start` / `task work` measures it
+    /// again.
+    ///
+    /// **No verb anywhere accepts a commit id**, and that is the point of this one. This used to
+    /// take a sha, and produced three findings across three review passes, all the same shape:
+    /// the sha nearest a user's hand is the branch tip, a cut point equal to the tip reads as
+    /// "nothing has happened here" forever, and the task then can neither be credited by a review
+    /// nor land — with no repair path. Each was fixed by rewording a message; there are only so
+    /// many messages.
+    ///
+    /// The one case forgetting cannot repair — a branch whose work was merged away — is closed
+    /// with `jkb task set <uid> --status done`, which is also not a sha.
+    Base {
+        /// The branch whose record to drop. Keyed by branch, so no task uid is needed.
+        #[arg(long, value_name = "BRANCH")]
+        forget: String,
+    },
     /// Start work: claim the task and record the branch and repo it is being done on, so
     /// `jkb task close-merged` can close it once that branch lands. Both default from the
     /// git repo in the current directory.
@@ -727,6 +794,12 @@ enum TaskCmd {
         /// The branch (default: the current branch here).
         #[arg(long)]
         branch: Option<String>,
+        /// The branch this one was cut from and will land on. Recorded as `--branch`'s land
+        /// target, and it is what the cut point is measured against — without it only the
+        /// branch's own tip can be measured, which reads as "nothing has happened here" on a
+        /// branch that already has commits.
+        #[arg(long)]
+        onto: Option<String>,
         /// The repo key (default: the basename of this git repo's root).
         #[arg(long)]
         repo: Option<String>,
@@ -759,9 +832,19 @@ enum TaskCmd {
         /// Keep the session worktree and branch after landing.
         #[arg(long)]
         keep_worktree: bool,
+        /// Land without a recorded review. The waiver is recorded on the task, so a
+        /// bypass is visible rather than invisible.
+        #[arg(long)]
+        no_review: bool,
     },
-    /// Drop a session without landing it: release the claim, reopen the task, remove the
-    /// worktree. The branch is kept unless you ask for it to go.
+    /// Record that a code review ran, so `task land` can require one.
+    Review {
+        #[command(subcommand)]
+        cmd: TaskReviewCmd,
+    },
+    /// Drop a session without landing it: remove the worktree, and release the claim and
+    /// reopen the task unless it has already finished or someone else has claimed it. The
+    /// branch is kept unless you ask for it to go.
     Abandon {
         /// The task uid.
         uid: String,
@@ -796,6 +879,21 @@ enum TaskCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Record that a branch was grafted onto another — for the merge queue, which is bash and
+    /// cannot write the record directly the way `jkb task land` does.
+    ///
+    /// A landing event is a **trusted** fact: readers act on it without re-deriving anything from
+    /// refs, so this verb is a new write route for exactly the class of fact this area exists to
+    /// protect. It therefore refuses unless the branch's work really is in the target, judged by
+    /// the same policy every reader uses — so a hand-run for work that has not landed fails, and
+    /// one for work that has records a truth.
+    Landed {
+        /// The branch that was grafted.
+        branch: String,
+        /// The branch it was grafted onto.
+        #[arg(long)]
+        onto: String,
+    },
     /// Release a task's claim held by an owner (defaults to this process).
     Release {
         /// The task uid.
@@ -818,9 +916,36 @@ enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+enum TaskReviewCmd {
+    /// Record a review against a branch: tags every task working that branch with the
+    /// reviewed SHA and the findings namespace, and moves `in_progress` to `needs_review`.
+    Record {
+        /// The reviewed branch (default: the current branch here).
+        #[arg(long)]
+        branch: Option<String>,
+        /// The reviewed HEAD (default: this branch's HEAD).
+        #[arg(long)]
+        sha: Option<String>,
+        /// The namespace holding the review's findings.
+        #[arg(long)]
+        findings: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TaskTagCmd {
     /// Apply `facet=value` to a task.
     Add {
+        /// The task uid.
+        uid: String,
+        /// The tag as `facet=value`.
+        facet_value: String,
+    },
+    /// Make `facet=value` the facet's **only** value, replacing any others.
+    ///
+    /// Use for facets with one true answer — `branch=`, `repo=` — where a second value is a
+    /// contradiction rather than extra information (design D36.6).
+    Set {
         /// The task uid.
         uid: String,
         /// The tag as `facet=value`.
@@ -965,7 +1090,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
         Command::Mount { cmd } => cmd_mount(&db, cmd, json),
-        Command::Sync { ns, watch } => cmd_sync(&db, ns.as_deref(), watch),
+        Command::Sync {
+            ns,
+            watch,
+            conflict,
+        } => cmd_sync(
+            &db,
+            ns.as_deref(),
+            watch,
+            conflict.map(ConflictPolicy::from),
+        ),
+        Command::Staging { cmd } => match cmd {
+            StagingCmd::Ls { all } => cmd_staging_ls(&db, all, cli.json),
+        },
         Command::Service { cmd } => match cmd {
             ServiceCmd::Print => service::print(&db_path),
             ServiceCmd::Install => service::install(&db_path),
@@ -979,7 +1116,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Task { cmd } => cmd_task(&db, cmd, global, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
-        Command::Index => cmd_index(&db),
+        Command::Index { sweep } => cmd_index(&db, sweep),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Ls {
@@ -1120,6 +1257,36 @@ fn cmd_blob_cat(db: &Db, hash: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a path the way the sync journal's uris were built: canonicalized.
+///
+/// `canonicalize` needs the file to exist, which is precisely what `jkb history` is often asked
+/// about, and plain absolutisation resolves no symlinks — so on macOS a deleted file under
+/// `/tmp` or `/var` produced a uri the journal never wrote. Canonicalizing the deepest ancestor
+/// that DOES exist (normally the parent) and rejoining the rest gets both: the symlinks are
+/// resolved and the missing leaf is preserved.
+fn resolve_for_journal(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut rest = Vec::new();
+    let mut cur = abs.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_owned());
+        }
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    abs
+}
+
 /// `jkb history <path>` — every synced version of a file, newest first.
 fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
     // Accept a bare path or a `file://` uri, and canonicalize so a relative path matches the
@@ -1127,11 +1294,17 @@ fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
     let uri = if path.starts_with("file://") {
         path.to_owned()
     } else {
-        let abs = std::fs::canonicalize(path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(path))
-            .to_string_lossy()
-            .into_owned();
-        format!("file://{abs}")
+        // Absolutised WITHOUT requiring the file to exist, then keyed with `jkb-sync`'s own
+        // spelling. `canonicalize` fails for a deleted file, which left a relative uri that
+        // matched no journal row — so `jkb history <deleted file>` reported "no recorded
+        // history" and blamed the build version, on exactly the recovery path the archive
+        // exists to serve.
+        // Canonicalize when the file is there — the journal's uris come from a canonicalized
+        // mount directory, so on macOS `/var/...` must become `/private/var/...` to match — and
+        // fall back to plain absolutisation when it is not, which is the case `jkb history`
+        // exists for. Using only one of the two fails half the time: `canonicalize` alone left a
+        // *relative* uri for a deleted file, and `absolute` alone misses the symlink.
+        jkb_sync::file_uri(&resolve_for_journal(std::path::Path::new(path)))
     };
 
     let versions = db.read({
@@ -1432,9 +1605,26 @@ fn cmd_search(
         println!("(no results)");
         return Ok(());
     }
+    // Resolved BY ID, never by position — the JSON branch above already does this. `fetch_items`
+    // drops rows it cannot find, so zipping made one missing item print nothing at all (and exit
+    // 0), and a gap mid-list mislabelled every hit after it (design D42.4). Never pair two lists
+    // by index when one of them can be shorter.
     let ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
-    let items = output::fetch_items(db, &ids)?;
-    for (hit, item) in hits.iter().zip(items.iter()) {
+    let by_id: std::collections::HashMap<i64, output::DisplayItem> = output::fetch_items(db, &ids)?
+        .into_iter()
+        .map(|i| (i.id, i))
+        .collect();
+    for hit in &hits {
+        let Some(item) = by_id.get(&hit.item.get()) else {
+            // A hit whose item is gone should be unreachable now that `knn_live` filters them,
+            // so say so rather than skipping silently — a search that quietly drops results is
+            // the failure this fix exists to remove.
+            eprintln!(
+                "warning: search hit {} has no item row; run `jkb index --sweep`",
+                hit.item.get()
+            );
+            continue;
+        };
         println!(
             "[{} {:.3}] {}",
             hit.route.as_str(),
@@ -1560,27 +1750,14 @@ impl Child {
 
 /// A short label for an item: its first non-empty content line (≤80 chars), else its uid.
 fn item_label(meta: &item::ItemMeta) -> String {
-    let line = meta
-        .content
-        .as_deref()
-        .unwrap_or("")
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.is_empty() {
-        return meta.uid.clone();
-    }
-    let mut s: String = line.chars().take(80).collect();
-    if line.chars().count() > 80 {
-        s.push('…');
-    }
-    s
+    // The derivation is `output::title_of` — the one copy. Only the width is this function's
+    // own, which is the split that helper's doc describes: a tree row, a staging row and a
+    // gate refusal have different widths but must agree on what the task is *called*. This
+    // was the fourth surviving copy, and the one that names tasks in the explorer tree.
+    let title = output::title_of(meta);
+    truncate(&title, 80)
 }
 
-/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
-/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
-/// tasks are hidden unless `all`.
 /// The children of any item that contains others — the container behaviour a node takes on
 /// (design D35).
 ///
@@ -1600,7 +1777,7 @@ fn contained_children(
         let Some(meta) = item::get(conn, id)? else {
             continue;
         };
-        if !all && matches!(meta.status.as_deref(), Some("done" | "cancelled")) {
+        if !all && jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref()) {
             continue;
         }
         let subtasks = subtask_counts.get(&id).copied();
@@ -1625,6 +1802,9 @@ fn contained_children(
     Ok(out)
 }
 
+/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
+/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
+/// tasks are hidden unless `all`.
 fn list_children(
     conn: &rusqlite::Connection,
     path: Option<&str>,
@@ -1701,7 +1881,7 @@ fn list_children(
                 };
                 // Hide any terminal-status item (done/cancelled) unless `all` — like
                 // ignored files, revealed only on explicit toggle.
-                let terminal = matches!(meta.status.as_deref(), Some("done" | "cancelled"));
+                let terminal = jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref());
                 if !all && terminal {
                     continue;
                 }
@@ -2151,6 +2331,11 @@ fn cmd_tree(
 /// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
 fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
     let id = require_uid(db, uid)?;
+    // Deliberately no vector sweep, and none is needed: the `vec_items_<dim>_gc` trigger
+    // (D42.2) removes the vector with the item, in the same statement, for every connection and
+    // every caller. Two belts remain behind that brace — an id is never reissued (D40), so even
+    // a row that somehow survives cannot be inherited, and `jkb index --sweep` collects rows
+    // written before the trigger existed.
     let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
     if json {
         println!(
@@ -2864,10 +3049,13 @@ fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
     }
 }
 
-/// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
-fn cmd_guide() {
-    print!(
-        r#"jkb — agent quickstart
+/// The cheat-sheet itself. A constant rather than a literal inside [`cmd_guide`], because it is
+/// **data**: as a function body it counted against `clippy::too_many_lines`, so every line added
+/// to the guide was priced against a limit that has nothing to say about a block of text.
+///
+/// Mirrored by the root `AGENTS.md`. Keep the two in step — an agent reads whichever it meets
+/// first, and a command documented in only one of them is a command half the readers never learn.
+const GUIDE: &str = r#"jkb — agent quickstart
 
 CONVENTIONS
   --json      every read command emits machine-readable JSON; parse that, not the text.
@@ -2885,6 +3073,8 @@ ORIENT (read-only)
   jkb grep <pat> [path] [-i -l -c]   literal-substring content search; exit 1 on no match.
   jkb query "<DSL>"           full query DSL (kind: tag: status: ns: is:ready due<= …).
   jkb search "<terms>" --route hybrid   ranked vector/FTS retrieval (needs the embedder).
+      Pick by what you already know: `find`/`query` when you know the KIND/TAG/STATUS,
+      `grep` for a LITERAL string in content, `search` for fuzzy/semantic ranking.
 
 READ ONE ITEM
   jkb cat <uid>               the raw body to stdout (pipe it, no metadata).
@@ -2894,20 +3084,46 @@ READ ONE ITEM
 TASKS
   jkb task add "text !p1 @2026-07-15 +ns #facet=value"   quick-add.
   jkb task next [DSL]         the ready frontier (unblocked, by priority then due).
-  jkb task set <uid> --status done|open|in_progress|needs_review
+  jkb task set <uid> --status open|in_progress|needs_review|done|cancelled
   jkb task show <uid>         the full task body.
 
 WORKING A TASK IN PARALLEL (each session is its own git worktree)
   jkb task work <uid>         open (or return to) this task's session: its own checkout and
                               branch `task/<session>`, claimed so nothing else starts it.
                               Work and COMMIT inside the printed worktree, nowhere else.
+                              --onto <branch> names the STAGING branch it lands on; omit it
+                              and jkb joins the batch in flight, or cuts one from trunk.
   jkb task land <uid>         rebase the session onto its target, run the repo's gate, and
                               on green mark the task done and remove the session. Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
+                              REFUSES a task with no recorded review, or whose review left a
+                              must-fix finding open — anything at priority <= 1, so !p0 blocks
+                              as well as !p1. --no-review records a waiver.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
   jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
       If you are inside a session, land is the human's call — commit, and say you are done.
+
+STAGING BRANCHES (where a batch lands before trunk — the swarm's integration branch)
+  jkb staging ls [--all]      every staging branch and the tasks landing on it: each task's state
+                              (implementing / review / landed / dropped), its commits, and how
+                              many must-fix findings its review left open. `dropped` is a
+                              cancelled task, never folded into `landed`. --all shows merged ones.
+  jkb task review record --findings <ns>
+                              record that a review ran against the current branch, so `land`
+                              can require one. /jkb-review-log does this for you.
+  jkb task tag set <uid> <f>=<v>
+                              make <v> the facet's ONLY value (add appends). Use for the
+                              single-answer facets: repo=. Writing branch= also records where
+                              that branch was cut, but prefer `task start`, which can be told
+                              the branch it was cut FROM.
+  jkb task start <uid> [--branch B] [--onto S]
+                              claim it and record the branch, the repo, where B lands, and —
+                              from --onto — where B forked. Prefer it to tagging branch=.
+  jkb task base --forget <branch>
+                              drop a branch's cut point; it prints what can be recorded next,
+                              which depends on the branch. No verb takes a sha — the nearest
+                              one to hand is the branch tip, which freezes the task.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -2946,13 +3162,17 @@ WRITE (all audited + undoable)
   jkb item edit <uid> [--append] <text>   replace/append an item's content.
   jkb item rm <uid> [--force]             delete an item + its cascade; `jkb undo` restores
                                           it. Refuses tombstones and synced-file items.
-  jkb task tag add <uid> facet=value      apply a tag.
+  jkb task tag add <uid> facet=value      apply a tag (additive; `tag set` replaces).
+  jkb task depend <uid> <dep-uid>         add a dependency edge (`undepend` removes it).
   jkb undo                                revert the last change.
 
 Tips: prefer `find`/`query` (structured) over `grep` when you know the kind/tag; add
 `--json` and parse; scope with a path or rely on the ambient cwd namespace.
-"#
-    );
+"#;
+
+/// `jkb guide` — a one-page cheat-sheet of the agent-facing command surface.
+fn cmd_guide() {
+    print!("{GUIDE}");
 }
 
 /// The item's primary (home) namespace path, if placed.
@@ -3381,17 +3601,21 @@ fn cmd_mount(db: &Db, cmd: MountCmd, json: bool) -> Result<()> {
             mode,
             serializer,
             include,
+            no_include,
             exclude,
+            no_exclude,
             policy,
         } => cmd_mount_create(
             db,
             &ns,
             &dir,
-            mode.into(),
-            &serializer,
-            include.as_deref(),
-            exclude.as_deref(),
-            policy.into(),
+            MountEdit {
+                mode: mode.map(Into::into),
+                serializer,
+                include: FieldEdit::from_flags(include, no_include),
+                exclude: FieldEdit::from_flags(exclude, no_exclude),
+                policy: policy.map(Into::into),
+            },
         ),
         MountCmd::Ls => cmd_mount_ls(db, json),
     }
@@ -3409,6 +3633,9 @@ fn cmd_mount_ls(db: &Db, json: bool) -> Result<()> {
                     "serializer": m.serializer,
                     "backing": m.backing_uri,
                     "sync_mode": m.sync_mode,
+                    "conflict_policy": m.conflict_policy,
+                    "include_glob": m.include_glob,
+                    "exclude_glob": m.exclude_glob,
                 })
             })
             .collect();
@@ -3416,24 +3643,64 @@ fn cmd_mount_ls(db: &Db, json: bool) -> Result<()> {
     } else if mounts.is_empty() {
         println!("(no mounts)");
     } else {
+        // The globs and the policy decide which files a sync will touch and what it does when
+        // both sides changed. Listing only the serializer and directory made a mount whose
+        // include glob had been dropped look identical to one that still had it.
         for (path, m) in &mounts {
             println!("{path}  [{}]  {}", m.serializer, m.backing_uri);
+            println!(
+                "    mode={}  policy={}  include={}  exclude={}",
+                m.sync_mode,
+                m.conflict_policy,
+                m.include_glob.as_deref().unwrap_or("(none)"),
+                m.exclude_glob.as_deref().unwrap_or("(none)"),
+            );
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_mount_create(
-    db: &Db,
-    ns_path: &str,
-    dir: &Path,
-    mode: SyncMode,
-    serializer: &str,
-    include: Option<&str>,
-    exclude: Option<&str>,
-    policy: ConflictPolicy,
-) -> Result<()> {
+/// What a `mount create` invocation asked to change. Every field distinguishes "not
+/// mentioned" from "set to this", because `mount create` doubles as the update command and a
+/// re-run that silently reset the fields you did not name is how a mount's include glob was
+/// once dropped — after which the `tasks` serializer discovered every file in the tree and
+/// overwrote 62 of them.
+struct MountEdit {
+    mode: Option<SyncMode>,
+    serializer: Option<String>,
+    include: FieldEdit,
+    exclude: FieldEdit,
+    policy: Option<ConflictPolicy>,
+}
+
+/// An optional field's requested change: leave it, set it, or clear it. A bare `Option`
+/// cannot express all three, and collapsing "leave" onto "clear" is the whole bug.
+enum FieldEdit {
+    Keep,
+    Set(String),
+    Clear,
+}
+
+impl FieldEdit {
+    fn from_flags(value: Option<String>, clear: bool) -> Self {
+        match (value, clear) {
+            (Some(v), _) => Self::Set(v),
+            (None, true) => Self::Clear,
+            (None, false) => Self::Keep,
+        }
+    }
+
+    /// Resolve against what the mount already stores.
+    fn apply(&self, current: Option<String>) -> Option<String> {
+        match self {
+            Self::Keep => current,
+            Self::Set(v) => Some(v.clone()),
+            Self::Clear => None,
+        }
+    }
+}
+
+fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Result<()> {
     let abs = std::fs::canonicalize(dir)
         .with_context(|| format!("resolving mount directory {}", dir.display()))?;
     // The backing path is stored verbatim in the `file://` uri and later resolved for sync,
@@ -3444,10 +3711,43 @@ fn cmd_mount_create(
         anyhow::anyhow!("mount directory path is not valid UTF-8: {}", abs.display())
     })?;
     let backing = format!("file://{abs_str}");
-    let (ns_path, serializer) = (ns_path.to_owned(), serializer.to_owned());
-    let include = include.map(str::to_owned);
-    let exclude = exclude.map(str::to_owned);
+    let ns_path = ns_path.to_owned();
     let ns_display = ns_path.clone();
+
+    // Read what the mount already is, so an update only changes what was actually named.
+    let existing = {
+        let ns_path = ns_path.clone();
+        db.read(move |conn| match ns::get(conn, &ns_path)? {
+            Some(id) => mount::get(conn, id),
+            None => Ok(None),
+        })?
+    };
+
+    let mode = edit.mode.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|m| SyncMode::from_db_str(&m.sync_mode))
+            .unwrap_or(SyncMode::Bidirectional)
+    });
+    let serializer = edit
+        .serializer
+        .or_else(|| existing.as_ref().map(|m| m.serializer.clone()))
+        .unwrap_or_else(|| "document".to_owned());
+    let include = edit
+        .include
+        .apply(existing.as_ref().and_then(|m| m.include_glob.clone()));
+    let exclude = edit
+        .exclude
+        .apply(existing.as_ref().and_then(|m| m.exclude_glob.clone()));
+    let policy = edit.policy.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|m| ConflictPolicy::from_db_str(&m.conflict_policy))
+            .unwrap_or(ConflictPolicy::Manual)
+    });
+
+    let updating = existing.is_some();
+    let (ser, inc, exc) = (serializer.clone(), include.clone(), exclude.clone());
     db.write_txn("cli", move |conn, meta| {
         let ns_id = ns::ensure(conn, &ns_path)?;
         mount::create(
@@ -3456,17 +3756,33 @@ fn cmd_mount_create(
             ns_id,
             &backing,
             mode,
-            &serializer,
-            include.as_deref(),
-            exclude.as_deref(),
+            &ser,
+            inc.as_deref(),
+            exc.as_deref(),
             policy,
         )
     })?;
-    println!("mounted {ns_display} -> {}", abs.display());
+    let verb = if updating { "updated mount" } else { "mounted" };
+    println!("{verb} {ns_display} -> {}", abs.display());
+    // Print the resulting configuration, not just the path: an update that silently kept or
+    // dropped a glob is exactly the failure this command now guards against, so the answer
+    // has to be visible at the moment it is decided.
+    println!(
+        "  serializer={serializer}  mode={}  policy={}  include={}  exclude={}",
+        mode.as_str(),
+        policy.as_str(),
+        include.as_deref().unwrap_or("(none)"),
+        exclude.as_deref().unwrap_or("(none)"),
+    );
     Ok(())
 }
 
-fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool) -> Result<()> {
+fn cmd_sync(
+    db: &Db,
+    ns_path: Option<&str>,
+    watch: bool,
+    conflict: Option<ConflictPolicy>,
+) -> Result<()> {
     let debounce = std::time::Duration::from_millis(300);
     if watch {
         let stop = Arc::new(AtomicBool::new(false));
@@ -3484,46 +3800,129 @@ fn cmd_sync(db: &Db, ns_path: Option<&str>, watch: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut failed = 0usize;
     if let Some(ns) = ns_path {
-        report_sync(db, ns)?;
+        failed += report_sync(db, ns, conflict)?;
     } else {
+        // `--conflict` is a per-run override for unwedging ONE stuck file. Applied across
+        // every mount it silently resolves every conflict in the KB the same way, and
+        // `kb_wins` overwrites disk bytes that were never blobbed — unrecoverable, unlike a
+        // bad import. Requiring the namespace keeps the blast radius the size of the
+        // intention.
+        anyhow::ensure!(
+            conflict.is_none(),
+            "--conflict needs a namespace: it resolves conflicts destructively, and across \
+             every mount `kb_wins` would overwrite disk edits that no blob holds. Name the \
+             mount you are unwedging, e.g. `jkb sync <ns> --conflict disk-wins`."
+        );
         let paths = db.read(jkb_core::mount::all_paths)?;
         if paths.is_empty() {
             println!("no mounts configured");
         }
         for ns in paths {
-            report_sync(db, &ns)?;
+            // No `?`. The loop is total by construction: a mount that fails is reported and
+            // counted, and every later mount still reconciles. Pass 12 moved the raise out of
+            // `report_sync` and left the `?` here, so the abort it was fixing simply moved up
+            // one level — the whole point is that no single mount can end the run.
+            match report_sync(db, &ns, conflict) {
+                Ok(n) => failed += n,
+                Err(e) => {
+                    // A whole mount, counted as one — the closing line says "file(s) or
+                    // mount(s)" rather than pretending to know how many files were behind it.
+                    println!("sync {ns}: FAILED: {e:#}");
+                    failed += 1;
+                }
+            }
         }
     }
+    // Every mount has been reconciled by now; only the exit code is left to decide.
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} file(s) or mount(s) need attention; see the lines above"
+    );
     Ok(())
 }
 
 /// Reconcile one mount and print its summary.
-fn report_sync(db: &Db, ns_path: &str) -> Result<()> {
+fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Result<usize> {
     use jkb_sync::Outcome::{
-        Conflict, Created, Exported, Imported, Merged, Normalized, Quarantined, Skipped, UpToDate,
+        Conflict, Created, Exported, Failed, Imported, Merged, Normalized, Quarantined, Refused,
+        ResolvedFromDisk, ResolvedFromKb, Skipped, UpToDate,
     };
-    let report = jkb_sync::sync(db, ns_path)?;
+    let report = jkb_sync::sync_with_policy(db, ns_path, conflict)?;
     println!(
         "sync {ns_path}: {} created, {} imported, {} exported, {} merged, {} normalized, \
-         {} conflicts, {} quarantined, {} up-to-date, {} skipped",
+         {} conflicts, {} resolved, {} quarantined, {} up-to-date, {} skipped, {} refused, \
+         {} failed",
         report.count(Created),
         report.count(Imported),
         report.count(Exported),
         report.count(Merged),
         report.count(Normalized),
         report.count(Conflict),
+        report.count(ResolvedFromDisk) + report.count(ResolvedFromKb),
         report.count(Quarantined),
         report.count(UpToDate),
         report.count(Skipped),
+        report.count(Refused),
+        report.count(Failed),
     );
     for path in report.conflicts() {
         println!("  conflict: {}", path.display());
     }
+    // A policy resolution throws one side's edits away. Say which side won, per file, so a
+    // destructive resolution is visible at the moment it happens rather than discovered later.
+    for (path, how) in report.resolved() {
+        println!("  RESOLVED {} — {how}", path.display());
+    }
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
     }
-    Ok(())
+    // A refusal wrote nothing, so it must be visible or the file silently stops syncing.
+    for (path, reason) in report.refused() {
+        println!("  REFUSED {}: {reason}", path.display());
+    }
+    let failures = report.failed();
+    for (path, err) in &failures {
+        println!("  FAILED {}: {err}", path.display());
+    }
+    // "Unhealthy" is asked of the ONE authority that already answers it: the journal. Listing
+    // outcomes by hand meant two definitions that disagreed — the exit code counted `Failed` and
+    // `Quarantined` while `jkb doctor` reads `sync_state.status`, so a file left completely
+    // unsynced by a `Conflict` or `Refused` exited 0 and was simultaneously reported as needing
+    // attention. `/review-log` chains `jkb mount create … && jkb sync "$ns"`, so a zero there
+    // let a run record a review over nothing.
+    //
+    // Counted from this mount's own files, so one mount's stuck file does not make another
+    // mount's summary look bad.
+    // Keyed with `jkb-sync`'s own spelling. Hand-rebuilding `file://{path}` here made the exit
+    // code depend on a cross-crate string convention with no owner — and a third copy in this
+    // file already canonicalizes, so the spellings had already diverged.
+    let paths: std::collections::HashSet<String> = report
+        .results
+        .iter()
+        .map(|r| jkb_sync::file_uri(&r.path))
+        .collect();
+    let flagged = db.read(move |conn| {
+        Ok(jkb_core::sync_state::needs_attention(conn)?
+            .into_iter()
+            .filter(|s| paths.contains(&s.uri))
+            .count())
+    })?;
+    // The UNION, not the replacement. The journal is the better authority — it is what
+    // `jkb doctor` reads, so the two can no longer disagree — but flagging a failure is itself a
+    // database write, and the failures that matter most (disk full, a lost write-lock race) are
+    // exactly the ones that cannot perform it. Counting only journal rows meant those printed
+    // FAILED and still exited 0. A per-file failure must never need a successful write to be
+    // visible.
+    let unhealthy = flagged.max(failures.len() + report.quarantined().len());
+    // COUNTED, not raised. A failed file must not leave a zero exit — `/review-log` chains
+    // `jkb mount create … && jkb sync "$ns"`, and a silent zero let a run record a review over
+    // zero imported findings — but raising here aborted the all-mounts loop, so one bad file in
+    // the first mount silently skipped every mount after it. That is exactly what `reconcile_all`
+    // forbids one level down ("a per-file failure is a RESULT, not a run-ending error"),
+    // reinstated at mount granularity. The caller reconciles everything, then decides.
+    Ok(unhealthy)
 }
 
 /// The `--backlog`/`--sync`/`--managed` flags of `task add`, grouped so the helper
@@ -3532,6 +3931,9 @@ struct AddFlags {
     backlog: bool,
     sync: bool,
     managed: bool,
+    /// An explicit home namespace, taken verbatim rather than lexed out of the quick-add
+    /// line — see the `--home` flag.
+    home: Option<String>,
 }
 
 /// Derive a task's home namespace from `--backlog` and the ambient repo (design D26),
@@ -3545,7 +3947,10 @@ fn resolve_task_home(
 ) -> Result<()> {
     if had_explicit {
         if flags.backlog {
-            anyhow::bail!("--backlog conflicts with an explicit `+<ns>` placement");
+            anyhow::bail!(
+                "--backlog conflicts with an explicit placement (`--home`, or a `+<ns>` in the \
+                 task line)"
+            );
         }
     } else if flags.backlog {
         let root = task::DEFAULT_ROOT;
@@ -3605,9 +4010,55 @@ fn cmd_task_add(
 ) -> Result<()> {
     let input = text.join(" ");
     let qa = task::parse_quick_add(&input)?;
+    // `#branch=` and `#onto=` reach `tag::apply` from here, below the checks the other writers
+    // apply, so this was the one route by which a value git reads as an option could still enter
+    // the store — `#branch=--upload-pack=x`.
+    let mut qa = qa;
+    for (facet, value) in &qa.tags {
+        // A land target is a fact about a *branch* and lives in that branch's record, so a facet
+        // named `onto` reaches no reader at all. Refused rather than stored inert: a user who
+        // typed it expecting effect deserves an answer, not silence. (`base=` needs no such
+        // refusal — nothing reads that name either, and every message about a cut point must
+        // avoid naming a verb that takes a sha, which is how three passes of findings started.)
+        anyhow::ensure!(
+            facet != "onto",
+            "`#onto=` records where a *branch* lands, not where a task is, so it cannot be set \
+             from a task line. Use `jkb task work <uid> --onto <branch>` or `jkb task start \
+             <uid> --branch <b> --onto <branch>`."
+        );
+        if facet == repo::FACET_BRANCH {
+            gitrepo::valid_ref(value)?;
+        }
+    }
+    // `branch=` is lifted out of the quick-add tags and applied afterwards through
+    // `repo::record_branch`, which is what pairs a branch with its cut point. Left here it went
+    // straight to `tag::apply`, so this entry point silently opted out of the pairing CLAUDE.md
+    // calls the architecture of this area.
+    //
+    // The `retain` is routing, not a guard: `tag::apply` is idempotent on `(item, facet, value)`,
+    // so leaving the tag in place would write the same row and change nothing observable. What it
+    // buys is that "`record_branch` is the only writer of `branch=` in this crate" holds without
+    // an exception the next reader has to carry. It is a convention, not an enforced invariant:
+    // `branch=` is an ordinary facet and the store will take one from anyone — `jkb_core::tag`
+    // reserves nothing, deliberately, and says why in its module doc. The cut point is recorded by
+    // the call below either way, and that is the part with a test.
+    let quick_add_branches: Vec<String> = qa
+        .tags
+        .iter()
+        .filter(|(f, _)| f == repo::FACET_BRANCH)
+        .map(|(_, v)| v.clone())
+        .collect();
+    qa.tags.retain(|(f, _)| f != repo::FACET_BRANCH);
     let mut had_explicit_placement = !qa.placements.is_empty();
     let uid = task::mint_uid(&qa.title);
     let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
+
+    // `--home` wins over a `+<ns>` in the line: it is the unambiguous form, and it is the
+    // only one that can carry a path containing whitespace.
+    if let Some(home) = &flags.home {
+        spec.home.clone_from(home);
+        had_explicit_placement = true;
+    }
 
     // A subtask defaults to living beside its parent: splitting a task should not scatter
     // the pieces across namespaces, and `--under` is the only signal about where it belongs.
@@ -3636,6 +4087,43 @@ fn cmd_task_add(
         }
         Ok(id)
     })?;
+    // Any `#branch=` from the quick-add line, applied through the one writer that pairs a branch
+    // with its cut point. A second transaction rather than a field on `NewTask`, because the
+    // measurement needs the task's `repo=` — which `task::create` has only just written.
+    if !quick_add_branches.is_empty() {
+        let root = repo::measure_root_for(db, id, None)?;
+        let branches = quick_add_branches.clone();
+        let reasons = db.write_txn("cli", move |conn, meta| {
+            let mut reasons = Vec::new();
+            for branch in &branches {
+                reasons.push(repo::record_branch(
+                    conn,
+                    meta,
+                    id,
+                    root.as_deref(),
+                    branch,
+                    None,
+                    repo::BranchWrite::Add,
+                )?);
+            }
+            Ok(reasons)
+        })?;
+        // Reported, like every other branch writer. Naming a branch you are about to cut is the
+        // ordinary use of `#branch=` on a quick-add line, so "no cut point yet" is the *common*
+        // outcome here — and dropping it with a bare `?` made this the one writer that leaves a
+        // task unable to auto-close without saying so.
+        if !json {
+            for (branch, why) in quick_add_branches.iter().zip(reasons) {
+                if let Some(why) = why {
+                    println!(
+                        "  note: no cut point was recorded for {branch}, so this task will not \
+                         auto-close — {}.",
+                        why.remedy(&uid, branch)
+                    );
+                }
+            }
+        }
+    }
     if json {
         println!(
             "{}",
@@ -3659,6 +4147,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             sync,
             managed,
             under,
+            home,
         } => cmd_task_add(
             db,
             &text,
@@ -3666,6 +4155,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
                 backlog,
                 sync,
                 managed,
+                home,
             },
             under.as_deref(),
             json,
@@ -3684,7 +4174,8 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         }
         TaskCmd::Show { uid } => {
             let id = resolve_task_uid(db, &uid)?;
-            output::print_item_full(db, id, json)?;
+            let extra = task_branch_extra(db, id)?;
+            output::print_item_full(db, id, json, &extra)?;
             // Subtasks are shown after the body: a parent is off the ready frontier until
             // they are all terminal, so "why isn't this actionable?" must be answerable
             // from the same command that shows the task.
@@ -3692,7 +4183,7 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
             if !subs.is_empty() && !json {
                 let open = subs
                     .iter()
-                    .filter(|t| !matches!(t.status.as_deref(), Some("done" | "cancelled")))
+                    .filter(|t| !jkb_types::TaskStatus::is_terminal_str(t.status.as_deref()))
                     .count();
                 println!("\nsubtasks ({open} open of {}):", subs.len());
                 for t in &subs {
@@ -3715,6 +4206,61 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
+}
+
+/// What this task's branches record — the cut point, the land target, and any landing jkb itself
+/// performed — for `jkb task show`.
+///
+/// Read for **every** branch the task names, keyed by branch: that is what the record is keyed by,
+/// and a task legitimately carries two. The old shape — a `base=<branch>:<sha>` tag among the
+/// task's tags — showed the same thing by accident of the encoding, and is what a dozen call sites
+/// then had to take apart.
+///
+/// The repository is the task's own `repo=`, so this reads correctly from anywhere; the database
+/// is global across repos (D32) and a namesake branch elsewhere is a different branch.
+fn task_branch_extra(db: &Db, id: ItemId) -> Result<output::Extra> {
+    let tags = repo::task_tags(db, id)?;
+    let branches = repo::facet_values(&tags, repo::FACET_BRANCH);
+    // The task's own `repo=` first, so this reads correctly from anywhere; otherwise the checkout
+    // we are standing in, which is what `record_branch` keys a task with no stated repo under.
+    let repo_key = repo::facet_one(&tags, repo::FACET_REPO)
+        .cloned()
+        .or_else(|| repo::repo_ctx().ok().map(|c| c.key));
+    let Some(repo_key) = repo_key else {
+        return Ok(output::Extra::default());
+    };
+    let records = repo::branch_records(db, &repo_key)?;
+    let mut extra = output::Extra::default();
+    let mut rows = Vec::new();
+    for b in branches {
+        let Some(r) = records.get(b) else { continue };
+        let mut line = match &r.cut_point {
+            Some(cut) => format!("  {b}: cut from {cut}"),
+            None => format!("  {b}: no cut point recorded"),
+        };
+        if let Some(target) = &r.land_target {
+            let _ = write!(line, ", lands on {target}");
+        }
+        if let Some(l) = &r.landed {
+            let _ = write!(line, ", landed on {} at {}", l.onto, l.at);
+        }
+        extra.lines.push(line);
+        rows.push(serde_json::json!({
+            "branch": b,
+            "cut_point": r.cut_point,
+            "land_target": r.land_target,
+            "landed_at": r.landed.as_ref().map(|l| l.at.clone()),
+            "landed_onto": r.landed.as_ref().map(|l| l.onto.clone()),
+            "landed_head": r.landed.as_ref().map(|l| l.head.clone()),
+        }));
+    }
+    if !extra.lines.is_empty() {
+        extra.lines.insert(0, "branches:".to_owned());
+    }
+    extra
+        .json
+        .insert("branches".to_owned(), serde_json::Value::Array(rows));
+    Ok(extra)
 }
 
 /// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
@@ -3815,15 +4361,29 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Start {
             uid,
             branch,
+            onto,
             repo,
             owner,
-        } => cmd_task_start(db, &uid, branch, repo, owner, json)?,
+        } => cmd_task_start(
+            db,
+            &uid,
+            StartWhere {
+                branch,
+                onto,
+                repo,
+                owner,
+            },
+            json,
+        )?,
+        TaskCmd::Base { forget } => cmd_task_base_forget(db, &forget, json)?,
         TaskCmd::CloseMerged {
             repo,
             trunk,
             dry_run,
         } => cmd_task_close_merged(db, repo, trunk, dry_run, json)?,
+        TaskCmd::Landed { branch, onto } => cmd_task_landed(db, &branch, &onto, json)?,
         TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
+        TaskCmd::Review { cmd } => cmd_task_review(db, cmd, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         // The read and session subcommands are dispatched by `cmd_task` and never reach here.
         TaskCmd::Add { .. }
@@ -3867,28 +4427,27 @@ fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The facet recording which branch a task is being done on, and which repo that branch is
-/// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
-const FACET_BRANCH: &str = "branch";
-const FACET_REPO: &str = "repo";
-/// The trunk commit the branch was cut from, recorded at `task start`. Without it a
-/// rebase-merged branch — which GitHub fast-forwards, leaving it byte-identical to trunk —
-/// cannot be told apart from a branch that was just created and never touched.
-const FACET_BASE: &str = "base";
+/// Where `task start` is being told the work is happening. Grouped so the signature stays under
+/// clap's and clippy's argument-count limits.
+struct StartWhere {
+    branch: Option<String>,
+    onto: Option<String>,
+    repo: Option<String>,
+    owner: Option<String>,
+}
 
 /// `task start` — claim the task and record where the work is happening.
 ///
 /// Claiming and tagging together is the point: "I am starting this" and "here is the branch
 /// that will finish it" are the same moment, and splitting them is how the tag ends up
 /// missing on exactly the tasks that needed it.
-fn cmd_task_start(
-    db: &Db,
-    uid: &str,
-    branch: Option<String>,
-    repo: Option<String>,
-    owner: Option<String>,
-    json: bool,
-) -> Result<()> {
+fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<()> {
+    let StartWhere {
+        branch,
+        onto,
+        repo,
+        owner,
+    } = where_;
     let cwd = std::env::current_dir()?;
     let branch = match branch {
         Some(b) => b,
@@ -3896,70 +4455,548 @@ fn cmd_task_start(
             "not on a branch here (detached HEAD?) — pass --branch, or run inside a git repo",
         )?,
     };
+    // Through the MAIN copy, never `key(&cwd)`: inside a `jkb task work` session that is the
+    // session's own directory, so the key came out as the session name — and now that these
+    // facets are *set* rather than added, that replaced the real `repo=` instead of sitting
+    // beside it. Every `repo=`-keyed surface (`staging ls`, In Flight, `task sessions`,
+    // `batch_onto`, `task review record`) then stopped seeing the task, and `review record`
+    // matching nothing is indistinguishable from a review that was never run.
+    //
+    // Resolved **once**. It was built three times here, each discarding the `trunk` it had just
+    // spawned git to find, and two of those sat inside the write transaction — which holds the
+    // single writer thread while git runs.
+    let here = repo::repo_ctx().ok();
     let repo = match repo {
         Some(r) => r,
-        None => gitrepo::key(&cwd)?
-            .context("not inside a git repo — pass --repo, or run this from the repo")?,
+        None => here
+            .as_ref()
+            .context("not inside a git repo — pass --repo, or run this from the repo")?
+            .key
+            .clone(),
     };
-    // Refuse the trunk: tagging a task with `branch=main` would make it close the instant
-    // anything merged, since trunk is trivially "merged into" itself.
-    if let Some(t) = gitrepo::trunk(&cwd)? {
-        let trunk_name = t.rsplit('/').next().unwrap_or(&t);
-        anyhow::ensure!(
-            branch != trunk_name,
-            "`{branch}` is this repo's trunk — start work on a feature branch, or the task \
-             would auto-close immediately"
-        );
-    }
-
-    // Trunk's tip right now is this branch's base (see FACET_BASE).
-    let base = gitrepo::rev(
-        &cwd,
-        &gitrepo::trunk(&cwd)?.unwrap_or_else(|| "HEAD".to_owned()),
-    )?;
+    // Only *this* repo's rules may be applied to the branch, so a `--repo <other>` run skips them
+    // rather than judging one repo's branch by another's trunk.
+    let ours = here.as_ref().filter(|c| c.key == repo);
+    let Land {
+        target: land_target,
+        dropped_trunk,
+    } = land_target_for(ours, &branch, onto.as_deref())?;
 
     let id = resolve_task_uid(db, uid)?;
+    // The one answer to "may a cut point be measured here" (`repo::measure_root_for`), shared with
+    // `jkb task base` and `jkb task tag`. `--repo <other>` names which task to tag and legitimately
+    // runs from anywhere; it does not license measuring a namesake branch in this checkout.
+    // `intended_repo` is the key about to be recorded, because this command is *stating* where the
+    // work is rather than reading it back.
+    let measure_in = repo::measure_root_for(db, id, Some(&repo))?;
     let owner = owner.unwrap_or_else(owner::self_owner);
-    let (o, b, r, base_sha) = (owner.clone(), branch.clone(), repo.clone(), base.clone());
-    db.write_txn("cli", move |conn, meta| {
-        claim::claim(conn, meta, id, &o)?;
-        tag::apply(conn, meta, id, FACET_BRANCH, &b)?;
-        tag::apply(conn, meta, id, FACET_REPO, &r)?;
-        if let Some(sha) = &base_sha {
-            tag::apply(conn, meta, id, FACET_BASE, sha)?;
+    let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
+    // The parent for the measurement is what the caller said; the land target is that minus trunk.
+    let (measure_against, n) = (onto.clone(), land_target.clone());
+    // Naming trunk as the parent says this branch is NOT on a batch, so a land target left from an
+    // earlier one is now false — and left in place it keeps the task in `staging ls` under a batch
+    // it was never cut from, and keeps that batch reading as live work.
+    let clear_onto = dropped_trunk;
+    // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
+    // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
+    // answer as a refusal meant `task start` refused its own second run under a new pid, and
+    // refused after `task work` — the very sequence the facet writing below exists for, since
+    // a session claims as `session:<pid>:<worktree>`.
+    let held = current_claim(db, id)?;
+    let mut keep_claim = false;
+    if let Some(prev) = &held {
+        if prev != &owner && owner::is_alive(prev) {
+            // A live session for this task that we are standing **inside** keeps its claim:
+            // replacing a `session:` owner with this one-second process's `host:pid` would
+            // make the task read as dead to `doctor --fix` the moment it exits, freeing a
+            // session someone is working in (D36.6). Any other live owner is someone else.
+            let inside =
+                owner::session_worktree(prev).is_some_and(|w| session::is_within(&cwd, &w));
+            anyhow::ensure!(
+                inside,
+                "{uid} is already claimed by {prev}, which is still alive — nothing was \
+                 changed. Finish or abandon that work, or use `jkb task release {uid} \
+                 --owner {prev}` if you are sure it is gone."
+            );
+            keep_claim = true;
         }
-        Ok(())
+    }
+    let displaced = held.clone();
+    let measure_root = measure_in.clone();
+    let (missing, shared) = db.write_txn("cli", move |conn, meta| {
+        // The CAS answer is checked rather than discarded: losing it means someone claimed the
+        // task between the probe and here, and reporting "started" while writing this session's
+        // branch onto their task is exactly the confusion the liveness guard above prevents.
+        if !keep_claim && !swap_claim(conn, meta, id, displaced.as_deref(), &o)? {
+            return Err(jkb_types::Error::Validation(
+                "the task was claimed by someone else while this command was checking — \
+                 nothing was changed; run it again"
+                    .to_owned(),
+            )
+            .into());
+        }
+        // Through the one location-facet writer, exactly as `task work` does. These were
+        // additive here, so `task work` followed by `task start` — which the guide encourages
+        // — left the task carrying two `branch=` values for one worktree.
+        let missing = repo::set_location_facets(
+            conn,
+            meta,
+            id,
+            measure_root.as_deref(),
+            &repo::Location {
+                branch: Some(&b),
+                repo: Some(&r),
+                onto: n.as_deref(),
+                cut_from: measure_against.as_deref(),
+            },
+        )?;
+        let shared = if clear_onto {
+            repo::clear_land_targets(conn, meta, id, measure_root.as_deref())?
+        } else {
+            Vec::new()
+        };
+        Ok((missing, shared))
+    })?;
+    report_shared_branches(&shared);
+    report_started(
+        db,
+        &Started {
+            uid,
+            branch: &branch,
+            repo: &repo,
+            owner: &owner,
+            missing,
+            dropped_trunk,
+        },
+        json,
+    )
+}
+
+/// Say which land targets were left alone, and who they belong to.
+///
+/// On stderr, so `--json` output stays machine-readable, and unconditionally: a land target is a
+/// property of the *branch*, so a command acting on one task can silently change what every other
+/// task on that branch sees. Reporting is the difference between "your siblings kept their batch"
+/// and a batch that quietly vanished from `jkb staging ls`.
+fn report_shared_branches(shared: &[repo::SharedBranch]) {
+    for s in shared {
+        eprintln!(
+            "note: {} still carries work for {} other task(s) — its land target was kept ({})",
+            s.branch,
+            s.tasks.len(),
+            s.tasks.join(", ")
+        );
+    }
+}
+
+/// What `task start` has just recorded, for reporting it.
+struct Started<'a> {
+    uid: &'a str,
+    branch: &'a str,
+    repo: &'a str,
+    owner: &'a str,
+    /// Why no cut point was recorded, straight from the writer that decided. Re-deriving it here
+    /// from "were we in the right repo?" reported a missing branch when the real reason was that
+    /// no parent had been named — a different problem with a different remedy.
+    missing: Option<base::Missing>,
+    /// `--onto` named trunk: measured against, deliberately not recorded as a land target.
+    dropped_trunk: bool,
+}
+
+/// Report a `task start`, on **both** output paths.
+///
+/// The human note was added first and alone, which left a JSON consumer — the UI, a workflow —
+/// with no way to tell that no cut point was recorded and the task will therefore never
+/// auto-close. A fact worth saying out loud is worth saying to whoever is actually reading.
+fn report_started(db: &Db, s: &Started<'_>, json: bool) -> Result<()> {
+    let Started {
+        uid,
+        branch,
+        repo,
+        owner,
+        ref missing,
+        dropped_trunk,
+    } = *s;
+    let recorded = base::recorded_for(db, repo, branch)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "uid": uid,
+                "branch": branch,
+                "repo": repo,
+                "owner": owner,
+                "base": recorded,
+                // Why there is no cut point, when there is none — the writer's own reason. A
+                // consumer cannot otherwise tell "wait for the branch to exist" from "name the
+                // parent" from "run this in the task's own repo", and each has its own remedy.
+                "base_missing_because": recorded.is_none()
+                    .then(|| missing.as_ref().map(base::Missing::as_str)).flatten(),
+                // A dropped land target is a thing that HAPPENED, so it is on both paths. The
+                // human note alone left a `--json` consumer unable to tell "trunk was named and
+                // dropped" from "no target was ever given".
+                "onto_dropped_trunk": dropped_trunk,
+            })
+        );
+        return Ok(());
+    }
+    println!("started {uid} on {repo}@{branch} (owner {owner})");
+    if dropped_trunk {
+        println!(
+            "  note: {branch} was cut from trunk, so that is what its cut point is measured \
+             against — but trunk is not recorded as a land target, or the task would read as \
+             merged the moment anything landed. Any earlier land target was cleared."
+        );
+    }
+    // Said here rather than left to a `close-merged` that quietly declines to act — and the
+    // reason comes from the writer, which is the only thing that knows which of the four it was.
+    //
+    // No remedy here ever names a hand-typed sha. The sha nearest to hand is the branch tip, and
+    // a cut point equal to the tip reads as "nothing has happened here" forever: never creditable,
+    // never landable, and never corrected, because `ensure_recorded` does not overwrite.
+    if let (None, Some(why)) = (&recorded, missing) {
+        println!(
+            "  note: no cut point was recorded, so this task will not auto-close — {}.",
+            why.remedy(uid, branch)
+        );
+    }
+    Ok(())
+}
+
+/// What `--onto` should be **recorded** as, given what it was passed — and the trunk rules.
+///
+/// `--onto` carries two roles that only come apart at trunk: the branch this one was **cut from**
+/// (a measurement reference) and the branch it **lands on** (`branch_records.land_target`, which
+/// puts it in the staging picker). Trunk is a perfectly good answer to the first and an
+/// unacceptable one to the second (D34.3), so it is used for the measurement and dropped from the
+/// record.
+///
+/// Refusing the flag outright was the first version, and it left a branch genuinely cut from trunk
+/// with commits already on it able to record only `base == tip` — permanently `NothingToMerge`,
+/// never creditable, never landable — with a hand-computed merge-base as the only way out, which
+/// is the thing this area exists to stop callers doing.
+///
+/// The work branch itself may never be trunk: `branch=main` closes the task the instant anything
+/// merges, since trunk is trivially merged into itself.
+fn land_target_for(ctx: Option<&repo::RepoCtx>, branch: &str, onto: Option<&str>) -> Result<Land> {
+    let Some(ctx) = ctx else {
+        // Not in the task's repository, so neither the trunk rule nor the existence check can be
+        // applied. Nothing is measured there either (`measure_root_for`), so the caller's word is
+        // taken for the facet and the cut point is simply not recorded.
+        return Ok(Land {
+            target: onto.map(str::to_owned),
+            dropped_trunk: false,
+        });
+    };
+    if let Some(trunk_name) = ctx.trunk_name() {
+        anyhow::ensure!(
+            branch != trunk_name,
+            "`{branch}` is this repo's trunk — start work on a feature branch, or the task would \
+             auto-close immediately"
+        );
+    }
+    // A land target this repository does not have is refused rather than stored. Storing it took
+    // the task out of `jkb staging ls` — the one read behind the picker and In Flight — and made
+    // `task land` fail later claiming the branch "no longer exists", which is not what happened.
+    // `task work --onto` may name a branch that does not exist yet because it *creates* it; this
+    // verb only records, so there is nothing here to make the name true.
+    //
+    // Asked as "is this a **branch**", not "does this revision resolve". The two come apart on
+    // exactly the values that hurt: `origin/<batch>` and a tag both resolve, and both were
+    // accepted and stored — the first under a key `staging ls` cannot look up (its map is keyed by
+    // bare short name), so the task vanished from the listing the guard exists to keep it in, and
+    // `land_preflight`'s `adopt_remote` later cut a junk local branch literally called
+    // `origin/<batch>`. What is recorded is the map key, never the caller's spelling.
+    //
+    // **Before** the trunk comparison below, not after: that compared the caller's spelling
+    // against trunk's short name and full ref, which is two spellings of one branch guessed at by
+    // hand. Canonicalizing first leaves it one comparison against one name, so `--onto origin/main`
+    // is recognised as trunk in a repository whose trunk ref is the bare `main` too.
+    let target = match onto {
+        None => None,
+        Some(onto) => match gitrepo::branch_name(&ctx.root, onto)? {
+            gitrepo::BranchName::Is(name) => Some(name),
+            gitrepo::BranchName::Unknown => anyhow::bail!(
+                "`{onto}` is not a branch in {} — a land target has to exist, or the task drops \
+                 out of `jkb staging ls` and `jkb task land` fails on it later. Create it first, \
+                 or name the branch {branch} was really cut from.",
+                ctx.key
+            ),
+            gitrepo::BranchName::NotABranch => anyhow::bail!(
+                "`{onto}` resolves in {} but is not a branch — a tag, an object id or `HEAD` \
+                 cannot be a land target, because every reader looks one up by branch name and \
+                 the task would simply disappear from `jkb staging ls`.",
+                ctx.key
+            ),
+        },
+    };
+    if let Some(trunk_name) = ctx.trunk_name() {
+        if target.as_deref() == Some(trunk_name) {
+            return Ok(Land {
+                target: None,
+                dropped_trunk: true,
+            });
+        }
+    }
+    Ok(Land {
+        target,
+        dropped_trunk: false,
+    })
+}
+
+/// What `--onto` resolved to: the land target to record, and whether trunk was dropped as one.
+struct Land {
+    target: Option<String>,
+    /// Trunk was named, so it is measured against but not recorded. Reported on **both** output
+    /// paths — a `--json` consumer could not otherwise tell a dropped target from one never given.
+    dropped_trunk: bool,
+}
+
+/// `task landed <branch> --onto <target>` — record a landing the merge queue performed (B4).
+///
+/// **Why this cannot be a fabrication route.** `jkb task land` writes the record in Rust, straight
+/// after its own gate; the queue is bash and needs a verb. So the verb re-establishes the fact it
+/// is being told, by asking the same question every reader asks: is this branch's work in the
+/// target (`repo::landed_with_base` → `Merged`)? A branch with nothing on it answers
+/// `NothingToMerge` and is refused, which is the case a fabricated call would otherwise use to
+/// claim a landing for work that does not exist.
+///
+/// Deliberately **not** "is the branch's tip an ancestor of the target". A queue entry that landed
+/// after an earlier one is rebased, so its commits are rewritten and the branch ref — which the
+/// detached rebase does not move — is not an ancestor of the target at all. That check would have
+/// refused every entry but the first, which is precisely the case the serial queue exists for.
+/// Containment by content is the project's own definition of landed (D34.2) and is the one that
+/// survives rebase and squash alike.
+fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> {
+    gitrepo::valid_ref(branch)?;
+    gitrepo::valid_ref(onto)?;
+    let ctx = repo::repo_ctx()?;
+    // The branch's own tip, read **before** anything else could move it, and required: a landing
+    // that cannot say which tip landed can never be credited, so recording one without it would
+    // be a row that reads as "landed" to nothing.
+    let head = gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?
+        .and_then(|r| gitrepo::rev_commit(&ctx.root, &r).transpose())
+        .transpose()?
+        .with_context(|| format!("{branch} does not exist in {}", ctx.key))?;
+    let cut = repo::branch_record(db, &ctx.key, branch)?.and_then(|r| r.cut_point);
+    let (state, _) = repo::landed_with_base(
+        &ctx.root,
+        branch,
+        onto,
+        cut.as_deref(),
+        gitrepo::Prefer::Local,
+    )?;
+    // The remedy comes from `base::advice`, which asks git about the branch — it is never written
+    // out here, and this is the surface that taught the rule. A refusal at *this* moment is
+    // usually a branch that has just been fast-forwarded into `onto`, i.e. one with no commits of
+    // its own left: naming a measuring verb there records its tip, which freezes the task at
+    // `NothingToMerge` permanently. See `base::MEASURE_VERB`.
+    if state != gitrepo::MergeState::Merged {
+        let advice = base::advice(&ctx.root, branch)?;
+        anyhow::bail!(
+            "{branch}'s work is not in {onto} ({state:?}), so nothing was recorded — this verb \
+             reports a landing the merge queue has already performed, and a record that a landing \
+             happened is acted on without re-checking. If {branch} has no cut point recorded, {}.",
+            advice.sentence("<uid>", branch)
+        );
+    }
+    let (key, root, b, o, h) = (
+        ctx.key.clone(),
+        ctx.root.clone(),
+        branch.to_owned(),
+        onto.to_owned(),
+        head.clone(),
+    );
+    // Through `repo::record_landing`, which canonicalizes both names. `valid_ref` above rejects
+    // only an unusable *string*; a tag, an object id or `origin/<batch>` all pass it and all
+    // resolve for `is_merged`, then store a `landed_onto` no reader looks up.
+    db.write_txn("cli", move |conn, meta| {
+        repo::record_landing(conn, meta, &root, &key, &b, &o, &h)
+    })?;
+    // Whether the event can ever be *credited* — reported, because it cannot be repaired from
+    // here. `close-merged` follows a landing to its target and then asks whether that target
+    // reached trunk, which needs the target's own cut point; with none it holds the task and says
+    // "still in flight", which is indistinguishable from the truth.
+    //
+    // Deliberately **not** measured here, though this is the one place that knows. A cut point is
+    // only provable while a branch is untouched, and a landing is precisely the moment the target
+    // stops being: the queue's first entry fast-forwards the target onto commits its source branch
+    // still holds, so `has_own_commits` truthfully answers "nothing of its own" and the tip — the
+    // one value that freezes a task at `NothingToMerge` forever — becomes admissible. The record
+    // has to be made when the batch is cut, which is what `--onto <batch>` does.
+    let target_base = repo::branch_record(db, &ctx.key, onto)?.and_then(|r| r.cut_point);
+    let creditable = repo::base_is_usable(&ctx.root, target_base.as_deref())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "repo": ctx.key, "branch": branch, "onto": onto, "head": head,
+                "target_base": target_base,
+                "creditable": creditable,
+            })
+        );
+    } else {
+        println!("recorded: {branch} landed on {onto} (from {head})");
+    }
+    if !creditable {
+        // Same rule as the refusal above, applied to the *target*: the graft has just moved
+        // `onto`'s tip onto commits the source branch still holds, so `onto` has no commits of its
+        // own either and `advice` will say so rather than naming a verb that would record its tip.
+        let advice = base::advice(&ctx.root, onto)?;
+        eprintln!(
+            "note: {onto} has no usable cut point recorded, so this landing cannot decide \
+             whether its tasks are done — they will report as still in flight. {}.",
+            advice.sentence("<uid>", onto)
+        );
+    }
+    Ok(())
+}
+
+/// `task base --forget <branch>` — drop a branch's recorded cut point (design B6).
+///
+/// The **only** cut-point verb a user or a workflow can reach, and it takes no commit id. Its
+/// predecessor did, and produced a finding family: the sha nearest a user's hand is the branch
+/// tip, recording the tip freezes the task at `NothingToMerge` permanently, and nothing could
+/// repair it. Forgetting always can — the next `jkb task start` / `task work` measures again.
+///
+/// Keyed `(repo, branch)`, so it names no task: a cut point is a fact about a branch, and every
+/// task on that branch shared the one record.
+fn cmd_task_base_forget(db: &Db, branch: &str, json: bool) -> Result<()> {
+    gitrepo::valid_ref(branch)?;
+    // The record is keyed by repo, so this has to be run where the branch lives. The database is
+    // global across repos (D32) and a namesake branch elsewhere is a different branch.
+    let ctx = repo::repo_ctx()?;
+    let (b, key) = (branch.to_owned(), ctx.key.clone());
+    let dropped = db.write_txn("cli", move |conn, meta| {
+        base::forget_cut_point(conn, meta, &key, &b)
     })?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "uid": uid, "branch": branch, "repo": repo, "owner": owner })
+            serde_json::json!({ "repo": ctx.key, "branch": branch, "forgotten": dropped })
+        );
+    } else if dropped {
+        println!("forgot {branch}'s cut point in {}", ctx.key);
+        // What happens next depends on the branch, not on this command: forgetting a cut point on
+        // a branch whose work has already been fast-forwarded away leaves nothing measurable, and
+        // saying "the next `task start` measures it again" there is how the task acquires a cut
+        // point equal to its tip.
+        println!(
+            "  next: {}",
+            base::advice(&ctx.root, branch)?.sentence("<uid>", branch)
         );
     } else {
-        println!("started {uid} on {repo}@{branch} (owner {owner})");
+        println!("{branch} had no recorded cut point in {}", ctx.key);
     }
     Ok(())
 }
 
 /// `task tag add|rm <uid> <facet>=<value>` — apply or remove one facet tag.
 fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
-    let (uid, facet_value, adding) = match cmd {
-        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, true),
-        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, false),
+    let (uid, facet_value, mode) = match cmd {
+        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, TagMode::Add),
+        TaskTagCmd::Set { uid, facet_value } => (uid, facet_value, TagMode::Set),
+        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, TagMode::Rm),
     };
     let (facet, value) = facet_value
         .split_once('=')
         .context("tag must be `facet=value`, e.g. `size=small`")?;
-    let (facet, value) = (facet.to_owned(), value.to_owned());
+    // A land target is a fact about a *branch* and lives in that branch's record, so a facet named
+    // `onto` reaches no reader. Refused rather than stored inert — a user who typed it expecting
+    // effect deserves an answer, not silence.
+    //
+    // `rm` is deliberately **not** refused. The refusal exists to stop a value nothing reads being
+    // *set*; removing one is always safe, and there is a route that still creates them — a synced
+    // `tasks.md` line carrying `#onto=` goes through `tag::reconcile_tags`, which is inert by
+    // design (B3) but real. Refusing `rm` left the only command that could remove such a tag
+    // declining on the grounds that it could not exist.
+    anyhow::ensure!(
+        facet != "onto" || matches!(mode, TagMode::Rm),
+        "`onto` records where a *branch* lands, not where a task is, so it is no longer a tag. \
+         Use `jkb task work <uid> --onto <branch>`, or `jkb task start <uid> --branch <b> \
+         --onto <branch>`."
+    );
+    // The ref-valued facet is read back and handed to git, so the same rule applies here as at
+    // the location writer: a value git would read as an option must not reach the store.
+    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
+        gitrepo::valid_ref(value)?;
+    }
     let id = resolve_task_uid(db, &uid)?;
+    // Putting a branch on a task records where that branch was cut, **however** the branch got
+    // there. This command used to write `branch=` on its own, which is the state that broke
+    // `/task-swarm` — and the swarm reached for it because the guide recommended it. Fixing the
+    // swarm alone would have left the hole open at the verb the next workflow reaches for.
+    //
+    // `add` still appends and `set` still replaces: a task can legitimately record two branches
+    // and every reader indexes both, so a command called `add` must not silently delete one. What
+    // changes is that neither can leave a branch without a cut point.
+    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
+        let root = repo::measure_root_for(db, id, None)?;
+        let how = match mode {
+            TagMode::Add => repo::BranchWrite::Add,
+            _ => repo::BranchWrite::Set,
+        };
+        let branch = value.to_owned();
+        // No `onto`: this verb states no parent. For an untouched branch that is still measurable
+        // (its tip is its fork point); for one with commits it is not, and nothing is recorded —
+        // which is said out loud rather than papered over with the tip.
+        let missing = db.write_txn("cli", {
+            let branch = branch.clone();
+            move |conn, meta| {
+                repo::record_branch(conn, meta, id, root.as_deref(), &branch, None, how)
+            }
+        })?;
+        // ONE object shape on the JSON path whether or not a cut point was recorded — two
+        // disjoint ones meant a consumer keying on `action` saw nothing on the reporting path and
+        // one keying on `base` saw nothing on the other.
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "uid": uid,
+                    "action": "tagged",
+                    "base_missing_because": missing.as_ref().map(base::Missing::as_str),
+                })
+            );
+            return Ok(());
+        }
+        println!("tagged: {uid}");
+        if let Some(why) = missing {
+            // The repository the message names comes from `Missing::NotThisRepo` itself. It used
+            // to be an argument, and this caller had none to give: passing the checkout we are
+            // standing in told the user to re-run from the repository that had just refused them.
+            // The parameter is gone rather than documented, so there is nothing left to give.
+            println!(
+                "  note: no cut point was recorded for {branch}, so this task will not \
+                 auto-close — {}.",
+                why.remedy(&uid, &branch)
+            );
+        }
+        return Ok(());
+    }
+    let (facet, value) = (facet.to_owned(), value.to_owned());
     db.write_txn("cli", move |conn, meta| {
-        if adding {
-            tag::apply(conn, meta, id, &facet, &value)
-        } else {
-            tag::remove(conn, meta, id, &facet, &value)
+        match mode {
+            // `add` is additive, honest to its name: an open-ended facet legitimately holds
+            // several values, and a command called `add` must not silently delete one.
+            TagMode::Add => tag::apply(conn, meta, id, &facet, &value),
+            // `set` replaces the facet's other values. Right for the facets answering "where
+            // is this being worked" — `repo=` is the one left here, and a second value for it is
+            // a contradiction, not extra information, which a reader collapsing the multi-map
+            // resolves at random (D36.6). (`onto=` is refused above; `branch=` is routed through
+            // `repo::record_branch`, which honours the same mode.)
+            TagMode::Set => repo::set_facet(conn, meta, id, &facet, &value),
+            TagMode::Rm => tag::remove(conn, meta, id, &facet, &value),
         }
     })?;
-    report(json, &uid, if adding { "tagged" } else { "untagged" });
+    report(
+        json,
+        &uid,
+        match mode {
+            TagMode::Add | TagMode::Set => "tagged",
+            TagMode::Rm => "untagged",
+        },
+    );
     Ok(())
 }
 
@@ -3973,7 +5010,18 @@ fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             gate,
             no_gate,
             keep_worktree,
-        } => cmd_task_land(db, &uid, gate.as_deref(), no_gate, keep_worktree, json),
+            no_review,
+        } => cmd_task_land(
+            db,
+            &uid,
+            LandFlags {
+                gate: gate.clone(),
+                no_gate,
+                keep_worktree,
+                no_review,
+            },
+            json,
+        ),
         TaskCmd::Abandon {
             uid,
             force,
@@ -3985,135 +5033,15 @@ fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
     }
 }
 
-/// The branch a session's work lands on (design D36.3). Recorded at `task work` so a resumed
-/// session — and `task land` itself — target the branch the batch was always going to, not
-/// whatever happens to be checked out later.
-const FACET_ONTO: &str = "onto";
-
-/// A task's facet tags, **every** value per facet.
-///
-/// Tags are a multi-map: `tag::apply` adds, so a task can legitimately carry two `branch=`
-/// values — one from `jkb task start` (D34) and one from `task work`. Collapsing them to a
-/// single value silently picks one, and picking the wrong `branch=` makes `task work` mint a
-/// second session for a task that already has one.
-fn task_tags(db: &Db, id: ItemId) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (facet, value) in db.read(move |conn| tag::applications(conn, id))? {
-        out.entry(facet).or_default().push(value);
-    }
-    Ok(out)
-}
-
-/// The values recorded for one facet.
-fn facet_values<'a>(tags: &'a BTreeMap<String, Vec<String>>, facet: &str) -> &'a [String] {
-    tags.get(facet).map_or(&[], Vec::as_slice)
-}
-
-/// The single value of a facet that should only ever have one (`onto`, `repo`, `base`).
-fn facet_one<'a>(tags: &'a BTreeMap<String, Vec<String>>, facet: &str) -> Option<&'a String> {
-    facet_values(tags, facet).first()
-}
-
-/// Set a facet to exactly one value, removing any others it already had.
-///
-/// `tag::apply` is additive, which is right for open-ended facets and wrong for the ones that
-/// answer "where is this being worked" — a second value there is not extra information, it is
-/// a contradiction the readers have to guess their way through.
-fn set_facet(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    facet: &str,
-    value: &str,
-) -> jkb_core::Result<()> {
-    for (f, v) in tag::applications(conn, id)? {
-        if f == facet && v != value {
-            tag::remove(conn, meta, id, &f, &v)?;
-        }
-    }
-    tag::apply(conn, meta, id, facet, value)
-}
-
-/// What the session commands need to know about the repo they are running in.
-struct RepoCtx {
-    /// The **main** copy's root — where `.jkb/` lives, even when invoked from inside a
-    /// session worktree.
-    root: PathBuf,
-    /// The repo key, matching the `repo=` tag and the `repos/<repo>` namespace (D26/D32).
-    key: String,
-    /// The trunk ref (`origin/main`, `main`, …), if this repo has a discoverable one.
-    trunk: Option<String>,
-}
-
-impl RepoCtx {
-    /// The trunk's short branch name (`origin/main` → `main`), for comparing against a
-    /// checked-out branch and for cutting new branches.
-    fn trunk_name(&self) -> Option<&str> {
-        self.trunk
-            .as_deref()
-            .map(|t| t.rsplit('/').next().unwrap_or(t))
-    }
-}
-
-/// Resolve the repo the current directory belongs to.
-fn repo_ctx() -> Result<RepoCtx> {
-    let cwd = std::env::current_dir()?;
-    let root = gitrepo::main_root(&cwd)?.context(
-        "not inside a git repo — a task session is a git worktree, so run this from the repo",
-    )?;
-    let key = gitrepo::key(&root)?.context("could not determine this repo's name")?;
-    let trunk = gitrepo::trunk(&root)?;
-    Ok(RepoCtx { root, key, trunk })
-}
-
-/// One task, as far as the session commands care.
-struct SessionTask {
-    uid: String,
-    status: String,
-    onto: Option<String>,
-}
-
-/// This repo's tasks indexed by **every** branch each records.
-///
-/// `branch=` is the only link from a worktree back to its task — there is deliberately no
-/// session state file to fall out of step with git (design D36.2). A task carrying two of
-/// them is indexed under both, so a worktree is found whichever one names it.
-fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
-    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo_key}"))?;
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-    let mut out = BTreeMap::new();
-    for id in ids {
-        let tags = task_tags(db, id)?;
-        let Some(meta) = db.read(move |conn| item::get(conn, id))? else {
-            continue;
-        };
-        for branch in facet_values(&tags, FACET_BRANCH) {
-            out.insert(
-                branch.clone(),
-                SessionTask {
-                    uid: meta.uid.clone(),
-                    status: meta.status.clone().unwrap_or_default(),
-                    onto: facet_one(&tags, FACET_ONTO).cloned(),
-                },
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// The live session for a task, matched against **all** the branches it records.
-///
-/// Matching by worktree rather than by "the task's branch tag" is what makes a task that
-/// picked up a second `branch=` (from `jkb task start`, or an earlier `--onto`) still resolve
-/// to the session that actually exists on disk.
-fn session_for(
-    ctx: &RepoCtx,
-    tags: &BTreeMap<String, Vec<String>>,
-) -> Result<Option<session::Session>> {
-    let branches = facet_values(tags, FACET_BRANCH);
-    Ok(session::discover(&ctx.root)?
-        .into_iter()
-        .find(|s| branches.contains(&s.branch)))
+/// How `task tag` should write a facet.
+#[derive(Clone, Copy)]
+enum TagMode {
+    /// Append a value, keeping any others.
+    Add,
+    /// Make this the facet's only value.
+    Set,
+    /// Remove this value.
+    Rm,
 }
 
 /// `task work` — open (or return) an isolated session for a task (design D36.2).
@@ -4121,7 +5049,7 @@ fn session_for(
 /// Idempotent by construction: the task's own `branch=` tag names its session, so a second
 /// invocation hands back the same worktree instead of forking the work onto a second branch.
 fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let cwd = std::env::current_dir()?;
     let id = resolve_task_uid(db, uid)?;
 
@@ -4130,7 +5058,7 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
         .and_then(|m| m.status);
     if let Some(status) = status.as_deref() {
         anyhow::ensure!(
-            !matches!(status, "done" | "cancelled"),
+            !jkb_types::TaskStatus::is_terminal_str(Some(status)),
             "{uid} is already {status} — there is nothing to work"
         );
     }
@@ -4138,13 +5066,13 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     // Session worktrees live inside the repo, so the first one must not make it dirty.
     session::ensure_excluded(&ctx.root)?;
 
-    let tags = task_tags(db, id)?;
+    let tags = repo::task_tags(db, id)?;
     let sessions = session::discover(&ctx.root)?;
     // A session already recorded on the task keeps its name, so a second invocation returns
     // the same worktree instead of forking the work onto a second branch. A task may record
     // more than one branch (a `jkb task start` before a `task work`, or an earlier `--onto`),
     // so prefer the one that has a live worktree over merely the first that parses.
-    let recorded = facet_values(&tags, FACET_BRANCH);
+    let recorded = repo::facet_values(&tags, repo::FACET_BRANCH);
     let existing = recorded
         .iter()
         .find(|b| sessions.iter().any(|s| s.branch == **b))
@@ -4174,37 +5102,35 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
 
     let resumed = sessions.iter().any(|s| s.branch == branch);
     if !resumed {
-        if let Some(parent) = worktree.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        anyhow::ensure!(
-            !worktree.exists(),
-            "{} exists but git does not know it as a worktree — remove it, or run \
-             `git worktree prune`",
-            worktree.display()
-        );
-        if let Err(e) = gitrepo::worktree_add(&ctx.root, &worktree, &branch, &onto) {
-            // Do not leave the task claimed for a session that failed to open.
-            let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
-            return Err(e);
-        }
+        open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?;
     }
 
     // Record where the work is happening, exactly as `task start` does (D34.1), plus the
-    // land target so `land` and a resumed `work` agree on it. These four facets are *set*,
+    // land target so `land` and a resumed `work` agree on it. These three facets are *set*,
     // not added: a second value would be a contradiction rather than extra information, and
     // is how a task ends up with two branches and one worktree.
-    let base = gitrepo::rev(&ctx.root, &onto)?;
+    //
+    // The cut point is measured by `base::ensure_recorded`, which also discards a record that
+    // cannot describe this branch. Nothing about *this* call site decides that: it was gated on
+    // `resumed` once (worktree existence, a proxy for the wrong thing) and on a created-ness flag
+    // threaded out of `worktree_add` once, and both were state carried across the git/database
+    // boundary that a crash or a second entry point could lose.
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
+    let root = ctx.root.clone();
     db.write_txn("cli", move |conn, meta| {
-        set_facet(conn, meta, id, FACET_BRANCH, &b)?;
-        set_facet(conn, meta, id, FACET_REPO, &r)?;
-        set_facet(conn, meta, id, FACET_ONTO, &o)?;
-        if let Some(sha) = &base {
-            set_facet(conn, meta, id, FACET_BASE, sha)?;
-        }
-        Ok(())
+        repo::set_location_facets(
+            conn,
+            meta,
+            id,
+            Some(&root),
+            &repo::Location {
+                branch: Some(&b),
+                repo: Some(&r),
+                onto: Some(&o),
+                // `task work` cuts the branch from its land target, so the two are the same.
+                cut_from: None,
+            },
+        )
     })?;
 
     if json {
@@ -4217,6 +5143,9 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
                 "branch": branch,
                 "onto": onto,
                 "resumed": resumed,
+                // Reported for the same reason `task start` reports it: a consumer cannot
+                // otherwise tell whether this session's work can ever auto-close.
+                "base": base::recorded_for(db, &ctx.key, &branch)?,
                 "owner": owner,
             })
         );
@@ -4231,30 +5160,99 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     Ok(())
 }
 
+/// Make the session's worktree, returning whether its **branch** had to be created.
+///
+/// Split out of `cmd_task_work` for length.
+///
+/// **Every** failure path releases the claim. `claim_session` has already written a
+/// `session:<pid>:<worktree>` owner, and `owner::is_alive` judges one solely by whether that
+/// directory exists (D36.6) — so a bail-out caused by the directory being in the way leaves a
+/// claim that reads as alive forever, freed by neither `doctor --fix` nor `task reclaim`. Only the
+/// `worktree_add` arm used to release, while the doc claimed all of them did.
+fn open_worktree(
+    db: &Db,
+    id: ItemId,
+    root: &Path,
+    worktree: &Path,
+    branch: &str,
+    onto: &str,
+) -> Result<()> {
+    let opened = open_worktree_inner(root, worktree, branch, onto);
+    if opened.is_err() {
+        let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
+    }
+    opened
+}
+
+/// The fallible half of [`open_worktree`], so one `Err` covers every way it can fail.
+fn open_worktree_inner(root: &Path, worktree: &Path, branch: &str, onto: &str) -> Result<()> {
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    anyhow::ensure!(
+        !worktree.exists(),
+        "{} exists but git does not know it as a worktree — remove it, or run \
+         `git worktree prune`",
+        worktree.display()
+    );
+    gitrepo::worktree_add(root, worktree, branch, onto)
+}
+
 /// Decide which branch this session's work will land on (design D36.3).
 fn resolve_onto(
     db: &Db,
-    ctx: &RepoCtx,
+    ctx: &repo::RepoCtx,
     cwd: &Path,
     tags: &BTreeMap<String, Vec<String>>,
     flag: Option<&str>,
     session_name: &str,
 ) -> Result<String> {
-    if let Some(branch) = flag {
+    if let Some(flag) = flag {
+        // The bare branch name the flag refers to, before anything acts on it. Unlike `task
+        // start`, this verb may legitimately be handed a branch that does not exist yet — it
+        // creates one — so `Unknown` is accepted and taken literally. What is refused is a name
+        // that resolves to something *else*: `git branch <tag> <tag>` would otherwise cut a branch
+        // named after a tag, and `--onto origin/<batch>` cut one literally called
+        // `origin/<batch>`, which no reader of a land target can ever look up.
+        let branch = match gitrepo::branch_name(&ctx.root, flag)? {
+            gitrepo::BranchName::Is(name) => name,
+            gitrepo::BranchName::Unknown => flag.to_owned(),
+            gitrepo::BranchName::NotABranch => anyhow::bail!(
+                "`{flag}` resolves in {} but is not a branch — a tag, an object id or `HEAD` \
+                 cannot be a land target, because every reader looks one up by branch name and \
+                 the session would simply disappear from `jkb staging ls`.",
+                ctx.key
+            ),
+        };
         anyhow::ensure!(
-            Some(branch) != ctx.trunk_name(),
+            Some(branch.as_str()) != ctx.trunk_name(),
             "refusing to land on {branch}: it is this repo's trunk, and a task tagged with \
              it would read as merged the moment anything lands"
         );
-        if !gitrepo::has_branch(&ctx.root, branch)? {
-            gitrepo::create_branch(&ctx.root, branch, &batch_start(ctx, cwd)?)?;
+        // Adopt an existing branch — including one that exists only on `origin/` — rather than
+        // replacing it with an empty namesake cut from trunk. The start point is resolved **only**
+        // if there is nothing to adopt: computing it eagerly made every `task work` fail in a repo
+        // whose trunk cannot be discovered, including the `--onto` escape hatch the error
+        // recommends.
+        if !gitrepo::adopt_remote(&ctx.root, &branch)? {
+            gitrepo::create_branch(&ctx.root, &branch, &batch_start(ctx, cwd)?)?;
         }
-        return Ok(branch.to_owned());
+        return Ok(branch);
     }
-    // A session that already has a target keeps it.
-    if let Some(branch) = facet_one(tags, FACET_ONTO) {
-        if gitrepo::has_branch(&ctx.root, branch)? {
-            return Ok(branch.clone());
+    // A session that already has a target keeps it — counting the remote-tracking copy, or a
+    // batch whose local ref was pruned would silently retarget the session somewhere else.
+    //
+    // Read from the branch's own record, and from **every** branch this task records: the session
+    // branch is minted before this runs, so on a resume the target hangs off whichever branch the
+    // previous run recorded it against.
+    let records = repo::branch_records(db, &ctx.key)?;
+    for work in repo::facet_values(tags, repo::FACET_BRANCH) {
+        let Some(branch) = records.get(work).and_then(|r| r.land_target.as_deref()) else {
+            continue;
+        };
+        if gitrepo::adopt_remote(&ctx.root, branch)? {
+            return Ok(branch.to_owned());
         }
     }
     // Join the batch the other live sessions are landing on.
@@ -4270,6 +5268,9 @@ fn resolve_onto(
         }
     }
     // Cut the batch branch from trunk, named after this task — the first of the batch.
+    // `create_branch`, deliberately: this is cutting a NEW batch at a known start point, so a
+    // same-named branch left on the remote by an earlier, possibly already-merged batch must not
+    // be adopted in its place.
     gitrepo::create_branch(&ctx.root, session_name, &batch_start(ctx, cwd)?)?;
     Ok(session_name.to_owned())
 }
@@ -4281,7 +5282,7 @@ fn resolve_onto(
 /// (you just merged a PR and pulled, or you commit locally first), and cutting the batch from
 /// the remote ref there would silently start the work behind commits you already have, then
 /// land it as if it were on top of them.
-fn batch_start(ctx: &RepoCtx, cwd: &Path) -> Result<String> {
+fn batch_start(ctx: &repo::RepoCtx, cwd: &Path) -> Result<String> {
     if let Some(branch) = gitrepo::current_branch(cwd)? {
         if Some(branch.as_str()) == ctx.trunk_name() {
             return Ok(branch);
@@ -4298,14 +5299,19 @@ fn batch_start(ctx: &RepoCtx, cwd: &Path) -> Result<String> {
 /// This is what makes a second session started from trunk join the first one's batch instead
 /// of cutting a branch of its own. Sessions that disagree are left alone: guessing which of
 /// two batches a new task belongs to is worse than asking for `--onto`.
-fn batch_onto(db: &Db, ctx: &RepoCtx) -> Result<Option<String>> {
-    let by_branch = tasks_by_branch(db, &ctx.key)?;
+fn batch_onto(db: &Db, ctx: &repo::RepoCtx) -> Result<Option<String>> {
+    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
     let mut found: Option<String> = None;
     for s in session::discover(&ctx.root)? {
         let Some(onto) = by_branch.get(&s.branch).and_then(|t| t.onto.clone()) else {
             continue;
         };
-        if !gitrepo::has_branch(&ctx.root, &onto)? {
+        // Remote-aware for the same reason: a live batch whose local ref is gone must still be
+        // joinable, or the next session cuts a second batch beside it. **Materialised**, not just
+        // detected — a bare branch name that only exists under `refs/remotes` is not a valid start
+        // point, so merely counting it as live handed `git branch <session> <batch>` a name it
+        // could not resolve and aborted the command.
+        if !gitrepo::adopt_remote(&ctx.root, &onto)? {
             continue;
         }
         match &found {
@@ -4331,7 +5337,7 @@ fn batch_onto(db: &Db, ctx: &RepoCtx) -> Result<Option<String>> {
 }
 
 /// The branch checked out in `.jkb/base`, if that worktree exists.
-fn base_branch(ctx: &RepoCtx) -> Result<Option<String>> {
+fn base_branch(ctx: &repo::RepoCtx) -> Result<Option<String>> {
     let base = session::base_worktree(&ctx.root);
     Ok(gitrepo::worktrees(&ctx.root)?
         .into_iter()
@@ -4346,16 +5352,22 @@ fn base_branch(ctx: &RepoCtx) -> Result<Option<String>> {
 ///
 /// A repo with no discoverable trunk cannot answer the question, so the batch is kept: losing
 /// a live batch is worse than reusing a spent one.
-fn batch_is_spent(ctx: &RepoCtx, branch: &str) -> Result<bool> {
+fn batch_is_spent(ctx: &repo::RepoCtx, branch: &str) -> Result<bool> {
     let Some(trunk) = &ctx.trunk else {
         return Ok(false);
     };
-    Ok(gitrepo::is_merged(&ctx.root, branch, trunk, None)?.0 == gitrepo::MergeState::Merged)
+    // The **local** branch: this asks whether the batch here has anything left to give,
+    // and a local ref that has had another task landed onto it is not spent, whatever its
+    // pushed copy did.
+    Ok(
+        gitrepo::is_merged(&ctx.root, branch, trunk, None, gitrepo::Prefer::Local)?.0
+            == gitrepo::MergeState::Merged,
+    )
 }
 
 /// Remove `.jkb/base`, freeing the branch it holds. It is only ever a checkout cache; `land`
 /// makes a new one on demand.
-fn release_base_worktree(ctx: &RepoCtx) -> Result<()> {
+fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
     let base = session::base_worktree(&ctx.root);
     if base.exists() {
         gitrepo::worktree_remove(&ctx.root, &base, true)?;
@@ -4363,14 +5375,54 @@ fn release_base_worktree(ctx: &RepoCtx) -> Result<()> {
     Ok(())
 }
 
-/// Take the session's claim, taking over from this session's own previous process (a resume)
-/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
-fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -> Result<()> {
-    let held = db
+/// Who holds `id` right now, or `None` if it is free.
+///
+/// The read half of every claim takeover: the owner string this returns is the one the caller
+/// judges (liveness, same-session, same-worktree) and the one [`swap_claim`] must later CAS
+/// against, so the two always talk about the same claim.
+fn current_claim(db: &Db, id: ItemId) -> Result<Option<String>> {
+    Ok(db
         .read(claim::claimed)?
         .into_iter()
         .find(|c| c.id == id)
-        .map(|c| c.owner);
+        .map(|c| c.owner))
+}
+
+/// Move the claim on `id` to `owner`, atomically against `displaced` — the **exact** owner
+/// [`current_claim`] returned and the caller judged. `Ok(false)` means the claim changed hands
+/// in between and nothing was written; every caller turns that into "run it again".
+///
+/// Clearing first is what lets a resumed session re-take its own claim under a new pid: the CAS
+/// in [`claim::claim`] accepts only a free task or a byte-identical owner. Clearing only the
+/// *judged* owner is what stops it from throwing away a claim it never looked at — the liveness
+/// probe forks `ps` outside the transaction, and a `jkb task work` landing in that window would
+/// otherwise lose its fresh claim to a decision taken about a different, dead owner.
+///
+/// The one rendering of that dance. It was written twice, and the copies had already drifted:
+/// one checked the CAS answer and one did not, so half the callers could report success while
+/// writing this session's branch onto somebody else's task.
+///
+/// # Errors
+/// Returns an error if either claim write fails.
+fn swap_claim(
+    conn: &rusqlite::Connection,
+    meta: &jkb_core::WriteMeta,
+    id: ItemId,
+    displaced: Option<&str>,
+    owner: &str,
+) -> jkb_core::Result<bool> {
+    if let Some(prev) = displaced {
+        if !claim::clear_if(conn, meta, id, prev)? {
+            return Ok(false);
+        }
+    }
+    claim::claim(conn, meta, id, owner)
+}
+
+/// Take the session's claim, taking over from this session's own previous process (a resume)
+/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
+fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -> Result<()> {
+    let held = current_claim(db, id)?;
     if let Some(prev) = &held {
         let same_session =
             owner::session_worktree(prev).is_some_and(|w| session::same_path(&w, worktree));
@@ -4385,71 +5437,203 @@ fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -
             );
         }
     }
-    let (o, had) = (owner.to_owned(), held.is_some());
+    let (o, displaced) = (owner.to_owned(), held.clone());
     let ok = db.write_txn("cli", move |conn, meta| {
-        // Clearing first is what lets a resumed session re-take its own claim under a new
-        // pid: the CAS in `claim` only accepts a free task or the identical owner string.
-        if had {
-            claim::clear(conn, meta, id)?;
-        }
-        claim::claim(conn, meta, id, &o)
+        swap_claim(conn, meta, id, displaced.as_deref(), &o)
     })?;
-    anyhow::ensure!(ok, "could not claim {uid}");
+    anyhow::ensure!(
+        ok,
+        "{uid} was claimed by someone else while this command was checking — nothing was \
+         changed; run it again"
+    );
     Ok(())
 }
 
 /// `task land` — the merge queue for one session (design D36.4).
-fn cmd_task_land(
-    db: &Db,
-    uid: &str,
-    gate_flag: Option<&str>,
+/// The flags of `task land`, grouped so the signature stays under the bool-argument lint.
+struct LandFlags {
+    gate: Option<String>,
     no_gate: bool,
     keep_worktree: bool,
-    json: bool,
-) -> Result<()> {
-    let ctx = repo_ctx()?;
-    let id = resolve_task_uid(db, uid)?;
-    let tags = task_tags(db, id)?;
+    no_review: bool,
+}
+
+/// What `land` needs from the task and its session once every precondition has held.
+struct Preflight {
+    sess: session::Session,
+    branch: String,
+    onto: String,
+    ahead: usize,
+}
+
+/// Everything `land` checks before the review gate: it must be landable *at all*, and nothing
+/// here has moved a branch, so a refusal leaves the repo exactly as it was.
+///
+/// These are the same conditions `staging::land_blocker` reports per row (design D38.8) —
+/// this is the authority, and the row renders the verdict this side computes rather than
+/// re-deriving it from a projection that cannot express half of them.
+///
+/// Runs with the land lock already held, which is what lets these be checked **once**: a target
+/// checkout found clean here is still the one the graft a moment later goes into, so the second
+/// dirty check that used to sit on the other side of the lock closed no window and was simply a
+/// second wording of one rule.
+fn land_preflight(
+    db: &Db,
+    ctx: &repo::RepoCtx,
+    uid: &str,
+    id: ItemId,
+    tags: &BTreeMap<String, Vec<String>>,
+) -> Result<Preflight> {
+    // The task's own pipeline state, mapped by the one function that does that — so the
+    // terminal arm of `land_blocker` below is the arm that actually fires here, rather than a
+    // second bail beside it saying the same thing in its own words.
+    let state = staging::State::from_status(
+        &db.read(move |conn| item::get(conn, id))?
+            .and_then(|m| m.status)
+            .unwrap_or_default(),
+    );
     anyhow::ensure!(
-        !facet_values(&tags, FACET_BRANCH).is_empty(),
+        !repo::facet_values(tags, repo::FACET_BRANCH).is_empty(),
         "{uid} has no session — run `jkb task work {uid}` first"
     );
-    let sess = session_for(&ctx, &tags)?.with_context(|| {
-        format!(
-            "no session worktree for {} — it may already have landed, or been removed",
-            facet_values(&tags, FACET_BRANCH).join(", ")
-        )
-    })?;
-    let branch = sess.branch.clone();
-    let onto = facet_one(&tags, FACET_ONTO)
-        .cloned()
+    // A missing worktree is NOT bailed on here. `land_blocker` below already judges it, and
+    // judges it better — it distinguishes a swarm task being built elsewhere from an abandoned
+    // checkout, and tells the first not to run `jkb task work` (which would cut a second branch
+    // and detach it from its group). A bail here made that arm unreachable from the one command
+    // it is the authority for, so the In Flight row and `land` explained the same task
+    // differently.
+    //
+    // Session and branch together, through the one rule the In Flight row uses. Sharing the
+    // existence *predicate* was not enough: the row preferred a recorded branch that resolves
+    // while this took whichever came first, so the one shared blocker explained the same task two
+    // opposite ways — and this side's advice, `jkb task work`, cuts a second branch and detaches
+    // the task from its batch.
+    let repo::Work {
+        session: sess,
+        branch,
+    } = repo::work_for(ctx, tags)?;
+    let branch = branch.context("this task records no branch")?;
+    // The land target of the branch the work is on — asked of that branch's record, so a task
+    // carrying a stale sibling branch cannot answer with the sibling's batch.
+    let onto = repo::branch_record(db, &ctx.key, &branch)?
+        .and_then(|r| r.land_target)
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
+    // The same question the session paths ask, and materialised for the same reason: the land
+    // path checks the target out, so a target that exists only on `origin/` is usable — refusing
+    // it meant `land` rejected a branch it would itself have created a moment later.
+    //
+    // This **writes** — it can create a local ref — which is worth saying out loud in something
+    // called a preflight. It is confined to `cmd_task_land`, this function's only caller, which
+    // materialises the same branch moments later anyway; the listing surfaces use
+    // `staging::land_blocker`, which reads and never creates.
     anyhow::ensure!(
-        gitrepo::has_branch(&ctx.root, &onto)?,
+        gitrepo::adopt_remote(&ctx.root, &onto)?,
         "the land target {onto} no longer exists"
     );
+    // Everything from here is `staging::land_blocker` — the ONE derivation of "may this
+    // land", which the In Flight row renders verbatim. It was restated per surface twice, and
+    // each time a row claimed "Landable" for a task this command then refused: the uncommitted
+    // session, the empty branch, the dirty target checkout, the review gate. Assembling the
+    // facts is this side's job; judging them is not.
+    //
+    // ONE question about the work branch, asked the same way the listing asks it: does it exist
+    // here — counting a remote-tracking copy — and under what name? Asking `has_branch` here while
+    // the row asked remote-inclusively made the one shared blocker print two opposite explanations
+    // for the same task: the row said it is being built elsewhere, the command said its worktree
+    // was abandoned and told the owner to open a new session, which detaches it from its group.
+    // The resolved ref is also what the count is taken with — a bare remote-only name resolves to
+    // nothing, and `ahead_count` refuses rather than answering zero.
+    // BOTH operands resolved through the same map. The work branch was, and the land target was
+    // still passed as a bare name — so a target living only as `origin/<onto>` aborted the command
+    // with a raw git error before any of the graceful refusals below, while `staging ls` counted
+    // the identical pair without trouble. `adopt_remote` above has just materialised it locally,
+    // so the map is re-read rather than reused from before that.
+    let refs = gitrepo::branch_refs(&ctx.root)?;
+    let work_ref = refs.get(&branch);
+    let onto_ref = refs.get(&onto);
+    let ahead = match (work_ref, onto_ref) {
+        (Some(work), Some(target)) => gitrepo::ahead_count(&ctx.root, target, work)?,
+        _ => 0,
+    };
+    let worktrees = gitrepo::worktrees(&ctx.root)?;
+    let mut dirty_cache = BTreeMap::new();
+    let target_dirty =
+        staging::target_dirty_reason(&worktrees, &ctx.root, &onto, &mut dirty_cache)?;
+    let dirty = match &sess {
+        Some(s) => gitrepo::is_dirty(&s.worktree)?,
+        None => false,
+    };
+    if let Some(reason) = staging::land_blocker(&staging::LandFacts {
+        state,
+        worktree: sess.as_ref().map(|s| s.worktree.as_path()),
+        dirty,
+        commits: ahead,
+        branch_exists: work_ref.is_some(),
+        target_dirty: target_dirty.as_deref(),
+        // The review is enforced a moment later by `review::enforce`, which renders the same
+        // verdict at length and is where `--no-review` records a waiver instead of refusing.
+        verdict: None,
+    }) {
+        anyhow::bail!("{uid} cannot land. {reason}");
+    }
+    // Unreachable: `land_blocker` refuses `worktree: None` above. Written as an error rather
+    // than an `expect` so the no-panic rule holds even if that arm is ever weakened.
+    let sess = sess.context("this task has no session worktree")?;
+    Ok(Preflight {
+        sess,
+        branch,
+        onto,
+        ahead,
+    })
+}
 
-    anyhow::ensure!(
-        !gitrepo::is_dirty(&sess.worktree)?,
-        "{} has uncommitted changes — commit them in the session before landing",
-        sess.worktree.display()
-    );
-    let ahead = gitrepo::ahead_count(&ctx.root, &onto, &branch)?;
-    anyhow::ensure!(
-        ahead > 0,
-        "{branch} has no commits that {onto} does not — nothing to land"
-    );
+fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
+    let LandFlags {
+        gate: gate_flag,
+        no_gate,
+        keep_worktree,
+        no_review,
+    } = flags;
+    let gate_flag = gate_flag.as_deref();
+    let ctx = repo::repo_ctx()?;
+    let id = resolve_task_uid(db, uid)?;
+    let tags = repo::task_tags(db, id)?;
 
-    // Landing is serial: two grafts at once would each gate a tree the other is changing.
+    // The lock is taken **before** anything is checked, not just before the graft.
+    //
+    // It used to be taken afterwards, which left a window between deciding the target checkout was
+    // clean and grafting into it — and the answer was a second, independently worded dirty check
+    // on the other side of the lock. That does not close the window, it moves it: the second check
+    // has exactly the same gap to the graft. What actually closes it is checking under the lock,
+    // so there is now one rule (`staging::target_dirty_reason`, shared with the In Flight row)
+    // evaluated once. A redundant guard that reads as protection is worse than none.
+    //
+    // Acquiring costs nothing here: it fails fast rather than waiting, and every other precondition
+    // below is equally worth serialising against a concurrent land.
+    //
+    // The lock file lives in `.jkb/`, and taking it this early means a land that is about to be
+    // *refused* creates that directory too — in a repo where `task work` has never run, and so has
+    // never excluded it. A lock file stranded by a kill would then show up as untracked and make
+    // the user's tree dirty. Excluded first, in `.git/info/exclude` exactly as `task work` does it:
+    // local to this clone, never their committed `.gitignore` (D36.2).
+    session::ensure_excluded(&ctx.root)?;
     let _lock = session::LandLock::acquire(&ctx.root)?;
 
+    let Preflight {
+        sess,
+        branch,
+        onto,
+        ahead,
+    } = land_preflight(db, &ctx, uid, id, &tags)?;
+
+    // The review gate (design D38.5), before the graft: a refusal must not have moved a
+    // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
+    // only *owed* here; it is written after the landing actually happens, so a land that then
+    // fails on the graft or the gate build leaves no waiver for something that never occurred.
+    let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
+    let waiver_owed = review::enforce(db, uid, &tags, no_review, json)?;
+
     let land_dir = land_dir_for(&ctx, &onto)?;
-    anyhow::ensure!(
-        !gitrepo::is_dirty(&land_dir)?,
-        "{} (checked out to {onto}) has uncommitted changes — landing would roll them back \
-         on a red gate",
-        land_dir.display()
-    );
 
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
     let gitrepo::Graft::Landed { grafted } = outcome else {
@@ -4484,38 +5668,215 @@ fn cmd_task_land(
         }
     }
 
-    // Landed: the task is done, the claim is free, and the session branch is a duplicate of
-    // commits now in `onto`.
-    db.write_txn("cli", move |conn, meta| {
-        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
-        claim::clear(conn, meta, id)?;
-        Ok(())
-    })?;
+    settle_landing(
+        db,
+        id,
+        &ctx,
+        &sess,
+        Landed {
+            uid,
+            branch: &branch,
+            onto: &onto,
+            grafted: &grafted,
+            ahead,
+            gate: gate.as_deref(),
+            gate_source: source.label(),
+            keep_worktree,
+            waiver: waiver_owed.then_some(head.as_str()),
+            // Only a real commit id: `head` falls back to the literal "unknown" for the waiver
+            // string, and a landing event whose `landed_head` is not a commit can never be
+            // credited — it would silently mean "never credited" rather than "not recorded".
+            head: base::is_object_id(&head).then_some(head.as_str()),
+        },
+        json,
+    )
+}
+
+/// What a successful graft produced, for the bookkeeping that follows it.
+#[derive(Clone, Copy)]
+struct Landed<'a> {
+    uid: &'a str,
+    branch: &'a str,
+    onto: &'a str,
+    grafted: &'a str,
+    ahead: usize,
+    gate: Option<&'a str>,
+    gate_source: &'a str,
+    keep_worktree: bool,
+    /// The branch HEAD to record as `review-waived=`, when `--no-review` carried this land.
+    waiver: Option<&'a str>,
+    /// The branch's **own tip** at the moment of the graft, recorded as `landed_head`.
+    ///
+    /// `graft` rebases a detached HEAD, so the branch ref still points here afterwards — which is
+    /// what lets a later reader tell this landing from one belonging to a namesake branch cut
+    /// under the same name after the fact.
+    head: Option<&'a str>,
+}
+
+/// Mark the task done, free the claim, and dispose of the session (design D36.4).
+fn settle_landing(
+    db: &Db,
+    id: ItemId,
+    ctx: &repo::RepoCtx,
+    sess: &session::Session,
+    landed: Landed<'_>,
+    json: bool,
+) -> Result<()> {
+    // The waiver first, in its own transaction, because it describes something that has
+    // **already** happened: the commits are on the target before this function is called.
+    // Written together with the status below, it was lost every time the dirty-session guard
+    // bailed — the override had landed, and nothing anywhere recorded that the review gate was
+    // skipped, which is precisely the state `--no-review` records a facet to avoid (D38.5). It
+    // is also recorded for a task somebody finished during the gate: the waived landing is what
+    // it describes, not the status.
+    if let Some(sha) = landed.waiver {
+        let sha = sha.to_owned();
+        db.write_txn("cli", move |conn, meta| {
+            repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, &sha)
+        })?;
+    }
+
+    // The landing itself, recorded because jkb performed it (design B4). It shrinks the number of
+    // branches whose landing has to be *inferred* from refs from one per task to one per batch —
+    // and the surviving one, the staging branch, is the case where the cut point is provable (an
+    // untouched branch forked at its own tip) rather than measured against a moving parent.
+    //
+    // After the gate, deliberately: a land that rolled back must leave no event. Before the
+    // session-disposal guard below, equally deliberately: the commits are on the target by this
+    // point, so the event is true whatever happens to the worktree.
+    //
+    // WHAT IS RECORDED IS WHERE THE BRANCH WILL POINT WHEN THIS COMMAND EXITS. `credited` compares
+    // the branch's tip against `landed_head`, and the `--keep-worktree` arm below re-points the
+    // branch to the grafted commit — so recording the pre-graft tip there wrote an event that
+    // could never match, silently discarding the one piece of evidence jkb had about a landing it
+    // performed itself. The ordinary arm deletes the branch, and a gone branch is credited
+    // outright, so its `head` is only ever read if the deletion fails.
+    if let Some(head) = landed.head {
+        let recorded = if landed.keep_worktree {
+            landed.grafted
+        } else {
+            head
+        };
+        let (key, root, branch, onto, recorded) = (
+            ctx.key.clone(),
+            ctx.root.clone(),
+            landed.branch.to_owned(),
+            landed.onto.to_owned(),
+            recorded.to_owned(),
+        );
+        db.write_txn("cli", move |conn, meta| {
+            repo::record_landing(conn, meta, &root, &key, &branch, &onto, &recorded)
+        })?;
+    }
+
+    // Is the session still there at all? `git status` in a directory that no longer exists
+    // exits non-zero, and `gitrepo::git` maps that to `Ok(None)` — so `is_dirty` answers
+    // "clean" for a vanished worktree and the disposal below then fails on it. A concurrent
+    // `jkb task abandon` removes exactly this directory, so the case is real, and "gone" is
+    // the one state where disposal has nothing left to do.
+    let disposed_already = !sess.worktree.exists();
+
+    // The session was verified clean in `land_preflight`, but that was before a graft and a
+    // gate build that can run for minutes — long enough for the agent sitting in the session
+    // to write a file. Every disposal below is destructive (`reset --hard`, `worktree
+    // remove`), so the check is taken **again**, here, against the state we are about to
+    // discard. The landing itself already happened and is not undone by this; the session is
+    // simply kept, with its work, for the person to deal with.
+    anyhow::ensure!(
+        disposed_already || !gitrepo::is_dirty(&sess.worktree)?,
+        "{branch} landed on {onto} — the commits are there — but {} has uncommitted changes \
+         written since the landing began, so the session is kept exactly as it is rather than \
+         reset over them. Deal with them, then close the task with \
+         `jkb task set {uid} --status done` and drop the session with \
+         `jkb task abandon {uid} --force`.",
+        sess.worktree.display(),
+        branch = landed.branch,
+        onto = landed.onto,
+        uid = landed.uid,
+    );
+
+    // Dispose of the session FIRST, because it is the fallible half. `worktree_remove` without
+    // `--force` is refused by git on a dirty tree, and doing it after the status write left
+    // the task marked `done` with its claim freed and its worktree still there — a state both
+    // escape hatches then refuse ("is done — there is nothing to land", "abandoning it would
+    // reopen finished work"), recoverable only by hand-editing the status.
     let mut cleaned = false;
-    if keep_worktree {
+    if disposed_already {
+        // Somebody removed it while the gate ran. Nothing to dispose of, and prune the
+        // registration so git stops listing a worktree whose directory is gone.
+        let _ = gitrepo::prune_worktrees(&ctx.root);
+        cleaned = true;
+    } else if landed.keep_worktree {
         // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
         // commits. Left there, the kept session reads as N commits ahead of a target that
         // already contains its work, and a second `land` re-runs the whole graft. Move it to
-        // what actually landed; the worktree is verified clean above, so nothing is lost.
-        gitrepo::reset_hard(&sess.worktree, &grafted)?;
+        // what actually landed; the worktree is verified clean just above, so nothing is lost.
+        gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
     } else {
         gitrepo::worktree_remove(&ctx.root, &sess.worktree, false)?;
-        gitrepo::delete_branch(&ctx.root, &branch, true)?;
+        gitrepo::delete_branch(&ctx.root, landed.branch, true)?;
         cleaned = true;
     }
 
+    // Landed: the task is done, the claim is free, and the session branch is a duplicate of
+    // commits now in `onto`.
+    //
+    // The status is re-read **inside** the transaction: `land_preflight` checked it before a
+    // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
+    // land (`LandLock` only excludes a second land). Writing `Done` over a cancellation made
+    // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
+    // Whether the status was left as somebody else set it during the gate. Reported, not
+    // returned as an error: the session HAS been disposed of by this point, so bailing left
+    // the claim held on a worktree that no longer exists — freed only by `doctor --fix` — and
+    // said nothing about what had just been removed.
+    let kept_status = db.write_txn("cli", move |conn, meta| {
+        // No claim CAS here. `task::set_status` clears the claim unconditionally on a terminal
+        // status (task.rs:446) and `claim::clear` has no owner predicate, so an owner-scoped
+        // clear a few lines above it decided nothing on the path that matters — and a guard that
+        // does nothing is worse than none, because it reads as protection.
+        //
+        // Two things this deliberately leaves OPEN rather than pretending to solve: on the
+        // early-return below (the task is already terminal) `set_status` never runs, so nothing
+        // clears the claim there; and `land_preflight` never checks who holds the claim, so
+        // `jkb task land` can still free a live non-session claim through that same transition.
+        let current = item::get(conn, id)?.and_then(|m| m.status);
+        if jkb_types::TaskStatus::is_terminal_str(current.as_deref()) {
+            return Ok(current);
+        }
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
+        Ok(None)
+    })?;
+    if let Some(status) = &kept_status {
+        eprintln!(
+            "note: {} became {status} while the gate was running, so its status was left \
+             alone. Its commits are on {}, and its session has been disposed of.",
+            landed.uid, landed.onto
+        );
+    }
+
+    // Reported from what actually happened, never from what was intended. Two claims here were
+    // simply false: `"{uid} is done"` after a status this transaction deliberately left as
+    // `cancelled`, and "removed session and its branch" in the arm that only ran
+    // `git worktree prune` because somebody else had already removed the directory.
+    let status = kept_status.as_deref().unwrap_or("done");
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "uid": uid, "landed": true, "branch": branch, "onto": onto,
-                "commits": ahead, "gate": gate, "gate_source": source.label(),
-                "session_removed": cleaned,
+                "uid": landed.uid, "landed": true, "branch": landed.branch, "onto": landed.onto,
+                "commits": landed.ahead, "gate": landed.gate, "gate_source": landed.gate_source,
+                "session_removed": cleaned, "status": status,
+                "branch_deleted": cleaned && !disposed_already,
             })
         );
     } else {
-        println!("landed: {branch} → {onto} ({ahead} commit(s)); {uid} is done");
-        if cleaned {
+        println!(
+            "landed: {} → {} ({} commit(s)); {} is {status}",
+            landed.branch, landed.onto, landed.ahead, landed.uid
+        );
+        if cleaned && disposed_already {
+            println!("  session was already gone; pruned its registration");
+        } else if cleaned {
             println!("  removed session {} and its branch", sess.name);
         }
     }
@@ -4530,14 +5891,29 @@ fn cmd_task_land(
 /// refuses a path that already exists, so adding a second one would fail the moment a batch
 /// landed onto a different branch than the last, and keep failing until the directory was
 /// deleted by hand.
-fn land_dir_for(ctx: &RepoCtx, onto: &str) -> Result<PathBuf> {
+fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
     if let Some(dir) = gitrepo::worktree_for_branch(&ctx.root, onto)? {
         return Ok(dir);
     }
     let base = session::base_worktree(&ctx.root);
-    if base_branch(ctx)?.is_some() {
-        // It exists and holds some other branch — if it held `onto`, the lookup above would
-        // have found it. Reuse it: it is a cache, and switching keeps its build artifacts.
+    // Whether git knows a worktree there — NOT whether it has a branch. A **detached**
+    // `.jkb/base` has no branch, so the branch test sent it to the "exists but git does not
+    // know it" bail below and refused every landing, while `staging::land_dir_in` matched the
+    // same directory by path and reported the task landable. `switch_to` attaches it either
+    // way, so a detached base is an ordinary reusable cache.
+    let base_registered = gitrepo::worktrees(&ctx.root)?
+        .iter()
+        .any(|w| session::same_path(&w.path, &base));
+    if base_registered {
+        // It exists and holds some other branch (or none) — if it held `onto`, the lookup
+        // above would have found it. Reuse it: it is a cache, and switching keeps its
+        // build artifacts.
+        //
+        // This is not a second copy of the land gate's dirty rule (that one lives in
+        // `staging::target_dirty_reason` and is asked once, under the lock). It guards the
+        // mutation on the *next* line: `git switch` across branches carries uncommitted changes
+        // over, or refuses outright with a message about neither jkb nor the task. Hence its own
+        // remedy, which is about this scratch checkout rather than about landing.
         anyhow::ensure!(
             !gitrepo::is_dirty(&base)?,
             "{} has uncommitted changes — it is jkb's own scratch checkout, so commit or \
@@ -4576,17 +5952,57 @@ fn cmd_task_abandon(
     delete_branch: bool,
     json: bool,
 ) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let id = resolve_task_uid(db, uid)?;
-    let tags = task_tags(db, id)?;
-    let sess = session_for(&ctx, &tags)?;
-    // Prefer the branch that actually has a worktree; fall back to the recorded one so a
-    // session whose checkout was deleted by hand can still be cleaned up in the KB.
-    let branch = sess
-        .as_ref()
-        .map(|s| s.branch.clone())
-        .or_else(|| facet_one(&tags, FACET_BRANCH).cloned())
-        .with_context(|| format!("{uid} has no session"))?;
+    // Abandon does two separable things: it **disposes of the session**, and it **reopens the
+    // task**. Only the second is wrong for a terminal task — a landed one is already merged
+    // and a cancelled one was deliberately dropped, so putting either back on the ready
+    // frontier (still tagged with its branch, re-dispatchable to the swarm) is the harm.
+    //
+    // Refusing outright was the first fix, and it stranded the session instead: `task set
+    // --status cancelled` leaves the worktree, branch and claim in place, no other verb
+    // removes them, and the workaround the refusal suggested — reopen, then abandon — caused
+    // exactly the reopening it was guarding against. So the cleanup runs and the status is
+    // left alone. The decision is taken inside the transaction below, against the status as
+    // it is *then* — not against a snapshot from before a worktree removal that can take
+    // long enough for a concurrent land to finish.
+    let tags = repo::task_tags(db, id)?;
+    // Through the one rule (`repo::work_for`), not a third theory of it. This used to prefer the
+    // session's branch and otherwise take the *first* recorded value — and `tag::applications`
+    // orders by value, so a task carrying a stale `a-old` beside a live `z-live` had this command
+    // delete `a-old` and forget its cut point under `--delete-branch`, while `jkb staging ls` and
+    // `jkb task land` both named `z-live` as the branch the row was about. Abandon acted on a
+    // branch the user was never shown, and reported it as though it were the one they clicked.
+    let repo::Work {
+        session: sess,
+        branch,
+    } = repo::work_for(&ctx, &tags)?;
+    let branch = branch.with_context(|| format!("{uid} has no session"))?;
+
+    // Abandoning is for **this** session's work. Since the swarm now records `branch=` and its
+    // branch's land target so its tasks appear in the same views (D38), a task another IMPLEMENTER is
+    // actively building is one right-click away — and `claim::clear` has no owner CAS, so it
+    // would free a live claim and let the next SCHEDULER pass dispatch a second builder while
+    // the first keeps going. Refuse a claim this session does not hold unless forced.
+    let held = current_claim(db, id)?;
+    if let Some(owner) = &held {
+        let mine = sess.as_ref().is_some_and(|s| {
+            owner::session_worktree(owner).is_some_and(|w| session::same_path(&w, &s.worktree))
+        });
+        // **Liveness**, the same rule `task work` and `task start` follow (D27.1/D36.6) —
+        // not owner-string identity. Judging by name refused a claim left behind by a crashed
+        // implementer or a session whose worktree was deleted by hand, so the one command that
+        // exists to clean a session up was blocked by the wreckage it was there to remove, and
+        // pointed the user at `jkb task release` for an owner that provably no longer exists.
+        // What must be protected is work someone is *still doing*.
+        if !mine && owner::is_alive(owner) && !force {
+            anyhow::bail!(
+                "{uid} is claimed by {owner}, which is still alive — abandoning it would free \
+                 a claim someone is working under. Finish or abandon that work, use `jkb task \
+                 release {uid} --owner {owner}` if you are sure it is gone, or pass --force."
+            );
+        }
+    }
 
     if let Some(sess) = &sess {
         if !force {
@@ -4598,25 +6014,98 @@ fn cmd_task_abandon(
         }
         gitrepo::worktree_remove(&ctx.root, &sess.worktree, force)?;
     }
+    // Deleting the branch takes its cut point with it. `--delete-branch` frees the branch *name*
+    // while leaving the task live, so the next `jkb task work` cuts a **new** branch under that
+    // name — and the old record still resolved, still differed from the new tip, so `is_merged`
+    // skipped its freshly-cut guard and `close-merged` closed a task with nothing written on it.
+    //
+    // Its own transaction, before the one below: that one has several early returns (a claim taken
+    // in the meantime, a task that finished while the worktree was being removed) and none of them
+    // change the fact that the branch is gone.
+    let mut branch_deleted = false;
     if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
+        branch_deleted = true;
+        let (gone, key, root) = (branch.clone(), ctx.key.clone(), ctx.root.clone());
+        db.write_txn("cli", move |conn, meta| {
+            base::forget(conn, meta, Some(&root), &key, &gone)
+        })?;
     }
-    // Release and reopen: the task is available again, and its claim is gone with the
-    // worktree that held it.
-    db.write_txn("cli", move |conn, meta| {
-        claim::clear(conn, meta, id)?;
+    // Release, and reopen unless the task is already finished.
+    //
+    // The land target is cleared **only** when the task is reopened, which is exactly when it
+    // stops being true: an abandoned task is no longer landing on that batch, and leaving it
+    // made the task keep rendering as live `implementing` work — which in turn kept its staging
+    // branch classified unmerged and offered as a land target long after the batch was spent
+    // (D36.3). For a task that stays `done` or `cancelled` it is history: it records which batch
+    // the work went to (or was dropped from), and the In Flight view reads it.
+    //
+    // The status is re-read inside the transaction, so a task that finished while this
+    // command was removing a worktree is not reopened by a decision taken before that.
+    // Reported from what the transaction actually did, not from the snapshot taken before the
+    // worktree removal: a task that finished while this command was running was correctly
+    // left alone, and then announced as "open again" with `"reopened": true`, which the
+    // extension believes.
+    let observed = held.clone();
+    let abandon_root = ctx.root.clone();
+    let (reopened, final_status, shared) = db.write_txn("cli", move |conn, meta| {
+        // Only the claim judged above, and nothing at all when there was none. `held` was read
+        // before two git subprocesses (`worktree remove`, `delete-branch`) — a far wider window
+        // than the `ps` fork that motivated `clear_if` — so a claim taken in the meantime
+        // belongs to a worker whose claim this command never looked at. An unconditional clear
+        // freed a task the next SCHEDULER pass had just handed to an implementer, and then
+        // reopened it, which is how two builders end up on one task.
+        // Also covers the case the guard above missed: no claim was observed before the git
+        // subprocesses, but one exists now. `set_status(Open)` is non-terminal so `task.rs:446`
+        // does not fire and the new owner's claim survives either way — the harm is a cleared
+        // land target and a `"reopened": true` that is not true, rather than two builders on one
+        // task, since `ready` requires `claimant_id IS NULL`.
+        if observed.is_none() && claim::claimed(conn)?.iter().any(|c| c.id == id) {
+            let current = item::get(conn, id)?
+                .and_then(|m| m.status)
+                .unwrap_or_default();
+            return Ok((false, current, Vec::new()));
+        }
+        if let Some(prev) = &observed {
+            if !claim::clear_if(conn, meta, id, prev)? {
+                // The claim changed hands while the worktrees were being removed. Whoever
+                // holds it now was never judged by this command, so reopening the task and
+                // clearing its land target would take work off a live worker — the same reasoning
+                // that makes the clear itself a CAS. Report what is true and change nothing.
+                let current = item::get(conn, id)?
+                    .and_then(|m| m.status)
+                    .unwrap_or_default();
+                return Ok((false, current, Vec::new()));
+            }
+        }
+        let current = item::get(conn, id)?
+            .and_then(|m| m.status)
+            .unwrap_or_default();
+        if jkb_types::TaskStatus::is_terminal_str(Some(current.as_str())) {
+            return Ok((false, current, Vec::new()));
+        }
+        let shared = repo::clear_land_targets(conn, meta, id, Some(&abandon_root))?;
         task::set_status(conn, meta, id, jkb_types::TaskStatus::Open)?;
-        Ok(())
+        Ok((true, "open".to_owned(), shared))
     })?;
+    report_shared_branches(&shared);
 
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "uid": uid, "abandoned": true, "branch": branch,
-                "worktree_removed": sess.is_some(), "branch_deleted": delete_branch,
+                "uid": uid, "abandoned": true, "branch": branch, "reopened": reopened,
+                "status": final_status,
+                // What happened, not what was asked for: `--delete-branch` on a branch that was
+                // already gone deletes nothing.
+                "worktree_removed": sess.is_some(), "branch_deleted": branch_deleted,
             })
         );
+    } else if !reopened {
+        println!("abandoned the session for {uid}; it stays {final_status}");
+        if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
+            println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
+        }
     } else {
         println!("abandoned {uid}; it is open again");
         if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
@@ -4628,17 +6117,27 @@ fn cmd_task_abandon(
 
 /// `task sessions` — what is in flight in this repo.
 fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     let sessions = session::discover(&ctx.root)?;
-    let by_branch = tasks_by_branch(db, &ctx.key)?;
+    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
 
     let mut rows = Vec::new();
     for s in &sessions {
         let task = by_branch.get(&s.branch);
         let onto = task.and_then(|t| t.onto.clone());
-        let ahead = match &onto {
-            Some(o) => gitrepo::ahead_count(&ctx.root, o, &s.branch)?,
-            None => 0,
+        // Resolved first: a recorded land target whose branch has since been deleted cannot be
+        // counted against, and `ahead_count` refuses an operand it cannot resolve rather than
+        // answering zero.
+        let onto_ref = match &onto {
+            Some(o) => gitrepo::branch_ref(&ctx.root, o, gitrepo::Prefer::Local)?,
+            None => None,
+        };
+        // `None`, never `0`: a recorded land target that no longer exists makes the count
+        // unknowable, and zero already means "nothing to land" to every other reader. This is the
+        // fourth call site of `ahead_count` and the last one still folding the two together.
+        let ahead = match &onto_ref {
+            Some(reference) => Some(gitrepo::ahead_count(&ctx.root, reference, &s.branch)?),
+            None => None,
         };
         // Deliberately no "attended" flag: nothing here can observe whether anyone is sitting
         // in a session. The owner's pid belongs to the one-second `jkb task work` process, so
@@ -4668,12 +6167,19 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
             } else {
                 ""
             };
+            // Three states, not two: a count, a target that has been deleted, and a session that
+            // never recorded one. Folding the last into the second sent people looking for a
+            // branch nobody had removed.
+            let commits = match (r["commits"].as_u64(), r["onto"].as_str()) {
+                (Some(n), _) => format!("{n} commit(s)"),
+                (None, Some(onto)) => format!("commits unknown ({onto} no longer exists)"),
+                (None, None) => "commits unknown (no land target recorded)".to_owned(),
+            };
             println!(
-                "{:<28} {} → {}  {} commit(s){dirty}",
+                "{:<28} {} → {}  {commits}{dirty}",
                 r["session"].as_str().unwrap_or("?"),
                 r["branch"].as_str().unwrap_or("?"),
                 r["onto"].as_str().unwrap_or("?"),
-                r["commits"],
             );
             if let Some(uid) = r["uid"].as_str() {
                 println!("  {uid} ({})", r["status"].as_str().unwrap_or("?"));
@@ -4685,7 +6191,7 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
 
 /// `task gate` — show, set, or clear the command that verifies a landing here (D36.5).
 fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<()> {
-    let ctx = repo_ctx()?;
+    let ctx = repo::repo_ctx()?;
     if clear {
         session::set_gate(db, &ctx.key, None)?;
     } else if let Some(cmd) = cmd {
@@ -4723,14 +6229,14 @@ fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<
 /// a session you are working in from one you walked away from (design D36.6), and a report
 /// that guesses would tell you to abandon the work you are doing.
 fn report_sessions(db: &Db) {
-    let Ok(ctx) = repo_ctx() else { return };
+    let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
         return;
     };
     if sessions.is_empty() {
         return;
     }
-    let by_branch = tasks_by_branch(db, &ctx.key).unwrap_or_default();
+    let by_branch = repo::tasks_by_branch(db, &ctx.key).unwrap_or_default();
     println!("task sessions: {} in flight", sessions.len());
     for s in &sessions {
         let uid = by_branch
@@ -4745,7 +6251,176 @@ fn report_sessions(db: &Db) {
     }
 }
 
+/// Mark `id` done, unless it finished on its own since the caller last looked. Returns whether
+/// the status was written.
+///
+/// The status is re-read **inside** the transaction. `close-merged` snapshots every candidate
+/// up front and then runs several git subprocesses per task, and it runs from a post-merge
+/// hook over all of them at once — long enough for a `jkb task set --status cancelled` to land
+/// in between and be silently overwritten with `done`. Same reasoning as `settle_landing` and
+/// `review::record`.
+fn close_if_still_open(db: &Db, id: ItemId) -> Result<bool> {
+    Ok(db.write_txn("cli", move |conn, meta| {
+        let current = item::get(conn, id)?.and_then(|m| m.status);
+        if jkb_types::TaskStatus::is_terminal_str(current.as_deref()) {
+            return Ok(false);
+        }
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)?;
+        Ok(true)
+    })?)
+}
+
+/// `--repo` names which tasks to consider; every git question is still asked of the repository
+/// we are standing in, so those must be the same place.
+///
+/// The refusal is a **refusal**, not a skip. Written as `if let Ok(here) = repo_ctx()` it did
+/// nothing at all outside a git repo — the case where the mismatch is total — and the run then
+/// reported every live branch of the named repo as gone, advising the user to delete the tag
+/// tracking it. An answer that is unavailable must not read as a benign one.
+fn check_repo_is_here(repo: &str) -> Result<()> {
+    let here = repo::repo_ctx().with_context(|| {
+        format!(
+            "--repo {repo} was given but this is not a git repository, and every branch would be \
+             looked up here — reporting {repo}'s live branches as gone. Run it from {repo}'s \
+             checkout."
+        )
+    })?;
+    anyhow::ensure!(
+        here.key == repo,
+        "--repo {repo} does not match the repository here ({}), and the branches would be looked \
+         up in this one. Run it from {repo}'s checkout.",
+        here.key
+    );
+    Ok(())
+}
+
+/// Which of `branches` do not exist here at all — asked **per branch**, with the same `Prefer`
+/// `close-merged` uses everywhere else.
+///
+/// Both arms that report goneness call this. They each had their own loop for one commit, which is
+/// how one of them came to interpolate the joined branch list into the message and call a live
+/// branch gone alongside a deleted one. A local-only `refs/heads/` probe is also wrong here: a
+/// branch living solely on the remote is the ordinary state after a merged PR deletes the local
+/// copy.
+fn gone_branches(cwd: &Path, branches: &[String]) -> Result<Vec<String>> {
+    let mut gone = Vec::new();
+    for b in branches {
+        if gitrepo::branch_ref(cwd, b, gitrepo::Prefer::Remote)?.is_none() {
+            gone.push(b.clone());
+        }
+    }
+    Ok(gone)
+}
+
+/// The merge state of a task, given **every** branch it records: anything short of `Merged`
+/// wins, so one unmerged branch holds the task whatever order they come back in.
+///
+/// Taking one branch — the lexicographically smallest, as `tag::applications` orders them — meant
+/// a task with `a-merged` and `z-live` closed while `z-live` was still in flight.
+fn merged_state_of_all(
+    db: &Db,
+    cwd: &Path,
+    repo_key: &str,
+    branches: &[String],
+    trunk_ref: &str,
+    warned_fallback: &mut bool,
+) -> Result<gitrepo::MergeState> {
+    let mut state = gitrepo::MergeState::Merged;
+    for b in branches {
+        // `landed_for_action`, not `is_merged`: closing a task is acting on the answer, so a
+        // branch with no recorded cut point must not count as landed. It is also what consults a
+        // landing jkb itself performed, and what refuses a record whose branch shows a verified
+        // anchor mismatch. The remote copy answers "did this work ship?" — after a merged PR the
+        // local branch is usually stale or already deleted (design D34.2).
+        let (s, fell_back) =
+            repo::landed_for_action(db, cwd, repo_key, b, trunk_ref, gitrepo::Prefer::Remote)?;
+        if fell_back && !*warned_fallback {
+            *warned_fallback = true;
+            eprintln!(
+                "warning: this git lacks `merge-tree --write-tree` (needs 2.38+), so \
+                 squash-merged branches will read as unmerged"
+            );
+        }
+        if !matches!(s, gitrepo::MergeState::Merged) {
+            return Ok(s);
+        }
+        state = s;
+    }
+    Ok(state)
+}
+
 /// `task close-merged` — close tasks whose branch has landed (design D34.4).
+/// The uid, status and facets `close-merged` needs for one task.
+type CloseMergedRow = (String, Option<String>, BTreeMap<String, Vec<String>>);
+
+/// Read one task's uid, status and facet tags in a single database round-trip.
+///
+/// The whole multi-map, not a hand-picked facet or two. The previous reader collected `branch=`
+/// with `tags.iter().find(...)`, and `tag::applications` is `ORDER BY facet, value`, so it
+/// silently took the lexicographically smallest branch: with `a-merged` and `z-live` recorded,
+/// the task closed while `z-live` was still in flight.
+fn close_merged_row(db: &Db, id: ItemId) -> Result<CloseMergedRow> {
+    Ok(db
+        .read(move |conn| {
+            let meta = item::get(conn, id)?;
+            let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (facet, value) in tag::applications(conn, id)? {
+                grouped.entry(facet).or_default().push(value);
+            }
+            Ok(meta.map(|m| (m.uid, m.status, grouped)))
+        })?
+        .unwrap_or_default())
+}
+
+/// Which tasks `close-merged` considers, and what it measures them against.
+///
+/// Split from the loop for length; every rule here is about the *arguments*, not about any task.
+///
+/// # Errors
+/// Returns an error if the repo cannot be determined, `--repo` names a different one than this
+/// checkout, or trunk cannot be resolved.
+fn close_merged_scope(
+    cwd: &Path,
+    repo: Option<String>,
+    trunk: Option<String>,
+) -> Result<(String, String)> {
+    // The main copy's key, for the same reason `task start` uses it: run from a session worktree,
+    // `key(&cwd)` is the session's name and this silently matches no tasks at all.
+    let explicit_repo = repo.is_some();
+    let repo =
+        match repo {
+            Some(r) => r,
+            // Deliberately not "pass --repo": every branch is looked up in the repository we are
+            // standing in, so `check_repo_is_here` refuses that flag in exactly this situation.
+            // Recommending it sent the user round a loop with no exit.
+            None => repo::repo_ctx()
+                .context(
+                    "not inside a git repo, and every branch is looked up here — run this from \
+                     the checkout of the repo whose tasks you want to close",
+                )?
+                .key,
+        };
+    // `--repo` selects which tasks to consider; every git question is still asked of the
+    // repository we are standing in. Those must be the same place or the command probes one repo
+    // about another's branches — reporting live work as gone and advising its tag be deleted. It
+    // is a filter, not a redirect, so a mismatch is refused rather than guessed at.
+    if explicit_repo {
+        check_repo_is_here(&repo)?;
+    }
+    let trunk_ref = match trunk {
+        Some(t) => t,
+        None => gitrepo::trunk(cwd)?.context(
+            "could not determine this repo's trunk (no origin/HEAD and no main/master/trunk) \
+             — pass --trunk",
+        )?,
+    };
+    // Checked where the flag is accepted, not only where it is eventually used: with no candidate
+    // task the probe never runs, so an unusable `--trunk` was silently accepted and the run
+    // reported "nothing to close" as though it had asked.
+    gitrepo::valid_ref(&trunk_ref)?;
+    Ok((repo, trunk_ref))
+}
+
 fn cmd_task_close_merged(
     db: &Db,
     repo: Option<String>,
@@ -4754,109 +6429,358 @@ fn cmd_task_close_merged(
     json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo = match repo {
-        Some(r) => r,
-        None => gitrepo::key(&cwd)?
-            .context("not inside a git repo — pass --repo, or run this from the repo")?,
-    };
-    let trunk_ref = match trunk {
-        Some(t) => t,
-        None => gitrepo::trunk(&cwd)?.context(
-            "could not determine this repo's trunk (no origin/HEAD and no main/master/trunk) \
-             — pass --trunk",
-        )?,
-    };
+    let (repo, trunk_ref) = close_merged_scope(&cwd, repo, trunk)?;
 
-    // Every open task tagged for this repo that names a branch.
-    let query = jkb_core::query::parse(&format!("kind:task tag:{FACET_REPO}={repo}"))?;
+    // Every open task tagged for this repo that names a branch. Typed, not interpolated into
+    // the DSL: `--repo` is user-typed and a value with whitespace would re-tokenize into a
+    // different query that matches nothing, closing no task and reporting no error.
+    let query = repo::tasks_in_repo(&repo);
     let ids = db.read(move |conn| query.evaluate(conn))?;
 
     let mut closed = Vec::new();
     let mut blocked = Vec::new();
     let mut pending = Vec::new();
+    let mut undecidable = Vec::new();
+    let mut unresolvable = Vec::new();
+    let mut stale_record = Vec::new();
     let mut warned_fallback = false;
+    // Every branch record in the repo, in one read — the buckets below ask about a task's
+    // branches once per task, and this also runs from `scripts/hooks/post-merge`.
+    let records = repo::branch_records(db, &repo)?;
 
     for id in ids {
-        let (uid, status, branch, base) = db
-            .read(move |conn| {
-                let meta = item::get(conn, id)?;
-                let tags = tag::applications(conn, id)?;
-                let of = |facet: &str| {
-                    tags.iter()
-                        .find(|(f, _)| f == facet)
-                        .map(|(_, v)| v.clone())
-                };
-                Ok(meta.map(|m| (m.uid, m.status, of(FACET_BRANCH), of(FACET_BASE))))
-            })?
-            .unwrap_or_default();
-        let Some(branch) = branch else { continue };
-        if matches!(status.as_deref(), Some("done" | "cancelled")) {
+        let (uid, status, tags) = close_merged_row(db, id)?;
+        let branches = repo::facet_values(&tags, repo::FACET_BRANCH).to_vec();
+        if branches.is_empty() || jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
             continue;
         }
+        let branch = branches.join(", ");
 
-        let (state, fell_back) = gitrepo::is_merged(&cwd, &branch, &trunk_ref, base.as_deref())?;
-        if fell_back && !warned_fallback {
-            warned_fallback = true;
-            eprintln!(
-                "warning: this git lacks `merge-tree --write-tree` (needs 2.38+), so \
-                 squash-merged branches will read as unmerged"
-            );
+        // A value git cannot be handed at all must cost its own row and no more. Such a value can
+        // no longer be stored (`task add` and `task tag` both refuse one), but rows predating that
+        // check exist, and `?`-ing on one aborted the entire run — so a single malformed tag
+        // stopped every healthy task in the repo from closing, silently, because this also runs
+        // from `scripts/hooks/post-merge`.
+        //
+        // Checked once, at the top of the row, rather than around each probe: every git call below
+        // takes its ref from `branches`, so one guard covers all of them and there is no second
+        // place to remember. Wrapping only the merge probe missed `gone_branches`.
+        if let Err(e) = branches.iter().try_for_each(|b| gitrepo::valid_ref(b)) {
+            blocked.push((uid, format!("{branch} unusable: {e}")));
+            continue;
         }
+        let state =
+            merged_state_of_all(db, &cwd, &repo, &branches, &trunk_ref, &mut warned_fallback)?;
         match state {
             gitrepo::MergeState::Merged => {
                 // A merged branch is evidence, not proof: a task with unfinished subtasks
                 // did not finish, whatever landed (design D34.4).
                 if db.read(move |conn| task::subtasks_all_terminal(conn, id))? {
-                    if !dry_run {
-                        db.write_txn("cli", move |conn, meta| {
-                            task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
-                        })?;
+                    let wrote = dry_run || close_if_still_open(db, id)?;
+                    if wrote {
+                        closed.push((uid, branch));
+                    } else {
+                        blocked.push((uid, format!("{branch} (finished while checking)")));
                     }
-                    closed.push((uid, branch));
                 } else {
                     blocked.push((uid, branch));
                 }
             }
+            // Not merged — but "still working on it" and "we declined to decide" are different
+            // answers and only one of them has a remedy. A branch with no cut point we can use
+            // (never recorded, removed by `task tag rm`, dropped as an unattributable legacy
+            // value, or present but unresolvable here) can *never* close, and reported as "in
+            // flight" it looks exactly like one that simply is. `BranchMissing` below has named
+            // its own way out since D34; this did not.
+            //
+            // Asked of the **branches**, not of the collapsed state, so the label does not depend
+            // on which branch answered first. `merged_state_of_all` returns the first non-`Merged`
+            // state it meets and `tag::applications` orders by value, so a task with one unmerged
+            // branch and one unusable cut point would otherwise be labelled by whichever sorted
+            // lower. The decision to hold was never in doubt either way; the explanation was.
             gitrepo::MergeState::Unmerged | gitrepo::MergeState::NothingToMerge => {
-                pending.push((uid, branch));
+                match hold_reason(&cwd, &branches, &records)? {
+                    Hold::Gone(b) => blocked.push((
+                        uid,
+                        format!("{b} gone — `jkb task tag rm <uid> branch=<name>` if stale"),
+                    )),
+                    Hold::StaleRecord(b) => {
+                        // Built here, once, and handed to both renderers. The JSON arm used to
+                        // emit `{uid, branch}` for this bucket and drop the remedy the human arm
+                        // printed, so a consumer saw a hold with no way out.
+                        let remedy = format!(
+                            "drop it with `{}`, then re-measure when the branch is next cut",
+                            base::FORGET_VERB
+                        );
+                        stale_record.push((uid, b, remedy));
+                    }
+                    Hold::InFlight => pending.push((uid, branch)),
+                    Hold::NoUsableCutPoint {
+                        no_cut_point,
+                        unusable,
+                    } => {
+                        // The remedy is asked of git here, where the branch names are still
+                        // separate, and carried into the report — `report_close_merged` cannot know
+                        // whether measuring is safe for these branches, and a branch that reaches
+                        // this bucket *after* its work landed is exactly the one where it is not
+                        // (`base::advice`).
+                        if !no_cut_point.is_empty() {
+                            let remedy = base::advice_for_any(&cwd, &uid, &no_cut_point)?;
+                            undecidable.push((uid.clone(), no_cut_point.join(", "), remedy));
+                        }
+                        if !unusable.is_empty() {
+                            // The `--forget` step is part of the remedy, not decoration the
+                            // human renderer adds. It is the load-bearing half: a task reaches
+                            // this bucket only when `stale_instance` was false, so
+                            // `ensure_recorded` computes no anchor mismatch and
+                            // `record_cut_point`'s `WHERE cut_point IS NULL OR SUPERSEDED`
+                            // matches nothing — a consumer following the advice alone re-runs a
+                            // command that changes nothing and stays in this bucket for ever.
+                            let remedy = format!(
+                                "drop it with `{}`; {}",
+                                base::FORGET_VERB,
+                                base::advice_for_any(&cwd, &uid, &unusable)?
+                            );
+                            unresolvable.push((uid, unusable.join(", "), remedy));
+                        }
+                    }
+                }
             }
-            // A missing branch is ambiguous — merged-and-deleted, or a typo. Never closed.
-            gitrepo::MergeState::BranchMissing => blocked.push((uid, format!("{branch} (gone)"))),
+            // A missing branch is ambiguous — merged-and-deleted, or a typo — so it HOLDS.
+            //
+            // Decided explicitly, because the two readers of this state disagree on purpose:
+            // `review::work_is_in` counts `BranchMissing` as *covered*, this counts it as
+            // *blocked*. Auto-closing on ambiguity is the one thing this verb must not do; the
+            // cost is that a stale recorded branch holds the task, so the message names the way
+            // out rather than leaving the user to find it.
+            // Name only the branches that are actually missing. `merged_state_of_all` short-
+            // circuits on the first non-`Merged` state and `tag::applications` orders by value, so
+            // a task recording a deleted branch and a live one answered `BranchMissing` from the
+            // first and never probed the second — then printed both as gone, telling the user to
+            // delete the tag that is the only record of the work still in flight. Same per-branch
+            // question the arm above asks, for the same reason.
+            gitrepo::MergeState::BranchMissing => blocked.push((
+                uid,
+                format!(
+                    "{} gone — `jkb task tag rm <uid> branch=<name>` if stale",
+                    gone_branches(&cwd, &branches)?.join(", ")
+                ),
+            )),
             gitrepo::MergeState::NoTrunk => {
                 anyhow::bail!("trunk `{trunk_ref}` does not resolve in this repo")
             }
         }
     }
 
+    report_close_merged(
+        &CloseMergedReport {
+            repo: &repo,
+            trunk_ref: &trunk_ref,
+            dry_run,
+            closed: &closed,
+            blocked: &blocked,
+            pending: &pending,
+            undecidable: &undecidable,
+            unresolvable: &unresolvable,
+            stale_record: &stale_record,
+        },
+        json,
+    )
+}
+
+/// Why an unmerged task is held — decided per **branch**, since a task may record several and
+/// they can be in different states.
+///
+/// "Still working on it" and "we declined to decide" are different answers and only some of them
+/// have a remedy; reported alike, a task that can *never* close looks exactly like one that simply
+/// has not yet. Split out of `cmd_task_close_merged` so each state is named once.
+enum Hold {
+    /// One or more recorded branches do not exist here. Ambiguous — merged-and-deleted, or a typo.
+    Gone(String),
+    /// The record was measured on a different branch of the same name (`base::stale_instance`).
+    StaleRecord(String),
+    /// Nothing is wrong; the work is not in trunk yet.
+    InFlight,
+    /// No cut point this repository can act on. Two faults with two different remedies: one needs
+    /// a cut point *measured*, the other needs an unusable one *dropped* first — collapsed into
+    /// one bucket, the message could only name one verb.
+    NoUsableCutPoint {
+        no_cut_point: Vec<String>,
+        unusable: Vec<String>,
+    },
+}
+
+/// Classify why `branches` are held, in the order the reasons dominate each other.
+///
+/// # Errors
+/// Returns an error if git cannot be run.
+fn hold_reason(
+    cwd: &Path,
+    branches: &[String],
+    records: &BTreeMap<String, jkb_core::branch::BranchRecord>,
+) -> Result<Hold> {
+    // A vanished branch first. Hoisting the base check above `is_merged` meant `landed_with_base`
+    // short-circuits before branch existence is ever probed, so a task that was BOTH gone and
+    // missing a cut point stopped reporting `BranchMissing` and told the user to record a cut
+    // point — advice that changes nothing except which problem the next run names.
+    let gone = gone_branches(cwd, branches)?;
+    if !gone.is_empty() {
+        return Ok(Hold::Gone(gone.join(", ")));
+    }
+    // Then recycling, which is proof about the *record* rather than about the value in it:
+    // `landed_for_action` returns on the anchor mismatch without ever consulting the cut point, so
+    // "this record is a different branch's" is the reason and "its cut point does not resolve"
+    // would only be a symptom. This is the one hold state the branch-records change introduced and
+    // the only one that had no explanation at all — it fell through to "still in flight", which is
+    // what a task genuinely being worked on looks like.
+    let mut recycled = Vec::new();
+    for b in branches {
+        if let Some(record) = records.get(b) {
+            if base::stale_instance(cwd, b, record)? {
+                recycled.push(b.clone());
+            }
+        }
+    }
+    if !recycled.is_empty() {
+        return Ok(Hold::StaleRecord(recycled.join(", ")));
+    }
+    // Then the cut point, per branch. A task may legitimately record two (`BranchWrite::Add`, the
+    // quick-add modifier, `task tag add`), and folding them with an AND over "usable" and an OR
+    // over "recorded" mislabelled every task whose branches differ in fault: one branch with a
+    // good cut point beside one with none routed to "its recorded cut point does not resolve",
+    // which was true of neither half, and named a repair that would do nothing.
+    let mut no_cut_point = Vec::new();
+    let mut unusable = Vec::new();
+    for b in branches {
+        match records.get(b).and_then(|r| r.cut_point.as_deref()) {
+            None => no_cut_point.push(b.clone()),
+            Some(v) if !repo::base_is_usable(cwd, Some(v))? => unusable.push(b.clone()),
+            Some(_) => {}
+        }
+    }
+    if no_cut_point.is_empty() && unusable.is_empty() {
+        return Ok(Hold::InFlight);
+    }
+    Ok(Hold::NoUsableCutPoint {
+        no_cut_point,
+        unusable,
+    })
+}
+
+/// What one `close-merged` run decided, split by what the user can do about it.
+struct CloseMergedReport<'a> {
+    repo: &'a str,
+    trunk_ref: &'a str,
+    dry_run: bool,
+    /// Marked done (or would be, under `--dry-run`).
+    closed: &'a [(String, String)],
+    /// Merged, but something else holds them — usually open subtasks.
+    blocked: &'a [(String, String)],
+    /// Genuinely still in flight. Counted, not listed: this is the ordinary case and naming
+    /// every open task on every run buries the two buckets that need a decision.
+    pending: &'a [(String, String)],
+    /// We declined to decide, because **no** cut point is recorded. Listed **individually** even
+    /// though it is a form of "not closed": unlike `pending` it will never resolve on its own,
+    /// and it has a remedy the user cannot guess.
+    ///
+    /// The second field names only the branches actually in this state, not every branch the task
+    /// records — a task whose branches differ in fault appears in both buckets, under the right
+    /// half of itself each time.
+    ///
+    /// `(uid, branches, remedy)`; see the note on `unresolvable` for why the remedy arrives
+    /// pre-computed.
+    undecidable: &'a [(String, String, String)],
+    /// A cut point *is* recorded and this repository cannot resolve it. Split from `undecidable`
+    /// because this half has to be *dropped* before anything else can help it, while the other
+    /// half has nothing to drop. Per branch, for the same reason.
+    ///
+    /// `(uid, branches, remedy)`. The remedy is computed where the branches are known and git can
+    /// be asked, never here: see `base::MEASURE_VERB`.
+    unresolvable: &'a [(String, String, String)],
+    /// Held because the record was measured on a **different branch of the same name**, proved by
+    /// an anchor mismatch. Its own bucket because it is the one hold with no other symptom: the
+    /// branch exists and its cut point resolves, so every other bucket passes it through and it
+    /// was reported as ordinary work in progress. `(uid, branches, remedy)` — the remedy is fixed
+    /// (`base::FORGET_VERB`) and needs nothing asked of git, but it is carried like every other
+    /// bucket's so both renderers print the same string.
+    stale_record: &'a [(String, String, String)],
+}
+
+/// Print what a `close-merged` run decided.
+fn report_close_merged(r: &CloseMergedReport<'_>, json: bool) -> Result<()> {
+    let rows = |v: &[(String, String)]| {
+        v.iter()
+            .map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
+            .collect::<Vec<_>>()
+    };
+    // The buckets that carry a remedy put it on the JSON too — a consumer that cannot see why a
+    // task is stuck is in the state the human note exists to prevent.
+    let held_rows = |v: &[(String, String, String)]| {
+        v.iter()
+            .map(|(u, b, why)| serde_json::json!({"uid": u, "branch": b, "remedy": why}))
+            .collect::<Vec<_>>()
+    };
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "repo": repo,
-                "trunk": trunk_ref,
-                "dry_run": dry_run,
-                "closed": closed.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
-                    .collect::<Vec<_>>(),
-                "blocked": blocked.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
-                    .collect::<Vec<_>>(),
-                "pending": pending.iter().map(|(u, b)| serde_json::json!({"uid": u, "branch": b}))
-                    .collect::<Vec<_>>(),
+                "repo": r.repo,
+                "trunk": r.trunk_ref,
+                "dry_run": r.dry_run,
+                "closed": rows(r.closed),
+                "blocked": rows(r.blocked),
+                "pending": rows(r.pending),
+                "undecidable": held_rows(r.undecidable),
+                "unresolvable": held_rows(r.unresolvable),
+                "stale_record": held_rows(r.stale_record),
             }))?
         );
         return Ok(());
     }
-    let verb = if dry_run { "would close" } else { "closed" };
-    for (uid, branch) in &closed {
+    let verb = if r.dry_run { "would close" } else { "closed" };
+    for (uid, branch) in r.closed {
         println!("{verb} {uid} ({branch} merged)");
     }
-    for (uid, branch) in &blocked {
-        println!("held  {uid} ({branch}) — subtasks still open, or branch gone");
+    for (uid, branch) in r.blocked {
+        println!("held  {uid} ({branch}) — `jkb task show {uid}` says why (usually open subtasks)");
     }
-    if closed.is_empty() && blocked.is_empty() {
+    // Split, because the two halves have different remedies: one needs a cut point *measured*,
+    // the other needs the unusable one *dropped* first. Neither names a sha, and no verb accepts
+    // one any more — the sha nearest to hand is the branch tip, and a cut point equal to the tip
+    // reads as "nothing has happened here" forever, which is how a task became permanently
+    // unlandable with no repair path.
+    for (uid, branch, remedy) in r.undecidable {
         println!(
-            "nothing to close ({} task(s) still in flight)",
-            pending.len()
+            "unknown {uid} ({branch}) — no cut point recorded, so whether it landed cannot be \
+             decided: {remedy}"
         );
+    }
+    for (uid, branch, remedy) in r.unresolvable {
+        println!(
+            "unknown {uid} ({branch}) — its recorded cut point does not resolve in this repo, so \
+             whether it landed cannot be decided: {remedy}"
+        );
+    }
+    for (uid, branch, remedy) in r.stale_record {
+        println!(
+            "unknown {uid} ({branch}) — the recorded cut point was measured on a different branch \
+             of that name (deleted and recreated since), so nothing here may act on it: {remedy}"
+        );
+    }
+    // Independent of the other buckets. Gated on them, the count vanished in exactly the runs
+    // where something else printed — so a run showing two `unknown` lines silently stopped
+    // accounting for the tasks that are simply still being worked on.
+    if !r.pending.is_empty() {
+        println!("{} task(s) still in flight", r.pending.len());
+    }
+    if r.closed.is_empty()
+        && r.blocked.is_empty()
+        && r.undecidable.is_empty()
+        && r.unresolvable.is_empty()
+        && r.stale_record.is_empty()
+        && r.pending.is_empty()
+    {
+        println!("nothing to close");
     }
     Ok(())
 }
@@ -5123,6 +7047,8 @@ fn cmd_view(db: &Db, cmd: ViewCmd, json: bool) -> Result<()> {
 }
 
 fn cmd_undo(db: &Db, txn: Option<i64>) -> Result<()> {
+    // No vector sweep: see `cmd_item_rm`. Undoing an ingest leaves the chunks' vector rows
+    // behind, and since D40 that is inert rather than the permanent corruption it once was.
     let n = db.write_txn("cli", move |conn, meta| match txn {
         Some(txn) => undo::undo(conn, meta, txn),
         None => undo::undo_last(conn, meta),
@@ -5131,7 +7057,33 @@ fn cmd_undo(db: &Db, txn: Option<i64>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(db: &Db) -> Result<()> {
+/// Remove stale derived-index rows, returning what went.
+///
+/// The **one** cleanup, called from `jkb index --sweep` and `jkb doctor --fix`. Nothing sweeps
+/// implicitly any more: before D40 every path that deleted an item had to sweep in its own
+/// transaction or a new item inherited a dead embedding, and that obligation was discovered
+/// one missed call site at a time over four review passes. `AUTOINCREMENT` removed the hazard,
+/// which turns cleanup from an invariant every writer must uphold into housekeeping one verb
+/// can do whenever it is convenient.
+fn sweep_stale(db: &Db) -> Result<jkb_index::StaleRows> {
+    db.write_txn_with::<_, anyhow::Error, _>("cli", |conn, _meta| Ok(jkb_index::sweep_stale(conn)?))
+}
+
+fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
+    // The on-demand half of the derived-index hygiene pair (design D40). `AUTOINCREMENT`
+    // makes a leftover vector row harmless — its id is never reissued, so nothing can inherit
+    // its embedding — but not absent, and an index that only grows is worth being able to
+    // clean without running the whole of `doctor`. Deliberately its own flag rather than
+    // something `index` always does: embedding needs a live embedder and this must not.
+    if sweep {
+        let removed = sweep_stale(db)?;
+        if removed.is_empty() {
+            println!("index: no stale rows");
+        } else {
+            println!("index: removed {} stale vector row(s)", removed.vectors);
+        }
+        return Ok(());
+    }
     // Embed every content-bearing item not yet in the vector index (D21): this covers
     // items created by file sync, not just the ingest pipeline. Needs a live embedder.
     let pipeline = Pipeline::new(embedder()?);
@@ -5161,6 +7113,15 @@ fn cmd_index(db: &Db) -> Result<()> {
 }
 
 fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Result<()> {
+    // FIRST, before any diagnostic and before `--fix` mutates anything. `--backup` is the
+    // safety copy you take *before* a repair; taken at the end it held post-repair state, so
+    // `jkb doctor --backup ~/pre-fix.db --fix` produced a file that was the opposite of what its
+    // name and its help said.
+    if let Some(dest) = backup {
+        db.backup(dest)?;
+        println!("backup written to {}", dest.display());
+    }
+
     // Embedder health.
     let embed_status = match embedder().and_then(|e| e.health_check().map_err(Into::into)) {
         Ok(()) => "ok".to_owned(),
@@ -5201,9 +7162,57 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         }
     }
 
+    // Reflog retention entries this clone holds for branches nothing records any more.
+    //
+    // `base::ensure_recorded` writes an exact-ref `gc.refs/heads/<b>.reflogExpire = never` beside
+    // a branch record, so the instance anchor it stored survives `git gc`; `base::forget` removes
+    // it. The residue is a branch that was recorded and never forgotten — inert config, but config
+    // the user did not ask for, so it is reported rather than left to accumulate silently.
+    //
+    // Only inside a repo: `jkb doctor` runs from anywhere, and the entries are per clone.
+    if let Ok(ctx) = repo::repo_ctx() {
+        let retained = gitrepo::retained_reflogs(&ctx.root)?;
+        let recorded = repo::branch_records(db, &ctx.key)?;
+        let stale: Vec<&String> = retained
+            .iter()
+            .filter(|b| !recorded.contains_key(*b))
+            .collect();
+        if stale.is_empty() {
+            println!(
+                "reflog retention: {} entry(ies), all recorded",
+                retained.len()
+            );
+        } else {
+            println!(
+                "reflog retention: {} entry(ies) for branches no longer recorded in {}{}",
+                stale.len(),
+                ctx.key,
+                if fix { ", removing" } else { "" }
+            );
+            for b in stale {
+                if fix {
+                    // The same verb `base::forget` uses, so a repair here and a repair there
+                    // cannot come to mean different things.
+                    gitrepo::release_reflog(&ctx.root, b)?;
+                    println!("  {b} — removed");
+                } else {
+                    // BOTH keys, derived from the pair that wrote them. Retention writes
+                    // `reflogExpire` *and* `reflogExpireUnreachable`, while `retained_reflogs`
+                    // only matches the first — so a remedy naming one key left the other behind
+                    // and the next run reported "all recorded" over the top of it.
+                    let keys = gitrepo::reflog_retention_keys(b)
+                        .map(|k| format!("git config --unset-all \"{k}\""))
+                        .join(" && ");
+                    println!("  {b} — `{keys}` (or `jkb doctor --fix`)");
+                }
+            }
+        }
+    }
+
     // Stale task claims: owner-existence reclaim (design D27.2). For each claimed task
-    // probe whether the recorded owner still exists (`kill -0`); a claim whose owner is
-    // gone is orphaned (no time-based staleness — a paused-but-alive owner is retained).
+    // probe whether the recorded owner still exists (`ps -p`, see `owner::is_alive`); a claim
+    // whose owner is gone is orphaned (no time-based staleness — a paused-but-alive owner is
+    // retained).
     // A bare run reports; `--fix` clears orphaned claims so their tasks return to the
     // ready frontier.
     // One `reclaim_orphaned(.., false)` computes the report (shared with `task reclaim`,
@@ -5231,6 +7240,8 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         }
     }
 
+    report_vector_index(db, fix)?;
+
     // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on
     // purpose — the half-written branch is still there — so a session is never reported as
     // orphaned. Doctor lists every one, because nothing observable distinguishes a session
@@ -5243,10 +7254,6 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
         None => println!("db location: ok ({})", db_path.display()),
     }
 
-    if let Some(dest) = backup {
-        db.backup(dest)?;
-        println!("backup written to {}", dest.display());
-    }
     Ok(())
 }
 
@@ -5265,7 +7272,299 @@ fn output_line(item: &output::DisplayItem) -> String {
     format!("{}{ns}{snip}", item.uid)
 }
 
+/// The first line of a body, for a one-line report. The derivation is `output::first_nonblank`
+/// (the one copy); only the width is this function's own.
 fn first_line(content: &str) -> String {
-    let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    line.trim().chars().take(100).collect()
+    truncate(output::first_nonblank(content), 100)
+}
+
+/// `jkb staging ls` — the staging branches in this repo and what is landing on each.
+///
+/// The one read behind both the explorer's branch picker and its In Flight view (design
+/// D38.2), so the two cannot disagree about what is live.
+fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
+    let ctx = repo::repo_ctx()?;
+    let rows = staging::collect(db, &ctx, all)?;
+
+    if json {
+        let v: Vec<_> = rows
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "branch": s.branch,
+                    "merged": s.merged,
+                    "ahead": s.ahead,
+                    "checkout": s.checkout,
+                    "tasks": s.tasks.iter().map(|t| serde_json::json!({
+                        "uid": t.uid,
+                        "title": t.title,
+                        "status": t.status,
+                        "state": t.state.as_str(),
+                        "branch": t.branch,
+                        "worktree": t.worktree,
+                        "dirty": t.dirty,
+                        "commits": t.commits,
+                        "reviewed": t.reviewed,
+                        "review_nss": t.review_nss,
+                        "review_waived": t.review_waived,
+                        "open_must_fix": t.open_must_fix,
+                        "review_ok": t.review_ok,
+                        "land_blocked": t.land_blocked,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("(no staging branches in {})", ctx.key);
+        println!("one is created the first time you run `jkb task work <uid>`");
+        return Ok(());
+    }
+    for s in &rows {
+        let merged = if s.merged { "  [merged]" } else { "" };
+        println!(
+            "{}  {} commit(s) vs trunk · {} task(s){merged}",
+            s.branch,
+            s.ahead,
+            s.tasks.len()
+        );
+        for t in &s.tasks {
+            let mut notes = vec![t.state.as_str().to_owned()];
+            if t.commits > 0 {
+                notes.push(format!("{} commit(s)", t.commits));
+            }
+            if t.dirty {
+                notes.push("uncommitted".to_owned());
+            }
+            if t.open_must_fix > 0 {
+                notes.push(format!("{} must-fix open", t.open_must_fix));
+            } else if t.reviewed.is_some() && t.review_ok {
+                // "reviewed" only when the gate would actually pass on it. A review whose
+                // findings never reached the KB leaves `reviewed=` on the task and is refused
+                // by the gate, so printing "reviewed" told a terminal user the opposite of
+                // what `jkb task land` was about to do.
+                notes.push("reviewed".to_owned());
+            }
+            if t.review_waived.is_some() {
+                notes.push("review waived".to_owned());
+            }
+            println!("    {}  [{}]", truncate(&t.title, 60), notes.join(" · "));
+            println!("      {}", t.uid);
+            // The verdict itself, not just its symptoms: this is the same string the In
+            // Flight tooltip shows, and without it the terminal listing was the one surface
+            // that could not say why a landing would be refused.
+            if let Some(reason) = &t.land_blocked {
+                println!("      cannot land: {reason}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `jkb task review record` — record that a review ran against a branch (design D38.4).
+fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
+    let TaskReviewCmd::Record {
+        branch,
+        sha,
+        findings,
+    } = cmd;
+    let ctx = repo::repo_ctx()?;
+    let cwd = std::env::current_dir()?;
+    let branch = match branch {
+        Some(b) => b,
+        None => gitrepo::current_branch(&cwd)?
+            .context("not on a branch here (detached HEAD?) — pass --branch")?,
+    };
+    let sha = match sha {
+        Some(s) => Some(s),
+        None => gitrepo::rev(&ctx.root, &branch)?,
+    };
+
+    // Refuse a findings namespace that holds nothing, here, where the caller can still fix it.
+    // A review recorded against an empty namespace is a review whose findings never reached
+    // the KB — a quarantined `tasks.md`, a typo, a namespace renamed since — and the land gate
+    // must never read that as a clean review. It is caught at both ends deliberately: this is
+    // the actionable moment, the gate is the one that must not be bypassed.
+    let found = review::findings_in(db, std::slice::from_ref(&findings))?;
+    anyhow::ensure!(
+        found.total > 0,
+        "no findings found under `{findings}` — nothing was recorded. A review whose findings \
+         never reached the KB must not be recorded as one: check the namespace exists \
+         (`jkb ls {findings}`), that `jkb sync` imported the review's tasks.md, and that it \
+         was not quarantined (`jkb doctor`)."
+    );
+
+    let review::Recording {
+        recorded,
+        skipped_unlanded,
+        skipped_no_base,
+        unusable,
+    } = review::record(db, &ctx.root, &ctx.key, &branch, sha.as_deref(), &findings)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "branch": branch,
+                "sha": sha,
+                "findings": findings,
+                "tasks": recorded.iter().map(|r| serde_json::json!({
+                    "uid": r.uid, "moved_to_review": r.moved_to_review,
+                })).collect::<Vec<_>>(),
+                "skipped_unlanded": skipped_unlanded,
+                "skipped_no_base": skipped_no_base.iter().map(|(uid, why)| serde_json::json!({
+                    "uid": uid, "remedy": why,
+                })).collect::<Vec<_>>(),
+                "unusable": unusable,
+            })
+        );
+        return Ok(());
+    }
+    if recorded.is_empty() {
+        // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and
+        // not an error (design D38.4). But "no task records this branch" and "tasks record it
+        // and every one was skipped" are different facts, and printing the first while the
+        // skipped list appears directly beneath it contradicted the very next line.
+        if skipped_unlanded.is_empty() && skipped_no_base.is_empty() && unusable.is_empty() {
+            println!("no task records branch={branch} — nothing to tag (review still filed)");
+        } else {
+            println!("nothing tagged for branch={branch} — every matching task was skipped, below (review still filed)");
+        }
+    } else {
+        println!(
+            "recorded review of {branch}@{} -> {findings}",
+            sha.as_deref().unwrap_or("unknown")
+        );
+        for r in &recorded {
+            let moved = if r.moved_to_review {
+                " (now needs_review)"
+            } else {
+                ""
+            };
+            println!("  {}{moved}", r.uid);
+        }
+    }
+    // Said out loud for the same reason as the buckets below: silence reads as "everything was
+    // tagged", and a task skipped here is one `task land` will refuse as never reviewed.
+    if !unusable.is_empty() {
+        println!(
+            "not tagged — a recorded branch cannot be handed to git at all, so nothing about them \
+             could be checked (`jkb task tag rm <uid> branch=<value>`):"
+        );
+        for uid in &unusable {
+            println!("  {uid}");
+        }
+    }
+    // Said out loud, because a task landing on this branch whose work is not in it yet has
+    // NOT been reviewed, and silence would read as "everything was tagged".
+    if !skipped_no_base.is_empty() {
+        // Never a hand-typed sha, and never a measuring verb this surface chose: the remedy is
+        // per task, asked of git by `review::record`, because a branch that reaches this bucket
+        // *after* its work landed cannot be measured at all and telling anyone to try records its
+        // tip — which freezes the task at `NothingToMerge` for good. `/review-log` prints this on
+        // every run, so it is the most frequently read of the family.
+        println!(
+            "not tagged — no cut point recorded for their work branch, so whether this review \
+             saw them cannot be decided:"
+        );
+        for (uid, remedy) in &skipped_no_base {
+            println!("  {uid} — {remedy}");
+        }
+    }
+    if !skipped_unlanded.is_empty() {
+        println!(
+            "not tagged — landing on {branch} but not merged into it yet, so this review did \
+             not see them:"
+        );
+        for uid in &skipped_unlanded {
+            println!("  {uid}");
+        }
+        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
+    }
+    Ok(())
+}
+
+/// Report — and with `--fix`, sweep — derived-index rows whose item is gone.
+///
+/// A `vec0` virtual table cannot carry a foreign key to `items`, so a deleted item leaves its
+/// vector behind. Since D40 (`items.id AUTOINCREMENT`) that row is **stale, not dangerous** —
+/// the freed id is never reissued, so no new item can inherit its embedding — which is why
+/// this reads as housekeeping rather than corruption, and why nothing sweeps implicitly.
+fn report_vector_index(db: &Db, fix: bool) -> Result<()> {
+    // What counts as one of our derived-index tables, and what counts as stale in one, are
+    // `jkb-index`'s to say — the CLI asks. It used to carry its own copy of both queries,
+    // including the `vec0` shadow-table filter that is the non-obvious part, so `doctor`'s
+    // report and `doctor --fix`'s delete were two statements that had to be kept in step.
+    let tables =
+        db.read_with::<Vec<String>, anyhow::Error, _>(|conn| Ok(jkb_index::vector_tables(conn)?))?;
+    if tables.is_empty() {
+        println!("vector index: no vector table yet");
+    } else if fix {
+        println!(
+            "vector index: removed {} stale row(s)",
+            sweep_stale(db)?.vectors
+        );
+    } else {
+        let stale =
+            db.read_with::<_, anyhow::Error, _>(|conn| Ok(jkb_index::count_stale(conn)?))?;
+        if stale.is_empty() {
+            println!("vector index: ok");
+        } else {
+            println!(
+                "vector index: {} stale row(s) whose item is gone",
+                stale.vectors
+            );
+            println!("  run `jkb index --sweep` (or `jkb doctor --fix`) to remove them");
+        }
+    }
+
+    Ok(())
+}
+
+/// Shorten `s` to `n` characters with an ellipsis, for one-line listings.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(n.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GUIDE;
+    use jkb_types::TaskStatus;
+
+    /// Both `--status` enumerations name every status the CLI accepts.
+    ///
+    /// `GUIDE` declares `AGENTS.md` its mirror and nothing held the two in step: both omitted
+    /// `cancelled`, while AGENTS.md's own landing section tells you to set exactly that to clear
+    /// a must-fix and land. The set comes from `TaskStatus::ALL`, generated with the enum, so
+    /// adding a status fails here rather than shipping a verb an agent never learns about.
+    #[test]
+    fn both_status_enumerations_name_every_status_the_cli_accepts() {
+        let agents = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"),
+        )
+        .expect("AGENTS.md sits at the repo root");
+        for (surface, text) in [("jkb guide", GUIDE), ("AGENTS.md", agents.as_str())] {
+            // Anchored on the verb, not on `--status`: `jkb find --status S` is a different line
+            // in both files and matching it first would make this test pass against nothing.
+            let line = text
+                .lines()
+                .find(|l| l.contains("task set <uid> --status"))
+                .unwrap_or_else(|| panic!("{surface} has no `task set <uid> --status` line"));
+            for status in TaskStatus::ALL {
+                assert!(
+                    line.contains(status.as_str()),
+                    "{surface} omits `{}` from `{line}`, so an agent reading it never learns \
+                     that the status exists",
+                    status.as_str()
+                );
+            }
+        }
+    }
 }

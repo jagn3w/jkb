@@ -12,9 +12,10 @@
 //! relies on *do* live in `jkb-types` ([`jkb_types::ensure_compatible`]).
 //!
 //! ## `sqlite-vec` registration
-//! [`vector::register`] must be called once, before opening the database whose
-//! connections will use vectors (before `jkb_core::Db::open`). It is the only
-//! `unsafe` in the workspace and is isolated to [`vector`].
+//! [`vector::register`] is handed to `jkb_core::Db::open_with(path,
+//! &[jkb_index::register])`, which runs it before opening the connection — core owns the
+//! sequencing (design D15), so nothing calls it directly. It is the only `unsafe` in the
+//! workspace and is isolated to [`vector`].
 
 mod error;
 pub mod fts;
@@ -26,7 +27,10 @@ use jkb_types::ItemId;
 
 pub use error::{Error, Result};
 pub use fts::FtsIndexer;
-pub use vector::{register, VectorIndexer};
+pub use vector::{
+    count_orphan_vectors, count_stale, drop_orphan_vectors, register, sweep_stale, vector_tables,
+    StaleRows, VectorIndexer,
+};
 
 /// The item fields an [`Indexer`] needs to (re)index a single item.
 ///

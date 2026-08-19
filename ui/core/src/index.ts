@@ -5,4 +5,5 @@ export * from "./client.js";
 export * from "./registry.js";
 export * from "./decoration.js";
 export * from "./summary.js";
+export * from "./staging.js";
 export * from "./details.js";

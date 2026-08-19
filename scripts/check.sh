@@ -28,8 +28,9 @@ fi
 # `pnpm -r` runs topologically, which also guarantees @jkb/core emits its .d.ts before the
 # adapter type-checks against it.
 echo "==> ui (typecheck + build)"
-# pnpm lives under PNPM_HOME, which ~/.zshrc only exports for interactive shells — mirror the
-# `source ~/.cargo/env` trick above so this works when run directly.
+# pnpm lives under PNPM_HOME, which ~/.zshrc only exports for interactive shells — put it on
+# PATH here, the same way the other scripts self-source ~/.cargo/env, so this works when run
+# directly.
 export PNPM_HOME="${PNPM_HOME:-$HOME/Library/pnpm}"
 case ":$PATH:" in
     *":$PNPM_HOME/bin:"*) ;;

@@ -10,6 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use jkb_types::{Error as TypeError, NamespaceId};
 
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -327,16 +328,26 @@ pub fn set_metadata(
     id: NamespaceId,
     metadata: &Value,
 ) -> Result<()> {
+    // The JSON this replaces, under the column's own name — that is what `undo` writes back. It
+    // used to log no before-state at all, which reads as "nothing to restore".
+    let before: Option<String> = conn
+        .prepare_cached("SELECT metadata FROM namespaces WHERE id = ?1")?
+        .query_row([id.get()], |row| row.get(0))
+        .optional()?;
     conn.prepare_cached("UPDATE namespaces SET metadata = ?2 WHERE id = ?1")?
         .execute(params![id.get(), metadata.to_string()])?;
+    let Some(before) = before else {
+        // No such namespace: the UPDATE changed nothing, so there is nothing to record.
+        return Ok(());
+    };
     changelog::append(
         conn,
         meta,
-        "update",
-        "namespaces",
+        Op::Update,
+        Entity::Namespaces,
         &id.get().to_string(),
-        None,
-        Some(metadata),
+        Some(&json!({ "metadata": before })),
+        Some(&json!({ "metadata": metadata.to_string() })),
     )?;
     Ok(())
 }
@@ -497,6 +508,16 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
     };
 
     let rows = subtree(conn, &from)?;
+    // ONE ENTRY PER ROW THIS MOVES. It used to log a single entry naming the root's old `path`,
+    // which describes a fraction of what changed: `undo` restoring that one row would leave every
+    // descendant under the new path, so the move was not reversible at all and `jkb undo` after a
+    // `jkb ns mv` had to be refused. Each row's before-state is now its own previous path, which
+    // is exactly what the generic column inverse writes back.
+    let old_parent: Option<i64> = conn
+        .prepare_cached("SELECT parent_id FROM namespaces WHERE id = ?1")?
+        .query_row([root_id], |row| row.get(0))
+        .optional()?
+        .flatten();
     for (id, path) in &rows {
         let new_path = if *path == from {
             to.clone()
@@ -505,18 +526,27 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
         };
         conn.prepare_cached("UPDATE namespaces SET path = ?1 WHERE id = ?2")?
             .execute(params![new_path, id.get()])?;
+        // The root additionally changes parent, so its entry carries both columns.
+        let (before, after) = if id.get() == root_id {
+            (
+                json!({ "path": path, "parent_id": old_parent }),
+                json!({ "path": new_path, "parent_id": new_parent }),
+            )
+        } else {
+            (json!({ "path": path }), json!({ "path": new_path }))
+        };
+        changelog::append(
+            conn,
+            meta,
+            Op::Update,
+            Entity::Namespaces,
+            &id.get().to_string(),
+            Some(&before),
+            Some(&after),
+        )?;
     }
     conn.prepare_cached("UPDATE namespaces SET parent_id = ?1 WHERE id = ?2")?
         .execute(params![new_parent, root_id])?;
-    changelog::append(
-        conn,
-        meta,
-        "update",
-        "namespaces",
-        &root_id.to_string(),
-        Some(&json!({ "path": from })),
-        Some(&json!({ "path": to })),
-    )?;
     Ok(rows.len())
 }
 
@@ -552,15 +582,31 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<()> {
         ))
         .into());
     }
+    // The whole row, so `undo` can put it back — a `{path}` alone named the namespace without
+    // describing it, and a namespace restored without its `kind` or `metadata` is a different one.
+    let row = conn
+        .prepare_cached(
+            "SELECT id, path, parent_id, kind, metadata, created_at FROM namespaces WHERE id = ?1",
+        )?
+        .query_row([id.get()], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "path": r.get::<_, String>(1)?,
+                "parent_id": r.get::<_, Option<i64>>(2)?,
+                "kind": r.get::<_, String>(3)?,
+                "metadata": r.get::<_, String>(4)?,
+                "created_at": r.get::<_, String>(5)?,
+            }))
+        })?;
     conn.prepare_cached("DELETE FROM namespaces WHERE id = ?1")?
         .execute([id.get()])?;
     changelog::append(
         conn,
         meta,
-        "delete",
-        "namespaces",
+        Op::Delete,
+        Entity::Namespaces,
         &id.get().to_string(),
-        Some(&json!({ "path": normalized })),
+        Some(&row),
         None,
     )?;
     Ok(())

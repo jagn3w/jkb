@@ -2,14 +2,27 @@
 //!
 //! A facet (e.g. `read_year`, `topic`, `size`) is declared once; applications
 //! attach a value to an item and may carry per-application properties.
+//!
+//! Every facet here holds **content**: something a person or an agent asserted about an item, and
+//! which any writer may set. There is deliberately no privileged or reserved facet.
+//!
+//! There was one — `base`, the commit a branch was cut from — and the reservation apparatus around
+//! it (a refusal in [`apply`], a privileged `apply_reserved`, an authored/unauthored split on the
+//! read side, and skips in both directions of [`reconcile_tags`]) existed because a *branch* fact
+//! was being kept in an item-keyed, multi-valued, untyped, openly-writable store. Six ascending
+//! choke points did not close it — the fifth write route was found *after* the store-side
+//! reservation was added, and the reservation's own asymmetry produced a must-fix of its own. The
+//! fact moved to `branch_records`, keyed `(repo, branch)`, and the whole apparatus went with it:
+//! there is nothing to route around when the value is not in the facet namespace at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, params_from_iter, types::Value, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::ItemId;
 
+use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -39,6 +52,14 @@ pub fn apply(
     value: &str,
 ) -> Result<()> {
     define_facet(conn, facet, "string")?;
+    // Idempotent means the second call updates a row that was already there, and logging that as
+    // an insert made `jkb undo` remove a tag application the transaction had not created.
+    let existing: Option<i64> = conn
+        .prepare_cached(
+            "SELECT rowid FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+        )?
+        .query_row(params![item.get(), facet, value], |row| row.get(0))
+        .optional()?;
     let rowid: i64 = conn
         .prepare_cached(
             "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, ?2, ?3)
@@ -47,13 +68,14 @@ pub fn apply(
         )?
         .query_row(params![item.get(), facet, value], |row| row.get(0))?;
     let after = json!({ "item_id": item.get(), "facet": facet, "value": value });
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
-        "tag_applications",
+        Entity::TagApplications,
         &rowid.to_string(),
-        None,
+        // The key is the whole row, so a re-application's before-state is its after-state; what
+        // this records is that there *was* one.
+        existing.map(|_| after.clone()).as_ref(),
         Some(&after),
     )?;
     Ok(())
@@ -72,21 +94,68 @@ pub fn remove(
     facet: &str,
     value: &str,
 ) -> Result<()> {
+    // Read `props` before the delete: `undo` puts the application back from exactly the columns
+    // recorded here, and one restored without them is a different application.
+    let props: Option<String> = conn
+        .prepare_cached(
+            "SELECT props FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+        )?
+        .query_row(params![item.get(), facet, value], |r| r.get(0))
+        .optional()?;
     let removed = conn
         .prepare_cached(
             "DELETE FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
         )?
         .execute(params![item.get(), facet, value])?;
-    if removed > 0 {
+    if let (1.., Some(props)) = (removed, props) {
         changelog::append(
             conn,
             meta,
-            "delete",
-            "tag_applications",
+            Op::Delete,
+            Entity::TagApplications,
             &item.get().to_string(),
-            Some(&json!({ "item_id": item.get(), "facet": facet, "value": value })),
+            Some(&json!({
+                "item_id": item.get(), "facet": facet, "value": value, "props": props,
+            })),
             None,
         )?;
+    }
+    Ok(())
+}
+
+/// Reconcile `item`'s tags to exactly `desired`.
+///
+/// The one tag seam for file sync, shared by the engine's create and update paths so a task's
+/// tags are diffed against the document in exactly one place. Every facet is ordinary content
+/// here — there is no reserved facet to skip in either direction, because the one fact that was
+/// not content is not a facet any more (see the module docs).
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn reconcile_tags(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    desired: &[(String, String)],
+) -> Result<()> {
+    let want: HashSet<(&str, &str)> = desired
+        .iter()
+        .map(|(f, v)| (f.as_str(), v.as_str()))
+        .collect();
+    let current = applications(conn, item)?;
+    let have: HashSet<(&str, &str)> = current
+        .iter()
+        .map(|(f, v)| (f.as_str(), v.as_str()))
+        .collect();
+    for (facet, value) in &current {
+        if !want.contains(&(facet.as_str(), value.as_str())) {
+            remove(conn, meta, item, facet, value)?;
+        }
+    }
+    for (facet, value) in desired {
+        if !have.contains(&(facet.as_str(), value.as_str())) {
+            apply(conn, meta, item, facet, value)?;
+        }
     }
     Ok(())
 }
@@ -164,24 +233,56 @@ pub fn items_with(conn: &Connection, facet: &str, value: &str) -> Result<Vec<Ite
 /// Rename a facet across its definition and every application. Returns the number
 /// of applications updated.
 ///
+/// **One entry per row it rewrites, keyed on that row's `rowid`.** It used to log a single
+/// entry against `tag_defs` keyed on the facet *name*, which is not a row id and describes none
+/// of the applications — so `undo` had no inverse for it, and one `jkb tag rename` made every
+/// later bare `jkb undo` refuse that transaction for good. A rename is trivially reversible: what
+/// it needs is what every other column write supplies, the previous value under the column's own
+/// name, against a key `undo` can address. `ns::move_subtree` is the precedent — it had exactly
+/// this defect, one entry naming the root's old path, and the fix was to log what actually
+/// changed rather than to hand-write an inverse.
+///
 /// # Errors
 /// Returns an error if a statement fails (e.g. the new facet collides with an
 /// existing application on the same item and value).
 pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -> Result<usize> {
+    // Read the row ids BEFORE the update: afterwards nothing selects them by `old`.
+    let rowids = |table: &str| -> Result<Vec<i64>> {
+        let sql = if table == "tag_defs" {
+            "SELECT rowid FROM tag_defs WHERE facet = ?1"
+        } else {
+            "SELECT rowid FROM tag_applications WHERE facet = ?1"
+        };
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(params![old], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    };
+    let applications = rowids("tag_applications")?;
+    let definitions = rowids("tag_defs")?;
+
     let updated = conn
         .prepare_cached("UPDATE tag_applications SET facet = ?1 WHERE facet = ?2")?
         .execute(params![new, old])?;
     conn.prepare_cached("UPDATE tag_defs SET facet = ?1 WHERE facet = ?2")?
         .execute(params![new, old])?;
-    changelog::append(
-        conn,
-        meta,
-        "update",
-        "tag_defs",
-        old,
-        Some(&json!({ "facet": old })),
-        Some(&json!({ "facet": new })),
-    )?;
+
+    let (before, after) = (json!({ "facet": old }), json!({ "facet": new }));
+    for (entity, rows) in [
+        (Entity::TagApplications, &applications),
+        (Entity::TagDefs, &definitions),
+    ] {
+        for rowid in rows {
+            changelog::append(
+                conn,
+                meta,
+                Op::Update,
+                entity,
+                &rowid.to_string(),
+                Some(&before),
+                Some(&after),
+            )?;
+        }
+    }
     Ok(updated)
 }
 
@@ -201,9 +302,59 @@ pub fn facets(conn: &Connection) -> Result<Vec<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, facets, items_with, rename_facet};
+    use super::{applications, apply, facets, items_with, reconcile_tags, rename_facet};
     use crate::item::{upsert, NewItem};
     use crate::Db;
+    use jkb_types::ItemId;
+
+    fn an_item(db: &Db) -> ItemId {
+        db.write_txn("t", |conn, meta| {
+            upsert(
+                conn,
+                meta,
+                &NewItem {
+                    uid: "task:t".to_owned(),
+                    kind: "task".to_owned(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )
+        })
+        .unwrap()
+    }
+
+    fn tags_of(db: &Db, id: ItemId) -> Vec<(String, String)> {
+        db.read(move |conn| applications(conn, id)).unwrap()
+    }
+
+    /// Reconciling adds and drops exactly what the document declares — this is the sync engine's
+    /// whole tag contract, and every facet is subject to it.
+    #[test]
+    fn reconciling_still_adds_and_drops_ordinary_facets() {
+        let db = Db::open_in_memory().unwrap();
+        let id = an_item(&db);
+        db.write_txn("t", move |conn, meta| {
+            apply(conn, meta, id, "area", "sync")?;
+            apply(conn, meta, id, "size", "small")
+        })
+        .unwrap();
+        let desired = vec![
+            ("area".to_owned(), "sync".to_owned()),
+            ("owner".to_owned(), "me".to_owned()),
+        ];
+        db.write_txn("t", move |conn, meta| {
+            reconcile_tags(conn, meta, id, &desired)
+        })
+        .unwrap();
+        assert_eq!(
+            tags_of(&db, id),
+            vec![
+                ("area".to_owned(), "sync".to_owned()),
+                ("owner".to_owned(), "me".to_owned())
+            ]
+        );
+    }
 
     #[test]
     fn tagged_items_are_found_by_facet_and_value() {

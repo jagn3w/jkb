@@ -1,8 +1,9 @@
 //! Task DAG: first-class task ergonomics on the item substrate (design D5/D19).
 //!
 //! A task is an item of `kind = 'task'` whose lifecycle lives in the real `status`
-//! column (`open`/`in_progress`/`done`/`cancelled`); `blocked` is **derived** — a
-//! task with a `depends_on` edge to a non-`done` task — never stored, so there is a
+//! column (`open`/`in_progress`/`needs_review`/`done`/`cancelled`); `blocked` is
+//! **derived** — a task with a `depends_on` edge to a non-**terminal** task (`done` and
+//! `cancelled` both unblock; `needs_review` does not) — never stored, so there is a
 //! single source of truth. `priority` and `due` are indexed columns (not tags), so
 //! the ready frontier can order by them cheaply.
 //!
@@ -19,6 +20,7 @@ use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, TaskStatus};
 
+use crate::changelog::{Entity, Op};
 use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
 use crate::query::{Query, Scope, TagPred};
 use crate::store::WriteMeta;
@@ -165,11 +167,10 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
             |row| row.get(0),
         )?;
     let item_id = ItemId::new(id);
-    changelog::append(
+    changelog::upsert(
         conn,
         meta,
-        "insert",
-        "items",
+        Entity::Items,
         &id.to_string(),
         None,
         Some(&json!({
@@ -432,8 +433,8 @@ pub fn set_status(
     changelog::append(
         conn,
         meta,
-        "update",
-        "items",
+        Op::Update,
+        Entity::Items,
         &task.get().to_string(),
         Some(&json!({ "status": before })),
         Some(&json!({ "status": status.as_str() })),
@@ -497,8 +498,8 @@ pub fn set_priority(
     changelog::append(
         conn,
         meta,
-        "update",
-        "items",
+        Op::Update,
+        Entity::Items,
         &task.get().to_string(),
         Some(&json!({ "priority": before })),
         Some(&json!({ "priority": priority })),
@@ -525,8 +526,8 @@ pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&s
     changelog::append(
         conn,
         meta,
-        "update",
-        "items",
+        Op::Update,
+        Entity::Items,
         &task.get().to_string(),
         Some(&json!({ "due": before })),
         Some(&json!({ "due": due })),
@@ -558,7 +559,7 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
 }
 
 /// The **ready frontier**: tasks (`kind = 'task'`) whose status is non-terminal and
-/// which have no `depends_on` edge to a non-`done` task, optionally narrowed to a
+/// which have no `depends_on` edge to a non-terminal task, optionally narrowed to a
 /// `scope` and `tags`. Ordered by priority (ascending, nulls last) then due date
 /// (ascending, nulls last).
 ///
