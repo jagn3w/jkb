@@ -608,7 +608,7 @@ mod tests {
     fn the_asset_stamp_changes_when_the_installed_names_do() {
         assert_ne!(
             super::hash_of_bundle(super::installed_name),
-            super::hash_of_bundle(|stem| stem.to_owned()),
+            super::hash_of_bundle(str::to_owned),
             "the stamp is blind to the name each asset is written under, so a config directory \
              holding the wrong names reads as reconciled and is never corrected"
         );
