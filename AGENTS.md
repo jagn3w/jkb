@@ -67,10 +67,10 @@ run — starts the same one.
 - `jkb staging ls [--all]` — the staging branches in this repo and what is landing on each:
   every task's state (`implementing` / `review` / `landed` / `dropped`), its commits, and
   whether its review left anything must-fix open. A staging branch is the same thing
-  `/task-swarm` calls its integration branch, and both paths show up here. `dropped` is a
+  `/jkb-task-swarm` calls its integration branch, and both paths show up here. `dropped` is a
   cancelled task that was on the branch — the opposite outcome to `landed`, never folded into it.
 - `jkb task review record --findings <ns>` — record that a review ran against the current
-  branch. `/review-log` does this for you; `jkb task land` requires it.
+  branch. `/jkb-review-log` does this for you; `jkb task land` requires it.
 
 **Recording where a task is being worked.** `jkb task work` does this for you; do it explicitly
 only when the branch was made some other way (a swarm run, a branch you cut by hand).

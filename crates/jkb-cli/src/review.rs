@@ -119,13 +119,13 @@ impl GateVerdict {
         match self {
             Self::Passed => None,
             Self::NeverReviewed => Some(
-                "No review has been recorded. Run /review-log in the session, or land with \
+                "No review has been recorded. Run /jkb-review-log in the session, or land with \
                  --no-review."
                     .to_owned(),
             ),
             Self::NoFindingsRecorded(nss) => Some(format!(
                 "Its review ({}) holds no findings at all, so they never reached the KB — this \
-                 is not a clean review. Re-run /review-log.",
+                 is not a clean review. Re-run /jkb-review-log.",
                 nss.join(", ")
             )),
             Self::OpenFindings(open) => Some(format!(
@@ -215,13 +215,13 @@ pub(crate) fn enforce(
     match verdict {
         GateVerdict::Passed => Ok(false),
         GateVerdict::NeverReviewed => anyhow::bail!(
-            "{uid} has no recorded review — run `/review-log` in the session (it records the \
+            "{uid} has no recorded review — run `/jkb-review-log` in the session (it records the \
              review itself), or land with --no-review to record a waiver instead"
         ),
         GateVerdict::NoFindingsRecorded(nss) => anyhow::bail!(
             "{uid} records a review of {} but that namespace holds no findings at all — so \
              the review's findings never reached the KB (a quarantined tasks.md, a typo'd \
-             --findings, or a namespace renamed since). Re-run `/review-log`, or land with \
+             --findings, or a namespace renamed since). Re-run `/jkb-review-log`, or land with \
              --no-review. This is NOT read as a clean review.",
             nss.join(", ")
         ),

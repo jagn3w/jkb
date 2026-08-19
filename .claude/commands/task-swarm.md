@@ -136,13 +136,13 @@ as `owner` below; the workflow's implementers claim with it and the sidecar keep
 Locate the installed workflow script (first that exists): `"$CLAUDE_CONFIG_DIR/workflows/jkb-task-swarm.js"`,
 `"$HOME/.claude/workflows/jkb-task-swarm.js"`, or `./.claude/workflows/task-swarm.js`.
 
-Call the **Workflow** tool with `scriptPath` = that path (or `name: "task-swarm"` if your
+Call the **Workflow** tool with `scriptPath` = that path (or `name: "jkb-task-swarm"` if your
 setup resolves saved workflows), and `args`.
 
 > **Gotcha:** pass `args` as an **actual JSON object**, not a JSON-encoded string. The
 > script does `const cfg = args || {}` and reads `cfg.integration` etc.; a stringified
 > value makes `cfg` a string, so every field is `undefined` and the script throws
-> `task-swarm requires args.integration and args.integrationWorktree` on launch.
+> `jkb-task-swarm requires args.integration and args.integrationWorktree` on launch.
 
 ```json
 {

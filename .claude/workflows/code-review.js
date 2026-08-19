@@ -1,5 +1,5 @@
 export const meta = {
-  name: 'code-review',
+  name: 'jkb-code-review',
   description:
     'Reviews a diff and returns ranked, structured findings. At the default effort "low", up to three reviewers split the change by feature area and each asks every lens question against one reading of its code. "medium" fans the lenses out instead — nine specialists plus one holistic reviewer per functional unit. "high" adds adversarial skeptics, batched by file — three angles per defect finding, one per quality finding — with each surviving on a majority of the verdicts cast about it.',
   whenToUse:

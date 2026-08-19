@@ -3111,7 +3111,7 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               cancelled task, never folded into `landed`. --all shows merged ones.
   jkb task review record --findings <ns>
                               record that a review ran against the current branch, so `land`
-                              can require one. /review-log does this for you.
+                              can require one. /jkb-review-log does this for you.
   jkb task tag set <uid> <f>=<v>
                               make <v> the facet's ONLY value (add appends). Use for the
                               single-answer facets: repo=. Writing branch= also records where
@@ -7482,7 +7482,7 @@ fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
         for uid in &skipped_unlanded {
             println!("  {uid}");
         }
-        println!("  review each in its own session (`/review-log` there), or land first.");
+        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
     }
     Ok(())
 }

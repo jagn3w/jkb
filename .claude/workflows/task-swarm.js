@@ -1,5 +1,5 @@
 export const meta = {
-  name: 'task-swarm',
+  name: 'jkb-task-swarm',
   description:
     'SCHEDULER groups overlapping ready jkb tasks into work-groups; one IMPLEMENTER builds each group on a clean branch; a fresh REVIEWER checks the whole group; a deterministic merge queue (no agent) rebase/fast-forwards approved branches into one feature branch and marks the group done. Pipelined (no per-round barrier), claim-guarded, looping as dependents unblock.',
   whenToUse:
@@ -53,7 +53,7 @@ const OWNER = cfg.owner || `swarm:${INTEGRATION}`
 
 if (!INTEGRATION || !INTEGRATION_WT) {
   throw new Error(
-    'task-swarm requires args.integration and args.integrationWorktree — the /jkb-task-swarm command sets these up before launching.',
+    'jkb-task-swarm requires args.integration and args.integrationWorktree — the /jkb-task-swarm command sets these up before launching.',
   )
 }
 
