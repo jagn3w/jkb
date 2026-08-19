@@ -135,7 +135,16 @@ fn remove_set(dir: &Path, prefix: &str, ext: &str, set: &[(&str, &str)]) -> Resu
 /// # Errors
 /// Returns an error if `HOME` is unset or an asset can't be written.
 pub fn install() -> Result<()> {
-    let base = base_dir()?;
+    install_into(&base_dir()?)
+}
+
+/// The body of [`install`], against an explicit config base so a test can watch what it writes.
+///
+/// Split out for exactly that: the prefix rule lives in the *paths these two build*, and until a
+/// test ran them against a directory it could inspect, reverting `ASSET_PREFIX` to `""` for
+/// workflows left the whole suite green — the cross-reference tests read the bundled bodies and
+/// never observe a write.
+fn install_into(base: &Path) -> Result<()> {
     write_set(
         &base.join("commands"),
         ASSET_PREFIX,
@@ -150,7 +159,7 @@ pub fn install() -> Result<()> {
         BUNDLED_WORKFLOWS,
         true,
     )?;
-    std::fs::write(stamp_path(&base), fingerprint()).context("writing asset stamp")?;
+    std::fs::write(stamp_path(base), fingerprint()).context("writing asset stamp")?;
     println!(
         "installed {} command(s) and {} workflow(s).",
         BUNDLED_COMMANDS.len(),
@@ -173,7 +182,11 @@ pub fn install() -> Result<()> {
 /// # Errors
 /// Returns an error if `HOME` is unset or an asset can't be removed.
 pub fn uninstall() -> Result<()> {
-    let base = base_dir()?;
+    uninstall_from(&base_dir()?)
+}
+
+/// The body of [`uninstall`], against an explicit config base. See [`install_into`].
+fn uninstall_from(base: &Path) -> Result<()> {
     remove_set(&base.join("commands"), ASSET_PREFIX, "md", BUNDLED_COMMANDS)?;
     remove_set(
         &base.join("workflows"),
@@ -184,7 +197,7 @@ pub fn uninstall() -> Result<()> {
     if base.exists() {
         // Mark the current bundle reconciled so auto-install won't re-add these until the
         // binary ships a different set.
-        std::fs::write(stamp_path(&base), fingerprint()).context("writing asset stamp")?;
+        std::fs::write(stamp_path(base), fingerprint()).context("writing asset stamp")?;
         println!(
             "removed. Auto-install won't re-add them until the next `jkb` upgrade; set \
              JKB_NO_AUTO_COMMANDS=1 to disable auto-install entirely."
@@ -413,6 +426,77 @@ mod tests {
                      `jkb commands install` does not write — add `{named}` to BUNDLED_COMMANDS"
                 );
             }
+        }
+    }
+
+    /// **Every asset is written under the prefix, and a file jkb did not write is not touched.**
+    ///
+    /// The one test that watches the config directory rather than the bundled bodies. Both
+    /// writers are unconditional — `try_ensure` fires on any `jkb` invocation whose stamp does not
+    /// match and `fs::write`s the whole set with no existence check, no prompt and no backup, and
+    /// `uninstall` `remove_file`s it while printing "removed" — so under the bare stem workflows
+    /// used to carry, `jkb <anything>` destroyed a user's own `~/.claude/workflows/code-review.js`
+    /// and `jkb commands uninstall` then deleted it. Nothing observed a write, so reverting the
+    /// prefix left the whole suite green.
+    ///
+    /// The user's file is checked after **both** verbs, because they fail differently: `install`
+    /// overwrites it, `uninstall` deletes it, and a prefix dropped from only one still loses it.
+    #[test]
+    fn installing_prefixes_every_asset_and_never_touches_a_file_jkb_did_not_write() {
+        const MINE: &str = "// my own review workflow, not jkb's\n";
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let base = dir.path();
+        let workflows = base.join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        // A name that collides with a bundled stem — likelier to be chosen for `code-review` than
+        // for anything else jkb ships, which is what makes this data loss rather than a naming
+        // preference.
+        let theirs = workflows.join("code-review.js");
+        std::fs::write(&theirs, MINE).unwrap();
+
+        // Read through a missing file rather than unwrapping it: `uninstall`'s failure mode is
+        // deletion, so an unwrap here would panic on the read and never reach the sentence that
+        // says what was lost.
+        let survives = || std::fs::read_to_string(&theirs).unwrap_or_default();
+
+        // THE HARM FIRST, so a build with the prefix dropped fails on the file it destroyed
+        // rather than on one of our own filenames being absent.
+        super::install_into(base).expect("install");
+        assert_eq!(
+            survives(),
+            MINE,
+            "`jkb commands install` overwrote a workflow of the user's own that it never wrote"
+        );
+        super::uninstall_from(base).expect("uninstall");
+        assert_eq!(
+            survives(),
+            MINE,
+            "`jkb commands uninstall` deleted a workflow of the user's own that it never wrote"
+        );
+
+        // …and then that our own assets really are there under the installed name, so the test
+        // cannot be satisfied by an installer that writes nothing at all.
+        super::install_into(base).expect("re-install");
+        for (stem, _) in BUNDLED_WORKFLOWS {
+            let path = workflows.join(format!("{ASSET_PREFIX}{stem}.js"));
+            assert!(
+                path.exists(),
+                "install wrote no {}, so the workflow went in under some other name",
+                path.display()
+            );
+        }
+        for (stem, _) in BUNDLED_COMMANDS {
+            let path = base
+                .join("commands")
+                .join(format!("{ASSET_PREFIX}{stem}.md"));
+            assert!(path.exists(), "install wrote no {}", path.display());
+        }
+        super::uninstall_from(base).expect("uninstall again");
+        for (stem, _) in BUNDLED_WORKFLOWS {
+            assert!(
+                !workflows.join(format!("{ASSET_PREFIX}{stem}.js")).exists(),
+                "uninstall left {stem} behind"
+            );
         }
     }
 
