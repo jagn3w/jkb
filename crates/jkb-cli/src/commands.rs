@@ -163,22 +163,24 @@ fn stamp_path(base: &Path) -> PathBuf {
 /// A stable fingerprint of the bundled asset set; changes whenever the binary ships different
 /// commands or workflows — **or writes the same ones under different names**.
 fn fingerprint() -> String {
-    hash_of_bundle(ASSET_PREFIX)
+    hash_of_bundle(installed_name)
 }
 
-/// The stamp's input, with the prefix taken as an argument so a test can show the installed
-/// **name** is part of it.
+/// The stamp's input, over the names `name` gives each stem — which in production is
+/// [`installed_name`], the same function the paths come from, so the stamp cannot describe names
+/// other than the ones written. Taking it as an argument is what lets a test show the name is in
+/// there at all.
 ///
 /// It hashes the *installed path*, not the stem. Hashing the stem alone made a prefix regression
 /// self-perpetuating: a config directory written under the wrong names still matched the stamp,
 /// so the auto-install — the one thing that would have corrected it — read as already reconciled
 /// and never ran again.
-fn hash_of_bundle(prefix: &str) -> String {
+fn hash_of_bundle(name: fn(&str) -> String) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for kind in KINDS {
         for (stem, body) in kind.set {
-            format!("{}/{prefix}{stem}.{}", kind.dir, kind.ext).hash(&mut h);
+            format!("{}/{}.{}", kind.dir, name(stem), kind.ext).hash(&mut h);
             body.hash(&mut h);
         }
     }
@@ -605,14 +607,14 @@ mod tests {
     #[test]
     fn the_asset_stamp_changes_when_the_installed_names_do() {
         assert_ne!(
-            super::hash_of_bundle(ASSET_PREFIX),
-            super::hash_of_bundle(""),
+            super::hash_of_bundle(super::installed_name),
+            super::hash_of_bundle(|stem| stem.to_owned()),
             "the stamp is blind to the name each asset is written under, so a config directory \
              holding the wrong names reads as reconciled and is never corrected"
         );
         assert_eq!(
             super::fingerprint(),
-            super::hash_of_bundle(ASSET_PREFIX),
+            super::hash_of_bundle(super::installed_name),
             "the stamp is not taken over the names the installer actually writes"
         );
     }
