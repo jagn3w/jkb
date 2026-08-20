@@ -92,12 +92,18 @@ only when the branch was made some other way (a swarm run, a branch you cut by h
 transition, who applied it, the branch and land target recorded with it, and the evidence each
 guard fired on. It is the first thing to run when a task is stuck.
 
-**Auto-close is proved, never inferred.** `jkb task close-merged` closes a task when its **pull
-request has merged** — `jkb task pr <uid> [number]` records or discovers the number, and after
-that the branch name is never consulted, because a pull request number is minted by GitHub and
-never reused. Anything it cannot prove is *held with the reason printed*: no number recorded, no
-`gh` installed, no network, or a branch name that matches two pull requests. A missed close costs
-one command; a wrong one buries work still in flight.
+**Auto-close is proved, never inferred.** `jkb task close-merged` closes a task on either of two
+proofs: a landing **jkb itself recorded** (`jkb task land`, or the merge queue's `jkb task
+landed`), consulted first, and otherwise its **pull request having merged** — `jkb task pr <uid>
+[number]` records or discovers the number, and after that the branch name is never consulted,
+because a pull request number is minted by GitHub and never reused. The recorded landing is the
+only proof a locally-grafted branch has, since no pull request exists for it.
+
+Either proof is **spent** once the task has been put back to work since: reopen a landed task and
+it stays open, rather than being closed again by the next `git pull` on the strength of the
+landing you reopened it from. Anything it cannot prove is *held with the reason printed*: no
+number recorded, no `gh` installed, no network, or a branch name that matches two pull requests.
+A missed close costs one command; a wrong one buries work still in flight.
 
 **Landing is review-gated.** `jkb task land` refuses a task with no recorded review, or whose
 review left a must-fix finding open — anything at `priority <= 1`, so `!p0` blocks as well as

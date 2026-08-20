@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **580 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **582 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -755,6 +755,34 @@ the code had no way to have. Design: `openspec/changes/jkb-state-machine/`.
   different targets are two entries with timestamps, not one row keeping whichever wrote last.
 - **`jkb task why <uid>`** prints it: every transition, who applied it, and the evidence each guard
   fired on. Fourteen must-fixes are "held for ever with no way to see why"; that is now one command.
+
+### Evidence of a landing is spent once the task is put back to work
+
+The log removed the reconciliation problem from **writing** — an append-only history makes no
+claim about the present, so nothing has to be kept in agreement. It moved it to **reading**. Every
+caller asks a present-tense question (*has this landed?*, *where does it land?*), and turning a
+history into a present-tense answer needs a rule for when an older row stops counting — which was
+written separately in each reader, and they disagreed. `land_target` stopped at `abandon`;
+`landed` stopped at nothing. Five findings across two review rounds are that one gap.
+
+- **The rule is asked of the status, not of a list of events.** `transition::resumed` is the one
+  statement: the newest row that moved the task **out of** a terminal status. The obvious repair —
+  give `landed` the same stop-list its sibling has — is a fourth private rule for a fifth reader
+  to get wrong, and one that a newly-added event has to be *remembered* and added to. Every row
+  already records where it moved the task, so an event added later is covered by nobody.
+- **Both halves are load-bearing**, and the looser reading (*is* non-terminal, rather than *moved
+  out of* terminal) was wrong in a way only running it showed: the row recording a landing held
+  for an open subtask is `in_progress -> in_progress`, so it superseded **itself** and its task
+  could never close.
+- **It reaches the pull-request path too** (`pr::spent`), which is where it matters most: a merge
+  reads as `MERGED` for ever, so reopening a landed task and running `git pull` closed it again —
+  unattended, from the `post-merge` hook, over every task at once. That half **predates** the
+  recorded-landing path and predates this branch.
+- **Deliberately narrow.** It fires only on a merge and a resumption that can both be placed in
+  time; every gap leaves the answer alone. Declining to close genuinely landed work is silent and
+  permanent, where the other direction costs one command (D34.4).
+- **The pure half is separated from the `gh` call** so it is testable at all — a rule exercisable
+  only by shelling out to an authenticated network client is a rule nothing checks.
 
 ### Auto-close is a lookup on an id that is never reused
 

@@ -332,10 +332,60 @@ pub fn land_target(conn: &Connection, task: ItemId) -> Result<Option<String>> {
 pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
     use jkb_fsm::Event as _;
     let landing = [TaskEvent::Land.name(), TaskEvent::ObservedLanded.name()];
-    Ok(history(conn, task)?
+    let rows = history(conn, task)?;
+    let back_to_work = resumption(&rows).map_or(i64::MIN, |r| r.id);
+    Ok(rows
         .into_iter()
         .rev()
-        .find(|r| landing.contains(&r.event.as_str()) && r.labels.onto.is_some()))
+        .find(|r| landing.contains(&r.event.as_str()) && r.labels.onto.is_some())
+        .filter(|r| r.id > back_to_work))
+}
+
+/// The newest row that **put this task back to work**, or `None` if none did.
+///
+/// *The* statement of when evidence of a landing goes stale, and the reason it is one function:
+/// a landing is proof about the past, and every caller asks a present-tense question — *has this
+/// task landed?* Turning a history into a present-tense answer needs a rule for when an older row
+/// stops counting, and that rule was written separately in each reader. They disagreed:
+/// [`land_target`] stopped at `abandon`, [`landed`] stopped at nothing. So a task that landed and
+/// was then deliberately reopened still read as landed, and `jkb task close-merged` — which runs
+/// unattended from a `post-merge` hook, over every task at once — closed it again while somebody
+/// had a live session on it.
+///
+/// **Asked of the status, not of a list of events.** The obvious repair was to give [`landed`]
+/// the same stop-list its sibling has, and that is the shape that caused this: a fourth private
+/// rule for a fifth reader to get wrong, and one a new event has to be remembered and added to.
+/// A row already records where it moved the task, so "did anything put this back to work?" is
+/// answerable from the data — an event added later is covered without anybody remembering it.
+///
+/// A resumption is a **move out of a terminal status**, which is what *put back to work* means:
+/// you can only be put back if you had finished. Both halves are load-bearing, and a row that
+/// merely *is* non-terminal is not enough — the row recording a landing that was held for an open
+/// subtask is `in_progress -> in_progress`, so under the looser reading it superseded **itself**
+/// and the task it was recorded for could never close. Found by running it.
+///
+/// It follows that `done -land-> done` is not a resumption (nothing moved) while an operator
+/// override out of a terminal status is one whatever it is called — which is the point of asking
+/// the status rather than the event name.
+///
+/// A row with no `from_status` — a history that starts before this table did — is not a
+/// resumption: it cannot be shown to have moved out of anything, and inventing the stronger
+/// answer would retire a landing on no evidence.
+///
+/// # Errors
+/// Returns a database error if the history cannot be read.
+pub fn resumed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
+    Ok(resumption(&history(conn, task)?).cloned())
+}
+
+/// [`resumed`] over rows already in hand, so a caller needing both reads the history once.
+fn resumption(rows: &[TransitionRow]) -> Option<&TransitionRow> {
+    rows.iter().rev().find(|r| {
+        r.from_status
+            .as_deref()
+            .is_some_and(|from| TaskStatus::is_terminal_str(Some(from)))
+            && !TaskStatus::is_terminal_str(Some(&r.to_status))
+    })
 }
 
 /// The pull request recorded for this task, if any — the most recently recorded one.

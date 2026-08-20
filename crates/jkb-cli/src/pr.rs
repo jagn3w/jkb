@@ -135,7 +135,11 @@ pub(crate) fn lookup(dir: &Path, number: i64) -> Result<PullRequest, String> {
 /// The one thing the lifecycle's `observed_landed` guard reads. Every failure — no number
 /// recorded, no `gh`, no network, an unrecognized state — is [`Fact::Unknown`], and the guard
 /// requires it proven.
-pub(crate) fn merged_fact(dir: &Path, number: Option<i64>) -> (Fact, Option<String>) {
+pub(crate) fn merged_fact(
+    dir: &Path,
+    number: Option<i64>,
+    resumed_at: Option<&str>,
+) -> (Fact, Option<String>) {
     let Some(number) = number else {
         return (
             Fact::Unknown,
@@ -144,6 +148,20 @@ pub(crate) fn merged_fact(dir: &Path, number: Option<i64>) -> (Fact, Option<Stri
     };
     match lookup(dir, number) {
         Ok(pr) => {
+            // **Spent evidence**, the same rule `jkb_core::transition::resumed` states for a
+            // recorded landing, reaching the other half of the evidence. A merge is proof about
+            // the past and reads as `MERGED` for ever; a task put back to work after it merged is
+            // being worked on *now*, and closing it again on the strength of that merge is the
+            // defect this pair exists to stop. It predates the recorded-landing path — a merged
+            // pull request has always re-closed a reopened task on the next `git pull`.
+            //
+            // `No` rather than `Unknown`: we are not failing to establish something, we have
+            // established that this merge does not speak for the work in flight. RFC-3339 from
+            // `gh`, so the strings compare correctly; a merge with no timestamp is left alone
+            // rather than guessed at.
+            if let Some(stale) = spent(&pr, resumed_at) {
+                return (Fact::No, Some(stale));
+            }
             let fact = pr.merged();
             let why = match fact {
                 Fact::Yes => None,
@@ -159,6 +177,36 @@ pub(crate) fn merged_fact(dir: &Path, number: Option<i64>) -> (Fact, Option<Stri
         }
         Err(why) => (Fact::Unknown, Some(why)),
     }
+}
+
+/// Whether this merge is **spent** — it happened, and the task has since been put back to work,
+/// so it says nothing about the work in flight. `Some(reason)` when it is.
+///
+/// The same rule `jkb_core::transition::resumed` states for a recorded landing, reaching the
+/// other half of the evidence. A merge reads as `MERGED` for ever, so without this a reopened
+/// task is closed again on the next `git pull` — the `post-merge` hook runs `close-merged` over
+/// every task unattended, so nobody chose to run it. It predates the recorded-landing path.
+///
+/// Pure, and separated from [`merged_fact`] for that reason: everything around it needs `gh`, and
+/// a rule that can only be exercised by shelling out to an authenticated network client is a rule
+/// nothing checks.
+///
+/// Deliberately narrow. It fires only on a merge we can **place in time** against a resumption we
+/// can place in time; anything missing leaves the answer alone rather than guessing, since the
+/// failure it would cause — declining to close genuinely landed work — is silent and permanent,
+/// where the other direction costs one command.
+fn spent(pr: &PullRequest, resumed_at: Option<&str>) -> Option<String> {
+    let (merged_at, resumed_at) = (pr.merged_at.as_deref()?, resumed_at?);
+    // RFC-3339 from `gh` and from `strftime('%Y-%m-%dT%H:%M:%fZ')` — both zero-padded, both UTC,
+    // so lexical order is chronological order. Compared as strings on purpose: parsing them would
+    // add a date library to answer a question the format already answers.
+    (pr.merged() == Fact::Yes && merged_at < resumed_at).then(|| {
+        format!(
+            "pull request #{} merged at {merged_at}, but the task was put back to work at \
+             {resumed_at}",
+            pr.number
+        )
+    })
 }
 
 /// Run `gh` in `dir`, returning stdout or a sentence explaining why we could not ask.
@@ -198,7 +246,7 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Discovery, PullRequest};
+    use super::{spent, Discovery, PullRequest};
     use jkb_fsm::Fact;
 
     fn pr(state: &str) -> PullRequest {
@@ -268,6 +316,44 @@ mod tests {
             Discovery::Ambiguous(ns) => assert_eq!(ns, vec![31, 44]),
             _ => panic!("expected ambiguity"),
         }
+    }
+    /// A merge speaks for the work in flight only if nothing has put the task back to work since.
+    ///
+    /// The narrowness is asserted with it: this fires on a merge and a resumption it can both
+    /// place in time, and on nothing else. Declining to close genuinely landed work is silent and
+    /// permanent, so every gap in the evidence leaves the answer alone.
+    #[test]
+    fn a_merge_is_spent_once_the_task_has_been_put_back_to_work() {
+        let merged = PullRequest {
+            number: 31,
+            state: Some("MERGED".to_owned()),
+            merged_at: Some("2026-08-19T10:00:00Z".to_owned()),
+            base_ref_name: None,
+            head_ref_name: None,
+        };
+        // Put back to work the day after it merged: the merge is about older work.
+        let why = spent(&merged, Some("2026-08-20T09:00:00Z")).expect("spent");
+        assert!(
+            why.contains("#31") && why.contains("put back to work"),
+            "{why}"
+        );
+
+        // Resumed *before* the merge — an ordinary landing of work that was in progress.
+        assert_eq!(spent(&merged, Some("2026-08-18T09:00:00Z")), None);
+        // Never resumed at all.
+        assert_eq!(spent(&merged, None), None);
+        // A merge we cannot place in time is left alone rather than assumed stale.
+        let undated = PullRequest {
+            merged_at: None,
+            ..merged.clone()
+        };
+        assert_eq!(spent(&undated, Some("2026-08-20T09:00:00Z")), None);
+        // And an open pull request is not a spent merge; it is not a merge.
+        let open = PullRequest {
+            state: Some("OPEN".to_owned()),
+            ..merged.clone()
+        };
+        assert_eq!(spent(&open, Some("2026-08-20T09:00:00Z")), None);
     }
 }
 

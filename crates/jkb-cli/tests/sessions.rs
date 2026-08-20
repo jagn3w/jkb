@@ -2121,6 +2121,102 @@ fn a_landing_recorded_while_a_task_was_held_closes_it_once_the_hold_lifts() {
     );
 }
 
+/// A landing is spent once the task is put back to work — and **still closes it when it is not**.
+///
+/// Both directions, because either alone passes with the rule broken the other way: refusing
+/// every close makes the first assertion pass, and closing everything makes the second.
+///
+/// `close-merged` runs unattended from the `post-merge` hook over every task at once, so this is
+/// not a command anybody chose to run: you reopen a landed task, work on it, `git pull`, and it
+/// is silently `done` again with a live session on it. Reproduced exactly this way.
+#[test]
+fn a_landing_stops_counting_once_the_task_is_put_back_to_work() {
+    let f = Fixture::new();
+
+    // Both tasks are `in_progress` with a recorded landing when `close-merged` runs, so the only
+    // thing that can separate them is whether the landing still speaks for the work. Neither is
+    // already in the state its assertion wants — an earlier version of this asserted `done` on a
+    // task `jkb task landed` had *already* closed, which no breakage of the rule could disturb.
+    let reopened = f.add_task("reopened after landing");
+    let s = f.work(&reopened);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    // No `git merge` anywhere here: `jkb task landed` is the merge queue reporting a graft it
+    // performed and gated itself, and verifies nothing of its own — the recorded event is the
+    // subject, and grafting both branches for real would only make them diverge.
+    commit_in(&worktree, "a.txt", "work\n", "work");
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            s["onto"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&reopened), "done");
+    // The work was wrong and has to go ahead again.
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "set",
+            &reopened,
+            "--status",
+            "in_progress",
+        ])
+        .assert()
+        .success();
+
+    // The other one was *held* at landing time by an open subtask, so it is `in_progress` with a
+    // landing nothing has superseded — the case `close-merged` has to close.
+    let held = f.add_task("held by a subtask");
+    let s = f.work(&held);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&worktree, "b.txt", "work\n", "work");
+    let out = f
+        .jkb()
+        .args([
+            "--global", "task", "add", "child", "--under", &held, "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task add --under: {out:?}");
+    let child = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            s["onto"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&held), "in_progress", "it closed while held");
+    f.jkb()
+        .args(["--global", "task", "set", &child, "--status", "done"])
+        .assert()
+        .success();
+
+    // One `git pull`, firing the hook over both.
+    f.jkb().args(["task", "close-merged"]).assert().success();
+
+    assert_eq!(
+        f.status_of(&reopened),
+        "in_progress",
+        "a landing recorded before the reopen closed the task again, over work in flight"
+    );
+    assert_eq!(
+        f.status_of(&held),
+        "done",
+        "the staleness rule swallowed a landing nothing had superseded"
+    );
+}
+
 /// One task `close-merged` cannot decide must not stop it deciding the rest.
 ///
 /// The run is **total**: every task in the repo gets a verdict, and a task whose branch value is

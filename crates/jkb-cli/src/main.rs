@@ -851,9 +851,14 @@ enum TaskCmd {
         #[arg(long, conflicts_with = "cmd")]
         clear: bool,
     },
-    /// Close tasks whose pull request has merged. A task closes only when the merge is
-    /// **proven** — a recorded pull request in state `MERGED` — and all of its subtasks are
-    /// terminal; anything else is reported with the reason.
+    /// Close tasks whose work is proven to have landed, and whose subtasks are all terminal;
+    /// anything else is reported with the reason.
+    ///
+    /// Two proofs, in this order: a landing **jkb itself recorded** (`jkb task land`, or the
+    /// merge queue's `jkb task landed`), and otherwise a recorded pull request in state `MERGED`.
+    /// The first is what a locally-grafted branch has, since there is no pull request to ask
+    /// about. Either is **spent** once the task has been put back to work since — a reopened task
+    /// is not closed again on the strength of the landing it was reopened from.
     ///
     /// Works with merge-commit, squash and rebase merges alike, and needs no cut point, because
     /// it asks GitHub about an id rather than asking the commit graph about a branch name.
@@ -3134,9 +3139,10 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               and the evidence each one fired on. Run this FIRST when a task
                               is stuck.
   jkb task pr <uid> [number]  record (or discover, from the branch) the pull request that will
-                              prove this task's work landed. `close-merged` closes a task only
-                              when that PR has MERGED; anything it cannot prove is reported
-                              with the reason. No verb takes a sha.
+                              prove this task's work landed. `close-merged` closes a task on a
+                              landing jkb recorded, else on that PR having MERGED — and neither
+                              counts once the task has been put back to work since. Anything it
+                              cannot prove is reported with the reason. No verb takes a sha.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -4523,7 +4529,10 @@ fn cmd_task_pr(db: &Db, uid: &str, number: Option<i64>, json: bool) -> Result<()
     let ctx = repo::repo_ctx().ok();
     let (merged, why) = ctx.as_ref().map_or_else(
         || (Fact::Unknown, Some("not in a git repository".to_owned())),
-        |c| pr::merged_fact(&c.root, Some(number)),
+        // `None`: this verb reports a fact about the pull request — *did it merge* — and is not
+        // deciding whether to close anything. The staleness rule belongs to the close decision,
+        // where the question is whether the merge speaks for the work in flight.
+        |c| pr::merged_fact(&c.root, Some(number), None),
     );
     if json {
         println!(
@@ -6548,6 +6557,10 @@ fn close_one(db: &Db, root: &Path, id: ItemId, dry_run: bool) -> Result<CloseVer
     // ever — with the row that would have freed it sitting in its history.
     let recorded = db.read(move |conn| jkb_core::transition::landed(conn, id))?;
     let number = db.read(move |conn| jkb_core::transition::pull_request(conn, id))?;
+    // When the task was last put back to work, so a merge older than that is not read as proof
+    // about the work in flight. Both evidence paths answer to the one rule.
+    let resumed = db.read(move |conn| jkb_core::transition::resumed(conn, id))?;
+    let resumed_at = resumed.as_ref().map(|r| r.at.clone());
     let (number, merged, why) = if recorded.is_some() {
         (number, Fact::Yes, None)
     } else {
@@ -6566,7 +6579,7 @@ fn close_one(db: &Db, root: &Path, id: ItemId, dry_run: bool) -> Result<CloseVer
                 }
             },
         };
-        let (merged, why) = pr::merged_fact(root, number);
+        let (merged, why) = pr::merged_fact(root, number, resumed_at.as_deref());
         (number, merged, why)
     };
     let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
