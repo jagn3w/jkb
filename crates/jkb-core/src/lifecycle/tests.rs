@@ -83,7 +83,7 @@ fn every_context() -> Vec<TaskFacts> {
                     review_clean: digit(n, 7),
                     review_waived: digit(n, 8),
                     open_subtasks: digit(n, 9),
-                    pr_merged: digit(n, 10),
+                    landed_elsewhere: digit(n, 10),
                 });
             }
         }
@@ -263,7 +263,7 @@ fn a_parent_with_open_subtasks_does_not_land() {
     // Nor does a merged pull request close it, which is D34.4's rule that a missed close costs
     // one command while a wrong one buries unfinished work.
     let merged = TaskFacts {
-        pr_merged: Fact::Yes,
+        landed_elsewhere: Fact::Yes,
         open_subtasks: Fact::Yes,
         ..landable()
     };
@@ -278,7 +278,7 @@ fn a_parent_with_open_subtasks_does_not_land() {
 #[test]
 fn an_external_landing_needs_a_merged_pull_request() {
     let unproven = TaskFacts {
-        pr_merged: Fact::Unknown,
+        landed_elsewhere: Fact::Unknown,
         ..landable()
     };
     assert!(matches!(reconcile(&unproven), Reconciliation::Settled));
@@ -287,7 +287,7 @@ fn an_external_landing_needs_a_merged_pull_request() {
         .is_some());
 
     let merged = TaskFacts {
-        pr_merged: Fact::Yes,
+        landed_elsewhere: Fact::Yes,
         ..landable()
     };
     let Reconciliation::Fired(out) = reconcile(&merged) else {
@@ -320,7 +320,7 @@ fn only_a_proven_dead_owner_is_reclaimed() {
         .refusal()
         .is_some());
     let out = apply(&held(Fact::No), TaskEvent::ObservedOwnerGone);
-    assert_eq!(out.effects(), [TaskEffect::ReleaseClaim]);
+    assert_eq!(out.effects(), [TaskEffect::ReclaimFrom(agent("a"))]);
     assert_eq!(
         out.state(),
         TaskStatus::InProgress,

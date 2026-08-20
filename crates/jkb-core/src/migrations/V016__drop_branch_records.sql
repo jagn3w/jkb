@@ -1,0 +1,29 @@
+-- `branch_records` is gone (design S-series, D48). Its two durable facts -- where a branch was cut,
+-- and that jkb landed it -- are now entries in `task_transitions`, and the question that made a cut
+-- point necessary at all no longer exists.
+--
+-- That question was: *does this branch add anything to trunk?* -- the only containment test that
+-- survives a squash or rebase merge, and one a branch with **no commits at all** also answers no
+-- to. Separating "landed and squashed away" from "never started" needed a stored fork point per
+-- branch, and because a branch name outlives the branch that held it, that record then needed an
+-- instance anchor derived from the reflog, a supersede rule, a `landed_head` column, and a verb to
+-- forget a wrong one. Every one of those was added after a defect, and the cluster produced roughly
+-- a quarter of the `staging-workflow` review corpus's must-fix findings.
+--
+-- A merged pull request answers the question directly, and a pull request number is minted by
+-- GitHub and never reused -- so there is nothing left to disambiguate, and nothing to keep in
+-- agreement with a moving world.
+--
+-- **Nothing is migrated into the history**, deliberately, and for the reason `V013` gave for
+-- back-filling nothing: importing values whose reliability was the problem defeats the point of
+-- the store they are imported into. A cut point that survived here would answer a question nothing
+-- asks any more; a landing event would be an entry with no task attached, since these rows are
+-- keyed by branch and the history is keyed by task. What is lost is auto-close for tasks whose
+-- pull request is not yet recorded, and the repair is one command: `jkb task pr <uid> <number>`,
+-- or `jkb task close-merged`, which discovers it from the branch and records it.
+--
+-- The changelog rows that mention this table are left in place. They are history, and
+-- `changelog::Entity` no longer has a variant for them, so `jkb undo` refuses a transaction that
+-- touched one by name rather than reverting something else -- which is D47's rule exactly.
+
+DROP TABLE IF EXISTS branch_records;

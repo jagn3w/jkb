@@ -163,7 +163,6 @@ entities! {
     Ingestions => "ingestions",
     Containment => "containment",
     SyncState => "sync_state",
-    BranchRecords => "branch_records",
     /// `undo` markers, whose `entity_id` is the reverted transaction's id.
     Changelog => "changelog",
 }
@@ -225,8 +224,7 @@ impl Entity {
             | Self::Bindings
             | Self::Mounts
             | Self::Ingestions
-            | Self::Containment
-            | Self::BranchRecords => InsertInverse::DeleteRow,
+            | Self::Containment => InsertInverse::DeleteRow,
             // Keyed by a uri, a transaction id and a content hash respectively, so a rowid
             // delete would address some other row; none is ever logged with op `insert`.
             Self::SyncState | Self::Changelog | Self::Blobs => InsertInverse::Never,

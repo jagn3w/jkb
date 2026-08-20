@@ -76,26 +76,28 @@ run — starts the same one.
 only when the branch was made some other way (a swarm run, a branch you cut by hand).
 
 - `jkb task start <uid> [--branch B] [--onto S]` — claim the task and record, in one write, the
-  branch, the repo, the branch it lands on, and the commit `B` was **cut from**. Prefer it to
-  tagging `branch=` by hand — that records a cut point too, but this is the writer you can tell
-  the parent branch. Without `--onto` only a branch with no commits of its own can be measured
-  (its own tip is provably its fork point); one that already has commits gets nothing recorded,
-  and says so.
+  branch, the repo, and the branch it lands on. Prefer it to tagging `branch=` by hand.
 - `jkb task tag set <uid> <facet>=<value>` — make `<value>` the facet's **only** value. `add` is
   additive and stays that way (an open-ended facet legitimately holds several values); `set` is
   for the single-answer ones, `repo=` being the one left. A second value there is a
   contradiction, and a reader collapsing the multi-map picks one at random.
 - `onto=` is **refused** by `tag add`/`tag set` and by `#onto=` in quick-add, and says so: where a
-  branch lands is a fact about the *branch*, so it lives in that branch's record and a facet of
-  that name reaches no reader. Use `task work --onto` / `task start --onto`. `base=` is **not**
-  refused, and it is not inert either: nothing reads it (a cut point is a row in the branch record,
-  written by `jkb task start` / `jkb task base`), but on a *file-backed* task the `tasks`
-  serializer renders every facet, so a stray one is written back into your `tasks.md`. Remove it
-  with `jkb task tag rm <uid> base=<value>`.
-- **No verb takes a commit id.** The sha nearest your hand is the branch tip, and a cut point
-  equal to the tip reads as "nothing has happened on this branch" forever — the task can then
-  neither be credited by a review nor land. If a branch's cut point is wrong,
-  `jkb task base --forget <branch>` drops it and prints what can be recorded next.
+  branch lands is recorded as a label on the task's transition history, by `task work --onto` /
+  `task start --onto`, so a facet of that name reaches no reader.
+- **No verb takes a commit id**, and none needs one. Where a branch was cut is not stored at all
+  any more (D48): it existed only to make a commit-graph inference answerable, and that inference
+  is gone.
+
+**Why is this task here?** `jkb task why <uid>` prints the task's lifecycle history — every
+transition, who applied it, the branch and land target recorded with it, and the evidence each
+guard fired on. It is the first thing to run when a task is stuck.
+
+**Auto-close is proved, never inferred.** `jkb task close-merged` closes a task when its **pull
+request has merged** — `jkb task pr <uid> [number]` records or discovers the number, and after
+that the branch name is never consulted, because a pull request number is minted by GitHub and
+never reused. Anything it cannot prove is *held with the reason printed*: no number recorded, no
+`gh` installed, no network, or a branch name that matches two pull requests. A missed close costs
+one command; a wrong one buries work still in flight.
 
 **Landing is review-gated.** `jkb task land` refuses a task with no recorded review, or whose
 review left a must-fix finding open — anything at `priority <= 1`, so `!p0` blocks as well as
@@ -165,8 +167,8 @@ current state.
   tombstone, or a unit an edge records as killed) and synced-file items sync would recreate;
   `--force` overrides.
 - `jkb task tag add <uid> facet=value` — apply a tag (additive); `jkb task tag set` replaces the
-  facet's other values. Neither can set `onto=`, and a cut point is not a tag at all — see
-  *Recording where a task is being worked* above. `jkb task depend <uid> <dep-uid>` — add a
+  facet's other values. Neither can set `onto=` — see *Recording where a task is being worked*
+  above. `jkb task depend <uid> <dep-uid>` — add a
   dependency edge.
 - `jkb undo` — revert the last change (yours or another agent's).
 

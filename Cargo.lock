@@ -1895,6 +1895,7 @@ dependencies = [
  "ctrlc",
  "jkb-core",
  "jkb-embed",
+ "jkb-fsm",
  "jkb-index",
  "jkb-ingest",
  "jkb-mcp",
@@ -1903,6 +1904,7 @@ dependencies = [
  "jkb-types",
  "predicates",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

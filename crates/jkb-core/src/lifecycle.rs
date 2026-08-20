@@ -143,8 +143,16 @@ pub enum TaskEffect {
     SetStatus(TaskStatus),
     /// Take the claim for this owner.
     Claim(AgentId),
-    /// Clear the claim, whoever holds it.
+    /// Clear the claim, whoever holds it — what a transition to a terminal status entails.
     ReleaseClaim,
+    /// Take the claim away from an owner judged gone.
+    ///
+    /// Distinct from [`TaskEffect::ReleaseClaim`] because the audit trail distinguishes them: a
+    /// release is the holder letting go, a reclaim is somebody else deciding it had. It names
+    /// the owner it judged, so the write is a compare-and-set — the judgement was made outside
+    /// the transaction, and between reading the owner and clearing it somebody else can
+    /// legitimately have claimed the task.
+    ReclaimFrom(AgentId),
 }
 
 /// Everything a guard is allowed to look at.
@@ -184,13 +192,19 @@ pub struct TaskFacts {
     pub review_waived: Fact,
     /// The task has a non-terminal subtask (design D34.1: you work the leaves).
     pub open_subtasks: Fact,
-    /// A merged pull request proves this work reached its target.
+    /// A trusted report that this work reached its target, from something other than jkb's own
+    /// `task land`.
     ///
-    /// `Unknown` where there is no pull request recorded, no `gh`, no network, or no GitHub
-    /// remote — and `Unknown` holds, which is the whole point: it replaces an *inference* from
-    /// the commit graph, which could not tell a squash-landed branch from one that never
-    /// started, with a *lookup* on an id that is never reused.
-    pub pr_merged: Fact,
+    /// Two sources, one fact, because a guard that took two would eventually be given one and
+    /// not the other: a **merged pull request** (looked up by number — minted by GitHub and never
+    /// reused), and **jkb's own merge queue** saying it performed the graft. What is recorded is
+    /// which of the two it was, as a label on the transition.
+    ///
+    /// `Unknown` wherever we could not establish it — no pull request recorded, no `gh`, no
+    /// network, no GitHub remote — and `Unknown` **holds**. That is the whole point: it replaces
+    /// an inference from the commit graph, which could not tell a squash-landed branch from one
+    /// that never started, with a lookup on an id that needs no disambiguating.
+    pub landed_elsewhere: Fact,
 }
 
 /// The state lives in the observation, so nothing can pass a state that disagrees with the
@@ -320,7 +334,7 @@ fn review_gate(f: &TaskFacts) -> Verdict<TaskEvent> {
 
 /// The pull-request-proved landing, for work jkb did not graft itself.
 ///
-/// This is the whole of what replaced the commit-graph inference. `pr_merged` must be proven
+/// This is the whole of what replaced the commit-graph inference. `landed_elsewhere` must be proven
 /// true, and `Unknown` — no pull request recorded, no `gh`, no network, no GitHub remote —
 /// holds and says so. The inference it replaces had to distinguish *squash-landed* from *never
 /// started* from a branch that adds nothing to trunk, which needed a stored cut point, an
@@ -333,11 +347,14 @@ fn review_gate(f: &TaskFacts) -> Verdict<TaskEvent> {
 /// review gate comes to be bypassed by a merge somebody else performed.
 fn landed_externally(f: &TaskFacts) -> Verdict<TaskEvent> {
     all_of([
-        require_yes(f.pr_merged, || {
-            Denial::new("No merged pull request proves this work landed.")
+        require_yes(f.landed_elsewhere, || {
+            Denial::new(
+                "Nothing proves this work landed — no merged pull request, and jkb did \
+                         not perform the graft itself.",
+            )
         }),
         require_no(f.open_subtasks, || {
-            Denial::new("Its pull request merged, but it still has open subtasks.")
+            Denial::new("Its work landed, but it still has open subtasks.")
         }),
     ])
 }
@@ -441,8 +458,13 @@ fn plan_changes(_: &TaskFacts) -> Vec<TaskEffect> {
     vec![TaskEffect::SetStatus(TaskStatus::InProgress)]
 }
 
-fn plan_release(_: &TaskFacts) -> Vec<TaskEffect> {
-    vec![TaskEffect::ReleaseClaim]
+fn plan_release(f: &TaskFacts) -> Vec<TaskEffect> {
+    match &f.claimant {
+        Some(held) => vec![TaskEffect::ReclaimFrom(held.clone())],
+        // Unreachable: `owner_gone` requires a claimant. Spelled as an empty plan rather than
+        // a panic, so a future guard change degrades to doing nothing.
+        None => Vec::new(),
+    }
 }
 
 /// A stated status carries the same obligations as a declared one — including the claim release

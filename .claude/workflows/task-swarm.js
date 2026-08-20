@@ -282,25 +282,18 @@ Run them, then return ok=true (detail = any command that returned false/failed).
 // Record the implementer's branch on every task in the group, so `jkb staging ls` can show
 // the sub-branch and its commits exactly as it does for a hand-driven session (D38.2).
 //
-// The cut point is recorded with it, and is not optional bookkeeping: landing and review-recording
-// both refuse to act on a branch with no base, because without one an empty freshly-cut branch and
-// a landed one are indistinguishable. The swarm once wrote a land target, `branch=` and `repo=`
-// and no cut point,
-// so `jkb task review record` on the integration branch skipped every swarm task, reporting them
-// as "not merged into it yet" while they were fully contained in it.
+// One write, recording `branch=`, `repo=` and the branch's land target together — which is why
+// there is one command here rather than three. Idempotent under this run's own claim, so a retry
+// pass is safe.
 //
-// This is `jkb task start`, and the swarm passes NO commit id — that is the whole point of the
-// verb. Every previous attempt here had the swarm compute one, and each computed value was wrong
-// in its own way: the integration branch's tip named a commit the group's branch never sat on (it
-// moves under a pipelined run), and then the group branch's own tip made `base == tip` permanently,
-// so `is_merged` answered `NothingToMerge` and every task of every group was blocked from landing.
-//
-// What it does state is `--onto ${INTEGRATION}` — *which branch this one was cut from*, which the
-// swarm knows for certain because it told the implementer to branch off it. `task start` measures
-// the rest (their merge-base) and refuses to overwrite a cut point already recorded, so re-running
-// it on a retry pass is safe. It also sets `branch=`/`repo=` and the branch's land target, which
-// is why there is one
-// command here rather than three, and it is idempotent under this run's own claim.
+// There is **no cut point** any more, and no commit id anywhere in this file. It used to be
+// required, because whether a branch had landed was inferred from the commit graph and an empty
+// freshly-cut branch is indistinguishable from a landed one without knowing where it forked.
+// Every value the swarm computed for it was wrong in its own way: the integration branch's tip
+// named a commit the group's branch never sat on (it moves under a pipelined run), and the group
+// branch's own tip made `base == tip` permanently, blocking every task of every group from
+// landing. The inference is gone (D48): `scripts/merge-queue.sh` records the landing as an event
+// when it performs the graft, so nothing has to be worked out afterwards.
 function branchTagPrompt(group, branch) {
   const cmds = group.tasks
     .map(

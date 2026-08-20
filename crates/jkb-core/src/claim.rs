@@ -7,10 +7,7 @@
 //! [`claim`] is a **compare-and-swap** that succeeds only if the slot is free or held
 //! by the same owner, and in the same statement advances `status` `open`→`in_progress`
 //! so there is never a claimed-but-`open` window. [`release`] clears the claim (leaving
-//! `status` to the lifecycle). [`reclaim_dead`] is the crash-recovery net: it NULLs
-//! only claims whose owner is **not** in the caller's verified-alive set, writing only
-//! the claim columns — so it can never clash with a status transition, and a live run
-//! never reclaims its own in-flight work.
+//! `status` to the lifecycle).
 //!
 //! Liveness is by **owner-existence**, never by a claim's age: there is no TTL and no
 //! agent heartbeat, precisely so a paused-but-alive agent (e.g. blocked on a permission
@@ -18,11 +15,14 @@
 //! (`host:pid`+run, or `session:<pid>:<worktree>`); the probe lives at the CLI/coordinator
 //! edge (`owner::is_alive` — `ps -p` for a process owner, worktree existence for a
 //! session owner) — this
-//! module only records who holds what. All three seams are **changelogged** (op
-//! `claim`/`release`/`reclaim`) for audit; they are not auto-reverted by undo (which
-//! inverts only `insert` ops).
-
-use std::collections::HashMap;
+//! module only records who holds what. Every seam here is **changelogged** (op
+//! `claim`/`release`) for audit; they are not auto-reverted by undo (which inverts only
+//! `insert` ops).
+//!
+//! The crash-recovery net moved out, to [`crate::transition::reclaim_dead`]: freeing a dead
+//! owner's claim is a lifecycle transition (`observed_owner_gone`) like any other, and routing
+//! it through the machine is what makes it appear in a task's history and what stops it firing
+//! on an owner whose liveness merely could not be established.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
@@ -171,16 +171,56 @@ pub fn clear_if(
 ///
 /// [`release`] is owner-scoped on purpose — one agent must not drop another's claim while
 /// the work is live. This is the exception: it exists for the moment the work *stops being
-/// live*, where the holder is irrelevant because there is nothing left to hand out. Called
-/// from `task::set_status` when a task reaches a terminal status, so a completed task never
-/// keeps a claim that `doctor` would later report as orphaned.
+/// live*, where the holder is irrelevant because there is nothing left to hand out. Reached
+/// from the lifecycle's [`crate::lifecycle::TaskEffect::ReleaseClaim`], which every transition
+/// to a terminal status carries, so a completed task never keeps a claim that `doctor` would
+/// later report as orphaned.
 ///
 /// Prefer [`clear_if`] whenever the decision to clear was taken outside this transaction.
 ///
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
 pub fn clear(conn: &Connection, meta: &WriteMeta, item: ItemId) -> Result<bool> {
+    clear_inner(conn, meta, item, None, Op::Release)
+}
+
+/// Take a claim away from an owner judged **gone**, recorded as a `reclaim` rather than a
+/// `release`.
+///
+/// The op matters in the audit trail: a release is the holder letting go, a reclaim is somebody
+/// else deciding it had. It is a compare-and-set on `expected_owner` for the reason [`clear_if`]
+/// is — the judgement was made outside this transaction, so between reading the owner and
+/// clearing it somebody else can legitimately have claimed the task.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn reclaim(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    expected_owner: &str,
+) -> Result<bool> {
+    clear_inner(conn, meta, item, Some(expected_owner), Op::Reclaim)
+}
+
+/// The one clearing statement, with the audit op and the optional owner guard as parameters.
+fn clear_inner(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    expected_owner: Option<&str>,
+    op: Op,
+) -> Result<bool> {
     let before = read_before(conn, item)?;
+    if let Some(expected) = expected_owner {
+        if before
+            .as_ref()
+            .and_then(|b| b.claimant_id.as_deref())
+            .is_none_or(|owner| owner != expected)
+        {
+            return Ok(false);
+        }
+    }
     let changed = conn
         .prepare_cached(
             "UPDATE items
@@ -194,7 +234,7 @@ pub fn clear(conn: &Connection, meta: &WriteMeta, item: ItemId) -> Result<bool> 
         changelog::append(
             conn,
             meta,
-            Op::Release,
+            op,
             Entity::Items,
             &item.get().to_string(),
             Some(&json!({
@@ -274,66 +314,9 @@ pub fn claimed(conn: &Connection) -> Result<Vec<ClaimInfo>> {
     Ok(rows)
 }
 
-/// Reclaim every claim whose owner is not alive: NULL the claim columns (only) of any
-/// task held by an owner that is neither in `keep` nor passes the `is_alive` probe.
-///
-/// This is the deterministic crash-recovery net (design D27.1/D27.2). Liveness is
-/// evaluated **inside the write transaction** against the freshly-read claim set — the
-/// `is_alive` predicate is the caller's owner-existence probe (e.g. `kill -0`), and
-/// `keep` holds owners that are alive by fiat (a live coordinator passes **its own**
-/// owner id in `keep` so it never reclaims its own in-flight work). Evaluating liveness
-/// here — rather than against a snapshot read before the txn — closes the race where a
-/// claim acquired concurrently by a live owner would be reclaimed from a stale set. Each
-/// distinct owner is probed at most once. The reclaim writes **only**
-/// `claimant_id`/`claimed_at` — never `status` — so it cannot clash with a status
-/// transition (e.g. the merge queue setting `done`), and the writer-actor serializes it
-/// against every other write. Each reclaim is recorded in the changelog (op `reclaim`).
-/// Returns the claims that were cleared.
-///
-/// # Errors
-/// Returns a database error if a query fails.
-pub fn reclaim_dead(
-    conn: &Connection,
-    meta: &WriteMeta,
-    keep: &[String],
-    is_alive: impl Fn(&str) -> bool,
-) -> Result<Vec<ClaimInfo>> {
-    let held = claimed(conn)?;
-    // Probe each *distinct* owner's liveness at most once; owners in `keep` are alive by
-    // fiat and never probed.
-    let mut alive: HashMap<String, bool> = HashMap::new();
-    for c in &held {
-        if !alive.contains_key(&c.owner) {
-            let live = keep.iter().any(|o| o == &c.owner) || is_alive(&c.owner);
-            alive.insert(c.owner.clone(), live);
-        }
-    }
-    let orphaned: Vec<ClaimInfo> = held.into_iter().filter(|c| !alive[&c.owner]).collect();
-    for c in &orphaned {
-        conn.prepare_cached(
-            "UPDATE items
-                SET claimant_id = NULL,
-                    claimed_at = NULL,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-              WHERE id = ?1",
-        )?
-        .execute([c.id.get()])?;
-        changelog::append(
-            conn,
-            meta,
-            Op::Reclaim,
-            Entity::Items,
-            &c.id.get().to_string(),
-            Some(&json!({ "claimant_id": c.owner, "claimed_at": c.claimed_at })),
-            Some(&json!({ "claimant_id": null, "claimed_at": null })),
-        )?;
-    }
-    Ok(orphaned)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{claim, claimed, reclaim_dead, release};
+    use super::{claim, claimed, release};
     use crate::query::Scope;
     use crate::task::{create, ready, NewTask};
     use crate::Db;
@@ -435,33 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_clears_dead_owners_and_keeps_live_ones() {
-        let db = Db::open_in_memory().unwrap();
-        let live = make_task(&db, "task:live");
-        let dead = make_task(&db, "task:dead");
-        db.write_txn("t", move |conn, meta| {
-            claim(conn, meta, live, "host:live")?;
-            claim(conn, meta, dead, "host:dead")?;
-            Ok(())
-        })
-        .unwrap();
-
-        // Only host:live is verified alive. The dead owner's claim is cleared; the live
-        // owner's claim is preserved; status is never written by reclaim.
-        let reclaimed = db
-            .write_txn("t", move |conn, meta| {
-                reclaim_dead(conn, meta, &["host:live".to_owned()], |_| false)
-            })
-            .unwrap();
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].owner, "host:dead");
-        assert_eq!(claimant_of(&db, live).as_deref(), Some("host:live"));
-        assert_eq!(claimant_of(&db, dead), None);
-        assert_eq!(status_of(&db, live), "in_progress");
-        assert_eq!(status_of(&db, dead), "in_progress"); // reclaim never touched status
-    }
-
-    #[test]
     fn claim_refuses_a_terminal_task() {
         use crate::task::set_status;
         use jkb_types::TaskStatus;
@@ -476,45 +432,6 @@ mod tests {
             assert_eq!(status_of(&db, id), terminal.as_str());
             assert_eq!(claimant_of(&db, id), None);
         }
-    }
-
-    #[test]
-    fn reclaim_keeps_owners_the_predicate_reports_alive_and_probes_each_once() {
-        use std::sync::{Arc, Mutex};
-        let db = Db::open_in_memory().unwrap();
-        let a = make_task(&db, "task:a");
-        let b = make_task(&db, "task:b");
-        let c = make_task(&db, "task:c");
-        // a and b share owner host:live; c is held by host:dead.
-        db.write_txn("t", move |conn, meta| {
-            claim(conn, meta, a, "host:live")?;
-            claim(conn, meta, b, "host:live")?;
-            claim(conn, meta, c, "host:dead")?;
-            Ok(())
-        })
-        .unwrap();
-
-        // The predicate reports host:live alive, host:dead not. Record every probe to
-        // prove each *distinct* owner is checked at most once (two tasks, one owner).
-        let probed = Arc::new(Mutex::new(Vec::<String>::new()));
-        let probed2 = Arc::clone(&probed);
-        let reclaimed = db
-            .write_txn("t", move |conn, meta| {
-                reclaim_dead(conn, meta, &[], |o| {
-                    probed2.lock().unwrap().push(o.to_owned());
-                    o == "host:live"
-                })
-            })
-            .unwrap();
-
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].owner, "host:dead");
-        assert_eq!(claimant_of(&db, a).as_deref(), Some("host:live"));
-        assert_eq!(claimant_of(&db, b).as_deref(), Some("host:live"));
-        assert_eq!(claimant_of(&db, c), None);
-        let mut seen = probed.lock().unwrap().clone();
-        seen.sort();
-        assert_eq!(seen, vec!["host:dead".to_owned(), "host:live".to_owned()]);
     }
 
     #[test]
@@ -533,8 +450,10 @@ mod tests {
         assert!(frontier.is_empty());
 
         // A live scan that does NOT include the owner reclaims it → back in the frontier.
-        db.write_txn("t", |conn, meta| reclaim_dead(conn, meta, &[], |_| false))
-            .unwrap();
+        db.write_txn("t", |conn, meta| {
+            crate::transition::reclaim_dead(conn, meta, &[], |_| jkb_fsm::Fact::No)
+        })
+        .unwrap();
         let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
         assert_eq!(frontier.len(), 1);
     }
@@ -555,8 +474,10 @@ mod tests {
         // Re-claim with a dead owner, then reclaim it.
         db.write_txn("t", move |conn, meta| claim(conn, meta, id, "host:dead"))
             .unwrap();
-        db.write_txn("t", |conn, meta| reclaim_dead(conn, meta, &[], |_| false))
-            .unwrap();
+        db.write_txn("t", |conn, meta| {
+            crate::transition::reclaim_dead(conn, meta, &[], |_| jkb_fsm::Fact::No)
+        })
+        .unwrap();
         assert_eq!(changelog_count(&db, "reclaim"), 1);
     }
 

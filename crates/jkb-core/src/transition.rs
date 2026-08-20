@@ -131,6 +131,13 @@ fn apply_effects(
             TaskEffect::ReleaseClaim => {
                 claim::clear(conn, meta, task)?;
             }
+            TaskEffect::ReclaimFrom(owner) => {
+                // A compare-and-set on the owner that was judged: the probe ran outside this
+                // transaction, so between reading the holder and clearing it somebody else can
+                // legitimately have claimed the task. Discarding a claim nobody examined is how
+                // a live session's hold gets dropped by a scan that never looked at it.
+                claim::reclaim(conn, meta, task, &owner.as_str())?;
+            }
         }
     }
     Ok(())
@@ -222,7 +229,7 @@ fn evidence(facts: &TaskFacts) -> String {
         "review_clean": facts.review_clean.as_str(),
         "review_waived": facts.review_waived.as_str(),
         "open_subtasks": facts.open_subtasks.as_str(),
-        "pr_merged": facts.pr_merged.as_str(),
+        "landed_elsewhere": facts.landed_elsewhere.as_str(),
     })
     .to_string()
 }
@@ -279,6 +286,52 @@ pub fn latest_with_branch(conn: &Connection, task: ItemId) -> Result<Option<Tran
         .find(|r| r.labels.branch.is_some()))
 }
 
+/// The branch this task's work lands on, as most recently recorded.
+///
+/// The replacement for `branch_records.land_target`. It is a **label on the moment somebody
+/// said so**, not a property kept in agreement with git: two tasks that were told different
+/// targets are two rows with timestamps, resolved by recency and visible in `jkb task why`,
+/// rather than one row silently keeping whichever wrote last.
+///
+/// # Errors
+/// Returns a database error if the query fails.
+pub fn land_target(conn: &Connection, task: ItemId) -> Result<Option<String>> {
+    use jkb_fsm::Event as _;
+    let abandoned = TaskEvent::Abandon.name();
+    let mut out = None;
+    for row in history(conn, task)?.into_iter().rev() {
+        // An abandon **ends** the answer. Where work lands is a property of the session that was
+        // doing it, so a task put back on the shelf lands nowhere until somebody picks it up
+        // again — and a staging branch is spent when nothing is landing on it, so leaving a
+        // stale target kept an abandoned task rendering as live work on a batch long after it
+        // was dropped (design D36.3). Re-working the task records a fresh target and recovers.
+        if row.event == abandoned {
+            break;
+        }
+        if let Some(onto) = row.labels.onto {
+            out = Some(onto);
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The landing jkb itself performed for this task, if it did.
+///
+/// Proof of the strongest kind available: jkb ran the graft. Everything else — a pull request
+/// merged by somebody else — is [`crate::lifecycle::TaskEvent::ObservedLanded`].
+///
+/// # Errors
+/// Returns a database error if the query fails.
+pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
+    use jkb_fsm::Event as _;
+    let want = TaskEvent::Land.name();
+    Ok(history(conn, task)?
+        .into_iter()
+        .rev()
+        .find(|r| r.event == want))
+}
+
 /// The pull request recorded for this task, if any — the most recently recorded one.
 ///
 /// # Errors
@@ -290,9 +343,123 @@ pub fn pull_request(conn: &Connection, task: ItemId) -> Result<Option<i64>> {
         .find_map(|r| r.labels.pr_number))
 }
 
+/// Append a fact to a task's history without moving it.
+///
+/// For something that *happened* but is not a transition — most importantly, learning which
+/// pull request carries this work. The alternative was a self-loop event per state carrying no
+/// effects, which would put five rows of noise in the table and five edges in the diagram to
+/// record one label; a note changes no state and has no guard, so modelling it as a transition
+/// would be describing it wrongly to make it fit.
+///
+/// The `event` column holds `note` for these, so a reader can tell them from transitions.
+///
+/// # Errors
+/// Returns a database error if the write fails.
+pub fn note(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    facts: &TaskFacts,
+    labels: &Labels,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO task_transitions
+             (txn_id, item_id, at, event, from_status, to_status,
+              agent_id, branch, onto, ref_commit, pr_number, evidence)
+         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'note', ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?
+    .execute(params![
+        meta.txn_id,
+        task.get(),
+        facts.status.as_str(),
+        facts.actor.as_ref().map(AgentId::as_str),
+        labels.branch,
+        labels.onto,
+        labels.ref_commit,
+        labels.pr_number,
+        evidence(facts),
+    ])?;
+    Ok(())
+}
+
+/// Free every claim whose owner is **proven** gone, one lifecycle transition each.
+///
+/// The crash-recovery net (design D27.1/D27.2), now routed through the machine so it appears in
+/// each task's history and obeys the same evidence rule as everything else.
+///
+/// The probe answers a [`Fact`], and only [`Fact::No`] reclaims. An owner whose liveness cannot
+/// be established — an externally-minted `agent:` id, or a `claimant_id` in a shape this binary
+/// cannot read — comes back in `unverifiable` instead. That is a behaviour change and a
+/// deliberate one: the old predicate returned `bool` and treated an unreadable owner as
+/// reclaimable, which silently frees a live agent's task. Reporting it costs one command
+/// (`jkb task reclaim --force`); reclaiming it wrongly costs the work.
+///
+/// Liveness is evaluated **inside the write transaction** against the freshly-read claim set,
+/// which closes the race where a claim acquired concurrently by a live owner is reclaimed from a
+/// stale snapshot. Each distinct owner is probed at most once; owners in `keep` are alive by
+/// fiat and never probed, so a live coordinator passing its own id never reclaims its own work.
+///
+/// # Errors
+/// Returns a database error if a query fails.
+pub fn reclaim_dead(
+    conn: &Connection,
+    meta: &WriteMeta,
+    keep: &[String],
+    probe: impl Fn(&str) -> Fact,
+) -> Result<Reclaimed> {
+    let held = claim::claimed(conn)?;
+    let mut alive: std::collections::HashMap<String, Fact> = std::collections::HashMap::new();
+    for c in &held {
+        if !alive.contains_key(&c.owner) {
+            let live = if keep.iter().any(|o| o == &c.owner) {
+                Fact::Yes
+            } else {
+                probe(&c.owner)
+            };
+            alive.insert(c.owner.clone(), live);
+        }
+    }
+    let mut out = Reclaimed::default();
+    for c in held {
+        match alive[&c.owner] {
+            Fact::No => {
+                let facts = TaskFacts {
+                    claimant: Some(AgentId::parse(&c.owner)),
+                    owner_alive: Fact::No,
+                    ..crate::task::observe(conn, c.id)?
+                };
+                let outcome = perform(
+                    conn,
+                    meta,
+                    c.id,
+                    &facts,
+                    TaskEvent::ObservedOwnerGone,
+                    &Labels::default(),
+                )?;
+                if outcome.moved() {
+                    out.cleared.push(c);
+                }
+            }
+            Fact::Unknown => out.unverifiable.push(c),
+            Fact::Yes => {}
+        }
+    }
+    Ok(out)
+}
+
+/// What a reclaim scan found.
+#[derive(Debug, Default)]
+pub struct Reclaimed {
+    /// Claims whose owner was proven gone, now freed.
+    pub cleared: Vec<claim::ClaimInfo>,
+    /// Claims held by an owner whose liveness could not be established. **Not** freed — see
+    /// [`reclaim_dead`].
+    pub unverifiable: Vec<claim::ClaimInfo>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{history, perform, Labels};
+    use super::{history, perform, reclaim_dead, Labels};
     use crate::lifecycle::{TaskEvent, TaskFacts};
     use crate::task::{create, NewTask};
     use crate::Db;
@@ -429,5 +596,161 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("\"reviewed\":\"yes\""));
+    }
+
+    // ---- the crash-recovery net, moved here with the reclaim (design S3.2) ----
+
+    use crate::claim::claim;
+    use crate::query::Scope;
+    use crate::task::ready;
+
+    fn make_task(db: &Db, uid: &str) -> jkb_types::ItemId {
+        let uid = uid.to_owned();
+        db.write_txn("t", move |conn, meta| {
+            create(conn, meta, &NewTask::new(uid, "T"))
+        })
+        .expect("create")
+    }
+
+    fn claimant_of(db: &Db, id: jkb_types::ItemId) -> Option<String> {
+        db.read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT claimant_id FROM items WHERE id = ?1",
+                [id.get()],
+                |r| r.get(0),
+            )?)
+        })
+        .expect("read")
+    }
+
+    fn status_of(db: &Db, id: jkb_types::ItemId) -> String {
+        db.read(move |conn| {
+            Ok(
+                conn.query_row("SELECT status FROM items WHERE id = ?1", [id.get()], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .expect("read")
+    }
+
+    #[test]
+    fn reclaim_clears_dead_owners_and_keeps_live_ones() {
+        let db = Db::open_in_memory().unwrap();
+        let live = make_task(&db, "task:live");
+        let dead = make_task(&db, "task:dead");
+        db.write_txn("t", move |conn, meta| {
+            claim(conn, meta, live, "host:live")?;
+            claim(conn, meta, dead, "host:dead")?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Only host:live is verified alive. The dead owner's claim is cleared; the live
+        // owner's claim is preserved; status is never written by reclaim.
+        let reclaimed = db
+            .write_txn("t", move |conn, meta| {
+                reclaim_dead(conn, meta, &["host:live".to_owned()], |_| Fact::No)
+            })
+            .unwrap();
+        assert_eq!(reclaimed.cleared.len(), 1);
+        assert_eq!(reclaimed.cleared[0].owner, "host:dead");
+        assert_eq!(claimant_of(&db, live).as_deref(), Some("host:live"));
+        assert_eq!(claimant_of(&db, dead), None);
+        assert_eq!(status_of(&db, live), "in_progress");
+        assert_eq!(status_of(&db, dead), "in_progress"); // reclaim never touched status
+    }
+
+    #[test]
+    fn reclaim_keeps_owners_the_predicate_reports_alive_and_probes_each_once() {
+        use std::sync::{Arc, Mutex};
+        let db = Db::open_in_memory().unwrap();
+        let a = make_task(&db, "task:a");
+        let b = make_task(&db, "task:b");
+        let c = make_task(&db, "task:c");
+        // a and b share owner host:live; c is held by host:dead.
+        db.write_txn("t", move |conn, meta| {
+            claim(conn, meta, a, "host:live")?;
+            claim(conn, meta, b, "host:live")?;
+            claim(conn, meta, c, "host:dead")?;
+            Ok(())
+        })
+        .unwrap();
+
+        // The predicate reports host:live alive, host:dead not. Record every probe to
+        // prove each *distinct* owner is checked at most once (two tasks, one owner).
+        let probed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let probed2 = Arc::clone(&probed);
+        let reclaimed = db
+            .write_txn("t", move |conn, meta| {
+                reclaim_dead(conn, meta, &[], |o| {
+                    probed2.lock().unwrap().push(o.to_owned());
+                    Fact::from(o == "host:live")
+                })
+            })
+            .unwrap();
+
+        assert_eq!(reclaimed.cleared.len(), 1);
+        assert_eq!(reclaimed.cleared[0].owner, "host:dead");
+        assert_eq!(claimant_of(&db, a).as_deref(), Some("host:live"));
+        assert_eq!(claimant_of(&db, b).as_deref(), Some("host:live"));
+        assert_eq!(claimant_of(&db, c), None);
+        let mut seen = probed.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec!["host:dead".to_owned(), "host:live".to_owned()]);
+    }
+
+    /// The behaviour change S3.2 argues for: an owner whose liveness cannot be established
+    /// keeps its claim, and is **reported** rather than freed. Reclaiming on an unestablished
+    /// answer silently frees a live agent's task; reporting it costs one command.
+    #[test]
+    fn an_unverifiable_owner_keeps_its_claim_and_is_reported() {
+        let db = db();
+        let id = make_task(&db, "task:opaque");
+        db.write_txn("t", move |conn, meta| {
+            claim(conn, meta, id, "agent:01JBX7Q4")
+        })
+        .unwrap();
+
+        let found = db
+            .write_txn("t", |conn, meta| {
+                reclaim_dead(conn, meta, &[], |_| Fact::Unknown)
+            })
+            .unwrap();
+        assert!(found.cleared.is_empty(), "nothing was proven gone");
+        assert_eq!(found.unverifiable.len(), 1);
+        assert_eq!(found.unverifiable[0].owner, "agent:01JBX7Q4");
+        assert_eq!(claimant_of(&db, id).as_deref(), Some("agent:01JBX7Q4"));
+        // ...and the frontier still excludes it, so it is held rather than quietly handed out.
+        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        assert!(frontier.is_empty());
+    }
+
+    /// A reclaim appends to the task's history, so `jkb task why` can say the claim was taken
+    /// away and on what evidence — which the old side-door write could not.
+    #[test]
+    fn a_reclaim_is_recorded_in_the_history() {
+        let db = db();
+        let id = make_task(&db, "task:crashed");
+        db.write_txn("t", move |conn, meta| {
+            claim(conn, meta, id, "host:4294967290")
+        })
+        .unwrap();
+        db.write_txn("t", |conn, meta| {
+            reclaim_dead(conn, meta, &[], |_| Fact::No)
+        })
+        .unwrap();
+        let rows = db.read(move |conn| history(conn, id)).expect("history");
+        assert_eq!(
+            rows.last().map(|r| r.event.as_str()),
+            Some("observed_owner_gone")
+        );
+        assert_eq!(
+            rows.last().unwrap().to_status,
+            "in_progress",
+            "status untouched"
+        );
+        assert_eq!(claimant_of(&db, id), None);
+        assert_eq!(status_of(&db, id), "in_progress");
     }
 }

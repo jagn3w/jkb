@@ -502,7 +502,6 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     // that transaction, with no surface printing a txn id to escape it with.
     (Op::Update, Some(Entity::TagDefs), Inverse::Columns),
     (Op::Update, Some(Entity::Namespaces), Inverse::Columns),
-    (Op::Update, Some(Entity::BranchRecords), Inverse::Columns),
     (Op::Update, Some(Entity::Ingestions), Inverse::Columns),
     (Op::Delete, Some(Entity::Placements), Inverse::ReinsertRow),
     (
@@ -512,11 +511,6 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     ),
     (Op::Delete, Some(Entity::Edges), Inverse::ReinsertRow),
     (Op::Delete, Some(Entity::Namespaces), Inverse::ReinsertRow),
-    (
-        Op::Delete,
-        Some(Entity::BranchRecords),
-        Inverse::ReinsertRow,
-    ),
     // Any table whose inserts delete by rowid; an insert into anything else is uninvertible, not
     // deleted on a guess. The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so
     // a table-specific `insert` inverse placed after it would never be reached.
@@ -2009,52 +2003,6 @@ mod tests {
             .is_none());
     }
 
-    /// The other half of the same family, one table later: `jkb task start` writes a
-    /// `branch_records` row, logged as an `insert`.
-    ///
-    /// An insert `undo` could not reverse used to make `undo_last` skip the whole transaction — so
-    /// a bare `jkb undo` after `task start` did not fail, it quietly reverted the *previous*
-    /// transaction and reported success, deleting the task itself. That is the failure mode worth
-    /// a test: not "undo errors" but "undo silently reverts the wrong thing".
-    ///
-    /// Membership is derived from `Entity::insert_inverse`, so this is a regression test for the
-    /// derivation rather than for a line in a list — and since round 6 the skip itself is gone, so
-    /// the same omission would now cost a refusal instead of this task.
-    #[test]
-    fn a_transaction_that_records_a_branch_is_the_one_undo_last_reverts() {
-        use crate::branch::{self, Cut, Supersede};
-        use crate::item;
-
-        let db = Db::open_in_memory().unwrap();
-        db.write_txn("t", |c, m| upsert(c, m, &note("the-task")))
-            .unwrap();
-        db.write_txn("t", |c, m| {
-            branch::record_cut_point(
-                c,
-                m,
-                "jkb",
-                "task/x",
-                &Cut::Fork("a".repeat(40)),
-                None,
-                Supersede::default(),
-            )
-        })
-        .unwrap();
-
-        assert!(db.write_txn("t", undo_last).unwrap() > 0);
-        assert_eq!(
-            db.read(|c| branch::get(c, "jkb", "task/x")).unwrap(),
-            None,
-            "the branch record survived the undo that claimed to have reverted its transaction"
-        );
-        assert!(
-            db.read(|c| item::id_for_uid(c, "the-task"))
-                .unwrap()
-                .is_some(),
-            "undo reverted an older transaction instead, deleting a task nobody asked about"
-        );
-    }
-
     /// **The root of the three-pass family.** A transaction carrying work with no inverse is
     /// refused; it is never swapped for an older one.
     ///
@@ -2247,7 +2195,7 @@ mod tests {
     /// give it a non-default value.
     #[test]
     fn undoing_a_delete_restores_the_whole_row_for_every_deleter() {
-        use crate::{branch, edge, ns, placement, tag};
+        use crate::{edge, ns, placement, tag};
         use jkb_types::{EdgeType, PlacementRole};
         use serde_json::json;
 
@@ -2275,18 +2223,6 @@ mod tests {
                 Some(2.5),
                 Some(&json!({ "why": "evidence" })),
             )?;
-            branch::record_cut_point(
-                c,
-                m,
-                "jkb",
-                "task/x",
-                &branch::Cut::Fork("a".repeat(40)),
-                Some(&branch::Anchor {
-                    sha: "b".repeat(40),
-                    ts: 7,
-                }),
-                branch::Supersede::default(),
-            )?;
             ns::ensure(c, "x/doomed")?;
             Ok(())
         })
@@ -2302,9 +2238,6 @@ mod tests {
             edge::unlink(c, m, item, other, EdgeType::Supports)
         });
         delete_round_trips(&db, "namespaces", |c, m| ns::remove(c, m, "x/doomed"));
-        delete_round_trips(&db, "branch_records", |c, m| {
-            branch::forget(c, m, "jkb", "task/x").map(|_| ())
-        });
     }
 
     /// Undoing an edit to an item's body restores the body **and its hash**.
@@ -2564,51 +2497,6 @@ mod tests {
     /// A **`branch_records`** update comes back too — the entity whose non-insert writes are all
     /// upserts, so an undo of one has nothing to delete and everything to restore.
     ///
-    /// Its own test because `record_json` deliberately emits every column rather than the ones the
-    /// statement touched, and that is only load-bearing through this arm.
-    #[test]
-    fn undoing_a_land_target_write_restores_the_record_it_replaced() {
-        use crate::branch::{self, Cut, Supersede};
-
-        let db = Db::open_in_memory().unwrap();
-        db.write_txn("t", |c, m| {
-            branch::record_cut_point(
-                c,
-                m,
-                "jkb",
-                "task/x",
-                &Cut::Fork("a".repeat(40)),
-                None,
-                Supersede::default(),
-            )
-        })
-        .unwrap();
-        db.write_txn("t", |c, m| {
-            branch::set_land_target(c, m, "jkb", "task/x", Some("batch-1"))
-        })
-        .unwrap();
-        db.write_txn("t", |c, m| {
-            branch::set_land_target(c, m, "jkb", "task/x", Some("batch-2"))
-        })
-        .unwrap();
-
-        db.write_txn("t", undo_last).unwrap();
-        let record = db
-            .read(|c| branch::get(c, "jkb", "task/x"))
-            .unwrap()
-            .expect("the record must survive: the edit is what was undone");
-        assert_eq!(
-            record.land_target.as_deref(),
-            Some("batch-1"),
-            "undoing a land-target edit did not restore the target it replaced"
-        );
-        assert_eq!(
-            record.cut_point.as_deref(),
-            Some("a".repeat(40).as_str()),
-            "the cut point was disturbed by undoing an unrelated column"
-        );
-    }
-
     /// Re-parenting is an upsert, so undoing it must put the previous container back — not
     /// delete the row and leave the item contained by nothing.
     #[test]

@@ -155,28 +155,23 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     let tasks = crate::repo::repo_tasks(db, &ctx.key)?;
     let sessions = session::discover(&ctx.root)?;
 
-    // Group tasks by the branch they land on, read from each **branch's** own record (D38.1
-    // holds: which branches exist still comes from git, below — a record is never evidence one
-    // does). A task none of whose branches records a land target has never been through
-    // `task work` and is simply not in this view.
+    // Group tasks by the branch they land on, read from each task's own **history** — the last
+    // time anybody said where its work lands. A task that has never been through `task work` or
+    // `task start` has no such entry and is simply not in this view.
     //
-    // One read for the whole repo, joined in memory: this view redraws on every database write
-    // and holds a row per task (design risk 2).
+    // (D38.1 still holds: which branches *exist* comes from git, below. A recorded target is
+    // never evidence that a branch is there.)
     //
-    // A task is grouped under **every** target its branches name, not just the first. It was one
-    // one land target per task, so a task carrying two branches had one answer and the second
-    // branch's batch simply did not know about it.
-    let records = crate::repo::branch_records(db, &ctx.key)?;
+    // This used to read a `land_target` column keyed by branch, which had to be kept in agreement
+    // with a world where branches are deleted and their names reused. A history entry is a
+    // statement about a moment, so it needs no such agreement — and two tasks told different
+    // targets are now two entries with timestamps rather than one row silently keeping whichever
+    // wrote last.
     let mut by_onto: BTreeMap<String, Vec<&RepoTask>> = BTreeMap::new();
     for t in &tasks {
-        let mut targets: Vec<&str> = facet_values(&t.tags, FACET_BRANCH)
-            .iter()
-            .filter_map(|b| records.get(b).and_then(|r| r.land_target.as_deref()))
-            .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        for target in targets {
-            by_onto.entry(target.to_owned()).or_default().push(t);
+        let id = t.meta.id;
+        if let Some(target) = db.read(move |conn| jkb_core::transition::land_target(conn, id))? {
+            by_onto.entry(target).or_default().push(t);
         }
     }
 
@@ -204,35 +199,20 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         let Some(branch_ref) = existing.get(&branch).cloned() else {
             continue;
         };
-        // A branch that adds nothing to trunk is either **landed** or **freshly cut and still
-        // empty** — refs alone cannot tell those apart, which is exactly the ambiguity D34.2
-        // records. Live work is the tie-break: a batch with a non-terminal task on it is not
-        // spent, however few commits it has yet. Without this, the branch cut by the very
-        // first `jkb task work` is hidden from the picker that exists to offer it.
-        let has_live_work = group.iter().any(|t| {
-            !State::from_status(t.meta.status.as_deref().unwrap_or_default()).is_terminal()
+        // A batch is **spent** when every task on it has finished, one way or the other. That
+        // is now the whole test, and it is the answer the old merge probe was reaching for.
+        //
+        // It used to ask `merge-tree` whether the branch added anything to trunk, and then had
+        // to hand-correct the answer, because a branch that adds nothing is either landed *or*
+        // freshly cut and still empty and refs cannot tell those apart — so live work was the
+        // tie-break, or the branch cut by the very first `jkb task work` was hidden from the
+        // picker that exists to offer it. With live work deciding both ways, the probe only
+        // ever confirmed what the statuses already said, at the cost of several git spawns per
+        // branch on a view that redraws on every database write.
+        let spent = group.iter().all(|t| {
+            State::from_status(t.meta.status.as_deref().unwrap_or_default()).is_terminal()
         });
-        // The merge probe (`merge-tree --write-tree`, several `rev-parse`s) only runs when
-        // live work has not already answered the question — and its answer is only *needed*
-        // when a merged branch would be hidden.
-        let merged = if has_live_work {
-            false
-        } else {
-            match &ctx.trunk {
-                Some(trunk) => {
-                    // The **local** ref, not `origin/<branch>` (design D34.2's preference is
-                    // right for `close-merged` and wrong here): a staging branch whose pushed
-                    // copy merged, but which has since had another task landed onto it
-                    // locally, still has commits to give. Asking the remote reported it
-                    // merged and hid it — while the row's own `ahead`, read from the local
-                    // ref, said otherwise.
-                    gitrepo::is_merged(&ctx.root, &branch, trunk, None, gitrepo::Prefer::Local)?.0
-                        == gitrepo::MergeState::Merged
-                }
-                None => false,
-            }
-        };
-        if merged && !include_merged {
+        if spent && !include_merged {
             continue;
         }
         let ahead = match &ctx.trunk {
@@ -261,7 +241,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 
         out.push(Staging {
             branch: branch.clone(),
-            merged,
+            merged: spent,
             ahead,
             checkout: worktrees
                 .iter()
