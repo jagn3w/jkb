@@ -71,6 +71,13 @@ jobs:
       - name: test (fastembed)
         run: cargo test --all --features fastembed
 
+      # The auto-mode posture's tests (design D48). Hermetic and seconds-long: no Rust, no
+      # session, no network — they only exercise the JSON merge/subset logic against a temp
+      # CLAUDE_CONFIG_DIR. `check.sh` skips them when jq is missing; the runner always has jq,
+      # so a local skip never becomes a CI skip.
+      - name: auto-mode posture
+        run: ./scripts/auto-mode-test.sh
+
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny

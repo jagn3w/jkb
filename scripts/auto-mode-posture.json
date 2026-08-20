@@ -1,0 +1,161 @@
+{
+  "require": {
+    "permissions": {
+      "defaultMode": "auto",
+      "disableBypassPermissionsMode": "disable",
+      "ask": [
+        "WebFetch"
+      ],
+      "deny": [
+        "Read(~/.ssh/**)",
+        "Read(~/.aws/**)",
+        "Read(~/.gnupg/**)",
+        "Read(~/.config/gh/**)",
+        "Read(~/.kube/**)",
+        "Read(~/.docker/config.json)",
+        "Read(~/.netrc)",
+        "Read(~/.npmrc)",
+        "Read(~/.pypirc)",
+        "Read(~/.cargo/credentials.toml)",
+        "Read(~/.claude/.credentials.json)",
+        "Read(~/Library/Keychains/**)",
+        "Read(~/Library/Messages/**)",
+        "Read(~/Library/Mail/**)",
+        "Read(~/Documents/**)",
+        "Read(~/Desktop/**)",
+        "Read(~/Downloads/**)",
+        "Edit(~/.claude/settings.json)",
+        "Edit(~/.claude/settings.local.json)",
+        "Edit(~/.claude/plugins/**)",
+        "Write(~/.claude/settings.json)",
+        "Write(~/.claude/settings.local.json)",
+        "Write(~/.claude/plugins/**)"
+      ]
+    },
+    "sandbox": {
+      "enabled": true,
+      "failIfUnavailable": true,
+      "allowUnsandboxedCommands": false,
+      "autoAllowBashIfSandboxed": true,
+      "allowAppleEvents": false,
+      "enableWeakerNestedSandbox": false,
+      "enableWeakerNetworkIsolation": false,
+      "network": {
+        "strictAllowlist": true,
+        "allowLocalBinding": true,
+        "allowAllUnixSockets": false,
+        "allowedDomains": [
+          "localhost",
+          "127.0.0.1",
+          "api.anthropic.com",
+          "github.com",
+          "api.github.com",
+          "codeload.github.com",
+          "*.githubusercontent.com",
+          "crates.io",
+          "index.crates.io",
+          "static.crates.io",
+          "*.rust-lang.org",
+          "registry.npmjs.org",
+          "get.pnpm.io",
+          "registry.ollama.ai"
+        ]
+      },
+      "filesystem": {
+        "disabled": false,
+        "denyRead": [
+          "~",
+          "/Volumes"
+        ],
+        "allowRead": [
+          "~/repos",
+          "~/.jkb",
+          "~/.cargo",
+          "~/.rustup",
+          "~/.local/bin",
+          "~/.local/share/pnpm",
+          "~/Library/pnpm",
+          "~/Library/Caches",
+          "~/.local/share/claude",
+          "~/.claude/skills",
+          "~/.claude/plugins",
+          "~/.claude/commands",
+          "~/.gitconfig",
+          "~/.gitignore_global",
+          "~/.zshrc",
+          "~/.zshenv",
+          "~/.zprofile",
+          "~/.profile",
+          "~/.bashrc",
+          "~/.bash_profile"
+        ],
+        "allowWrite": [
+          "~/repos",
+          "~/.jkb",
+          "~/.cargo",
+          "~/.rustup",
+          "~/Library/Caches",
+          "~/Library/pnpm",
+          "~/.local/share/pnpm",
+          "/tmp"
+        ]
+      },
+      "credentials": {
+        "files": [
+          {
+            "path": "~/.ssh",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.aws",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.gnupg",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.config/gh",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.kube",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.docker/config.json",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.netrc",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.npmrc",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.pypirc",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.cargo/credentials.toml",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.claude/.credentials.json",
+            "mode": "deny"
+          },
+          {
+            "path": "~/Library/Keychains",
+            "mode": "deny"
+          }
+        ]
+      }
+    }
+  },
+  "forbid": {
+    "sandbox.excludedCommands": "commands excluded from the sandbox \u2014 a bypass list, must be empty",
+    "permissions.additionalDirectories": "widens the in-process permission scope beyond the workspace"
+  }
+}

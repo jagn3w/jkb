@@ -42,4 +42,15 @@ else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"
 fi
 
+# The auto-mode posture (design D48) is committed data that a script consumes, so it is part of
+# the gate too: the tests are hermetic (a temp CLAUDE_CONFIG_DIR, no session, no network) and
+# they generate their drift cases FROM the posture file, so a key added there is covered without
+# anyone remembering to add a case. Skipped gracefully when jq is absent; CI always runs it.
+echo "==> auto-mode posture (scripts/auto-mode.sh)"
+if command -v jq >/dev/null 2>&1; then
+    "$(dirname "$0")/auto-mode-test.sh"
+else
+    echo "   (skipped: jq not installed — 'brew install jq'; CI runs this gate)"
+fi
+
 echo "All checks passed."

@@ -217,6 +217,68 @@ each, and why any of them cannot land yet). Both are **clients of the `jkb` CLI*
 `./scripts/setup.sh` builds and installs the extension; see [`ui/README.md`](ui/README.md)
 to run it from source.
 
+## Running Claude unattended (auto mode, safely)
+
+`./scripts/auto-mode.sh` sets up a machine posture that lets you run Claude Code — terminal
+**and** IDE — with no permission prompts, inside a boundary that still holds when the model is
+wrong (design D48).
+
+```sh
+./scripts/auto-mode.sh print      # the posture, as JSON (scripts/auto-mode-posture.json)
+./scripts/auto-mode.sh install    # merge it into ~/.claude/settings.json (idempotent, backs up)
+./scripts/auto-mode.sh check      # is the posture still intact? exit 1 if it drifted
+./scripts/auto-mode.sh run        # check, then exec `claude --permission-mode auto`
+./scripts/auto-mode.sh probe      # live end-to-end smoke — costs a real session
+```
+
+Two layers, because they fail differently. `--permission-mode auto` is a **classifier**: it
+decides what is worth asking about, it is a model judgment, and it buys ergonomics. Claude
+Code's **sandbox** (macOS seatbelt, Linux bubblewrap + seccomp) bounds what can happen when that
+judgment is wrong, and it buys the guarantee. `autoAllowBashIfSandboxed` joins them: a sandboxed
+command is never shown to the classifier — the OS boundary *is* the check.
+
+Not `--dangerously-skip-permissions`: the sandbox confines Bash and everything it spawns, but
+**not** Claude Code's in-process tools (Read/Edit/Write/WebFetch), so bypassing permissions
+leaves a hole exactly the shape of the file-editing tools. Auto mode keeps the classifier over
+precisely what the kernel does not cover, and the posture's `permissions.deny` rules close the
+named paths in *both* layers at once.
+
+**File access is an allowlist.** Writes were already default-deny (the workspace only), so
+`filesystem.allowWrite` is the list: `~/repos`, `~/.jkb`, the Rust/pnpm caches, `/tmp`. Reads are
+default-deny too — `denyRead: ["~", "/Volumes"]` blankets your data and `allowRead` re-opens the
+work roots and the toolchain. System paths (`/usr`, `/bin`, `/Library`) are deliberately not
+denied: a command that cannot read its own dynamic linker cannot run. Extend `allowRead` freely —
+`check` asserts a subset, so entries you add are fine.
+
+**What still runs outside the sandbox**, because a guarantee you cannot state is not one. The
+sandbox covers Bash and everything it spawns — compilers, git, package managers, `jkb` itself.
+It does **not** cover Claude Code's in-process tools:
+
+| Runs unsandboxed | Bounded by |
+|---|---|
+| `Read`, `Glob`, `Grep` | `permissions.deny Read(...)` only — an unnamed path is readable |
+| `Write`, `Edit`, `NotebookEdit` | permission rules + the permission scope (`additionalDirectories`, kept empty) |
+| `WebFetch`, `WebSearch` | permission rules only — in-process tools are **not** gated by `strictAllowlist` |
+| MCP servers | nothing: long-lived processes started at session start, never per-command wrapped |
+| Hooks | nothing established — a cloned repo's hooks are code you did not write |
+
+So the posture adds three keys aimed squarely at that column: `permissions.ask: ["WebFetch"]`
+(reading anything and fetching anywhere is read-everything-send-anywhere outside the kernel
+boundary — the one composition that defeats the posture, so it is the single surviving prompt;
+drop that line if you would rather not be asked), `disableBypassPermissionsMode: "disable"` (the
+in-process layer is the only bound those tools have, so being able to switch it off is being able
+to remove them all), and `defaultMode: "auto"` so IDE sessions are prompt-free too. For a repo
+that is not yours, add `--strict-mcp-config`.
+
+`~/.claude/settings.json` is deliberately **not** writable — it *is* the posture, and an agent
+that can edit it can switch off its own sandbox. `~/.claude/projects/**` stays writable, so
+auto-memory still works.
+
+Stated consequence: with `~/.ssh` unreadable, `git push` over SSH fails inside the sandbox —
+the right default for an unattended agent. Set `JKB_AUTO_MODE_SSH_AGENT=1` before
+`auto-mode.sh run` to allow the ssh-agent *socket* instead: the agent can authenticate, but can
+never read the key.
+
 ## Workspace
 
 jkb is a Cargo workspace of small crates under `crates/`, plus a **pnpm** workspace under
@@ -255,6 +317,7 @@ jkb is a Cargo workspace of small crates under `crates/`, plus a **pnpm** worksp
 ./scripts/clippy.sh    # clippy only
 ./scripts/setup.sh     # one-shot install (binary + KB scaffold + extension + watcher)
 ./scripts/install-extension.sh   # rebuild + reinstall just the VS Code extension
+./scripts/auto-mode.sh check     # verify the unattended-Claude posture is still intact
 ```
 
 The `ui/` packages build with **pnpm only** (never npm): `cd ui && pnpm install && pnpm run build`.

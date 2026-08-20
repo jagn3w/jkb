@@ -1145,6 +1145,129 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   enforced: making every post-review fixup force a re-review is the fastest way to make people
   reach for `--no-review` by reflex.
 
+## Unattended Claude: the sandbox is the guarantee, the classifier is the ergonomics (D48)
+
+Running the IDE and the CLI with no permission prompts, with a boundary that holds when the
+model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; design in
+`openspec/changes/jkb-safe-auto-mode/`.
+
+- **Claude Code already ships the boundary, so we do not build one.** 2.1.237 embeds
+  `@anthropic-ai/sandbox-runtime`: every Bash command is re-executed under `sandbox-exec` with a
+  generated seatbelt profile (macOS) or `bubblewrap` + seccomp (Linux), with a settings schema
+  covering `filesystem.{allowWrite,denyWrite,denyRead,allowRead,disabled}`,
+  `network.{allowedDomains,strictAllowlist,allowUnixSockets,…}` and `credentials.{files,envVars}`.
+  That is strictly more targeted than a container — per-command OS confinement **plus** an egress
+  allowlist **plus** credential denial, on the host, with the host toolchain.
+- **Two layers, because they fail differently.** `--permission-mode auto` is a **classifier**
+  (`claude auto-mode defaults` prints its rules as English prose): it decides what is worth
+  asking about, it can be wrong, and it buys ergonomics. The sandbox bounds what happens when it
+  is wrong, and it buys the guarantee. `autoAllowBashIfSandboxed` joins them — a sandboxed
+  command is never shown to the classifier, so the OS boundary **is** the check.
+- **`bypassPermissions` is the wrong mode, precisely.** The sandbox confines Bash and its
+  children; it does **not** confine the in-process tools — the schema says so about
+  `strictAllowlist` ("in-process tools such as WebFetch are not gated by this setting"). Skipping
+  permissions leaves Read/Edit/Write/WebFetch unbounded, a hole the shape of the file-editing
+  tools. `auto` keeps the classifier over exactly what the kernel does not cover, and the
+  posture's `permissions.deny` rules close the named paths in **both** layers at once (the schema
+  merges `Read(...)` deny rules into `filesystem.denyRead`, `Edit(...)` into `denyWrite`) — one
+  list, two enforcers, rather than two lists that drift.
+- **The posture is user-level, and Claude Code enforces that.** Several keys are honored only
+  from user/managed/`--settings`, and the binary carries an **operator-posture guard** that
+  refuses to run when a repo's `.claude/settings.json` negates `sandbox.enabled`,
+  `sandbox.failIfUnavailable`, `sandbox.allowUnsandboxedCommands` or `disableAllHooks`
+  ("operator posture belongs in the user-level settings.json"), and likewise refuses a project
+  `env` block (`BASH_ENV`/`LD_PRELOAD`/`NODE_OPTIONS`/`GIT_*` are unsandboxed-exec inlets). So a
+  cloned repo cannot switch it off — and installing the posture into a repo would silently drop
+  half of it. It also has to hold in **every** repo under `~/repos`, which is why this is not jkb
+  configuration.
+- **Four settings, each closing one silent degradation.** `failIfUnavailable: true` is the hard
+  gate: its default is `false`, under which a *warning* prints and commands run **unsandboxed** —
+  the exact failure of believing you are protected. `allowUnsandboxedCommands: false` deletes the
+  `dangerouslyDisableSandbox` parameter, or one argument steps outside and in auto mode nobody is
+  asked. `network.strictAllowlist: true` **denies** rather than prompting, because a prompt in
+  auto mode is a question nobody answers. `enabled: true` is the rest.
+- **File access is an allowlist, both ways.** Writes were already default-deny (workspace only),
+  so `filesystem.allowWrite` *is* the allowlist. Reads are default-deny too:
+  `denyRead: ["~", "/Volumes"]` blankets the user's data and `allowRead` — which takes precedence
+  over `denyRead` — re-opens the work roots and the toolchain. System paths (`/usr`, `/bin`,
+  `/Library`) are deliberately **not** denied: a command that cannot read its own dynamic linker
+  cannot run, so "allowlist everything" is not a posture but an inoperative machine; what is
+  denied by default is *your data*, which is what a leak is about. The in-process `Read` tool
+  **cannot** be made default-deny — Claude Code's rule model is deny-beats-allow with no
+  re-allow, so a blanket `Read(~/**)` could never be punched through for `~/repos` — so there it
+  is an enumerated deny list plus an empty `additionalDirectories`, and the stronger option
+  (deny the `Read` tool outright, read through sandboxed `cat`/`rg`) is offered, not imposed.
+- **What actually runs unsandboxed**, since that is the residual worth naming: `Read`/`Glob`/
+  `Grep` (bounded by deny rules only), `Write`/`Edit`/`NotebookEdit` (deny rules + the permission
+  scope), `WebFetch`/`WebSearch` (the schema states in-process tools are **not** gated by
+  `strictAllowlist`), **MCP servers** (long-lived processes started at session start, never
+  per-command wrapped — `jkb mcp` is one), **hooks** (not evidenced as sandboxed anywhere in the
+  binary), and the `claude` process itself. Bash and everything it spawns — which is where the
+  real capability lives — is the sandboxed part. Three keys answer what can be answered:
+  `permissions.ask: ["WebFetch"]` (Read-anything ∘ WebFetch-anywhere is read-everything-send-
+  anywhere outside the kernel boundary — the one composition that defeats the posture, so it is
+  the single surviving prompt), `disableBypassPermissionsMode: "disable"` (the in-process layer
+  is the *only* bound on those tools, so being able to switch it off is being able to remove
+  them all), and `defaultMode: "auto"` (without it every IDE session starts prompting, and the
+  ergonomic half of the ask is silently unmet).
+- **The one place the obvious sketch inverts.** Granting `~/.claude` write access is the grant
+  that must not be made: `~/.claude/settings.json` **is** the posture, so an agent that can write
+  it can disable its own sandbox next session, and the guard above does not defend the file it
+  lives in. The deny is kept narrow — `~/.claude/projects/**` stays writable (the auto-memory),
+  and a repo's own `.claude/settings.json` stays writable because it cannot weaken the posture.
+- **`check` is two generic rules, not a list of assertions.** Claude Code enforces the boundary;
+  re-checking its enforcement here would be a second model of the world. What is ours is that
+  **the posture is a file and files drift** — Claude Code appends to `permissions.allow` on every
+  "always allow", `/statusline` edits the same file, `claude auto-mode reset` rewrites a section.
+  So the posture file has two halves and `check` asks two questions. **`require`** (what `install`
+  merges): is it a **deep subset** of the effective settings? Arrays are subset-by-membership,
+  never equality, so domains you add yourself are fine. **`forbid`**: is each named key empty or
+  absent? That second rule exists because **a subset check cannot express emptiness** — a posture
+  entry of `excludedCommands: []` would assert nothing, and `excludedCommands` is the sandbox's
+  own bypass list ("all bash commands must run in the sandbox unless they are explicitly listed
+  in excludedCommands"); `permissions.additionalDirectories` is the other, since it widens the
+  only bound the unsandboxed tools have. Adding a key to either half extends the check *and* the
+  **tests**, which generate their cases from the posture file (flip every boolean, drop every
+  list entry, populate every forbid key).
+  - `jq` gotcha, pinned by a test: `false // x` is `x`, so the obvious spelling of "the value, or
+    null if absent" turns every correct `false` into a failure — and the strongest setting here
+    (`allowUnsandboxedCommands`) is exactly that shape. Use `has`, never `//`.
+- **The posture is validated against Claude Code's own schema.** `claude doctor` reports settings
+  violations for the directory it runs in, so the tests hand it the committed `require` block in
+  a temp project and fail on `Invalid settings` — a typo'd key or an out-of-range enum installs
+  cleanly, is ignored at runtime, and is indistinguishable from a posture in force. That check
+  was **inert when first written**: the stub `claude` the `run` tests put on `PATH` shadowed the
+  real binary, so it was validating against a stub that prints nothing, and only the mutation run
+  found it. Resolve the real binary before the stub exists.
+- **`probe` takes its verdict from the filesystem, not the transcript** — what a model narrates
+  about its own confinement is not evidence. It needs a real billed session, so it is this
+  change's `#[ignore]` test and is never in `check.sh`. **Two files, because one cannot tell the
+  two failures apart**: "the canary is absent" is evidence the *sandbox* denied the write only if
+  the session ran the command at all, and with the sandbox off — the state the probe exists to
+  detect — Bash is no longer auto-allowed, so the **classifier** gets the out-of-bounds write and
+  will very likely refuse it, and an absent canary would read as a clean pass. A control file
+  written inside the workspace separates "denied at the boundary" from "never ran", and the
+  second is reported **inconclusive**, never as a pass. The canary is deliberately not
+  dot-prefixed: `~/.jkb-…` shares a prefix with the allowed `~/.jkb`, and that near-miss is how a
+  probe comes to lie.
+- **Not the container, and why.** The sketch mounts `~/repos` and `~/.claude`, which *is* the
+  blast radius that matters — escape is not the threat model, an agent damaging the mounts is. A
+  container also has **more** egress than this posture, and for an agent that has read every repo
+  you own, egress is the risk. On macOS it is a VM: bind-mount IO is slow and this repo's loop is
+  native (pinned rustup toolchain, `sqlite-vec` FFI, headless Chrome, launchd, worktrees under
+  `~/repos`). And the vendor gates auto-approval on **its own** sandbox, so inside a container you
+  would still be prompted. Containers remain right where the host is untrusted or the work is.
+- **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
+  not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
+  processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not
+  yours). Any allowlisted host is an exfiltration channel — egress control bounds *where*, not
+  *what*. And a posture too tight to work gets switched off, which is why `check` tolerates
+  entries you add and `probe` reports inconclusive rather than pass. `~/.ssh` being unreadable means SSH pushes
+  fail inside the sandbox (correct for an unattended agent; `JKB_AUTO_MODE_SSH_AGENT=1` allows the
+  agent **socket** instead of the key, so it can authenticate but never read it). `localhost`
+  egress and that socket overlay are unverified without a live session, and both fail in the safe
+  direction.
+
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
 `/review-log` used to wrap the host's `/code-review`, which reports to the user rather than
