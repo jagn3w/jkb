@@ -16,7 +16,14 @@ import {
   type TreeChild,
 } from "@jkb/core";
 
-import { launchClaude, deliverQueuedPrompt, type Launch, type Launcher } from "./claude.js";
+import {
+  launchClaude,
+  deliverQueuedPrompt,
+  sessionTerminal,
+  sessionTerminalName,
+  type Launch,
+  type Launcher,
+} from "./claude.js";
 import { CliJkbClient, type SessionInfo } from "./cliClient.js";
 import { JkbDecorationProvider } from "./decorations.js";
 import { InFlightProvider, type FlightNode } from "./inflight.js";
@@ -312,7 +319,6 @@ async function workTaskWithClaude(
     worktree: session.worktree,
     uid,
     prompt,
-    resumed: session.resumed,
     launcher: taskLauncher(),
   });
   if (launch.where === "terminal") {
@@ -350,7 +356,6 @@ const STATUS_SUFFIX: Record<Launch["where"], string> = {
   here: "",
   // Not "opened its window": VS Code may have focused one that was already up.
   window: " — opening its window",
-  declined: " — left as it is",
   terminal: "",
   blocked: "",
 };
@@ -375,10 +380,22 @@ function taskPrompt(uid: string, title: string, session: SessionInfo): string {
   );
 }
 
-/** The fallback when Claude Code is not there: the CLI, in a terminal in the worktree. */
+/**
+ * Run `claude` in a terminal in the worktree — the operator's choice, or the fallback.
+ *
+ * A session that already has one is **shown, not duplicated**. This is the surface where a
+ * second click certainly starts a second agent on one checkout (`sendText` runs it, where the
+ * extension path leaves its prompt unsent), so convergence is the whole guard — there is no
+ * question to ask, because clicking twice now does one thing.
+ */
 function startClaudeInTerminal(session: SessionInfo, prompt: string): void {
+  const existing = sessionTerminal(vscode.window.terminals, session.session, session.worktree);
+  if (existing) {
+    existing.show();
+    return;
+  }
   const terminal = vscode.window.createTerminal({
-    name: `claude: ${session.session.slice(0, 24)}`,
+    name: sessionTerminalName(session.session),
     cwd: session.worktree,
   });
   terminal.show();

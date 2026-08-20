@@ -47,8 +47,6 @@ export type Launcher = "auto" | "extension" | "terminal";
 export type Launch =
   | { readonly where: "here" }
   | { readonly where: "window" }
-  /** The user declined to reopen a session that may already have a window. */
-  | { readonly where: "declined" }
   /**
    * The caller should start `claude` in a terminal. `fallback` is absent when that is what the
    * operator asked for — there is nothing to apologise for — and present when Claude Code was
@@ -67,12 +65,6 @@ export interface LaunchRequest {
   readonly worktree: string;
   readonly uid: string;
   readonly prompt: string;
-  /**
-   * `jkb task work` returned an existing session, so a window may already be open on it.
-   * It is evidence, not proof — a session opened yesterday and closed is also `resumed` —
-   * which is why this asks rather than deciding.
-   */
-  readonly resumed: boolean;
   readonly launcher: Launcher;
 }
 
@@ -85,24 +77,32 @@ interface PendingPrompt {
 /**
  * Start Claude Code on the session's worktree with `prompt` in its input.
  *
- * `where: "unavailable"` means the caller should fall back to a terminal. It is never returned
- * once a window has been opened, so a fallback can only ever add a terminal to the window the
- * user is already in.
+ * Returns `terminal` when the caller should run `claude` itself — either because that is what
+ * the operator asked for (no `fallback`) or because Claude Code could not be reached (with
+ * one) — and `blocked` when the operator ruled a terminal out. Neither is returned once a
+ * window has been opened, so a fallback can only ever add a terminal to the window the user
+ * is already in.
  *
- * A **resumed** session is asked about rather than reopened. Forcing a window would either put
- * a second Claude chat on a checkout the first is mid-edit on — the hazard D36 exists to
- * prevent, one level up from the session — or, if VS Code focuses the existing window instead,
- * deliver nothing and say nothing. Nothing observable tells the two apart from here: no API
- * reports another window's folder, and `resumed` is about the *session*, not the window. So
- * the person who can see their own windows is the one asked.
+ * **Clicking twice asks nothing, on any surface.** The guard this needs is "is an agent live
+ * on this checkout", and that is not obtainable: no API reports another window\'s folder, and
+ * D27/D36.6 deliberately refused the heartbeat that would track a live process. `resumed` is
+ * the nearest available signal and it is the wrong one — a session opened yesterday and
+ * closed is equally resumed — so a confirmation keyed on it fires on every ordinary return to
+ * a task and catches nothing, which is how a guard becomes a reflex click. Instead each
+ * surface **converges on what already exists**, the same property `jkb task work` has: VS Code
+ * opens one window per folder, the handed-over prompt lands *unsent* so no agent runs without
+ * a keystroke from someone looking at it, and `sessionTerminal` finds the session\'s existing
+ * terminal rather than starting a second `claude` beside it.
  */
 export async function launchClaude(
   context: vscode.ExtensionContext,
   req: LaunchRequest,
 ): Promise<Launch> {
   const { worktree, uid, prompt, launcher } = req;
-  // Asked for a terminal: no window, no queue, no question. The rest of this function is about
-  // reaching Claude Code, and none of it is something the operator asked to happen.
+  // Asked for a terminal: no window and no queue. Everything below is about reaching Claude
+  // Code, and none of it is something the operator asked to happen. Returning early is safe
+  // only because the duplicate guard is no longer down there — it is `sessionTerminal`, which
+  // the caller applies to the surface it is actually about to start.
   if (launcher === "terminal") return { where: "terminal" };
 
   if (!vscode.extensions.getExtension(CLAUDE_EXTENSION_ID)) {
@@ -115,8 +115,6 @@ export async function launchClaude(
     const failure = await openClaudeHere(prompt);
     return failure === undefined ? { where: "here" } : unreachable(launcher, false, failure);
   }
-
-  if (req.resumed && !(await confirmReopen(worktree))) return { where: "declined" };
 
   try {
     queuePrompt(context, worktree, { uid, prompt });
@@ -142,6 +140,63 @@ export async function launchClaude(
   return { where: "window" };
 }
 
+/** The terminal a session's `claude` runs in, named so a later click can find it again. */
+export function sessionTerminalName(session: string): string {
+  return `claude: ${session.slice(0, 24)}`;
+}
+
+/**
+ * Only what matching needs, so this is testable without a running VS Code.
+ *
+ * `creationOptions` is left as `object` on purpose. VS Code types it as a union whose other arm
+ * (an extension-owned pty) has no `cwd` at all, so `{ cwd?: … }` is a *weak* type that a real
+ * `Terminal` does not satisfy — the generic then degrades to this interface and `show()` is
+ * gone at the call site. The shape is narrowed where it is read instead.
+ */
+export interface TerminalLike {
+  readonly name: string;
+  readonly creationOptions: object;
+}
+
+/**
+ * The session's own `claude` terminal, if this window already has one.
+ *
+ * This is what makes a second click harmless on the terminal surface, where a duplicate is
+ * otherwise *certain* — `sendText` runs the command, unlike the extension path where the
+ * handed-over prompt waits unsent. Showing a terminal whose `claude` has since exited is the
+ * benign outcome: the user sees a shell in the worktree and re-runs, one keystroke.
+ *
+ * Matched on name **and** working directory. In Flight's "Open Session Terminal" opens a plain
+ * shell with the same `cwd` and a different name, and converging onto a bare shell when a
+ * `claude` is running next door would be the wrong answer to the same question.
+ *
+ * Only this window's terminals are visible, so a `claude` started from another window is not
+ * found. That residue is stated rather than closed: it is the same thing no API can observe.
+ */
+export function sessionTerminal<T extends TerminalLike>(
+  terminals: readonly T[],
+  session: string,
+  worktree: string,
+): T | undefined {
+  const name = sessionTerminalName(session);
+  return terminals.find((t) => {
+    if (t.name !== name) return false;
+    const dir = directoryOf(t.creationOptions);
+    return dir !== undefined && sameDirectory(dir, worktree);
+  });
+}
+
+/** A terminal's working directory, from the `string | Uri` VS Code accepts — or nothing. */
+function directoryOf(options: object): string | undefined {
+  const cwd: unknown = "cwd" in options ? (options as { cwd?: unknown }).cwd : undefined;
+  if (typeof cwd === "string") return cwd;
+  if (cwd !== null && typeof cwd === "object" && "fsPath" in cwd) {
+    const { fsPath } = cwd as { fsPath: unknown };
+    if (typeof fsPath === "string") return fsPath;
+  }
+  return undefined;
+}
+
 /**
  * Claude Code was wanted and could not be started: fall back, or report, per the operator.
  *
@@ -152,16 +207,6 @@ function unreachable(launcher: Launcher, missing: boolean, cause: string): Launc
   return launcher === "extension"
     ? { where: "blocked", cause }
     : { where: "terminal", fallback: { missing, cause } };
-}
-
-/** Ask before reopening a session that may already have a window; false means leave it alone. */
-async function confirmReopen(worktree: string): Promise<boolean> {
-  const choice = await vscode.window.showInformationMessage(
-    `jkb: ${path.basename(worktree)} is already open as a session. If its window is up, switch ` +
-      "to it — reopening starts a second Claude on the same checkout.",
-    "Open its window",
-  );
-  return choice === "Open its window";
 }
 
 /**
