@@ -868,11 +868,12 @@ enum TaskCmd {
     /// Record that a branch was grafted onto another — for the merge queue, which is bash and
     /// cannot write the record directly the way `jkb task land` does.
     ///
-    /// A landing event is a **trusted** fact: readers act on it without re-deriving anything from
-    /// refs, so this verb is a new write route for exactly the class of fact this area exists to
-    /// protect. It therefore refuses unless the branch's work really is in the target, judged by
-    /// the same policy every reader uses — so a hand-run for work that has not landed fails, and
-    /// one for work that has records a truth.
+    /// A landing event is a **trusted** fact — readers act on it without re-deriving anything
+    /// from refs — and this verb verifies nothing of its own: the caller performed the graft and
+    /// gated it, and is reporting what it did. That is why the recorded event is
+    /// `observed_landed` and not `land`, whose guard asks whether jkb *may perform* a graft that
+    /// here has already happened. Run by hand for work that did not land, it records a falsehood,
+    /// so it is the merge queue's verb rather than a general one.
     Landed {
         /// The branch that was grafted.
         branch: String,
@@ -888,9 +889,11 @@ enum TaskCmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Reclaim claims whose owner process is gone (the deterministic crash-recovery
-    /// scan). Keeps claims whose pid is alive plus any `--keep` owners — so a live
-    /// coordinator passes its own owner to never reclaim its own in-flight work.
+    /// Reclaim claims whose owner is **proven** gone (the deterministic crash-recovery scan).
+    /// Keeps every other claim — one whose owner is alive, one in `--keep`, and one whose owner
+    /// cannot be established at all, which is reported and never cleared, since treating an
+    /// unobtainable answer as "dead" frees a live agent's task. A live coordinator passes its
+    /// own owner so it never reclaims its own in-flight work.
     Reclaim {
         /// Owner id(s) to always preserve (repeatable), e.g. this run's own owner.
         #[arg(long)]
@@ -4997,16 +5000,43 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
         match outcome.refusal() {
             None => recorded.push(uid.clone()),
             Some(why) => {
-                // **The graft still happened, so it is still recorded.** `perform` writes a
-                // history row only when it moves, and a group task held for an open subtask
-                // would otherwise store nothing about a landing the queue really performed: the
-                // subtask finishes later, nothing re-runs this verb, and `close-merged` finds no
-                // landing and no pull request (the queue grafts locally, so there is none) —
-                // holding the task for ever on "no pull request has that branch as its head".
+                // **The graft still happened, so it is still recorded** — but only when the
+                // refusal was a *guard* denying. `perform` writes a history row only when it
+                // moves, and a group task held for an open subtask would otherwise store nothing
+                // about a landing the queue really performed: the subtask finishes later, nothing
+                // re-runs this verb, and `close-merged` finds no landing and no pull request (the
+                // queue grafts locally, so there is none) — held for ever on "no pull request has
+                // that branch as its head".
+                //
+                // `Undefined` is the other refusal and means the opposite: this machine has no
+                // `observed_landed` from where the task is, so the event did not apply to this
+                // task at all. That is what an **abandoned** task looks like here — `abandon` does
+                // not clear `branch=`, so it is still selected — and recording a landing for it
+                // put an `onto` back into its history, where `land_target` reads the newest one
+                // and would have answered with a target the abandon had just retired. The task
+                // reappears in `jkb staging ls` as live work, and its batch never counts as spent.
+                //
+                // Recorded under the event's own name rather than as a `note`, so it is legible
+                // as a landing: `note` is bookkeeping that asserts nothing, and `jkb task start
+                // --onto` writes one carrying the same labels.
+                if !matches!(outcome, jkb_fsm::Outcome::Refused { .. }) {
+                    not_closed.push((uid.clone(), why));
+                    continue;
+                }
                 let labels = labels_for_note.clone();
                 db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-                    let facts = task::observe(conn, id)?;
-                    jkb_core::transition::note(conn, meta, id, &facts, &labels)?;
+                    let facts = jkb_core::lifecycle::TaskFacts {
+                        landed_elsewhere: Fact::Yes,
+                        ..task::observe(conn, id)?
+                    };
+                    jkb_core::transition::observed(
+                        conn,
+                        meta,
+                        id,
+                        &facts,
+                        lifecycle::TaskEvent::ObservedLanded,
+                        &labels,
+                    )?;
                     Ok(())
                 })?;
                 not_closed.push((uid.clone(), why));
@@ -6507,23 +6537,38 @@ fn close_one(db: &Db, root: &Path, id: ItemId, dry_run: bool) -> Result<CloseVer
         .read(move |conn| item::get(conn, id))?
         .map(|m| m.uid)
         .unwrap_or_default();
+    // **A landing jkb itself recorded is asked about first**, and it settles the question — it
+    // outranks anything GitHub could say, and when the merge queue grafted locally it is the only
+    // evidence that exists, because there is no pull request to ask about. A task held here for
+    // an open subtask has exactly that entry (see `cmd_task_landed`).
+    //
+    // Before the pull-request lookup, not after it: `discover_quietly` returns early with a hold
+    // whenever it cannot name a PR, which is *always* for a locally-grafted branch. Asking second
+    // meant this was never reached on the one path it exists for, and the task stayed held for
+    // ever — with the row that would have freed it sitting in its history.
+    let recorded = db.read(move |conn| jkb_core::transition::landed(conn, id))?;
     let number = db.read(move |conn| jkb_core::transition::pull_request(conn, id))?;
-    // Discover once, from the branch, and record what is found — after which the number is what
-    // is consulted and the branch name never is again.
-    let number = match number {
-        Some(n) => Some(n),
-        None => match discover_quietly(db, root, id)? {
-            Ok(found) => found,
-            Err(why) => {
-                return Ok(CloseVerdict {
-                    uid,
-                    pr: None,
-                    held: Some(why),
-                })
-            }
-        },
+    let (number, merged, why) = if recorded.is_some() {
+        (number, Fact::Yes, None)
+    } else {
+        // Discover once, from the branch, and record what is found — after which the number is
+        // what is consulted and the branch name never is again.
+        let number = match number {
+            Some(n) => Some(n),
+            None => match discover_quietly(db, root, id)? {
+                Ok(found) => found,
+                Err(why) => {
+                    return Ok(CloseVerdict {
+                        uid,
+                        pr: None,
+                        held: Some(why),
+                    })
+                }
+            },
+        };
+        let (merged, why) = pr::merged_fact(root, number);
+        (number, merged, why)
     };
-    let (merged, why) = pr::merged_fact(root, number);
     let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
         // The status is re-read **inside** the transaction. This snapshots every candidate up
         // front and then runs a subprocess per task, and it runs from a post-merge hook over all
@@ -6864,7 +6909,9 @@ fn reclaim_orphaned(db: &Db, keep: &[String], fix: bool) -> Result<(usize, Recla
 /// The second bucket is the S3.2 behaviour change made visible: an externally-minted `agent:`
 /// owner, or a `claimant_id` in a shape this binary cannot read, is **not** reclaimable, because
 /// treating an unestablished answer as "dead" silently frees a live agent's task. It is reported
-/// so a person can decide, and `--force` is how they say so.
+/// so a person can decide, and `jkb task release <uid> --owner <owner>` is how they say so —
+/// there is deliberately no `--force`, because a blanket override would free the whole bucket on
+/// the strength of one judgement about one owner.
 ///
 /// Owners in `keep` are alive by fiat and never probed; each **distinct** owner is probed at
 /// most once via [`owner::is_alive`] — the same rule the txn-internal probe in
@@ -7446,28 +7493,48 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"),
         )
         .expect("AGENTS.md sits at the repo root");
+        // Matched **anywhere on the line**, not at its start. Anchoring it to the start read
+        // every one of `GUIDE`'s bare command lines and none of AGENTS.md's, where the same
+        // commands are markdown bullets (`- ` + a backtick) — so half this guard was inert, and
+        // inert in exactly the way that looks like a clean result. One surface reporting nothing
+        // is indistinguishable from one with nothing to report.
+        let mut checked = 0_usize;
         for (surface, text) in [("jkb guide", GUIDE), ("AGENTS.md", agents.as_str())] {
+            let mut seen_here = 0_usize;
             for line in text.lines() {
-                let Some(rest) = line.trim_start().strip_prefix("jkb task ") else {
-                    continue;
-                };
-                let Some(verb) = rest.split_whitespace().next() else {
-                    continue;
-                };
-                // `jkb task <uid>`-style placeholders and prose are skipped; only a bare word
-                // that looks like a subcommand is held to the list.
-                if verb.starts_with('<')
-                    || verb.starts_with('[')
-                    || !verb.chars().all(|c| c.is_ascii_lowercase() || c == '-')
-                {
-                    continue;
+                for (i, _) in line.match_indices("jkb task ") {
+                    let rest = &line[i + "jkb task ".len()..];
+                    let verb: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                        .collect();
+                    // Placeholders and prose (`jkb task <uid>`, `jkb task ...`) carry no verb.
+                    // A verb has to be the whole token, so `jkb task work-tree` is not read as
+                    // `work`; anything else is skipped rather than guessed at.
+                    if verb.is_empty()
+                        || !rest[verb.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                    {
+                        continue;
+                    }
+                    seen_here += 1;
+                    assert!(
+                        verbs.contains(&verb.as_str()),
+                        "{surface} advertises `jkb task {verb}`, which the binary does not have"
+                    );
                 }
-                assert!(
-                    verbs.contains(&verb),
-                    "{surface} advertises `jkb task {verb}`, which the binary does not have"
-                );
             }
+            // A surface this found no verb in is a surface this did not check, which is the
+            // failure the anchoring bug produced silently for a whole branch.
+            assert!(
+                seen_here > 0,
+                "{surface} yielded no `jkb task <verb>` to check"
+            );
+            checked += seen_here;
         }
+        assert!(checked > 20, "only {checked} verb mentions were checked");
     }
 
     /// `GUIDE` declares `AGENTS.md` its mirror and nothing held the two in step: both omitted

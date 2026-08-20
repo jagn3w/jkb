@@ -2057,6 +2057,70 @@ fn the_row_and_the_command_talk_about_the_same_branch() {
     );
 }
 
+/// A landing the queue recorded while the task was **held** still closes it once the hold lifts.
+///
+/// The merge queue grafts a whole branch locally, so there is no pull request to ask about — the
+/// recorded landing is the only evidence that exists. A group task with an open subtask is
+/// rightly not closed at that moment (D34.4), and the previous shape of this recorded the graft
+/// as a `note`: a row `transition::landed` does not match and nothing else reads, indistinguishable
+/// from the one `jkb task start --onto` writes. So the subtask finished, nothing re-ran the verb,
+/// and `close-merged` asked GitHub for a pull request that never existed. Held for ever.
+///
+/// Asserted end to end and through the CLI, because the defect was that two halves each looked
+/// right on their own: the row was written, and the reader could not see it.
+#[test]
+fn a_landing_recorded_while_a_task_was_held_closes_it_once_the_hold_lifts() {
+    let f = Fixture::new();
+    let parent = f.add_task("parent task");
+    let s = f.work(&parent);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "p.txt", "parent work\n", "parent work");
+    let out = f
+        .jkb()
+        .args([
+            "--global",
+            "task",
+            "add",
+            "child task",
+            "--under",
+            &parent,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task add --under: {out:?}");
+    let child = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The queue grafts the branch and reports it. The parent is held for its open subtask.
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", &onto])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("open subtasks"));
+    assert_eq!(f.status_of(&parent), "in_progress", "it closed while held");
+
+    // The hold lifts.
+    f.jkb()
+        .args(["--global", "task", "set", &child, "--status", "done"])
+        .assert()
+        .success();
+
+    // `close-merged` now has to find the landing jkb recorded. There is no pull request — the
+    // graft was local — so if it asks `gh` instead, the task is held for ever.
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&parent),
+        "done",
+        "the recorded landing was not readable as evidence, so the task stayed held"
+    );
+}
+
 /// One task `close-merged` cannot decide must not stop it deciding the rest.
 ///
 /// The run is **total**: every task in the repo gets a verdict, and a task whose branch value is

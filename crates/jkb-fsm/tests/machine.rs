@@ -559,6 +559,17 @@ const UNREPEATABLE: &[Transition<Parcel, Move, Facts, Fx>] = &[
         guard: None,
         plan: None,
     },
+    // Present so the exemption below is *testable*. `observed_delivered` lands on `delivered`,
+    // which declares no row for it, so it meets the condition in every respect but one: it is a
+    // reconciliation. Without this row the assertion that reconciliations are left alone could
+    // not fail whatever the check did — the defect it looks for would be unproducible.
+    Transition {
+        from: Parcel::Shipped,
+        event: Move::ObservedDelivered,
+        to: Dest::To(Parcel::Delivered),
+        guard: Some(|f: &Facts| require_yes(f.signed_for, || Denial::new("no signature on file."))),
+        plan: None,
+    },
 ];
 
 #[test]

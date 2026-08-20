@@ -262,24 +262,21 @@ fn start_guard(f: &TaskFacts) -> Verdict<TaskEvent> {
 fn land_guard(f: &TaskFacts) -> Verdict<TaskEvent> {
     all_of([
         require_yes(f.session_exists.or(f.has_commits), || {
-            // The remedy is state-dependent, and has to be: `start` is not accepted from
-            // `needs_review`, so offering it there would be advice the machine itself refuses.
-            // `Machine::audit` caught exactly that in the first version of this guard, which is
-            // the whole argument for a remedy being an event rather than a sentence.
-            if f.status == TaskStatus::NeedsReview {
-                Denial::with_remedy(
-                    "There is no work to land — no session checkout and no commits.",
-                    TaskEvent::RequestChanges,
-                    "Send it back to the implementer with `jkb task set <uid> --status \
-                     in_progress`, then open a session with `jkb task work <uid>`.",
-                )
-            } else {
-                Denial::with_remedy(
-                    "There is no work to land — no session checkout and no commits.",
-                    TaskEvent::Start,
-                    "Open one with `jkb task work <uid>`.",
-                )
-            }
+            // One remedy, from every state. It was split in two because `start` was not accepted
+            // from `needs_review`, so offering it there would have been advice the machine itself
+            // refuses — `Machine::audit` caught exactly that in the guard's first version, which
+            // is the argument for a remedy being an event rather than a sentence.
+            //
+            // Declaring `needs_review -start-> in_progress` (re-runnability, and the commonest
+            // resume there is) removed the reason. The branch had to go with it: `jkb task work`
+            // now works from there directly, and the advice it was giving instead — set the
+            // status by hand, then open a session — writes an `override` into the history where a
+            // `start` belongs, so `jkb task why` reported a resume as an operator override.
+            Denial::with_remedy(
+                "There is no work to land — no session checkout and no commits.",
+                TaskEvent::Start,
+                "Open one with `jkb task work <uid>`.",
+            )
         }),
         require_no(f.work_dirty, || {
             Denial::new(

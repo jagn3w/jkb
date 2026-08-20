@@ -117,7 +117,18 @@ pub fn is_alive(owner: &str) -> Fact {
 /// limit, `fork` denied — one `doctor --fix` would read every live `host:pid` owner as proven
 /// dead and free the lot. Exiting non-zero is an answer; failing to run is not.
 fn pid_exists(pid: u32) -> Fact {
-    match Command::new("ps")
+    pid_exists_with("ps", pid)
+}
+
+/// The probe, with the program to run named by the caller.
+///
+/// Split out **only** so the "could not spawn" arm is reachable from a test without emptying
+/// `PATH`. It was tested that way, and `PATH` is process-global while `cargo test` runs the whole
+/// binary's tests on a thread pool — so it intermittently broke sibling tests that spawn `ps` and
+/// `git`, in a crate whose gate is shared. A test that reddens the gate at random teaches people
+/// to re-run it, which is how a real failure gets waved through.
+fn pid_exists_with(prog: &str, pid: u32) -> Fact {
+    match Command::new(prog)
         .args(["-p", &pid.to_string(), "-o", "pid="])
         .output()
     {
@@ -167,25 +178,24 @@ mod tests {
     /// process is gone", so one `doctor --fix` in a stripped container would free every live
     /// `host:pid` claim in the database.
     ///
-    /// Exercised by making the spawn fail for real — `PATH` emptied, so `ps` cannot be found —
-    /// rather than by trusting the match arm to be right.
+    /// Exercised by making the spawn fail for real — an absolute path to a program that is not
+    /// there — rather than by trusting the match arm to be right.
+    ///
+    /// It emptied `PATH` to do this at first, which works and is not confinable: `PATH` is
+    /// process-global, `cargo test` runs this binary's tests on a thread pool, and three tests
+    /// in this very module spawn `ps` while `gitrepo`'s spawn `git`. It reddened the shared gate
+    /// about one run in six, in tests with no connection to the change. Naming the program is
+    /// the same coverage with no global state.
     #[test]
     fn a_probe_that_could_not_run_is_unknown_not_dead() {
-        // Serialized against nothing else here: this test owns the env var for its duration and
-        // the other tests in this module do not read `PATH`.
-        let saved = std::env::var_os("PATH");
-        // SAFETY-adjacent: single-threaded within this test, restored below.
-        std::env::set_var("PATH", "");
-        let answer = is_alive(&self_owner());
-        match saved {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
         assert_eq!(
-            answer,
+            super::pid_exists_with("/nonexistent/jkb-not-a-program", std::process::id()),
             Fact::Unknown,
-            "a `ps` that could not be spawned read as a dead owner"
+            "a probe that could not be spawned read as a dead owner"
         );
+        // The same pid through the real program is proven alive — so the answer above is the
+        // spawn failing, not the pid being unfindable.
+        assert_eq!(super::pid_exists_with("ps", std::process::id()), Fact::Yes);
     }
 
     #[test]

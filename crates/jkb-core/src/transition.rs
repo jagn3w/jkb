@@ -368,15 +368,56 @@ pub fn note(
     facts: &TaskFacts,
     labels: &Labels,
 ) -> Result<()> {
+    append(conn, meta, task, facts, "note", labels)
+}
+
+/// An event that **happened and did not move the task**, recorded under its own name.
+///
+/// The distinction from [`note`] is what a reader can do with the row. A `note` is bookkeeping —
+/// a branch and target being written down, a pull request number arriving — and asserts nothing
+/// about the world. This says the event was really observed; the task simply did not move,
+/// because a guard about the *task* denied while the fact about the *work* stood.
+///
+/// The merge queue is the case: it grafts a whole branch, and a task on it that still has open
+/// subtasks must not close (D34.4). Recording that as a `note` lost it — [`landed`] matches on
+/// the event name, and no reader could tell that row from `jkb task start --onto` writing down
+/// where work is going to land. So the task was held, the subtask finished, and nothing ever
+/// re-ran the verb: `close-merged` then asked GitHub for a pull request that never existed,
+/// because the queue grafts locally. Held for ever, which is the shape D48 exists to end.
+///
+/// # Errors
+/// Returns a database error if the insert fails.
+pub fn observed(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    facts: &TaskFacts,
+    event: TaskEvent,
+    labels: &Labels,
+) -> Result<()> {
+    use jkb_fsm::Event as _;
+    append(conn, meta, task, facts, event.name(), labels)
+}
+
+/// One row, `from_status == to_status`, under whatever name the caller gives the event.
+fn append(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    facts: &TaskFacts,
+    event: &str,
+    labels: &Labels,
+) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO task_transitions
              (txn_id, item_id, at, event, from_status, to_status,
               agent_id, branch, onto, ref_commit, pr_number, evidence)
-         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'note', ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?
     .execute(params![
         meta.txn_id,
         task.get(),
+        event,
         facts.status.as_str(),
         facts.actor.as_ref().map(AgentId::as_str),
         labels.branch,
