@@ -6,10 +6,10 @@
 //!
 //! | fact | source |
 //! | --- | --- |
-//! | which branches are staging branches | `branch_records.land_target` |
-//! | which tasks are on one | that, joined to the tasks' `branch=` facets |
+//! | which branches are staging branches | the `onto` label on each task's latest transition |
+//! | which branches exist | `gitrepo::branch_refs` (D38.1: a record is never evidence one does) |
 //! | whether a session exists | `session::discover` (git worktrees) |
-//! | whether it merged to trunk | `gitrepo::is_merged` (squash-safe, D34.2) |
+//! | whether a batch is spent | every task on it is terminal (D48) |
 //! | what state a task is in | `items.status` (D27.7) |
 //!
 //! A staging *item* would add a title and a PR url and would then need reconciling against

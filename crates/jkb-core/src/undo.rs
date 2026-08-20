@@ -2494,9 +2494,6 @@ mod tests {
         );
     }
 
-    /// A **`branch_records`** update comes back too — the entity whose non-insert writes are all
-    /// upserts, so an undo of one has nothing to delete and everything to restore.
-    ///
     /// Re-parenting is an upsert, so undoing it must put the previous container back — not
     /// delete the row and leave the item contained by nothing.
     #[test]

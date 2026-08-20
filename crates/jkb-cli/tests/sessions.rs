@@ -2594,3 +2594,123 @@ fn a_branch_name_cannot_smuggle_a_git_option() {
     assert!(after.contains("main"), "trunk was deleted: {after}");
     assert!(after.contains("victim"), "a branch was deleted: {after}");
 }
+
+// ---------------------------------------------------------------------------
+// The lifecycle machine at the CLI edge (design D48)
+// ---------------------------------------------------------------------------
+
+/// A finished task has no `start` transition, so `jkb task work` refuses it — and refuses it
+/// with the machine's own sentence rather than a second one written beside it.
+///
+/// The rule was stated twice before: once here and once in the table. Two copies of a rule read
+/// as protection while diverging from the one that actually decides, which is how one click came
+/// to reopen a task that had already merged.
+#[test]
+fn a_finished_task_cannot_be_worked() {
+    let f = Fixture::new();
+    let uid = f.add_task("already finished");
+    f.jkb()
+        .args(["--global", "task", "set", &uid, "--status", "done"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "work", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not something that can happen"));
+    assert_eq!(f.status_of(&uid), "done", "the refusal changed the task");
+}
+
+/// An owner whose liveness cannot be established keeps its claim, and is **reported** rather
+/// than freed (design S3.2).
+///
+/// The behaviour change this branch makes, and the one worth pinning end to end: the old probe
+/// returned `bool` and treated an owner it could not read as dead, which silently hands a live
+/// agent's task to somebody else. `doctor --fix` must leave it alone and say so.
+#[test]
+fn an_owner_whose_liveness_cannot_be_checked_keeps_its_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("held by an opaque agent");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "claim",
+            &uid,
+            "--owner",
+            "agent:01JBX7Q4",
+        ])
+        .assert()
+        .success();
+
+    // Reported in its own bucket — not as "orphaned (owner gone)", which is a different answer.
+    f.jkb()
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("liveness cannot be checked"))
+        .stdout(predicate::str::contains(&uid));
+
+    // ...and `--fix` does not touch it: the claim is still there, still reported.
+    f.jkb().args(["doctor", "--fix"]).assert().success();
+    f.jkb()
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent:01JBX7Q4"))
+        .stdout(predicate::str::contains("NOT auto-reclaimed"));
+
+    // A dead *process* owner, by contrast, is proven gone and is reclaimed.
+    let other = f.add_task("held by a dead process");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "claim",
+            &other,
+            "--owner",
+            "host:4294967290",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared 1 orphaned claim"));
+}
+
+/// `jkb task why` is the read this area most obviously lacked: what moved a task, and on what
+/// evidence. Fourteen must-fix findings in the corpus are "held for ever with no way to see why".
+#[test]
+fn task_why_shows_what_moved_the_task_and_on_what_evidence() {
+    let f = Fixture::new();
+    let uid = f.add_task("a task with a history");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+
+    let out = f
+        .jkb()
+        .args(["--global", "task", "why", &uid, "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["history"].as_array().unwrap();
+    assert!(!rows.is_empty(), "opening a session recorded nothing");
+    let start = rows
+        .iter()
+        .find(|r| r["event"].as_str() == Some("start"))
+        .expect("the claim that started the task is in its history");
+    assert_eq!(start["to"].as_str(), Some("in_progress"));
+    assert!(
+        start["agent"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("session:")),
+        "the history does not say who acted"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["branch"].as_str() == Some(branch.as_str())),
+        "the branch the work is on is not recorded anywhere in the history"
+    );
+}

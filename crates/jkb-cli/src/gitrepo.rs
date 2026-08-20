@@ -101,8 +101,7 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>> {
 /// remote's default branch renamed, or `origin/main` pruned — and it was the one arm that took its
 /// answer on trust while the fallback arm verified. A trunk that does not resolve used to make
 /// `ahead_count` quietly answer zero; it now refuses, which turned `jkb staging ls` from a listing
-/// into a hard error in exactly that repo. Callers are entitled to assume this ref works, and
-/// `base::measure_git` says so in as many words.
+/// into a hard error in exactly that repo. Callers are entitled to assume this ref works.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
@@ -568,10 +567,9 @@ pub fn reset_hard(dir: &Path, reference: &str) -> Result<()> {
 /// **Not [`rev`].** Plain `rev-parse` is a *parser*: handed a 40-character hex string it exits 0
 /// and echoes it back whether or not the object exists, because that is already a well-formed
 /// object name. So `rev` answers "is this spellable", and using it to mean "is this a commit I
-/// have" made a fabricated sha read as a real cut point — after which `is_merged`'s tip-vs-base
-/// comparison is merely *false* rather than unknown, its freshly-cut guard is skipped, and an
-/// empty branch closes as merged. `--verify --quiet` with `^{commit}` is the question that
-/// actually looks the object up, and it is the one every caller wanting existence must ask.
+/// have" once made a fabricated sha read as a real commit. `--verify --quiet` with `^{commit}` is
+/// the question that actually looks the object up, and it is the one every caller wanting
+/// existence must ask.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
@@ -665,10 +663,8 @@ pub fn branch_ref(dir: &Path, branch: &str, prefer: Prefer) -> Result<Option<Str
 ///
 /// Used only by [`worktree_add`], to undo a branch it created when the worktree add then fails.
 /// It was once threaded out to the cut-point writer as evidence that a record under this name
-/// belonged to a different branch; that is now derived in `base::ensure_recorded` from git alone
-/// ("an untouched branch forked at its own tip"), because a flag has to be supplied by every
-/// caller — `jkb task start` could not — and is lost by a crash between the git write and the
-/// database write.
+/// belonged to a different branch — a flag every caller had to supply, and one a crash between
+/// the git write and the database write loses. There is no cut point to protect any more.
 pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
     // Composed from [`adopt_remote`] rather than repeating its logic: two functions that both
     // knew how to prefer a remote copy is the overlap that once made `create_branch` silently

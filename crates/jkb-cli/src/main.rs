@@ -4627,6 +4627,39 @@ struct StartWhere {
     owner: Option<String>,
 }
 
+/// May this run take a claim somebody else holds, and if not, may it leave it in place?
+///
+/// **Liveness, not string equality** (D27.1). The bare `claim::claim` CAS accepts only a free
+/// task or a byte-identical owner, so using its answer as a refusal meant `task start` refused
+/// its own second run under a new pid, and refused after `task work` — the very sequence the
+/// facet writing exists for, since a session claims as `session:<pid>:<worktree>`.
+///
+/// Returns whether the existing claim should be **kept**.
+///
+/// # Errors
+/// Errors when a live owner other than this one holds the task.
+fn judge_existing_claim(held: Option<&str>, owner: &str, uid: &str, cwd: &Path) -> Result<bool> {
+    let Some(prev) = held else { return Ok(false) };
+    // Refuse unless the holder is **proven** gone. An owner whose liveness cannot be established
+    // (an externally-minted `agent:` id) keeps its claim: taking it away on an unestablished
+    // answer is how a live agent's work gets started twice (design S3.2).
+    if prev == owner || owner::is_alive(prev).is_no() {
+        return Ok(false);
+    }
+    // A live session for this task that we are standing **inside** keeps its claim: replacing a
+    // `session:` owner with this one-second process's `host:pid` would make the task read as
+    // dead to `doctor --fix` the moment it exits, freeing a session someone is working in
+    // (D36.6). Any other live owner is someone else.
+    let inside = owner::session_worktree(prev).is_some_and(|w| session::is_within(cwd, &w));
+    anyhow::ensure!(
+        inside,
+        "{uid} is already claimed by {prev}, which is still alive — nothing was changed. \
+         Finish or abandon that work, or use `jkb task release {uid} --owner {prev}` if you \
+         are sure it is gone."
+    );
+    Ok(true)
+}
+
 /// `task start` — claim the task and record where the work is happening.
 ///
 /// Claiming and tagging together is the point: "I am starting this" and "here is the branch
@@ -4677,39 +4710,27 @@ fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<
     let owner = owner.unwrap_or_else(owner::preferred_owner);
     let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
     let n = land_target.clone();
-    // Who holds it, and may we take it? **Liveness**, not string equality (D27.1). The bare
-    // `claim::claim` CAS accepts only a free task or a byte-identical owner, so using its
-    // answer as a refusal meant `task start` refused its own second run under a new pid, and
-    // refused after `task work` — the very sequence the facet writing below exists for, since
-    // a session claims as `session:<pid>:<worktree>`.
     let held = current_claim(db, id)?;
-    let mut keep_claim = false;
-    if let Some(prev) = &held {
-        // Refuse unless the holder is **proven** gone. An owner whose liveness cannot be
-        // established (an externally-minted `agent:` id) keeps its claim: taking it away on an
-        // unestablished answer is how a live agent's work gets started twice (design S3.2).
-        if prev != &owner && !owner::is_alive(prev).is_no() {
-            // A live session for this task that we are standing **inside** keeps its claim:
-            // replacing a `session:` owner with this one-second process's `host:pid` would
-            // make the task read as dead to `doctor --fix` the moment it exits, freeing a
-            // session someone is working in (D36.6). Any other live owner is someone else.
-            let inside =
-                owner::session_worktree(prev).is_some_and(|w| session::is_within(&cwd, &w));
-            anyhow::ensure!(
-                inside,
-                "{uid} is already claimed by {prev}, which is still alive — nothing was \
-                 changed. Finish or abandon that work, or use `jkb task release {uid} \
-                 --owner {prev}` if you are sure it is gone."
-            );
-            keep_claim = true;
-        }
-    }
+    let keep_claim = judge_existing_claim(held.as_deref(), &owner, uid, &cwd)?;
     let displaced = held.clone();
     db.write_txn("cli", move |conn, meta| {
         // The CAS answer is checked rather than discarded: losing it means someone claimed the
         // task between the probe and here, and reporting "started" while writing this session's
         // branch onto their task is exactly the confusion the liveness guard above prevents.
-        if !keep_claim && !swap_claim(conn, meta, id, displaced.as_deref(), &o)? {
+        if !keep_claim
+            && !swap_claim(
+                conn,
+                meta,
+                id,
+                displaced.as_deref(),
+                &o,
+                &jkb_core::transition::Labels {
+                    branch: Some(b.clone()),
+                    onto: n.clone(),
+                    ..jkb_core::transition::Labels::default()
+                },
+            )?
+        {
             return Err(jkb_types::Error::Validation(
                 "the task was claimed by someone else while this command was checking — \
                  nothing was changed; run it again"
@@ -4812,26 +4833,20 @@ fn report_started(db: &Db, s: &Started<'_>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// What `--onto` should be **recorded** as, given what it was passed — and the trunk rules.
+/// What `--onto` should be **recorded** as, given what it was passed — and the trunk rule.
 ///
-/// `--onto` carries two roles that only come apart at trunk: the branch this one was **cut from**
-/// (a measurement reference) and the branch it **lands on** (`branch_records.land_target`, which
-/// puts it in the staging picker). Trunk is a perfectly good answer to the first and an
-/// unacceptable one to the second (D34.3), so it is used for the measurement and dropped from the
-/// record.
+/// Trunk is an unacceptable land target (D34.3): a task recorded as landing on trunk reads as
+/// merged the moment anything lands there, and `jkb staging ls` would offer trunk as a batch. So
+/// `--onto <trunk>` is accepted — it is an ordinary thing to say about a branch cut from trunk —
+/// and simply not recorded, which the caller is told.
 ///
-/// Refusing the flag outright was the first version, and it left a branch genuinely cut from trunk
-/// with commits already on it able to record only `base == tip` — permanently `NothingToMerge`,
-/// never creditable, never landable — with a hand-computed merge-base as the only way out, which
-/// is the thing this area exists to stop callers doing.
-///
-/// The work branch itself may never be trunk: `branch=main` closes the task the instant anything
-/// merges, since trunk is trivially merged into itself.
+/// Refusing the flag outright was the first version, and it left the caller nothing to say about
+/// a branch genuinely cut from trunk.
 fn land_target_for(ctx: Option<&repo::RepoCtx>, branch: &str, onto: Option<&str>) -> Result<Land> {
     let Some(ctx) = ctx else {
         // Not in the task's repository, so neither the trunk rule nor the existence check can be
-        // applied. Nothing is measured there either (`measure_root_for`), so the caller's word is
-        // taken for the facet and the cut point is simply not recorded.
+        // applied. The caller's word is taken for the record — a land target is a name, not a
+        // measurement, so there is nothing here this checkout could honestly establish.
         return Ok(Land {
             target: onto.map(str::to_owned),
             dropped_trunk: false,
@@ -5132,14 +5147,16 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     let cwd = std::env::current_dir()?;
     let id = resolve_task_uid(db, uid)?;
 
-    let status = db
-        .read(move |conn| item::get(conn, id))?
-        .and_then(|m| m.status);
-    if let Some(status) = status.as_deref() {
-        anyhow::ensure!(
-            !jkb_types::TaskStatus::is_terminal_str(Some(status)),
-            "{uid} is already {status} — there is nothing to work"
-        );
+    // Asked of the lifecycle rather than re-stated here: `start` has no transition out of a
+    // terminal status, so this is the same refusal `jkb task start` and the In Flight row give.
+    // Only the *state* half is checked now — everything a session needs is established below,
+    // and asking about it before the worktree exists would be asking about facts that are not
+    // yet true.
+    let held = db.read(move |conn| task::observe(conn, id))?;
+    if let Some(why) = lifecycle::apply(&held, lifecycle::TaskEvent::Start).refusal() {
+        if held.status.is_terminal() {
+            anyhow::bail!("{uid}: {why}");
+        }
     }
 
     // Session worktrees live inside the repo, so the first one must not make it dirty.
@@ -5494,13 +5511,39 @@ fn swap_claim(
     id: ItemId,
     displaced: Option<&str>,
     owner: &str,
+    labels: &jkb_core::transition::Labels,
 ) -> jkb_core::Result<bool> {
     if let Some(prev) = displaced {
         if !claim::clear_if(conn, meta, id, prev)? {
             return Ok(false);
         }
     }
-    claim::claim(conn, meta, id, owner)
+    // Through the machine, so **starting a task is in its history** — with who started it and
+    // what was recorded alongside. Taking the claim directly was a hole exactly where it hurts:
+    // `jkb task work` is the commonest way a task starts, so `jkb task why` said nothing about
+    // the one event every later question is asked relative to.
+    //
+    // The displaced owner is already cleared above, so the guard sees a free slot; what it still
+    // decides is that a terminal task cannot be started, which is the same refusal `task work`
+    // gives before it gets here.
+    let facts = jkb_core::lifecycle::TaskFacts {
+        actor: Some(jkb_types::AgentId::parse(owner)),
+        ..jkb_core::task::observe(conn, id)?
+    };
+    let outcome = jkb_core::transition::perform(
+        conn,
+        meta,
+        id,
+        &facts,
+        jkb_core::lifecycle::TaskEvent::Start,
+        labels,
+    )?;
+    match outcome.refusal() {
+        Some(why) => Err(jkb_types::Error::Validation(why).into()),
+        // An already-started task claimed by the same owner is `Idempotent`, which writes
+        // nothing and is not a failure — asking twice is not an error (D48/S1.6).
+        None => Ok(true),
+    }
 }
 
 /// Take the session's claim, taking over from this session's own previous process (a resume)
@@ -5523,8 +5566,9 @@ fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -
         }
     }
     let (o, displaced) = (owner.to_owned(), held.clone());
+    let labels = jkb_core::transition::Labels::default();
     let ok = db.write_txn("cli", move |conn, meta| {
-        swap_claim(conn, meta, id, displaced.as_deref(), &o)
+        swap_claim(conn, meta, id, displaced.as_deref(), &o, &labels)
     })?;
     anyhow::ensure!(
         ok,
@@ -6151,12 +6195,15 @@ fn cmd_task_abandon(
         let current = item::get(conn, id)?
             .and_then(|m| m.status)
             .unwrap_or_default();
-        if jkb_types::TaskStatus::is_terminal_str(Some(current.as_str())) {
-            return Ok((false, current, Vec::new()));
-        }
-        // Through the machine, which refuses to reopen a finished task and releases the claim
-        // with the status in one plan — the pair that used to be written by hand here and, in
-        // the incident this replaces, one click reopened a task that had already merged.
+        // Through the machine, and **only** the machine: a terminal task simply has no `abandon`
+        // transition, so the refusal that used to be re-stated here is the same refusal the In
+        // Flight row shows. A second copy of a rule reads as protection while diverging from the
+        // one that actually decides — which is how one click came to reopen a task that had
+        // already merged.
+        //
+        // The claim is not re-judged here either. If it changed hands while the worktrees were
+        // being removed, the arm above has already returned; past that point the machine's plan
+        // releases the claim with the status, as one value.
         let facts = lifecycle::TaskFacts {
             work_dirty: Fact::No,
             ..task::observe(conn, id)?

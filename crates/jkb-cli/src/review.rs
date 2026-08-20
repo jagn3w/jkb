@@ -3,9 +3,9 @@
 //! Whether a review has run is the one fact in the staging picture with nowhere authoritative
 //! to live: git does not know, and the reviewer is a Claude workflow the CLI cannot run. So it
 //! is **stored**, as facets on the task — the smallest thing that can hold it, already
-//! carrying the sibling `branch=`/`repo=` facets, and queryable for free. (Where a branch was
-//! cut and where it lands are facts about the *branch* and live in `branch_records`; review
-//! state is a fact about the *task*, so it stays here.)
+//! carrying the sibling `branch=`/`repo=` facets, and queryable for free. (Whether the review
+//! *saw* a task's work is a different question, and no longer stored at all: jkb performs the
+//! graft, so a `land` transition onto the reviewed branch is the answer — see `credited_by`.)
 //!
 //! It deliberately does **not** live on the review folder's namespace: that object's metadata
 //! is owned by the sync engine (`header_line`, `sync_section`), and adding a

@@ -2,8 +2,9 @@
 //!
 //! Where a task is being worked — which repo, which branch — is recorded as plain facet tags
 //! (design D34.1/D36), and several modules need to read and write them. (Where that branch
-//! lands is a fact about the *branch*, not the task, and lives in `branch_records`; see the
-//! note on `FACET_BRANCH` below.) They lived in `main.rs` beside the clap surface, which made
+//! lands is a **label on the task's transition history**, written by the same call that records
+//! the transition — see `jkb_core::transition::land_target`.) They lived in `main.rs` beside the
+//! clap surface, which made
 //! `staging.rs` and
 //! `review.rs` depend *inward* on the binary root while every other module depends sideways,
 //! and forced eleven items to be `pub(crate)` in an already very large file.
@@ -23,9 +24,9 @@ pub(crate) const FACET_BRANCH: &str = "branch";
 pub(crate) const FACET_REPO: &str = "repo";
 
 /// The branch a session's work lands on used to be a facet here (`onto=`). It is now
-/// `branch_records.land_target`, because it was branch-keyed by accident of having exactly one
-/// writer: two tasks on one branch could record different land targets, and `None` on a facet
-/// could not tell "lands on trunk" from "never recorded". See `jkb_core::branch::BranchRecord`.
+/// a label on the task's transition history: it is a statement about a moment, so two tasks told
+/// different targets are two entries with timestamps rather than one row silently keeping
+/// whichever wrote last. See `jkb_core::transition::land_target`.
 /// A task's facet tags, **every** value per facet.
 ///
 /// Tags are a multi-map: `tag::apply` adds, so a task can legitimately carry two `branch=`
@@ -50,9 +51,8 @@ pub(crate) fn facet_values<'a>(
 
 /// The single value of a facet that should only ever have one (`repo`).
 ///
-/// The two facts that are per-*branch* rather than per-task — where a branch was cut and where it
-/// lands — are not facets at all any more; they are `branch_records` columns, keyed
-/// `(repo, branch)`, so there is nothing here to collapse.
+/// Where a branch lands is not a facet at all — it is a label on the task's transition history —
+/// and where it was cut is not stored anywhere, so there is nothing here to collapse.
 pub(crate) fn facet_one<'a>(
     tags: &'a BTreeMap<String, Vec<String>>,
     facet: &str,
