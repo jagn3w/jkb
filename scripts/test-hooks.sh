@@ -199,6 +199,24 @@ found=$(env -u JKB_NOTIFIER HOME="$fake_home" bash "$hook" --find-notifier </dev
 check "the notifier is found at its install path" \
   "$found" "$fake_home/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
 
+# 12c. `--notifier-path` is the single place the install location is written down, and
+#      `scripts/build-notifier.sh` builds to it. The two used to compose the path independently;
+#      renaming the bundle in either would have left the hook falling back to plain banners, which
+#      is indistinguishable from the feature not existing. So: the path the installer targets must
+#      be one the hook actually searches, and the plist must name the same executable.
+want=$(env -u JKB_NOTIFIER bash "$hook" --notifier-path </dev/null 2>/dev/null)
+check "--notifier-path answers even with nothing installed" \
+  "$([ -n "$want" ] && echo yes || echo no)" "yes"
+
+# The decomposition build-notifier.sh performs, asserted here rather than trusted there.
+check "the install path is one find_notifier searches" \
+  "$(env -u JKB_NOTIFIER HOME="$tmp/pathcheck" bash "$hook" --notifier-path </dev/null 2>/dev/null)" \
+  "$tmp/pathcheck/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
+check "the plist declares the executable the install path names" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+      "$(cd "$(dirname "$0")/.." && pwd)/macos/notifier/Info.plist" 2>/dev/null || echo MISSING)" \
+  "${want##*/}"
+
 # 13. The live round-trip against the real notifier bundle. Withdrawing a delivered notification
 #     is the one behaviour that justifies shipping our own notifier at all, and no stub can show
 #     it works — only the notification centre can. Opt-in, mirroring how this repo treats its

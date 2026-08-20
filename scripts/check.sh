@@ -36,6 +36,18 @@ if [ -f ~/.cargo/env ]; then
     source ~/.cargo/env
 fi
 
+# `macos/notifier/main.swift` is code no other gate reaches — `cargo` does not know it exists and
+# CI runs on Ubuntu, where swiftc does not. This is the same trap the `ui` gate exists for (esbuild
+# strips types without checking them), with one difference worth stating: that one is covered by a
+# CI job, and this one CANNOT be, because there is no macOS runner. So it is a local-only gate, and
+# a broken notifier reaches CI green. Anyone touching main.swift is running macOS by definition.
+echo "==> macos notifier (swift typecheck)"
+if [ "$(uname -s)" = "Darwin" ] && command -v swiftc >/dev/null 2>&1; then
+    swiftc -typecheck -swift-version 5 "$(dirname "$0")/../macos/notifier/main.swift"
+else
+    echo "   (skipped: needs macOS + swiftc; CI has no macOS runner, so nothing else covers this)"
+fi
+
 echo "==> rustfmt (check)"
 cargo fmt --all -- --check
 

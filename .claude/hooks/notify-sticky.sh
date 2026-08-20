@@ -43,19 +43,27 @@
 # Env seams: `JKB_NOTIFIER` overrides the notifier binary, `JKB_NOTIFY_STATE` the marker
 # directory. `scripts/test-hooks.sh` drives both, which is what lets this be tested off macOS.
 
+# Where the notifier lives, spelled ONCE for the whole repo. `scripts/build-notifier.sh` installs
+# to `--notifier-path` (the first entry) rather than composing a path of its own: the two used to
+# be written out independently, and renaming the bundle in either one would have left the hook
+# quietly falling back to plain banners forever — the failure that looks identical to this feature
+# not existing. A per-user location first, because installing there needs no privileges.
+NOTIFIER_PATHS=(
+  "$HOME/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
+  "/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
+)
+
 notifier=""
 find_notifier() {
   if [ -n "${JKB_NOTIFIER:-}" ]; then
     [ -x "$JKB_NOTIFIER" ] && notifier="$JKB_NOTIFIER"
     return
   fi
-  # Our own bundle, at the one path `scripts/build-notifier.sh` installs it to. The binary is
-  # invoked DIRECTLY rather than through `open`: `open` is asynchronous, so a hook could not read
-  # its exit status to decide whether to fall back, and it is far too slow for a per-tool-call
-  # dismiss. Launch Services registration is what makes the direct path work.
+  # The binary is invoked DIRECTLY rather than through `open`: `open` is asynchronous, so a hook
+  # could not read its exit status to decide whether to fall back, and it is far too slow for a
+  # per-tool-call dismiss. Launch Services registration is what makes the direct path work.
   local c
-  for c in "$HOME/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier" \
-    "/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"; do
+  for c in "${NOTIFIER_PATHS[@]}"; do
     if [ -x "$c" ]; then
       notifier="$c"
       return
@@ -83,6 +91,14 @@ if [ "${1:-}" = "--find-notifier" ]; then
   find_notifier
   [ -n "$notifier" ] || exit 1
   printf '%s\n' "$notifier"
+  exit 0
+fi
+
+# Where a notifier SHOULD be installed, whether or not one is there yet — which is why this is a
+# separate question from `--find-notifier`, whose answer is "nowhere" on the machine that most
+# needs to install one. `scripts/build-notifier.sh` builds to exactly this.
+if [ "${1:-}" = "--notifier-path" ]; then
+  printf '%s\n' "${NOTIFIER_PATHS[0]}"
   exit 0
 fi
 
