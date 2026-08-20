@@ -287,6 +287,37 @@ else
   esac
 fi
 
+echo "==> post-merge (setup.sh rebuild trigger)"
+
+# The trigger that decides whether a `git pull` rebuilds what setup.sh installs. It kept its own
+# copy of the path list and drifted the first time it mattered — setup.sh gained the notifier step
+# (built from macos/) and this pattern did not, so pulling a notifier change left the stale bundle
+# in place. It now asks setup.sh, and these assert the property that failed: every path setup.sh
+# builds FROM must fire the trigger.
+setup_sh="$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh"
+pm="$(cd "$(dirname "$0")/.." && pwd)/scripts/hooks/post-merge"
+build_paths=$("$setup_sh" --build-paths 2>/dev/null)
+check "setup.sh answers --build-paths" "$([ -n "$build_paths" ] && echo yes || echo no)" "yes"
+
+fires() { printf '%s\n' "$1" | grep -qE "$build_paths" && echo fire || echo skip; }
+for path in macos/notifier/main.swift macos/notifier/Info.plist crates/jkb-cli/src/main.rs \
+            ui/core/src/summary.ts scripts/build-notifier.sh Cargo.toml Cargo.lock; do
+  check "a pull touching $path rebuilds" "$(fires "$path")" "fire"
+done
+for path in openspec/changes/x/design.md README.md CLAUDE.md .codereviews/x/tasks.md; do
+  check "a pull touching $path does not rebuild" "$(fires "$path")" "skip"
+done
+
+# post-merge must not keep a pattern of its own — that is the whole fix, and a re-added literal
+# would pass every assertion above while drifting again on the next step.
+check "post-merge holds no path pattern of its own" \
+  "$(grep -cE "crates/\|ui/|\^\(crates" "$pm" | tr -d ' ')" "0"
+
+# An unanswerable trigger must degrade toward running setup.sh: a skipped rebuild is silent, an
+# unnecessary one only costs time.
+check "an empty pattern is not treated as 'matches nothing'" \
+  "$(grep -c 'if \[ -z "$build_paths" \] ||' "$pm" | tr -d ' ')" "1"
+
 if [ "$failures" -ne 0 ]; then
   printf '\n%d hook test(s) failed\n' "$failures" >&2
   exit 1
