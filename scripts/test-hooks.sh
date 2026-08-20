@@ -212,10 +212,32 @@ check "--notifier-path answers even with nothing installed" \
 check "the install path is one find_notifier searches" \
   "$(env -u JKB_NOTIFIER HOME="$tmp/pathcheck" bash "$hook" --notifier-path </dev/null 2>/dev/null)" \
   "$tmp/pathcheck/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
-check "the plist declares the executable the install path names" \
-  "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
-      "$(cd "$(dirname "$0")/.." && pwd)/macos/notifier/Info.plist" 2>/dev/null || echo MISSING)" \
-  "${want##*/}"
+# Asked of build-notifier.sh, which owns the rule, rather than re-read here — and its --check arm
+# runs before its own macOS gate and reads the plist with awk, so this assertion is live on Linux
+# CI too. It used to call /usr/libexec/PlistBuddy directly, which does not exist on ubuntu-latest:
+# the `|| echo MISSING` arm turned "cannot read" into a wrong VALUE and reddened CI on every push,
+# in a suite whose header claims it is portable.
+"$(cd "$(dirname "$0")/.." && pwd)/scripts/build-notifier.sh" --check --quiet >/dev/null 2>&1
+check "the plist declares the executable the install path names" "$?" "0"
+
+# 12d. The hook's events and `.claude/settings.json`'s registrations, diffed BOTH ways. The hook
+#      can act only on events Claude Code is told to send it, and that registration lives in a file
+#      the hook cannot see — so an event handled but unregistered does nothing, and one registered
+#      but unhandled spawns a process per occurrence for no reason. Neither errors. Losing `Stop`
+#      is the sharpest case: a *denied* permission produces no `PostToolUse`, so its notification
+#      would sit on screen until the session ended, which is the case `Stop` exists for.
+settings="$(cd "$(dirname "$0")/.." && pwd)/.claude/settings.json"
+handled=$(env -u JKB_NOTIFIER bash "$hook" --events </dev/null 2>/dev/null | sort)
+registered=$(jq -r --arg h "notify-sticky.sh" '
+  .hooks | to_entries[]
+  | .key as $event
+  | .value[]?.hooks[]?
+  | select(.command // "" | contains($h))
+  | $event' "$settings" 2>/dev/null | sort -u)
+check "every event the hook handles is registered in settings.json" \
+  "$(comm -23 <(printf '%s\n' "$handled") <(printf '%s\n' "$registered") | tr '\n' ' ' | sed 's/ *$//')" ""
+check "every event registered in settings.json is handled by the hook" \
+  "$(comm -13 <(printf '%s\n' "$handled") <(printf '%s\n' "$registered") | tr '\n' ' ' | sed 's/ *$//')" ""
 
 # 13. The live round-trip against the real notifier bundle. Withdrawing a delivered notification
 #     is the one behaviour that justifies shipping our own notifier at all, and no stub can show

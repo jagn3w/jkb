@@ -53,6 +53,23 @@ NOTIFIER_PATHS=(
   "/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
 )
 
+# The events this hook acts on, and the ONLY place they are enumerated. They also have to be
+# registered in `.claude/settings.json`, and that is a second file this one cannot see — so
+# `--events` exists for `scripts/test-hooks.sh` to diff the two. Losing a registration is silent
+# in the worst way: drop `Stop` and a *denied* permission, which produces no `PostToolUse`, leaves
+# its notification on screen until the session ends — which is the case `Stop` is here for.
+SHOW_EVENTS=(Notification)
+DISMISS_EVENTS=(PostToolUse UserPromptSubmit Stop SessionEnd)
+
+in_list() {
+  local needle=$1 x
+  shift
+  for x in "$@"; do
+    [ "$x" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 notifier=""
 find_notifier() {
   if [ -n "${JKB_NOTIFIER:-}" ]; then
@@ -99,6 +116,12 @@ fi
 # needs to install one. `scripts/build-notifier.sh` builds to exactly this.
 if [ "${1:-}" = "--notifier-path" ]; then
   printf '%s\n' "${NOTIFIER_PATHS[0]}"
+  exit 0
+fi
+
+# Every event this hook acts on, for the settings.json cross-check in scripts/test-hooks.sh.
+if [ "${1:-}" = "--events" ]; then
+  printf '%s\n' "${SHOW_EVENTS[@]}" "${DISMISS_EVENTS[@]}"
   exit 0
 fi
 
@@ -161,9 +184,11 @@ notif_id="jkb-claude-$session"
 state_dir="${JKB_NOTIFY_STATE:-${TMPDIR:-/tmp}/jkb-claude-notify}"
 marker="$state_dir/$session"
 
-case "$event" in
-  Notification) show ;;
-  PostToolUse | UserPromptSubmit | Stop | SessionEnd) dismiss ;;
-esac
+# Dispatched off the arrays above rather than a `case` arm spelling the events a second time.
+if in_list "$event" "${SHOW_EVENTS[@]}"; then
+  show
+elif in_list "$event" "${DISMISS_EVENTS[@]}"; then
+  dismiss
+fi
 
 exit 0

@@ -93,9 +93,27 @@ func withSettings(_ body: @escaping (UNNotificationSettings) -> Void) {
     center.getNotificationSettings { body($0) }
 }
 
+/// Whether the system will actually honour `.timeSensitive` for this bundle. Reported because it
+/// cannot be assumed: the capability is normally granted by an entitlement, and this bundle is
+/// ad-hoc signed with none, so the honest thing is to read back what the system decided rather
+/// than to claim Focus is covered.
+func timeSensitive(_ s: UNNotificationSettings) -> String {
+    if #available(macOS 12.0, *) {
+        switch s.timeSensitiveSetting {
+        case .enabled: return "enabled"
+        case .disabled: return "disabled"
+        case .notSupported: return "not-supported"
+        @unknown default: return "unknown"
+        }
+    }
+    return "unavailable"
+}
+
 func doStatus() {
     withSettings { s in
-        print("authorization=\(name(s.authorizationStatus)) alert-style=\(name(s.alertStyle))")
+        print(
+            "authorization=\(name(s.authorizationStatus)) alert-style=\(name(s.alertStyle)) "
+                + "time-sensitive=\(timeSensitive(s))")
         exit(EXIT_OK)
     }
 }
@@ -141,8 +159,19 @@ func doPost() {
         content.title = title
         if let sub = flags["subtitle"], !sub.isEmpty { content.subtitle = sub }
         if let body = flags["body"], !body.isEmpty { content.body = body }
-        // Time-sensitive breaks through Focus and is retained longer by the system. It needs no
-        // entitlement, unlike `.critical`, which Apple grants only on request.
+        // Requested, but DO NOT read this as "Focus is handled" — on an ad-hoc signed bundle it is
+        // not. `status` reports `time-sensitive=not-supported` here, because the capability comes
+        // from `com.apple.developer.usernotifications.time-sensitive` and this bundle carries no
+        // entitlements. The system does not error; it silently delivers at the ordinary level, so
+        // a Focus mode WILL suppress the very prompts this exists to surface.
+        //
+        // Embedding the entitlement anyway was measured and is worse: an ad-hoc signature carrying
+        // a restricted entitlement is rejected outright and the binary is SIGKILLed on launch, so
+        // the notifier stops working entirely. Honouring it needs a real signing identity.
+        //
+        // Kept set regardless: it costs nothing, it is the correct request, and it starts working
+        // the day this is signed properly. The claim lives in `status` where it can be read back,
+        // not in a comment asserting a capability we do not have.
         content.interruptionLevel = .timeSensitive
 
         // Reusing the identifier REPLACES the delivered notification rather than stacking a

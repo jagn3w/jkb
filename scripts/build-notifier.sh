@@ -20,15 +20,17 @@
 # banners and the feature silently is not there. There is deliberately no --prefix — a flag that
 # installs somewhere the hook does not look is a way to produce exactly that state.
 #
-# Flags: --quiet, -h/--help.
+# Flags: --check (verify the plist/path agreement and stop; runs on any OS), --quiet, -h/--help.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 quiet=0
+check_only=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --quiet) quiet=1 ;;
+    --check) check_only=1 ;;
     -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -37,15 +39,24 @@ done
 
 note() { [ "$quiet" -eq 1 ] || echo "$@"; }
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  echo "jkb-notifier is macOS-only; nothing to build on $(uname -s)" >&2
-  exit 0
-fi
-
-if ! command -v swiftc >/dev/null 2>&1; then
-  echo "swiftc not found — install the Xcode Command Line Tools: xcode-select --install" >&2
-  exit 1
-fi
+# Read a <string> value out of the Info.plist. Deliberately NOT PlistBuddy or plutil: the
+# consistency check below is worth running on every machine, and a check that only exists on macOS
+# is absent from CI, which is where it would actually catch someone. Handles the key and value on
+# one line or on two, which are the two layouts a hand-edit and `plutil -convert xml1` produce.
+plist_string() { # plist_string <file> <key>
+  awk -v key="$2" '
+    index($0, "<key>" key "</key>") {
+      rest = substr($0, index($0, "<key>" key "</key>"))
+      if (match(rest, /<string>[^<]*<\/string>/)) {
+        print substr(rest, RSTART + 8, RLENGTH - 17); exit
+      }
+      seen = 1; next
+    }
+    seen && match($0, /<string>[^<]*<\/string>/) {
+      print substr($0, RSTART + 8, RLENGTH - 17); exit
+    }
+  ' "$1"
+}
 
 src="$repo_root/macos/notifier"
 
@@ -60,13 +71,36 @@ app="${target%/Contents/MacOS/*}"
 exe="${target##*/}"
 
 # CFBundleExecutable must name the file we are about to write, or the bundle will not launch and
-# every later symptom (no notifications, no error) points somewhere else entirely. Checked here
-# because this is the only place that knows both halves.
-declared="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$src/Info.plist" 2>/dev/null || true)"
-if [ "$declared" != "$exe" ]; then
-  echo "Info.plist CFBundleExecutable is '$declared' but the install path names '$exe'" >&2
+# every later symptom (no notifications, no error) points somewhere else entirely.
+check_plist() {
+  local declared
+  declared="$(plist_string "$src/Info.plist" CFBundleExecutable)"
+  if [ "$declared" != "$exe" ]; then
+    echo "Info.plist CFBundleExecutable is '$declared' but the install path names '$exe'" >&2
+    return 1
+  fi
+}
+
+# The consistency check on its own, buildable-or-not and macOS-or-not, so `scripts/test-hooks.sh`
+# can assert the real rule rather than re-implementing it in a second place. Answered before the
+# Darwin gate below, which is the whole point — this is the arm CI reaches.
+if [ "${check_only:-0}" -eq 1 ]; then
+  check_plist || exit 1
+  note "  • plist:      CFBundleExecutable matches '$exe'"
+  exit 0
+fi
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "jkb-notifier is macOS-only; nothing to build on $(uname -s)" >&2
+  exit 0
+fi
+
+if ! command -v swiftc >/dev/null 2>&1; then
+  echo "swiftc not found — install the Xcode Command Line Tools: xcode-select --install" >&2
   exit 1
 fi
+
+check_plist || exit 1
 
 # Built into a staging directory and moved into place only once every step has succeeded, so a
 # failed build cannot leave a half-made bundle that Launch Services has already registered.
