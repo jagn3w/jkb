@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **548 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **562 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -748,6 +748,33 @@ the code had no way to have. Design: `openspec/changes/jkb-state-machine/`.
   closes every task on that branch. `jkb task review record` credits a task whose work jkb
   *grafted* onto the reviewed branch — a recorded event, where it used to be a containment probe
   that could not tell an empty session from a landed one.
+
+### The second machine: the sync journal, and what it moved
+
+`jkb-sync/src/lifecycle.rs` declares the per-file journal on the same library — a **reconciler**,
+not a lifecycle: nothing finishes, every event is `Reconciled`, and the question is never *what
+may I do next* but *which condition applies to what I just saw*. It moved the library three
+times, which is the evidence that "it generalizes" is a claim worth making:
+
+- **`is_terminal` → `is_settled`.** A synced file is never finished; it settles and is edited
+  again. Under the old name the machine either had no terminal state — making `Wedged` vacuous —
+  or had to lie about one. What the checks want is *rest*: the object owes the system nothing.
+- **`State::awaits_input`** (default `false`). A conflicted file is waiting on a person, so no
+  observation moves it; without this, `DeadEnd` fired on every such observation. A lifecycle
+  keeps the default because an operator escape (`cancel`) is always available.
+- **The initial state may be at rest.** A file an export-only mount holds no items for is nobody's
+  business.
+- What did **not** move is what carries the value — and `reconcile` refusing ambiguity turns out
+  to be the *central* property here rather than a corner case, because evaluating every
+  candidate's guard against one observation is exactly D45.5's *"a route is not a cause; the
+  condition must dominate every arm"*.
+- **The modelling found that `needs_attention` is two states** — a quarantine wants the file
+  fixed, a blocked write wants the store fixed — which `Outcome::Refused`'s own doc already
+  warned about in prose. And that a flag whose cause has gone is not always cleared (an
+  import-only mount with a store-side-only change writes no row): modelled faithfully, filed, not
+  fixed.
+- `sync_state.status` now has **one writer** (`lifecycle::status_for`), replacing four
+  hand-written spellings.
 
 ### Claim keying: an owner id is a type, and `Unknown` is not `dead`
 
