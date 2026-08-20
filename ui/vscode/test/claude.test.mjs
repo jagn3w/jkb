@@ -39,7 +39,7 @@ await esbuild.build({
   ],
 });
 
-const { launchClaude, deliverQueuedPrompt, sessionTerminal, sessionTerminalName } =
+const { launchClaude, deliverQueuedPrompt, sessionTerminal, sessionTerminalName, startSessionTerminal } =
   await import(bundle);
 const { state, reset } = await import(stub);
 
@@ -325,4 +325,79 @@ test("the name is what createTerminal is given, so the two cannot drift apart", 
   // The finder matches on the name the starter sets; a literal in either place would rot.
   assert.equal(sessionTerminalName("task-a-1730"), "claude: task-a-1730");
   assert.equal(sessionTerminalName("x".repeat(40)), `claude: ${"x".repeat(24)}`);
+});
+
+// ---------------------------------------------------------------------------
+// The find-or-create decision itself — the guard, not just the matcher.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `vscode.window` stand-in that records what was created, shown and sent, into one log the
+ * caller owns — so an existing terminal's `show` and a created one's land in the same order.
+ */
+function host(log, existing = []) {
+  return {
+    terminals: existing,
+    createTerminal(options) {
+      log.push(["created", options.name, options.cwd]);
+      return {
+        show: () => log.push(["shown", options.name]),
+        sendText: (text) => log.push(["sent", text]),
+      };
+    },
+  };
+}
+const liveTerm = (name, cwd, log) => ({
+  name,
+  creationOptions: { cwd },
+  show: () => log.push(["shown", name]),
+});
+
+test("a first click creates the session's terminal and sends the command", () => {
+  const log = [];
+  const h = host(log);
+  assert.equal(startSessionTerminal(h, "task-a-1730", "/w/task-a", "claude 'GO'"), "started");
+  assert.deepEqual(log, [
+    ["created", "claude: task-a-1730", "/w/task-a"],
+    ["shown", "claude: task-a-1730"],
+    ["sent", "claude 'GO'"],
+  ]);
+});
+
+test("a second click shows the existing terminal and sends NOTHING", () => {
+  const log = [];
+  const h = host(log, [liveTerm("claude: task-a-1730", "/w/task-a", log)]);
+  // "shown" is the caller's cue to stop reporting a launch: no agent was started, and the
+  // prompt this click built — carrying its own branch and land target — was not delivered.
+  assert.equal(startSessionTerminal(h, "task-a-1730", "/w/task-a", "claude 'GO'"), "shown");
+  assert.deepEqual(log, [["shown", "claude: task-a-1730"]]);
+});
+
+test("a terminal whose shell has exited is not reused — showing it would start nothing", () => {
+  const log = [];
+  const dead = { ...liveTerm("claude: task-a-1730", "/w/task-a", log), exitStatus: { code: 0 } };
+  const h = host(log, [dead]);
+  assert.equal(startSessionTerminal(h, "task-a-1730", "/w/task-a", "claude 'GO'"), "started");
+  assert.deepEqual(log[0], ["created", "claude: task-a-1730", "/w/task-a"]);
+});
+
+test("another task's terminal is never reused, so each session gets its own", () => {
+  const log = [];
+  const h = host(log, [liveTerm("claude: task-b-9910", "/w/task-b", log)]);
+  assert.equal(startSessionTerminal(h, "task-a-1730", "/w/task-a", "claude 'GO'"), "started");
+});
+
+test("the session's own window opens a NEW chat each click — pinned, not endorsed", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  reset(work);
+
+  // Claude Code exposes no way to find an existing panel, and `primaryEditor.open(undefined,…)`
+  // means a fresh conversation by design — so this surface is the one place a second click is
+  // not idempotent. Pinned so the docs and the code cannot drift apart again: if this ever
+  // starts reusing a panel, the claim in CLAUDE.md and ui/README.md has to change with it.
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+  assert.deepEqual(state.calls, [...opened("PROMPT"), ...opened("PROMPT")]);
+  assert.deepEqual(t.queue(), {});
 });

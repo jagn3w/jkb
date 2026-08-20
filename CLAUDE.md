@@ -1353,11 +1353,17 @@ reflex click (the D38 lesson about `--no-review`). A first attempt did exactly t
 the question on the *extension* path — where VS Code opens one window per folder and the
 handed-over prompt lands **unsent**, so a duplicate is merely possible — while leaving the
 *terminal* path, where `sendText` makes a second agent certain, to fork silently. So the
-question is gone and idempotence replaces it, extending the property `jkb task work` already
-has one level up: `sessionTerminal` finds the session's own `claude: <session>` terminal —
-matched on name **and** cwd, since In Flight's plain shell shares the cwd — and shows it
-instead of starting a second. Residual, stated not closed: a `claude` running in *another*
-window is invisible, because `vscode.window.terminals` is per-window. **`takePrompt` returns without writing when it took nothing**: every window
+question is gone and idempotence replaces it — **on the terminal surface**, where
+`startSessionTerminal` finds the session's own `claude: <session>` terminal (matched on name,
+cwd and `exitStatus`, since In Flight's plain shell shares the cwd and a dead tab looks
+identical to a live one) and shows it without sending, the caller saying so rather than
+reporting a launch that did not happen. **Do not write that the other two surfaces converge**
+— three passes running, a version of this paragraph has claimed more than the code delivers.
+`window` passes `forceNewWindow: true`, whose documented meaning is the opposite of reuse, and
+which arm VS Code actually takes is *unobserved*; `here` opens a fresh conversation by design,
+because Claude Code exposes no way to find an existing panel. What holds on every surface is
+that a handed-over prompt lands **unsent**. Residual: a `claude` in *another* window is
+invisible, `vscode.window.terminals` being per-window. **`takePrompt` returns without writing when it took nothing**: every window
 now activates at startup and calls it, so writing back would put every VS Code window on the
 machine into the read-modify-write race for one shared file, whose lost update is an
 already-delivered prompt resurrected.
