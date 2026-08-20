@@ -614,3 +614,34 @@ mod tests {
         assert!(!TaskStatus::InProgress.unblocks_dependents());
     }
 }
+
+/// A task starts [`TaskStatus::Open`] — the machine's initial state, and the value
+/// `task::create` writes.
+impl Default for TaskStatus {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+/// [`TaskStatus`] **is** the task lifecycle's state set (design S2.1).
+///
+/// Implemented here rather than in `jkb-core` because the orphan rule requires it beside the
+/// enum — and that is the right home anyway: a parallel `TaskState` enum in the machine's crate
+/// would be a fourth hand-written list over the same five strings, beside the enum, `as_str`,
+/// and `staging::State`.
+///
+/// The richer state set that folds the claim in (`unstarted` / `claimed` / `implementing`) is
+/// deliberately **not** what this is. D27.1 separated *"is anyone holding this?"* from *"how far
+/// along is the work?"* precisely because they are different questions; re-fusing them in the
+/// state enum would put that back. A claim is context, and a claim change is an effect.
+impl jkb_fsm::State for TaskStatus {
+    const ALL: &'static [Self] = Self::ALL;
+
+    fn name(self) -> &'static str {
+        self.as_str()
+    }
+
+    fn is_terminal(self) -> bool {
+        Self::is_terminal(self)
+    }
+}

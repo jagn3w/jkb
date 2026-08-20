@@ -89,7 +89,7 @@ mod tests {
         // V013 branch_records (a branch is a record, not a tag value),
         // V014 the undo watermark (undo history begins after the entries written under the
         // audit-only contract).
-        assert_eq!(user_version, 14);
+        assert_eq!(user_version, 15);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -161,7 +161,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 14);
+        assert_eq!(user_version, 15);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

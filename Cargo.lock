@@ -1912,6 +1912,7 @@ name = "jkb-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "jkb-fsm",
  "jkb-types",
  "proptest",
  "refinery",
@@ -1932,6 +1933,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "jkb-fsm"
+version = "0.1.0"
 
 [[package]]
 name = "jkb-index"
@@ -2014,6 +2019,7 @@ dependencies = [
 name = "jkb-types"
 version = "0.1.0"
 dependencies = [
+ "jkb-fsm",
  "proptest",
  "serde",
  "serde_json",

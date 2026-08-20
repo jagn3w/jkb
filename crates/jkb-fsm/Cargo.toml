@@ -1,0 +1,15 @@
+[package]
+name = "jkb-fsm"
+description = "A declarative, checkable state machine: states, guarded transitions, three-valued facts, and effects planned as data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately dependency-free. The whole point of this crate is that a lifecycle can be
+# declared and checked without dragging in a database, a process spawner or a serializer;
+# a dependency here would be inherited by every machine that wants only the checks.
+[dependencies]

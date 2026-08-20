@@ -1827,7 +1827,8 @@ fn apply_doc(
             continue;
         }
         if item_kind(conn, id)?.as_deref() == Some("task") {
-            task::set_status(conn, meta, id, TaskStatus::Cancelled)?;
+            // Attributed to the file, because the file is what said so: the line is gone.
+            task::set_status_from_file(conn, meta, id, TaskStatus::Cancelled)?;
         }
         binding::set(conn, meta, id, "managed:", None, None)?;
     }
@@ -1975,11 +1976,10 @@ fn create_item(
     // the UNIQUE constraint and the whole sync fails. Re-attaching instead is both the fix
     // and the better semantics: deleting a line and putting it back restores the same item,
     // with its edges, tags and history intact, rather than a stranger wearing its name.
-    let id = if let Some(existing) = item::id_for_uid(conn, uri)? {
-        update_item(conn, meta, existing, it, home)?;
-        existing
-    } else {
-        let id = item::upsert(
+    let existing = item::id_for_uid(conn, uri)?;
+    let id = match existing {
+        Some(id) => id,
+        None => item::upsert(
             conn,
             meta,
             &NewItem {
@@ -1989,11 +1989,13 @@ fn create_item(
                 content_hash: None,
                 mime: None,
             },
-        )?;
-        set_task_columns(conn, meta, id, it)?;
-        placement::place(conn, meta, id, home, PlacementRole::Primary, it.position)?;
-        id
+        )?,
     };
+    // The binding is written **before** the columns, because it is what makes this item
+    // file-backed and the status write below is attributed to the file
+    // (`task::set_status_from_file`), which declines to act for a task the file does not back.
+    // Written afterwards, a brand-new task's very first status came from an authority the store
+    // could not yet see.
     binding::set(
         conn,
         meta,
@@ -2002,6 +2004,12 @@ fn create_item(
         Some(sync_mode_of(&ctx.sync_mode)),
         None,
     )?;
+    if existing.is_some() {
+        update_item(conn, meta, id, it, home)?;
+    } else {
+        set_task_columns(conn, meta, id, it)?;
+        placement::place(conn, meta, id, home, PlacementRole::Primary, it.position)?;
+    }
     // The same call the update path makes, so a file's tags reach the store by exactly one
     // route whether the line is new or re-attached. It was two — a bare `apply` loop here and a
     // reconcile there — and a rule that has to hold at both is a rule one of them will
@@ -2038,7 +2046,10 @@ fn set_task_columns(conn: &Connection, meta: &WriteMeta, id: ItemId, it: &SyncIt
         .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     if it.status != status {
         if let Some(s) = &it.status {
-            task::set_status_str(conn, meta, id, s)?;
+            // The file is the authority here, not an operator — so this is a reconciliation
+            // with a guard on it (the file may only speak for a task it backs), and
+            // `jkb task why` records it as the file's doing.
+            task::set_status_str_from_file(conn, meta, id, s)?;
         }
     }
     if it.priority != priority {
