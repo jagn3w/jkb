@@ -6,14 +6,14 @@
 # your permission": the one notification you have to act on is the one most likely to be missed,
 # and a session then sits blocked until you happen to look. Two halves, one script:
 #
-#   Notification                                       -> post, grouped by session
-#   PostToolUse | UserPromptSubmit | Stop | SessionEnd  -> remove that session's group
+#   Notification                                       -> post under this session's id
+#   PostToolUse | UserPromptSubmit | Stop | SessionEnd  -> withdraw that id
 #
-# **The group key is derived from `session_id`, so dismissing owns nothing.** "Remove whatever
-# this session posted" is a single call with no pid to track, no window handle and no cleanup
-# pass — which is what a persistent alert window, the other way to get stickiness, would have
-# needed. Parallel sessions (the D36 worktrees) each hold their own group and so cannot clear one
-# another's notification, as a single global group or a shared pid file would. The one file this
+# **The notification id is derived from `session_id`, so dismissing owns nothing.** "Withdraw
+# whatever this session posted" is a single call with no pid to track, no window handle and no
+# cleanup pass — which is what a persistent alert window, the other way to get stickiness, would
+# have needed. Parallel sessions (the D36 worktrees) each hold their own id and so cannot clear
+# one another's notification, as a single global id or a shared pid file would. The one file this
 # does keep is a marker, and it is an optimisation only: see `dismiss` for why a stale one costs
 # nothing.
 #
@@ -23,16 +23,24 @@
 # notification when the command finishes, not when you granted it. `UserPromptSubmit` covers the
 # idle-waiting notification and `Stop` sweeps a denial, which produces no `PostToolUse` at all.
 #
-# **Stickiness is a macOS setting, not something a notifier can force.** It needs
-# terminal-notifier, whose alert style is set to "Alerts" once in System Settings; only then does
-# a banner wait instead of hiding. Without it this hook still posts the ordinary auto-hiding
-# banner through osascript, so the behaviour is never *worse* than before it existed — and
-# `scripts/setup.sh` reports the missing piece rather than leaving a silently non-sticky hook.
+# **The notifier is ours** — `macos/notifier/`, built by `scripts/build-notifier.sh` into
+# `jkb Notifier.app`. Withdrawing a delivered notification is the entire feature and only Apple's
+# current `UserNotifications` framework offers it: `osascript` cannot take back what it posted,
+# and terminal-notifier can but was last released in 2017 on an API deprecated since macOS 11.
+#
+# **Stickiness itself is a per-app macOS setting no API can set.** `alert` waits for the user,
+# `banner` hides itself; the user chooses in System Settings. What our notifier adds is that it
+# can *read* that back (`jkb-notifier status`), so `scripts/setup.sh` reports a hook that is
+# posting self-hiding banners instead of leaving it to look like a broken hook.
+#
+# Until the bundle is installed and authorized, `post` REFUSES and the hook falls back to the
+# plain osascript banner — never worse than before this existed, and never a silent success for a
+# notification the user cannot see.
 #
 # Fails OPEN and silent. Any failure here must not disturb the session, so it always exits 0 and
 # writes nothing to stdout (a hook's stdout lands in the transcript).
 #
-# Env seams: `JKB_NOTIFIER` overrides the terminal-notifier path, `JKB_NOTIFY_STATE` the marker
+# Env seams: `JKB_NOTIFIER` overrides the notifier binary, `JKB_NOTIFY_STATE` the marker
 # directory. `scripts/test-hooks.sh` drives both, which is what lets this be tested off macOS.
 
 notifier=""
@@ -41,16 +49,14 @@ find_notifier() {
     [ -x "$JKB_NOTIFIER" ] && notifier="$JKB_NOTIFIER"
     return
   fi
+  # Our own bundle, at the one path `scripts/build-notifier.sh` installs it to. The binary is
+  # invoked DIRECTLY rather than through `open`: `open` is asynchronous, so a hook could not read
+  # its exit status to decide whether to fall back, and it is far too slow for a per-tool-call
+  # dismiss. Launch Services registration is what makes the direct path work.
   local c
-  c=$(command -v terminal-notifier 2>/dev/null || true)
-  # PATH first, then the places terminal-notifier actually installs itself. A hook inherits the
-  # session's PATH, which for a GUI-launched terminal often omits /opt/homebrew/bin.
-  for c in "$c" \
-    /opt/homebrew/bin/terminal-notifier \
-    /usr/local/bin/terminal-notifier \
-    "$HOME/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier" \
-    /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier; do
-    if [ -n "$c" ] && [ -x "$c" ]; then
+  for c in "$HOME/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier" \
+    "/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"; do
+    if [ -x "$c" ]; then
       notifier="$c"
       return
     fi
@@ -69,10 +75,10 @@ as_applescript() {
   printf '"%s"' "$s"
 }
 
-# `scripts/setup.sh` asks THIS file where terminal-notifier is instead of keeping a second copy
-# of the search list above: a copy that gained a location here and not there would report the
-# notifier missing while the hook was happily using it. Answered before stdin is read, because a
-# probe has none to give — `input=$(cat)` below would block on the terminal.
+# `scripts/setup.sh` asks THIS file where the notifier is instead of keeping a second copy of the
+# search list above: a copy that gained a location here and not there would report the notifier
+# missing while the hook was happily using it. Answered before stdin is read, because a probe has
+# none to give — `input=$(cat)` below would block on the terminal.
 if [ "${1:-}" = "--find-notifier" ]; then
   find_notifier
   [ -n "$notifier" ] || exit 1
@@ -92,13 +98,14 @@ show() {
   # Written before posting, so the dismiss side never misses a notification that did go out.
   mkdir -p "$state_dir" 2>/dev/null && : > "$marker" 2>/dev/null
 
+  # Same id as any earlier notification from this session, so a second one replaces the first
+  # rather than stacking. A non-zero exit means the bundle is not installed or not yet authorized
+  # — it refuses instead of posting something invisible, precisely so this can fall through to a
+  # banner the user will actually see.
   find_notifier
   if [ -n "$notifier" ]; then
-    # Same group as any earlier notification from this session, so a second one replaces the
-    # first rather than stacking.
-    "$notifier" -group "$group" -title "Claude Code" -subtitle "$subtitle" -message "$message" \
-      >/dev/null 2>&1
-    return
+    "$notifier" post --id "$notif_id" --title "Claude Code" --subtitle "$subtitle" \
+      --body "$message" >/dev/null 2>&1 && return
   fi
 
   command -v osascript >/dev/null 2>&1 || return
@@ -109,13 +116,13 @@ show() {
 dismiss() {
   # `PostToolUse` runs after EVERY tool call, so the common case — nothing pending — must not
   # spawn a process. The marker is what makes that check a stat instead of an exec. A marker left
-  # behind by a crashed session costs exactly one wasted `-remove` of a group that no longer
-  # exists, so it needs no expiry.
+  # behind by a crashed session costs exactly one wasted `remove` of an id that is no longer on
+  # screen, so it needs no expiry.
   [ -f "$marker" ] || return
   rm -f "$marker" 2>/dev/null
   find_notifier
   [ -n "$notifier" ] || return
-  "$notifier" -remove "$group" >/dev/null 2>&1
+  "$notifier" remove --id "$notif_id" >/dev/null 2>&1
 }
 
 input=$(cat)
@@ -128,13 +135,13 @@ IFS=$'\t' read -r event session <<<"$(
   printf '%s' "$input" | jq -r '[.hook_event_name // "", .session_id // ""] | @tsv' 2>/dev/null
 )"
 
-# The session id becomes both a notification group and a filename, so reduce it to characters
+# The session id becomes both a notification id and a filename, so reduce it to characters
 # that are inert in each — an id carrying `/` or `..` must not be able to name a path. An id we
 # cannot use is not a reason to disturb the session, so it is a silent exit.
 session=${session//[!A-Za-z0-9_-]/_}
 [ -n "$session" ] || exit 0
 
-group="jkb-claude-$session"
+notif_id="jkb-claude-$session"
 state_dir="${JKB_NOTIFY_STATE:-${TMPDIR:-/tmp}/jkb-claude-notify}"
 marker="$state_dir/$session"
 

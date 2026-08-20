@@ -13,14 +13,16 @@ hook="$(cd "$(dirname "$0")/.." && pwd)/.claude/hooks/notify-sticky.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# A stand-in for terminal-notifier that records the argv of each call, one argument per line with
-# a blank line between calls. Asserting on argv is the point: what this hook does is choose a
-# command line.
+# A stand-in for jkb-notifier that records the argv of each call, one argument per line with a
+# blank line between calls. Asserting on argv is the point: what this hook does is choose a
+# command line. `NOTIFIER_FAILS` makes it refuse, which is how the real one reports "not installed
+# or not yet authorized" — the state the osascript fallback exists for.
 rec="$tmp/calls"
 cat > "$tmp/notifier" <<'STUB'
 #!/usr/bin/env bash
 for a in "$@"; do printf '%s\n' "$a" >> "$REC"; done
 printf '\n' >> "$REC"
+exit "${NOTIFIER_FAILS:-0}"
 STUB
 chmod +x "$tmp/notifier"
 
@@ -42,19 +44,20 @@ payload() { printf '{"hook_event_name":"%s","session_id":"%s","message":"%s","cw
 
 echo "==> notify-sticky.sh"
 
-# 1. A Notification posts, grouped by session, carrying the message and the worktree name.
+# 1. A Notification posts under an id derived from the session, carrying the message and the
+#    worktree name.
 run "$(payload Notification s1 'Claude needs your permission to use Bash')"
-check "Notification posts grouped by session" \
+check "Notification posts under the session's id" \
   "$(calls)" \
-  "-group jkb-claude-s1 -title Claude Code -subtitle wt -message Claude needs your permission to use Bash"
+  "post --id jkb-claude-s1 --title Claude Code --subtitle wt --body Claude needs your permission to use Bash"
 
-# 2. The dismissing events each remove that same group. All four are asserted: they fire on
+# 2. The dismissing events each withdraw that same id. All four are asserted: they fire on
 #    different paths through a turn (grant, type, deny, quit) and any one of them silently
 #    dropping out of the case arm leaves a notification stuck on screen.
 for ev in PostToolUse UserPromptSubmit Stop SessionEnd; do
   run "$(payload Notification s1 'needs permission')" >/dev/null
   run "$(payload "$ev" s1 '')"
-  check "$ev removes the group" "$(calls)" "-remove jkb-claude-s1"
+  check "$ev withdraws the notification" "$(calls)" "remove --id jkb-claude-s1"
 done
 
 # 3. With nothing posted, a dismiss must not spawn the notifier — PostToolUse runs after every
@@ -68,19 +71,19 @@ run "$(payload PostToolUse s1 '')" >/dev/null
 run "$(payload PostToolUse s1 '')"
 check "a second dismiss is free" "$(calls)" ""
 
-# 5. Parallel sessions (D36 worktrees) hold separate groups, so one session answering a prompt
+# 5. Parallel sessions (D36 worktrees) hold separate ids, so one session answering a prompt
 #    must not clear another session's notification.
 run "$(payload Notification s1 'a')" >/dev/null
 run "$(payload Notification s2 'b')" >/dev/null
 run "$(payload PostToolUse s1 '')"
-check "one session's dismiss targets only its own group" "$(calls)" "-remove jkb-claude-s1"
+check "one session's dismiss targets only its own id" "$(calls)" "remove --id jkb-claude-s1"
 run "$(payload PostToolUse s2 '')"
-check "the other session is still pending" "$(calls)" "-remove jkb-claude-s2"
+check "the other session is still pending" "$(calls)" "remove --id jkb-claude-s2"
 
 # 6. An id is a group name and a filename, so it must not be able to name a path.
 run '{"hook_event_name":"Notification","session_id":"../../etc/passwd","message":"m","cwd":"/x"}'
 check "a path-like session id is sanitised" "$(calls)" \
-  "-group jkb-claude-______etc_passwd -title Claude Code -subtitle x -message m"
+  "post --id jkb-claude-______etc_passwd --title Claude Code --subtitle x --body m"
 # The marker it wrote is a direct child of the state directory under the sanitised name, so the
 # separators were neutralised rather than merely renamed somewhere deeper.
 check "the marker stays a direct child of the state directory" \
@@ -106,26 +109,37 @@ check "the hook is silent on stdout" "$out" ""
 # 10. The fallback path. With no terminal-notifier installed this is what actually runs, so it is
 #     not a degraded corner — on a stock macOS it is the only path there is. `JKB_NOTIFIER` naming
 #     a file that does not exist forces it deterministically.
+osa="$tmp/osacalls"
 cat > "$tmp/osascript" <<'STUB'
 #!/usr/bin/env bash
-for a in "$@"; do printf '%s\n' "$a" >> "$REC"; done
+for a in "$@"; do printf '%s\n' "$a" >> "$OSA_REC"; done
 STUB
 chmod +x "$tmp/osascript"
+osa_calls() { tr '\n' ' ' < "$osa" | sed 's/  */ /g; s/^ //; s/ $//'; }
+
+# No notifier bundle at all.
 fallback() {
-  : > "$rec"
-  PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/does-not-exist" JKB_NOTIFY_STATE="$tmp/state" REC="$rec" \
-    bash "$hook" <<<"$1"
+  : > "$rec"; : > "$osa"
+  PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/does-not-exist" JKB_NOTIFY_STATE="$tmp/state" \
+    REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$1"
+}
+
+# Bundle present but REFUSING, which is what the real notifier does when it is not yet authorized.
+refusing() {
+  : > "$rec"; : > "$osa"
+  PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" NOTIFIER_FAILS=2 JKB_NOTIFY_STATE="$tmp/state" \
+    REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$1"
 }
 
 fallback '{"hook_event_name":"Notification","session_id":"s10","message":"needs permission","cwd":"/repos/wt"}'
-check "without terminal-notifier it still posts a banner" \
-  "$(calls)" \
+check "without the notifier bundle it still posts a banner" \
+  "$(osa_calls)" \
   '-e display notification "needs permission" with title "Claude Code" subtitle "wt"'
 
 # A notification message is Claude's text, so it can carry the three characters that end an
 # AppleScript string early. Getting this wrong means no notification at all, silently.
 fallback '{"hook_event_name":"Notification","session_id":"s11","message":"say \"hi\" \\ now\nplease","cwd":"/repos/wt"}'
-script=$(sed -n '2p' "$rec")
+script=$(sed -n '2p' "$osa")
 check "quotes, backslashes and newlines are escaped" \
   "$script" \
   'display notification "say \"hi\" \\ now please" with title "Claude Code" subtitle "wt"'
@@ -155,6 +169,59 @@ found=$(JKB_NOTIFIER="$tmp/does-not-exist" bash "$hook" --find-notifier </dev/nu
 status=$?
 check "--find-notifier says nothing when there is none" "$found" ""
 check "--find-notifier exits non-zero when there is none" "$([ "$status" -ne 0 ] && echo yes || echo no)" "yes"
+
+# 12. The refusal path, which is the whole reason `post` reports failure instead of quietly
+#     succeeding: an unauthorized notification is accepted by macOS, displays nothing, and returns
+#     no error, so a notifier that did not refuse would be indistinguishable from a working one.
+refusing '{"hook_event_name":"Notification","session_id":"s12","message":"needs permission","cwd":"/repos/wt"}'
+check "a refusing notifier is still tried first" \
+  "$(calls)" \
+  "post --id jkb-claude-s12 --title Claude Code --subtitle wt --body needs permission"
+check "a refusing notifier falls back to a banner" \
+  "$(osa_calls)" \
+  '-e display notification "needs permission" with title "Claude Code" subtitle "wt"'
+
+# ...and the dismiss side still runs, so the notification is withdrawn if it did reach the screen
+# by some other route. Refusing to post must not also disable clearing.
+: > "$rec"; : > "$osa"
+PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" JKB_NOTIFY_STATE="$tmp/state" \
+  REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12 '')"
+check "a refused post still leaves the session dismissable" "$(calls)" "remove --id jkb-claude-s12"
+
+# 12b. The bundle search itself. Every test above injects `JKB_NOTIFIER`, so without this the
+#      hard-coded install path is covered only by the opt-in live test — and a typo there would
+#      leave the hook silently falling back to plain banners on every machine while the suite
+#      stayed green. A fake HOME is enough: what is under test is the path, not the binary.
+fake_home="$tmp/fakehome"
+mkdir -p "$fake_home/Applications/jkb Notifier.app/Contents/MacOS"
+cp "$tmp/notifier" "$fake_home/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
+found=$(env -u JKB_NOTIFIER HOME="$fake_home" bash "$hook" --find-notifier </dev/null 2>/dev/null)
+check "the notifier is found at its install path" \
+  "$found" "$fake_home/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
+
+# 13. The live round-trip against the real notifier bundle. Withdrawing a delivered notification
+#     is the one behaviour that justifies shipping our own notifier at all, and no stub can show
+#     it works — only the notification centre can. Opt-in, mirroring how this repo treats its
+#     other live smokes (the ollama and Chrome tests are #[ignore]d for the same reason): it puts
+#     a real notification on screen, and a gate run before every commit must not flash one.
+echo "==> live notifier round-trip"
+live_bin=$(bash "$hook" --find-notifier </dev/null 2>/dev/null || true)
+if [ "${JKB_HOOK_LIVE_TEST:-0}" != "1" ]; then
+  printf '  --  %s\n' "skipped (set JKB_HOOK_LIVE_TEST=1 to run; posts a real notification)"
+elif [ -z "$live_bin" ]; then
+  fail "live round-trip: no notifier installed — run scripts/build-notifier.sh"
+elif ! "$live_bin" status 2>/dev/null | grep -q "authorization=authorized"; then
+  fail "live round-trip: notifier is not authorized — run: '$live_bin' authorize"
+else
+  live_id="jkb-hook-selftest-$$"
+  "$live_bin" post --id "$live_id" --title "jkb self-test" --body "withdrawn immediately" \
+    >/dev/null 2>&1
+  check "a posted notification is delivered" \
+    "$("$live_bin" list 2>/dev/null | grep -c "^$live_id$" | tr -d ' ')" "1"
+  "$live_bin" remove --id "$live_id" >/dev/null 2>&1
+  check "a withdrawn notification is gone" \
+    "$("$live_bin" list 2>/dev/null | grep -c "^$live_id$" | tr -d ' ')" "0"
+fi
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d hook test(s) failed\n' "$failures" >&2
