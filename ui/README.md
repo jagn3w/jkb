@@ -88,12 +88,12 @@ and `jkb.taskLauncher` — `auto` (default), `extension`, or `terminal`; see bel
     otherwise; `extension` always uses it and *says why* if it cannot, rather than handing
     you the thing you ruled out; `terminal` always runs `claude` in the worktree and never
     opens a window.
-  - **Clicking twice does one thing**, on either surface, and asks nothing. Whether an agent
-    is live on a checkout is not observable — no API reports another window's folder — so
-    instead of guessing or asking, each surface converges on what exists: VS Code opens one
-    window per folder, the handed-over prompt waits *unsent* until someone presses enter, and
-    the terminal path shows the session's existing `claude` terminal rather than starting a
-    second beside it.
+  - **Clicking twice asks nothing**, because whether an agent is live on a checkout is not
+    observable — no API reports another window's folder. On the terminal surface the second
+    click shows the session's existing `claude` terminal and sends nothing, and says so. On
+    the other two it is *not* yet idempotent: opening a window passes `forceNewWindow`, and a
+    chat in the session's own window is a fresh conversation by design. What holds everywhere
+    is that a handed-over prompt waits **unsent** until someone presses enter.
 - **Land this task**: runs `jkb task land` in a terminal — the gate is a build, so its
   output is watchable.
 

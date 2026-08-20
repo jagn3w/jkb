@@ -19,10 +19,10 @@ import {
 import {
   launchClaude,
   deliverQueuedPrompt,
-  sessionTerminal,
-  sessionTerminalName,
+  startSessionTerminal,
   type Launch,
   type Launcher,
+  type TerminalStart,
 } from "./claude.js";
 import { CliJkbClient, type SessionInfo } from "./cliClient.js";
 import { JkbDecorationProvider } from "./decorations.js";
@@ -322,12 +322,20 @@ async function workTaskWithClaude(
     launcher: taskLauncher(),
   });
   if (launch.where === "terminal") {
-    startClaudeInTerminal(session, prompt);
-    // Nothing to say when this is what was asked for. Only a *missing* extension is worth
-    // advising an install for: saying it when the extension is installed and something else
-    // failed sends the user to reinstall it, and replaces the one line that would have
-    // explained the failure.
-    if (launch.fallback) {
+    const arm = startClaudeInTerminal(session, prompt);
+    // Nothing to say when a terminal is what was asked for and one actually started. Only a
+    // *missing* extension is worth advising an install for: saying it when the extension is
+    // installed and something else failed sends the user to reinstall it, and replaces the one
+    // line that would have explained the failure.
+    if (arm === "shown") {
+      // Nothing was sent. Reporting "started" here would name an agent that is not running,
+      // and would bury the fact that this click's prompt — carrying its branch and land
+      // target — was discarded in favour of whatever the terminal was given the first time.
+      vscode.window.showInformationMessage(
+        "jkb: this session already has a `claude` terminal — showed it, and sent nothing. " +
+          "If its agent has finished, start the next one in that terminal yourself.",
+      );
+    } else if (launch.fallback) {
       vscode.window.showInformationMessage(
         launch.fallback.missing
           ? "jkb: started `claude` in a terminal — install the Claude Code extension to work " +
@@ -383,23 +391,18 @@ function taskPrompt(uid: string, title: string, session: SessionInfo): string {
 /**
  * Run `claude` in a terminal in the worktree — the operator's choice, or the fallback.
  *
- * A session that already has one is **shown, not duplicated**. This is the surface where a
- * second click certainly starts a second agent on one checkout (`sendText` runs it, where the
- * extension path leaves its prompt unsent), so convergence is the whole guard — there is no
- * question to ask, because clicking twice now does one thing.
+ * The find-or-create decision belongs to `startSessionTerminal` in `claude.ts`, beside the
+ * name it matches on; this supplies the command and passes on which arm it took. Three lines
+ * of guard at a call site that no test can reach is how a rule gets deleted by a later edit
+ * with the suite still green — which is what the reviewer demonstrated here.
  */
-function startClaudeInTerminal(session: SessionInfo, prompt: string): void {
-  const existing = sessionTerminal(vscode.window.terminals, session.session, session.worktree);
-  if (existing) {
-    existing.show();
-    return;
-  }
-  const terminal = vscode.window.createTerminal({
-    name: sessionTerminalName(session.session),
-    cwd: session.worktree,
-  });
-  terminal.show();
-  terminal.sendText(`claude ${shellQuote(prompt)}`);
+function startClaudeInTerminal(session: SessionInfo, prompt: string): TerminalStart {
+  return startSessionTerminal(
+    vscode.window,
+    session.session,
+    session.worktree,
+    `claude ${shellQuote(prompt)}`,
+  );
 }
 
 /**

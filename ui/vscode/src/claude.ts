@@ -83,16 +83,27 @@ interface PendingPrompt {
  * window has been opened, so a fallback can only ever add a terminal to the window the user
  * is already in.
  *
- * **Clicking twice asks nothing, on any surface.** The guard this needs is "is an agent live
- * on this checkout", and that is not obtainable: no API reports another window\'s folder, and
- * D27/D36.6 deliberately refused the heartbeat that would track a live process. `resumed` is
- * the nearest available signal and it is the wrong one — a session opened yesterday and
- * closed is equally resumed — so a confirmation keyed on it fires on every ordinary return to
- * a task and catches nothing, which is how a guard becomes a reflex click. Instead each
- * surface **converges on what already exists**, the same property `jkb task work` has: VS Code
- * opens one window per folder, the handed-over prompt lands *unsent* so no agent runs without
- * a keystroke from someone looking at it, and `sessionTerminal` finds the session\'s existing
- * terminal rather than starting a second `claude` beside it.
+ * **Clicking twice asks nothing.** The guard that would need is "is an agent live on this
+ * checkout", and that is not obtainable: no API reports another window's folder, and D27/D36.6
+ * deliberately refused the heartbeat that would track a live process. `resumed` is the nearest
+ * available signal and it is the wrong one — a session opened yesterday and closed is equally
+ * resumed — so a confirmation keyed on it fires on every ordinary return to a task and catches
+ * nothing, which is how a guard becomes a reflex click.
+ *
+ * What replaces it is convergence, and **it is only complete on the terminal surface**, where
+ * `startSessionTerminal` reuses the session's own terminal. Stated plainly, because two
+ * earlier versions of this comment claimed more than the code delivers:
+ *
+ * - `window`: this passes `forceNewWindow: true`, whose documented meaning is *not* to reuse.
+ *   Whether VS Code nevertheless focuses an existing window on that folder has **not been
+ *   observed**, and the two outcomes differ — a second checkout with its own chat, or a
+ *   focused window that never activates and so never takes the queued prompt. Unresolved.
+ * - `here`: `primaryEditor.open(undefined, …)` means a fresh conversation by design, so a
+ *   second click in the session's own window adds a second chat tab. Claude Code exposes no
+ *   way to find an existing panel, so there is nothing to converge on.
+ *
+ * What is load-bearing on both: the handed-over prompt lands *unsent*, so no agent runs
+ * without a keystroke from someone looking at the window it is in.
  */
 export async function launchClaude(
   context: vscode.ExtensionContext,
@@ -156,6 +167,49 @@ export function sessionTerminalName(session: string): string {
 export interface TerminalLike {
   readonly name: string;
   readonly creationOptions: object;
+  /** Set once the shell has exited; VS Code keeps the tab until it is dismissed. */
+  readonly exitStatus?: unknown;
+}
+
+/** Which arm `startSessionTerminal` took. `"shown"` means **nothing was sent**. */
+export type TerminalStart = "started" | "shown";
+
+/** The slice of `vscode.window` this needs, so the decision is testable without VS Code. */
+export interface TerminalHost {
+  readonly terminals: readonly (TerminalLike & { show(): void })[];
+  createTerminal(options: { name: string; cwd: string }): {
+    show(): void;
+    sendText(text: string): void;
+  };
+}
+
+/**
+ * Run `command` in the session's terminal, or show the one it already has.
+ *
+ * The decision lives here, beside the name and the matcher that make it, rather than at the
+ * call site. It is the entire duplicate guard on this surface, and as three lines in a command
+ * handler no test could reach it: deleting them left the build and the whole suite green,
+ * which is how a guard gets removed by a later edit without anything noticing.
+ *
+ * The caller must distinguish the arms. `"shown"` sends nothing, so reporting it as a launch
+ * would name an agent that is not running — and the prompt it declined to send carries this
+ * click's branch and land target, which may differ from the one the terminal was given.
+ */
+export function startSessionTerminal(
+  window: TerminalHost,
+  session: string,
+  worktree: string,
+  command: string,
+): TerminalStart {
+  const existing = sessionTerminal(window.terminals, session, worktree);
+  if (existing) {
+    existing.show();
+    return "shown";
+  }
+  const terminal = window.createTerminal({ name: sessionTerminalName(session), cwd: worktree });
+  terminal.show();
+  terminal.sendText(command);
+  return "started";
 }
 
 /**
@@ -163,8 +217,10 @@ export interface TerminalLike {
  *
  * This is what makes a second click harmless on the terminal surface, where a duplicate is
  * otherwise *certain* — `sendText` runs the command, unlike the extension path where the
- * handed-over prompt waits unsent. Showing a terminal whose `claude` has since exited is the
- * benign outcome: the user sees a shell in the worktree and re-runs, one keystroke.
+ * handed-over prompt waits unsent. A tab whose *shell* has exited is skipped (`exitStatus`) —
+ * showing it would start nothing at all. A live shell whose `claude` has exited cannot be told
+ * from one still working, since nothing exposes that, so it matches and the user sees a shell
+ * in the worktree; what makes that recoverable is the caller saying nothing was sent.
  *
  * Matched on name **and** working directory. In Flight's "Open Session Terminal" opens a plain
  * shell with the same `cwd` and a different name, and converging onto a bare shell when a
@@ -181,6 +237,9 @@ export function sessionTerminal<T extends TerminalLike>(
   const name = sessionTerminalName(session);
   return terminals.find((t) => {
     if (t.name !== name) return false;
+    // A dead tab matches by name and cwd exactly as a live one does, and showing it starts
+    // nothing at all — so liveness is part of the match, not a caveat in the docstring.
+    if (t.exitStatus !== undefined) return false;
     const dir = directoryOf(t.creationOptions);
     return dir !== undefined && sameDirectory(dir, worktree);
   });
