@@ -5969,9 +5969,14 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (`LandLock` only excludes a second land). The machine refuses `land` from a terminal
-    // status, so a cancellation that arrived during the gate is not overwritten — and it says so
-    // rather than being silently skipped.
+    // land (`LandLock` only excludes a second land). The machine has no `land` from `cancelled`,
+    // so a cancellation that arrived during the gate is not overwritten — and it says so rather
+    // than being silently skipped.
+    //
+    // `done` is deliberately *not* symmetrical: it has a self-loop, because a verb must survive
+    // its own second run (`Defect::Unrepeatable`). Nothing is lost by that here — the plan
+    // re-asserts the status it already has and re-releases a freed claim — and re-landing is
+    // refused far earlier anyway, by `staging::land_blocker`, before any graft happens.
     let (branch_owned, onto_owned) = (landed.branch.to_owned(), landed.onto.to_owned());
     let head_owned = landed.head.map(str::to_owned);
     let kept_status = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
