@@ -213,14 +213,38 @@ elif [ -z "$live_bin" ]; then
 elif ! "$live_bin" status 2>/dev/null | grep -q "authorization=authorized"; then
   fail "live round-trip: notifier is not authorized — run: '$live_bin' authorize"
 else
-  live_id="jkb-hook-selftest-$$"
-  "$live_bin" post --id "$live_id" --title "jkb self-test" --body "withdrawn immediately" \
-    >/dev/null 2>&1
-  check "a posted notification is delivered" \
-    "$("$live_bin" list 2>/dev/null | grep -c "^$live_id$" | tr -d ' ')" "1"
-  "$live_bin" remove --id "$live_id" >/dev/null 2>&1
-  check "a withdrawn notification is gone" \
-    "$("$live_bin" list 2>/dev/null | grep -c "^$live_id$" | tr -d ' ')" "0"
+  # Driven through the REAL hook with the payloads Claude Code actually sends — nothing stubbed,
+  # no injected notifier. Testing `jkb-notifier` on its own would leave the seam that matters
+  # (hook -> notifier -> notification centre) uncovered, and that seam is the whole feature.
+  live_sid="hook-selftest-$$"
+  live_id="jkb-claude-$live_sid"
+  delivered() { "$live_bin" list 2>/dev/null | grep -c "^$live_id\$" | tr -d ' '; }
+  live() { printf '%s' "$1" | bash "$hook"; }
+
+  printf '  --  %s\n' "style: $("$live_bin" status 2>/dev/null)"
+
+  # Claude needs permission.
+  live "$(payload Notification "$live_sid" 'Claude needs your permission to use Bash')"
+  check "the Notification hook posts a real notification" "$(delivered)" "1"
+
+  # You grant it; the tool runs; PostToolUse fires. This is the pair the whole change exists for.
+  live "$(payload PostToolUse "$live_sid" '')"
+  check "granting permission withdraws it" "$(delivered)" "0"
+
+  # The other half: the idle-waiting notification, cleared by typing rather than by a tool.
+  live "$(payload Notification "$live_sid" 'Claude is waiting for your input')"
+  check "the idle notification posts" "$(delivered)" "1"
+  live "$(payload UserPromptSubmit "$live_sid" '')"
+  check "typing a prompt withdraws it" "$(delivered)" "0"
+
+  # NOTE: `list` reports DELIVERED notifications, which includes one that has hidden its banner
+  # and is resting in Notification Center. So nothing above proves the notification stayed
+  # VISIBLE — no API exposes that. Stickiness is checked the only way it can be, by reading the
+  # style back, and confirmed the only way it can be, by looking at the screen.
+  case "$("$live_bin" status 2>/dev/null)" in
+    *alert-style=alert*) ok "the alert style is sticky" ;;
+    *) printf '  --  %s\n' "alert style is not 'alert' — banners will hide; set System Settings > Notifications > jkb Notifier > Alerts" ;;
+  esac
 fi
 
 if [ "$failures" -ne 0 ]; then
