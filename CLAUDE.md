@@ -1306,7 +1306,13 @@ package's `typecheck` is `--noEmit`, so a bare `pnpm -r run typecheck` cannot re
 `@jkb/core` on a clean tree (nothing emits its `.d.ts`) — `-r run build` is topological, so
 core emits before the adapter checks. `check.sh` skips the UI when pnpm is missing (it lives
 under `PNPM_HOME`, which `~/.zshrc` only exports for interactive shells); the CI job never
-skips.
+skips. **`pnpm run test` runs beside the build**, in both — `node --test` over
+`ui/vscode/test/*.test.mjs`, no framework and no new dependency. A test bundles its module
+with esbuild (already there for the extension bundle) and aliases `vscode` to a stub, so it
+needs neither a running VS Code nor `dist/`; the stub is kept **external** to the bundle, or
+the recorders the test reads are a second copy the code never touches. That fits glue over an
+API we do not own: what it pins is our half — which command is asked for, with which
+arguments, and the state kept between two windows.
 
 **A session is worked in its own VS Code window, in the Claude Code extension.** "Work this
 task with Claude" used to run `claude <prompt>` in a terminal — a terminal is where the whole

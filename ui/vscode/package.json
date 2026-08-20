@@ -213,6 +213,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
+    "test": "node --test \"test/*.test.mjs\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

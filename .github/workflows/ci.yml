@@ -113,3 +113,9 @@ jobs:
       # a clean checkout nothing produces that .d.ts and the adapter cannot resolve it.)
       - name: build (type-checks)
         run: pnpm run build
+
+      # The adapter's tests. They bundle the module under test themselves (with `vscode`
+      # stubbed), so they need no VS Code and no dist — but they do need a node new enough
+      # for `node --test`, which is why this job pins one rather than taking the runner's.
+      - name: test
+        run: pnpm run test

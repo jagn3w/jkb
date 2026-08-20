@@ -25,11 +25,18 @@ Uses **pnpm only** (never npm).
 pnpm install          # from this ui/ directory
 pnpm run build        # build @jkb/core, then bundle the extension
 pnpm run typecheck    # typecheck both packages
+pnpm run test         # node --test; no framework, no new dependency
 ```
 
 `pnpm run build` is the real gate (and what `scripts/check.sh` and CI run): esbuild strips
 types *without* checking them, so each package type-checks before it emits, and `pnpm -r`
 runs topologically so `@jkb/core` emits its `.d.ts` before the adapter checks against it.
+
+`pnpm run test` runs beside it, in both. It is `node --test` over `vscode/test/*.test.mjs` —
+no framework and no new dependency. A test bundles the module it covers with esbuild (already
+here for the extension bundle), aliasing `vscode` to a stub, so it needs neither a running
+VS Code nor `dist/`. That suits glue over an API we do not own: what it pins is our half —
+which command is asked for, with which arguments, and the state kept between two windows.
 
 ## Run the extension
 
