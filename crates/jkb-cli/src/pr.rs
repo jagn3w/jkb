@@ -181,11 +181,16 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
             }
         })?;
     if !out.status.success() {
+        // Collapsed to one line. `gh`'s own messages are multi-line — the unauthenticated one is
+        // two sentences on two lines — and this string is carried as a *reason* into a report
+        // that prints one task per line. A newline in it silently breaks that alignment for
+        // every consumer, so it is flattened here, at the one place the string is made, rather
+        // than at each of them.
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
             "`gh {}` failed: {}",
             args.first().copied().unwrap_or("pr"),
-            err.trim()
+            err.split_whitespace().collect::<Vec<_>>().join(" ")
         ));
     }
     String::from_utf8(out.stdout).map_err(|_| "`gh` returned output that is not UTF-8".to_owned())
@@ -263,5 +268,56 @@ mod tests {
             Discovery::Ambiguous(ns) => assert_eq!(ns, vec![31, 44]),
             _ => panic!("expected ambiguity"),
         }
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::{discover, lookup, Discovery};
+    use jkb_fsm::Fact;
+
+    /// The one thing the offline tests cannot establish: that a **real** merged pull request
+    /// comes back from *this exact query* with `state: "MERGED"`.
+    ///
+    /// Everything around it is checked without the network — the field names against
+    /// `gh pr view --json`'s own list, the flags against `gh pr list --help`, the uppercase
+    /// state against `gh`'s `display.go`, and the whole failure path against a real
+    /// unauthenticated `gh`. What is left is one live call.
+    ///
+    /// `#[ignore]` for the same reason the ollama and Chrome smokes are: it needs something this
+    /// suite cannot provide. Run it with `gh` installed **and authenticated**
+    /// (`gh auth login`, or `GH_TOKEN` set):
+    ///
+    /// ```text
+    /// ./scripts/test.sh -p jkb-cli --lib -- --ignored live_
+    /// ```
+    #[test]
+    #[ignore = "needs `gh` authenticated against a repo with a merged pull request"]
+    fn live_a_merged_pull_request_reads_as_merged() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Discovery by head branch, then a lookup by number — the two calls in the order the
+        // commands make them. A branch nobody ever opened a pull request for is `None`, which is
+        // an answer, not a failure.
+        // The failure names what happened. Run without auth, the discovery comes back
+        // `Unavailable` carrying `gh`'s own message, and a panic saying only "expected one pull
+        // request" would send its reader to look for a missing branch instead of to
+        // `gh auth login`.
+        let found = match discover(repo, "staging-workflow") {
+            Discovery::One(found) => found,
+            Discovery::None => panic!("no pull request has `staging-workflow` as its head branch"),
+            Discovery::Ambiguous(ns) => panic!("that branch name has been reused: {ns:?}"),
+            Discovery::Unavailable(why) => panic!("could not ask: {why}"),
+        };
+        assert_eq!(found.merged(), Fact::Yes, "state was {:?}", found.state);
+        assert_eq!(found.base_ref_name.as_deref(), Some("main"));
+
+        let by_number = lookup(repo, found.number).expect("view by number");
+        assert_eq!(by_number.number, found.number);
+        assert_eq!(
+            by_number.merged(),
+            Fact::Yes,
+            "the number and the branch disagree, which is the whole reason the number is what \
+             gets stored"
+        );
     }
 }

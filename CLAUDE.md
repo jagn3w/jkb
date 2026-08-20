@@ -736,7 +736,10 @@ the code had no way to have. Design: `openspec/changes/jkb-state-machine/`.
   reused branch name matches two); after that the branch name is never consulted. `close-merged`
   asks `gh`, and **everything degrades to `Fact::Unknown`, never to a `no`** — no `gh`, no
   network, no GitHub remote, an unrecognized state — so the task is *held with the reason printed*.
-  It also produces an answer the inference could not: *closed without merging*.
+  It also produces an answer the inference could not: *closed without merging*. The field names,
+  the flags and the **uppercase** state values are verified against `gh` itself rather than from
+  memory (`gh pr view --json`'s own field list, `gh pr list --help`, and `gh`'s `display.go`); the
+  one live call is an `#[ignore]` test beside the ollama and Chrome smokes.
 - **Deleted:** `jkb-cli/src/base.rs` (932 lines), `jkb_core::branch`, `gitrepo::is_merged` /
   `MergeState` / `merge_base` / `has_own_commits` / `is_ancestor` / the reflog-anchor plumbing,
   `repo::landed_for_action` / `credited` / `clear_land_targets` / `measure_root_for`,
