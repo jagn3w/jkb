@@ -37,9 +37,10 @@ interface PendingPrompt {
  * not installed, or it refused the command. It is never returned once a window has been
  * opened, so a fallback can only ever add a terminal to the window the user is already in.
  *
- * VS Code opens at most one window per folder, so a session whose window is already open is
- * focused rather than duplicated. Its prompt then stays queued until that window is next
- * opened — the same prompt for the same task, which is where the button leads anyway.
+ * What VS Code does when a window is already open on the worktree is its call, and this does
+ * not depend on knowing: the prompt is queued either way. A window that opens takes it on
+ * activation; one already open leaves it queued until its next start. Both end at the same
+ * prompt for the same task, which is where the button leads anyway.
  */
 export async function launchClaude(
   context: vscode.ExtensionContext,
@@ -62,6 +63,9 @@ export async function launchClaude(
     return "unavailable";
   }
   try {
+    // `forceNewWindow` is load-bearing, not a preference: without it VS Code opens the folder
+    // in THIS window, which shuts the current extension host down — killing the click
+    // mid-command, and taking the repo's own explorer with it.
     await vscode.commands.executeCommand(
       "vscode.openFolder",
       vscode.Uri.file(worktree),
