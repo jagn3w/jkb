@@ -16,7 +16,7 @@ import {
   type TreeChild,
 } from "@jkb/core";
 
-import { launchClaude, deliverQueuedPrompt } from "./claude.js";
+import { launchClaude, deliverQueuedPrompt, type Launch, type Launcher } from "./claude.js";
 import { CliJkbClient, type SessionInfo } from "./cliClient.js";
 import { JkbDecorationProvider } from "./decorations.js";
 import { InFlightProvider, type FlightNode } from "./inflight.js";
@@ -308,19 +308,57 @@ async function workTaskWithClaude(
   }
 
   const prompt = taskPrompt(uid, child?.label ?? uid, session);
-  const launch = await launchClaude(context, session.worktree, uid, prompt);
-  if (launch === "unavailable") {
+  const launch = await launchClaude(context, {
+    worktree: session.worktree,
+    uid,
+    prompt,
+    resumed: session.resumed,
+    launcher: taskLauncher(),
+  });
+  if (launch.where === "terminal") {
     startClaudeInTerminal(session, prompt);
-    vscode.window.showInformationMessage(
-      "jkb: started `claude` in a terminal — install the Claude Code extension to work the " +
-        "session in its own window instead.",
+    // Nothing to say when this is what was asked for. Only a *missing* extension is worth
+    // advising an install for: saying it when the extension is installed and something else
+    // failed sends the user to reinstall it, and replaces the one line that would have
+    // explained the failure.
+    if (launch.fallback) {
+      vscode.window.showInformationMessage(
+        launch.fallback.missing
+          ? "jkb: started `claude` in a terminal — install the Claude Code extension to work " +
+              "the session in its own window instead."
+          : `jkb: could not start Claude Code (${launch.fallback.cause}) — started \`claude\` ` +
+              "in a terminal.",
+      );
+    }
+  } else if (launch.where === "blocked") {
+    // `jkb.taskLauncher` is "extension", so a terminal is not a substitute — it is the thing
+    // the operator ruled out. The session is open either way and In Flight can open a shell.
+    vscode.window.showErrorMessage(
+      `jkb: could not start Claude Code (${launch.cause}). The session is open at ` +
+        `${session.worktree} — set jkb.taskLauncher to "auto" to fall back to a terminal.`,
     );
   }
   vscode.window.setStatusBarMessage(
     `jkb: ${session.resumed ? "resumed" : "opened"} session ${session.session} on ${session.branch}` +
-      (launch === "window" ? " — opening its window" : ""),
+      STATUS_SUFFIX[launch.where],
     4000,
   );
+}
+
+/** What the status line adds about where the session's Claude ended up. */
+const STATUS_SUFFIX: Record<Launch["where"], string> = {
+  here: "",
+  // Not "opened its window": VS Code may have focused one that was already up.
+  window: " — opening its window",
+  declined: " — left as it is",
+  terminal: "",
+  blocked: "",
+};
+
+/** How the operator wants a session started; anything unrecognised reads as the default. */
+function taskLauncher(): Launcher {
+  const choice = vscode.workspace.getConfiguration("jkb").get<string>("taskLauncher");
+  return choice === "extension" || choice === "terminal" ? choice : "auto";
 }
 
 /** What Claude is asked to do in a session, in the one place that knows the session's shape. */

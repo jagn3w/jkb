@@ -65,13 +65,22 @@ function fresh() {
   };
 }
 
-const opened = (prompt) => [["claude-vscode.editor.open", undefined, prompt]];
+const opened = (prompt) => [["claude-vscode.primaryEditor.open", undefined, prompt]];
+
+/** A launch request for a session being opened for the first time, under the default policy. */
+const first = (worktree, uid, prompt) => ({
+  worktree,
+  uid,
+  prompt,
+  resumed: false,
+  launcher: "auto",
+});
 
 test("a session opens as a window, and that window takes its prompt exactly once", async () => {
   const t = fresh();
   const work = t.worktree("task-a");
 
-  assert.equal(await launchClaude(t.context, work, "task:a", "PROMPT"), "window");
+  assert.deepEqual(await launchClaude(t.context, first(work, "task:a", "PROMPT")), { where: "window" });
   assert.equal(state.calls[0][0], "vscode.openFolder");
   assert.equal(state.calls[0][1].fsPath, work);
   assert.deepEqual(state.calls[0][2], { forceNewWindow: true });
@@ -95,8 +104,8 @@ test("two sessions in flight keep their own prompts", async () => {
   const a = t.worktree("task-a");
   const b = t.worktree("task-b");
 
-  await launchClaude(t.context, a, "task:a", "PROMPT A");
-  await launchClaude(t.context, b, "task:b", "PROMPT B");
+  await launchClaude(t.context, first(a, "task:a", "PROMPT A"));
+  await launchClaude(t.context, first(b, "task:b", "PROMPT B"));
   assert.deepEqual(Object.keys(t.queue()).sort(), [a, b].sort());
 
   reset(b);
@@ -108,14 +117,14 @@ test("two sessions in flight keep their own prompts", async () => {
 test("a prompt whose worktree is gone expires; no clock decides it", async () => {
   const t = fresh();
   const abandoned = t.worktree("task-a");
-  await launchClaude(t.context, abandoned, "task:a", "PROMPT A");
+  await launchClaude(t.context, first(abandoned, "task:a", "PROMPT A"));
 
   // `jkb task abandon`, or a landed session: no window can ever open on it again.
   fs.rmSync(abandoned, { recursive: true, force: true });
 
   reset(t.repo);
   const live = t.worktree("task-b");
-  await launchClaude(t.context, live, "task:b", "PROMPT B");
+  await launchClaude(t.context, first(live, "task:b", "PROMPT B"));
   assert.deepEqual(Object.keys(t.queue()), [live]);
 });
 
@@ -124,7 +133,7 @@ test("clicking from the session's own window starts Claude in it, queueing nothi
   const work = t.worktree("task-a");
 
   reset(work);
-  assert.equal(await launchClaude(t.context, work, "task:a", "PROMPT"), "here");
+  assert.deepEqual(await launchClaude(t.context, first(work, "task:a", "PROMPT")), { where: "here" });
   assert.deepEqual(state.calls, opened("PROMPT"));
   assert.deepEqual(t.queue(), {});
 });
@@ -136,7 +145,10 @@ test("without the Claude Code extension the caller is told to fall back", async 
 
   // No window is opened and nothing is queued: the caller's terminal is the whole feature,
   // and a queued prompt would fire at some unrelated later opening of that folder.
-  assert.equal(await launchClaude(t.context, work, "task:a", "PROMPT"), "unavailable");
+  assert.deepEqual(await launchClaude(t.context, first(work, "task:a", "PROMPT")), {
+    where: "terminal",
+    fallback: { missing: true, cause: "the Claude Code extension is not installed" },
+  });
   assert.deepEqual(state.calls, []);
   assert.deepEqual(t.queue(), {});
 });
@@ -146,7 +158,11 @@ test("a window that fails to open leaves no undeliverable prompt behind", async 
   const work = t.worktree("task-a");
   state.openFolderFails = true;
 
-  assert.equal(await launchClaude(t.context, work, "task:a", "PROMPT"), "unavailable");
+  const launch = await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+  assert.equal(launch.where, "terminal");
+  // Not `missing`: the extension is installed, and advising an install would be wrong.
+  assert.equal(launch.fallback.missing, false);
+  assert.match(launch.fallback.cause, /no window/);
   assert.deepEqual(t.queue(), {});
 });
 
@@ -162,14 +178,14 @@ test("a corrupt queue file reads as empty rather than throwing", async () => {
 
   // And the next write replaces it wholesale, so one bad file is not permanent.
   reset(t.repo);
-  assert.equal(await launchClaude(t.context, work, "task:a", "PROMPT"), "window");
+  assert.deepEqual(await launchClaude(t.context, first(work, "task:a", "PROMPT")), { where: "window" });
   assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "PROMPT" });
 });
 
 test("a Claude Code that refuses is reported, not swallowed", async () => {
   const t = fresh();
   const work = t.worktree("task-a");
-  await launchClaude(t.context, work, "task:a", "PROMPT");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
 
   reset(work);
   state.claudeRefuses = true;
@@ -179,4 +195,127 @@ test("a Claude Code that refuses is reported, not swallowed", async () => {
   // Taken all the same: a prompt that re-fires on every later opening of the folder is worse
   // than one click of the button, which returns the same session.
   assert.deepEqual(t.queue(), {});
+});
+
+// ---------------------------------------------------------------------------
+// Reopening a session that may already have a window (the second click).
+// ---------------------------------------------------------------------------
+
+test("a resumed session is asked about, not reopened behind the user's back", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  // The user dismisses the prompt: their session's window is already up.
+  state.answer = undefined;
+
+  const launch = await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), resumed: true });
+  assert.deepEqual(launch, { where: "declined" });
+  assert.equal(state.asked.length, 1);
+  // Nothing was opened and nothing was queued — a second Claude on one checkout is exactly
+  // what D36 exists to prevent, and a queued prompt would fire at some later opening.
+  assert.deepEqual(state.calls, []);
+  assert.deepEqual(t.queue(), {});
+});
+
+test("a resumed session reopens when the user says so", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  state.answer = "Open its window";
+
+  const launch = await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), resumed: true });
+  assert.deepEqual(launch, { where: "window" });
+  assert.equal(state.calls[0][0], "vscode.openFolder");
+  assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "PROMPT" });
+});
+
+test("the session's own window never asks — it is the window", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  reset(work);
+
+  const launch = await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), resumed: true });
+  assert.deepEqual(launch, { where: "here" });
+  assert.deepEqual(state.asked, []);
+});
+
+// ---------------------------------------------------------------------------
+// `jkb.taskLauncher` — the operator's choice, honoured rather than inferred.
+// ---------------------------------------------------------------------------
+
+test('launcher "terminal" opens no window and asks nothing, even for a fresh session', async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+
+  const launch = await launchClaude(t.context, {
+    ...first(work, "task:a", "PROMPT"),
+    launcher: "terminal",
+  });
+  // No `fallback`: this is what was asked for, so the caller has nothing to apologise for.
+  assert.deepEqual(launch, { where: "terminal" });
+  assert.deepEqual(state.calls, []);
+  assert.deepEqual(state.asked, []);
+  assert.deepEqual(t.queue(), {});
+});
+
+test('launcher "terminal" is honoured even from the session\'s own window', async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  reset(work);
+
+  const launch = await launchClaude(t.context, {
+    ...first(work, "task:a", "PROMPT"),
+    launcher: "terminal",
+  });
+  assert.deepEqual(launch, { where: "terminal" });
+  assert.deepEqual(state.calls, []);
+});
+
+test('launcher "extension" reports a failure instead of substituting a terminal', async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  state.claudeInstalled = false;
+
+  const launch = await launchClaude(t.context, {
+    ...first(work, "task:a", "PROMPT"),
+    launcher: "extension",
+  });
+  assert.equal(launch.where, "blocked");
+  assert.match(launch.cause, /not installed/);
+  assert.deepEqual(t.queue(), {});
+});
+
+test('launcher "extension" blocks on every failure path, not just a missing extension', async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  state.openFolderFails = true;
+
+  const launch = await launchClaude(t.context, {
+    ...first(work, "task:a", "PROMPT"),
+    launcher: "extension",
+  });
+  assert.equal(launch.where, "blocked");
+  assert.match(launch.cause, /no window/);
+  assert.deepEqual(t.queue(), {});
+});
+
+// ---------------------------------------------------------------------------
+// The queue file has as few writers as possible.
+// ---------------------------------------------------------------------------
+
+test("a window with no prompt waiting does not write the queue at all", async () => {
+  const t = fresh();
+  // Every VS Code window now activates at startup and calls this. If each one wrote the file
+  // back, the read-modify-write race would have every window in it, and the lost update it
+  // allows is an already-delivered prompt resurrected.
+  reset(path.join(t.repo, "unrelated"));
+  await deliverQueuedPrompt(t.context);
+  assert.equal(fs.existsSync(t.queueFile), false);
+
+  // And with a queue that exists, an unrelated window leaves it byte-identical.
+  const work = t.worktree("task-a");
+  reset(t.repo);
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+  const before = fs.readFileSync(t.queueFile);
+  reset(path.join(t.repo, "unrelated"));
+  await deliverQueuedPrompt(t.context);
+  assert.deepEqual(fs.readFileSync(t.queueFile), before);
 });
