@@ -1320,8 +1320,9 @@ UX then lived. The extension is the better surface, and **`jkb.taskLauncher` let
 say so or not** (`auto` | `extension` | `terminal`): `auto` is the only value that substitutes
 one surface for the other, and the two explicit values are honoured or *reported*, never
 quietly swapped. One function (`unreachable`) turns a failure into either a fallback or a
-refusal, so the setting cannot be honoured on three failure paths and forgotten on the fourth.
-The extension forces the window: its panel
+refusal — for the failures inside `launchClaude`. **`deliverQueuedPrompt` is a fifth path that
+does not go through it** and reports rather than falling back; that is a known, filed gap, not
+a property of the design. The extension forces the window: its panel
 derives a cwd from **`workspaceFolders[0]`** and takes no directory argument, so a chat opened
 from the repo's window would work the **main checkout** — the one thing a session exists to
 keep apart (D36). So the worktree has to *be* the window's folder. `vscode.openFolder` carries
@@ -1342,11 +1343,21 @@ ViewColumn.Active) setPreferredLocation("panel"); … }`, and that setter writes
 `claudeCode.preferredLocation` with `ConfigurationTarget.Global`. Calling it without a column
 rewrites the user's global settings on **every** hand-off, moving Claude Code out of their
 sidebar for every window and project; jkb does not edit other people's configuration, which is
-the same rule that kept D46 from writing a git ref. **A resumed session is asked about, not
-reopened**: `resumed` is evidence about the *session*, not about whether a window is up (one
-opened yesterday and closed is also resumed), and no API reports another window's folder — so
-the person who can see their own windows is the one asked, rather than forcing a second Claude
-onto one checkout. **`takePrompt` returns without writing when it took nothing**: every window
+the same rule that kept D46 from writing a git ref. **Clicking twice asks nothing; each surface converges on what
+exists.** The guard wanted here is "is an agent live on this checkout", which is *not
+obtainable* — no API reports another window's folder, and D27/D36.6 deliberately refused the
+heartbeat that would track a live process. `resumed` is the nearest signal and it is the wrong
+one: a session opened yesterday and closed is equally resumed, so a confirmation keyed on it
+fires on every ordinary return to a task and catches nothing, which is how a guard becomes a
+reflex click (the D38 lesson about `--no-review`). A first attempt did exactly that, and put
+the question on the *extension* path — where VS Code opens one window per folder and the
+handed-over prompt lands **unsent**, so a duplicate is merely possible — while leaving the
+*terminal* path, where `sendText` makes a second agent certain, to fork silently. So the
+question is gone and idempotence replaces it, extending the property `jkb task work` already
+has one level up: `sessionTerminal` finds the session's own `claude: <session>` terminal —
+matched on name **and** cwd, since In Flight's plain shell shares the cwd — and shows it
+instead of starting a second. Residual, stated not closed: a `claude` running in *another*
+window is invisible, because `vscode.window.terminals` is per-window. **`takePrompt` returns without writing when it took nothing**: every window
 now activates at startup and calls it, so writing back would put every VS Code window on the
 machine into the read-modify-write race for one shared file, whose lost update is an
 already-delivered prompt resurrected.
