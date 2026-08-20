@@ -9,6 +9,8 @@
 #      reaper) as OS services (launchd/systemd)
 #   5. installs the repo's post-merge git hook into this repo's .git/hooks — and, when
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
+#   6. reports whether sticky Claude Code notifications are ready (macOS only; nothing
+#      is installed or changed — it only tells you what is missing)
 #
 # Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
 #
@@ -206,6 +208,33 @@ fi
 # re-runs after a `git pull` — jkb does not rearrange other people's configuration behind them.
 if [ "$link_memory" -eq 1 ]; then
   "$repo_root/scripts/link-claude-memory.sh" || warn "some repos could not be linked (see above)"
+fi
+
+# --- notifications -------------------------------------------------------------------
+# `.claude/hooks/notify-sticky.sh` makes Claude Code's "needs your permission" notification stay
+# on screen and clears it when you answer. The staying-on-screen half is a macOS setting, not
+# something a notifier can force: it needs terminal-notifier, whose alert style the user sets to
+# "Alerts" once. Report both, because without them the hook still fires and the banner still
+# hides after a few seconds — a silently non-sticky notification looks exactly like a broken one.
+#
+# This step INSTALLS NOTHING. terminal-notifier is a signed third-party binary and pulling one
+# down unasked is not a thing a setup script should do; it says what to run instead.
+if [ "$(uname -s)" = "Darwin" ]; then
+  say "sticky notifications"
+  # Asked of the hook itself, so this reports on exactly the binary the hook will use. A second
+  # copy of the search list here would eventually disagree with it, and the disagreement reads as
+  # a broken notifier rather than as the drift it is.
+  tn=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --find-notifier 2>/dev/null || true)
+  if [ -n "$tn" ]; then
+    echo "  • notifier:   $tn"
+    echo "  • one manual step: System Settings > Notifications > terminal-notifier > Alerts"
+    echo "    (banners auto-hide; only the Alerts style waits for you)"
+  else
+    warn "terminal-notifier not found — permission notifications will fire but auto-hide."
+    echo "    install it, then re-run this script:"
+    echo "      brew install terminal-notifier"
+    echo "      # or the signed release: https://github.com/julienXX/terminal-notifier/releases"
+  fi
 fi
 
 say "setup complete"
