@@ -15,11 +15,8 @@ export const state = {
   claudeRefuses: false,
   /** Make `vscode.openFolder` fail. */
   openFolderFails: false,
-  /** What the user clicks on an information message with buttons; undefined = dismissed. */
-  answer: undefined,
   calls: [],
   errors: [],
-  asked: [],
 };
 
 export function reset(folder) {
@@ -27,10 +24,8 @@ export function reset(folder) {
   state.claudeInstalled = true;
   state.claudeRefuses = false;
   state.openFolderFails = false;
-  state.answer = undefined;
   state.calls = [];
   state.errors = [];
-  state.asked = [];
 }
 
 export const workspace = {
@@ -58,9 +53,4 @@ export const Uri = { file: (fsPath) => ({ fsPath }) };
 
 export const window = {
   showErrorMessage: (message) => state.errors.push(message),
-  /** Records the question and returns the scripted answer, as a dismissible prompt does. */
-  showInformationMessage: async (message, ...items) => {
-    state.asked.push({ message, items });
-    return state.answer;
-  },
 };

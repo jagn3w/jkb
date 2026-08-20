@@ -39,7 +39,8 @@ await esbuild.build({
   ],
 });
 
-const { launchClaude, deliverQueuedPrompt } = await import(bundle);
+const { launchClaude, deliverQueuedPrompt, sessionTerminal, sessionTerminalName } =
+  await import(bundle);
 const { state, reset } = await import(stub);
 
 /** A fresh repo, global storage and worktree factory, so no test can depend on another. */
@@ -67,14 +68,8 @@ function fresh() {
 
 const opened = (prompt) => [["claude-vscode.primaryEditor.open", undefined, prompt]];
 
-/** A launch request for a session being opened for the first time, under the default policy. */
-const first = (worktree, uid, prompt) => ({
-  worktree,
-  uid,
-  prompt,
-  resumed: false,
-  launcher: "auto",
-});
+/** A launch request under the default policy. */
+const first = (worktree, uid, prompt) => ({ worktree, uid, prompt, launcher: "auto" });
 
 test("a session opens as a window, and that window takes its prompt exactly once", async () => {
   const t = fresh();
@@ -198,46 +193,6 @@ test("a Claude Code that refuses is reported, not swallowed", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Reopening a session that may already have a window (the second click).
-// ---------------------------------------------------------------------------
-
-test("a resumed session is asked about, not reopened behind the user's back", async () => {
-  const t = fresh();
-  const work = t.worktree("task-a");
-  // The user dismisses the prompt: their session's window is already up.
-  state.answer = undefined;
-
-  const launch = await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), resumed: true });
-  assert.deepEqual(launch, { where: "declined" });
-  assert.equal(state.asked.length, 1);
-  // Nothing was opened and nothing was queued — a second Claude on one checkout is exactly
-  // what D36 exists to prevent, and a queued prompt would fire at some later opening.
-  assert.deepEqual(state.calls, []);
-  assert.deepEqual(t.queue(), {});
-});
-
-test("a resumed session reopens when the user says so", async () => {
-  const t = fresh();
-  const work = t.worktree("task-a");
-  state.answer = "Open its window";
-
-  const launch = await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), resumed: true });
-  assert.deepEqual(launch, { where: "window" });
-  assert.equal(state.calls[0][0], "vscode.openFolder");
-  assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "PROMPT" });
-});
-
-test("the session's own window never asks — it is the window", async () => {
-  const t = fresh();
-  const work = t.worktree("task-a");
-  reset(work);
-
-  const launch = await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), resumed: true });
-  assert.deepEqual(launch, { where: "here" });
-  assert.deepEqual(state.asked, []);
-});
-
-// ---------------------------------------------------------------------------
 // `jkb.taskLauncher` — the operator's choice, honoured rather than inferred.
 // ---------------------------------------------------------------------------
 
@@ -252,7 +207,6 @@ test('launcher "terminal" opens no window and asks nothing, even for a fresh ses
   // No `fallback`: this is what was asked for, so the caller has nothing to apologise for.
   assert.deepEqual(launch, { where: "terminal" });
   assert.deepEqual(state.calls, []);
-  assert.deepEqual(state.asked, []);
   assert.deepEqual(t.queue(), {});
 });
 
@@ -318,4 +272,57 @@ test("a window with no prompt waiting does not write the queue at all", async ()
   reset(path.join(t.repo, "unrelated"));
   await deliverQueuedPrompt(t.context);
   assert.deepEqual(fs.readFileSync(t.queueFile), before);
+});
+
+// ---------------------------------------------------------------------------
+// Clicking twice does one thing — the guard, in place of a question nobody can answer.
+// ---------------------------------------------------------------------------
+
+/** A stand-in for `vscode.window.terminals`, which is all `sessionTerminal` reads. */
+const term = (name, cwd) => ({ name, creationOptions: cwd === undefined ? {} : { cwd } });
+
+test("a session's own claude terminal is found again, so a second click shows it", () => {
+  const name = sessionTerminalName("task-a-1730");
+  const found = sessionTerminal(
+    [term("bash", "/w/task-a"), term(name, "/w/task-a")],
+    "task-a-1730",
+    "/w/task-a",
+  );
+  assert.equal(found?.name, name);
+});
+
+test("a Uri cwd matches as well as a string, since VS Code allows either", () => {
+  const name = sessionTerminalName("task-a-1730");
+  const found = sessionTerminal([term(name, { fsPath: "/w/task-a" })], "task-a-1730", "/w/task-a");
+  assert.equal(found?.name, name);
+});
+
+test("In Flight's plain shell in the same worktree is not mistaken for the agent", () => {
+  // `openSessionTerminal` opens a bare shell with the same cwd and a different name.
+  // Converging onto it would show a shell while a claude runs unseen next door.
+  assert.equal(
+    sessionTerminal([term("jkb: task:use-claude-18cd", "/w/task-a")], "task-a-1730", "/w/task-a"),
+    undefined,
+  );
+});
+
+test("another session's terminal is not mistaken for this one", () => {
+  const other = sessionTerminalName("task-b-9910");
+  assert.equal(sessionTerminal([term(other, "/w/task-b")], "task-a-1730", "/w/task-a"), undefined);
+});
+
+test("the same name in a different worktree does not match", () => {
+  const name = sessionTerminalName("task-a-1730");
+  assert.equal(sessionTerminal([term(name, "/w/elsewhere")], "task-a-1730", "/w/task-a"), undefined);
+});
+
+test("a terminal with no cwd never matches — it says nothing about which checkout it is in", () => {
+  const name = sessionTerminalName("task-a-1730");
+  assert.equal(sessionTerminal([term(name, undefined)], "task-a-1730", "/w/task-a"), undefined);
+});
+
+test("the name is what createTerminal is given, so the two cannot drift apart", () => {
+  // The finder matches on the name the starter sets; a literal in either place would rot.
+  assert.equal(sessionTerminalName("task-a-1730"), "claude: task-a-1730");
+  assert.equal(sessionTerminalName("x".repeat(40)), `claude: ${"x".repeat(24)}`);
 });
