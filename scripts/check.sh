@@ -27,7 +27,7 @@ fi
 # strips types WITHOUT checking them — so `esbuild` alone would happily ship a type error).
 # `pnpm -r` runs topologically, which also guarantees @jkb/core emits its .d.ts before the
 # adapter type-checks against it.
-echo "==> ui (typecheck + build)"
+echo "==> ui (typecheck + build + tests)"
 # pnpm lives under PNPM_HOME, which ~/.zshrc only exports for interactive shells — put it on
 # PATH here, the same way the other scripts self-source ~/.cargo/env, so this works when run
 # directly.
@@ -37,7 +37,9 @@ case ":$PATH:" in
     *) export PATH="$PNPM_HOME/bin:$PATH" ;;
 esac
 if command -v pnpm >/dev/null 2>&1; then
-    (cd "$(dirname "$0")/../ui" && pnpm run build)
+    # `test` after `build`: the tests bundle their own module, so they do not need dist — but
+    # a type error is the cheaper failure to read, so it is the one reported first.
+    (cd "$(dirname "$0")/../ui" && pnpm run build && pnpm run test)
 else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"
 fi
