@@ -191,6 +191,85 @@ fn landing_yields_status_and_claim_release_as_one_plan() {
     );
 }
 
+/// Every verb, run a second time, does what it did the first time — **and does not re-ask the
+/// preconditions**, which is the half a self-loop is easy to get wrong.
+///
+/// `Defect::Unrepeatable` pins the table's shape; this pins what that shape is *for*. S1.6 says
+/// the plan is applied last so a failed verb leaves the task where it was and can simply be run
+/// again — and that is worth nothing if the second run refuses, because then a retry means first
+/// working out how far the first attempt got.
+///
+/// It regressed exactly that way: correcting the absorption rule (a row with a plan is never
+/// absorbed, since the task may have arrived by another route with the plan still owed) turned
+/// five destinations into refusals at once, `land` on a landed task among them. Both halves are
+/// asserted here from **empty** facts, so a re-run that had started consulting the review gate
+/// or the checkout again would fail this rather than pass it quietly.
+#[test]
+fn running_a_verb_a_second_time_repeats_it_and_re_asks_nothing() {
+    let cases = [
+        (TaskStatus::Done, TaskEvent::Land),
+        (TaskStatus::Cancelled, TaskEvent::Cancel),
+        (TaskStatus::Open, TaskEvent::Reopen),
+        (TaskStatus::NeedsReview, TaskEvent::SubmitForReview),
+        (TaskStatus::InProgress, TaskEvent::RequestChanges),
+    ];
+    for (status, event) in cases {
+        // Deliberately bare: nothing is proven, no claim, no session. A guard that fired here
+        // would be re-asking a question about work that is already behind us.
+        let facts = TaskFacts {
+            status,
+            ..TaskFacts::default()
+        };
+        let out = apply(&facts, event);
+        assert_eq!(
+            out.refusal(),
+            None,
+            "`{}` from `{}` refused on the second run",
+            event.name(),
+            status.as_str()
+        );
+        assert_eq!(out.state(), status, "`{}`", event.name());
+    }
+}
+
+/// The other two self-loops **do** keep their guards, and the difference is worth stating: for
+/// these the verb may still have real work to do, so the second run is not merely a repeat.
+///
+/// `abandon` reaches `open` from an operator override, where a live session may still hold
+/// uncommitted changes; `observed_landed` is a reconciliation, and being done already is not
+/// evidence that *this* branch is what landed it. Both are re-runnable under the facts their
+/// callers actually supply — which is the property that matters — without being unconditional.
+#[test]
+fn the_two_guarded_self_loops_still_demand_their_evidence() {
+    let settled = TaskFacts {
+        status: TaskStatus::Open,
+        work_dirty: Fact::No,
+        ..TaskFacts::default()
+    };
+    assert_eq!(apply(&settled, TaskEvent::Abandon).refusal(), None);
+    // A checkout that cannot be read is not a clean one (D48's `Fact` rule, at a guard).
+    let hazy = TaskFacts {
+        work_dirty: Fact::Unknown,
+        ..settled
+    };
+    assert!(apply(&hazy, TaskEvent::Abandon).refusal().is_some());
+
+    let landed = TaskFacts {
+        status: TaskStatus::Done,
+        landed_elsewhere: Fact::Yes,
+        open_subtasks: Fact::No,
+        ..TaskFacts::default()
+    };
+    assert_eq!(apply(&landed, TaskEvent::ObservedLanded).refusal(), None);
+    let unproven = TaskFacts {
+        landed_elsewhere: Fact::Unknown,
+        ..landed
+    };
+    assert!(apply(&unproven, TaskEvent::ObservedLanded)
+        .refusal()
+        .is_some());
+}
+
 /// Passes 7, 24, 33 — a branch with no commits merge-trees to trunk's own tree and read as
 /// merged, so a task whose work never started closed as done. Landing requires commits proven
 /// present; zero is a load-bearing answer.

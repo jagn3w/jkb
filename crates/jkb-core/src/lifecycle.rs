@@ -530,6 +530,33 @@ const ROWS: &[Transition<TaskStatus, TaskEvent, TaskFacts, TaskEffect>] = &[
         guard: None,
         plan: Some(plan_changes),
     },
+    // **The five self-loops below are S1.6's re-runnability, declared.**
+    //
+    // *Apply the plan last, so a failure leaves the task where it was and the verb is
+    // re-runnable* is worth nothing if the re-run is a refusal — you would have to work out
+    // whether the first attempt got far enough before retrying, which is the diagnosis the
+    // ordering rule exists to spare you. Implicit absorption used to give this for free and no
+    // longer does, correctly: a row with a plan is never absorbed, because the task may have
+    // arrived by some other route with that plan still owed.
+    //
+    // So each one is declared with **the plan it owes there** rather than as a bare no-op. Every
+    // plan here is a status write plus, on a terminal, the claim release — idempotent by
+    // construction, so re-asserting costs nothing and repairs a task that reached this state by
+    // an override. `Defect::Unrepeatable` is what asks for them, one destination at a time.
+    Transition {
+        from: TaskStatus::NeedsReview,
+        event: TaskEvent::SubmitForReview,
+        to: Dest::To(TaskStatus::NeedsReview),
+        guard: None,
+        plan: Some(plan_review),
+    },
+    Transition {
+        from: TaskStatus::InProgress,
+        event: TaskEvent::RequestChanges,
+        to: Dest::To(TaskStatus::InProgress),
+        guard: None,
+        plan: Some(plan_changes),
+    },
     // --- landing ---------------------------------------------------------------------------
     Transition {
         from: TaskStatus::InProgress,
@@ -543,6 +570,17 @@ const ROWS: &[Transition<TaskStatus, TaskEvent, TaskFacts, TaskEffect>] = &[
         event: TaskEvent::Land,
         to: Dest::To(TaskStatus::Done),
         guard: Some(land_guard),
+        plan: Some(plan_land),
+    },
+    // Landing an already-landed task, and **deliberately unguarded**. `land_guard` asks whether
+    // jkb may perform the graft — is the checkout clean, is there a review, are the subtasks
+    // finished — and none of that is a question about a task that has already landed. Demanding
+    // the review gate a second time to permit a no-op would make the re-run harder than the run.
+    Transition {
+        from: TaskStatus::Done,
+        event: TaskEvent::Land,
+        to: Dest::To(TaskStatus::Done),
+        guard: None,
         plan: Some(plan_land),
     },
     // --- putting it back -------------------------------------------------------------------
@@ -595,7 +633,21 @@ const ROWS: &[Transition<TaskStatus, TaskEvent, TaskFacts, TaskEffect>] = &[
         plan: Some(plan_cancel),
     },
     Transition {
+        from: TaskStatus::Cancelled,
+        event: TaskEvent::Cancel,
+        to: Dest::To(TaskStatus::Cancelled),
+        guard: None,
+        plan: Some(plan_cancel),
+    },
+    Transition {
         from: TaskStatus::Done,
+        event: TaskEvent::Reopen,
+        to: Dest::To(TaskStatus::Open),
+        guard: None,
+        plan: Some(plan_reopen),
+    },
+    Transition {
+        from: TaskStatus::Open,
         event: TaskEvent::Reopen,
         to: Dest::To(TaskStatus::Open),
         guard: None,
@@ -618,6 +670,22 @@ const ROWS: &[Transition<TaskStatus, TaskEvent, TaskFacts, TaskEffect>] = &[
     },
     Transition {
         from: TaskStatus::NeedsReview,
+        event: TaskEvent::ObservedLanded,
+        to: Dest::To(TaskStatus::Done),
+        guard: Some(landed_externally),
+        plan: Some(plan_land),
+    },
+    // Seeing the same landing twice. `Defect::Unrepeatable` does not ask for this one — it is a
+    // reconciliation, and re-observing a condition is the guards' business — but the merge queue
+    // re-runs `jkb task landed` on a whole branch after a transient failure, and without this row
+    // every task it had already closed comes back as `not closed`, which is the queue's caller
+    // being told the opposite of the truth.
+    //
+    // Guarded, like every reconciliation: `UnguardedReconciliation` is a defect precisely so a
+    // state change can never be asserted from nothing observed, and *already being done* is not
+    // evidence that this branch is what did it.
+    Transition {
+        from: TaskStatus::Done,
         event: TaskEvent::ObservedLanded,
         to: Dest::To(TaskStatus::Done),
         guard: Some(landed_externally),

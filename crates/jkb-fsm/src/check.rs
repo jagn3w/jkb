@@ -92,6 +92,37 @@ pub enum Defect<S, E> {
         /// The state no context covered.
         state: S,
     },
+    /// An [`EventKind::Applied`] event leads to a state that does not accept it, so **running
+    /// the verb a second time is a refusal rather than a no-op**.
+    ///
+    /// This is design S1.6 — *apply the plan last, so a failure leaves the object where it was
+    /// and the verb is re-runnable* — stated as a property of the table. The second half of that
+    /// sentence is what makes the first half worth anything: a verb you cannot safely re-run is
+    /// one whose failure you have to diagnose before retrying, which is the thing the ordering
+    /// rule exists to avoid.
+    ///
+    /// It has to be checked rather than remembered because [`Machine::accepts`] only absorbs an
+    /// event implicitly when nothing would be lost by skipping it — a row carrying a guard or a
+    /// plan is never absorbed, since the object may have arrived by some other route with that
+    /// plan still owed. That rule is right, and it silently makes every plan-carrying
+    /// destination refuse its own event. The domain has to say which it wants, one row at a
+    /// time; this is what asks it.
+    ///
+    /// Restricted to [`EventKind::Applied`] on purpose. A reconciliation is an *observation*,
+    /// not a verb somebody re-runs, and what happens when the same condition is seen twice is
+    /// its guards' business — see [`Machine::reconcile`].
+    ///
+    /// **It asks for a decision, not for a particular one.** A domain that really does want the
+    /// second run to fail says so with a self-loop whose guard always denies: the pair is then
+    /// declared, this stops firing, and the refusal carries a sentence and a remedy instead of
+    /// being the silent absence of a row. That is strictly better than what an undeclared pair
+    /// gives you, which is [`Outcome::Undefined`] and a message assembled from two names.
+    Unrepeatable {
+        /// The destination that will not accept the event that leads to it.
+        state: S,
+        /// The event that gets there and then cannot be repeated.
+        event: E,
+    },
     /// Under this observation, two reconciliations fire at once, so
     /// [`Machine::reconcile`] can only refuse. Reported rather than tolerated: a domain either
     /// proves the pair is impossible, or narrows a guard.
@@ -134,6 +165,14 @@ impl<S: State, E: Event> fmt::Display for Defect<S, E> {
             Self::UnusedEvent { event } => {
                 write!(f, "event `{}` appears in no transition", event.name())
             }
+            Self::Unrepeatable { state, event } => write!(
+                f,
+                "`{}` leads to `{}`, which does not accept it — so running it twice refuses \
+                 instead of doing nothing. Declare the self-loop with whatever it owes there \
+                 (often nothing).",
+                event.name(),
+                state.name()
+            ),
             Self::UnreachableRemedy {
                 state,
                 event,
@@ -203,6 +242,23 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
         for &event in E::ALL {
             if !self.transitions.iter().any(|t| t.event == event) {
                 defects.push(Defect::UnusedEvent { event });
+            }
+        }
+
+        // Re-runnability, one destination at a time. Deduplicated, because several rows
+        // legitimately share a destination (three states `land` to `done`) and the defect is a
+        // property of the *pair*, not of each row that produces it.
+        let mut asked: HashSet<(S, E)> = HashSet::new();
+        for t in self.transitions {
+            let Dest::To(dest) = t.to else { continue };
+            if t.event.kind() != EventKind::Applied || !asked.insert((dest, t.event)) {
+                continue;
+            }
+            if matches!(self.accepts(dest, t.event), Acceptance::Undefined) {
+                defects.push(Defect::Unrepeatable {
+                    state: dest,
+                    event: t.event,
+                });
             }
         }
 

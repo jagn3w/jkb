@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **576 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **579 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -699,9 +699,20 @@ the code had no way to have. Design: `openspec/changes/jkb-state-machine/`.
   can be *walked*, and walking it is what makes these checkable at all: every state reaches a
   terminal one (`Wedged`), every state is reachable, no two rows compete (`Nondeterministic`),
   every reconciliation carries evidence (`UnguardedReconciliation`), every refusal's advice is an
-  event the machine really accepts (`UnreachableRemedy`), and under every observation something
-  can still move the object (`DeadEnd`). `Machine::dot()` renders it — the artifact whose absence
-  is the first item on the list.
+  event the machine really accepts (`UnreachableRemedy`), every verb can be run twice
+  (`Unrepeatable`), and under every observation something can still move the object (`DeadEnd`).
+  `Machine::dot()` renders it — the artifact whose absence is the first item on the list.
+- **`Unrepeatable` was found by the fix for the absorption bug below, and is the pair to it.**
+  Correcting absorption — a row with a guard or a plan is never absorbed implicitly, because the
+  object may have arrived by another route with that plan still owed — is right, and it silently
+  turned five destinations into refusals: `land` on an already-landed task among them. That is
+  S1.6's *the verb is re-runnable* lapsing, and a lapsed guarantee is worse than one never
+  claimed, because the retry advice everywhere else assumes it. The two rules together say: **a
+  verb you run is always answerable at its own destination, an observation only where somebody
+  wrote down what re-seeing it means.** Satisfying it does not mean "make it a no-op" — a domain
+  that wants the second run to fail declares a self-loop whose guard denies, and gets a sentence
+  and a remedy instead of the silent absence of a row. Two rows here keep their guards on purpose
+  (`abandon` from `open`, `observed_landed` from `done`): those verbs may still have work to do.
 - **`Fact` is three-valued and has no method that collapses `Unknown` to a `bool`.** Nine
   must-fixes are one unobtainable answer spelled `false`: `ahead_count` returning `0` (which means
   *nothing to land*) for a branch it could not resolve; `has_own_commits` answering *no* when

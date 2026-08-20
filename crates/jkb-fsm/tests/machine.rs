@@ -190,6 +190,23 @@ const ROWS: &[Transition<Parcel, Move, Facts, Fx>] = &[
         guard: Some(|f: &Facts| require_yes(f.signed_for, || Denial::new("no signature on file."))),
         plan: None,
     },
+    // Re-running a verb that worked. Both are unguarded: `ship_guard` asks whether the parcel
+    // may be shipped, which is not a question about one already in transit, and re-asking it
+    // would make the retry stricter than the original attempt.
+    Transition {
+        from: Parcel::Shipped,
+        event: Move::Ship,
+        to: Dest::To(Parcel::Shipped),
+        guard: None,
+        plan: None,
+    },
+    Transition {
+        from: Parcel::Delivered,
+        event: Move::Deliver,
+        to: Dest::To(Parcel::Delivered),
+        guard: None,
+        plan: None,
+    },
     Transition {
         from: Parcel::Shipped,
         event: Move::ObservedCourierGone,
@@ -248,8 +265,15 @@ fn a_well_formed_machine_has_no_defects() {
 ///
 /// The rule as first written absorbed any event whose destination you were already in, and a
 /// review found the hole: arriving there by some *other* route leaves that transition's plan
-/// unapplied. `write_off` carries no guard and no plan, so absorbing it loses nothing; `ship`
-/// carries a guard, so it is **not** absorbed and the pair is a named refusal instead.
+/// unapplied. `write_off` carries no guard and no plan, so absorbing it loses nothing;
+/// `observed_delivered` carries a guard, so it is **not** absorbed and the pair is a named
+/// refusal instead.
+///
+/// The example has to be a *reconciliation*, and that is the second rule showing through:
+/// [`Defect::Unrepeatable`] requires every applied event's destination to declare an answer, so
+/// there is no guarded, undeclared applied pair left in a well-formed machine to demonstrate on.
+/// Between them the two rules say: a verb you run is always answerable at its own destination,
+/// and an observation is answerable only where somebody wrote down what re-seeing it means.
 #[test]
 fn only_an_empty_transition_is_absorbed_implicitly() {
     let m = parcel();
@@ -265,13 +289,13 @@ fn only_an_empty_transition_is_absorbed_implicitly() {
         Outcome::Idempotent { .. }
     ));
 
-    // `ship` has a guard, so the destination does **not** absorb it: the answer is a refusal a
-    // person can read, not a silent skip that discards the guard.
+    // `observed_delivered` has a guard, so the destination does **not** absorb it: the answer is
+    // a refusal a person can read, not a silent skip that discards the guard.
     assert_eq!(
-        m.accepts(Parcel::Shipped, Move::Ship),
+        m.accepts(Parcel::Delivered, Move::ObservedDelivered),
         Acceptance::Undefined
     );
-    let out = m.apply(&at(Parcel::Shipped, &facts), Move::Ship);
+    let out = m.apply(&at(Parcel::Delivered, &facts), Move::ObservedDelivered);
     assert!(
         out.refusal().is_some(),
         "a guarded event was absorbed silently"
@@ -510,6 +534,51 @@ fn a_reconciliation_with_no_evidence_is_a_defect() {
         }),
         "{:?}",
         render(&defects)
+    );
+}
+
+/// `ship` carries a plan, so its destination does not absorb it — and nothing declares what a
+/// second `ship` means. The verb worked, and running it again is a refusal.
+///
+/// This is the defect the corrected absorption rule introduced into the task lifecycle: five
+/// pairs, including `land` on an already-landed task, all of them the S1.6 re-runnability
+/// guarantee quietly lapsing. It is checkable and nothing else finds it — the table is
+/// deterministic, every state is reachable and nothing is wedged.
+const UNREPEATABLE: &[Transition<Parcel, Move, Facts, Fx>] = &[
+    Transition {
+        from: Parcel::Ordered,
+        event: Move::Ship,
+        to: Dest::To(Parcel::Shipped),
+        guard: None,
+        plan: Some(|_| vec![Fx::DropCourier]),
+    },
+    Transition {
+        from: Parcel::Shipped,
+        event: Move::WriteOff,
+        to: Dest::To(Parcel::Lost),
+        guard: None,
+        plan: None,
+    },
+];
+
+#[test]
+fn a_verb_that_cannot_be_run_twice_is_a_defect() {
+    let defects = with(UNREPEATABLE).check();
+    assert!(
+        defects.contains(&Defect::Unrepeatable {
+            state: Parcel::Shipped,
+            event: Move::Ship,
+        }),
+        "{:?}",
+        render(&defects)
+    );
+    // ...and it is about *verbs*. `observed_delivered` also lands somewhere that does not accept
+    // it, and that is left alone: re-seeing a condition is the guards' business, not a retry.
+    assert!(
+        !defects.iter().any(
+            |d| matches!(d, Defect::Unrepeatable { event, .. } if *event == Move::ObservedDelivered)
+        ),
+        "a reconciliation was held to the re-runnability rule"
     );
 }
 

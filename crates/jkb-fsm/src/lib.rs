@@ -11,6 +11,7 @@
 //! * every *reconciliation* — a transition the world forces on us, rather than one somebody
 //!   asked for — carries evidence ([`Defect::UnguardedReconciliation`]);
 //! * a refusal's advice actually works ([`Defect::UnreachableRemedy`]);
+//! * every verb can be run twice ([`Defect::Unrepeatable`]), so a retry is never a diagnosis;
 //! * and under every observation, something can still move the object ([`Defect::DeadEnd`]).
 //!
 //! Three ideas do most of the work:
@@ -69,11 +70,16 @@
 //!                    else { Verdict::Deny(Denial::with_remedy("it is not latched.", Act::Shut, "Shut it first.")) }),
 //!         plan: None,
 //!     },
+//!     // `weld` carries a guard, so its destination does not absorb it and the second run has
+//!     // to be declared — unguarded, because "is it latched?" is not a question about a door
+//!     // that is already welded shut.
+//!     Transition { from: Door::Welded, event: Act::Weld, to: Dest::To(Door::Welded), guard: None, plan: None },
 //! ];
 //! let m = Machine { transitions: ROWS, initial: Door::Open };
 //! assert!(m.check().is_empty());
 //!
-//! // Asking twice is not an error: `shut` on a shut door is a no-op, declared by nobody.
+//! // Asking twice is not an error: `shut` on a shut door is a no-op, declared by nobody —
+//! // it has nothing to do, so there is nothing absorbing it can lose.
 //! let ctx = Ctx { at: Door::Closed, latched: Fact::Yes };
 //! assert!(matches!(m.apply(&ctx, Act::Shut), Outcome::Idempotent { .. }));
 //!
