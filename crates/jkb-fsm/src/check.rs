@@ -41,14 +41,15 @@ pub enum Defect<S, E> {
         /// The state nothing reaches.
         state: S,
     },
-    /// No path from this state reaches any terminal state. Whatever enters it never finishes:
-    /// the static half of *"the task is held for ever"*.
+    /// No path from this state reaches a state where nothing is owed. Whatever enters it never
+    /// gets back to rest: the static half of *"held for ever"* — a task that can never close, a
+    /// synced file that is refused on every pass.
     Wedged {
         /// The state with no way to finish.
         state: S,
     },
-    /// The machine declares no terminal state at all, so [`Self::Wedged`] would be vacuous.
-    NoTerminalState,
+    /// The machine declares no state at rest at all, so [`Self::Wedged`] would be vacuous.
+    NoSettledState,
     /// A [`EventKind::Reconciled`] transition with no guard: a state change asserted from
     /// nothing observed. Reconciliation paths are supposed to be the *explicit* ones.
     UnguardedReconciliation {
@@ -73,9 +74,12 @@ pub enum Defect<S, E> {
         /// The remedy that leads nowhere.
         remedy: E,
     },
-    /// Under this observation, a non-terminal state can be moved out of by nothing at all.
+    /// Under this observation, a state can be moved out of by nothing at all.
+    ///
     /// The per-context statement of *"held for ever"*, which static liveness cannot see because
-    /// every path out is guarded.
+    /// every path out is guarded. Skipped for states that are at rest, and for those that
+    /// declare [`State::awaits_input`] — a state waiting on a person has nothing the system can
+    /// do by definition, and reporting that would drown the ones that are genuinely stuck.
     DeadEnd {
         /// The state with nothing available.
         state: S,
@@ -115,10 +119,11 @@ impl<S: State, E: Event> fmt::Display for Defect<S, E> {
             }
             Self::Wedged { state } => write!(
                 f,
-                "state `{}` cannot reach any terminal state — whatever enters it never finishes",
+                "state `{}` cannot reach a state where nothing is owed — whatever enters it \
+                 never gets back to rest",
                 state.name()
             ),
-            Self::NoTerminalState => write!(f, "no state is terminal"),
+            Self::NoSettledState => write!(f, "no state is at rest"),
             Self::UnguardedReconciliation { from, event } => write!(
                 f,
                 "reconciliation `{}` in `{}` has no guard — it would assert a state change from \
@@ -215,13 +220,13 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
             }
         }
 
-        let terminals: Vec<S> = S::ALL.iter().copied().filter(|s| s.is_terminal()).collect();
-        if terminals.is_empty() {
-            defects.push(Defect::NoTerminalState);
+        let settled: Vec<S> = S::ALL.iter().copied().filter(|s| s.is_settled()).collect();
+        if settled.is_empty() {
+            defects.push(Defect::NoSettledState);
         } else {
-            let can_finish = reach(&backward, terminals.iter().copied());
+            let can_finish = reach(&backward, settled.iter().copied());
             for &state in S::ALL {
-                if !state.is_terminal() && !can_finish.contains(&state.name()) {
+                if !state.is_settled() && !can_finish.contains(&state.name()) {
                     defects.push(Defect::Wedged { state });
                 }
             }
@@ -290,7 +295,7 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
                     Outcome::Idempotent { .. } | Outcome::Undefined { .. } => {}
                 }
             }
-            if !state.is_terminal() && !can_move {
+            if !state.is_settled() && !state.awaits_input() && !can_move {
                 defects.push(Defect::DeadEnd { state, context: i });
             }
             if let Reconciliation::Ambiguous(events) = self.reconcile(ctx) {

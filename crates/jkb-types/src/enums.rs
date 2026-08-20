@@ -641,7 +641,10 @@ impl jkb_fsm::State for TaskStatus {
         self.as_str()
     }
 
-    fn is_terminal(self) -> bool {
+    /// A task is at rest when it is terminal: `done` or `cancelled`. The trait calls this
+    /// *settled* rather than *terminal* because not every machine's rest state is an ending —
+    /// a synced file settles and is then edited again — but for a task the two coincide.
+    fn is_settled(self) -> bool {
         Self::is_terminal(self)
     }
 }

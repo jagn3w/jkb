@@ -38,7 +38,7 @@
 //!     fn name(self) -> &'static str {
 //!         match self { Self::Open => "open", Self::Closed => "closed", Self::Welded => "welded" }
 //!     }
-//!     fn is_terminal(self) -> bool { matches!(self, Self::Welded) }
+//!     fn is_settled(self) -> bool { matches!(self, Self::Welded) }
 //! }
 //!
 //! #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,6 +73,30 @@
 //! let out = m.apply(&unknown, Act::Weld);
 //! assert_eq!(out.refusal().as_deref(), Some("it is not latched. Shut it first."));
 //! ```
+
+//! ## What a second machine changed
+//!
+//! The library was written against one lifecycle, and the second one — the sync journal, a
+//! *reconciler* rather than a lifecycle — moved three things. Recorded here because "it
+//! generalizes" is a claim, and this is the evidence:
+//!
+//! 1. **`is_terminal` became [`State::is_settled`].** A synced file is never finished; it
+//!    settles and is then edited again. Under the old name the machine either had no terminal
+//!    state — making [`Defect::Wedged`] vacuous — or had to lie about one. The property the
+//!    checks want is *rest*: the object owes the system nothing.
+//! 2. **[`State::awaits_input`] was added.** A conflicted file is waiting on a person; no
+//!    observation moves it, and that is correct rather than stuck. Without it,
+//!    [`Defect::DeadEnd`] fired on every such observation. A lifecycle leaves the default
+//!    (`false`) because an operator escape is always available.
+//! 3. **The *initial* state can be at rest.** A file an export-only mount has never imported and
+//!    holds no items for is nobody's business. Reachability is measured from `initial` and is
+//!    indifferent to whether it settles, so nothing else had to move.
+//!
+//! What did **not** move is the part that carries the value: [`Fact`], the plan-as-data, the
+//! remedy-as-event, and [`Machine::reconcile`] refusing ambiguity — which in the reconciler turns
+//! out to be the central property rather than a corner case, because *"a route is not a cause;
+//! the condition must dominate every arm"* is precisely what evaluating every candidate's guard
+//! against one observation gives you.
 
 mod check;
 mod fact;

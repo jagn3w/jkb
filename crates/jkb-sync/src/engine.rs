@@ -31,6 +31,7 @@ use jkb_types::{
 };
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::lifecycle::{FileEvent, FileState};
 use crate::serializers::{resolve, SyncBlock, SyncDoc, SyncItem, SyncSection, SyncSerializer};
 use crate::{Error, Result};
 
@@ -1504,7 +1505,7 @@ fn flag_needs_attention(
         &sync_state::SyncStateWrite {
             uri: bare_uri,
             serializer: ser_name,
-            status: "needs_attention",
+            status: journal_status(conn, bare_uri, FileEvent::WriteBlocked)?,
             last_synced_hash: journal.and_then(|j| j.last_synced_hash.as_deref()),
             base_blob_hash: journal.and_then(|j| j.base_blob_hash.as_deref()),
             parse_error: Some(reason),
@@ -1590,7 +1591,7 @@ fn three_way_resolve(
                     &sync_state::SyncStateWrite {
                         uri: bare_uri,
                         serializer: ser_name,
-                        status: "conflict",
+                        status: journal_status(conn, bare_uri, FileEvent::Conflicted)?,
                         last_synced_hash: last.as_deref(),
                         base_blob_hash: base.as_deref(),
                         parse_error: None,
@@ -1627,7 +1628,7 @@ fn quarantine(
         &sync_state::SyncStateWrite {
             uri: bare_uri,
             serializer: ser_name,
-            status: "needs_attention",
+            status: journal_status(conn, bare_uri, FileEvent::ParseFailed)?,
             last_synced_hash: last.as_deref(),
             base_blob_hash: base.as_deref(),
             parse_error: Some(&err.to_string()),
@@ -1691,7 +1692,7 @@ fn mark_ok(
         &sync_state::SyncStateWrite {
             uri: bare_uri,
             serializer: ser_name,
-            status: "ok",
+            status: journal_status(conn, bare_uri, FileEvent::Unchanged)?,
             last_synced_hash: Some(hash),
             base_blob_hash: Some(hash),
             parse_error: None,
@@ -1700,6 +1701,27 @@ fn mark_ok(
         },
     )?;
     Ok(())
+}
+
+/// The journal status this conclusion settles on, asked of `crate::lifecycle`.
+///
+/// The **one** place `sync_state.status` gets a value. It had four hand-written spellings, and
+/// two of them were the same string for two different states — a quarantine and a blocked write
+/// are both `needs_attention`, and `Outcome::Refused`'s own doc warns that the reason "must be
+/// read rather than assumed". The state set says which; this maps it back to the column.
+///
+/// # Errors
+/// Errors if the journal cannot be read, or if the conclusion is one the machine does not
+/// declare from this file's current state.
+fn journal_status(conn: &Connection, bare_uri: &str, event: FileEvent) -> Result<&'static str> {
+    let row = sync_state::get(conn, bare_uri)?;
+    let from = FileState::from_journal(
+        row.as_ref().map(|r| r.status.as_str()),
+        row.as_ref()
+            .is_some_and(|r| r.quarantine_blob_hash.is_some()),
+    );
+    crate::lifecycle::status_for(from, event)
+        .map_err(|e| Error::Types(TypeError::Validation(format!("{bare_uri}: {e}"))))
 }
 
 /// Everything about the file being reconciled that does not change during the pass.

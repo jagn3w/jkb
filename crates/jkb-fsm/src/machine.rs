@@ -18,9 +18,37 @@ pub trait State: Copy + Eq + std::hash::Hash + fmt::Debug + 'static {
     /// The stable, human-facing name (matches the stored spelling where there is one).
     fn name(self) -> &'static str;
 
-    /// Whether the lifecycle is finished here. At least one state must be terminal, and
-    /// every state must be able to reach one — see [`crate::Defect::Wedged`].
-    fn is_terminal(self) -> bool;
+    /// Whether the object is **at rest** here: it owes the system nothing further.
+    ///
+    /// At least one state must be, and every state must be able to reach one — see
+    /// [`crate::Defect::Wedged`].
+    ///
+    /// Deliberately *rest*, not *finished*. This was `is_terminal` while there was one machine,
+    /// and the second one broke it: a synced file is never finished — it settles and is then
+    /// edited again — so it either had no terminal state, making the liveness checks vacuous,
+    /// or had to lie about one. What the checks actually want is the state in which nothing is
+    /// owed. For a task that is `done`/`cancelled`; for a synced file it is `ok`; for an
+    /// investigation unit it would be any resolution other than `unresolved`.
+    fn is_settled(self) -> bool;
+
+    /// Whether this state legitimately has nothing the *system* can do: it is waiting on a
+    /// person.
+    ///
+    /// Default `false`, and a lifecycle usually leaves it there — a task always has an operator
+    /// escape (`cancel`), so a task state with no available move is a defect.
+    ///
+    /// A **reconciler** is different, and this is the second thing the second machine forced.
+    /// A synced file in `conflict` is waiting for you to edit it; until you do, no observation
+    /// moves it, and that is correct rather than stuck. Without this,
+    /// [`crate::Defect::DeadEnd`] reports every such observation and the check trains its reader
+    /// to ignore it.
+    ///
+    /// [`crate::Defect::Wedged`] still applies to these states, and it is the one that matters
+    /// for them: waiting on a person is fine, having *no edge back to rest at all* is the
+    /// "refused on every pass for ever" defect.
+    fn awaits_input(self) -> bool {
+        false
+    }
 }
 
 /// The observation a guard reads, which **is** where the object's state lives.
@@ -461,7 +489,7 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
     pub fn dot(&self, name: &str) -> String {
         let mut out = format!("digraph {name} {{\n  rankdir=LR;\n");
         for s in S::ALL {
-            let shape = if s.is_terminal() {
+            let shape = if s.is_settled() {
                 "doublecircle"
             } else {
                 "ellipse"

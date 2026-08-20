@@ -35,7 +35,7 @@ impl State for Parcel {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    fn is_settled(self) -> bool {
         matches!(self, Self::Delivered | Self::Lost)
     }
 }
@@ -620,7 +620,7 @@ fn a_machine_with_no_terminal_state_says_so() {
                 Self::B => "b",
             }
         }
-        fn is_terminal(self) -> bool {
+        fn is_settled(self) -> bool {
             false
         }
     }
@@ -663,5 +663,5 @@ fn a_machine_with_no_terminal_state_says_so() {
         transitions: ROWS,
         initial: Spin::A,
     };
-    assert!(m.check().contains(&Defect::NoTerminalState));
+    assert!(m.check().contains(&Defect::NoSettledState));
 }

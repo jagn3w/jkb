@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 globset = "0.4"
+jkb-fsm = { version = "0.1.0", path = "../jkb-fsm" }
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
 jkb-types = { version = "0.1.0", path = "../jkb-types" }
 notify = "8"
