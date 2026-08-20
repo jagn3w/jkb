@@ -108,9 +108,18 @@
 //!
 //! Two limits, stated rather than papered over. [`Defect::DeadEnd`] is a **lifecycle** check: for
 //! both reconcilers the states it would fire on declare [`State::awaits_input`], so it is
-//! vacuous there and [`Defect::Wedged`] is the one doing the work. And the remedy check has now
-//! caught a bad remedy in **every** machine written on this library, which is either strong
-//! evidence for it or a sign that naming a remedy is harder than it looks — probably both.
+//! vacuous there and [`Defect::Wedged`] is the one doing the work.
+//!
+//! And the remedy check has caught one bad remedy in **each of the three** real machines — the
+//! task lifecycle, the sync journal and investigation units — every time by the same mistake:
+//! the remedy was named from the *reader's* point of view rather than the machine's. "Open a
+//! session", "wait for an export", "re-run the observation" are all sensible sentences, and each
+//! named a transition that did not exist from the state being refused. That is the argument for
+//! [`Denial::remedy`] holding an event: a sentence cannot be wrong in a way anything can detect.
+//!
+//! Twice the bad remedy was the *symptom* of a bad rule underneath it — a guard whose premise was
+//! false, and a guard that did not know which of two tables it was running in. Which is the more
+//! interesting half: the check finds a sentence, and the sentence leads somewhere.
 
 mod check;
 mod fact;
