@@ -4571,7 +4571,13 @@ fn discover_pr(db: &Db, id: ItemId) -> Result<Option<i64>> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        pr::Discovery::Unavailable(why) => anyhow::bail!("{why}"),
+        // The remedy `gh` itself names — "close the task by hand" — is `close-merged`'s, and
+        // this is not that command: what to do *here* is name the number, which needs no `gh` at
+        // all. A message carried through from where it was written is how advice comes to be
+        // about somebody else's problem.
+        pr::Discovery::Unavailable(why) => anyhow::bail!(
+            "{why}\n  ...or name it directly: `jkb task pr <uid> <number>`, which needs no `gh`."
+        ),
     }
 }
 
@@ -5193,8 +5199,23 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
 
     // Claim first: if someone else is on this task, stop before making a worktree they
     // would have to clean up.
+    //
+    // The branch and its land target ride along **on the `start` transition**, because both are
+    // already known here and `start` is the entry a reader looks at first — a history whose
+    // opening line does not say where the work is sends them to the next line to find out.
     let owner = owner::session_owner(&worktree);
-    claim_session(db, id, uid, &owner, &worktree)?;
+    claim_session(
+        db,
+        id,
+        uid,
+        &owner,
+        &worktree,
+        &jkb_core::transition::Labels {
+            branch: Some(branch.clone()),
+            onto: Some(onto.clone()),
+            ..jkb_core::transition::Labels::default()
+        },
+    )?;
 
     let resumed = sessions.iter().any(|s| s.branch == branch);
     if !resumed {
@@ -5206,8 +5227,10 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     // added: a second value would be a contradiction rather than extra information, and is how
     // a task ends up with two branches and one worktree.
     //
-    // The land target rides along as a **label on the transition**, written in the same
-    // statement, so there is no second store for a resume to find out of step.
+    // The land target itself is recorded on the `start` transition above, not here: it is a
+    // label on the moment somebody said so, and there is no second store for a resume to find
+    // out of step. A **resumed** session re-asserts the claim, which is idempotent and writes no
+    // second row, so the facets are what this transaction is for.
     let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
     db.write_txn("cli", move |conn, meta| {
         repo::set_location_facets(
@@ -5218,18 +5241,6 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
                 branch: Some(&b),
                 repo: Some(&r),
                 onto: Some(&o),
-            },
-        )?;
-        let facts = task::observe(conn, id)?;
-        jkb_core::transition::note(
-            conn,
-            meta,
-            id,
-            &facts,
-            &jkb_core::transition::Labels {
-                branch: Some(b.clone()),
-                onto: Some(o.clone()),
-                ..jkb_core::transition::Labels::default()
             },
         )
     })?;
@@ -5548,7 +5559,14 @@ fn swap_claim(
 
 /// Take the session's claim, taking over from this session's own previous process (a resume)
 /// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
-fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -> Result<()> {
+fn claim_session(
+    db: &Db,
+    id: ItemId,
+    uid: &str,
+    owner: &str,
+    worktree: &Path,
+    labels: &jkb_core::transition::Labels,
+) -> Result<()> {
     let held = current_claim(db, id)?;
     if let Some(prev) = &held {
         let same_session =
@@ -5565,8 +5583,7 @@ fn claim_session(db: &Db, id: ItemId, uid: &str, owner: &str, worktree: &Path) -
             );
         }
     }
-    let (o, displaced) = (owner.to_owned(), held.clone());
-    let labels = jkb_core::transition::Labels::default();
+    let (o, displaced, labels) = (owner.to_owned(), held.clone(), labels.clone());
     let ok = db.write_txn("cli", move |conn, meta| {
         swap_claim(conn, meta, id, displaced.as_deref(), &o, &labels)
     })?;
