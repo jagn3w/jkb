@@ -19,10 +19,58 @@ import * as vscode from "vscode";
 
 /** The Claude Code extension, and the command that opens a chat with an initial prompt. */
 const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
-const CLAUDE_OPEN_COMMAND = "claude-vscode.editor.open";
+// `primaryEditor.open`, deliberately, and NOT `editor.open`. The latter is registered as
+// `(session, prompt, column) => { if (column !== ViewColumn.Active) setPreferredLocation("panel"); … }`
+// and `setPreferredLocation` writes `claudeCode.preferredLocation` with
+// `ConfigurationTarget.Global` — so calling it without a column silently rewrites the user's
+// GLOBAL settings on every hand-off, moving Claude Code out of their sidebar for every window
+// and every project. jkb does not edit other people's configuration. `primaryEditor.open` is
+// `createPanel(session, prompt, ViewColumn.Active)` with no such write, and is what Claude
+// Code's own `vscode://…/open?prompt=` URI handler calls.
+const CLAUDE_OPEN_COMMAND = "claude-vscode.primaryEditor.open";
 
-/** Where a launch went, so the caller can fall back when Claude Code is not there. */
-export type Launch = "here" | "window" | "unavailable";
+/**
+ * How the operator wants a session started (`jkb.taskLauncher`).
+ *
+ * The Claude Code extension is the better surface, not an obligation: someone who works in a
+ * terminal, or does not want a window per task, says so once instead of being handed a
+ * workflow. `auto` is the default and is the only value that silently substitutes one for the
+ * other — the two explicit values are honoured or reported, never quietly swapped.
+ */
+export type Launcher = "auto" | "extension" | "terminal";
+
+/** Where a launch went, and why it did not reach Claude Code when it did not. */
+export type Launch =
+  | { readonly where: "here" }
+  | { readonly where: "window" }
+  /** The user declined to reopen a session that may already have a window. */
+  | { readonly where: "declined" }
+  /**
+   * The caller should start `claude` in a terminal. `fallback` is absent when that is what the
+   * operator asked for — there is nothing to apologise for — and present when Claude Code was
+   * wanted and could not be had. `missing` then distinguishes "not installed", the one case
+   * where advising an install helps, from a failure that has a `cause`.
+   */
+  | {
+      readonly where: "terminal";
+      readonly fallback?: { readonly missing: boolean; readonly cause: string };
+    }
+  /** `launcher: "extension"` and it could not be started. Report it; substitute nothing. */
+  | { readonly where: "blocked"; readonly cause: string };
+
+/** What to start, and what is already known about the session. */
+export interface LaunchRequest {
+  readonly worktree: string;
+  readonly uid: string;
+  readonly prompt: string;
+  /**
+   * `jkb task work` returned an existing session, so a window may already be open on it.
+   * It is evidence, not proof — a session opened yesterday and closed is also `resumed` —
+   * which is why this asks rather than deciding.
+   */
+  readonly resumed: boolean;
+  readonly launcher: Launcher;
+}
 
 /** A prompt waiting for the window that opens on a session's worktree. */
 interface PendingPrompt {
@@ -31,36 +79,47 @@ interface PendingPrompt {
 }
 
 /**
- * Start Claude Code on `worktree` with `prompt` in its input.
+ * Start Claude Code on the session's worktree with `prompt` in its input.
  *
- * `"unavailable"` means the caller should fall back to a terminal: either the extension is
- * not installed, or it refused the command. It is never returned once a window has been
- * opened, so a fallback can only ever add a terminal to the window the user is already in.
+ * `where: "unavailable"` means the caller should fall back to a terminal. It is never returned
+ * once a window has been opened, so a fallback can only ever add a terminal to the window the
+ * user is already in.
  *
- * What VS Code does when a window is already open on the worktree is its call, and this does
- * not depend on knowing: the prompt is queued either way. A window that opens takes it on
- * activation; one already open leaves it queued until its next start. Both end at the same
- * prompt for the same task, which is where the button leads anyway.
+ * A **resumed** session is asked about rather than reopened. Forcing a window would either put
+ * a second Claude chat on a checkout the first is mid-edit on — the hazard D36 exists to
+ * prevent, one level up from the session — or, if VS Code focuses the existing window instead,
+ * deliver nothing and say nothing. Nothing observable tells the two apart from here: no API
+ * reports another window's folder, and `resumed` is about the *session*, not the window. So
+ * the person who can see their own windows is the one asked.
  */
 export async function launchClaude(
   context: vscode.ExtensionContext,
-  worktree: string,
-  uid: string,
-  prompt: string,
+  req: LaunchRequest,
 ): Promise<Launch> {
-  if (!vscode.extensions.getExtension(CLAUDE_EXTENSION_ID)) return "unavailable";
+  const { worktree, uid, prompt, launcher } = req;
+  // Asked for a terminal: no window, no queue, no question. The rest of this function is about
+  // reaching Claude Code, and none of it is something the operator asked to happen.
+  if (launcher === "terminal") return { where: "terminal" };
+
+  if (!vscode.extensions.getExtension(CLAUDE_EXTENSION_ID)) {
+    return unreachable(launcher, true, "the Claude Code extension is not installed");
+  }
 
   const here = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (here !== undefined && sameDirectory(here, worktree)) {
-    return (await openClaudeHere(prompt)) ? "here" : "unavailable";
+    // This window *is* the session, so there is nothing to ask and nothing to hand over.
+    const failure = await openClaudeHere(prompt);
+    return failure === undefined ? { where: "here" } : unreachable(launcher, false, failure);
   }
+
+  if (req.resumed && !(await confirmReopen(worktree))) return { where: "declined" };
 
   try {
     queuePrompt(context, worktree, { uid, prompt });
-  } catch {
+  } catch (e) {
     // The queue IS the hand-off. Opening the window anyway would give an empty Claude panel
     // in a worktree with no sign of which task it is for; a terminal carries the prompt.
-    return "unavailable";
+    return unreachable(launcher, false, (e as Error).message);
   }
   try {
     // `forceNewWindow` is load-bearing, not a preference: without it VS Code opens the folder
@@ -71,12 +130,34 @@ export async function launchClaude(
       vscode.Uri.file(worktree),
       { forceNewWindow: true },
     );
-  } catch {
+  } catch (e) {
     // No window will ever open on it, so nothing would ever take the prompt back out.
     takePrompt(context, worktree);
-    return "unavailable";
+    return unreachable(launcher, false, (e as Error).message);
   }
-  return "window";
+  return { where: "window" };
+}
+
+/**
+ * Claude Code was wanted and could not be started: fall back, or report, per the operator.
+ *
+ * One place decides, so the `extension` setting cannot be honoured on three of the four
+ * failure paths and quietly ignored on the fourth.
+ */
+function unreachable(launcher: Launcher, missing: boolean, cause: string): Launch {
+  return launcher === "extension"
+    ? { where: "blocked", cause }
+    : { where: "terminal", fallback: { missing, cause } };
+}
+
+/** Ask before reopening a session that may already have a window; false means leave it alone. */
+async function confirmReopen(worktree: string): Promise<boolean> {
+  const choice = await vscode.window.showInformationMessage(
+    `jkb: ${path.basename(worktree)} is already open as a session. If its window is up, switch ` +
+      "to it — reopening starts a second Claude on the same checkout.",
+    "Open its window",
+  );
+  return choice === "Open its window";
 }
 
 /**
@@ -92,18 +173,25 @@ export async function deliverQueuedPrompt(context: vscode.ExtensionContext): Pro
   if (folder === undefined) return;
   const pending = takePrompt(context, folder);
   if (!pending) return;
-  if (!(await openClaudeHere(pending.prompt))) {
+  const failure = await openClaudeHere(pending.prompt);
+  if (failure !== undefined) {
     vscode.window.showErrorMessage(
-      `jkb: could not start Claude Code for ${pending.uid} — run \`claude\` in a terminal here, ` +
-        "or click Work this task with Claude again.",
+      `jkb: could not start Claude Code for ${pending.uid} (${failure}) — run \`claude\` in a ` +
+        "terminal here, or click Work this task with Claude again.",
     );
   }
 }
 
-/** Open a Claude Code chat in this window with `prompt` in its input; false if it would not. */
-async function openClaudeHere(prompt: string): Promise<boolean> {
+/**
+ * Open a Claude Code chat in this window with `prompt` in its input.
+ *
+ * Returns `undefined` on success, or why it failed — the cause is what the user needs and what
+ * a swallowed `catch` throws away, leaving every failure to be reported as the one cause that
+ * happens to have advice attached.
+ */
+async function openClaudeHere(prompt: string): Promise<string | undefined> {
   const claude = vscode.extensions.getExtension(CLAUDE_EXTENSION_ID);
-  if (!claude) return false;
+  if (!claude) return "the Claude Code extension is not installed";
   try {
     // Its commands are registered by `activate`, and this runs at startup, where the order
     // two extensions activate in is not ours to assume.
@@ -112,9 +200,9 @@ async function openClaudeHere(prompt: string): Promise<boolean> {
     // box rather than being sent — the extension offers no way to submit it, and seeing what
     // is about to be asked before pressing enter is the better half of that trade.
     await vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND, undefined, prompt);
-    return true;
-  } catch {
-    return false;
+    return undefined;
+  } catch (e) {
+    return (e as Error).message;
   }
 }
 
@@ -140,6 +228,12 @@ function takePrompt(
   const queue = readQueue(context);
   const key = directoryKey(dir);
   const pending = queue[key];
+  // Nothing here: return without writing. Every VS Code window now activates at startup and
+  // calls this, so writing anyway would make each of them a read-modify-write of one shared
+  // file — and the lost update that race allows is an already-delivered prompt written back.
+  // Pruning rides on genuine writes instead, which is enough: an entry whose worktree is gone
+  // is undeliverable whether or not it is still in the file.
+  if (!pending) return undefined;
   delete queue[key];
   try {
     writeQueue(context, queue);
