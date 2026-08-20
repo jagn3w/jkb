@@ -1,10 +1,14 @@
-//! Starting a task session in the Claude Code extension rather than in a terminal.
+//! Starting a task session in the Claude Code extension, which by default means its own window.
 //
 // The extension runs Claude in the window's **first workspace folder** — its panel derives a
 // cwd from `workspaceFolders[0]` and takes no directory argument — while a task session is a
 // git worktree under the repo (design D36). So a panel opened from the repo's own window
 // would run Claude on the main checkout, editing the files the session exists to keep apart.
 // The session gets its own VS Code window instead.
+//
+// Which surface is used at all is the operator's, via `jkb.taskLauncher` (see `Launcher`): a
+// terminal in the worktree is a supported answer, not a degraded one, and everything below
+// about windows and hand-off applies only when Claude Code is the chosen surface.
 //
 // `vscode.openFolder` carries no payload and the new window is a different extension host, so
 // the prompt is handed over through a small queue in global storage: the opening window
