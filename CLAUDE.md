@@ -1316,7 +1316,12 @@ arguments, and the state kept between two windows.
 
 **A session is worked in its own VS Code window, in the Claude Code extension.** "Work this
 task with Claude" used to run `claude <prompt>` in a terminal — a terminal is where the whole
-UX then lived. The extension is the better surface, and it forces the window: its panel
+UX then lived. The extension is the better surface, and **`jkb.taskLauncher` lets the operator
+say so or not** (`auto` | `extension` | `terminal`): `auto` is the only value that substitutes
+one surface for the other, and the two explicit values are honoured or *reported*, never
+quietly swapped. One function (`unreachable`) turns a failure into either a fallback or a
+refusal, so the setting cannot be honoured on three failure paths and forgotten on the fourth.
+The extension forces the window: its panel
 derives a cwd from **`workspaceFolders[0]`** and takes no directory argument, so a chat opened
 from the repo's window would work the **main checkout** — the one thing a session exists to
 keep apart (D36). So the worktree has to *be* the window's folder. `vscode.openFolder` carries
@@ -1329,6 +1334,22 @@ it. Without the Claude Code extension installed the terminal remains the fallbac
 still the whole feature rather than a degraded one. The prompt lands in the chat input and is
 not sent — the extension offers no way to submit it, and seeing what is about to be asked is
 the better half of that trade.
+
+Three things this got wrong on the first pass, all found by `/review-log` and all worth
+keeping written down. **The command is `claude-vscode.primaryEditor.open`, never
+`editor.open`** — the latter is `(session, prompt, column) => { if (column !==
+ViewColumn.Active) setPreferredLocation("panel"); … }`, and that setter writes
+`claudeCode.preferredLocation` with `ConfigurationTarget.Global`. Calling it without a column
+rewrites the user's global settings on **every** hand-off, moving Claude Code out of their
+sidebar for every window and project; jkb does not edit other people's configuration, which is
+the same rule that kept D46 from writing a git ref. **A resumed session is asked about, not
+reopened**: `resumed` is evidence about the *session*, not about whether a window is up (one
+opened yesterday and closed is also resumed), and no API reports another window's folder — so
+the person who can see their own windows is the one asked, rather than forcing a second Claude
+onto one checkout. **`takePrompt` returns without writing when it took nothing**: every window
+now activates at startup and calls it, so writing back would put every VS Code window on the
+machine into the read-modify-write race for one shared file, whose lost update is an
+already-delivered prompt resurrected.
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.

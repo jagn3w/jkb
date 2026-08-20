@@ -206,6 +206,21 @@
           "type": "string",
           "default": "",
           "description": "Path to the jkb database (blank uses $JKB_DB or ~/.jkb/jkb.db)."
+        },
+        "jkb.taskLauncher": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "extension",
+            "terminal"
+          ],
+          "enumDescriptions": [
+            "Use the Claude Code extension when it is installed; otherwise run `claude` in a terminal.",
+            "Always use the Claude Code extension. If it cannot be started, say why rather than opening a terminal.",
+            "Always run `claude` in a terminal in the session's worktree. Never opens a window."
+          ],
+          "default": "auto",
+          "description": "How \"Work this task with Claude\" starts a task session. The extension opens the session's worktree as its own VS Code window (it runs Claude in the window's first workspace folder, so the worktree has to be that folder); the terminal runs in the worktree without opening a window."
         }
       }
     }

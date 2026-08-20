@@ -49,7 +49,8 @@ which command is asked for, with which arguments, and the state kept between two
    and edit tasks/namespaces inline) and **In Flight** (staging branches and the tasks
    landing on them).
 
-Settings: `jkb.cliPath` (default `jkb`) and `jkb.dbPath` (blank = `$JKB_DB` / `~/.jkb/jkb.db`).
+Settings: `jkb.cliPath` (default `jkb`), `jkb.dbPath` (blank = `$JKB_DB` / `~/.jkb/jkb.db`),
+and `jkb.taskLauncher` — `auto` (default), `extension`, or `terminal`; see below.
 
 ## What works
 
@@ -81,8 +82,17 @@ Settings: `jkb.cliPath` (default `jkb`) and `jkb.dbPath` (blank = `$JKB_DB` / `~
   the task's prompt. Clicking twice returns the same session rather than forking the work.
   It is a window because the Claude Code extension runs in the window's first workspace
   folder and takes no directory argument — so the worktree has to *be* that folder, or
-  Claude would work the main checkout. Without the Claude Code extension installed it falls
-  back to `claude` in a terminal in the worktree.
+  Claude would work the main checkout.
+  - **`jkb.taskLauncher` decides how**, because the extension is the better surface and not
+    an obligation. `auto` (default) uses it when installed and runs `claude` in a terminal
+    otherwise; `extension` always uses it and *says why* if it cannot, rather than handing
+    you the thing you ruled out; `terminal` always runs `claude` in the worktree and never
+    opens a window.
+  - **A session that already exists is asked about, not reopened.** Nothing observable says
+    whether its window is up — no API reports another window's folder — so rather than
+    guessing, the second click offers to open it. Forcing a window would either put a second
+    Claude on one checkout (the hazard the session model exists to prevent) or focus the
+    existing one and deliver nothing, silently.
 - **Land this task**: runs `jkb task land` in a terminal — the gate is a build, so its
   output is watchable.
 
