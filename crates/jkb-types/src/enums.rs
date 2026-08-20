@@ -615,6 +615,36 @@ mod tests {
     }
 }
 
+/// [`Resolution`] is the state set of an investigation unit's machine (design S9).
+///
+/// The third machine on [`jkb_fsm`], and the one whose rules are **strategy-supplied**: two
+/// tables over this one state set, differing where the strategies genuinely differ. See
+/// `jkb_core::nstype::lifecycle`.
+impl jkb_fsm::State for Resolution {
+    const ALL: &'static [Self] = Self::ALL;
+
+    fn name(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// A unit is at rest once it has ended, however it ended. The inherent
+    /// [`Resolution::is_settled`] says exactly this and the two must agree, so it is the one
+    /// definition — a second would be a second answer.
+    fn is_settled(self) -> bool {
+        Self::is_settled(self)
+    }
+
+    /// An unresolved unit is waiting on a person to go and investigate it.
+    ///
+    /// Nothing the *system* can do moves it: evidence has to arrive from outside, as an edge
+    /// somebody links. That is unlike a task's `open`, which always has `cancel` and `start`
+    /// available — which is why the task machine leaves this at its default and this one does
+    /// not.
+    fn awaits_input(self) -> bool {
+        !Self::is_settled(self)
+    }
+}
+
 /// A task starts [`TaskStatus::Open`] — the machine's initial state, and the value
 /// `task::create` writes.
 impl Default for TaskStatus {

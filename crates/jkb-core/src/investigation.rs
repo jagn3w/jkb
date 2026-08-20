@@ -585,15 +585,39 @@ pub fn roll_up(
     }
     .evaluate(conn)?;
 
+    let machine = strategy.unit_machine();
     let mut changed = Vec::new();
     for id in ids {
-        let current = item::get_resolution(conn, id)?.unwrap_or(Resolution::Unresolved);
-        let derived = strategy.resolution_rollup(conn, id)?;
-        if derived == current {
-            continue;
+        // The strategy says what it observed; the machine says what that means. Those were one
+        // function — a rollup that concluded — and the conclusion encoded the priority of
+        // contradictory evidence in the order of its `if`s, where nothing could see it.
+        //
+        // `reconcile` also refuses ambiguity, so two conditions claiming one unit is reported
+        // rather than resolved by whichever question the code asked first.
+        let facts = strategy.unit_facts(conn, id)?;
+        let current = facts.resolution;
+        let outcome = match machine.reconcile(&facts) {
+            jkb_fsm::Reconciliation::Settled => continue,
+            jkb_fsm::Reconciliation::Fired(out) => out,
+            jkb_fsm::Reconciliation::Ambiguous(events) => {
+                return Err(Error::Types(TypeError::Validation(format!(
+                    "`{}` carries evidence for two outcomes at once ({}), so `{}` will not \
+                     choose between them",
+                    uid_of(conn, id)?,
+                    events
+                        .iter()
+                        .map(|e| jkb_fsm::Event::name(*e))
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    strategy.name(),
+                ))))
+            }
+        };
+        for effect in outcome.effects() {
+            let nstype::lifecycle::UnitEffect::SetResolution(to) = effect;
+            item::set_resolution(conn, meta, id, *to)?;
+            changed.push((uid_of(conn, id)?, current, *to));
         }
-        item::set_resolution(conn, meta, id, derived)?;
-        changed.push((uid_of(conn, id)?, current, derived));
     }
     Ok(changed)
 }

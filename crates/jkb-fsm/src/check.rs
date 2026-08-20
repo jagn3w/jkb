@@ -214,8 +214,9 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
         let backward = self.adjacency(Direction::Backward);
 
         let reachable = reach(&forward, std::iter::once(self.initial));
+        let by_override = self.stated_reaches_everything();
         for &state in S::ALL {
-            if !reachable.contains(&state.name()) {
+            if !by_override && !reachable.contains(&state.name()) {
                 defects.push(Defect::UnreachableState { state });
             }
         }
@@ -239,6 +240,12 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
     /// A [`Dest::Stated`] row contributes no edge: it is an escape hatch, not a way the
     /// lifecycle gets anywhere, and counting it would make [`Defect::Wedged`] vacuous for every
     /// machine that has an operator override (see [`Dest`]).
+    ///
+    /// **Reachability is the exception, and asks the opposite question.** *Can the object be
+    /// here* is answered yes by an override, whatever the lifecycle does; *can the lifecycle get
+    /// it out of here* is not. Collapsing the two reported the investigation machine's
+    /// `abandoned` — which only a person ever sets — as unreachable dead code, when it is a
+    /// state units are in every day.
     fn adjacency(&self, direction: Direction) -> HashMap<&'static str, Vec<&'static str>> {
         let mut map: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         for t in self.transitions {
@@ -250,6 +257,14 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
             map.entry(a.name()).or_default().push(b.name());
         }
         map
+    }
+
+    /// Every state an operator could name outright — the destinations a [`Dest::Stated`] row can
+    /// resolve to, which is *any* state, since the caller chooses.
+    fn stated_reaches_everything(&self) -> bool {
+        self.transitions
+            .iter()
+            .any(|t| matches!(t.to, Dest::Stated(_)))
     }
 
     /// Walk every `(state, event)` pair against each observed context, and report the defects

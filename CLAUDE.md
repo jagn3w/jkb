@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **562 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **571 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -775,6 +775,33 @@ times, which is the evidence that "it generalizes" is a claim worth making:
   fixed.
 - `sync_state.status` now has **one writer** (`lifecycle::status_for`), replacing four
   hand-written spellings.
+
+### The third machine: investigation units, where the rules are strategy-supplied
+
+`jkb-core/src/nstype/lifecycle.rs` declares `items.resolution` on the same library — **two tables
+over one state set**, which is the axis neither earlier machine had. It moved the library twice
+more and found two rules that existed only in the shape of a function:
+
+- **`debugging` concludes differently, twice.** A settled result can go **stale** and return to
+  the frontier (an observation about a mutable system carries a `commit-range=`); and a tombstone
+  is **not** revived by fresh evidence, where the base table's is. Both were already true — the
+  first is one `if` in `debugging::resolution_rollup`, the second is that rollup's early return
+  versus `default_rollup`'s fall-through — and neither was discoverable from anywhere else.
+- **The strategy supplies the facts; the machine supplies the rules.** `resolution_rollup` (which
+  returned a *conclusion*) became `unit_facts`. A rollup that concludes has to encode the priority
+  of contradictory evidence in the order of its `if`s, where nothing can see it and nothing would
+  notice a reorder. As guard clauses the priority is arguable and `audit` proves it exclusive. A
+  strategy that merely *observes* differently — a `debugging` symptom is confirmed by a verified
+  fix, not a `confirms` edge — now needs no table of its own.
+- **Reachability counts a `Dest::Stated` edge; liveness still does not.** *Can the object be here*
+  is answered yes by an operator override; *can the lifecycle get it out of here* is not.
+  Collapsing them reported `abandoned` — which only a person ever sets — as unreachable dead code.
+- **`Resolution::Unresolved` declares `awaits_input`.** Nothing the system can do moves it;
+  evidence arrives from outside as an edge somebody links. Unlike a task's `open`, which always
+  has `cancel`.
+- **`UnusedEvent` is a per-machine statement**, and this is the first place two machines share one
+  event enum. The domain filters it only where *another* machine in the family declares the event,
+  and asserts the union separately — a narrow filter, so an event no table uses is still a defect.
 
 ### Claim keying: an owner id is a type, and `Unknown` is not `dead`
 

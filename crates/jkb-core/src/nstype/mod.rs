@@ -44,6 +44,7 @@
 pub mod conjecture;
 pub mod debugging;
 pub mod journal;
+pub mod lifecycle;
 pub mod tasks;
 pub mod views;
 
@@ -351,14 +352,36 @@ pub trait NamespaceType: Send + Sync {
         Ok(promise(conn, node)? + edge::evidence_for(conn, node)?)
     }
 
-    /// The resolution `node` *should* carry, derived from its incident edges — the
-    /// rollup that keeps the outcome axis honest instead of relying on an agent to
-    /// remember to set it. See [`default_rollup`] for the base rules.
+    /// What this strategy observed about one unit — the facts its machine reads.
+    ///
+    /// This replaced `resolution_rollup`, which returned a *conclusion*. The difference matters:
+    /// a rollup that concludes has to encode the priority of contradictory evidence in the order
+    /// of its `if`s, where nothing can see it and nothing would notice a reorder. Answering with
+    /// facts leaves the priority to [`lifecycle`]'s guards, where it is a clause a reader can
+    /// disagree with and [`jkb_fsm::Machine::audit`] can prove exclusive.
+    ///
+    /// The default reads the edge vocabulary ([`lifecycle::base_facts`]). Override it to observe
+    /// differently — a `debugging` symptom is confirmed by a *verified fix*, not by a `confirms`
+    /// edge — which most strategies with special rules need instead of a table of their own.
     ///
     /// # Errors
     /// Returns an error if a query fails.
-    fn resolution_rollup(&self, conn: &Connection, node: ItemId) -> Result<Resolution> {
-        default_rollup(conn, node)
+    fn unit_facts(&self, conn: &Connection, node: ItemId) -> Result<lifecycle::UnitFacts> {
+        lifecycle::base_facts(conn, node)
+    }
+
+    /// The machine governing this strategy's units (design S9, the third machine).
+    ///
+    /// Most strategies want [`lifecycle::BASE`]: they observe differently, not conclude
+    /// differently, and *what an observation means* is the shared part. A table of its own is for
+    /// a strategy that genuinely disagrees — `debugging` alone does, twice, and both differences
+    /// were previously only visible in the shape of one function.
+    ///
+    /// [`resolution_rollup`](NamespaceType::resolution_rollup) is checked against this: a derived
+    /// resolution the machine does not declare from the unit's current one is a named refusal,
+    /// not a silent write.
+    fn unit_machine(&self) -> &'static lifecycle::UnitMachine {
+        &lifecycle::BASE
     }
 
     /// The acceptance test for the investigation rooted at `ns_path`: is it finished, and
@@ -605,48 +628,6 @@ pub fn promise(conn: &Connection, node: ItemId) -> Result<f64> {
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite())
         .unwrap_or(0.0))
-}
-
-/// The base resolution rollup every strategy starts from: read the outcome off the edges
-/// that recorded it, so a unit cannot silently look live after being killed.
-///
-/// - an incoming `refutes` or `rules_out` ⇒ [`Resolution::DeadEnd`]
-/// - an incoming `supersedes` ⇒ [`Resolution::Superseded`]
-/// - an incoming `confirms` or `verifies` ⇒ [`Resolution::Success`]
-/// - otherwise the stored resolution (NULL reading as [`Resolution::Unresolved`])
-///
-/// Death wins over confirmation deliberately: a unit that is both confirmed and refuted is
-/// in dispute, and treating it as live-but-dead is safer than treating it as settled-good.
-///
-/// # Errors
-/// Returns an error if a query fails.
-pub fn default_rollup(conn: &Connection, node: ItemId) -> Result<Resolution> {
-    let incoming = |types: &[EdgeType]| -> Result<bool> {
-        let list = types
-            .iter()
-            .map(|t| format!("'{}'", t.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // The type strings come from the closed `EdgeType` enum, never from user input.
-        let sql =
-            format!("SELECT 1 FROM edges WHERE dst_item_id = ?1 AND type IN ({list}) LIMIT 1");
-        Ok(conn
-            .prepare_cached(&sql)?
-            .query_row([node.get()], |_| Ok(true))
-            .optional()?
-            .unwrap_or(false))
-    };
-
-    if incoming(&[EdgeType::Refutes, EdgeType::RulesOut])? {
-        return Ok(Resolution::DeadEnd);
-    }
-    if incoming(&[EdgeType::Supersedes])? {
-        return Ok(Resolution::Superseded);
-    }
-    if incoming(&[EdgeType::Confirms, EdgeType::Verifies])? {
-        return Ok(Resolution::Success);
-    }
-    Ok(crate::item::get_resolution(conn, node)?.unwrap_or(Resolution::Unresolved))
 }
 
 #[cfg(test)]

@@ -74,7 +74,7 @@
 //! assert_eq!(out.refusal().as_deref(), Some("it is not latched. Shut it first."));
 //! ```
 
-//! ## What a second machine changed
+//! ## What later machines changed
 //!
 //! The library was written against one lifecycle, and the second one — the sync journal, a
 //! *reconciler* rather than a lifecycle — moved three things. Recorded here because "it
@@ -92,11 +92,25 @@
 //!    holds no items for is nobody's business. Reachability is measured from `initial` and is
 //!    indifferent to whether it settles, so nothing else had to move.
 //!
+//! A **third** — investigation units, whose rules are strategy-supplied — moved two more:
+//!
+//! 4. **Reachability counts a [`Dest::Stated`] edge; liveness still does not.** *Can the object
+//!    be here* is answered yes by an operator override; *can the lifecycle get it out of here* is
+//!    not. Collapsing them reported a state only a person ever sets as unreachable dead code.
+//! 5. **[`Defect::UnusedEvent`] is a per-machine statement.** That machine is two tables over one
+//!    event enum, and an event one table does not use is normal. A family checks the union.
+//!
 //! What did **not** move is the part that carries the value: [`Fact`], the plan-as-data, the
-//! remedy-as-event, and [`Machine::reconcile`] refusing ambiguity — which in the reconciler turns
+//! remedy-as-event, and [`Machine::reconcile`] refusing ambiguity — which in a reconciler turns
 //! out to be the central property rather than a corner case, because *"a route is not a cause;
 //! the condition must dominate every arm"* is precisely what evaluating every candidate's guard
 //! against one observation gives you.
+//!
+//! Two limits, stated rather than papered over. [`Defect::DeadEnd`] is a **lifecycle** check: for
+//! both reconcilers the states it would fire on declare [`State::awaits_input`], so it is
+//! vacuous there and [`Defect::Wedged`] is the one doing the work. And the remedy check has now
+//! caught a bad remedy in **every** machine written on this library, which is either strong
+//! evidence for it or a sign that naming a remedy is harder than it looks — probably both.
 
 mod check;
 mod fact;
