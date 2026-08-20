@@ -514,3 +514,20 @@ fn the_verdict_type_is_reachable_without_any_io() {
     let v: Verdict<TaskEvent> = super::land_guard(&landable());
     assert!(matches!(v, Verdict::Allow));
 }
+/// REPRO of the review's must-fix: an event absorbed by the idempotence rule discards the
+/// plan its declared row carries.
+#[test]
+fn absorbed_abandon_still_releases_the_claim() {
+    let facts = TaskFacts {
+        status: TaskStatus::Open,
+        claimant: Some(agent("a")),
+        owner_alive: Fact::Yes,
+        work_dirty: Fact::No,
+        ..TaskFacts::default()
+    };
+    let out = apply(&facts, TaskEvent::Abandon);
+    assert!(
+        out.effects().contains(&TaskEffect::ReleaseClaim),
+        "abandon was absorbed and dropped its plan: {out:?}"
+    );
+}

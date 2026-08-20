@@ -3123,14 +3123,17 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               make <v> the facet's ONLY value (add appends). Use for the
                               single-answer facets: repo=. Writing branch= also records where
                               that branch was cut, but prefer `task start`, which can be told
-                              the branch it was cut FROM.
+                              the branch it lands ON.
   jkb task start <uid> [--branch B] [--onto S]
-                              claim it and record the branch, the repo, where B lands, and —
-                              from --onto — where B forked. Prefer it to tagging branch=.
-  jkb task base --forget <branch>
-                              drop a branch's cut point; it prints what can be recorded next,
-                              which depends on the branch. No verb takes a sha — the nearest
-                              one to hand is the branch tip, which freezes the task.
+                              claim it and record the branch, the repo and where B lands.
+                              Prefer it to tagging branch= by hand.
+  jkb task why <uid>          how this task reached its state: every transition, who applied it,
+                              and the evidence each one fired on. Run this FIRST when a task
+                              is stuck.
+  jkb task pr <uid> [number]  record (or discover, from the branch) the pull request that will
+                              prove this task's work landed. `close-merged` closes a task only
+                              when that PR has MERGED; anything it cannot prove is reported
+                              with the reason. No verb takes a sha.
 
 RECOVERY (the archive nothing else exposes)
   jkb history <path>          every synced version of a file, newest first.
@@ -4922,21 +4925,18 @@ struct Land {
     dropped_trunk: bool,
 }
 
-/// `task landed <branch> --onto <target>` — record a landing the merge queue performed (B4).
+/// `task landed <branch> --onto <target>` — the merge queue reporting a graft it performed.
 ///
-/// **Why this cannot be a fabrication route.** `jkb task land` writes the record in Rust, straight
-/// after its own gate; the queue is bash and needs a verb. So the verb re-establishes the fact it
-/// is being told, by asking the same question every reader asks: is this branch's work in the
-/// target (`repo::landed_with_base` → `Merged`)? A branch with nothing on it answers
-/// `NothingToMerge` and is refused, which is the case a fabricated call would otherwise use to
-/// claim a landing for work that does not exist.
+/// **It does not verify the graft, and no longer claims to.** The predecessor refused unless the
+/// work was demonstrably in the target, judged from the commit graph; that inference is gone, and
+/// with it the check. What remains is a trusted report from a caller that ran the graft itself and
+/// gated it — `scripts/merge-queue.sh`, whose own REVIEWER is a stricter gate than `task land`'s
+/// (D38). Recorded as `observed_landed`, which is the event for a landing jkb did not perform
+/// through `task land`.
 ///
-/// Deliberately **not** "is the branch's tip an ancestor of the target". A queue entry that landed
-/// after an earlier one is rebased, so its commits are rewritten and the branch ref — which the
-/// detached rebase does not move — is not an ancestor of the target at all. That check would have
-/// refused every entry but the first, which is precisely the case the serial queue exists for.
-/// Containment by content is the project's own definition of landed (D34.2) and is the one that
-/// survives rebase and squash alike.
+/// # Errors
+/// Errors if either name is not usable as a git ref, if this is not a git repository, or if no
+/// task in it records `branch`.
 fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> {
     gitrepo::valid_ref(branch)?;
     gitrepo::valid_ref(onto)?;
@@ -4972,6 +4972,7 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
             ref_commit: head.clone(),
             ..jkb_core::transition::Labels::default()
         };
+        let labels_for_note = labels.clone();
         let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
             // `landed_elsewhere` is **asserted by the caller**, and the caller is the merge queue
             // reporting a graft it performed and gated itself (D38: the swarm's REVIEWER is that
@@ -4995,7 +4996,21 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
         })?;
         match outcome.refusal() {
             None => recorded.push(uid.clone()),
-            Some(why) => not_closed.push((uid.clone(), why)),
+            Some(why) => {
+                // **The graft still happened, so it is still recorded.** `perform` writes a
+                // history row only when it moves, and a group task held for an open subtask
+                // would otherwise store nothing about a landing the queue really performed: the
+                // subtask finishes later, nothing re-runs this verb, and `close-merged` finds no
+                // landing and no pull request (the queue grafts locally, so there is none) —
+                // holding the task for ever on "no pull request has that branch as its head".
+                let labels = labels_for_note.clone();
+                db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
+                    let facts = task::observe(conn, id)?;
+                    jkb_core::transition::note(conn, meta, id, &facts, &labels)?;
+                    Ok(())
+                })?;
+                not_closed.push((uid.clone(), why));
+            }
         }
     }
 
@@ -5708,8 +5723,13 @@ fn land_preflight(
         Some(s) => gitrepo::is_dirty(&s.worktree)?,
         None => false,
     };
+    // The same question the machine's `land` guard asks, asked **before** the graft. Both read
+    // `containment`, which is where the answer lives (D35), so the row, the command and the
+    // machine cannot disagree about which parents are held.
+    let open_subtasks = !db.read(move |conn| task::subtasks_all_terminal(conn, id))?;
     if let Some(reason) = staging::land_blocker(&staging::LandFacts {
         state,
+        open_subtasks,
         worktree: sess.as_ref().map(|s| s.worktree.as_path()),
         dirty,
         commits: ahead,
@@ -6431,6 +6451,20 @@ struct CloseVerdict {
 fn cmd_task_close_merged(db: &Db, repo: Option<String>, dry_run: bool, json: bool) -> Result<()> {
     let ctx = repo::repo_ctx().map_err(|e| anyhow::anyhow!("{e}"))?;
     let repo = repo.unwrap_or_else(|| ctx.key.clone());
+    // **Refused when `--repo` names somewhere else.** Pull request numbers are per-repository
+    // and low ones collide by construction, so resolving another repo's task against *this*
+    // checkout asks `gh pr view 31` here and closes on an unrelated merge — D34.4's "a wrong
+    // close buries work still in flight". The predecessor refused this outright; deleting the
+    // whole inference took its guard with it.
+    anyhow::ensure!(
+        repo == ctx.key,
+        "`--repo {repo}` names a different repository from this checkout ({}), and pull request \
+         numbers are per-repository — asking `gh` here would resolve {}'s numbers against {}'s. \
+         Run it from {repo}'s checkout.",
+        ctx.key,
+        repo,
+        ctx.key,
+    );
     // Typed, not interpolated into the DSL: `--repo` is user-typed, and a value with whitespace
     // would re-tokenize into a different query that matches nothing — closing no task and
     // reporting no error.
@@ -6439,6 +6473,17 @@ fn cmd_task_close_merged(db: &Db, repo: Option<String>, dry_run: bool, json: boo
 
     let mut verdicts = Vec::new();
     for id in ids {
+        // A finished task costs nothing. `tasks_in_repo` deliberately keeps terminal tasks (the
+        // staging view needs them), so the filter lives here — without it this fired a `gh`
+        // subprocess and a write transaction per long-`done` task on **every `git pull`**, via
+        // the `post-merge` hook, and then reported them under "closed N task(s)" because
+        // `Outcome::Idempotent` has no refusal to print.
+        let status = db
+            .read(move |conn| item::get(conn, id))?
+            .and_then(|m| m.status);
+        if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
+            continue;
+        }
         verdicts.push(close_one(db, &ctx.root, id, dry_run)?);
     }
     report_close_merged(&verdicts, dry_run, json);
@@ -6720,11 +6765,39 @@ fn cmd_task_claim(
     let owner = owner.unwrap_or_else(owner::preferred_owner);
     let id = resolve_task_uid(db, uid)?;
     let owner2 = owner.clone();
-    let ok = db.write_txn("cli", move |conn, meta| {
-        if acquire {
-            claim::claim(conn, meta, id, &owner2)
-        } else {
-            claim::release(conn, meta, id, &owner2)
+    // Acquiring goes through the machine, like `task work` and `task start`. It is the **third**
+    // claim verb and the busiest — `/task-swarm` runs it on every task in every group — so a
+    // bare `claim::claim` here meant swarm work had no `start` entry in its history at all, and
+    // meant this verb and `jkb task start` answered `needs_review` oppositely: one flipped it to
+    // `in_progress`, the other refused.
+    //
+    // Releasing stays owner-scoped and outside the machine: giving up a claim you hold is not a
+    // lifecycle move, and `release` is deliberately a CAS on the owner so one agent cannot drop
+    // another's.
+    let ok = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
+        if !acquire {
+            return Ok(claim::release(conn, meta, id, &owner2)?);
+        }
+        let facts = lifecycle::TaskFacts {
+            actor: Some(jkb_types::AgentId::parse(&owner2)),
+            ..task::observe(conn, id)?
+        };
+        let outcome = jkb_core::transition::perform(
+            conn,
+            meta,
+            id,
+            &facts,
+            lifecycle::TaskEvent::Start,
+            &jkb_core::transition::Labels::default(),
+        )?;
+        match outcome.refusal() {
+            // A refusal is reported, not raised: the caller asked whether it could have the
+            // task, and "no, because …" is an answer. The swarm reads the boolean.
+            Some(why) => {
+                eprintln!("{why}");
+                Ok(false)
+            }
+            None => Ok(true),
         }
     })?;
     let key = if acquire { "acquired" } else { "released" };
@@ -6736,7 +6809,9 @@ fn cmd_task_claim(
     } else {
         match (acquire, ok) {
             (true, true) => println!("claimed {uid} for {owner} (now in_progress)"),
-            (true, false) => println!("{uid} is already claimed by another live owner"),
+            // The machine's own sentence has already gone to stderr, so this does not restate a
+            // reason it does not know: the refusal may be a live owner, or a terminal task.
+            (true, false) => println!("{uid} was not claimed (see above)"),
             (false, true) => println!("released {uid} (was held by {owner})"),
             (false, false) => println!("{uid} was not claimed by {owner}"),
         }
@@ -7340,6 +7415,56 @@ mod tests {
 
     /// Both `--status` enumerations name every status the CLI accepts.
     ///
+    /// Neither agent-facing surface may advertise a verb the binary does not have.
+    ///
+    /// `jkb guide` is compiled into the binary and `AGENTS.md` sits at the repo root, so a verb
+    /// deleted from `clap` leaves both untouched — and an agent following either runs a command
+    /// that does not exist. `jkb task base` was deleted with the cut point and stayed in `GUIDE`
+    /// for a whole branch; the class is what is closed here, not the instance.
+    ///
+    /// Checked by asking `clap` itself for the subcommand names, so this cannot drift.
+    #[test]
+    fn neither_agent_surface_advertises_a_verb_that_was_deleted() {
+        use clap::CommandFactory;
+        let task = super::Cli::command();
+        let task = task
+            .get_subcommands()
+            .find(|c| c.get_name() == "task")
+            .expect("`jkb task` exists");
+        let verbs: Vec<&str> = task
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(verbs.contains(&"why") && verbs.contains(&"pr"), "{verbs:?}");
+
+        let agents = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"),
+        )
+        .expect("AGENTS.md sits at the repo root");
+        for (surface, text) in [("jkb guide", GUIDE), ("AGENTS.md", agents.as_str())] {
+            for line in text.lines() {
+                let Some(rest) = line.trim_start().strip_prefix("jkb task ") else {
+                    continue;
+                };
+                let Some(verb) = rest.split_whitespace().next() else {
+                    continue;
+                };
+                // `jkb task <uid>`-style placeholders and prose are skipped; only a bare word
+                // that looks like a subcommand is held to the list.
+                if verb.starts_with('<')
+                    || verb.starts_with('[')
+                    || !verb.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                {
+                    continue;
+                }
+                assert!(
+                    verbs.contains(&verb),
+                    "{surface} advertises `jkb task {verb}`, which the binary does not have"
+                );
+            }
+        }
+    }
+
     /// `GUIDE` declares `AGENTS.md` its mirror and nothing held the two in step: both omitted
     /// `cancelled`, while AGENTS.md's own landing section tells you to set exactly that to clear
     /// a must-fix and land. The set comes from `TaskStatus::ALL`, generated with the enum, so

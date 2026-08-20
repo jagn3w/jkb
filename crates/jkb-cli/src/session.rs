@@ -250,12 +250,18 @@ impl LandLock {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let holder = fs::read_to_string(&path).unwrap_or_default();
-                    let alive = holder
+                    // Stale **only when the holder is proven gone**. A pid we could not parse and
+                    // a `ps` we could not run are both unestablished, and breaking a live land
+                    // lock on an unestablished answer runs two grafts at once — the one thing
+                    // this file exists to prevent. So the lock is respected unless the holder is
+                    // provably dead.
+                    let dead = holder
                         .trim()
                         .parse::<u32>()
-                        .is_ok_and(crate::owner::pid_alive);
+                        .map_or(jkb_fsm::Fact::Unknown, crate::owner::pid_alive)
+                        .is_no();
                     anyhow::ensure!(
-                        !alive,
+                        dead,
                         "another `jkb task land` is running here (pid {}) — landing is serial \
                          so its gate result stays meaningful; wait for it to finish",
                         holder.trim()

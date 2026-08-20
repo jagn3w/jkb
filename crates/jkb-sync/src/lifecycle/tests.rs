@@ -284,11 +284,9 @@ fn unparseable_bytes_quarantine_from_anywhere() {
             parses: Fact::No,
             ..settled()
         };
-        if *state == FileState::Quarantined {
-            // Already there: the machine absorbs the event rather than treating a second
-            // failing pass as an error (the idempotence rule).
-            continue;
-        }
+        // Including from `Quarantined` itself: a second failing pass has different bytes to
+        // stash, so it concludes the same thing and writes it again. That row is declared
+        // rather than absorbed, because absorbing it would throw the stash away.
         assert_eq!(
             fired(&facts),
             Some((FileEvent::ParseFailed, FileState::Quarantined)),

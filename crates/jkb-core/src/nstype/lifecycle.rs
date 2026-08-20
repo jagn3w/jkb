@@ -151,11 +151,14 @@ fn refuted(f: &UnitFacts) -> Verdict<UnitEvent> {
 fn superseded(f: &UnitFacts) -> Verdict<UnitEvent> {
     all_of([
         require_yes(f.superseded, || Denial::new("nothing replaces it.")),
+        // No remedy event: `refuted` is what is *blocking* this, so naming it points at the
+        // transition that makes things worse — and `validate_remedy` would certify it, because
+        // the event really is accepted where the unit is unresolved. What clears it is unlinking
+        // an edge, which is not a transition of this machine at all.
         require_no(f.refuted, || {
-            Denial::with_remedy(
-                "it is refuted, and a refutation outranks a replacement.",
-                UnitEvent::Refuted,
-                "Unlink the refuting edge if the refutation no longer stands.",
+            Denial::new(
+                "it is refuted, and a refutation outranks a replacement — unlink the refuting \
+                 edge if the refutation no longer stands.",
             )
         }),
     ])
@@ -165,17 +168,15 @@ fn confirmed(f: &UnitFacts) -> Verdict<UnitEvent> {
     all_of([
         require_yes(f.confirmed, || Denial::new("nothing confirms it.")),
         require_no(f.refuted, || {
-            Denial::with_remedy(
-                "it is refuted, and a refutation outranks a confirmation.",
-                UnitEvent::Refuted,
-                "Unlink the refuting edge if the refutation no longer stands.",
+            Denial::new(
+                "it is refuted, and a refutation outranks a confirmation — unlink the refuting \
+                 edge if the refutation no longer stands.",
             )
         }),
         require_no(f.superseded, || {
-            Denial::with_remedy(
-                "it has been replaced, and the replacement is what to confirm.",
-                UnitEvent::Superseded,
-                "Confirm the unit that superseded it instead.",
+            Denial::new(
+                "it has been replaced, and the replacement is what to confirm — confirm the unit \
+                 that superseded it instead.",
             )
         }),
         // **Staleness outranks confirmation**, which is the priority `debugging`'s rollup had

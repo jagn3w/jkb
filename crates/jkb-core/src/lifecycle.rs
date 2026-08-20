@@ -315,18 +315,22 @@ fn review_gate(f: &TaskFacts) -> Verdict<TaskEvent> {
         return Verdict::Allow;
     }
     all_of([
+        // **No remedy event on either of these**, and that is the corrected form. Both sentences
+        // are already complete advice, and both obvious candidates are wrong: `submit_for_review`
+        // is not accepted from `needs_review` (you are there), and `request_changes` is not
+        // accepted from `in_progress` (likewise) — so naming either points at the transition the
+        // task has already made. What actually clears these is running a review or fixing its
+        // findings, neither of which is a transition of this machine.
         require_yes(f.reviewed, || {
-            Denial::with_remedy(
-                "No review is recorded for this head.",
-                TaskEvent::SubmitForReview,
-                "Run `/review-log`, or land anyway with `jkb task land --no-review`.",
+            Denial::new(
+                "No review is recorded for this head. Run `/review-log`, or land anyway with \
+                 `jkb task land --no-review`.",
             )
         }),
         require_yes(f.review_clean, || {
-            Denial::with_remedy(
-                "Its review has open must-fix findings.",
-                TaskEvent::RequestChanges,
-                "Fix or cancel them, or land anyway with `jkb task land --no-review`.",
+            Denial::new(
+                "Its review has open must-fix findings. Fix or cancel them, or land anyway with \
+                 `jkb task land --no-review`.",
             )
         }),
     ])
@@ -487,10 +491,25 @@ const ROWS: &[Transition<TaskStatus, TaskEvent, TaskFacts, TaskEffect>] = &[
         guard: Some(start_guard),
         plan: Some(take_claim),
     },
-    // Declared so a re-`start` by a *different* agent is refused rather than silently absorbed
-    // by the idempotence rule. Same agent: a no-op that re-asserts the claim.
+    // Declared so a re-`start` by a *different* agent is refused rather than silently absorbed.
+    // Same agent: a no-op that re-asserts the claim.
     Transition {
         from: TaskStatus::InProgress,
+        event: TaskEvent::Start,
+        to: Dest::To(TaskStatus::InProgress),
+        guard: Some(start_guard),
+        plan: Some(take_claim),
+    },
+    // **Picking a reviewed task back up.** `needs_review` is where the documented review loop
+    // leaves every task, so a `jkb task work` that refused it would refuse the commonest resume
+    // there is — including the explorer's "Work this task with Claude" button, on exactly the
+    // task a reviewer has just filed findings against.
+    //
+    // The same destination as `request_changes`, and deliberately a different event: that one is
+    // the *reviewer* sending work back, this one is somebody picking it up. The history should
+    // not report them as the same thing.
+    Transition {
+        from: TaskStatus::NeedsReview,
         event: TaskEvent::Start,
         to: Dest::To(TaskStatus::InProgress),
         guard: Some(start_guard),
@@ -536,6 +555,18 @@ const ROWS: &[Transition<TaskStatus, TaskEvent, TaskFacts, TaskEffect>] = &[
     },
     Transition {
         from: TaskStatus::NeedsReview,
+        event: TaskEvent::Abandon,
+        to: Dest::To(TaskStatus::Open),
+        guard: Some(abandon_guard),
+        plan: Some(plan_abandon),
+    },
+    // **Abandoning a task that is already `open`.** Reaching `open` some other way — an operator
+    // override, which is non-terminal and so keeps the claim — used to make this event get
+    // absorbed, and with it went the guard, the claim release, and the history row, while the
+    // caller read success. The claim then held the task off every frontier: verbatim the harm
+    // `plan_abandon` exists to prevent. Declared, so the plan runs.
+    Transition {
+        from: TaskStatus::Open,
         event: TaskEvent::Abandon,
         to: Dest::To(TaskStatus::Open),
         guard: Some(abandon_guard),

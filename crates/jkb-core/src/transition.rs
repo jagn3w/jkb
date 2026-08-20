@@ -316,20 +316,26 @@ pub fn land_target(conn: &Connection, task: ItemId) -> Result<Option<String>> {
     Ok(out)
 }
 
-/// The landing jkb itself performed for this task, if it did.
+/// The landing recorded for this task, whichever route recorded it.
 ///
-/// Proof of the strongest kind available: jkb ran the graft. Everything else — a pull request
-/// merged by somebody else — is [`crate::lifecycle::TaskEvent::ObservedLanded`].
+/// **Both events, and that is the point.** `jkb task land` records `land`; the merge queue's
+/// `jkb task landed` records `observed_landed`. Matching only the first meant the swarm's whole
+/// flow — queue fast-forwards, records the graft, then `/review-log` runs `review record` — put
+/// every group task in "has not grafted their work onto it yet", which was false, while three
+/// separate places documented the opposite.
+///
+/// An `onto` is required: it is what a reader asks about ("did this work reach *that* branch"),
+/// and an entry without one answers nothing.
 ///
 /// # Errors
 /// Returns a database error if the query fails.
 pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
     use jkb_fsm::Event as _;
-    let want = TaskEvent::Land.name();
+    let landing = [TaskEvent::Land.name(), TaskEvent::ObservedLanded.name()];
     Ok(history(conn, task)?
         .into_iter()
         .rev()
-        .find(|r| r.event == want))
+        .find(|r| landing.contains(&r.event.as_str()) && r.labels.onto.is_some()))
 }
 
 /// The pull request recorded for this task, if any — the most recently recorded one.
@@ -392,7 +398,8 @@ pub fn note(
 /// cannot read — comes back in `unverifiable` instead. That is a behaviour change and a
 /// deliberate one: the old predicate returned `bool` and treated an unreadable owner as
 /// reclaimable, which silently frees a live agent's task. Reporting it costs one command
-/// (`jkb task reclaim --force`); reclaiming it wrongly costs the work.
+/// (`jkb task release <uid> --owner <owner>`, once you know that owner is gone); reclaiming it
+/// wrongly costs the work.
 ///
 /// Liveness is evaluated **inside the write transaction** against the freshly-read claim set,
 /// which closes the race where a claim acquired concurrently by a live owner is reclaimed from a

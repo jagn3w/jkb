@@ -101,11 +101,16 @@ fn a_refutation_outranks_a_confirmation_and_says_so() {
     };
     assert_eq!(out.state(), Resolution::DeadEnd);
 
-    // ...and the refusal says *why* the confirmation lost, naming the event that would change it.
+    // ...and the refusal says *why* the confirmation lost — in a sentence, and deliberately with
+    // **no remedy event**. The obvious candidate is `refuted`, which is what is blocking it: a
+    // remedy naming the event that makes things worse is exactly the class the remedy check
+    // exists for, and `validate_remedy` would have certified this one, because `refuted` really
+    // is accepted where the unit is unresolved.
     let Outcome::Refused { denial, .. } = BASE.apply(&contradictory, UnitEvent::Confirmed) else {
         panic!("a confirmation against a refutation must be refused");
     };
-    assert_eq!(denial.remedy.map(|r| r.event), Some(UnitEvent::Refuted));
+    assert_eq!(denial.remedy, None, "the remedy points at the blocker");
+    assert!(denial.reason.contains("unlink the refuting edge"));
 }
 
 /// An observation nobody could establish moves nothing. For a rollup that is the whole safety

@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **571 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **576 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -663,6 +663,27 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
 
 ## The lifecycle is a checkable state machine, and a landing is an event (D48)
+
+**Reviewed in three ranges (`low`, ~18 agents): 36 findings, 8 must-fix, all fixed.** What the
+reviewer caught that the machine's own checks did not, recorded because the pattern repeats:
+
+- **Absorption discarded a plan.** The idempotence rule treated any event whose destination you
+  were already in as a no-op — but arriving there another way leaves the plan unapplied.
+  `abandon` on an operator-reopened task skipped its guard *and* its claim release, reported
+  success, and the surviving claim held the task off every frontier. A row with a guard or a plan
+  is never absorbed now; the domain declares the self-loop.
+- **Two of my own tests could not fail.** One asserted `stdout contains uid` where the failure
+  path prints the uid too; one asserted a defect that is structurally unreachable for its machine.
+  Both are why `jkb task landed` never credited a swarm group for a whole branch.
+- **A guard that only reports is not a guard.** The open-subtasks rule lived in the machine's
+  `land` plan, which is applied *last* — so it narrated a landing that had already grafted and
+  disposed of the session. It belongs in the preflight, beside every other precondition.
+- **`Unknown` spelled as `No`, in the probe that protects every claim.** `pid_exists` folded "`ps`
+  would not spawn" into "that process is gone" — the exact defect `Fact` exists to prevent.
+- **A choke point with a third door.** `jkb task claim`, the verb the swarm runs on every task,
+  still wrote the claim directly; swarm work had no `start` entry at all, and the two claim verbs
+  answered `needs_review` oppositely.
+
 
 The `staging-workflow` branch took 44 review passes and ~80 must-fix findings. Sorting the
 task-lifecycle ones by *cause* rather than by site gives six groups, and each maps to a property

@@ -566,9 +566,17 @@ const ROWS: &[Transition<FileState, FileEvent, FileFacts, FileEffect>] = rows! {
                                                        -Recovered->        Settled : recovering, settle;
 
     // --- the three ways a pass ends without settling ---------------------------------------
-    [Untracked, Settled, Conflicted, Blocked]          -ParseFailed->      Quarantined : parse_failed, stash;
-    [Settled, Quarantined, Blocked]                    -Conflicted->       Conflicted : conflicting, flag_conflict;
-    [Untracked, Settled, Conflicted, Quarantined]      -WriteBlocked->     Blocked : write_blocked, flag_blocked;
+    // Each includes its **own** state. A pass that re-observes the same trouble concludes the
+    // same thing and writes it again — the file failed to parse again, with different bytes to
+    // stash; the conflict is still unresolved. These used to be absorbed implicitly, which threw
+    // the plan away; a row carrying a plan is never absorbed now, so what a pass really does is
+    // declared rather than assumed.
+    [Untracked, Settled, Conflicted, Quarantined, Blocked]
+                                                       -ParseFailed->      Quarantined : parse_failed, stash;
+    [Untracked, Settled, Conflicted, Quarantined, Blocked]
+                                                       -Conflicted->       Conflicted : conflicting, flag_conflict;
+    [Untracked, Settled, Conflicted, Quarantined, Blocked]
+                                                       -WriteBlocked->     Blocked : write_blocked, flag_blocked;
 };
 
 /// The sync journal's machine.

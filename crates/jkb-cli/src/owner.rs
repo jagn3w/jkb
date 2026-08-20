@@ -63,8 +63,11 @@ pub fn session_worktree(owner: &str) -> Option<PathBuf> {
 
 /// Whether a process with this pid exists — the raw probe, for callers that hold a pid rather
 /// than an owner id (the land lock's stale-holder check).
+///
+/// `Unknown` when `ps` could not be run at all. The land lock reads this to decide whether a
+/// holder is stale, and treating "could not ask" as "gone" there breaks a live lock.
 #[must_use]
-pub fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> Fact {
     pid_exists(pid)
 }
 
@@ -96,8 +99,10 @@ fn hostname() -> String {
 #[must_use]
 pub fn is_alive(owner: &str) -> Fact {
     match AgentId::parse(owner).liveness() {
-        Liveness::Process(pid) => Fact::from(pid_exists(pid)),
-        Liveness::Worktree(dir) => Fact::from(dir.exists()),
+        Liveness::Process(pid) => pid_exists(pid),
+        // `Path::exists` is itself lossy — it answers `false` for a permission error as well as
+        // for a missing directory — so it is asked through `try_exists`, which separates them.
+        Liveness::Worktree(dir) => Fact::observed(dir.try_exists()),
         Liveness::External => Fact::Unknown,
     }
 }
@@ -105,11 +110,20 @@ pub fn is_alive(owner: &str) -> Fact {
 /// Whether a process with this pid exists. `ps -p <pid> -o pid=` prints the pid and exits 0
 /// if it does, 1 otherwise; it does not require ownership of the process. Dependency-free
 /// and single-host.
-fn pid_exists(pid: u32) -> bool {
-    Command::new("ps")
+///
+/// **A spawn failure is [`Fact::Unknown`], not `No`.** `is_ok_and` collapsed the two, which is
+/// the exact defect this whole type exists to prevent, sitting in the probe that protects every
+/// claim: in an environment where `ps` cannot be spawned — a stripped container, a process-table
+/// limit, `fork` denied — one `doctor --fix` would read every live `host:pid` owner as proven
+/// dead and free the lot. Exiting non-zero is an answer; failing to run is not.
+fn pid_exists(pid: u32) -> Fact {
+    match Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "pid="])
         .output()
-        .is_ok_and(|out| out.status.success())
+    {
+        Ok(out) => Fact::from(out.status.success()),
+        Err(_) => Fact::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +158,34 @@ mod tests {
         assert_eq!(is_alive("host:4294967290"), Fact::No);
         assert_eq!(is_alive("garbage"), Fact::Unknown);
         assert_eq!(is_alive("agent:01JBX7Q4"), Fact::Unknown);
+    }
+
+    /// A probe that **could not be run** is `Unknown`, never `No`.
+    ///
+    /// This is the defect the whole `Fact` type exists to prevent, and it was sitting in the one
+    /// probe that protects every claim: `is_ok_and` folded "`ps` would not spawn" into "that
+    /// process is gone", so one `doctor --fix` in a stripped container would free every live
+    /// `host:pid` claim in the database.
+    ///
+    /// Exercised by making the spawn fail for real — `PATH` emptied, so `ps` cannot be found —
+    /// rather than by trusting the match arm to be right.
+    #[test]
+    fn a_probe_that_could_not_run_is_unknown_not_dead() {
+        // Serialized against nothing else here: this test owns the env var for its duration and
+        // the other tests in this module do not read `PATH`.
+        let saved = std::env::var_os("PATH");
+        // SAFETY-adjacent: single-threaded within this test, restored below.
+        std::env::set_var("PATH", "");
+        let answer = is_alive(&self_owner());
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(
+            answer,
+            Fact::Unknown,
+            "a `ps` that could not be spawned read as a dead owner"
+        );
     }
 
     #[test]

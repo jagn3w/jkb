@@ -24,6 +24,15 @@
 //! domain's own effect type, produced with the move, so a caller cannot perform half of a
 //! transition. The machine performs nothing itself and knows nothing about databases or git.
 //!
+//! **Absorption is only for a transition with nothing to do.** The destination of a transition
+//! treats that event as a no-op *only* when the row carrying it has no guard and no plan. The
+//! first version absorbed any such pair, and a review found what that costs: arriving at a
+//! destination by some **other** route leaves the plan unapplied, so `abandon` on a task an
+//! operator had already moved to `open` skipped its guard, skipped its claim release, wrote no
+//! history and reported success — while the surviving claim held the task off every frontier.
+//! A row with something to do is [`Outcome::Undefined`] instead, which is a named refusal, and a
+//! domain that wants the no-op declares the self-loop and gets its plan run.
+//!
 //! **A refusal names an event, not a sentence.** [`Denial::remedy`] is a [`Remedy`] holding an
 //! event of this machine, so "here is what to do instead" is checkable — and a remedy that
 //! cannot be expressed as an event means the machine is missing a transition.
@@ -105,6 +114,12 @@
 //! out to be the central property rather than a corner case, because *"a route is not a cause;
 //! the condition must dominate every arm"* is precisely what evaluating every candidate's guard
 //! against one observation gives you.
+//!
+//! And a limit found the same way: **a remedy must not name the event that is blocking it.**
+//! Three guards did, and [`Machine::validate_remedy`] certified them, because the event really
+//! is accepted where the object is — it just makes things worse. Where the way out is not a
+//! transition at all (unlink an edge, fix a finding, run a review), the honest answer is a
+//! sentence and no remedy.
 //!
 //! Two limits, stated rather than papered over. [`Defect::DeadEnd`] is a **lifecycle** check: for
 //! both reconcilers the states it would fire on declare [`State::awaits_input`], so it is

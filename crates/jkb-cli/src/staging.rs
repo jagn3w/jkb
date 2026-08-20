@@ -167,11 +167,35 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     // statement about a moment, so it needs no such agreement — and two tasks told different
     // targets are now two entries with timestamps rather than one row silently keeping whichever
     // wrote last.
+    // **One** read for the whole listing, not one per task. This view redraws on every database
+    // write and every `db.read` is a round trip to the single writer thread, so a per-task read
+    // is the N+1 shape `repo_tasks` already exists to avoid — and it replaced a batched read when
+    // the branch records went.
+    //
+    // The two per-task facts are gathered together: where the task's work lands, and whether it
+    // is held by an open subtask.
+    let ids: Vec<jkb_types::ItemId> = tasks.iter().map(|t| t.meta.id).collect();
+    let per_task: Vec<(Option<String>, bool)> = db.read(move |conn| {
+        ids.iter()
+            .map(|id| {
+                Ok((
+                    jkb_core::transition::land_target(conn, *id)?,
+                    !jkb_core::task::subtasks_all_terminal(conn, *id)?,
+                ))
+            })
+            .collect()
+    })?;
+    let held: std::collections::HashSet<jkb_types::ItemId> = tasks
+        .iter()
+        .zip(&per_task)
+        .filter(|(_, (_, open_subtasks))| *open_subtasks)
+        .map(|(t, _)| t.meta.id)
+        .collect();
+
     let mut by_onto: BTreeMap<String, Vec<&RepoTask>> = BTreeMap::new();
-    for t in &tasks {
-        let id = t.meta.id;
-        if let Some(target) = db.read(move |conn| jkb_core::transition::land_target(conn, id))? {
-            by_onto.entry(target).or_default().push(t);
+    for (t, (target, _)) in tasks.iter().zip(&per_task) {
+        if let Some(target) = target {
+            by_onto.entry(target.clone()).or_default().push(t);
         }
     }
 
@@ -232,7 +256,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         };
         let mut staged = Vec::new();
         for t in group {
-            staged.push(stage_task(db, ctx, &branch_ctx, t, &mut cache)?);
+            staged.push(stage_task(db, ctx, &branch_ctx, t, &held, &mut cache)?);
         }
         // Pipeline order — what is being built, then what is under review, then what is
         // finished — with a stable uid tie-break so the listing does not reshuffle between
@@ -316,6 +340,7 @@ fn stage_task(
     ctx: &RepoCtx,
     branch_ctx: &BranchCtx<'_>,
     t: &RepoTask,
+    held: &std::collections::HashSet<jkb_types::ItemId>,
     cache: &mut Cache,
 ) -> Result<StagedTask> {
     let BranchCtx {
@@ -380,11 +405,16 @@ fn stage_task(
     // the first run's still-open must-fix findings.
     let review_nss = facet_values(&t.tags, review::FACET_REVIEW).to_vec();
     let found = cache.findings(db, &review_nss)?;
+    // Read once for the whole listing, from `containment` — the same source the command and the
+    // machine read, so the row and the land it describes cannot disagree about which parents are
+    // held. Terminal work is past the question.
+    let open_subtasks = !terminal && held.contains(&t.meta.id);
     let worktree = sess.map(|s| s.worktree.clone());
     let verdict = review::gate_with(&found, &t.tags, &review_nss);
     let review_ok = matches!(verdict, review::GateVerdict::Passed);
     let land_blocked = land_blocker(&LandFacts {
         state,
+        open_subtasks,
         worktree: worktree.as_deref(),
         dirty,
         commits,
@@ -481,6 +511,14 @@ pub(crate) fn target_dirty_reason(
 /// command (`land_preflight`) from the same git and KB reads.
 pub(crate) struct LandFacts<'a> {
     pub(crate) state: State,
+    /// Whether the task still has a non-terminal subtask (design D34.1: you work the leaves).
+    ///
+    /// Judged **here**, with every other precondition, so the refusal happens before the graft.
+    /// It was checked only inside the machine's `land` guard, which `transition::perform` runs
+    /// *last* — after the rebase, the fast-forward, the gate and the session disposal — so the
+    /// rule reported on a branch that had already moved and a worktree that was already gone,
+    /// three lines below a comment saying a refusal must not have moved a branch first.
+    pub(crate) open_subtasks: bool,
     pub(crate) worktree: Option<&'a std::path::Path>,
     pub(crate) dirty: bool,
     /// Commits the work branch has that the staging branch does not.
@@ -550,6 +588,13 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
     if facts.commits == 0 {
         return Some("It has no commits that the staging branch does not.".to_owned());
     }
+    if facts.open_subtasks {
+        return Some(
+            "It still has open subtasks — you work the leaves, and the parent lands after them."
+                .to_owned(),
+        );
+    }
+
     if let Some(reason) = facts.target_dirty {
         return Some(reason.to_owned());
     }

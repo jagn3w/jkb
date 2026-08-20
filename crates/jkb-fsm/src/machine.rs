@@ -321,11 +321,12 @@ pub struct Machine<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> {
 impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, X> {
     /// Whether this machine has a transition for `(state, event)`, before guards.
     ///
-    /// The idempotence rule (design S1.6) lives here: **the destination of a transition accepts
-    /// that transition's own event as a no-op, unless the table declares otherwise.** So
-    /// `start` on an already-started task is not an error, and no verb has to remember that.
-    /// A domain that wants different behaviour there declares the self-loop, and the declared
-    /// row wins.
+    /// The idempotence rule (design S1.6) lives here, in the form a review corrected it to:
+    /// **the destination of a transition absorbs that event as a no-op only when the row
+    /// carrying it has nothing to do.** A row with a guard or a plan is never absorbed
+    /// implicitly, because arriving at its destination by some *other* route leaves that plan
+    /// unapplied — see the comment in the body for the incident. A domain that wants the no-op
+    /// declares the self-loop, and the declared row wins.
     pub fn accepts(&self, state: S, event: E) -> Acceptance<S> {
         if let Some(t) = self.row(state, event) {
             return match t.to {
@@ -333,12 +334,26 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
                 Dest::Stated(_) => Acceptance::MovesAsStated,
             };
         }
-        // Only a *declared* destination absorbs its own event. A stated one names no state, so
-        // there is nothing for it to be already-achieved at.
-        if self
-            .transitions
-            .iter()
-            .any(|t| t.event == event && matches!(t.to, Dest::To(to) if to == state))
+        // Implicit absorption, and **only when there is nothing to absorb**.
+        //
+        // The rule was: the destination of a transition accepts its own event as a no-op. That
+        // is true when the object got here *by that transition* and false when it arrived another
+        // way — and the difference is the whole plan. A task moved to `open` by an operator
+        // override still holds its claim; `abandon` was then absorbed, so `abandon_guard` never
+        // ran, `[SetStatus(Open), ReleaseClaim]` never ran, no history was written, and the
+        // caller read success while the claim kept the task off every frontier.
+        //
+        // So a row carrying a guard or a plan is never absorbed implicitly: the pair is
+        // [`Acceptance::Undefined`], which is a **named refusal** rather than a silent skip, and
+        // a domain that wants the no-op declares the self-loop and gets its plan run. Only a row
+        // with nothing to do can be absorbed, because there is then nothing to lose.
+        let landing_here = || {
+            self.transitions
+                .iter()
+                .filter(|t| t.event == event && matches!(t.to, Dest::To(to) if to == state))
+        };
+        if landing_here().next().is_some()
+            && landing_here().all(|t| t.guard.is_none() && t.plan.is_none())
         {
             return Acceptance::Idempotent;
         }

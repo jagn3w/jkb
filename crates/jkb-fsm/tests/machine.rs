@@ -244,28 +244,76 @@ fn a_well_formed_machine_has_no_defects() {
     assert!(dynamics.is_empty(), "{:?}", render(&dynamics));
 }
 
-/// Asking for what already happened is a no-op, and no verb had to remember that (design S1.6).
+/// Asking for what already happened is a no-op — **only when there is nothing to absorb**.
+///
+/// The rule as first written absorbed any event whose destination you were already in, and a
+/// review found the hole: arriving there by some *other* route leaves that transition's plan
+/// unapplied. `write_off` carries no guard and no plan, so absorbing it loses nothing; `ship`
+/// carries a guard, so it is **not** absorbed and the pair is a named refusal instead.
 #[test]
-fn the_destination_of_a_transition_absorbs_its_own_event() {
+fn only_an_empty_transition_is_absorbed_implicitly() {
     let m = parcel();
     let facts = Facts::default();
-    assert!(matches!(
-        m.apply(&at(Parcel::Shipped, &facts), Move::Ship),
-        Outcome::Idempotent { .. }
-    ));
+
+    // Nothing to do, so nothing is lost by treating it as done.
     assert_eq!(
-        m.accepts(Parcel::Shipped, Move::Ship),
+        m.accepts(Parcel::Lost, Move::WriteOff),
         Acceptance::Idempotent
     );
-    // ...and it does not invent one for an event that never lands here.
+    assert!(matches!(
+        m.apply(&at(Parcel::Lost, &facts), Move::WriteOff),
+        Outcome::Idempotent { .. }
+    ));
+
+    // `ship` has a guard, so the destination does **not** absorb it: the answer is a refusal a
+    // person can read, not a silent skip that discards the guard.
+    assert_eq!(
+        m.accepts(Parcel::Shipped, Move::Ship),
+        Acceptance::Undefined
+    );
+    let out = m.apply(&at(Parcel::Shipped, &facts), Move::Ship);
+    assert!(
+        out.refusal().is_some(),
+        "a guarded event was absorbed silently"
+    );
+
+    // ...and it does not invent an answer for an event that never lands here at all.
     assert_eq!(
         m.accepts(Parcel::Ordered, Move::Deliver),
         Acceptance::Undefined
     );
-    assert!(matches!(
-        m.apply(&at(Parcel::Ordered, &facts), Move::Deliver),
-        Outcome::Undefined { .. }
-    ));
+}
+
+/// A domain that wants the no-op **declares the self-loop**, and then gets its plan run — which
+/// is the whole point of not absorbing it silently.
+#[test]
+fn a_declared_self_loop_runs_its_plan() {
+    static ROWS: &[Transition<Parcel, Move, Facts, Fx>] = &[
+        Transition {
+            from: Parcel::Ordered,
+            event: Move::WriteOff,
+            to: Dest::To(Parcel::Lost),
+            guard: None,
+            plan: None,
+        },
+        Transition {
+            from: Parcel::Lost,
+            event: Move::WriteOff,
+            to: Dest::To(Parcel::Lost),
+            guard: None,
+            plan: Some(|_| vec![Fx::DropCourier]),
+        },
+    ];
+    let m = Machine {
+        transitions: ROWS,
+        initial: Parcel::Ordered,
+    };
+    let out = m.apply(&at(Parcel::Lost, &Facts::default()), Move::WriteOff);
+    assert_eq!(
+        out.effects(),
+        [Fx::DropCourier],
+        "the declared self-loop's plan was skipped"
+    );
 }
 
 /// An undeclared pair is a refusal a person can read, not a silent nothing.

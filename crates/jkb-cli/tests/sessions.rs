@@ -1667,12 +1667,21 @@ fn a_review_credits_a_group_whose_branch_was_tagged_after_its_work() {
         .success();
 
     f.add_finding("reviews/swarm", "something to fix");
+    // Asserted on the **consequence**, not on the uid appearing in stdout. The first version
+    // checked `stdout contains uid`, and `review::record` prints the uid in the *skipped* bucket
+    // too — so the assertion was satisfied by the exact failure it was written to catch, and the
+    // bug shipped green. It must be absent from the skipped bucket and carry `reviewed=`.
     f.jkb()
         .args(["task", "review", "record", "--branch", "integration"])
         .args(["--findings", "reviews/swarm"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(&uid));
+        .stdout(predicate::str::contains("not tagged").not());
+    f.jkb()
+        .args(["--global", "task", "show", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reviewed="));
     // `landed` closes it — the queue's own gate is what D38 says the swarm's review is — so the
     // review credits a task that is already `done` rather than moving it to `needs_review`.
     // What is asserted is the crediting: the task is named, and `reviewed=` is written.
@@ -2713,4 +2722,43 @@ fn task_why_shows_what_moved_the_task_and_on_what_evidence() {
             .any(|r| r["branch"].as_str() == Some(branch.as_str())),
         "the branch the work is on is not recorded anywhere in the history"
     );
+}
+
+/// A parent with an open subtask is refused **before** the graft, not reported after it.
+///
+/// The rule was checked only inside the machine's `land` guard, which the transition applies
+/// last — after the rebase, the fast-forward, the gate and the session disposal. So it did not
+/// prevent the landing, it narrated one that had already happened: branch moved, worktree gone,
+/// task left `in_progress`. The assertion that matters is that the **target did not move**.
+#[test]
+fn a_parent_with_an_open_subtask_is_refused_before_the_graft() {
+    let f = Fixture::new();
+    let parent = f.add_task("parent task");
+    let s = f.work(&parent);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "p.txt", "parent work\n", "parent work");
+
+    // A subtask, created after the session so the parent already has commits to land.
+    f.jkb()
+        .args(["--global", "task", "add", "child task", "--under", &parent])
+        .assert()
+        .success();
+
+    let before = git(&f.repo, &["rev-parse", &onto]);
+    f.jkb()
+        .args(["task", "land", &parent, "--no-gate", "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("open subtasks"));
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &onto]),
+        before,
+        "the refusal happened after the graft had already moved the target"
+    );
+    assert!(
+        worktree.exists(),
+        "the session was disposed of before the refusal"
+    );
+    assert_eq!(f.status_of(&parent), "in_progress");
 }
