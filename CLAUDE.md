@@ -1250,13 +1250,36 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   second is reported **inconclusive**, never as a pass. The canary is deliberately not
   dot-prefixed: `~/.jkb-…` shares a prefix with the allowed `~/.jkb`, and that near-miss is how a
   probe comes to lie.
-- **Not the container, and why.** The sketch mounts `~/repos` and `~/.claude`, which *is* the
-  blast radius that matters — escape is not the threat model, an agent damaging the mounts is. A
-  container also has **more** egress than this posture, and for an agent that has read every repo
-  you own, egress is the risk. On macOS it is a VM: bind-mount IO is slow and this repo's loop is
-  native (pinned rustup toolchain, `sqlite-vec` FFI, headless Chrome, launchd, worktrees under
-  `~/repos`). And the vendor gates auto-approval on **its own** sandbox, so inside a container you
-  would still be prompted. Containers remain right where the host is untrusted or the work is.
+- **The container: measured, and the first answer here was wrong.** This section originally
+  argued a container "buys nothing, because the sketch mounts `~/repos` and `~/.claude` and that
+  *is* the blast radius". That is right about **Bash** and wrong about everything else — the
+  generalisation was the error. For the in-process tools a container is not a second copy of the
+  seatbelt: it puts the `claude` process itself in a mount namespace, so `Read`/`Glob`/`Grep`/
+  `Edit` become default-deny **by the kernel**, which is exactly what the deny-beats-allow rule
+  model cannot express. Genuine depth, and it closes the hole above.
+  - **Whether the layers compose was measured** (Lima VM, Ubuntu 26.04 / kernel 7.0, Docker 29.7),
+    with a no-container baseline first so a failure is attributable to the container profile and
+    not the kernel. **Stock Docker cannot host it** — not root, not non-root, not with
+    `--cap-add SYS_ADMIN`, not with AppArmor off; `bwrap` fails at namespace creation every time.
+    The blocker is **seccomp**, and the fix is narrower than the folklore: neither `--privileged`
+    nor `seccomp=unconfined` is required. Docker's *default* profile plus an unconditional allow
+    for `clone, clone3, unshare, setns, mount, umount2, pivot_root, mount_setattr, open_tree,
+    move_mount, fsopen, fsconfig, fsmount, fspick` suffices — and those are then usable only
+    *inside* the user namespace `bwrap` creates, where the process holds no privilege over the
+    host. It must also run **non-root**: with seccomp off, root in a container still cannot create
+    a mount/net/pid namespace directly. Dev Containers already default to non-root.
+  - **Not established:** that Claude Code *itself* starts in such a container, or that
+    `strictAllowlist` survives nesting. `claude -p` hangs in a bare container — and hangs
+    identically with **no** sandbox configuration, so the control proves the hang is unrelated and
+    the probe cannot discriminate. The table is the mechanism, not the product; "bwrap works,
+    therefore the sandbox works" is still an inference.
+  - **What it does not buy:** `~/repos` mounted is still writable and push-able — the win is
+    bounded to what you did not mount. And container egress is unrestricted by default, so if the
+    inner sandbox ever fails to start you lose `strictAllowlist`; a container without its own
+    iptables/ipset allowlist is a **downgrade** on egress. On macOS both container paths are a
+    Linux VM, so the native loop (pinned rustup, `sqlite-vec` FFI, headless Chrome, launchd,
+    worktrees under `~/repos`) has to be re-plumbed. That cost is unchanged; what changed is that
+    the security argument now favours the container where it did not before.
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not
