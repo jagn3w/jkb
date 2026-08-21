@@ -49,7 +49,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # Docker seeds a fresh volume from the image directory at that path — and when there is no such
 # directory it creates the volume root-owned, so the container user cannot write it and the first
 # build dies with EACCES several minutes in. Cheap to create, expensive to debug.
-RUN mkdir -p /home/vscode/.cargo-target \
+RUN mkdir -p /home/vscode/.cargo/target \
              /home/vscode/.cargo/registry \
              /home/vscode/.claude-state \
              /home/vscode/.claude

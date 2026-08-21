@@ -2,7 +2,7 @@
 //!
 //! The *identity* is [`jkb_types::AgentId`] — a parsed type with a closed set of shapes, each
 //! declaring what would prove it via [`Liveness`]. This module is the other half: the probe, at
-//! the edge, where forking `ps` and touching the filesystem belong.
+//! the edge, where probing processes and touching the filesystem belong.
 //!
 //! The probe answers a [`Fact`], not a `bool`. That is the load-bearing change: an owner whose
 //! liveness cannot be established — an externally-minted `agent:` id, or a `claimant_id` in a
@@ -65,7 +65,7 @@ pub fn session_worktree(owner: &str) -> Option<PathBuf> {
 /// Whether a process with this pid exists — the raw probe, for callers that hold a pid rather
 /// than an owner id (the land lock's stale-holder check).
 ///
-/// `Unknown` when `ps` could not be run at all. The land lock reads this to decide whether a
+/// `Unknown` when liveness could not be established at all. The land lock reads this to decide whether a
 /// holder is stale, and treating "could not ask" as "gone" there breaks a live lock.
 #[must_use]
 pub fn pid_alive(pid: u32) -> Fact {
@@ -86,10 +86,10 @@ fn hostname() -> String {
 /// The match is over [`Liveness`], a closed enum, so a new owner shape cannot be added without
 /// the compiler demanding a probe for it. Per shape:
 ///
-/// * a **process** is probed with `ps -p <pid>`, which exits 0 iff a process with that pid
-///   exists **regardless of which OS user owns it**. (`kill -0` was rejected here: it exits
-///   non-zero on `EPERM` for a foreign-owned but live process, which would wrongly reclaim a
-///   still-running agent's claim.)
+/// * a **process** is probed with `kill(pid, 0)`, which reports existence **regardless of which
+///   OS user owns it**: `EPERM` means the process is there and is not ours, which is as good an
+///   answer as `Ok`. (The shell's `kill -0` is what was rejected, and rightly — it collapses
+///   `EPERM` and `ESRCH` into one non-zero exit. `pid_exists` below has the full history.)
 /// * a **session** is judged **only** by its worktree (design D36.6). `jkb task work` exits in
 ///   under a second, so its pid is gone before anyone reads the claim; the thing that persists
 ///   — and that means "this work is in flight" — is the checkout. The pid is ignored rather
@@ -213,10 +213,35 @@ mod tests {
         assert_eq!(super::liveness_from(Ok(())), Fact::Yes);
     }
 
+    /// A pid that really is gone, driven through the syscall.
+    ///
+    /// Every other dead-pid fixture here is `4294967290`, which is not representable as `pid_t`
+    /// and short-circuits before `kill` is ever called — so `ESRCH` -> [`Fact::No`], the one
+    /// verdict that frees another agent's claim, had no coverage at all. A child that has been
+    /// spawned and reaped gives a pid that was real a moment ago and certainly is not now.
+    #[test]
+    fn a_reaped_child_is_established_dead() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        child
+            .wait()
+            .expect("reap it, so it is gone rather than a zombie");
+        assert_eq!(
+            is_alive(&format!("host:{pid}")),
+            Fact::No,
+            "a reaped pid must reach the kernel and come back ESRCH"
+        );
+    }
+
     #[test]
     fn a_foreign_owned_live_process_is_alive() {
-        // pid 1 (launchd/init) always exists and is owned by root. `kill -0` would exit
-        // EPERM (non-zero) here when we are not root; `ps -p` reports it alive regardless.
+        // pid 1 (launchd/init) always exists and is owned by root, so unless we ARE root the
+        // kernel answers `EPERM` — which is the whole point: the refusal is evidence the process
+        // exists. This is the case the shell's `kill -0` gets wrong by reading its non-zero exit
+        // as "gone", and the case `ps` was originally brought in to recover.
         assert_eq!(is_alive("host:1"), Fact::Yes);
     }
 

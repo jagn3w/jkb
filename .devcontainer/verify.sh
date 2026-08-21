@@ -31,18 +31,22 @@ fi
 #    cannot express default-deny. Here the kernel can, so ask it: every host path mounted in shows
 #    up in /proc/self/mountinfo, and the set must be exactly what devcontainer.json declares.
 #    A mount added in a hurry fails this line by name, including one nobody thought to forbid.
+# EVERY mount point the kernel reports, minus the runtime's own fixed set — NOT the ones that
+# happen to live under /home/vscode. Filtering by target prefix made this a list of absences with
+# two entries: mounting /var/run/docker.sock (root on the host) or $HOME at /host passed cleanly.
 EXPECTED="/home/vscode/repos/jkb
 /home/vscode/.jkb
-/home/vscode/.claude/.credentials.json
 /home/vscode/.claude-state
-/home/vscode/.cargo/registry
-/home/vscode/.cargo-target"
-actual="$(awk '$5 ~ /^\/home\/vscode/ || $5 ~ /^\/workspaces/ {print $5}' /proc/self/mountinfo | sort -u)"
+/home/vscode/.cargo/target"
+# What every container has regardless of configuration. Anything outside this and EXPECTED is
+# something a human added to devcontainer.json and must be looked at.
+RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets'
+actual="$(awk '{print $5}' /proc/self/mountinfo | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
 unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED" | sort -u))"
 if [ -z "$unexpected" ]; then
-    ok "every mounted host path is one devcontainer.json declares ($(printf '%s\n' "$actual" | grep -c . ) mounts)"
+    ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked)"
 else
-    bad "UNDECLARED host paths are mounted: $(tr '\n' ' ' <<<"$unexpected")"
+    bad "UNDECLARED mounts: $(tr '\n' ' ' <<<"$unexpected")"
 fi
 
 #    ...and the one that would quietly undo the whole posture: ~/.claude must NOT be a host mount.

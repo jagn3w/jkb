@@ -23,8 +23,12 @@ POSTURE="${1:-/workspaces/jkb/scripts/auto-mode-posture.json}"
 
 say() { printf '[firewall] %s\n' "$*"; }
 
-ipset destroy allowed 2>/dev/null || true
-ipset create allowed hash:net
+# Idempotent regardless of whether an iptables rule still references the set. `destroy` cannot run
+# while the OUTPUT rule points at it, and the subsequent `create` then failed "set with the same
+# name already exists" under `set -e` — which aborted postStart on every fresh container create,
+# because postCreate has already installed the rule by then.
+ipset create -exist allowed hash:net
+ipset flush allowed
 
 skipped=()
 resolved=0
@@ -50,6 +54,20 @@ say "allowed $resolved addresses from $(jq -r '.require.sandbox.network.allowedD
 iptables -F OUTPUT
 iptables -F INPUT 2>/dev/null || true
 
+# IPv6 is a SECOND, independent egress path. Filtering only v4 leaves the whole allowlist
+# bypassable over AAAA while this script prints "default-deny is active" — a firewall that
+# announces coverage it does not have. There is no v6 allowlist to build (the ipset above is
+# hash:net over v4 addresses), so v6 is denied outright: the allowlisted hosts all resolve over
+# v4, and a service reachable only over v6 fails closed and visibly.
+have_v6=0
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT >/dev/null 2>&1; then
+    have_v6=1
+    ip6tables -F OUTPUT
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A OUTPUT -j REJECT
+fi
+
 # DNS must survive or nothing resolves, including the allowlisted hosts themselves.
 iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
 iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
@@ -63,4 +81,16 @@ if ! iptables -C OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/nul
     echo "init-firewall: default-REJECT rule is not in place — refusing to report success" >&2
     exit 1
 fi
-say "egress default-deny is active"
+if [ "$have_v6" -eq 1 ]; then
+    say "egress default-deny is active (IPv4 allowlisted, IPv6 denied outright)"
+else
+    # Not silently: an operator who believes v6 is filtered here would be wrong.
+    say "egress default-deny is active (IPv4 only — ip6tables unavailable, so IPv6 is UNFILTERED;"
+    say "  this is safe only because the container has no IPv6 route, which is not checked here)"
+fi
+
+# #13: the ipset is resolved once, at start. A CDN-fronted allowlisted host whose A records rotate
+# stops working later and surfaces as a bare connection refusal with nothing pointing here. Say so
+# where it will be read, since re-resolving on a timer is its own daemon and a worse trade.
+say "addresses were resolved once, now. If an allowlisted host later fails to connect, its A"
+say "  records may have rotated — re-run this script to re-resolve (it is idempotent)."

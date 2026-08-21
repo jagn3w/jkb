@@ -37,7 +37,7 @@ say "rust toolchain (pinned by rust-toolchain.toml)"
 # CARGO_TARGET_DIR is set in devcontainer.json to a volume, off the bind-mounted workspace: a bind
 # mount carries the HOST's uids, so where the host uid is not 1000 the container user cannot
 # create target/ at all. Assert it rather than discover it three minutes into a build.
-[ -w "${CARGO_TARGET_DIR:-/home/vscode/.cargo-target}" ] || {
+[ -w "${CARGO_TARGET_DIR:-/home/vscode/.cargo/target}" ] || {
     echo "CARGO_TARGET_DIR (${CARGO_TARGET_DIR:-unset}) is not writable — check the volume mount" >&2
     exit 1
 }

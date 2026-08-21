@@ -21,6 +21,10 @@
         "Read(~/.local/share/keyrings/**)",
         "Read(~/.pki/**)",
         "Read(~/.config/gcloud/**)",
+        "Read(~/.git-credentials)",
+        "Read(~/.config/git/credentials)",
+        "Read(~/.cargo/credentials)",
+        "Read(~/.config/gh/hosts.yml)",
         "Read(~/Library/Keychains/**)",
         "Read(~/Library/Messages/**)",
         "Read(~/Library/Mail/**)",
@@ -182,6 +186,22 @@
           },
           {
             "path": "~/.config/gcloud",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.git-credentials",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.config/git/credentials",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.cargo/credentials",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.config/gh/hosts.yml",
             "mode": "deny"
           }
         ]

@@ -14,21 +14,37 @@ scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 SEC="$REPO/.devcontainer/seccomp-bwrap.json"
 BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)
+# A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
+# useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
+# matched `ok  ~/.claude is the container's own, not a host mount` — two of five mutations
+# reported CAUGHT with the guard deleted, and the summary line said "every guard fired".
 run() { # run <label> <expect-substring> <docker args...>
   local label="$1" expect="$2"; shift 2
-  local out; out="$(docker run --rm "$@" "$IMAGE" bash -c '
+  local out rc
+  out="$(docker run --rm "$@" "$IMAGE" bash -c '
       sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json >/dev/null 2>&1
-      ./scripts/auto-mode.sh install >/dev/null 2>&1
+      ./scripts/auto-mode.sh install --force >/dev/null 2>&1
       ./.devcontainer/verify.sh' 2>&1)"
-  if grep -qF "$expect" <<<"$out"; then printf '  CAUGHT   %s\n' "$label"
-  else fails=$((fails+1)); printf '  MISSED   %s  (expected a failure mentioning: %s)\n' "$label" "$expect"
-       sed 's/^/           /' <<<"$out" | grep -E "FAIL|passed|failed" | head -3; fi
+  rc=$?
+  # The FAIL marker and the label on the SAME line: that rendering exists only on the fail path.
+  if [ "$rc" -ne 0 ] && grep -E "FAIL.*$(sed 's/[][\.*^$/]/\\&/g' <<<"$expect")" <<<"$out" >/dev/null; then
+    printf '  CAUGHT   %s\n' "$label"
+  else
+    fails=$((fails+1))
+    printf '  MISSED   %s  (verify.sh exit %s; wanted a FAIL line mentioning: %s)\n' "$label" "$rc" "$expect"
+    sed 's/^/           /' <<<"$out" | grep -E "FAIL|passed|failed" | head -3
+  fi
 }
 fails=0
 echo "=== mutations of the container's own guarantees (each must be CAUGHT) ==="
-run "an undeclared host mount is added" "UNDECLARED host paths" \
+run "an undeclared host mount is added" "UNDECLARED mounts" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
     -v "$scratch/home/Documents":/home/vscode/Documents
+# Outside /home/vscode entirely — the case the old target-prefix filter could not see at all,
+# and the most valuable one: /var/run/docker.sock is root on the host.
+run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
+    -v "$scratch/home":/host
 run "the host's ~/.claude is mounted in" "not a host mount" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
     -v "$scratch/home":/home/vscode/.claude
@@ -39,6 +55,23 @@ run "no NET_ADMIN (firewall cannot come up)" "NON-allowlisted host was permitted
 run "runs as root" "runs as a non-root user" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user root "${BASE[@]}"
 
+# The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher
+# is matching something that is present when nothing is wrong — which is precisely the defect
+# this file exists to detect in verify.sh, and it had it too.
 echo
+echo "=== self-test: an unmutated container must be reported MISSED ==="
+before="$fails"
+run "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+if [ "$fails" -gt "$before" ]; then
+  self_ok=1; fails="$before"      # a MISSED here is the expected result, not a failure
+  echo "  (correct: a healthy container does not trip the matcher)"
+else
+  self_ok=0
+  echo "  MATCHER IS BROKEN: a healthy container was reported CAUGHT"
+fi
+
+echo
+[ "$self_ok" -eq 1 ] || { printf '\033[31mthe matcher reports CAUGHT for a healthy container — no result here is trustworthy\033[0m\n'; exit 1; }
 [ "$fails" -eq 0 ] || { printf '\033[31m%d guard(s) did not fire\033[0m\n' "$fails"; exit 1; }
-printf '\033[32mevery guard fired\033[0m\n'
+printf '\033[32mevery guard fired, and the matcher was shown to discriminate\033[0m\n'

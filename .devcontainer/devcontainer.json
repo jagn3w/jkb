@@ -35,10 +35,13 @@
     // write to it goes through the audited writer-actor, so damage here is undoable.
     "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
 
-    // ONLY the credential file, never all of ~/.claude. Mounting the directory would expose the
-    // host's settings.json — which IS the posture — to a process the posture is meant to bound.
-    // Read-only, and the sandbox additionally denies it to sandboxed commands.
-    "source=${localEnv:HOME}/.claude/.credentials.json,target=/home/vscode/.claude/.credentials.json,type=bind,readonly",
+    // NO credential mount, deliberately. `~/.claude/.credentials.json` is Linux/WSL-only — on
+    // macOS the credentials live in the Keychain and the file does not exist, and a bind mount
+    // whose source is missing is a hard error, so the container simply never started on the host
+    // this repo is developed on. Read-only would also have made an in-container `claude login`
+    // unable to write. Authenticate inside the container instead: `claude auth login` (or export
+    // ANTHROPIC_API_KEY), which lands in the ~/.claude-state volume below and persists across
+    // rebuilds without putting anything of the host's inside.
 
     // Sessions, history and auto-memory persist in a named volume rather than on the host, so
     // restarting the container does not lose context and the host stays untouched.
@@ -51,14 +54,14 @@
     // uids, so on a host whose uid is not 1000 the container user cannot create target/ at all —
     // the build fails with EACCES, which is how this was found. (2) Speed: target/ is by far the
     // heaviest write path in this repo, and on macOS a bind mount is a VM filesystem crossing.
-    "source=jkb-cargo-target,target=/home/vscode/.cargo-target,type=volume"
+    "source=jkb-cargo-target,target=/home/vscode/.cargo/target,type=volume"
   ],
 
   "containerEnv": {
     // Keep the posture's own paths meaningful inside the container.
     "JKB_DB": "/home/vscode/.jkb/jkb.db",
     // See the target/ volume above: keeps cargo's output off the bind mount.
-    "CARGO_TARGET_DIR": "/home/vscode/.cargo-target"
+    "CARGO_TARGET_DIR": "/home/vscode/.cargo/target"
   },
 
   // Order matters, and the lifecycle is postCreate BEFORE postStart — so the firewall cannot be

@@ -1364,6 +1364,34 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     process. It barely matters in practice — jkb's claimants are the same user's processes, so the
     live answers are `Ok`/`ESRCH`, neither of which needs privilege — and a denial would return
     `EPERM`, i.e. "alive", which is the safe direction (never reclaims live work).
+- **A review round found six must-fix and eight concerns, and four of them were one shape**
+  (D48.13): an assertion that matched text present on **both** the pass and fail paths, or read a
+  file nothing had written. `mutate-verify.sh` grepped a label `verify.sh` prints identically
+  either way, so 2 of 5 mutations reported CAUGHT with the guard deleted — under a summary line
+  reading "every guard fired". `verify.sh`'s mount check filtered `mountinfo` by target prefix, so
+  it *was* the list of absences this file claims it is not; `/var/run/docker.sock` passed. The
+  seccomp assertion was satisfied by the generator's own trailing allow group, true by
+  construction. And a Linux-only test grepped an argv file `run` never creates, passing having
+  observed nothing. The fix is the same in all four: **assert on a discriminating signal** — a
+  non-zero exit plus the FAIL-only rendering, the full mount set minus the runtime's own, the
+  negative "no restricted entry still names these", the precondition that the file exists — and
+  where a harness judges other guards, give it a **negative control**: an unmutated run must be
+  reported MISSED, or the matcher is matching something present when nothing is wrong.
+- **Two more were the posture not covering what the machine needs**, the D48.10 shape again in a
+  new place: `CARGO_TARGET_DIR` was a *sibling* of the allowlisted `~/.cargo`, and `covered()`
+  matches at component boundaries, so `denyRead: ["~"]` blanketed every sandboxed build in the
+  container while both guards reported it healthy. Moved inside `~/.cargo/target`, and `preflight`
+  now reads `CARGO_TARGET_DIR` so the class is checkable rather than latent.
+- **`install`'s preflight gate turned CI red**, which is the coupling CLAUDE.md already says to
+  avoid: preflight asks about the *machine*, and the hermetic suite drove `install` through it, so
+  on a runner (`/home/runner/work/...`, under no allowWrite root) install wrote nothing and two
+  assertions passed **vacuously** on the empty result. The suite now passes `--force`, and the gate
+  gets one deliberate test of its own instead of being exercised incidentally by all of them.
+- **The credential mount could not work on macOS.** `~/.claude/.credentials.json` is Linux/WSL
+  only — macOS keeps credentials in the Keychain — and a bind mount with a missing source is a
+  hard error, so the container never started on the host this repo is developed on. Removed
+  entirely: authenticate *inside* the container, into the state volume, which also fixes the
+  read-only mount that `claude login` could not have written.
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not

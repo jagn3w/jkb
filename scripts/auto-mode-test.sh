@@ -59,7 +59,7 @@ cat > "$settings" <<'JSON'
 }
 JSON
 set +e
-"$tool" install >"$tmp/install.out" 2>&1
+"$tool" install --force >"$tmp/install.out" 2>&1
 rc=$?
 set -e
 check_that "install succeeds on an existing settings file" \
@@ -83,7 +83,7 @@ check_that "a correct false-valued setting satisfies check" \
 
 # --- 3. install is idempotent, byte for byte ----------------------------------------------
 cp "$settings" "$tmp/first"
-"$tool" install >/dev/null 2>&1 || true
+"$tool" install --force >/dev/null 2>&1 || true
 check_that "install is idempotent (byte-identical on re-run)" \
     "$(cmp -s "$tmp/first" "$settings" && echo yes || echo no)"
 check_that "an unchanged re-install writes no backup" \
@@ -146,7 +146,7 @@ run_check
 check_that "check refuses malformed JSON, by name" \
     "$([ "$rc" -ne 0 ] && grep -q 'not valid JSON' <<<"$out" && echo yes || echo no)"
 set +e
-"$tool" install >/dev/null 2>&1
+"$tool" install --force >/dev/null 2>&1
 rc=$?
 set -e
 check_that "install refuses to merge into malformed JSON" \
@@ -197,7 +197,7 @@ else
         "$(grep -q "run: .*install" <<<"$out" && echo no || echo yes)"
 
     set +e
-    "$tool" install >"$tmp/inst.out" 2>&1
+    "$tool" install --force >"$tmp/inst.out" 2>&1
     rc=$?
     set -e
     check_that "install refuses rather than overwriting an unreadable file" \
@@ -209,10 +209,56 @@ fi
 chmod 644 "$settings" 2>/dev/null
 cp "$tmp/good" "$settings"
 
+# --- 6d. install's preflight gate, pinned deliberately -------------------------------------
+# Every other install in this suite passes --force, because preflight asks a question about the
+# MACHINE and the suite must be hermetic — on CI the checkout is /home/runner/work/..., under no
+# allowWrite root, and without --force install wrote nothing while two assertions ("idempotent",
+# "preserves allow") passed vacuously on the empty result. So the gate gets one test of its own
+# rather than being exercised incidentally by all of them.
+cp "$tmp/good" "$settings"
+narrow="$tmp/posture-narrow.json"
+jq '.require.sandbox.filesystem.allowWrite = ["/definitely-not-here"]' "$posture" > "$narrow"
+mkdir -p "$tmp/gate/scripts"
+cp "$here/auto-mode.sh" "$tmp/gate/scripts/"
+cp "$narrow" "$tmp/gate/scripts/auto-mode-posture.json"
+before="$(cat "$settings")"
+set +e
+"$tmp/gate/scripts/auto-mode.sh" install >"$tmp/gate.out" 2>&1
+rc=$?
+set -e
+check_that "install refuses a posture preflight rejects" \
+    "$([ "$rc" -ne 0 ] && grep -q 'preflight gaps' "$tmp/gate.out" && echo yes || echo no)"
+check_that "a refused install writes nothing" \
+    "$([ "$before" = "$(cat "$settings")" ] && echo yes || echo no)"
+set +e
+"$tmp/gate/scripts/auto-mode.sh" install --force >/dev/null 2>&1
+rc=$?
+set -e
+check_that "--force installs the same posture the gate refused" \
+    "$([ "$rc" -eq 0 ] && echo yes || echo no)"
+cp "$tmp/good" "$settings"
+
+# --- 6e. a forbidden key is REPAIRABLE by install ------------------------------------------
+# It was not: `check` failed permanently and named `install` as the remedy, while install could
+# only add keys and printed "already installed (no change)". The keys are declared must-be-empty,
+# so emptying them is the defined repair and belongs in the same write.
+jq '.sandbox.excludedCommands = ["bash"]' "$tmp/good" > "$settings"
+run_check
+check_that "a forbidden key makes check fail" "$([ "$rc" -ne 0 ] && echo yes || echo no)"
+set +e
+"$tool" install --force >/dev/null 2>&1
+set -e
+run_check
+check_that "install clears the forbidden key it was pointed at" \
+    "$([ "$rc" -eq 0 ] && echo yes || echo no)"
+check_that "and the key is actually gone, not merely emptied around" \
+    "$(jq -e '.sandbox | has("excludedCommands") | not' "$settings" >/dev/null && echo yes || echo no)"
+cp "$tmp/good" "$settings"
+
 # --- 7. install creates the config dir when a fresh machine has none -----------------------
 export CLAUDE_CONFIG_DIR="$tmp/fresh"
 set +e
-"$tool" install >/dev/null 2>&1
+"$tool" install --force >/dev/null 2>&1
 rc=$?
 set -e
 check_that "install bootstraps a missing config dir" \
@@ -255,9 +301,16 @@ set -e
 if [ "$(uname -s)" = "Darwin" ]; then
     check_that "the opt-in ssh-agent overlay names the socket and nothing else" \
         "$(grep -qF "{\"sandbox\":{\"network\":{\"allowUnixSockets\":[\"$tmp/agent.sock\"]}}}" "$CLAUDE_ARGV_OUT" && echo yes || echo no)"
-else
+elif [ -s "$CLAUDE_ARGV_OUT" ] && grep -q -- "--permission-mode" "$CLAUDE_ARGV_OUT"; then
+    # Only meaningful once `run` actually reached the exec: absence of the overlay in a file that
+    # was never written is not evidence of anything.
     check_that "the ssh-agent overlay is NOT emitted on Linux, where it would be inert" \
         "$(grep -q "allowUnixSockets" "$CLAUDE_ARGV_OUT" && echo no || echo yes)"
+else
+    # `run` refuses on this host (no bwrap/socat), so it never execs and there is no argv to
+    # inspect. Announced rather than passed — a skip that reads as a pass is how a Linux-only
+    # branch goes untested forever.
+    echo "  skip  ssh-agent overlay (run did not exec here: $( [ -s "$CLAUDE_ARGV_OUT" ] && echo 'no argv' || echo 'missing bwrap/socat' ))"
 fi
 
 rm -f "$CLAUDE_ARGV_OUT"

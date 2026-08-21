@@ -48,6 +48,37 @@ else
     bad "seccomp profile does not unconditionally allow: ${missing[*]} — regenerate it"
 fi
 
+# ...and the NEGATIVE half, which is the half that can actually fail. The generator appends one
+# unconditional allow group, so "is it allowed somewhere" is true by construction and would stay
+# true if the removal loop silently matched nothing against a changed upstream. What proves the
+# loop ran is that no OTHER entry still names these syscalls under a restriction.
+still_restricted=()
+while IFS= read -r sc; do
+    [ -n "$sc" ] || continue
+    jq -e --arg s "$sc" \
+        'any(.syscalls[]; (.names // [] | index($s)) and (.action != "SCMP_ACT_ALLOW" or ((.args // []) | length) > 0))' \
+        "$prof" >/dev/null 2>&1 && still_restricted+=("$sc")
+done <<<"$needed"
+if [ ${#still_restricted[@]} -eq 0 ]; then
+    ok "no restricted entry still names them (the removal loop ran)"
+else
+    bad "the removal loop missed: ${still_restricted[*]} — a restricted entry still matches, so the allow is shadowed"
+fi
+
+# Both assertions above loop over `needed`, and an empty or truncated loop reports success — so
+# the extraction itself has to be checked. Named members, not a count: a threshold passes while
+# silently losing names under it (10 of 14 cleared ">= 10" in testing), whereas losing `unshare`
+# or `pivot_root` is losing the two the container demonstrably cannot start without.
+missing_core=()
+for core in clone unshare mount pivot_root; do
+    grep -qx "$core" <<<"$needed" || missing_core+=("$core")
+done
+if [ ${#missing_core[@]} -eq 0 ]; then
+    ok "the generator's syscall list parsed and names the load-bearing calls"
+else
+    bad "generate-seccomp.sh's list no longer yields: ${missing_core[*]} — the checks above are vacuous"
+fi
+
 # The firewall reads the SAME allowlist the sandbox posture uses. If that path or key moves, the
 # firewall silently allowlists nothing and default-denies everything, which reads as "very secure"
 # right up until nothing works.

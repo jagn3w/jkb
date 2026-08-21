@@ -91,7 +91,11 @@ def merge($a; $b):
   elif ($a|type) == "array" and ($b|type) == "array" then
     $a + ($b - $a)
   else $b end;
-merge($got[0]; $want[0].require)
+# Merge what `require` declares, then DELETE what `forbid` names. Both halves of the posture are
+# applied by the same write, so `install` can repair either kind of drift — before, a forbidden
+# key made `check` fail permanently while its own remedy printed "already installed (no change)".
+reduce ($want[0].forbid | keys_unsorted[]) as $k
+    (merge($got[0]; $want[0].require); delpaths([$k | split(".")]))
 '
 
 # Every posture leaf that the settings do not carry, as {path, want, got}. A missing key and an
@@ -207,7 +211,8 @@ cmd_install() {
     if jq -e --slurpfile a "$settings" --slurpfile b "$merged" -n '$a[0] == $b[0]' >/dev/null; then
         rm -f "$merged" "$tmp_prev"
         echo "posture already installed in $settings (no change)"
-        return 0
+        cmd_check
+        return
     fi
 
     # Back up only a file that both existed and is about to change, so neither a re-run nor a
@@ -241,6 +246,10 @@ cmd_preflight() {
     need_write+=("${TMPDIR:-/tmp}" "/tmp" "$PWD")
     need_read+=("$settings" "$HOME/.cargo" "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.gitconfig")
     [ -n "${PNPM_HOME:-}" ] && need_write+=("$PNPM_HOME")
+    # Where cargo writes, which is not always under ~/.cargo: the dev container points it at a
+    # volume, and a value outside the allowlist denies every sandboxed build while `check` and
+    # `verify.sh` both report the machine healthy.
+    [ -n "${CARGO_TARGET_DIR:-}" ] && need_write+=("$CARGO_TARGET_DIR")
     [ -n "${SHELL:-}" ] && need_read+=("$HOME/.$(basename "$SHELL")rc")
 
     # Expand a posture entry to an absolute, symlink-resolved prefix.
@@ -270,7 +279,7 @@ cmd_preflight() {
     resolve() { # a path that may not exist yet: resolve the nearest existing ancestor
         local p="$1" d
         d="$(cd "$p" 2>/dev/null && pwd -P)" && { printf '%s' "$d"; return; }
-        d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" && { printf '%s/%s' "$d" "$(basename "$p")"; return; }
+        d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" && { printf '%s/%s' "${d%/}" "$(basename "$p")"; return; }
         printf '%s' "$p"
     }
 
