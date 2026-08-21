@@ -7,12 +7,12 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-raw-cargo.sh\"",
-            "statusMessage": "Checking for raw cargo…"
+            "statusMessage": "Checking for raw cargo\u2026"
           },
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-raw-sqlite.sh\"",
-            "statusMessage": "Checking for raw sqlite3…"
+            "statusMessage": "Checking for raw sqlite3\u2026"
           }
         ]
       }
@@ -23,7 +23,7 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/notify-sticky.sh\"",
-            "statusMessage": "Posting a sticky notification…"
+            "statusMessage": "Posting a sticky notification\u2026"
           }
         ]
       }
@@ -60,6 +60,16 @@
       }
     ],
     "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/notify-sticky.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
       {
         "hooks": [
           {

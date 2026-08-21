@@ -50,198 +50,68 @@ calls() { tr '\n' ' ' < "$rec" | sed 's/  */ /g; s/^ //; s/ $//'; }
 payload() { printf '{"hook_event_name":"%s","session_id":"%s","message":"%s","tool_name":"%s","cwd":"/repos/jkb/.jkb/work/wt"}' "$1" "$2" "$3" "${4:-}"; }
 PROMPT='Claude needs your permission to use Bash'
 
-echo "==> notify-sticky.sh"
+echo "==> notify-sticky.sh (the shim)"
 
-# 1. A Notification posts under an id derived from the session, carrying the message and the
-#    worktree name.
-run "$(payload Notification s1 'Claude needs your permission to use Bash')"
-check "Notification posts under the session's id" \
-  "$(calls)" \
-  "post --id jkb-claude-s1 --title Claude Code --subtitle wt --body Claude needs your permission to use Bash"
+# What is left here is what is genuinely SHELL. The rules — post, withdraw, which tool, the
+# sweep — moved into `jkb notify` when they became a checkable table, and their assertions moved
+# with them into crates/jkb-cli/src/notify/tests.rs. Testing them in both places would be two
+# descriptions of one rule, which is the drift this whole change exists to end.
+#
+# The shim's own contract is not covered there, and it is the part that can wedge a session.
 
-# 2. Each dismiss route, driven the way Claude Code drives it. All four are asserted: they fire on
-#    different paths through a turn (grant, type, deny, quit) and any one of them silently
-#    dropping out leaves a notification stuck on screen.
-run "$(payload Notification s1 "$PROMPT")" >/dev/null
-run "$(payload PostToolUse s1 '' Bash)"
-check "PostToolUse for the prompted tool withdraws" "$(calls)" "remove --id jkb-claude-s1"
-for ev in UserPromptSubmit Stop SessionEnd; do
-  run "$(payload Notification s1 "$PROMPT")" >/dev/null
-  run "$(payload "$ev" s1 '')"
-  check "$ev withdraws the notification" "$(calls)" "remove --id jkb-claude-s1"
+hook_run() { # hook_run <payload> <PATH> -> exit status, stdout captured in $hook_out
+  hook_out=$(printf '%s' "$1" | PATH="$2" JKB_NOTIFY_STATE="$tmp/state" bash "$hook" 2>/dev/null)
+  return $?
+}
+
+# A `jkb` that rejects the subcommand — an older binary that predates it, which clap exits 2 for.
+mkdir -p "$tmp/oldjkb"
+printf '#!/bin/sh\nexit 2\n' > "$tmp/oldjkb/jkb"
+chmod +x "$tmp/oldjkb/jkb"
+
+# A `jkb` that records how it was called.
+mkdir -p "$tmp/goodjkb"
+cat > "$tmp/goodjkb/jkb" <<STUB
+#!/bin/sh
+printf '%s ' "\$@" >> "$tmp/jkbcalls"
+printf '\n' >> "$tmp/jkbcalls"
+printf 'notifier=%s\n' "\${JKB_NOTIFIER:-none}" >> "$tmp/jkbcalls"
+STUB
+chmod +x "$tmp/goodjkb/jkb"
+
+PAYLOAD='{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash"}'
+
+# 1. THE CONTRACT THAT CAN WEDGE A SESSION. A PostToolUse hook exiting non-zero BLOCKS the tool
+#    call. The shim first used `exec`, which makes jkb's status the hook's, and an older jkb
+#    exiting 2 stopped the session dead — observed live, not hypothesised.
+hook_run "$PAYLOAD" "$tmp/oldjkb:/usr/bin:/bin"
+check "a jkb that rejects the subcommand still exits 0" "$?" "0"
+hook_run "$PAYLOAD" "/usr/bin:/bin"
+check "no jkb at all still exits 0" "$?" "0"
+hook_run "$PAYLOAD" "$tmp/goodjkb:/usr/bin:/bin"
+check "a working jkb still exits 0" "$?" "0"
+
+# 2. Silent on stdout: a hook's stdout lands in the transcript, and on UserPromptSubmit it is
+#    injected into the conversation as context.
+for ev in Notification PostToolUse UserPromptSubmit Stop SessionEnd; do
+  hook_run "$(payload "$ev" s1 'm')" "$tmp/goodjkb:/usr/bin:/bin"
+  check "$ev is silent on stdout" "$hook_out" ""
 done
 
-# 2b. THE CONCURRENCY CASE. One assistant message routinely batches several tool calls, so a slow
-#     allowlisted one finishes while another's permission prompt is still on screen and unanswered.
-#     Withdrawing there leaves the session blocked with nothing on screen — the exact state this
-#     hook exists to prevent — and, because the marker would be spent, nothing would re-post it.
-run "$(payload Notification s2b "$PROMPT")" >/dev/null
-run "$(payload PostToolUse s2b '' Read)"
-check "a concurrently-finishing tool does not withdraw the prompt" "$(calls)" ""
-run "$(payload PostToolUse s2b '' Bash)"
-check "the prompted tool finishing does withdraw it" "$(calls)" "remove --id jkb-claude-s2b"
+# 3. It delegates, and hands over the notifier path rather than making jkb look it up — the
+#    location stays spelled once, here, because setup.sh and build-notifier.sh already ask for it
+#    and both run where jkb may not be built yet.
+: > "$tmp/jkbcalls"
+hook_run "$PAYLOAD" "$tmp/goodjkb:/usr/bin:/bin"
+check "the shim delegates to jkb notify hook" \
+  "$(head -1 "$tmp/jkbcalls" | sed 's/ *$//')" "notify hook"
+check "and passes the notifier path it resolved" \
+  "$(grep -c '^notifier=' "$tmp/jkbcalls" | tr -d ' ')" "1"
 
-# 2c. A notification whose tool cannot be read from the message is never withdrawn by a tool
-#     event — it waits for the user or the sweep. The safe direction: late, not absent.
-run "$(payload Notification s2c 'Claude is waiting for your input')" >/dev/null
-run "$(payload PostToolUse s2c '' Bash)"
-check "an untooled notification ignores tool events" "$(calls)" ""
-run "$(payload UserPromptSubmit s2c '')"
-check "an untooled notification clears when the user types" "$(calls)" "remove --id jkb-claude-s2c"
-
-# 2d. The sweeps do NOT consult the marker. If the state dir is unwritable the marker never gets
-#     written, every marker-gated event short-circuits, and an `alert`-style notification waits
-#     forever by design — so the session would end with a stale alert and nothing reporting it.
-run "$(payload Stop s2d '')"
-check "Stop sweeps without a marker" "$(calls)" "remove --id jkb-claude-s2d"
-run "$(payload SessionEnd s2d '')"
-check "SessionEnd sweeps without a marker" "$(calls)" "remove --id jkb-claude-s2d"
-
-# 3. With nothing posted, a dismiss must not spawn the notifier — PostToolUse runs after every
-#    single tool call, so this is the whole reason the marker exists.
-run "$(payload PostToolUse s1 '')"
-check "dismiss with nothing pending is free" "$(calls)" ""
-
-# 4. Dismissing twice does not re-run it either: the marker is consumed, not just read.
-run "$(payload Notification s1 "$PROMPT")" >/dev/null
-run "$(payload PostToolUse s1 '' Bash)" >/dev/null
-run "$(payload PostToolUse s1 '' Bash)"
-check "a second dismiss is free" "$(calls)" ""
-
-# 5. Parallel sessions (D36 worktrees) hold separate ids, so one session answering a prompt
-#    must not clear another session's notification.
-run "$(payload Notification s1 "$PROMPT")" >/dev/null
-run "$(payload Notification s2 "$PROMPT")" >/dev/null
-run "$(payload PostToolUse s1 '' Bash)"
-check "one session's dismiss targets only its own id" "$(calls)" "remove --id jkb-claude-s1"
-run "$(payload PostToolUse s2 '' Bash)"
-check "the other session is still pending" "$(calls)" "remove --id jkb-claude-s2"
-
-# 6. An id is a group name and a filename, so it must not be able to name a path.
-run '{"hook_event_name":"Notification","session_id":"../../etc/passwd","message":"m","cwd":"/x"}'
-check "a path-like session id is sanitised" "$(calls)" \
-  "post --id jkb-claude-______etc_passwd --title Claude Code --subtitle x --body m"
-# The marker it wrote is a direct child of the state directory under the sanitised name, so the
-# separators were neutralised rather than merely renamed somewhere deeper.
-check "the marker stays a direct child of the state directory" \
-  "$(cd "$tmp/state" && find . -mindepth 2 | wc -l | tr -d ' ')" "0"
-check "the marker carries the sanitised name" \
-  "$([ -f "$tmp/state/______etc_passwd" ] && echo yes || echo no)" "yes"
-
-# 7. An event the hook has no business in does nothing at all.
-run "$(payload PreToolUse s1 '')"
-check "an unhandled event is a no-op" "$(calls)" ""
-
-# 8. Malformed input fails open rather than disturbing the session.
-: > "$rec"
-out=$(JKB_NOTIFIER="$tmp/notifier" JKB_NOTIFY_STATE="$tmp/state" REC="$rec" bash "$hook" <<<'not json' 2>/dev/null)
+# 4. Malformed input still exits 0 and says nothing.
+hook_run 'not json' "$tmp/goodjkb:/usr/bin:/bin"
 check "malformed input exits 0" "$?" "0"
-check "malformed input posts nothing" "$(calls)" ""
-
-# 9. Nothing reaches stdout: a hook's stdout lands in the transcript, and on UserPromptSubmit it
-#    is injected into the conversation as context.
-out=$(run "$(payload Notification s9 'permission')")
-check "the hook is silent on stdout" "$out" ""
-
-# 10. The fallback path. With no terminal-notifier installed this is what actually runs, so it is
-#     not a degraded corner — on a stock macOS it is the only path there is. `JKB_NOTIFIER` naming
-#     a file that does not exist forces it deterministically.
-osa="$tmp/osacalls"
-cat > "$tmp/osascript" <<'STUB'
-#!/usr/bin/env bash
-for a in "$@"; do printf '%s\n' "$a" >> "$OSA_REC"; done
-STUB
-chmod +x "$tmp/osascript"
-osa_calls() { tr '\n' ' ' < "$osa" | sed 's/  */ /g; s/^ //; s/ $//'; }
-
-# No notifier bundle at all.
-fallback() {
-  : > "$rec"; : > "$osa"
-  PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/does-not-exist" JKB_NOTIFY_STATE="$tmp/state" \
-    REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$1"
-}
-
-# Bundle present but REFUSING, which is what the real notifier does when it is not yet authorized.
-refusing() {
-  : > "$rec"; : > "$osa"
-  PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" NOTIFIER_FAILS=2 JKB_NOTIFY_STATE="$tmp/state" \
-    REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$1"
-}
-
-fallback '{"hook_event_name":"Notification","session_id":"s10","message":"needs permission","cwd":"/repos/wt"}'
-check "without the notifier bundle it still posts a banner" \
-  "$(osa_calls)" \
-  '-e display notification "needs permission" with title "Claude Code" subtitle "wt"'
-
-# A notification message is Claude's text, so it can carry the three characters that end an
-# AppleScript string early. Getting this wrong means no notification at all, silently.
-fallback '{"hook_event_name":"Notification","session_id":"s11","message":"say \"hi\" \\ now\nplease","cwd":"/repos/wt"}'
-script=$(sed -n '2p' "$osa")
-check "quotes, backslashes and newlines are escaped" \
-  "$script" \
-  'display notification "say \"hi\" \\ now please" with title "Claude Code" subtitle "wt"'
-
-# ...and that escaping is checked against a real AppleScript compiler where one exists, rather
-# than only against our own idea of it. Absent on Linux, so the suite skips it there.
-if ! command -v osacompile >/dev/null 2>&1; then
-  printf '  --  %s\n' "AppleScript compile check (osacompile not present)"
-elif [ -z "$script" ]; then
-  # `osacompile -e ""` falls back to READING STDIN and blocks forever, so an assertion that
-  # already failed above must not be allowed to hang the suite behind it. (`</dev/null` below is
-  # the same guard for the non-empty case.)
-  fail "the escaped script compiles as AppleScript: nothing was posted to compile"
-elif osacompile -o "$tmp/probe.scpt" -e "$script" >/dev/null 2>&1 </dev/null; then
-  ok "the escaped script compiles as AppleScript"
-else
-  fail "the escaped script compiles as AppleScript"
-fi
-
-# 11. `--find-notifier` is how `scripts/setup.sh` reports readiness without keeping its own copy
-#     of the search list, so it has to answer for the same binary the hook would actually run. It
-#     also must not read stdin: a probe has none, and `input=$(cat)` would block on the terminal.
-found=$(JKB_NOTIFIER="$tmp/notifier" bash "$hook" --find-notifier </dev/null 2>/dev/null)
-check "--find-notifier reports the notifier the hook would use" "$found" "$tmp/notifier"
-
-found=$(JKB_NOTIFIER="$tmp/does-not-exist" bash "$hook" --find-notifier </dev/null 2>/dev/null)
-status=$?
-check "--find-notifier says nothing when there is none" "$found" ""
-check "--find-notifier exits non-zero when there is none" "$([ "$status" -ne 0 ] && echo yes || echo no)" "yes"
-
-# 12. The refusal path, which is the whole reason `post` reports failure instead of quietly
-#     succeeding: an unauthorized notification is accepted by macOS, displays nothing, and returns
-#     no error, so a notifier that did not refuse would be indistinguishable from a working one.
-refusing '{"hook_event_name":"Notification","session_id":"s12","message":"needs permission","cwd":"/repos/wt"}'
-check "a refusing notifier is still tried first" \
-  "$(calls)" \
-  "post --id jkb-claude-s12 --title Claude Code --subtitle wt --body needs permission"
-check "a refusing notifier falls back to a banner" \
-  "$(osa_calls)" \
-  '-e display notification "needs permission" with title "Claude Code" subtitle "wt"'
-
-# ...and nothing is left for `dismiss` to do. The marker means "a withdrawable notification of
-# ours is on screen", so a refused post does not write one: what reached the screen was the
-# osascript banner, which no API can take back. Spawning a `remove` per tool call for an id that
-# was never posted would be pure cost.
-: > "$rec"; : > "$osa"
-PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" JKB_NOTIFY_STATE="$tmp/state" \
-  REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12 '')"
-check "a refused post leaves nothing to withdraw" "$(calls)" ""
-
-# 12a-bis. A withdraw that fails is attempted once and NOT retried on every later tool call.
-#          Round 2 made a failure re-arm the marker, which fixed a stuck alert and bought a worse
-#          one: `doRemove`'s realistic non-zero exit is a 10s timeout against a wedged notification
-#          centre, so every `PostToolUse` for the rest of the session would pay it, with the reason
-#          swallowed. The retry now lives with the sweeps, which run once per turn and once per
-#          session — bounded by construction rather than by hoping the failure is transient.
-run "$(payload Notification s12b "$PROMPT")" >/dev/null
-: > "$rec"
-PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" NOTIFIER_FAILS=1 JKB_NOTIFY_STATE="$tmp/state" \
-  REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12b '' Bash)"
-check "a failed withdraw is attempted" "$(calls)" "remove --id jkb-claude-s12b"
-run "$(payload PostToolUse s12b '' Bash)"
-check "a failed withdraw is not retried per tool call" "$(calls)" ""
-run "$(payload Stop s12b '')"
-check "the end-of-turn sweep is the retry" "$(calls)" "remove --id jkb-claude-s12b"
+check "malformed input is silent" "$hook_out" ""
 
 # 12b. The bundle search itself. Every test above injects `JKB_NOTIFIER`, so without this the
 #      hard-coded install path is covered only by the opt-in live test — and a typo there would
@@ -314,7 +184,15 @@ else
   live_sid="hook-selftest-$$"
   live_id="jkb-claude-$live_sid"
   delivered() { "$live_bin" list 2>/dev/null | grep -c "^$live_id\$" | tr -d ' '; }
-  live() { printf '%s' "$1" | bash "$hook"; }
+  # Driven against THIS CHECKOUT's jkb, not whatever is installed. The shim delegates to the
+  # first `jkb` on PATH, and an installed binary predating `notify` silently does nothing — which
+  # is precisely what this test saw the first time it ran against the shim.
+  repo_target="$(cd "$(dirname "$0")/.." && pwd)/target/debug"
+  if [ ! -x "$repo_target/jkb" ]; then
+    fail "live round-trip: $repo_target/jkb is not built — run ./scripts/build.sh"
+    live_bin=""
+  fi
+  live() { printf '%s' "$1" | PATH="$repo_target:$PATH" bash "$hook"; }
 
   printf '  --  %s\n' "style: $("$live_bin" status 2>/dev/null)"
 

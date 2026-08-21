@@ -126,3 +126,214 @@ fn a_second_prompt_re_posts() {
         assert_eq!(out.effects(), &[NotifEffect::Post, NotifEffect::Remember]);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The performing half. These were shell assertions until the decision moved into Rust; they run
+// the real `Request::perform` against a stub notifier that records its argv, because what this
+// code does is choose a command line and write a record.
+
+use std::path::{Path, PathBuf};
+
+/// A throwaway state directory plus a notifier that appends its argv to a file.
+struct Fixture {
+    dir: PathBuf,
+    notifier: PathBuf,
+    calls: PathBuf,
+}
+
+impl Fixture {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("jkb-notify-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let calls = dir.join("calls");
+        let notifier = dir.join("notifier");
+        std::fs::write(
+            &notifier,
+            format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" >> {}\nprintf '\\n' >> {}\n",
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .expect("stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        Self {
+            dir,
+            notifier,
+            calls,
+        }
+    }
+
+    fn request(&self, event: NotifEvent, session: &str) -> super::Request {
+        super::Request {
+            event,
+            id: format!("jkb-claude-{session}"),
+            marker: self.dir.join(session),
+            recorded: super::Record::read(&self.dir.join(session)),
+            prompted_tool: Some("Bash".to_owned()),
+            finished_tool: String::new(),
+            message: "Claude needs your permission to use Bash".to_owned(),
+            subtitle: "wt".to_owned(),
+            notifier: Some(self.notifier.clone()),
+        }
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(&self.calls)
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    fn marker(&self, session: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.join(session)).ok()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn with_state_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+    // `Remember` writes under the state dir, which is read from the environment. Tests in one
+    // binary share it, so this is set and restored around the call rather than left behind.
+    let previous = std::env::var("JKB_NOTIFY_STATE").ok();
+    std::env::set_var("JKB_NOTIFY_STATE", dir);
+    let out = body();
+    match previous {
+        Some(v) => std::env::set_var("JKB_NOTIFY_STATE", v),
+        None => std::env::remove_var("JKB_NOTIFY_STATE"),
+    }
+    out
+}
+
+/// Posting records the tool, so a later `PostToolUse` can tell its own prompt from a concurrent
+/// one — and the record names the owner, which is the only thing `sweep` can ask about liveness.
+#[test]
+fn posting_records_the_tool_and_the_owner() {
+    let f = Fixture::new("post");
+    let req = f.request(NotifEvent::Needed, "s1");
+    with_state_dir(&f.dir, || {
+        req.perform(&[NotifEffect::Post, NotifEffect::Remember]);
+    });
+    assert_eq!(
+        f.calls(),
+        "post --id jkb-claude-s1 --title Claude Code --subtitle wt --body Claude needs your permission to use Bash"
+    );
+    let record = f.marker("s1").expect("a record");
+    let mut lines = record.lines();
+    assert_eq!(lines.next(), Some("Bash"));
+    assert!(
+        lines.next().is_some_and(|p| p.parse::<u32>().is_ok()),
+        "the record names an owner pid: {record:?}"
+    );
+}
+
+/// Withdraw and forget are one plan, and performing it leaves nothing behind.
+#[test]
+fn withdrawing_clears_the_record() {
+    let f = Fixture::new("withdraw");
+    with_state_dir(&f.dir, || {
+        f.request(NotifEvent::Needed, "s1")
+            .perform(&[NotifEffect::Remember]);
+        assert!(f.marker("s1").is_some());
+        f.request(NotifEvent::ToolFinished, "s1")
+            .perform(&[NotifEffect::Withdraw, NotifEffect::Forget]);
+    });
+    assert_eq!(f.calls(), "remove --id jkb-claude-s1");
+    assert!(f.marker("s1").is_none(), "the record is gone");
+}
+
+/// End to end through the real decision: a concurrent tool must not take the prompt down, and
+/// the prompted one must.
+#[test]
+fn the_decision_and_the_effects_agree_about_a_concurrent_tool() {
+    let f = Fixture::new("concurrent");
+    with_state_dir(&f.dir, || {
+        f.request(NotifEvent::Needed, "s1")
+            .perform(&[NotifEffect::Remember]);
+
+        let mut req = f.request(NotifEvent::ToolFinished, "s1");
+        req.recorded = super::Record::read(&f.dir.join("s1"));
+        req.finished_tool = "Read".to_owned();
+        req.perform(machine().apply(&req.ctx(), req.event).effects());
+        assert_eq!(f.calls(), "", "a different tool must withdraw nothing");
+        assert!(f.marker("s1").is_some(), "and must not clear the record");
+
+        req.finished_tool = "Bash".to_owned();
+        req.perform(machine().apply(&req.ctx(), req.event).effects());
+    });
+    assert_eq!(f.calls(), "remove --id jkb-claude-s1");
+    assert!(f.marker("s1").is_none());
+}
+
+/// A path-like session id must not be able to name a path.
+#[test]
+fn a_path_like_session_id_is_sanitised() {
+    assert_eq!(super::sanitize("../../etc/passwd"), "______etc_passwd");
+    assert_eq!(super::sanitize("ok-9_A"), "ok-9_A");
+}
+
+/// The tool is read out of prose, so its failure mode matters more than its success.
+#[test]
+fn the_tool_is_read_out_of_the_message() {
+    assert_eq!(
+        super::tool_in("Claude needs your permission to use Bash").as_deref(),
+        Some("Bash")
+    );
+    assert_eq!(
+        super::tool_in("permission to use Read the file").as_deref(),
+        Some("Read")
+    );
+    assert_eq!(super::tool_in("Claude is waiting for your input"), None);
+    assert_eq!(super::tool_in("permission to use "), None);
+}
+
+/// The sweep withdraws a provably-dead session's notification and spares every other kind.
+///
+/// This is the only route by which a killed session's Alerts-style notification — which waits
+/// for ever by design — ever comes down, and the one place a wrong answer is expensive in the
+/// other direction: withdrawing a live session's prompt is exactly the harm the feature exists
+/// to prevent, so `Unknown` must keep the record rather than clear it.
+#[test]
+fn the_sweep_spares_everything_it_cannot_prove_dead() {
+    let f = Fixture::new("sweep");
+    // A pid that cannot be running, this process (certainly alive), and no owner at all.
+    std::fs::write(f.dir.join("dead"), "Bash\n4294967294\n").expect("dead");
+    std::fs::write(
+        f.dir.join("live"),
+        format!("Bash\n{}\n", std::process::id()),
+    )
+    .expect("live");
+    std::fs::write(f.dir.join("unknown"), "Bash\n\n").expect("unknown");
+
+    let previous = std::env::var("JKB_NOTIFIER").ok();
+    std::env::set_var("JKB_NOTIFIER", &f.notifier);
+    with_state_dir(&f.dir, super::sweep);
+    match previous {
+        Some(v) => std::env::set_var("JKB_NOTIFIER", v),
+        None => std::env::remove_var("JKB_NOTIFIER"),
+    }
+
+    assert_eq!(f.calls(), "remove --id jkb-claude-dead");
+    assert!(
+        f.marker("dead").is_none(),
+        "a dead session's record is cleared"
+    );
+    assert!(
+        f.marker("live").is_some(),
+        "a live session keeps its notification"
+    );
+    assert!(
+        f.marker("unknown").is_some(),
+        "an unprovable owner keeps its record: Unknown refuses"
+    );
+}

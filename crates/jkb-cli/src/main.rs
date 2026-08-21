@@ -63,8 +63,12 @@ struct Cli {
 /// `jkb notify` verbs.
 #[derive(Subcommand)]
 enum NotifyCmd {
-    /// Read a hook payload on stdin and print the decision as JSON.
+    /// Read a hook payload on stdin and print the decision as JSON, performing nothing.
     Plan,
+    /// Read a hook payload on stdin, decide, and carry it out. What the hook shim calls.
+    Hook,
+    /// Withdraw notifications left behind by sessions that are provably gone.
+    Sweep,
 }
 
 #[derive(Subcommand)]

@@ -53,33 +53,15 @@ NOTIFIER_PATHS=(
   "/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier"
 )
 
-# The events this hook acts on, and the ONLY place they are enumerated. They also have to be
-# registered in `.claude/settings.json`, and that is a second file this one cannot see — so
-# `--events` exists for `scripts/test-hooks.sh` to diff the two. Losing a registration is silent
-# in the worst way: drop `Stop` and a *denied* permission, which produces no `PostToolUse`, leaves
-# its notification on screen until the session ends — which is the case `Stop` is here for.
-SHOW_EVENTS=(Notification)
-# Split by how far each event can be trusted to mean "the user dealt with it".
-#   TOOL_EVENTS  fire after ANY tool call, including one running concurrently with an unanswered
-#                permission prompt — so they withdraw only when the finished tool is the one the
-#                prompt was about.
-#   USER_EVENTS  are the user acting on this session directly, so they withdraw unconditionally.
-#   SWEEP_EVENTS end the turn or the session: nothing can still be waiting, so they withdraw
-#                without consulting the marker at all. This is the backstop that makes every
-#                failure above temporary.
-TOOL_EVENTS=(PostToolUse)
-USER_EVENTS=(UserPromptSubmit)
-SWEEP_EVENTS=(Stop SessionEnd)
-DISMISS_EVENTS=("${TOOL_EVENTS[@]}" "${USER_EVENTS[@]}" "${SWEEP_EVENTS[@]}")
-
-in_list() {
-  local needle=$1 x
-  shift
-  for x in "$@"; do
-    [ "$x" = "$needle" ] && return 0
-  done
-  return 1
-}
+# Every event `.claude/settings.json` must register for this hook, and the ONLY place they are
+# enumerated. The shim no longer dispatches on them — `jkb notify hook` does — but a registration
+# that goes missing is silent in the worst way, so `--events` exists for the cross-check in
+# `scripts/test-hooks.sh` to diff this list against settings.json in both directions.
+#
+# `SessionStart` is not one of the lifecycle's events: it drives the sweep over records left by
+# OTHER sessions, which is the only route by which a notification from a killed session ever
+# comes down.
+HOOK_EVENTS=(Notification PostToolUse UserPromptSubmit Stop SessionEnd SessionStart)
 
 notifier=""
 find_notifier() {
@@ -131,124 +113,38 @@ if [ "${1:-}" = "--notifier-path" ]; then
 fi
 
 # Every event this hook acts on, for the settings.json cross-check in scripts/test-hooks.sh.
+# Every event this hook acts on, for the settings.json cross-check in scripts/test-hooks.sh.
 if [ "${1:-}" = "--events" ]; then
-  printf '%s\n' "${SHOW_EVENTS[@]}" "${DISMISS_EVENTS[@]}"
+  printf '%s\n' "${HOOK_EVENTS[@]}"
   exit 0
 fi
 
-show() {
-  local message subtitle
-  message=$(printf '%s' "$input" | jq -r '.message // ""' 2>/dev/null)
-  [ -n "$message" ] || message="Claude Code needs you"
-  # The working directory's leaf name, which under D36 is the session's worktree — the one thing
-  # that tells two parallel sessions apart at a glance.
-  subtitle=$(printf '%s' "$input" | jq -r '.cwd // ""' 2>/dev/null)
-  subtitle=${subtitle##*/}
-
-  # Same id as any earlier notification from this session, so a second one replaces the first
-  # rather than stacking. A non-zero exit means the bundle is not installed or not yet authorized
-  # — it refuses instead of posting something invisible, precisely so this can fall through to a
-  # banner the user will actually see.
-  find_notifier
-  if [ -n "$notifier" ] &&
-    "$notifier" post --id "$notif_id" --title "Claude Code" --subtitle "$subtitle" \
-      --body "$message" >/dev/null 2>&1; then
-    # The marker means "there is a notification of ours on screen that CAN be withdrawn", so it is
-    # written only once posting actually succeeded — and only on this branch. An osascript banner
-    # cannot be withdrawn, so marking one would buy `dismiss` nothing and cost every later tool
-    # call a look at a marker it can never act on.
-    # The marker records WHICH TOOL the prompt is about, so a concurrently-finishing tool cannot
-    # withdraw it. Claude Code's Notification payload names no tool, so it is read out of the
-    # message text; when that does not match, the marker is empty and no `PostToolUse` will
-    # consume it — the notification then waits for the user or for the end-of-turn sweep, which is
-    # the safe direction.
-    local tool=""
-    case "$message" in
-      *"permission to use "*)
-        tool=${message##*permission to use }
-        tool=${tool%% *}
-        tool=${tool//[!A-Za-z0-9_-]/}
-        ;;
-    esac
-    mkdir -p "$state_dir" 2>/dev/null && printf '%s\n' "$tool" > "$marker" 2>/dev/null
-    return
-  fi
-
-  command -v osascript >/dev/null 2>&1 || return
-  osascript -e "display notification $(as_applescript "$message") with title \"Claude Code\" subtitle $(as_applescript "$subtitle")" \
-    >/dev/null 2>&1
+# `jkb` carries the decision, but a hook inherits the session's PATH, and a GUI-launched terminal
+# routinely lacks ~/.cargo/bin. Looked up the same way the notifier is, and for the same reason.
+find_jkb() {
+  local c
+  for c in "$(command -v jkb 2>/dev/null || true)" \
+    "${CARGO_HOME:-$HOME/.cargo}/bin/jkb"; do
+    if [ -n "$c" ] && [ -x "$c" ]; then
+      printf '%s' "$c"
+      return
+    fi
+  done
 }
 
-# Withdraw, and forget the marker either way. Retrying a failed withdraw on every later tool call
-# is how a wedged notification centre turns into ~10s added to each one, so the retry lives with
-# the sweep events instead, which run a bounded number of times.
-withdraw() {
-  rm -f "$marker" 2>/dev/null
-  find_notifier
-  [ -n "$notifier" ] || return
-  "$notifier" remove --id "$notif_id" >/dev/null 2>&1
-}
+jkb_bin=$(find_jkb)
+# Fail OPEN and silent. No `jkb` means no notification — never a second implementation of the
+# rules in shell, which is the whole point of moving them into a table something can check.
+[ -n "$jkb_bin" ] || exit 0
 
-dismiss() {
-  if in_list "$event" "${SWEEP_EVENTS[@]}"; then
-    # Unconditional, and deliberately NOT gated on the marker: if the marker could not be written
-    # (unwritable or purged state dir) every marker-gated event short-circuits, and an
-    # `alert`-style notification waits forever by design — so the session would end with a stale
-    # alert on screen and nothing reporting it. These fire once per turn and once per session, so
-    # the sweep costs one withdraw of an id that is usually already gone.
-    withdraw
-    return
-  fi
-
-  # The frequent events. `PostToolUse` runs after EVERY tool call, so the common case — nothing
-  # pending — must not spawn a process, and the marker is what makes that a stat instead of an
-  # exec.
-  [ -f "$marker" ] || return
-
-  if in_list "$event" "${TOOL_EVENTS[@]}"; then
-    # A tool finishing is only evidence the PROMPT was answered when it is the tool the prompt was
-    # about. One assistant message routinely batches several calls, so a slow allowlisted one can
-    # finish while a permission prompt from another is still on screen — withdrawing there leaves
-    # the session blocked with nothing to show for it, which is the state this hook exists to
-    # prevent. An empty or mismatched marker waits for a user event or the sweep.
-    #
-    # Residual, stated rather than guarded: two calls to the SAME tool, one allowlisted and one
-    # prompting, are indistinguishable here, so the first to finish withdraws. The sweep still
-    # bounds it to the end of the turn.
-    local want=""
-    [ -r "$marker" ] && read -r want < "$marker" 2>/dev/null
-    { [ -n "$want" ] && [ "$want" = "$tool_name" ]; } || return
-  fi
-
-  withdraw
-}
-
-input=$(cat)
-
-# One `jq` and no other subprocess before the marker test below: `PostToolUse` fires after EVERY
-# tool call, so everything on the path to "nothing pending, exit" is a cost paid all day. Both
-# fields are identifiers, so a tab join needs no quoting; the message and cwd are read separately,
-# on the rare `Notification` path, precisely because they are free text.
-IFS=$'\t' read -r event session tool_name <<<"$(
-  printf '%s' "$input" |
-    jq -r '[.hook_event_name // "", .session_id // "", .tool_name // ""] | @tsv' 2>/dev/null
-)"
-
-# The session id becomes both a notification id and a filename, so reduce it to characters
-# that are inert in each — an id carrying `/` or `..` must not be able to name a path. An id we
-# cannot use is not a reason to disturb the session, so it is a silent exit.
-session=${session//[!A-Za-z0-9_-]/_}
-[ -n "$session" ] || exit 0
-
-notif_id="jkb-claude-$session"
-state_dir="${JKB_NOTIFY_STATE:-${TMPDIR:-/tmp}/jkb-claude-notify}"
-marker="$state_dir/$session"
-
-# Dispatched off the arrays above rather than a `case` arm spelling the events a second time.
-if in_list "$event" "${SHOW_EVENTS[@]}"; then
-  show
-elif in_list "$event" "${DISMISS_EVENTS[@]}"; then
-  dismiss
-fi
-
+find_notifier
+# The notifier's location stays OURS: `scripts/build-notifier.sh` and `scripts/setup.sh` already
+# ask this file for it, and both run where `jkb` may not be built yet. It is handed over rather
+# than looked up twice.
+#
+# NOT `exec`. `exec` makes jkb's exit status the HOOK's, and a `PostToolUse` hook that exits
+# non-zero blocks the tool call — so an older `jkb` without this subcommand, which clap rejects
+# with status 2, stops the session dead. That is exactly what happened the first time this shim
+# ran. Whatever jkb does, this exits 0.
+JKB_NOTIFIER="$notifier" "$jkb_bin" notify hook >/dev/null 2>&1
 exit 0

@@ -13,8 +13,8 @@
 //! artefact this module exists for; without it this is the same conditionals in a new shape.
 
 use jkb_fsm::{
-    require_no, require_yes, Denial, Dest, Event, EventKind, Fact, Machine, State, Stateful,
-    Transition, Verdict,
+    require_no, require_yes, Denial, Dest, Event, EventKind, Fact, Machine, Reconciliation, State,
+    Stateful, Transition, Verdict,
 };
 
 /// Where one session's notification stands.
@@ -370,6 +370,11 @@ use crate::NotifyCmd;
 pub fn run(cmd: &NotifyCmd) -> Result<()> {
     match cmd {
         NotifyCmd::Plan => plan(),
+        NotifyCmd::Hook => hook(),
+        NotifyCmd::Sweep => {
+            sweep();
+            Ok(())
+        }
     }
 }
 
@@ -399,28 +404,32 @@ fn tool_in(message: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Can we post something the user will see *and* take back? `Unknown` on anything we could not
-/// establish — never `No`, which would claim we asked.
-fn notifier_usable() -> Fact {
-    let Ok(bin) = std::env::var("JKB_NOTIFIER") else {
-        return Fact::Unknown;
-    };
-    let Ok(out) = Proc::new(&bin).arg("status").output() else {
+/// Where the notifier bundle is, as told to us by the shim.
+///
+/// Deliberately **not** a second copy of the search list. `.claude/hooks/notify-sticky.sh` owns
+/// it — `scripts/build-notifier.sh` and `scripts/setup.sh` already ask it, and those run in CI
+/// and on a machine where `jkb` may not be built yet — so it resolves the path and passes it in.
+/// A second copy is the defect this branch has already had to fix twice.
+fn notifier_path() -> Option<PathBuf> {
+    let bin = PathBuf::from(std::env::var("JKB_NOTIFIER").ok()?);
+    bin.is_file().then_some(bin)
+}
+
+/// Can we post something the user will see *and* take back?
+///
+/// `Unknown` for anything we could not establish — never `No`, which would claim we asked. The
+/// caller treats `Unknown` like `No` and shows a banner, because a banner the user sees beats a
+/// silent success: macOS accepts an unauthorized post, and one with alert style `none`, without
+/// any error at all.
+fn usable(bin: &std::path::Path) -> Fact {
+    let Ok(out) = Proc::new(bin).arg("status").output() else {
         return Fact::Unknown;
     };
     if !out.status.success() {
         return Fact::Unknown;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let authorized = text.contains("authorization=authorized");
-    // `alert-style=none` is accepted by macOS and displays nothing, so it is not usable even
-    // though the post would succeed and report success.
-    let visible = !text.contains("alert-style=none");
-    if authorized && visible {
-        Fact::Yes
-    } else {
-        Fact::No
-    }
+    Fact::from(text.contains("authorization=authorized") && !text.contains("alert-style=none"))
 }
 
 fn state_dir() -> PathBuf {
@@ -430,70 +439,296 @@ fn state_dir() -> PathBuf {
     )
 }
 
-fn plan() -> Result<()> {
-    let mut raw = String::new();
-    std::io::stdin()
-        .read_to_string(&mut raw)
-        .context("reading the hook payload from stdin")?;
-    let payload: serde_json::Value =
-        serde_json::from_str(&raw).context("the hook payload is not JSON")?;
+/// One hook invocation: the payload, the paths it resolves to, and the record it reads.
+///
+/// Built once and shared by deciding and performing, so the two cannot disagree about which
+/// session, which tool, or which record they are talking about.
+struct Request {
+    event: NotifEvent,
+    /// The notification id — the session, so parallel worktree sessions cannot clear each
+    /// other's, and a second prompt replaces the first rather than stacking.
+    id: String,
+    marker: PathBuf,
+    /// What the record already holds: the tool the prompt named, and where the session's
+    /// transcript lives. The transcript is the only evidence `sweep` has that a session died.
+    recorded: Option<Record>,
+    prompted_tool: Option<String>,
+    finished_tool: String,
+    message: String,
+    subtitle: String,
+    notifier: Option<PathBuf>,
+}
 
-    let field = |k: &str| {
-        payload
-            .get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    let session = sanitize(&field("session_id"));
-    let event = match field("hook_event_name").as_str() {
+/// The per-session record: the tool the prompt named, and the process to ask about liveness.
+///
+/// The owner is the hook's **parent** — Claude Code itself, since the shim `exec`s into `jkb`.
+/// Liveness is by owner-existence, never by age, which is D27's rule for claims and holds for the
+/// same reason here: a paused-but-alive session must keep the notification it is waiting on. A
+/// recycled pid reads as alive, which leaves an orphan up — the safe direction.
+struct Record {
+    tool: String,
+    owner: String,
+}
+
+impl Record {
+    fn read(path: &std::path::Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let mut lines = raw.lines();
+        Some(Self {
+            tool: lines.next().unwrap_or_default().trim().to_owned(),
+            owner: lines.next().unwrap_or_default().trim().to_owned(),
+        })
+    }
+}
+
+impl Request {
+    fn parse(raw: &str) -> Result<Option<Self>> {
+        let payload: serde_json::Value =
+            serde_json::from_str(raw).context("the hook payload is not JSON")?;
+        let field = |k: &str| {
+            payload
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+
+        let session = sanitize(&field("session_id"));
+        let Some(event) = event_for(&field("hook_event_name")) else {
+            return Ok(None);
+        };
+        if session.is_empty() {
+            return Ok(None);
+        }
+
+        let marker = state_dir().join(&session);
+        let cwd = field("cwd");
+        let message = field("message");
+        Ok(Some(Self {
+            event,
+            id: format!("jkb-claude-{session}"),
+            recorded: Record::read(&marker),
+            prompted_tool: tool_in(&message),
+            finished_tool: field("tool_name"),
+            subtitle: cwd.rsplit('/').next().unwrap_or_default().to_owned(),
+            notifier: notifier_path(),
+            marker,
+            message,
+        }))
+    }
+
+    /// The observation the machine reads. The state comes out of the record and nowhere else.
+    fn ctx(&self) -> NotifCtx {
+        let at = match self.recorded.as_ref() {
+            None => NotifState::Absent,
+            Some(r) if r.tool.is_empty() => NotifState::AwaitingUser,
+            Some(_) => NotifState::AwaitingTool,
+        };
+        NotifCtx {
+            at,
+            // Asked only where it is consulted: probing the notifier costs a subprocess, and the
+            // frequent events do not need it.
+            notifier_usable: if self.event == NotifEvent::Needed {
+                self.notifier.as_deref().map_or(Fact::Unknown, usable)
+            } else {
+                Fact::Unknown
+            },
+            tool_named: self.prompted_tool.is_some(),
+            tool_matches: match self.recorded.as_ref() {
+                Some(r) if !r.tool.is_empty() && !self.finished_tool.is_empty() => {
+                    Fact::from(r.tool == self.finished_tool)
+                }
+                _ => Fact::Unknown,
+            },
+            // One live session is being observed here; proving another one dead is `sweep`'s job.
+            session_alive: Fact::Unknown,
+        }
+    }
+
+    /// Carry out a plan. Every step is best-effort and silent: a hook must not disturb the
+    /// session, and there is nowhere for a complaint to go that is not the transcript.
+    fn perform(&self, effects: &[NotifEffect]) {
+        for effect in effects {
+            match effect {
+                NotifEffect::Post => {
+                    if let Some(bin) = &self.notifier {
+                        let _ = Proc::new(bin)
+                            .args(["post", "--id", &self.id, "--title", "Claude Code"])
+                            .args(["--subtitle", &self.subtitle, "--body", &self.message])
+                            .output();
+                    }
+                }
+                NotifEffect::Withdraw => {
+                    if let Some(bin) = &self.notifier {
+                        let _ = Proc::new(bin).args(["remove", "--id", &self.id]).output();
+                    }
+                }
+                NotifEffect::Banner => banner(&self.message, &self.subtitle),
+                NotifEffect::Remember => {
+                    let tool = self.prompted_tool.clone().unwrap_or_default();
+                    let owner = std::os::unix::process::parent_id();
+                    if std::fs::create_dir_all(state_dir()).is_ok() {
+                        let _ = std::fs::write(&self.marker, format!("{tool}\n{owner}\n"));
+                    }
+                }
+                NotifEffect::Forget => {
+                    let _ = std::fs::remove_file(&self.marker);
+                }
+            }
+        }
+    }
+}
+
+fn event_for(name: &str) -> Option<NotifEvent> {
+    match name {
         "Notification" => Some(NotifEvent::Needed),
         "PostToolUse" => Some(NotifEvent::ToolFinished),
         "UserPromptSubmit" => Some(NotifEvent::UserActed),
         "Stop" => Some(NotifEvent::TurnEnded),
         "SessionEnd" => Some(NotifEvent::SessionEnded),
         _ => None,
+    }
+}
+
+/// The plain `osascript` banner: visible, auto-hiding, impossible to withdraw. Newlines are
+/// folded because `AppleScript` has no escape for one inside a string literal, so one would end
+/// the statement mid-string.
+fn banner(message: &str, subtitle: &str) {
+    let quote = |s: &str| {
+        let s: String = s
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     };
-    let (Some(event), false) = (event, session.is_empty()) else {
+    let script = format!(
+        "display notification {} with title \"Claude Code\" subtitle {}",
+        quote(message),
+        quote(subtitle)
+    );
+    let _ = Proc::new("osascript").args(["-e", &script]).output();
+}
+
+/// Is the session that posted this still running? By owner-existence, never by age (D27).
+///
+/// `ps -p` rather than `kill -0`, which exits non-zero on `EPERM` for a live process owned by
+/// somebody else and would therefore report a running session dead — the same trap `owner.rs`
+/// documents. An unreadable or missing owner is `Unknown`, which refuses: leaving an orphan on
+/// screen is better than withdrawing a live session's prompt.
+fn session_alive(rec: &Record) -> Fact {
+    if rec.owner.is_empty() || rec.owner.parse::<u32>().is_err() {
+        return Fact::Unknown;
+    }
+    match Proc::new("ps").args(["-p", &rec.owner]).output() {
+        Ok(out) => Fact::from(out.status.success()),
+        Err(_) => Fact::Unknown,
+    }
+}
+
+/// Withdraw notifications left behind by sessions that are provably gone.
+///
+/// This is the ONLY route by which a notification from a killed session ever comes down. Every
+/// other event is scoped to a session id that will never occur again, so without this an
+/// Alerts-style notification — which waits for ever by design — sits on screen naming a session
+/// that no longer exists.
+///
+/// It goes through [`Machine::reconcile`] rather than calling the guard itself, so two conditions
+/// that both applied would be **reported** rather than resolved by whichever arm ran first.
+fn sweep() {
+    let Ok(entries) = std::fs::read_dir(state_dir()) else {
+        return;
+    };
+    let machine = machine();
+    for entry in entries.flatten() {
+        let marker = entry.path();
+        let Some(rec) = Record::read(&marker) else {
+            continue;
+        };
+        let Some(session) = marker.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let req = Request {
+            event: NotifEvent::SessionGone,
+            id: format!("jkb-claude-{session}"),
+            marker: marker.clone(),
+            prompted_tool: None,
+            finished_tool: String::new(),
+            message: String::new(),
+            subtitle: String::new(),
+            notifier: notifier_path(),
+            recorded: None,
+        };
+        let ctx = NotifCtx {
+            at: if rec.tool.is_empty() {
+                NotifState::AwaitingUser
+            } else {
+                NotifState::AwaitingTool
+            },
+            notifier_usable: Fact::Unknown,
+            tool_named: !rec.tool.is_empty(),
+            tool_matches: Fact::Unknown,
+            session_alive: session_alive(&rec),
+        };
+        if let Reconciliation::Fired(out) = machine.reconcile(&ctx) {
+            req.perform(out.effects());
+        }
+    }
+}
+
+fn read_stdin() -> Result<String> {
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .context("reading the hook payload from stdin")?;
+    Ok(raw)
+}
+
+/// Decide and print, performing nothing.
+fn plan() -> Result<()> {
+    let Some(req) = Request::parse(&read_stdin()?)? else {
         println!(
             "{}",
             serde_json::json!({ "effects": [], "reason": "not an event we act on" })
         );
         return Ok(());
     };
+    let out = machine().apply(&req.ctx(), req.event);
+    println!(
+        "{}",
+        serde_json::json!({
+            "state": out.state().name(),
+            "moved": out.moved(),
+            "effects": effect_names(out.effects()),
+            "tool": req.prompted_tool,
+            "refusal": out.refusal(),
+        })
+    );
+    Ok(())
+}
 
-    // State comes from the record, which is the single source the machine reads through
-    // `Stateful` — never a second value passed beside it.
-    let recorded = std::fs::read_to_string(state_dir().join(&session)).ok();
-    let remembered_tool = recorded.as_deref().map(str::trim).filter(|t| !t.is_empty());
-    let at = match (&recorded, remembered_tool) {
-        (None, _) => NotifState::Absent,
-        (Some(_), Some(_)) => NotifState::AwaitingTool,
-        (Some(_), None) => NotifState::AwaitingUser,
+/// Decide and carry it out. This is what the hook shim calls.
+fn hook() -> Result<()> {
+    let raw = read_stdin()?;
+    // `SessionStart` is not an event of the machine — it drives the machine over every OTHER
+    // session's record, which is a different question from "what should this session do now".
+    if serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("hook_event_name")?.as_str().map(str::to_owned))
+        .as_deref()
+        == Some("SessionStart")
+    {
+        sweep();
+        return Ok(());
+    }
+    let Some(req) = Request::parse(&raw)? else {
+        return Ok(());
     };
+    req.perform(machine().apply(&req.ctx(), req.event).effects());
+    Ok(())
+}
 
-    let message = field("message");
-    let prompted_tool = tool_in(&message);
-    let finished_tool = field("tool_name");
-    let ctx = NotifCtx {
-        at,
-        notifier_usable: if event == NotifEvent::Needed {
-            notifier_usable()
-        } else {
-            Fact::Unknown
-        },
-        tool_named: prompted_tool.is_some(),
-        tool_matches: match remembered_tool {
-            Some(want) if !finished_tool.is_empty() => Fact::from(want == finished_tool),
-            _ => Fact::Unknown,
-        },
-        // `plan` observes one live session; proving another one dead is `sweep`'s job (N10).
-        session_alive: Fact::Unknown,
-    };
-
-    let out = machine().apply(&ctx, event);
-    let effects: Vec<&str> = out
-        .effects()
+fn effect_names(effects: &[NotifEffect]) -> Vec<&'static str> {
+    effects
         .iter()
         .map(|e| match e {
             NotifEffect::Post => "post",
@@ -502,16 +737,5 @@ fn plan() -> Result<()> {
             NotifEffect::Remember => "remember",
             NotifEffect::Forget => "forget",
         })
-        .collect();
-    println!(
-        "{}",
-        serde_json::json!({
-            "state": out.state().name(),
-            "moved": out.moved(),
-            "effects": effects,
-            "tool": prompted_tool,
-            "refusal": out.refusal(),
-        })
-    );
-    Ok(())
+        .collect()
 }
