@@ -1268,11 +1268,23 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     *inside* the user namespace `bwrap` creates, where the process holds no privilege over the
     host. It must also run **non-root**: with seccomp off, root in a container still cannot create
     a mount/net/pid namespace directly. Dev Containers already default to non-root.
-  - **Not established:** that Claude Code *itself* starts in such a container, or that
-    `strictAllowlist` survives nesting. `claude -p` hangs in a bare container — and hangs
-    identically with **no** sandbox configuration, so the control proves the hang is unrelated and
-    the probe cannot discriminate. The table is the mechanism, not the product; "bwrap works,
-    therefore the sandbox works" is still an inference.
+  - **Two questions, and only one is about Docker.** Docker hosts limited mounts trivially — that
+    is where the default-deny read property comes from, and it needs no seccomp work. The table is
+    about the *different* question of running Claude Code's own sandbox **nested inside** such a
+    container. "Stock Docker cannot host it" conflated them: false of the mounts, true only of the
+    nesting. **Container-only is available today**; the seccomp profile is the price of keeping
+    both layers, not of admission.
+  - **Not established:** that Claude Code *itself* engages or refuses in a container. Two probes
+    failed instructively. `claude -p` with an **invalid** key hangs with zero output — and hangs
+    identically with no sandbox config, so the control proved it was the fake key; with **no** key
+    it exits in a second (`Not logged in`), so Claude Code runs fine in a stock container. That
+    suggested a credential-free discriminator, since `failIfUnavailable` is documented to error at
+    startup and so should precede auth — **it does not**: in a stock container, where bwrap
+    provably cannot create a namespace, it still printed `Not logged in`. So the sandbox is
+    checked lazily, or auth precedes it; either way the probe cannot discriminate and the
+    prediction behind it was wrong. Settling it needs a real session plus one `printenv
+    CLAUDE_CODE_SANDBOXED` — i.e. credentials inside the container, which is the credential
+    owner's call.
   - **What it does not buy:** `~/repos` mounted is still writable and push-able — the win is
     bounded to what you did not mount. And container egress is unrestricted by default, so if the
     inner sandbox ever fails to start you lose `strictAllowlist`; a container without its own
