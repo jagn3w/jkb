@@ -1327,8 +1327,9 @@ derives a cwd from **`workspaceFolders[0]`** and takes no directory argument, so
 from the repo's window would work the **main checkout** — the one thing a session exists to
 keep apart (D36). So the worktree has to *be* the window's folder. `vscode.openFolder` carries
 no payload and the new window is a different extension host, so the prompt is handed over
-through a one-file queue in global storage (`ui/vscode/src/claude.ts`), keyed by worktree:
-click writes it, the opened window takes it on activation — which is why the extension now
+through a queue in global storage (`ui/vscode/src/claude.ts`) — **one file per waiting prompt**
+under `<globalStorage>/pending/`, named `sha1(realpath(worktree)).json`: click writes one, the
+opened window takes it by `unlink` — which is why the extension now
 activates `onStartupFinished` rather than when its view is first shown. An entry expires when
 its worktree is gone, which is exactly the set that can never be delivered; no clock decides
 it. Without the Claude Code extension installed the terminal remains the fallback, where it is
@@ -1378,10 +1379,16 @@ across three review rounds and three fix rounds; a two-command probe settled it 
 minute. A claim was even *removed* from a comment for being unverifiable and then reinstated
 two commits later as the foundation of a redesign. When a design rests on what another program
 does, measure it before building on it, and record the measurement with its method and its
-limits so the next reader knows what kind of thing it is. **`takePrompt` returns without writing when it took nothing**: every window
-now activates at startup and calls it, so writing back would put every VS Code window on the
-machine into the read-modify-write race for one shared file, whose lost update is an
-already-delivered prompt resurrected.
+limits so the next reader knows what kind of thing it is. **The queue is one file per entry, not one file holding a map.** It
+was a map, and every window watching the directory then meant every window did a
+read-modify-write of one shared file on each delivery — whose lost update is an
+already-delivered prompt resurrected and delivered twice. Per-entry files make that
+unrepresentable rather than rule-avoided: there is no shared document to lose an update to, a
+take is one `unlink` touching no other entry, and "must a take write the file back?" stops
+being a question anyone can get wrong. Same move as `containment`'s primary key (D35). Expiry
+is `sweepUndeliverable` on worktree existence, running after a write and never touching the
+entry it was just handed. No migration was written and none is owed: the branch had not
+landed, so no released build ever wrote the map.
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.

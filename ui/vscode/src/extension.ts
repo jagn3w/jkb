@@ -21,6 +21,7 @@ import {
   watchQueuedPrompts,
   startSessionTerminal,
   reportTerminal,
+  reportBlocked,
   claudeCommand,
   taskLauncher,
   type Launch,
@@ -335,14 +336,7 @@ async function workTaskWithClaude(
   } else if (launch.where === "blocked") {
     // `jkb.taskLauncher` is "extension", so a terminal is not a substitute — it is the thing
     // the operator ruled out. The session is open either way and In Flight can open a shell.
-    vscode.window.showErrorMessage(
-      `jkb: could not start Claude Code (${launch.cause}). The session is open at ` +
-        `${session.worktree} — ` +
-        (launch.missing
-          ? "install the Claude Code extension"
-          : 'set jkb.taskLauncher to "auto" to fall back to a terminal') +
-        ".",
-    );
+    reportBlocked(launch, `— the session is open at ${session.worktree}`);
   }
   vscode.window.setStatusBarMessage(
     `jkb: ${session.resumed ? "resumed" : "opened"} session ${session.session} on ${session.branch}` +

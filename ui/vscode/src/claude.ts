@@ -138,7 +138,10 @@ export async function launchClaude(
   if (launcher === "terminal") return { where: "terminal" };
 
   if (!vscode.extensions.getExtension(CLAUDE_EXTENSION_ID)) {
-    return unreachable(launcher, true, "the Claude Code extension is not installed");
+    return unreachable(launcher, {
+      cause: "the Claude Code extension is not installed",
+      missing: true,
+    });
   }
 
   const here = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -147,7 +150,7 @@ export async function launchClaude(
     const failure = await openClaudeHere(prompt);
     return failure === undefined
       ? { where: "here" }
-      : unreachable(launcher, failure.missing, failure.cause);
+      : unreachable(launcher, failure);
   }
 
   try {
@@ -155,7 +158,7 @@ export async function launchClaude(
   } catch (e) {
     // The queue IS the hand-off. Opening the window anyway would give an empty Claude panel
     // in a worktree with no sign of which task it is for; a terminal carries the prompt.
-    return unreachable(launcher, false, causeOf(e));
+    return unreachable(launcher, { cause: causeOf(e), missing: false });
   }
   try {
     // `forceNewWindow` is load-bearing, not a preference: without it VS Code opens the folder
@@ -167,7 +170,7 @@ export async function launchClaude(
   } catch (e) {
     // No window will ever open on it, so nothing would ever take the prompt back out.
     takePrompt(context, worktree);
-    return unreachable(launcher, false, causeOf(e));
+    return unreachable(launcher, { cause: causeOf(e), missing: false });
   }
   return { where: "window" };
 }
@@ -326,10 +329,10 @@ export interface Unreached {
  * One place decides, so the `extension` setting cannot be honoured on three of the four
  * failure paths and quietly ignored on the fourth.
  */
-function unreachable(launcher: Launcher, missing: boolean, cause: string): Launch {
+function unreachable(launcher: Launcher, failure: Unreached): Launch {
   return launcher === "extension"
-    ? { where: "blocked", cause, missing }
-    : { where: "terminal", fallback: { missing, cause } };
+    ? { where: "blocked", ...failure }
+    : { where: "terminal", fallback: failure };
 }
 
 /**
@@ -407,15 +410,9 @@ export async function deliverQueuedPrompt(
     // over, through the same decision. It used to report and stop, which under `auto` withheld
     // the terminal the policy promises — in the one window whose folder already *is* the
     // worktree — and under `extension` advised the surface the operator ruled out.
-    const outcome = unreachable(launcher, failure.missing, failure.cause);
+    const outcome = unreachable(launcher, failure);
     if (outcome.where === "blocked") {
-      vscode.window.showErrorMessage(
-        `jkb: could not start Claude Code for ${pending.uid} (${failure.cause}). ` +
-          (outcome.missing
-            ? "Install the Claude Code extension"
-            : 'Set jkb.taskLauncher to "auto" to fall back to a terminal') +
-          ", then click Work this task with Claude again.",
-      );
+      reportBlocked(outcome, `for ${pending.uid}`);
       return;
     }
     reportTerminal(startSessionTerminal(host, pending.session, folder, claudeCommand(pending.prompt)), failure);
@@ -424,6 +421,26 @@ export async function deliverQueuedPrompt(
   reportTerminal(
     startSessionTerminal(host, pending.session, folder, claudeCommand(pending.prompt)),
     undefined,
+  );
+}
+
+/**
+ * Say that Claude Code was required and could not be started — the one wording both windows use.
+ *
+ * `reportTerminal`'s sibling, unified for the same reason: this text was written out in two
+ * files, both had to be edited when `missing` arrived, and they came out differently worded.
+ * `where` is the bit only the caller knows — which task, or which checkout is now sitting open.
+ */
+export function reportBlocked(
+  blocked: { readonly cause: string; readonly missing: boolean },
+  where: string,
+): void {
+  vscode.window.showErrorMessage(
+    `jkb: could not start Claude Code ${where} (${blocked.cause}). ` +
+      (blocked.missing
+        ? "Install the Claude Code extension"
+        : 'Set jkb.taskLauncher to "auto" to fall back to a terminal') +
+      ", then click Work this task with Claude again.",
   );
 }
 
@@ -438,7 +455,7 @@ export async function deliverQueuedPrompt(
 export function reportTerminal(arm: TerminalStart, fallback: Unreached | undefined): void {
   const why = fallback
     ? fallback.missing
-      ? " Install the Claude Code extension to work the session in its own window instead."
+      ? " Install the Claude Code extension to get a Claude chat rather than a terminal."
       : ` Claude Code could not be started (${fallback.cause}).`
     : "";
   if (arm === "started") {
@@ -550,8 +567,7 @@ function queuePrompt(
   try {
     fs.mkdirSync(queueDir(context), { recursive: true });
     // Written aside and renamed, so a window watching the directory never reads a half-written
-    // entry. The sweep runs first and never touches this key: a store that discarded what it
-    // was handed must not go on to report success.
+    // entry.
     const temp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(temp, JSON.stringify(entry, null, 2));
     fs.renameSync(temp, file);
@@ -559,6 +575,9 @@ function queuePrompt(
     // Queuing is the whole mechanism, so a failure here must not pass for a queued prompt.
     throw new Error(`could not write ${file}: ${causeOf(e)}`);
   }
+  // Housekeeping, and it runs AFTER the write: `keep` is what stops the sweep removing the
+  // entry that was just handed to it, since a store that discarded its input must not go on
+  // to report success.
   sweepUndeliverable(context, key);
 }
 
