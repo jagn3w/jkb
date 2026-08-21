@@ -57,21 +57,36 @@ export type Launch =
       readonly where: "terminal";
       readonly fallback?: { readonly missing: boolean; readonly cause: string };
     }
-  /** `launcher: "extension"` and it could not be started. Report it; substitute nothing. */
-  | { readonly where: "blocked"; readonly cause: string };
+  /**
+   * `launcher: "extension"` and it could not be started. Report it; substitute nothing.
+   *
+   * `missing` rides along for the same reason it does on `terminal`: with no extension
+   * installed the only remedy that honours what the operator asked for is to install it, and
+   * that is precisely the branch that must not tell them to abandon their own setting.
+   */
+  | { readonly where: "blocked"; readonly cause: string; readonly missing: boolean };
 
 /** What to start, and what is already known about the session. */
 export interface LaunchRequest {
   readonly worktree: string;
   readonly uid: string;
   readonly prompt: string;
+  /** The session's name, used to name (and later find) its terminal. */
+  readonly session: string;
   readonly launcher: Launcher;
 }
 
-/** A prompt waiting for the window that opens on a session's worktree. */
+/**
+ * A prompt waiting for the window that opens on a session's worktree.
+ *
+ * `session` is carried rather than re-derived from the worktree path: the delivering window
+ * needs it to name the session's terminal when it has to fall back, and inferring it from the
+ * last path segment would be a second, quieter definition of how a session is named.
+ */
 interface PendingPrompt {
   readonly uid: string;
   readonly prompt: string;
+  readonly session: string;
 }
 
 /**
@@ -112,7 +127,7 @@ export async function launchClaude(
   context: vscode.ExtensionContext,
   req: LaunchRequest,
 ): Promise<Launch> {
-  const { worktree, uid, prompt, launcher } = req;
+  const { worktree, uid, prompt, session, launcher } = req;
   // Asked for a terminal: no window and no queue. Everything below is about reaching Claude
   // Code, and none of it is something the operator asked to happen. Returning early is safe
   // only because the duplicate guard is no longer down there — it is `sessionTerminal`, which
@@ -131,27 +146,41 @@ export async function launchClaude(
   }
 
   try {
-    queuePrompt(context, worktree, { uid, prompt });
+    queuePrompt(context, worktree, { uid, prompt, session });
   } catch (e) {
     // The queue IS the hand-off. Opening the window anyway would give an empty Claude panel
     // in a worktree with no sign of which task it is for; a terminal carries the prompt.
-    return unreachable(launcher, false, (e as Error).message);
+    return unreachable(launcher, false, causeOf(e));
   }
   try {
     // `forceNewWindow` is load-bearing, not a preference: without it VS Code opens the folder
     // in THIS window, which shuts the current extension host down — killing the click
     // mid-command, and taking the repo's own explorer with it.
-    await vscode.commands.executeCommand(
-      "vscode.openFolder",
-      vscode.Uri.file(worktree),
-      { forceNewWindow: true },
-    );
+    await vscode.commands.executeCommand("vscode.openFolder", folderUri(worktree), {
+      forceNewWindow: true,
+    });
   } catch (e) {
     // No window will ever open on it, so nothing would ever take the prompt back out.
     takePrompt(context, worktree);
-    return unreachable(launcher, false, (e as Error).message);
+    return unreachable(launcher, false, causeOf(e));
   }
   return { where: "window" };
+}
+
+/**
+ * The worktree as a URI **in this window's world**, not necessarily the local disk.
+ *
+ * The adapter declares no `extensionKind`, so over Remote-SSH/WSL/devcontainer it runs in the
+ * workspace extension host and every path it handles is a *remote* path — `jkb` is spawned
+ * there, terminals open there, the queue is written there. `Uri.file` builds an authority-less
+ * `file://`, which asks the client to open the folder on the local machine: a window on a path
+ * that does not exist locally, while the prompt waits in the remote queue under a key no local
+ * window will ever match. Deriving from the window's own folder URI carries scheme and
+ * authority across; `Uri.file` remains the fallback only when there is no folder to derive from.
+ */
+function folderUri(worktree: string): vscode.Uri {
+  const base = vscode.workspace.workspaceFolders?.[0]?.uri;
+  return base ? base.with({ path: worktree }) : vscode.Uri.file(worktree);
 }
 
 /** The terminal a session's `claude` runs in, named so a later click can find it again. */
@@ -248,6 +277,20 @@ export function sessionTerminal<T extends TerminalLike>(
   });
 }
 
+/**
+ * What went wrong, as text fit to show someone.
+ *
+ * `executeCommand` propagates a rejection value as-is, so a command that rejects with a string
+ * or a plain object makes `causeOf(e)` `undefined` — and the cause this whole shape
+ * exists to carry renders as the literal "undefined". An `Error` with an empty message gives
+ * "()". One helper, so all three catches agree.
+ */
+function causeOf(e: unknown): string {
+  if (e instanceof Error && e.message) return e.message;
+  const text = String(e);
+  return text && text !== "undefined" ? text : "no reason given";
+}
+
 /** A terminal's working directory, from the `string | Uri` VS Code accepts — or nothing. */
 function directoryOf(options: object): string | undefined {
   const cwd: unknown = "cwd" in options ? (options as { cwd?: unknown }).cwd : undefined;
@@ -267,7 +310,7 @@ function directoryOf(options: object): string | undefined {
  */
 function unreachable(launcher: Launcher, missing: boolean, cause: string): Launch {
   return launcher === "extension"
-    ? { where: "blocked", cause }
+    ? { where: "blocked", cause, missing }
     : { where: "terminal", fallback: { missing, cause } };
 }
 
@@ -321,18 +364,72 @@ export function watchQueuedPrompts(context: vscode.ExtensionContext): vscode.Dis
  * Claude" in the repo window: `jkb task work` returns the same session, so re-running it
  * costs nothing.
  */
-export async function deliverQueuedPrompt(context: vscode.ExtensionContext): Promise<void> {
+export async function deliverQueuedPrompt(
+  context: vscode.ExtensionContext,
+  host: TerminalHost = vscode.window,
+): Promise<void> {
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (folder === undefined) return;
   const pending = takePrompt(context, folder);
   if (!pending) return;
   const failure = await openClaudeHere(pending.prompt);
-  if (failure !== undefined) {
+  if (failure === undefined) return;
+
+  // This is the same "Claude Code could not be reached" question `launchClaude` asks, one
+  // window over, and it goes through the same decision. It used to report and stop, which
+  // under `auto` withheld the terminal the policy promises — in the one window whose folder
+  // already *is* the worktree, so a terminal is trivially available — and under `extension`
+  // advised running `claude` by hand, the surface the operator ruled out.
+  const outcome = unreachable(taskLauncher(), false, failure);
+  if (outcome.where === "blocked") {
     vscode.window.showErrorMessage(
-      `jkb: could not start Claude Code for ${pending.uid} (${failure}) — run \`claude\` in a ` +
-        "terminal here, or click Work this task with Claude again.",
+      `jkb: could not start Claude Code for ${pending.uid} (${failure}). ` +
+        (outcome.missing
+          ? "Install the Claude Code extension"
+          : 'Set jkb.taskLauncher to "auto" to fall back to a terminal') +
+        ", then click Work this task with Claude again.",
     );
+    return;
   }
+  const arm = startSessionTerminal(
+    host,
+    pending.session,
+    folder,
+    claudeCommand(pending.prompt),
+  );
+  vscode.window.showInformationMessage(
+    arm === "started"
+      ? `jkb: could not start Claude Code (${failure}) — ran \`claude\` in a terminal instead.`
+      : "jkb: this session already has a `claude` terminal — showed it, and sent nothing.",
+  );
+}
+
+/**
+ * How the operator wants a session started; anything unrecognised reads as the default.
+ *
+ * Lives here, beside the policy it feeds, so the two windows that ask the question — the one
+ * clicking and the one receiving — cannot answer it from two different readings of the setting.
+ */
+export function taskLauncher(): Launcher {
+  const choice = vscode.workspace.getConfiguration("jkb").get<string>("taskLauncher");
+  return choice === "extension" || choice === "terminal" ? choice : "auto";
+}
+
+/**
+ * The shell command that starts an agent on `prompt`.
+ *
+ * Exported so the two windows that can start one — the clicking window and the receiving
+ * window falling back — build the identical line. Two copies of a quoting rule is one copy
+ * that eventually differs, and the difference would be in shell quoting of a prompt carrying
+ * task titles and branch names.
+ */
+export function claudeCommand(prompt: string): string {
+  return `claude ${shellQuote(prompt)}`;
+}
+
+/** Single-quote a string for safe use in a POSIX shell. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 /**
@@ -355,7 +452,7 @@ async function openClaudeHere(prompt: string): Promise<string | undefined> {
     await vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND, undefined, prompt);
     return undefined;
   } catch (e) {
-    return (e as Error).message;
+    return causeOf(e);
   }
 }
 
@@ -369,8 +466,13 @@ function queuePrompt(
   pending: PendingPrompt,
 ): void {
   const queue = readQueue(context);
-  queue[directoryKey(worktree)] = pending;
-  writeQueue(context, queue);
+  const key = directoryKey(worktree);
+  queue[key] = pending;
+  // `key` is exempt from the expiry sweep below. Without that, a worktree removed outside jkb
+  // — an interrupted land, a stray rm -rf — makes the sweep drop the very entry it was handed
+  // and return normally, so the launch reports "opening its window" having stored nothing.
+  // A store that discarded what it was given must not report success.
+  writeQueue(context, queue, key);
 }
 
 /** Remove and return the prompt queued for `dir`, if any. */
@@ -417,7 +519,11 @@ function readQueue(context: vscode.ExtensionContext): Record<string, PendingProm
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     const entry = value as Partial<PendingPrompt>;
     if (typeof entry?.uid === "string" && typeof entry?.prompt === "string") {
-      queue[key] = { uid: entry.uid, prompt: entry.prompt };
+      // `session` post-dates the first release of this file, so an entry written by an older
+      // build has none. Default it from the worktree's last segment — the shape `jkb task
+      // work` builds — rather than dropping a prompt someone is waiting on.
+      const session = typeof entry.session === "string" ? entry.session : path.basename(key);
+      queue[key] = { uid: entry.uid, prompt: entry.prompt, session };
     }
   }
   return queue;
@@ -426,13 +532,14 @@ function readQueue(context: vscode.ExtensionContext): Record<string, PendingProm
 function writeQueue(
   context: vscode.ExtensionContext,
   queue: Record<string, PendingPrompt>,
+  keep?: string,
 ): void {
   // A worktree that is gone — `jkb task abandon`, or a landed session — can never open a
   // window, so its prompt can never be taken. That is the whole expiry rule: the entries
   // that expire are exactly the undeliverable ones, and no clock decides it.
   const live: Record<string, PendingPrompt> = {};
   for (const [dir, pending] of Object.entries(queue)) {
-    if (fs.existsSync(dir)) live[dir] = pending;
+    if (dir === keep || fs.existsSync(dir)) live[dir] = pending;
   }
   const file = queueFile(context);
   try {
@@ -446,7 +553,7 @@ function writeQueue(
     fs.renameSync(temp, file);
   } catch (e) {
     // Queuing is the whole mechanism, so a failure here must not pass for a queued prompt.
-    throw new Error(`could not write ${file}: ${(e as Error).message}`);
+    throw new Error(`could not write ${file}: ${causeOf(e)}`);
   }
 }
 
