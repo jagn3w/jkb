@@ -336,7 +336,7 @@ async function workTaskWithClaude(
   } else if (launch.where === "blocked") {
     // `jkb.taskLauncher` is "extension", so a terminal is not a substitute — it is the thing
     // the operator ruled out. The session is open either way and In Flight can open a shell.
-    reportBlocked(launch, `— the session is open at ${session.worktree}`);
+    reportBlocked(launch, `The session is open at ${session.worktree}.`);
   }
   vscode.window.setStatusBarMessage(
     `jkb: ${session.resumed ? "resumed" : "opened"} session ${session.session} on ${session.branch}` +
@@ -420,7 +420,7 @@ async function pickStagingBranch(
   const create = {
     label: "$(add) New staging branch…",
     description: "cut a fresh branch from trunk",
-    value: " new",
+    value: "\0new",
   };
   const existing = branches.map((b) => ({
     label: `$(git-branch) ${b.branch}`,
@@ -437,7 +437,7 @@ async function pickStagingBranch(
     placeHolder: "Where should this task's work land?",
   });
   if (!pick) return undefined;
-  if (pick.value !== " new") return pick.value;
+  if (pick.value !== "\0new") return pick.value;
 
   const name = await vscode.window.showInputBox({
     prompt: "Name for the new staging branch (cut from trunk)",
