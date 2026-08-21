@@ -24,6 +24,17 @@ fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; failures=$((failures + 1)); }
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# Any temp file install_exec left in <dir>, or nothing. A plain glob rather than `find
+# -quit`, which is a GNU/BSD extension: this suite gates CI on Linux and is developed on
+# macOS, so it sticks to what both are guaranteed to have.
+stray_in() {
+    local f
+    for f in "$1"/.jkb-install.*; do
+        [ -e "$f" ] && printf '%s\n' "$f" && return 0
+    done
+    return 0
+}
+
 # --- 1. a script survives being replaced, by a longer version, while it is running -------
 case1() {
     local d="$work/running" out err status
@@ -74,7 +85,7 @@ PROG
     else
         fail "mode: exec bit" "$d/prog is not runnable (caller no longer chmods it)"
     fi
-    if [ -z "$(find "$d" -name '.jkb-install.*' -print -quit)" ]; then
+    if [ -z "$(stray_in "$d")" ]; then
         ok "no temp file is left behind"
     else
         fail "mode: temp" "a .jkb-install.* temp file survived a successful install"
@@ -120,7 +131,7 @@ case4() {
         fail "stranded: status" "install_exec reported success though its input was unreadable"
         return
     fi
-    stray="$(find "$d" -name '.jkb-install.*' -print -quit)"
+    stray="$(stray_in "$d")"
     if [ -z "$stray" ]; then
         ok "a failure after the temp file exists still leaves no temp file"
     else
