@@ -353,27 +353,6 @@ pub fn record_undo(
     Ok(())
 }
 
-/// The landing that **currently** speaks for this task's work, whichever route recorded it.
-///
-/// A present-tense question, so it answers `None` both when nothing ever landed and when what
-/// landed has since been superseded — see [`resumed`]. A caller that needs to tell those apart
-/// asks [`landing`] instead; this is the short form for callers that only need the row.
-///
-/// **Both events, and that is the point.** `jkb task land` records `land`; the merge queue's
-/// `jkb task landed` records `observed_landed`. Matching only the first meant the swarm's whole
-/// flow — queue fast-forwards, records the graft, then `/review-log` runs `review record` — put
-/// every group task in "has not grafted their work onto it yet", which was false, while three
-/// separate places documented the opposite.
-///
-/// An `onto` is required: it is what a reader asks about ("did this work reach *that* branch"),
-/// and an entry without one answers nothing.
-///
-/// # Errors
-/// Returns a database error if the query fails.
-pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
-    Ok(landing(conn, task)?.live().cloned())
-}
-
 /// The newest row that **put this task back to work**, or `None` if none did.
 ///
 /// *The* statement of when evidence of a landing goes stale, and the reason it is one function:
@@ -427,15 +406,19 @@ fn resumption(rows: &[TransitionRow]) -> Option<&TransitionRow> {
         .find(|r| TaskStatus::moved_backwards(r.from_status.as_deref(), Some(&r.to_status)))
 }
 
-/// What this task's history says about a landing, **now**.
+/// Everything one read of a task's history says about where its work went.
 ///
-/// Three answers, because two of them were being spelled the same way and no caller could tell
-/// them apart. [`landed`] returning `None` meant *no landing was ever recorded* and also *one was
-/// and it is spent*, so `jkb task close-merged` fell through to asking GitHub about a pull
-/// request — for a branch the merge queue had grafted locally, which never had one. The verdict
-/// it printed named a missing pull request and advised recording one, to a reader whose task's
-/// actual situation was that its landing had been superseded.
-
+/// A record, not a verdict: the accessors ask **different tenses** of it, and choosing between
+/// them is a real decision rather than a matter of taste. [`Landing::live`] and
+/// [`Landing::superseded`] are present-tense and exact complements — *does this landing still
+/// speak for the work in flight* — while [`Landing::recorded`] is deliberately historical, for
+/// the one question where a graft does not un-happen. Getting that choice wrong has gone both
+/// ways: the present tense silently dropped a task whose session was abandoned after its work was
+/// grafted, and the historical one credited a task reopened for a must-fix with a review that had
+/// never seen its fix.
+///
+/// [`Landing::pr_number`] is not about a landing at all; it is here because it comes from the
+/// same rows and was otherwise a second scan of them.
 #[derive(Debug, Clone, Default)]
 pub struct Landing {
     recorded: Option<TransitionRow>,
@@ -674,7 +657,7 @@ pub struct Reclaimed {
 
 #[cfg(test)]
 mod tests {
-    use super::{history, perform, reclaim_dead, Labels};
+    use super::{history, perform, reclaim_dead, Labels, Landing, TransitionRow};
     use crate::lifecycle::{TaskEvent, TaskFacts};
     use crate::task::{create, NewTask};
     use crate::Db;
@@ -967,5 +950,54 @@ mod tests {
         );
         assert_eq!(claimant_of(&db, id), None);
         assert_eq!(status_of(&db, id), "in_progress");
+    }
+
+    /// `live` and `superseded` are two spellings of one match and must stay exact complements;
+    /// `recorded` is deliberately neither. Pure functions over two `Option`s, so this needs no
+    /// database — and it is the guard the rule has been missing while being got wrong twice, once
+    /// in each direction.
+    #[test]
+    fn the_landing_accessors_partition_the_recorded_landing() {
+        fn row(id: i64) -> TransitionRow {
+            TransitionRow {
+                id,
+                txn_id: String::new(),
+                at: String::new(),
+                event: "land".to_owned(),
+                from_status: None,
+                to_status: "done".to_owned(),
+                agent_id: None,
+                labels: Labels::default(),
+                evidence: None,
+            }
+        }
+        // Every reachable combination, including the resumption arriving before *and* after.
+        let cases = [
+            (None, None, false, false),
+            (Some(row(5)), None, true, false),
+            (None, Some(row(5)), false, false),
+            (Some(row(5)), Some(row(9)), false, true),
+            (Some(row(9)), Some(row(5)), true, false),
+        ];
+        for (recorded, resumed, expect_live, expect_spent) in cases {
+            let had_landing = recorded.is_some();
+            let l = Landing {
+                recorded,
+                resumed,
+                pr_number: None,
+            };
+            assert_eq!(l.live().is_some(), expect_live, "live");
+            assert_eq!(l.superseded().is_some(), expect_spent, "superseded");
+            // The partition: a recorded landing is live or superseded, never both and never
+            // neither; with none recorded it is neither.
+            assert_eq!(
+                l.live().is_some() ^ l.superseded().is_some(),
+                had_landing,
+                "live and superseded are not complements over a recorded landing"
+            );
+            // ...and the historical answer ignores the split entirely, which is what makes it the
+            // right question for "did jkb ever graft this" and the wrong one for "may it land".
+            assert_eq!(l.recorded().is_some(), had_landing, "recorded");
+        }
     }
 }

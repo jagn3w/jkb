@@ -414,23 +414,39 @@ fn credited_by(db: &Db, t: &crate::repo::RepoTask, branch: &str) -> Result<Credi
         return Ok(Credit::OwnBranch);
     }
     let id = t.meta.id;
-    // **The historical question, deliberately** — `recorded()`, not `live()`. *Did jkb ever graft
-    // this task's work onto this branch?* A graft does not un-happen: the reviewer read what is in
-    // the branch, whatever the task did afterwards. Asking the present-tense question here made an
-    // abandoned-after-graft task `Unrelated`, which this loop discarded silently, so `review
-    // record` stamped nothing for it and `land` later refused it for want of a review.
-    let landed =
-        db.read(move |conn| Ok(jkb_core::transition::landing(conn, id)?.recorded().cloned()))?;
-    if landed
-        .as_ref()
-        .and_then(|r| r.labels.onto.as_deref())
-        .is_some_and(|onto| onto == branch)
-    {
+    let landing = db.read(move |conn| jkb_core::transition::landing(conn, id))?;
+    let onto_is_branch = |r: Option<&jkb_core::transition::TransitionRow>| -> bool {
+        r.and_then(|r| r.labels.onto.as_deref())
+            .is_some_and(|onto| onto == branch)
+    };
+
+    // **Present tense first, and it is the one that can credit.** A landing that still speaks for
+    // the work means this branch holds what the task is doing now, so the review read it.
+    if onto_is_branch(landing.live()) {
         return Ok(Credit::Grafted);
     }
+
+    // **Then the question the present tense cannot answer.** A task still aimed here has work
+    // coming that this review has not seen, whatever it grafted before — so it is reported, never
+    // credited. Asking the historical question ahead of this credited a task that landed, was
+    // reopened for a must-fix, and had its fix committed in a session this branch has never seen:
+    // `reviewed=` was stamped, the task was moved to `needs_review` under somebody's feet, and
+    // `land` would then graft commits no review ever read. That is the one direction this check
+    // must not fail in.
     let target = db.read(move |conn| jkb_core::transition::land_target(conn, id))?;
     if target.as_deref() == Some(branch) {
         return Ok(Credit::LandsHereButHasNot);
     }
+
+    // **Only now the historical question**, and only because nothing present-tense applies: the
+    // task aims nowhere. That is what `abandon` leaves — it retires the land target — and a graft
+    // does not un-happen, so a session abandoned after its work reached this branch is still
+    // covered by a review of it. Without this the task fell to `Unrelated`, which this loop drops,
+    // so `review record` said nothing about it and `land` refused it much later for want of a
+    // review nobody knew was missing.
+    if target.is_none() && onto_is_branch(landing.recorded()) {
+        return Ok(Credit::Grafted);
+    }
+
     Ok(Credit::Unrelated)
 }

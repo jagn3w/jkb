@@ -2349,6 +2349,69 @@ fn a_review_credits_work_grafted_before_the_session_was_abandoned() {
         .stdout(predicate::str::contains(&t).and(predicate::str::contains("recorded review")));
 }
 
+/// A task reopened for a must-fix is **not** credited by a review of the branch it landed on
+/// before — its fix is in a session that branch has never seen.
+///
+/// The two halves are one rule, and asking them in the wrong order opens the worst hole here:
+/// crediting it stamps `reviewed=`, moves the task to `needs_review` under whoever is working in
+/// its session, and lets `jkb task land` graft commits no review ever read. So the present-tense
+/// question credits, the land target reports, and only a task aiming nowhere falls through to the
+/// historical question.
+#[test]
+fn a_task_reopened_after_landing_is_not_credited_by_a_review_of_that_branch() {
+    let f = Fixture::new();
+    let t = f.add_task("landed then reopened");
+    let s = f.work(&t);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "a.txt", "w\n", "w");
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            &onto,
+        ])
+        .assert()
+        .success();
+    // A must-fix comes back: the task is reopened and the fix goes into its own session, which
+    // `onto` has never seen. The session was never abandoned, so it still aims here.
+    f.jkb()
+        .args(["--global", "task", "set", &t, "--status", "in_progress"])
+        .assert()
+        .success();
+
+    f.add_finding("reviews/run-1", "something to fix");
+    let out = f
+        .jkb()
+        .args([
+            "task",
+            "review",
+            "record",
+            "--branch",
+            &onto,
+            "--findings",
+            "reviews/run-1",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("has not grafted their work onto it yet"),
+        "a reopened task was not reported as still owing work: {text}"
+    );
+    assert!(
+        !text.contains("recorded review"),
+        "a reopened task was credited for work this branch has never seen: {text}"
+    );
+    assert_eq!(
+        f.status_of(&t),
+        "in_progress",
+        "it was moved to needs_review under a live session"
+    );
+}
+
 /// A superseded landing is **context, not a verdict**: it is reported, and the run still goes on
 /// to ask the other evidence.
 ///
@@ -2389,15 +2452,18 @@ fn a_spent_landing_is_context_and_does_not_stop_the_other_evidence() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // The **shape**, not a word: `with_context` renders `"{why}; {note}"`, so the superseded note
+    // arriving after a semicolon proves it was appended to some *other* reason — which is exactly
+    // what an early return cannot produce, in any environment.
+    //
+    // The first version asserted the reason contained "pull request", and that passed only because
+    // `gh` is absent on this machine: the NotFound message happens to contain the phrase. CI runs
+    // `ubuntu-latest`, where `gh` is preinstalled and a repo with no GitHub remote makes it exit
+    // non-zero, so the reason becomes "`gh pr` failed: …" — no such phrase, red on a green change.
+    let note = "; its earlier landing onto";
     assert!(
-        text.contains("superseded"),
-        "the spent landing was not reported at all: {text}"
-    );
-    // ...and the pull-request path still ran. Whether `gh` is installed here or not, its verdict
-    // names a pull request; an early return on the spent landing would name none.
-    assert!(
-        text.contains("pull request"),
-        "it stopped at the spent landing instead of asking the other evidence: {text}"
+        text.contains(note),
+        "the superseded landing did not colour another reason, so the run stopped at it: {text}"
     );
 }
 

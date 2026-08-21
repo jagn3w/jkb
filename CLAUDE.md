@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **587 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **589 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -797,13 +797,18 @@ written separately in each reader, and they disagreed. `land_target` stopped at 
 - **`Landing` carries all of it from one read** — the landing, the resumption, the pull request
   number — because those three were fetched separately and the third re-derived a row the first
   had already found and thrown away, three history scans per task per `git pull`.
-- **A review asks the HISTORICAL question**, `recorded()` rather than `live()`: *did jkb ever
-  graft this onto this branch?* A graft does not un-happen, and the reviewer read what is in the
-  branch whatever the task did afterwards. Asking the present-tense question made a task that was
-  grafted and then abandoned `Credit::Unrelated`, which `review record` drops — so it stamped
-  nothing, said nothing, and `jkb task land` refused it much later for want of a review nobody
-  knew was missing. The drop itself is right and stays: that loop walks every task in the repo, so
-  reporting `Unrelated` would list most of the backlog on every run.
+- **A review asks the present tense first, and the historical question only where it has no
+  answer** — and getting that order wrong is the sharpest hole in the area, because it ends in
+  landing unreviewed commits. `live()` credits; a task still aiming at this branch is *reported*,
+  never credited, whatever it grafted before; and only a task aiming nowhere falls through to
+  `recorded()`. That last case is what `abandon` leaves — it retires the land target — and a graft
+  does not un-happen, so a session abandoned after its work reached the branch is covered.
+  Asking `recorded()` first credited a task that landed, was reopened for a must-fix, and had its
+  fix committed in a session the branch had never seen: `reviewed=` stamped, the task moved to
+  `needs_review` under a live session, and `land` would then graft commits no review read. Asking
+  `live()` alone dropped the abandoned case into `Credit::Unrelated`, which the loop discards. The
+  discard is right and stays: that loop walks every task in the repo, so reporting `Unrelated`
+  would list most of the backlog on every run.
 - **The order is pinned where it is declared**, over all twenty-five status pairs plus the
   `None`/garbage cases. It had been rewritten twice, checked only through `close-merged`'s
   behaviour, and the one arguable rank — whether `cancelled` shares `done`'s — is exactly the edit
