@@ -20,6 +20,7 @@ import {
   launchClaude,
   watchQueuedPrompts,
   startSessionTerminal,
+  reportTerminal,
   claudeCommand,
   taskLauncher,
   type Launch,
@@ -327,34 +328,20 @@ async function workTaskWithClaude(
     launcher: taskLauncher(),
   });
   if (launch.where === "terminal") {
-    const arm = startClaudeInTerminal(session, prompt);
-    // Nothing to say when a terminal is what was asked for and one actually started. Only a
-    // *missing* extension is worth advising an install for: saying it when the extension is
-    // installed and something else failed sends the user to reinstall it, and replaces the one
-    // line that would have explained the failure.
-    if (arm === "shown") {
-      // Nothing was sent. Reporting "started" here would name an agent that is not running,
-      // and would bury the fact that this click's prompt — carrying its branch and land
-      // target — was discarded in favour of whatever the terminal was given the first time.
-      vscode.window.showInformationMessage(
-        "jkb: this session already has a `claude` terminal — showed it, and sent nothing. " +
-          "If its agent has finished, start the next one in that terminal yourself.",
-      );
-    } else if (launch.fallback) {
-      vscode.window.showInformationMessage(
-        launch.fallback.missing
-          ? "jkb: started `claude` in a terminal — install the Claude Code extension to work " +
-              "the session in its own window instead."
-          : `jkb: could not start Claude Code (${launch.fallback.cause}) — started \`claude\` ` +
-              "in a terminal.",
-      );
-    }
+    // One reporter for both windows: which arm the terminal took, and why it was a fallback if
+    // it was. Two literals in two files drifted in wording and in the advice they carried, and
+    // the shown arm silently dropped the Claude Code failure altogether.
+    reportTerminal(startClaudeInTerminal(session, prompt), launch.fallback);
   } else if (launch.where === "blocked") {
     // `jkb.taskLauncher` is "extension", so a terminal is not a substitute — it is the thing
     // the operator ruled out. The session is open either way and In Flight can open a shell.
     vscode.window.showErrorMessage(
       `jkb: could not start Claude Code (${launch.cause}). The session is open at ` +
-        `${session.worktree} — set jkb.taskLauncher to "auto" to fall back to a terminal.`,
+        `${session.worktree} — ` +
+        (launch.missing
+          ? "install the Claude Code extension"
+          : 'set jkb.taskLauncher to "auto" to fall back to a terminal') +
+        ".",
     );
   }
   vscode.window.setStatusBarMessage(

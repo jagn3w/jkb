@@ -78,7 +78,13 @@ export const commands = {
   async executeCommand(name, ...args) {
     state.calls.push([name, ...args]);
     if (name.startsWith("claude-vscode.")) {
-      if (state.claudeRefuses) throw new Error("refused");
+      // `true` throws an Error; any other truthy value is thrown AS IS, because
+      // `executeCommand` propagates a rejection value unchanged and a command that rejects
+      // with a bare string is the case `causeOf` exists for. Always wrapping in an Error made
+      // that test unable to fail — it survived the mutation that removes `causeOf`.
+      if (state.claudeRefuses) {
+        throw state.claudeRefuses === true ? new Error("refused") : state.claudeRefuses;
+      }
       // The ordering hazard `onStartupFinished` introduces: two extensions activate
       // concurrently, and a command of one is unregistered until its activate() has run.
       if (!state.claudeActive) throw new Error(`command '${name}' not found`);
