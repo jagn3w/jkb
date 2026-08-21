@@ -1340,6 +1340,30 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   not any sandbox is running, so a probe that reads it always looks confined — which is how a
   restored, sandbox-free machine was briefly misreported here as still sandboxed. Test
   confinement against a path the posture itself governs, never one the OS already protects.
+- **The liveness probe stopped shelling out (D48.12), and the dilemma dissolved.** `ps` is
+  setuid-root on macOS, a sandboxed process cannot exec setuid, so under this posture
+  `owner::pid_exists` could never run and every `host:pid` owner read as `Fact::Unknown`. The only
+  sandbox-level lever was `sandbox.excludedCommands`, which runs a command **wholly outside** the
+  sandbox — and `forbid` requires that list empty precisely because `require` cannot bound it
+  (subset semantics would let `["ps"]` become `["ps","bash"]`). Neither was needed: `ps` was
+  chosen over `kill -0` because it reports processes it does not own (D27.2), and that reasoning
+  is about the **shell builtin**, which collapses `EPERM` and `ESRCH` into one non-zero exit. The
+  *syscall* separates them, and **`EPERM` is positive evidence of existence** — the kernel refuses
+  because the process is there and is not ours. `rustix::process::test_kill_process` is a safe
+  wrapper (no `unsafe`, and rustix was already in the tree), so the probe needs no subprocess, no
+  `PATH`, and no setuid binary.
+  - **Better with no sandbox in the picture at all**, which is the test that keeps it from being
+    chosen for the wrong reason: no fork/exec per probe, no `PATH` dependency, identical on macOS
+    and Linux. The mapping is a pure function, so the `Unknown` arm — the one that protects every
+    claim — is an ordinary assertion instead of needing a deliberately-broken spawn (the previous
+    version reached it by naming a nonexistent program, after an earlier one emptied `PATH` and
+    reddened the shared gate one run in six).
+  - **A pid outside `pid_t` is `No`, not `Unknown`**: no process can carry that id, so its absence
+    is established rather than unobserved. That preserves the prior behaviour exactly.
+  - **Untested:** whether a sandbox profile permits `kill(pid, 0)` against a *foreign-owned*
+    process. It barely matters in practice — jkb's claimants are the same user's processes, so the
+    live answers are `Ok`/`ESRCH`, neither of which needs privilege — and a denial would return
+    `EPERM`, i.e. "alive", which is the safe direction (never reclaims live work).
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not

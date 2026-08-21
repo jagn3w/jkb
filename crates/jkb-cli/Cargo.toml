@@ -27,6 +27,10 @@ jkb-mcp = { version = "0.1.0", path = "../jkb-mcp" }
 jkb-search = { version = "0.1.0", path = "../jkb-search" }
 jkb-sync = { version = "0.1.0", path = "../jkb-sync" }
 jkb-types = { version = "0.1.0", path = "../jkb-types" }
+# For the liveness probe: a safe wrapper over `kill(pid, 0)`, so the probe needs no subprocess and
+# no `unsafe` (the workspace denies it). Already in the tree transitively; named here because
+# owner.rs calls it directly.
+rustix = { version = "1.1.4", features = ["process"] }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
