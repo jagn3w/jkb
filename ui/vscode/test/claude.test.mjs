@@ -183,7 +183,7 @@ test("a corrupt queue file reads as empty rather than throwing", async () => {
   assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "PROMPT" });
 });
 
-test("a Claude Code that refuses is reported, not swallowed", async () => {
+test("a Claude Code that refuses falls back here, rather than reporting and stopping", async () => {
   const t = fresh();
   const work = t.worktree("task-a");
   await launchClaude(t.context, first(work, "task:a", "PROMPT"));
@@ -191,8 +191,13 @@ test("a Claude Code that refuses is reported, not swallowed", async () => {
   reset(work);
   state.claudeRefuses = true;
   await deliverQueuedPrompt(t.context);
-  assert.equal(state.errors.length, 1);
-  assert.match(state.errors[0], /task:a/);
+  // Under `auto` the policy for "extension not usable" is a terminal, and this window's folder
+  // already IS the worktree — so reporting and stopping withheld the one thing it could do.
+  assert.ok(
+    state.calls.some(([kind]) => kind === "createTerminal"),
+    "no terminal was started in the window that could trivially start one",
+  );
+  assert.ok(state.notices.some((m) => /terminal/.test(m)), "the fallback was not reported");
   // Taken all the same: a prompt that re-fires on every later opening of the folder is worse
   // than one click of the button, which returns the same session.
   assert.deepEqual(t.queue(), {});
