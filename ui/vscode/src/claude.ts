@@ -90,19 +90,22 @@ interface PendingPrompt {
  * resumed — so a confirmation keyed on it fires on every ordinary return to a task and catches
  * nothing, which is how a guard becomes a reflex click.
  *
- * What replaces it is convergence, and **it is only complete on the terminal surface**, where
- * `startSessionTerminal` reuses the session's own terminal. Stated plainly, because two
- * earlier versions of this comment claimed more than the code delivers:
+ * What replaces it is convergence, per surface. Stated exactly, because two earlier versions
+ * of this comment claimed more than the code delivered:
  *
- * - `window`: this passes `forceNewWindow: true`, whose documented meaning is *not* to reuse.
- *   Whether VS Code nevertheless focuses an existing window on that folder has **not been
- *   observed**, and the two outcomes differ — a second checkout with its own chat, or a
- *   focused window that never activates and so never takes the queued prompt. Unresolved.
+ * - `window`: **VS Code reuses the window for a folder already open in one**, so a second
+ *   click focuses the session's window rather than making a second checkout. Measured on
+ *   1.131 — `code --new-window <folder>` twice leaves the window count unchanged — which is
+ *   the CLI entry point rather than this API, so: strong evidence, not a guarantee. What it
+ *   costs is that nothing *activates* in a focused window, which is why the receiving side
+ *   watches the queue (`watchQueuedPrompts`) instead of only reading it once at startup.
+ * - `terminal`: `startSessionTerminal` reuses the session's own terminal and sends nothing.
  * - `here`: `primaryEditor.open(undefined, …)` means a fresh conversation by design, so a
  *   second click in the session's own window adds a second chat tab. Claude Code exposes no
- *   way to find an existing panel, so there is nothing to converge on.
+ *   way to find an existing panel, so there is nothing to converge on. Not idempotent, pinned
+ *   by a test so this stays true rather than becoming another claim nobody rechecked.
  *
- * What is load-bearing on both: the handed-over prompt lands *unsent*, so no agent runs
+ * What is load-bearing on all three: the handed-over prompt lands *unsent*, so no agent runs
  * without a keystroke from someone looking at the window it is in.
  */
 export async function launchClaude(
@@ -266,6 +269,48 @@ function unreachable(launcher: Launcher, missing: boolean, cause: string): Launc
   return launcher === "extension"
     ? { where: "blocked", cause }
     : { where: "terminal", fallback: { missing, cause } };
+}
+
+/**
+ * Deliver queued prompts to this window: once on activation, and again whenever the queue
+ * changes while the window is already up.
+ *
+ * The second half exists because **VS Code reuses a window for a folder already open in one**
+ * — `forceNewWindow` does not override that. Measured on VS Code 1.131: `code --new-window
+ * <folder>` twice leaves the window count unchanged (evidence from the CLI entry point, not
+ * the extension API, so: strong, not proof). The consequence is that a second click from the
+ * repo window *focuses* the session's window instead of starting an extension host, so nothing
+ * activates — and a prompt queued for that worktree would sit unread until the window was next
+ * opened cold, then fire with a stale branch and land target.
+ *
+ * Watching the file is what makes the second click land where the user is now looking. Every
+ * window watches, and each takes only its own folder's entry, so the writer does not deliver
+ * to itself and a window with nothing waiting does not write (see `takePrompt`) — no storm.
+ */
+export function watchQueuedPrompts(context: vscode.ExtensionContext): vscode.Disposable {
+  void deliverQueuedPrompt(context);
+
+  const file = queueFile(context);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let watcher: fs.FSWatcher | undefined;
+  try {
+    // The directory may not exist until the first prompt is queued, and `fs.watch` on a
+    // missing path throws — so make it, then watch the directory rather than the file (an
+    // atomic rename replaces the inode, which a file watch would stop following).
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    watcher = fs.watch(path.dirname(file), (_event, name) => {
+      if (name !== null && name !== path.basename(file)) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => void deliverQueuedPrompt(context), 300);
+    });
+  } catch {
+    // Best-effort, exactly like the database watcher: without it a prompt still arrives on the
+    // window's next cold start, which is the behaviour this improves on rather than replaces.
+  }
+  return new vscode.Disposable(() => {
+    if (timer) clearTimeout(timer);
+    watcher?.close();
+  });
 }
 
 /**

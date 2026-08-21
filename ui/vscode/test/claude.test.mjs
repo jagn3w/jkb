@@ -39,8 +39,14 @@ await esbuild.build({
   ],
 });
 
-const { launchClaude, deliverQueuedPrompt, sessionTerminal, sessionTerminalName, startSessionTerminal } =
-  await import(bundle);
+const {
+  launchClaude,
+  deliverQueuedPrompt,
+  watchQueuedPrompts,
+  sessionTerminal,
+  sessionTerminalName,
+  startSessionTerminal,
+} = await import(bundle);
 const { state, reset } = await import(stub);
 
 /** A fresh repo, global storage and worktree factory, so no test can depend on another. */
@@ -400,4 +406,73 @@ test("the session's own window opens a NEW chat each click — pinned, not endor
   await launchClaude(t.context, first(work, "task:a", "PROMPT"));
   assert.deepEqual(state.calls, [...opened("PROMPT"), ...opened("PROMPT")]);
   assert.deepEqual(t.queue(), {});
+});
+
+// ---------------------------------------------------------------------------
+// The queue is watched, not only read at startup — VS Code reuses windows.
+// ---------------------------------------------------------------------------
+
+/** Wait for `check()` to hold, up to `ms`; fs.watch latency is real but small. */
+async function until(check, ms = 4000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
+}
+
+test("watching delivers a prompt already waiting when the window starts", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+
+  reset(work);
+  const sub = watchQueuedPrompts(t.context);
+  try {
+    assert.ok(await until(() => state.calls.length > 0), "nothing was delivered");
+    assert.deepEqual(state.calls, opened("PROMPT"));
+  } finally {
+    sub.dispose();
+  }
+});
+
+test("a prompt queued while the window is already up is delivered without a restart", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+
+  // This window is the session's, already running and with nothing waiting for it.
+  reset(work);
+  const sub = watchQueuedPrompts(t.context);
+  try {
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(state.calls, [], "nothing was waiting, so nothing should have started");
+
+    // A second click in the repo window queues a prompt and focuses this window — VS Code
+    // reuses the window for an open folder, so nothing here activates. Only the watch sees it.
+    const queued = { [work]: { uid: "task:a", prompt: "SECOND" } };
+    fs.mkdirSync(path.dirname(t.queueFile), { recursive: true });
+    const temp = `${t.queueFile}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(queued));
+    fs.renameSync(temp, t.queueFile);
+
+    assert.ok(await until(() => state.calls.length > 0), "the queued prompt was never delivered");
+    assert.deepEqual(state.calls, opened("SECOND"));
+    assert.deepEqual(t.queue(), {});
+  } finally {
+    sub.dispose();
+  }
+});
+
+test("disposing stops delivery, so a closed window does not keep taking prompts", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  reset(work);
+  watchQueuedPrompts(t.context).dispose();
+
+  fs.mkdirSync(path.dirname(t.queueFile), { recursive: true });
+  fs.writeFileSync(t.queueFile, JSON.stringify({ [work]: { uid: "task:a", prompt: "AFTER" } }));
+  await new Promise((r) => setTimeout(r, 600));
+  assert.deepEqual(state.calls, []);
+  assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "AFTER" });
 });
