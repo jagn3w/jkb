@@ -35,3 +35,23 @@ install_exec() {
     rm -f "$tmp"
     return 1
 }
+
+# git_hooks_dir <repo_root> — print the directory git runs hooks from. Fails if <repo_root>
+# is not a git repo.
+#
+# NOT `--git-dir`. In a linked worktree that is `<repo>/.git/worktrees/<name>`, which holds
+# no hooks: git resolves `hooks/` against the COMMON dir, so a hook installed under
+# `--git-dir` goes where git never looks, the installer reports success, and the stale hook
+# keeps running. `jkb task work` puts every session in a worktree, so that is the normal
+# case here rather than a corner one. `git rev-parse --git-path hooks/post-merge` is the
+# authority, and scripts/tests/git-hooks-dir.test.sh checks this against it.
+#
+# The path comes back relative to <repo_root> for an ordinary checkout (`.git`) and absolute
+# for a worktree, so it is normalised here rather than at each call site.
+git_hooks_dir() {
+    local repo_root="$1" common
+    common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    [ -n "$common" ] || return 1
+    case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
+    printf '%s\n' "$common/hooks"
+}

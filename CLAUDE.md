@@ -568,6 +568,16 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
+- **A hook goes in `--git-common-dir`, never `--git-dir`** (`scripts/lib.sh`'s `git_hooks_dir`).
+  In a linked worktree the latter is `<repo>/.git/worktrees/<name>`, which holds no hooks — git
+  resolves `hooks/` against the common dir. Since D36 puts *every* `jkb task work` session in a
+  worktree, the old rule meant a `setup.sh` run from a session installed the hook where nothing
+  would ever run it, printed success, and left the stale one in place; the chainer's dispatch
+  line had the same bug, so a pull in a worktree found no repo hook either way. The oracle is
+  `git rev-parse --git-path hooks/post-merge` — what git itself will execute — and
+  `scripts/tests/git-hooks-dir.test.sh` asserts against it rather than a hand-written path.
+  Because `setup.sh` never clobbers a chainer it did not write, it now *refreshes* one it did:
+  a chainer installed under the old rule would otherwise stay broken for ever.
 - **Every file `setup.sh` installs is written atomically** — `scripts/lib.sh`'s `install_exec`
   (temp file + `mv`), and `jkb service install`'s `write_atomic` for the unit. The loop above
   is why: the hook runs `setup.sh`, and `setup.sh` installs *that hook*. `cp` rewrites the

@@ -143,35 +143,56 @@ fi
 say "installing git hooks"
 hooks_src="$repo_root/scripts/hooks/post-merge"
 if [ -f "$hooks_src" ]; then
-  git_dir="$(git -C "$repo_root" rev-parse --git-dir 2>/dev/null || true)"
-  if [ -n "$git_dir" ]; then
-    case "$git_dir" in /*) ;; *) git_dir="$repo_root/$git_dir" ;; esac
-    mkdir -p "$git_dir/hooks"
+  # `git_hooks_dir`, not `rev-parse --git-dir`: in a worktree those differ and only the
+  # former is where git looks. See scripts/lib.sh.
+  hooks_dir="$(git_hooks_dir "$repo_root" || true)"
+  if [ -n "$hooks_dir" ]; then
+    mkdir -p "$hooks_dir"
     # `install_exec`, never `cp`: the hook we are replacing is very often the process that
     # invoked this script, and a `cp` rewrites its inode underneath the running shell.
-    install_exec "$git_dir/hooks/post-merge" <"$hooks_src"
-    echo "  • repo hook:  $git_dir/hooks/post-merge"
+    install_exec "$hooks_dir/post-merge" <"$hooks_src"
+    echo "  • repo hook:  $hooks_dir/post-merge"
 
     global_hooks="$(git config --get core.hooksPath || true)"
     if [ -n "$global_hooks" ]; then
       global_hooks="${global_hooks/#\~/$HOME}"
       mkdir -p "$global_hooks"
       chainer="$global_hooks/post-merge"
-      if [ ! -f "$chainer" ]; then
-        # Atomic for the same reason, plus its own: this file is on the path of every repo's
-        # `git pull`, so a half-written one breaks merges far outside this checkout.
-        install_exec "$chainer" <<'CHAIN'
+      # Written once, so the install and the refresh below cannot drift apart.
+      chainer_body() {
+        cat <<'CHAIN'
 #!/bin/sh
 # Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
 # repo-local hook if one exists (mirrors the commit-msg chainer).
-repo_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/post-merge"
+#
+# `--git-common-dir`, not `--git-dir`: in a linked worktree the latter is the per-worktree
+# directory, which holds no hooks. Git resolves `hooks/` against the common dir.
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+[ -n "$common_dir" ] || exit 0
+repo_hook="$common_dir/hooks/post-merge"
 [ -x "$repo_hook" ] && exec "$repo_hook" "$@"
 exit 0
 CHAIN
+      }
+      # Atomic for install_exec's reason, plus its own: this file is on the path of every
+      # repo's `git pull`, so a half-written one breaks merges far outside this checkout.
+      if [ ! -f "$chainer" ]; then
+        chainer_body | install_exec "$chainer"
         echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)"
+      elif grep -q "Global post-merge chainer" "$chainer" 2>/dev/null; then
+        # One of ours. Refresh it rather than leaving it: chainers written before the
+        # `--git-common-dir` fix dispatch to the per-worktree directory, so they find no
+        # repo hook in any worktree — silently, which is the failure this whole block exists
+        # to prevent. A stranger's chainer is still never clobbered.
+        if chainer_body | cmp -s - "$chainer"; then
+          echo "  • chainer:    $chainer (up to date)"
+        else
+          chainer_body | install_exec "$chainer"
+          echo "  • chainer:    $chainer (refreshed)"
+        fi
       else
-        # Something is already there; do not clobber it, but say so, because a chainer that
-        # does not dispatch means the repo hook never runs.
+        # Something else is already there; do not clobber it, but say so, because a chainer
+        # that does not dispatch means the repo hook never runs.
         grep -q "hooks/post-merge" "$chainer" 2>/dev/null \
           || warn "$chainer exists but may not chain to the repo hook — check it by hand"
       fi

@@ -378,12 +378,32 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
     }
 
+    /// Pins the *mechanism*, not just the result: reverting `write_atomic` to a plain
+    /// `std::fs::write` passes every assertion about the file's final contents, because
+    /// writing does work — it is the reader mid-load that an in-place rewrite corrupts.
+    /// So the test holds one open, the way `launchctl load` does.
     #[test]
-    fn write_atomic_replaces_the_unit_and_leaves_no_temp_file() {
+    #[cfg(unix)]
+    fn write_atomic_installs_by_rename_never_rewriting_the_unit_in_place() {
+        use std::io::Read;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(format!("{LABEL}.plist"));
         write_atomic(&path, "first").expect("first install");
+
+        // A supervisor that opened the unit just before the reinstall lands. A rename gives
+        // it the whole old unit; an in-place rewrite gives it whatever the truncation left.
+        let mut reader = std::fs::File::open(&path).expect("open the installed unit");
         write_atomic(&path, "second").expect("replacing install");
+        let mut seen = String::new();
+        reader
+            .read_to_string(&mut seen)
+            .expect("read through the open handle");
+        assert_eq!(
+            seen, "first",
+            "the reinstall rewrote the unit a reader was already holding"
+        );
+
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), "second");
         // A surviving temp file is a half-written unit left in the supervisor's directory.
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
