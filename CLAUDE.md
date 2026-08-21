@@ -1320,6 +1320,13 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     `/tmp` and `/private/tmp` agree, which would have hidden the exact symlink mismatch that
     denied `/tmp` — the sandbox matched the real path while the posture named the link. A path
     covered *only* after resolution is reported as a latent gap, not as covered.
+  - **A passing preflight names what it cannot check.** `install` refuses on its verdict, which
+    makes it read as authoritative, so "no gaps — this posture is workable" claimed far more than
+    a filesystem-path check supports. It now says "no FILESYSTEM gaps" and prints the four blind
+    spots every run: setuid-root exec (refused under any posture, not configurable, surfacing as
+    an opaque exec denial — it cost a peer session a red gate), unix sockets, the unvalidated
+    domain allowlist, and whether the sandbox engages at all. Same rule as everywhere else here —
+    an unstated gap in a tool something gates on is indistinguishable from coverage.
   - **Deliberately not in `check.sh`**: whether the real posture covers the real paths depends on
     where the checkout lives (`~/repos` on a dev box, `/home/runner/work` in CI), so a passing
     assertion would be a test of the machine. The tests exercise the *logic* — a posture covering

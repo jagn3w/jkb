@@ -299,10 +299,30 @@ cmd_preflight() {
         elif ! covered "$rp" "$HOME"; then printf '  \033[32mok\033[0m   readable: %s (outside denyRead)\n' "$p"
         else printf '  \033[31mGAP\033[0m  readable: %s -> %s is under denyRead and in no allowRead entry\n' "$p" "$rp"; gaps=$((gaps+1)); fi
     done
-    [ "$gaps" -eq 0 ] && { echo "  no gaps — this posture is workable on this machine"; return 0; }
+    preflight_blind_spots
+    [ "$gaps" -eq 0 ] && { echo "  no FILESYSTEM gaps — see the four items above for what that does not cover"; return 0; }
     printf '\n\033[31m%d gap(s)\033[0m — installing this posture would make the machine hard to work on.\n' "$gaps" >&2
     echo "Add the resolved paths to sandbox.filesystem.allowRead/allowWrite in $posture." >&2
     return 1
+}
+
+# What preflight structurally cannot check. Printed every run, because an unstated blind spot in
+# a tool that `install` gates on is indistinguishable from coverage — and the first three of these
+# have each already cost a session.
+preflight_blind_spots() {
+    cat <<'BLIND'
+
+  not checked here, and not checkable:
+    - setuid-root binaries (ps, top) cannot be exec'd under ANY posture. A sandboxed process
+      cannot exec setuid and keep the privilege, so the kernel refuses it. There is no setting
+      for this; the only lever is sandbox.excludedCommands, which runs a command wholly OUTSIDE
+      the sandbox. It surfaces as an opaque "operation not permitted" on exec.
+    - unix sockets are blocked by default, which severs Docker, Postgres and ssh-agent.
+    - the domain allowlist is not compared against what this machine actually reaches; a missing
+      host shows up as a failed request at the moment you needed it.
+    - whether the sandbox ENGAGES at all is not established here — that needs a live session
+      (`auto-mode.sh probe`, or `printenv CLAUDE_CODE_SANDBOXED` inside one).
+BLIND
 }
 
 cmd_check() {

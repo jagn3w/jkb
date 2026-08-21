@@ -308,6 +308,14 @@ run_preflight "$wide_posture"
 check_that "preflight passes when the posture covers everything" \
     "$([ "$rc" -eq 0 ] && echo yes || echo no)"
 
+# A pass must not read as blanket coverage. `install` refuses on preflight's verdict, so an
+# unstated blind spot in it is indistinguishable from a guarantee — and the setuid one has
+# already cost another session a red gate that no tool here would have warned about.
+check_that "even a passing preflight names what it cannot check" \
+    "$(grep -q 'not checked here' <<<"$out" && grep -q 'setuid' <<<"$out" && echo yes || echo no)"
+check_that "a passing preflight does not claim the machine is simply workable" \
+    "$(grep -q 'no FILESYSTEM gaps' <<<"$out" && echo yes || echo no)"
+
 # The symlink case, which is the one that resolving both sides would hide: allow only the
 # symlink spelling and require the tool to notice the real path is not listed.
 if [ -L /tmp ] || [ "$(cd /tmp && pwd -P)" != "/tmp" ]; then
