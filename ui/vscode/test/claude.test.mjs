@@ -7,6 +7,7 @@
 // worktree.
 
 import assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -53,16 +54,33 @@ const { state, reset } = await import(stub);
 function fresh() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jkb-claude-"));
   const context = { globalStorageUri: { fsPath: path.join(home, "globalStorage") } };
-  const queueFile = path.join(context.globalStorageUri.fsPath, "pending-prompts.json");
+  const queueDir = path.join(context.globalStorageUri.fsPath, "pending");
+  /** The file a given worktree's entry lands in — the code names it by hash of the key. */
+  const fileFor = (key) =>
+    path.join(queueDir, `${crypto.createHash("sha1").update(key).digest("hex")}.json`);
   const repo = path.join(home, "repo");
   fs.mkdirSync(repo, { recursive: true });
   reset(repo);
   return {
     context,
-    queueFile,
+    queueDir,
+    fileFor,
     repo,
-    /** The queue as it is on disk. */
-    queue: () => (fs.existsSync(queueFile) ? JSON.parse(fs.readFileSync(queueFile, "utf8")) : {}),
+    /** The queue as it is on disk, keyed by worktree — one file per waiting prompt. */
+    queue: () => {
+      const out = {};
+      let names = [];
+      try {
+        names = fs.readdirSync(queueDir);
+      } catch {
+        return out;
+      }
+      for (const name of names.filter((n) => n.endsWith(".json"))) {
+        const e = JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8"));
+        out[e.key] = e;
+      }
+      return out;
+    },
     /** A session worktree, by its real path — the key the module stores it under. */
     worktree: (name) => {
       const dir = path.join(home, "work", name);
@@ -75,7 +93,21 @@ function fresh() {
 const opened = (prompt) => [["claude-vscode.primaryEditor.open", undefined, prompt]];
 
 /** A launch request under the default policy. */
-const first = (worktree, uid, prompt) => ({ worktree, uid, prompt, launcher: "auto" });
+const first = (worktree, uid, prompt) => ({
+  worktree,
+  uid,
+  prompt,
+  session: path.basename(worktree),
+  launcher: "auto",
+});
+
+/** What a queued entry looks like on disk, so an omitted field cannot pass for a match. */
+const entry = (worktree, uid, prompt) => ({
+  uid,
+  prompt,
+  session: path.basename(worktree),
+  key: worktree,
+});
 
 test("a session opens as a window, and that window takes its prompt exactly once", async () => {
   const t = fresh();
@@ -85,7 +117,7 @@ test("a session opens as a window, and that window takes its prompt exactly once
   assert.equal(state.calls[0][0], "vscode.openFolder");
   assert.equal(state.calls[0][1].fsPath, work);
   assert.deepEqual(state.calls[0][2], { forceNewWindow: true });
-  assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "PROMPT" });
+  assert.deepEqual(t.queue()[work], entry(work, "task:a", "PROMPT"));
 
   // The window opens on the worktree, and the extension activates there.
   reset(work);
@@ -170,8 +202,8 @@ test("a window that fails to open leaves no undeliverable prompt behind", async 
 test("a corrupt queue file reads as empty rather than throwing", async () => {
   const t = fresh();
   const work = t.worktree("task-a");
-  fs.mkdirSync(path.dirname(t.queueFile), { recursive: true });
-  fs.writeFileSync(t.queueFile, "{not json");
+  fs.mkdirSync(t.queueDir, { recursive: true });
+  fs.writeFileSync(t.fileFor(work), "{not json");
 
   reset(work);
   await deliverQueuedPrompt(t.context);
@@ -180,7 +212,7 @@ test("a corrupt queue file reads as empty rather than throwing", async () => {
   // And the next write replaces it wholesale, so one bad file is not permanent.
   reset(t.repo);
   assert.deepEqual(await launchClaude(t.context, first(work, "task:a", "PROMPT")), { where: "window" });
-  assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "PROMPT" });
+  assert.deepEqual(t.queue()[work], entry(work, "task:a", "PROMPT"));
 });
 
 test("a Claude Code that refuses falls back here, rather than reporting and stopping", async () => {
@@ -273,16 +305,17 @@ test("a window with no prompt waiting does not write the queue at all", async ()
   // allows is an already-delivered prompt resurrected.
   reset(path.join(t.repo, "unrelated"));
   await deliverQueuedPrompt(t.context);
-  assert.equal(fs.existsSync(t.queueFile), false);
+  assert.equal(fs.existsSync(t.queueDir) && fs.readdirSync(t.queueDir).length > 0, false);
 
   // And with a queue that exists, an unrelated window leaves it byte-identical.
   const work = t.worktree("task-a");
   reset(t.repo);
   await launchClaude(t.context, first(work, "task:a", "PROMPT"));
-  const before = fs.readFileSync(t.queueFile);
+  const before = fs.readFileSync(t.fileFor(work));
   reset(path.join(t.repo, "unrelated"));
   await deliverQueuedPrompt(t.context);
-  assert.deepEqual(fs.readFileSync(t.queueFile), before);
+  // An unrelated window reads only its own (absent) file and writes nothing at all.
+  assert.deepEqual(fs.readFileSync(t.fileFor(work)), before);
 });
 
 // ---------------------------------------------------------------------------
@@ -455,11 +488,10 @@ test("a prompt queued while the window is already up is delivered without a rest
 
     // A second click in the repo window queues a prompt and focuses this window — VS Code
     // reuses the window for an open folder, so nothing here activates. Only the watch sees it.
-    const queued = { [work]: { uid: "task:a", prompt: "SECOND" } };
-    fs.mkdirSync(path.dirname(t.queueFile), { recursive: true });
-    const temp = `${t.queueFile}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(queued));
-    fs.renameSync(temp, t.queueFile);
+    fs.mkdirSync(t.queueDir, { recursive: true });
+    const temp = `${t.fileFor(work)}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(entry(work, "task:a", "SECOND")));
+    fs.renameSync(temp, t.fileFor(work));
 
     assert.ok(await until(() => state.calls.length > 0), "the queued prompt was never delivered");
     assert.deepEqual(state.calls, opened("SECOND"));
@@ -475,9 +507,128 @@ test("disposing stops delivery, so a closed window does not keep taking prompts"
   reset(work);
   watchQueuedPrompts(t.context).dispose();
 
-  fs.mkdirSync(path.dirname(t.queueFile), { recursive: true });
-  fs.writeFileSync(t.queueFile, JSON.stringify({ [work]: { uid: "task:a", prompt: "AFTER" } }));
+  fs.mkdirSync(t.queueDir, { recursive: true });
+  fs.writeFileSync(t.fileFor(work), JSON.stringify(entry(work, "task:a", "AFTER")));
   await new Promise((r) => setTimeout(r, 600));
   assert.deepEqual(state.calls, []);
-  assert.deepEqual(t.queue()[work], { uid: "task:a", prompt: "AFTER" });
+  assert.deepEqual(t.queue()[work], entry(work, "task:a", "AFTER"));
+});
+
+// ---------------------------------------------------------------------------
+// Round 5: one test per fix that reverted green in review 4.
+// ---------------------------------------------------------------------------
+
+test("a remote window opens the worktree on the remote, not on the local disk", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  // Remote-SSH: the adapter runs in the workspace extension host, so every path it holds is a
+  // remote one. Uri.file would build an authority-less file:// and open it locally — a window
+  // on a path that does not exist there, while the prompt waits in the remote queue.
+  state.scheme = "vscode-remote";
+  state.authority = "ssh-remote+box";
+
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+  const [, target] = state.calls[0];
+  assert.equal(target.scheme, "vscode-remote");
+  assert.equal(target.authority, "ssh-remote+box");
+  assert.equal(target.path, work);
+});
+
+test("queuing never sweeps away the entry it was just handed", async () => {
+  const t = fresh();
+  // A worktree removed outside jkb — an interrupted land, a stray rm -rf. The expiry sweep
+  // must not drop the entry this very write stored and then let the launch report success.
+  const gone = path.join(t.repo, "vanished");
+  const launch = await launchClaude(t.context, first(gone, "task:a", "PROMPT"));
+  assert.deepEqual(launch, { where: "window" });
+  assert.deepEqual(t.queue()[path.resolve(gone)], entry(path.resolve(gone), "task:a", "PROMPT"));
+});
+
+test("an entry whose worktree is gone is swept when the next one is queued", async () => {
+  const t = fresh();
+  const doomed = t.worktree("task-a");
+  await launchClaude(t.context, first(doomed, "task:a", "A"));
+  fs.rmSync(doomed, { recursive: true, force: true });
+
+  const live = t.worktree("task-b");
+  await launchClaude(t.context, first(live, "task:b", "B"));
+  assert.deepEqual(Object.keys(t.queue()), [live]);
+});
+
+test("the session name reaches the terminal the receiving window falls back to", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, { ...first(work, "task:a", "PROMPT"), session: "sess-xyz" });
+  assert.equal(t.queue()[work].session, "sess-xyz");
+
+  reset(work);
+  state.claudeRefuses = true;
+  const log = [];
+  await deliverQueuedPrompt(t.context, host(log));
+  // Named from the queued session, not re-derived from the worktree's last path segment.
+  assert.deepEqual(log[0], ["created", "claude: sess-xyz", work]);
+});
+
+test("an entry missing a required field is ignored rather than half-delivered", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  fs.mkdirSync(t.queueDir, { recursive: true });
+  fs.writeFileSync(t.fileFor(work), JSON.stringify({ uid: "task:a", prompt: "P" }));
+
+  reset(work);
+  await deliverQueuedPrompt(t.context);
+  assert.deepEqual(state.calls, []);
+});
+
+test('launcher "extension" with no extension advises installing it, not switching away', async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  state.claudeInstalled = false;
+  const launch = await launchClaude(t.context, {
+    ...first(work, "task:a", "PROMPT"),
+    launcher: "extension",
+  });
+  assert.equal(launch.where, "blocked");
+  // Without `missing` the only remedy offered is abandoning the setting the operator chose.
+  assert.equal(launch.missing, true);
+});
+
+test("a rejection that is not an Error still yields a readable cause", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  reset(work);
+  state.claudeRefuses = "rejected with a bare string, as executeCommand may";
+  const launch = await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+  assert.equal(launch.where, "terminal");
+  assert.notEqual(launch.fallback.cause, "undefined");
+  assert.ok(launch.fallback.cause.length > 0);
+});
+
+test("the delivering window honours launcher terminal without touching the extension", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+
+  // Queued under auto, delivered after the operator switched to terminal.
+  reset(work);
+  state.launcher = "terminal";
+  const log = [];
+  await deliverQueuedPrompt(t.context, host(log));
+  assert.deepEqual(state.calls, [], "the chat surface was opened despite the setting");
+  assert.deepEqual(log[0], ["created", `claude: ${path.basename(work)}`, work]);
+});
+
+test("the shown arm still reports why Claude Code failed", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+
+  reset(work);
+  state.claudeRefuses = true;
+  const log = [];
+  const existing = { name: `claude: ${path.basename(work)}`, creationOptions: { cwd: work },
+    show: () => log.push(["shown"]) };
+  await deliverQueuedPrompt(t.context, host(log, [existing]));
+  // Showing a terminal must not swallow the fact that the extension is broken.
+  assert.ok(state.notices.some((m) => /refused|could not/i.test(m)), state.notices.join(" | "));
 });
