@@ -18,7 +18,7 @@ import {
 
 import {
   launchClaude,
-  deliverQueuedPrompt,
+  watchQueuedPrompts,
   startSessionTerminal,
   type Launch,
   type Launcher,
@@ -96,10 +96,12 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
-  // This window may be the one "Work this task with Claude" just opened on a session
-  // worktree. `vscode.openFolder` carries no payload, so the prompt was left in a queue for
-  // it — which is also why the extension activates at startup rather than on its first view.
-  void deliverQueuedPrompt(context);
+  // This window may be the one "Work this task with Claude" just opened on a session worktree.
+  // `vscode.openFolder` carries no payload, so the prompt was left in a queue for it — which
+  // is also why the extension activates at startup rather than on its first view. It keeps
+  // watching afterwards because VS Code *reuses* a window for an already-open folder, so a
+  // later click focuses this window without activating anything.
+  context.subscriptions.push(watchQueuedPrompts(context));
 }
 
 /**

@@ -1357,13 +1357,26 @@ question is gone and idempotence replaces it — **on the terminal surface**, wh
 `startSessionTerminal` finds the session's own `claude: <session>` terminal (matched on name,
 cwd and `exitStatus`, since In Flight's plain shell shares the cwd and a dead tab looks
 identical to a live one) and shows it without sending, the caller saying so rather than
-reporting a launch that did not happen. **Do not write that the other two surfaces converge**
-— three passes running, a version of this paragraph has claimed more than the code delivers.
-`window` passes `forceNewWindow: true`, whose documented meaning is the opposite of reuse, and
-which arm VS Code actually takes is *unobserved*; `here` opens a fresh conversation by design,
-because Claude Code exposes no way to find an existing panel. What holds on every surface is
-that a handed-over prompt lands **unsent**. Residual: a `claude` in *another* window is
-invisible, `vscode.window.terminals` being per-window. **`takePrompt` returns without writing when it took nothing**: every window
+reporting a launch that did not happen. On the **window** surface it was finally
+*measured* rather than argued: `code --new-window <folder>` twice leaves VS Code's window count
+unchanged, so `forceNewWindow` does **not** defeat folder reuse and a second click focuses the
+session's window. (CLI entry point, not this API — strong evidence, not a guarantee, and
+written down that way.) That killed the hazard three passes had been designing against, and
+exposed the real defect: nothing *activates* in a focused window, so a queued prompt sat unread
+until that window was next opened cold, then fired with a stale branch and land target. The
+receiving side therefore **watches** the queue (`watchQueuedPrompts`) rather than reading it
+once at startup. The **`here`** surface is genuinely not idempotent — `primaryEditor.open(
+undefined, …)` is a fresh conversation by design and Claude Code exposes no way to find an
+existing panel — which is pinned by a test rather than asserted in prose. What holds on all
+three: a handed-over prompt lands **unsent**. Residual: a `claude` in *another* window is
+invisible, `vscode.window.terminals` being per-window.
+
+**The lesson worth keeping is about evidence, not windows.** This one fact was reasoned about
+across three review rounds and three fix rounds; a two-command probe settled it in under a
+minute. A claim was even *removed* from a comment for being unverifiable and then reinstated
+two commits later as the foundation of a redesign. When a design rests on what another program
+does, measure it before building on it, and record the measurement with its method and its
+limits so the next reader knows what kind of thing it is. **`takePrompt` returns without writing when it took nothing**: every window
 now activates at startup and calls it, so writing back would put every VS Code window on the
 machine into the read-modify-write race for one shared file, whose lost update is an
 already-delivered prompt resurrected.

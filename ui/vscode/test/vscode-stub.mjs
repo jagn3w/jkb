@@ -51,6 +51,13 @@ export const commands = {
 
 export const Uri = { file: (fsPath) => ({ fsPath }) };
 
+/** Real VS Code's Disposable: a class wrapping a teardown callback. */
+export class Disposable {
+  constructor(callOnDispose) {
+    this.dispose = callOnDispose;
+  }
+}
+
 export const window = {
   showErrorMessage: (message) => state.errors.push(message),
 };
