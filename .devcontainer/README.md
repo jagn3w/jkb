@@ -82,6 +82,16 @@ still reached the auth check rather than erroring at startup. So the sandbox is 
 auth precedes it. Settle it inside a live session with `printenv CLAUDE_CODE_SANDBOXED`, or
 `../scripts/auto-mode.sh probe`.
 
+## On a Linux host
+
+Better, mostly: no VM, so bind mounts are native and the IO penalty above disappears. Two things
+to know. **UID mapping** — a bind mount carries the host's uids, and Dev Containers' default
+`updateRemoteUserUID` remaps the container user to yours, which is what makes the workspace
+writable when your host uid is not 1000; the cargo `target/` volume sidesteps the question
+entirely. **Rootless Docker is untested here**: it already runs the container inside a user
+namespace, so nesting bubblewrap within it may behave differently from the rootful case measured
+above. Run `verify.sh` and believe it over this paragraph.
+
 ## Give it enough memory
 
 Building this workspace needs a few GB — `headless_chrome`, the image/AV1 crates and the ONNX

@@ -18,6 +18,9 @@
         "Read(~/.pypirc)",
         "Read(~/.cargo/credentials.toml)",
         "Read(~/.claude/.credentials.json)",
+        "Read(~/.local/share/keyrings/**)",
+        "Read(~/.pki/**)",
+        "Read(~/.config/gcloud/**)",
         "Read(~/Library/Keychains/**)",
         "Read(~/Library/Messages/**)",
         "Read(~/Library/Mail/**)",
@@ -68,7 +71,10 @@
         "disabled": false,
         "denyRead": [
           "~",
-          "/Volumes"
+          "/Volumes",
+          "/media",
+          "/mnt",
+          "/run/media"
         ],
         "allowRead": [
           "~/repos",
@@ -90,7 +96,10 @@
           "~/.zprofile",
           "~/.profile",
           "~/.bashrc",
-          "~/.bash_profile"
+          "~/.bash_profile",
+          "~/.cache",
+          "~/.config/git",
+          "~/.config/pnpm"
         ],
         "allowWrite": [
           "~/repos",
@@ -100,7 +109,8 @@
           "~/Library/Caches",
           "~/Library/pnpm",
           "~/.local/share/pnpm",
-          "/tmp"
+          "/tmp",
+          "~/.cache"
         ]
       },
       "credentials": {
@@ -151,6 +161,18 @@
           },
           {
             "path": "~/Library/Keychains",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.local/share/keyrings",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.pki",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.config/gcloud",
             "mode": "deny"
           }
         ]

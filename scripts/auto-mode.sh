@@ -135,6 +135,20 @@ readonly JQ_FORBID='
 | add // []
 '
 
+# macOS has sandbox-exec in the base system; Linux and WSL shell out to bubblewrap, and Claude
+# Code's own dependency error names exactly these two. Missing them does not corrupt the posture —
+# `failIfUnavailable: true` makes Claude Code refuse to start — but finding that out at launch is
+# strictly worse than being told here.
+missing_sandbox_deps() {
+    [ "$(uname -s)" = "Linux" ] || return 0
+    local missing=()
+    for dep in bwrap socat; do
+        command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+    done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    printf '%s' "${missing[*]}"
+}
+
 read_settings() {
     [ -f "$settings" ] || die "no settings file at $settings — run: $0 install"
     jq empty "$settings" 2>/dev/null || die "$settings is not valid JSON — fix it by hand, then re-run."
@@ -192,6 +206,8 @@ cmd_check() {
             *) echo "note: the sandbox supports macOS, Linux and WSL2 only — on $(uname -s)" \
                     "'failIfUnavailable' will refuse to start rather than run unconfined." ;;
         esac
+        local deps; deps="$(missing_sandbox_deps)"
+        [ -z "$deps" ] || printf '\033[33mwarning:\033[0m the sandbox needs %s on Linux — Claude Code will refuse to start until they are installed (apt install bubblewrap socat)\n' "$deps" >&2
         return 0
     fi
 
@@ -205,6 +221,11 @@ cmd_check() {
 
 cmd_run() {
     cmd_check
+    # A hard gate here, a warning in `check`: this is the moment you actually go unattended, and
+    # launching into a sandbox that cannot start is the one outcome the whole posture exists to
+    # prevent.
+    local deps; deps="$(missing_sandbox_deps)"
+    [ -z "$deps" ] || die "the sandbox needs $deps on this Linux host (apt install bubblewrap socat). Refusing to launch unattended without it."
     local claude; claude="$(command -v claude || true)"
     [ -n "$claude" ] || claude="$HOME/.local/bin/claude"
     [ -x "$claude" ] || die "claude not found on PATH or at $HOME/.local/bin/claude"
@@ -214,9 +235,18 @@ cmd_run() {
     # private key ever being readable (the key stays denied either way). Not in the posture file
     # because $SSH_AUTH_SOCK is a per-login-session path, so it can only be supplied at launch.
     if [ "${JKB_AUTO_MODE_SSH_AGENT:-0}" = "1" ] && [ -n "${SSH_AUTH_SOCK:-}" ]; then
-        overlay+=(--settings "$(jq -nc --arg s "$SSH_AUTH_SOCK" \
-            '{sandbox: {network: {allowUnixSockets: [$s]}}}')")
-        echo "ssh-agent socket allowed for this session: $SSH_AUTH_SOCK"
+        if [ "$(uname -s)" = "Linux" ]; then
+            # Say so rather than appear to work. `allowUnixSockets` is documented macOS-only
+            # ("Ignored on Linux — seccomp cannot filter by path"), so this overlay is inert here;
+            # Linux's only lever is `allowAllUnixSockets`, which is all-or-nothing and therefore
+            # not something to switch on behind a flag whose name promises one socket.
+            echo "note: JKB_AUTO_MODE_SSH_AGENT is macOS-only — sandbox.network.allowUnixSockets is" \
+                 "ignored on Linux, so this has no effect. Push from outside the sandbox instead." >&2
+        else
+            overlay+=(--settings "$(jq -nc --arg s "$SSH_AUTH_SOCK" \
+                '{sandbox: {network: {allowUnixSockets: [$s]}}}')")
+            echo "ssh-agent socket allowed for this session: $SSH_AUTH_SOCK"
+        fi
     fi
 
     say "claude --permission-mode auto"

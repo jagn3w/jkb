@@ -274,6 +274,16 @@ that is not yours, add `--strict-mcp-config`.
 that can edit it can switch off its own sandbox. `~/.claude/projects/**` stays writable, so
 auto-memory still works.
 
+**Linux and WSL work, with three differences.** The sandbox shells out to **bubblewrap + seccomp**
+instead of macOS's built-in `sandbox-exec`, so `bubblewrap` and `socat` must be installed —
+`auto-mode.sh check` warns if they are missing and `run` refuses to launch without them, rather
+than letting you discover it when Claude Code declines to start. Unprivileged user namespaces must
+be available (measured working on Ubuntu 26.04 even with
+`kernel.apparmor_restrict_unprivileged_userns=1`). And `JKB_AUTO_MODE_SSH_AGENT` is **macOS-only**:
+`sandbox.network.allowUnixSockets` is documented as ignored on Linux, so `run` says so instead of
+emitting an overlay that would do nothing. On WSL the `/mnt` deny is the valuable one — that is
+where the Windows filesystem lives.
+
 **Both layers, in a container.** `.devcontainer/` runs Claude Code's sandbox *nested inside* a
 dev container, which adds the one thing the host posture cannot express: file access that is
 default-deny **by the kernel**, since an unmounted host path does not exist in the container at

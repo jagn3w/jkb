@@ -1292,6 +1292,22 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     Linux VM, so the native loop (pinned rustup, `sqlite-vec` FFI, headless Chrome, launchd,
     worktrees under `~/repos`) has to be re-plumbed. That cost is unchanged; what changed is that
     the security argument now favours the container where it did not before.
+- **Cross-platform, with the differences named rather than smoothed over.** The posture file is
+  `~`-relative and carries both platforms' paths; macOS-only keys (`allowAppleEvents`,
+  `enableWeakerNetworkIsolation`, `allowUnixSockets`) are inert on Linux and harmless. What
+  actually differs: the mechanism is **bubblewrap + seccomp**, so `bubblewrap` and `socat` must be
+  installed — `check` **warns** and `run` **refuses**, deliberately split, because "has the posture
+  drifted" and "can this machine honour it" are different questions with different fixes and one
+  exit code must not mean both. `denyRead` covers `/media`, `/mnt` and `/run/media` as well as
+  `/Volumes` — `/mnt` being the most valuable entry on WSL, where the Windows filesystem lives —
+  and `~/.cache` is in `allowRead`/`allowWrite` because without it a Linux build cannot read its
+  own caches, and a posture too tight to work is one that gets switched off.
+  - **`JKB_AUTO_MODE_SSH_AGENT` is macOS-only, and now says so.** `allowUnixSockets` is documented
+    "Ignored on Linux (seccomp cannot filter by path)", so the overlay was a flag that reported
+    success and did nothing — a guard that cannot fire. Linux's only lever is
+    `allowAllUnixSockets`, all-or-nothing, which is not something to switch on behind a flag whose
+    name promises a single socket. The test is branched per platform and each branch was run on
+    its own platform, not inferred.
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not

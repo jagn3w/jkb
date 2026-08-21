@@ -220,8 +220,15 @@ rm -f "$CLAUDE_ARGV_OUT"
 set +e
 JKB_AUTO_MODE_SSH_AGENT=1 SSH_AUTH_SOCK="$tmp/agent.sock" "$tool" run >/dev/null 2>&1
 set -e
-check_that "the opt-in ssh-agent overlay names the socket and nothing else" \
-    "$(grep -qF "{\"sandbox\":{\"network\":{\"allowUnixSockets\":[\"$tmp/agent.sock\"]}}}" "$CLAUDE_ARGV_OUT" && echo yes || echo no)"
+# macOS passes the overlay; Linux must refuse to pretend. `allowUnixSockets` is documented
+# macOS-only, so an overlay emitted there would be a flag that reports success and does nothing.
+if [ "$(uname -s)" = "Darwin" ]; then
+    check_that "the opt-in ssh-agent overlay names the socket and nothing else" \
+        "$(grep -qF "{\"sandbox\":{\"network\":{\"allowUnixSockets\":[\"$tmp/agent.sock\"]}}}" "$CLAUDE_ARGV_OUT" && echo yes || echo no)"
+else
+    check_that "the ssh-agent overlay is NOT emitted on Linux, where it would be inert" \
+        "$(grep -q "allowUnixSockets" "$CLAUDE_ARGV_OUT" && echo no || echo yes)"
+fi
 
 rm -f "$CLAUDE_ARGV_OUT"
 jq '.sandbox.enabled = false' "$tmp/good" > "$settings"
