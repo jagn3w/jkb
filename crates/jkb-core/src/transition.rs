@@ -339,12 +339,17 @@ pub fn record_undo(
     from: &str,
     to: &str,
 ) -> Result<()> {
+    // `agent_id` is left NULL, deliberately. That column holds an `AgentId` — a process, a
+    // session worktree, an externally-minted id — and an undo has none of those; the nearest
+    // thing to hand, `meta.actor`, is `"cli"`/`"mcp"`, which would round-trip through
+    // `AgentId::parse` as `Unrecognized` and put a non-identity into a typed column. Who ran it
+    // is already recorded, on the changelog entry this row's `txn_id` points at.
     conn.prepare_cached(
         "INSERT INTO task_transitions
-             (txn_id, item_id, at, event, from_status, to_status, agent_id)
-         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'undo', ?3, ?4, ?5)",
+             (txn_id, item_id, at, event, from_status, to_status)
+         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'undo', ?3, ?4)",
     )?
-    .execute(params![meta.txn_id, task.get(), from, to, meta.actor])?;
+    .execute(params![meta.txn_id, task.get(), from, to])?;
     Ok(())
 }
 
