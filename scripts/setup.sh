@@ -223,14 +223,22 @@ fi
 #   - the sticky "Alerts" style is a per-app setting no API can set.
 if [ "$(uname -s)" = "Darwin" ]; then
   say "sticky notifications"
-  if ! "$repo_root/scripts/build-notifier.sh"; then
-    warn "could not build the notifier — permission notifications will fire but auto-hide"
+  # "Did this build succeed" and "what notifier is installed, in what state" are separate
+  # questions, and only the second is worth reporting. They used to be fused: a failed build
+  # asserted that notifications would auto-hide — untrue whenever a working bundle is already
+  # installed, which is the usual case, since build-notifier.sh bails at its `swiftc` guard before
+  # touching the existing one — and it suppressed the two manual-step instructions, so a machine
+  # that really was unauthorized was told nothing.
+  "$repo_root/scripts/build-notifier.sh" || warn "could not rebuild the notifier (any existing one is untouched)"
+
+  # Asked of the hook itself, so this reports on exactly the binary the hook will use. A second
+  # copy of the search list here would eventually disagree with it, and the disagreement reads
+  # as a broken notifier rather than as the drift it is.
+  nb=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --find-notifier 2>/dev/null || true)
+  state=$([ -n "$nb" ] && "$nb" status 2>/dev/null || true)
+  if [ -z "$nb" ]; then
+    warn "no notifier installed — permission notifications will fire but auto-hide"
   else
-    # Asked of the hook itself, so this reports on exactly the binary the hook will use. A second
-    # copy of the search list here would eventually disagree with it, and the disagreement reads
-    # as a broken notifier rather than as the drift it is.
-    nb=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --find-notifier 2>/dev/null || true)
-    state=$([ -n "$nb" ] && "$nb" status 2>/dev/null || true)
     case "$state" in
       *authorization=authorized*) ;;
       *) warn "not yet allowed to notify — run once and click Allow:"

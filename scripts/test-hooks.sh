@@ -40,7 +40,9 @@ run() {
 }
 calls() { tr '\n' ' ' < "$rec" | sed 's/  */ /g; s/^ //; s/ $//'; }
 
-payload() { printf '{"hook_event_name":"%s","session_id":"%s","message":"%s","cwd":"/repos/jkb/.jkb/work/wt"}' "$1" "$2" "$3"; }
+# payload <event> <session> <message> [tool_name]
+payload() { printf '{"hook_event_name":"%s","session_id":"%s","message":"%s","tool_name":"%s","cwd":"/repos/jkb/.jkb/work/wt"}' "$1" "$2" "$3" "${4:-}"; }
+PROMPT='Claude needs your permission to use Bash'
 
 echo "==> notify-sticky.sh"
 
@@ -51,14 +53,43 @@ check "Notification posts under the session's id" \
   "$(calls)" \
   "post --id jkb-claude-s1 --title Claude Code --subtitle wt --body Claude needs your permission to use Bash"
 
-# 2. The dismissing events each withdraw that same id. All four are asserted: they fire on
+# 2. Each dismiss route, driven the way Claude Code drives it. All four are asserted: they fire on
 #    different paths through a turn (grant, type, deny, quit) and any one of them silently
-#    dropping out of the case arm leaves a notification stuck on screen.
-for ev in PostToolUse UserPromptSubmit Stop SessionEnd; do
-  run "$(payload Notification s1 'needs permission')" >/dev/null
+#    dropping out leaves a notification stuck on screen.
+run "$(payload Notification s1 "$PROMPT")" >/dev/null
+run "$(payload PostToolUse s1 '' Bash)"
+check "PostToolUse for the prompted tool withdraws" "$(calls)" "remove --id jkb-claude-s1"
+for ev in UserPromptSubmit Stop SessionEnd; do
+  run "$(payload Notification s1 "$PROMPT")" >/dev/null
   run "$(payload "$ev" s1 '')"
   check "$ev withdraws the notification" "$(calls)" "remove --id jkb-claude-s1"
 done
+
+# 2b. THE CONCURRENCY CASE. One assistant message routinely batches several tool calls, so a slow
+#     allowlisted one finishes while another's permission prompt is still on screen and unanswered.
+#     Withdrawing there leaves the session blocked with nothing on screen — the exact state this
+#     hook exists to prevent — and, because the marker would be spent, nothing would re-post it.
+run "$(payload Notification s2b "$PROMPT")" >/dev/null
+run "$(payload PostToolUse s2b '' Read)"
+check "a concurrently-finishing tool does not withdraw the prompt" "$(calls)" ""
+run "$(payload PostToolUse s2b '' Bash)"
+check "the prompted tool finishing does withdraw it" "$(calls)" "remove --id jkb-claude-s2b"
+
+# 2c. A notification whose tool cannot be read from the message is never withdrawn by a tool
+#     event — it waits for the user or the sweep. The safe direction: late, not absent.
+run "$(payload Notification s2c 'Claude is waiting for your input')" >/dev/null
+run "$(payload PostToolUse s2c '' Bash)"
+check "an untooled notification ignores tool events" "$(calls)" ""
+run "$(payload UserPromptSubmit s2c '')"
+check "an untooled notification clears when the user types" "$(calls)" "remove --id jkb-claude-s2c"
+
+# 2d. The sweeps do NOT consult the marker. If the state dir is unwritable the marker never gets
+#     written, every marker-gated event short-circuits, and an `alert`-style notification waits
+#     forever by design — so the session would end with a stale alert and nothing reporting it.
+run "$(payload Stop s2d '')"
+check "Stop sweeps without a marker" "$(calls)" "remove --id jkb-claude-s2d"
+run "$(payload SessionEnd s2d '')"
+check "SessionEnd sweeps without a marker" "$(calls)" "remove --id jkb-claude-s2d"
 
 # 3. With nothing posted, a dismiss must not spawn the notifier — PostToolUse runs after every
 #    single tool call, so this is the whole reason the marker exists.
@@ -66,18 +97,18 @@ run "$(payload PostToolUse s1 '')"
 check "dismiss with nothing pending is free" "$(calls)" ""
 
 # 4. Dismissing twice does not re-run it either: the marker is consumed, not just read.
-run "$(payload Notification s1 'needs permission')" >/dev/null
-run "$(payload PostToolUse s1 '')" >/dev/null
-run "$(payload PostToolUse s1 '')"
+run "$(payload Notification s1 "$PROMPT")" >/dev/null
+run "$(payload PostToolUse s1 '' Bash)" >/dev/null
+run "$(payload PostToolUse s1 '' Bash)"
 check "a second dismiss is free" "$(calls)" ""
 
 # 5. Parallel sessions (D36 worktrees) hold separate ids, so one session answering a prompt
 #    must not clear another session's notification.
-run "$(payload Notification s1 'a')" >/dev/null
-run "$(payload Notification s2 'b')" >/dev/null
-run "$(payload PostToolUse s1 '')"
+run "$(payload Notification s1 "$PROMPT")" >/dev/null
+run "$(payload Notification s2 "$PROMPT")" >/dev/null
+run "$(payload PostToolUse s1 '' Bash)"
 check "one session's dismiss targets only its own id" "$(calls)" "remove --id jkb-claude-s1"
-run "$(payload PostToolUse s2 '')"
+run "$(payload PostToolUse s2 '' Bash)"
 check "the other session is still pending" "$(calls)" "remove --id jkb-claude-s2"
 
 # 6. An id is a group name and a filename, so it must not be able to name a path.
@@ -190,22 +221,21 @@ PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" JKB_NOTIFY_STATE="$tmp/state" \
   REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12 '')"
 check "a refused post leaves nothing to withdraw" "$(calls)" ""
 
-# 12a-bis. A withdraw that FAILED must not consume the marker. It used to be cleared before the
-# `remove` ran, on the reasoning that the marker is only an optimisation — but its absence gates
-# every later dismiss, so one failed withdraw (bundle mid-reinstall, notifier timing out) silently
-# disarmed `Stop` and `SessionEnd` as well and the alert stayed up for the whole session.
-run "$(payload Notification s12b 'needs permission')" >/dev/null
+# 12a-bis. A withdraw that fails is attempted once and NOT retried on every later tool call.
+#          Round 2 made a failure re-arm the marker, which fixed a stuck alert and bought a worse
+#          one: `doRemove`'s realistic non-zero exit is a 10s timeout against a wedged notification
+#          centre, so every `PostToolUse` for the rest of the session would pay it, with the reason
+#          swallowed. The retry now lives with the sweeps, which run once per turn and once per
+#          session — bounded by construction rather than by hoping the failure is transient.
+run "$(payload Notification s12b "$PROMPT")" >/dev/null
 : > "$rec"
 PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" NOTIFIER_FAILS=1 JKB_NOTIFY_STATE="$tmp/state" \
-  REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12b '')"
+  REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12b '' Bash)"
 check "a failed withdraw is attempted" "$(calls)" "remove --id jkb-claude-s12b"
-# The next dismiss event retries — and this one succeeds (the default stub exits 0), which is what
-# finally consumes the marker.
+run "$(payload PostToolUse s12b '' Bash)"
+check "a failed withdraw is not retried per tool call" "$(calls)" ""
 run "$(payload Stop s12b '')"
-check "a failed withdraw is retried by the next dismiss event" \
-  "$(calls)" "remove --id jkb-claude-s12b"
-run "$(payload SessionEnd s12b '')"
-check "and once a retry succeeds, dismissing is free again" "$(calls)" ""
+check "the end-of-turn sweep is the retry" "$(calls)" "remove --id jkb-claude-s12b"
 
 # 12b. The bundle search itself. Every test above injects `JKB_NOTIFIER`, so without this the
 #      hard-coded install path is covered only by the opt-in live test — and a typo there would
@@ -283,11 +313,15 @@ else
   printf '  --  %s\n' "style: $("$live_bin" status 2>/dev/null)"
 
   # Claude needs permission.
-  live "$(payload Notification "$live_sid" 'Claude needs your permission to use Bash')"
+  live "$(payload Notification "$live_sid" "$PROMPT")"
   check "the Notification hook posts a real notification" "$(delivered)" "1"
 
-  # You grant it; the tool runs; PostToolUse fires. This is the pair the whole change exists for.
-  live "$(payload PostToolUse "$live_sid" '')"
+  # A DIFFERENT tool finishing first — the batched-call case — must leave it up.
+  live "$(payload PostToolUse "$live_sid" '' Read)"
+  check "a concurrent tool leaves the real notification up" "$(delivered)" "1"
+
+  # You grant it; the tool runs; PostToolUse fires for THAT tool. The pair the change exists for.
+  live "$(payload PostToolUse "$live_sid" '' Bash)"
   check "granting permission withdraws it" "$(delivered)" "0"
 
   # The other half: the idle-waiting notification, cleared by typing rather than by a tool.
@@ -318,7 +352,7 @@ echo "==> post-merge (setup.sh rebuild trigger)"
 # (`jkb task close-merged`) cannot touch the real knowledge base from a test.
 pm_src="$(cd "$(dirname "$0")/.." && pwd)/scripts/hooks/post-merge"
 
-pm_run() { # pm_run <changed-path> <skip-paths-answer> -> "ran" | "skipped"
+pm_run() { # pm_run <changed-paths, space-separated> <skip-paths-answer> -> "ran" | "skipped"
   local d ans
   d=$(mktemp -d)
   ans=$2
@@ -337,7 +371,10 @@ STUB
     # An empty <changed-path> leaves ORIG_HEAD at HEAD, so `git diff` yields nothing — which is
     # also what an unresolvable range produces, since line 22 of the hook swallows the failure.
     if [ -n "$1" ]; then
-      mkdir -p "$(dirname "$1")" && echo x > "$1" && git add -A && git commit -qm two
+      for f in $1; do
+        mkdir -p "$(dirname "$f")" && echo x > "$f"
+      done
+      git add -A && git commit -qm two
     fi
     # Invoked the way git does — through the shebang — NOT with `sh`. Ubuntu's /bin/sh is dash,
     # which rejects the hook's own `set -uo pipefail` and exits before doing anything: every case
@@ -366,9 +403,28 @@ for path in openspec/changes/x/design.md README.md CLAUDE.md .codereviews/x/task
   check "a pull touching $path does not rebuild" "$(pm_run "$path" "$skip_paths")" "skipped"
 done
 
+# MIXED pulls, which are the common case — nearly every branch touches a top-level .md as well as
+# code, and this one touches CLAUDE.md alongside crates/, macos/ and .claude/. Every case above
+# changes exactly one path, so on its own the suite cannot tell "rebuild if ANY changed path is
+# outside the skip list" from "rebuild only if ALL are": inverting that quantifier leaves all of
+# them green while every real pull silently skips the rebuild.
+check "a pull touching docs AND code rebuilds" \
+  "$(pm_run "CLAUDE.md crates/jkb-cli/src/main.rs" "$skip_paths")" "ran"
+check "a pull touching docs AND the notifier rebuilds" \
+  "$(pm_run "README.md macos/notifier/main.swift" "$skip_paths")" "ran"
+check "a pull touching only several doc paths still skips" \
+  "$(pm_run "README.md CLAUDE.md openspec/changes/x/design.md" "$skip_paths")" "skipped"
+
 # An unanswerable trigger degrades toward doing the work: a skipped rebuild leaves a stale
 # artifact and says nothing, an unnecessary one only costs time.
 check "an unanswerable --skip-paths rebuilds anyway" "$(pm_run README.md "")" "ran"
+
+# A pattern grep CANNOT COMPILE is a third state, and as a bare `if` condition it was
+# indistinguishable from "everything matched" — so the hook printed grep's error and then took the
+# skip arm, the one direction its own comment forbids. The status is now read explicitly, and
+# anything that is not a clean "all matched" rebuilds.
+check "a skip pattern grep cannot compile rebuilds anyway" \
+  "$(pm_run crates/f.rs '^(unbalanced')" "ran"
 
 # The other unknown, and the one that used to degrade the wrong way: `git diff` produces an empty
 # list both when nothing was pulled and when it could not resolve the range at all, and the hook

@@ -59,7 +59,18 @@ NOTIFIER_PATHS=(
 # in the worst way: drop `Stop` and a *denied* permission, which produces no `PostToolUse`, leaves
 # its notification on screen until the session ends — which is the case `Stop` is here for.
 SHOW_EVENTS=(Notification)
-DISMISS_EVENTS=(PostToolUse UserPromptSubmit Stop SessionEnd)
+# Split by how far each event can be trusted to mean "the user dealt with it".
+#   TOOL_EVENTS  fire after ANY tool call, including one running concurrently with an unanswered
+#                permission prompt — so they withdraw only when the finished tool is the one the
+#                prompt was about.
+#   USER_EVENTS  are the user acting on this session directly, so they withdraw unconditionally.
+#   SWEEP_EVENTS end the turn or the session: nothing can still be waiting, so they withdraw
+#                without consulting the marker at all. This is the backstop that makes every
+#                failure above temporary.
+TOOL_EVENTS=(PostToolUse)
+USER_EVENTS=(UserPromptSubmit)
+SWEEP_EVENTS=(Stop SessionEnd)
+DISMISS_EVENTS=("${TOOL_EVENTS[@]}" "${USER_EVENTS[@]}" "${SWEEP_EVENTS[@]}")
 
 in_list() {
   local needle=$1 x
@@ -146,7 +157,20 @@ show() {
     # written only once posting actually succeeded — and only on this branch. An osascript banner
     # cannot be withdrawn, so marking one would buy `dismiss` nothing and cost every later tool
     # call a look at a marker it can never act on.
-    mkdir -p "$state_dir" 2>/dev/null && : > "$marker" 2>/dev/null
+    # The marker records WHICH TOOL the prompt is about, so a concurrently-finishing tool cannot
+    # withdraw it. Claude Code's Notification payload names no tool, so it is read out of the
+    # message text; when that does not match, the marker is empty and no `PostToolUse` will
+    # consume it — the notification then waits for the user or for the end-of-turn sweep, which is
+    # the safe direction.
+    local tool=""
+    case "$message" in
+      *"permission to use "*)
+        tool=${message##*permission to use }
+        tool=${tool%% *}
+        tool=${tool//[!A-Za-z0-9_-]/}
+        ;;
+    esac
+    mkdir -p "$state_dir" 2>/dev/null && printf '%s\n' "$tool" > "$marker" 2>/dev/null
     return
   fi
 
@@ -155,22 +179,48 @@ show() {
     >/dev/null 2>&1
 }
 
-dismiss() {
-  # `PostToolUse` runs after EVERY tool call, so the common case — nothing pending — must not
-  # spawn a process. The marker is what makes that check a stat instead of an exec. A marker left
-  # behind by a crashed session costs exactly one wasted `remove` of an id that is no longer on
-  # screen, so it needs no expiry.
-  [ -f "$marker" ] || return
+# Withdraw, and forget the marker either way. Retrying a failed withdraw on every later tool call
+# is how a wedged notification centre turns into ~10s added to each one, so the retry lives with
+# the sweep events instead, which run a bounded number of times.
+withdraw() {
+  rm -f "$marker" 2>/dev/null
   find_notifier
-  # The marker is CONSUMED ONLY BY A WITHDRAW THAT WORKED. It used to be cleared first, on the
-  # reasoning that it is "just an optimisation" — but its absence is authoritative for every later
-  # dismiss, so one failed `remove` (bundle mid-reinstall, notifier timing out) silently disarmed
-  # `Stop` and `SessionEnd` too, and the alert stayed up for the rest of the session. Leaving it
-  # costs two path tests per tool call and buys a retry on every subsequent dismiss event.
   [ -n "$notifier" ] || return
-  if "$notifier" remove --id "$notif_id" >/dev/null 2>&1; then
-    rm -f "$marker" 2>/dev/null
+  "$notifier" remove --id "$notif_id" >/dev/null 2>&1
+}
+
+dismiss() {
+  if in_list "$event" "${SWEEP_EVENTS[@]}"; then
+    # Unconditional, and deliberately NOT gated on the marker: if the marker could not be written
+    # (unwritable or purged state dir) every marker-gated event short-circuits, and an
+    # `alert`-style notification waits forever by design — so the session would end with a stale
+    # alert on screen and nothing reporting it. These fire once per turn and once per session, so
+    # the sweep costs one withdraw of an id that is usually already gone.
+    withdraw
+    return
   fi
+
+  # The frequent events. `PostToolUse` runs after EVERY tool call, so the common case — nothing
+  # pending — must not spawn a process, and the marker is what makes that a stat instead of an
+  # exec.
+  [ -f "$marker" ] || return
+
+  if in_list "$event" "${TOOL_EVENTS[@]}"; then
+    # A tool finishing is only evidence the PROMPT was answered when it is the tool the prompt was
+    # about. One assistant message routinely batches several calls, so a slow allowlisted one can
+    # finish while a permission prompt from another is still on screen — withdrawing there leaves
+    # the session blocked with nothing to show for it, which is the state this hook exists to
+    # prevent. An empty or mismatched marker waits for a user event or the sweep.
+    #
+    # Residual, stated rather than guarded: two calls to the SAME tool, one allowlisted and one
+    # prompting, are indistinguishable here, so the first to finish withdraws. The sweep still
+    # bounds it to the end of the turn.
+    local want=""
+    [ -r "$marker" ] && read -r want < "$marker" 2>/dev/null
+    { [ -n "$want" ] && [ "$want" = "$tool_name" ]; } || return
+  fi
+
+  withdraw
 }
 
 input=$(cat)
@@ -179,8 +229,9 @@ input=$(cat)
 # tool call, so everything on the path to "nothing pending, exit" is a cost paid all day. Both
 # fields are identifiers, so a tab join needs no quoting; the message and cwd are read separately,
 # on the rare `Notification` path, precisely because they are free text.
-IFS=$'\t' read -r event session <<<"$(
-  printf '%s' "$input" | jq -r '[.hook_event_name // "", .session_id // ""] | @tsv' 2>/dev/null
+IFS=$'\t' read -r event session tool_name <<<"$(
+  printf '%s' "$input" |
+    jq -r '[.hook_event_name // "", .session_id // "", .tool_name // ""] | @tsv' 2>/dev/null
 )"
 
 # The session id becomes both a notification id and a filename, so reduce it to characters

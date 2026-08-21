@@ -132,8 +132,20 @@ mkdir -p "$(dirname "$app")"
 rm -rf "$app"
 mv "$staging/app" "$app"
 
+# Step 4, and it must not be silent either way. `[ -x … ] && "$lsregister" …` let `set -e` decide
+# the two cases in OPPOSITE wrong directions: a missing lsregister made the whole list return 1,
+# which `set -e` ignores in a non-final position, so the script reported success for a bundle the
+# framework will refuse — while a lsregister that RAN and failed was the list's final command, so
+# `set -e` aborted after `mv` had already installed a good bundle and setup.sh then reported that
+# the build failed, which was untrue.
 lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-[ -x "$lsregister" ] && "$lsregister" -f "$app"
+if [ ! -x "$lsregister" ]; then
+  echo "warning: lsregister not found at $lsregister — the bundle is installed but NOT registered," >&2
+  echo "  so the notification centre will refuse it however it is signed ('post' will fail)." >&2
+elif ! "$lsregister" -f "$app"; then
+  echo "warning: lsregister failed — the bundle is installed but may not be registered," >&2
+  echo "  so the notification centre may refuse it ('post' will fail)." >&2
+fi
 
 note "  • notifier:   $app"
 # Report rather than assume. `status` is the same read `setup.sh` and the hook rely on, so if it
