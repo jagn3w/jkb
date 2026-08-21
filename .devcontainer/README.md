@@ -82,6 +82,30 @@ still reached the auth check rather than erroring at startup. So the sandbox is 
 auth precedes it. Settle it inside a live session with `printenv CLAUDE_CODE_SANDBOXED`, or
 `../scripts/auto-mode.sh probe`.
 
+## Give it enough memory
+
+Building this workspace needs a few GB — `headless_chrome`, the image/AV1 crates and the ONNX
+graph are each large — and **an out-of-memory build does not say so**: `rustc` is SIGKILLed and
+cargo reports a bare `(signal: 9, SIGKILL: kill)` with no mention of memory. If you see that, it
+is the VM's memory limit, not a broken toolchain. Raise the runtime's memory (Docker Desktop's
+Resources pane, `colima start --memory`), or cap parallelism with `CARGO_BUILD_JOBS=2`, which
+lowers peak usage far more than it costs in wall-clock.
+
+## `~/.jkb` is shared with the host, deliberately
+
+The knowledge base is bind-mounted, so the container and the host see the same database — which is
+the point, and every write goes through the audited writer-actor, so damage is undoable. The
+consequence to know about is the usual one: the DB migrates in place, so a container `jkb` built
+from a branch with a newer migration will lock the host binary out until it is rebuilt. Point
+`JKB_DB` at a container-local path if you would rather they were independent.
+
+## Open the repo root, not a session worktree
+
+`jkb task work` puts worktrees at `<repo>/.jkb/work/<session>`, and a linked worktree's `.git` is a
+*file* pointing into `<repo>/.git/worktrees/…`. Mount the repo root and both ends are inside the
+container, so sessions work normally. Mount only the worktree and git breaks, because the gitdir
+it points at is not there.
+
 Costs, stated: on macOS this is a Linux VM, so bind-mount IO is slower and the toolchain is the
 container's, not your host's. `~/repos` mounted is still writable and push-able — the container's
 win is bounded to what you did **not** mount.

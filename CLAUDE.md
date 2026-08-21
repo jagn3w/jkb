@@ -1349,6 +1349,28 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
   test; `check-config.sh` is the host-side half that runs in `check.sh`, and its real job is the
   **generated** seccomp profile: a patch that no-ops against a changed upstream yields a profile
   that parses, applies, and leaves the sandbox unable to start.
+- **Three defects found only by building and running it**, none of which static review would have
+  caught. (1) `jkb` was not installed in the container at all — the explorer extension spawns it
+  and every workflow verb needs it; `setup.sh` now builds and installs it, and `jkb 0.1.0` was
+  confirmed running inside. (2) **A named volume whose path does not exist in the image is created
+  root-owned**, so cargo died with `EACCES` minutes into the first build; every volume mount point
+  is now created in the Dockerfile, which is what makes Docker seed ownership from it. (3) Cargo's
+  `target/` moved off the bind mount into a volume — required by (2)'s uid mismatch, and
+  independently right because it is the heaviest write path and a macOS bind mount is a VM
+  filesystem crossing.
+  - **An out-of-memory build does not say so.** `rustc` is SIGKILLed and cargo reports a bare
+    `(signal: 9, SIGKILL: kill)`. Diagnosed from `dmesg` rather than guessed at, twice — the first
+    diagnosis was right about OOM and wrong about the cause, since the test VM was holding a 2.9 GB
+    copy of the repo on tmpfs. Worth knowing because the symptom names neither memory nor the fix.
+- **Where VS Code runs does not matter; where the `claude` process runs does.** Under Dev
+  Containers the UI is on the host and the server, extension host and terminals are in the
+  container. The Claude Code extension declares no `extensionKind` and has a Node `main`, so VS
+  Code runs it as a **workspace** extension — in the container — and `devcontainer.json` lists it
+  so the linux build is installed inside (a host copy is platform-specific and separate).
+- **Open the repo root, not a session worktree.** `jkb task work` puts worktrees at
+  `<repo>/.jkb/work/<session>` and a linked worktree's `.git` is a *file* pointing into
+  `<repo>/.git/worktrees/…`. Mounting the root puts both ends inside; mounting only the worktree
+  breaks git, because the gitdir it names is not there.
 - **Still not established:** that the nested sandbox actually *engages* for a tool call. `bwrap`
   working is the mechanism, not the product, and the credential-free probe does not discriminate
   (see D48.7). Settle it in a live session with `printenv CLAUDE_CODE_SANDBOXED`.

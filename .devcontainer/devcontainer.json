@@ -44,12 +44,21 @@
     // restarting the container does not lose context and the host stays untouched.
     "source=jkb-claude-state,target=/home/vscode/.claude-state,type=volume",
     // Cargo's registry cache, so a rebuild is not a re-download every time.
-    "source=jkb-cargo-registry,target=/home/vscode/.cargo/registry,type=volume"
+    "source=jkb-cargo-registry,target=/home/vscode/.cargo/registry,type=volume",
+
+    // Cargo's target/ dir, in a VOLUME rather than in the bind-mounted workspace, for two
+    // separate reasons that happen to share a fix. (1) Ownership: a bind mount carries the host's
+    // uids, so on a host whose uid is not 1000 the container user cannot create target/ at all —
+    // the build fails with EACCES, which is how this was found. (2) Speed: target/ is by far the
+    // heaviest write path in this repo, and on macOS a bind mount is a VM filesystem crossing.
+    "source=jkb-cargo-target,target=/home/vscode/.cargo-target,type=volume"
   ],
 
   "containerEnv": {
     // Keep the posture's own paths meaningful inside the container.
-    "JKB_DB": "/home/vscode/.jkb/jkb.db"
+    "JKB_DB": "/home/vscode/.jkb/jkb.db",
+    // See the target/ volume above: keeps cargo's output off the bind mount.
+    "CARGO_TARGET_DIR": "/home/vscode/.cargo-target"
   },
 
   // Order matters, and the lifecycle is postCreate BEFORE postStart — so the firewall cannot be

@@ -35,7 +35,8 @@ EXPECTED="/home/vscode/repos/jkb
 /home/vscode/.jkb
 /home/vscode/.claude/.credentials.json
 /home/vscode/.claude-state
-/home/vscode/.cargo/registry"
+/home/vscode/.cargo/registry
+/home/vscode/.cargo-target"
 actual="$(awk '$5 ~ /^\/home\/vscode/ || $5 ~ /^\/workspaces/ {print $5}' /proc/self/mountinfo | sort -u)"
 unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED" | sort -u))"
 if [ -z "$unexpected" ]; then

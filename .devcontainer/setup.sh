@@ -29,5 +29,23 @@ say "auto-mode posture"
 say "rust toolchain (pinned by rust-toolchain.toml)"
 ( cd "$repo" && rustup show >/dev/null && cargo --version )
 
+# The `jkb` binary has to exist INSIDE the container: the VS Code explorer extension spawns it,
+# and so does every workflow verb (`task work`, `staging ls`). Without this the container looks
+# fine and the tooling fails at first use. Slow on first create; the cargo registry volume makes
+# a rebuild cheap. Deliberately fatal rather than `|| true` — a swallowed failure here is a
+# container that looks ready and is not.
+# CARGO_TARGET_DIR is set in devcontainer.json to a volume, off the bind-mounted workspace: a bind
+# mount carries the HOST's uids, so where the host uid is not 1000 the container user cannot
+# create target/ at all. Assert it rather than discover it three minutes into a build.
+[ -w "${CARGO_TARGET_DIR:-/home/vscode/.cargo-target}" ] || {
+    echo "CARGO_TARGET_DIR (${CARGO_TARGET_DIR:-unset}) is not writable — check the volume mount" >&2
+    exit 1
+}
+
+say "install jkb into the container"
+( cd "$repo" && cargo install --path crates/jkb-cli --locked --force )
+command -v jkb >/dev/null || { echo "jkb is not on PATH after install" >&2; exit 1; }
+jkb --version || true
+
 say "verify the container is what it claims to be"
 "$repo/.devcontainer/verify.sh"
