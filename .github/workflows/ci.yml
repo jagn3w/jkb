@@ -21,6 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # First, because it needs no toolchain and takes a second: the shell under scripts/
+      # is gated too (scripts/check.sh runs the same loop). setup.sh's installs are not
+      # reachable from a Rust test, and one of them replaces the very hook that runs it.
+      # No `-e` guard on the glob, unlike check.sh: here, finding no tests is a failure.
+      - name: shell tests
+        run: for t in scripts/tests/*.test.sh; do bash "$t"; done
+
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
       # rav1e/image) and builds them twice (default + --features fastembed) plus a
       # --all-features cargo-deny graph, which overflows the runner's ~14 GB free disk

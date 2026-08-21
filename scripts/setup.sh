@@ -20,6 +20,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# `install_exec` — every file this script installs is written atomically, because the
+# post-merge hook runs this script and is itself one of them. See scripts/lib.sh.
+# shellcheck source=scripts/lib.sh
+. "$repo_root/scripts/lib.sh"
 do_extension=1
 do_service=1
 do_scaffold=1
@@ -143,8 +147,9 @@ if [ -f "$hooks_src" ]; then
   if [ -n "$git_dir" ]; then
     case "$git_dir" in /*) ;; *) git_dir="$repo_root/$git_dir" ;; esac
     mkdir -p "$git_dir/hooks"
-    cp "$hooks_src" "$git_dir/hooks/post-merge"
-    chmod +x "$git_dir/hooks/post-merge"
+    # `install_exec`, never `cp`: the hook we are replacing is very often the process that
+    # invoked this script, and a `cp` rewrites its inode underneath the running shell.
+    install_exec "$git_dir/hooks/post-merge" <"$hooks_src"
     echo "  • repo hook:  $git_dir/hooks/post-merge"
 
     global_hooks="$(git config --get core.hooksPath || true)"
@@ -153,7 +158,9 @@ if [ -f "$hooks_src" ]; then
       mkdir -p "$global_hooks"
       chainer="$global_hooks/post-merge"
       if [ ! -f "$chainer" ]; then
-        cat > "$chainer" <<'CHAIN'
+        # Atomic for the same reason, plus its own: this file is on the path of every repo's
+        # `git pull`, so a half-written one breaks merges far outside this checkout.
+        install_exec "$chainer" <<'CHAIN'
 #!/bin/sh
 # Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
 # repo-local hook if one exists (mirrors the commit-msg chainer).
@@ -161,7 +168,6 @@ repo_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/post-merge"
 [ -x "$repo_hook" ] && exec "$repo_hook" "$@"
 exit 0
 CHAIN
-        chmod +x "$chainer"
         echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)"
       else
         # Something is already there; do not clobber it, but say so, because a chainer that

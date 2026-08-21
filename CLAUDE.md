@@ -568,6 +568,17 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
+- **Every file `setup.sh` installs is written atomically** — `scripts/lib.sh`'s `install_exec`
+  (temp file + `mv`), and `jkb service install`'s `write_atomic` for the unit. The loop above
+  is why: the hook runs `setup.sh`, and `setup.sh` installs *that hook*. `cp` rewrites the
+  target inode in place, and bash reads a script lazily **by byte offset** — so a hook replaced
+  mid-run by one of a different length resumes at an offset that no longer means what it meant
+  and executes whatever fragment it lands on. It cost one fictional error (`post-merge: line
+  35: i: command not found`, on a line blank in both versions) and could as easily have skipped
+  `jkb task close-merged` silently. It fires only on pulls that change the hook's **length** —
+  i.e. exactly the pulls that update the hook, when nobody is watching. `mv` is a rename: it
+  swaps the directory entry and leaves the running process's inode alone. Pinned by
+  `scripts/tests/install-exec.test.sh`, which `check.sh` and CI both run.
 
 ## Parallel task sessions (D36) — driving tasks by hand, safely
 

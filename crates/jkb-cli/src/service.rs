@@ -72,7 +72,7 @@ pub fn install(db: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
+        write_atomic(&path, &unit)?;
         println!("wrote {}", path.display());
         match manager {
             Manager::Launchd => println!("activate with: launchctl load {}", path.display()),
@@ -105,6 +105,36 @@ pub fn uninstall(db: &Path) -> Result<()> {
         } else {
             println!("no service unit at {}", path.display());
         }
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` atomically: a temp file in the same directory, then a rename.
+///
+/// `fs::write` truncates the destination and rewrites it in place, so anything reading it
+/// meanwhile — `launchctl load`, `systemctl --user daemon-reload`, or a second
+/// `jkb service install` racing this one — can see a half-written unit and decline to start
+/// the job, with the only trace in the supervisor's own log. A rename swaps the directory
+/// entry in one step, so every reader sees the whole old unit or the whole new one.
+/// (`setup.sh` re-runs this on every pull that touched `scripts/`, from the post-merge hook.)
+///
+/// This is the same rule `scripts/lib.sh`'s `install_exec` follows for the git hooks, where
+/// it is sharper still: the file being replaced there is one bash is currently executing.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("unit")),
+    );
+    // The pid keeps two concurrent installs off one another's temp file.
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = dir.join(tmp_name);
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Leave the destination as it was, and take the half-written file with us.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("installing {}", path.display()));
     }
     Ok(())
 }
@@ -294,8 +324,8 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit, xml_escape, LABEL,
-        REAP_LABEL,
+        launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit, write_atomic,
+        xml_escape, LABEL, REAP_LABEL,
     };
     use std::path::Path;
 
@@ -346,6 +376,23 @@ mod tests {
         let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_unit_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("{LABEL}.plist"));
+        write_atomic(&path, "first").expect("first install");
+        write_atomic(&path, "second").expect("replacing install");
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "second");
+        // A surviving temp file is a half-written unit left in the supervisor's directory.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != &format!("{LABEL}.plist"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files survived: {leftovers:?}");
     }
 
     #[test]

@@ -9,6 +9,14 @@ cargo fmt --all -- --check
 echo "==> clippy (warnings are errors)"
 cargo clippy --all-targets --all-features -- -D warnings
 
+# The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
+# reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
+echo "==> shell tests (scripts/tests)"
+for t in "$(dirname "$0")"/tests/*.test.sh; do
+    [ -e "$t" ] || break
+    bash "$t"
+done
+
 echo "==> tests"
 cargo test --all
 
