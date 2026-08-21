@@ -4,6 +4,7 @@
 # summary in CLAUDE.md).
 #
 #   ./scripts/auto-mode.sh print            # the posture this would install, as JSON
+#   ./scripts/auto-mode.sh preflight        # would this posture let THIS machine work?
 #   ./scripts/auto-mode.sh install          # merge it into ~/.claude/settings.json
 #   ./scripts/auto-mode.sh check            # is the posture still intact? (exit 1 if not)
 #   ./scripts/auto-mode.sh run [args…]      # check, then exec `claude --permission-mode auto`
@@ -149,8 +150,27 @@ missing_sandbox_deps() {
     printf '%s' "${missing[*]}"
 }
 
+# Distinguishes the three states `[ -f ]` collapses into one: readable, present-but-unreadable,
+# and genuinely absent. Prints nothing and returns 0/1/2 so callers can act on the difference.
+settings_state() {
+    if [ -r "$settings" ] && head -c 1 "$settings" >/dev/null 2>&1; then return 0; fi
+    # Not readable. Distinguish "denied" from "absent" WITHOUT trusting a stat we may not be
+    # allowed to make: if the directory listing is itself denied, the file's existence is unknown
+    # and must not be reported as absence.
+    [ -e "$settings" ] && return 1                    # present, just not readable
+    [ -d "$config_dir" ] && return 2                  # directory readable, file genuinely absent
+    ls "$config_dir" >/dev/null 2>&1 && return 2      # listable by another route: absent
+    [ -e "$config_dir" ] && return 1                  # exists but unusable: denied
+    return 2                                          # no such directory: absent
+}
+
 read_settings() {
-    [ -f "$settings" ] || die "no settings file at $settings — run: $0 install"
+    local st=0; settings_state || st=$?
+    case $st in
+        0) ;;
+        1) die "cannot read $settings (permission denied). It exists — this is NOT a missing file, so do NOT run 'install', which would treat it as absent. If the sandbox is denying it, add the path to sandbox.filesystem.allowRead, or run this from an unsandboxed shell." ;;
+        2) die "no settings file at $settings — run: $0 install" ;;
+    esac
     jq empty "$settings" 2>/dev/null || die "$settings is not valid JSON — fix it by hand, then re-run."
 }
 
@@ -159,9 +179,24 @@ read_settings() {
 cmd_print() { cat "$posture"; }
 
 cmd_install() {
-    mkdir -p "$config_dir"
+    # Refuse before touching anything. The live install that denied its own settings file, $TMPDIR
+    # and /tmp is exactly what this stops, and every one of those was knowable here.
+    if [ "${1:-}" != "--force" ] && ! cmd_preflight; then
+        die "refusing to install a posture with preflight gaps (pass --force to install anyway)."
+    fi
+    mkdir -p "$config_dir" 2>/dev/null || true
     local existed=1
-    if [ ! -f "$settings" ]; then existed=0; printf '{}\n' > "$settings"; fi
+    local st=0; settings_state || st=$?
+    case $st in
+        0) ;;
+        # Refuse. Creating an empty file here would merge the posture into {} and drop everything
+        # the real file holds, and the backup below would not fire because this branch believes
+        # there was nothing to back up.
+        1) die "cannot read $settings (permission denied), and it exists — refusing to overwrite it with a fresh posture. Run this from an unsandboxed shell, or restore a backup by hand." ;;
+        2) existed=0
+           printf '{}\n' > "$settings" 2>/dev/null \
+             || die "cannot create $settings (permission denied). Installing the posture is deliberately a human action: the posture denies writes to itself, so an agent session cannot install or repair it. Run this from your own terminal." ;;
+    esac
     jq empty "$settings" 2>/dev/null || die "$settings is not valid JSON — refusing to merge into it."
 
     local merged tmp_prev
@@ -177,7 +212,7 @@ cmd_install() {
 
     # Back up only a file that both existed and is about to change, so neither a re-run nor a
     # fresh machine litters the config dir with backups of nothing.
-    mv "$merged" "$settings"
+    mv "$merged" "$settings" 2>/dev/null || die "cannot write $settings (permission denied). The posture denies writes to itself, so installing or repairing it is deliberately a human action — run this from your own terminal, not from inside an agent session."
     echo "posture installed in $settings"
     if [ "$existed" -eq 1 ]; then
         local backup="$settings.bak-$(date +%Y%m%d-%H%M%S)"
@@ -191,6 +226,83 @@ cmd_install() {
     echo "now starts in auto mode. That is the point — but it is machine-wide, so say it out"
     echo "loud rather than let it be discovered. To undo: restore the backup printed above."
     cmd_check
+}
+
+# Would this posture let THIS machine work? A different question from `check`, which asks whether
+# the settings match the posture — and the question that actually mattered: the first live install
+# denied its own settings file, $TMPDIR and /tmp, and every one of those was knowable from the
+# posture plus a few `realpath` calls, without installing anything.
+#
+# Coverage is computed on RESOLVED paths, because that is where two of the three hid: on macOS
+# /tmp is a symlink to /private/tmp and the sandbox matches the real path, and $TMPDIR is a
+# per-user /var/folders/… directory that no reasonable person guesses.
+cmd_preflight() {
+    local -a need_write=() need_read=()
+    need_write+=("${TMPDIR:-/tmp}" "/tmp" "$PWD")
+    need_read+=("$settings" "$HOME/.cargo" "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.gitconfig")
+    [ -n "${PNPM_HOME:-}" ] && need_write+=("$PNPM_HOME")
+    [ -n "${SHELL:-}" ] && need_read+=("$HOME/.$(basename "$SHELL")rc")
+
+    # Expand a posture entry to an absolute, symlink-resolved prefix.
+    local -a allow_w=() allow_r=()
+    local e real
+    while IFS= read -r e; do
+        e="${e/#\~/$HOME}"
+        real="$(cd "$e" 2>/dev/null && pwd -P)" || real="$e"
+        allow_w+=("$real")
+    done <<<"$(jq -r '.require.sandbox.filesystem.allowWrite[]?' "$posture")"
+    while IFS= read -r e; do
+        e="${e/#\~/$HOME}"
+        real="$(cd "$e" 2>/dev/null && pwd -P)" || real="$e"
+        allow_r+=("$real")
+    done <<<"$(jq -r '.require.sandbox.filesystem.allowRead[]?' "$posture")"
+
+    covered() { # covered <resolved-path> <prefix...>
+        local path="$1"; shift
+        local pfx
+        for pfx in "$@"; do
+            [ -n "$pfx" ] || continue
+            [ "$pfx" = "/" ] && return 0
+            case "$path" in "$pfx"|"$pfx"/*) return 0 ;; esac
+        done
+        return 1
+    }
+    resolve() { # a path that may not exist yet: resolve the nearest existing ancestor
+        local p="$1" d
+        d="$(cd "$p" 2>/dev/null && pwd -P)" && { printf '%s' "$d"; return; }
+        d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" && { printf '%s/%s' "$d" "$(basename "$p")"; return; }
+        printf '%s' "$p"
+    }
+
+    # The entries as WRITTEN (only ~ expanded). Compared separately from the resolved forms
+    # because resolving both sides makes /tmp and /private/tmp agree — which is exactly the
+    # mismatch that denied /tmp on the live install, where the sandbox matched the real path and
+    # the posture said the symlink. A path that is covered only after resolution is a latent gap.
+    local -a lit_w=() lit_r=()
+    while IFS= read -r e; do lit_w+=("${e/#\~/$HOME}"); done <<<"$(jq -r '.require.sandbox.filesystem.allowWrite[]?' "$posture")"
+    while IFS= read -r e; do lit_r+=("${e/#\~/$HOME}"); done <<<"$(jq -r '.require.sandbox.filesystem.allowRead[]?' "$posture")"
+
+    local gaps=0 p rp
+    echo "==> preflight: does the posture cover what this machine needs?"
+    for p in "${need_write[@]}"; do
+        rp="$(resolve "$p")"
+        if covered "$rp" "${lit_w[@]}"; then printf '  \033[32mok\033[0m   writable: %s\n' "$p"
+        elif covered "$rp" "${allow_w[@]}"; then
+            printf '  \033[31mGAP\033[0m  writable: %s resolves to %s, which is covered only if the sandbox follows symlinks — list %s literally\n' "$p" "$rp" "$rp"; gaps=$((gaps+1))
+        else printf '  \033[31mGAP\033[0m  writable: %s -> %s is in no allowWrite entry\n' "$p" "$rp"; gaps=$((gaps+1)); fi
+    done
+    for p in "${need_read[@]}"; do
+        rp="$(resolve "$p")"
+        # readable if covered by allowRead OR by allowWrite (a writable tree is readable), or if
+        # it simply is not under a denyRead root at all.
+        if covered "$rp" "${lit_r[@]}" "${lit_w[@]}"; then printf '  \033[32mok\033[0m   readable: %s\n' "$p"
+        elif ! covered "$rp" "$HOME"; then printf '  \033[32mok\033[0m   readable: %s (outside denyRead)\n' "$p"
+        else printf '  \033[31mGAP\033[0m  readable: %s -> %s is under denyRead and in no allowRead entry\n' "$p" "$rp"; gaps=$((gaps+1)); fi
+    done
+    [ "$gaps" -eq 0 ] && { echo "  no gaps — this posture is workable on this machine"; return 0; }
+    printf '\n\033[31m%d gap(s)\033[0m — installing this posture would make the machine hard to work on.\n' "$gaps" >&2
+    echo "Add the resolved paths to sandbox.filesystem.allowRead/allowWrite in $posture." >&2
+    return 1
 }
 
 cmd_check() {
@@ -309,6 +421,7 @@ PROMPT
 
 case "${1-}" in
     print)   shift; cmd_print "$@" ;;
+    preflight) shift; cmd_preflight "$@" ;;
     install) shift; cmd_install "$@" ;;
     check)   shift; cmd_check "$@" ;;
     run)     shift; cmd_run "$@" ;;

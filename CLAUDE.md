@@ -1308,6 +1308,31 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     `allowAllUnixSockets`, all-or-nothing, which is not something to switch on behind a flag whose
     name promises a single socket. The test is branched per platform and each branch was run on
     its own platform, not inferred.
+- **`preflight` exists because every live breakage was knowable without installing.** The first
+  real install denied its own settings file, `$TMPDIR` and `/tmp`, and all three are facts about
+  the machine's *resolved* paths rather than about the settings file — so no amount of checking
+  the posture could find them. `auto-mode.sh preflight` resolves what the machine actually needs
+  (`$TMPDIR`, the real path of `/tmp`, `$PWD`, the settings file, the toolchain roots) and reports
+  any that no `allowRead`/`allowWrite` entry covers; `install` runs it and **refuses** on a gap
+  (`--force` overrides). Verified by reverting the posture to the version that broke the machine:
+  it names all three, each with its fix.
+  - **It compares against the entries AS WRITTEN, not only resolved.** Resolving both sides makes
+    `/tmp` and `/private/tmp` agree, which would have hidden the exact symlink mismatch that
+    denied `/tmp` — the sandbox matched the real path while the posture named the link. A path
+    covered *only* after resolution is reported as a latent gap, not as covered.
+  - **Deliberately not in `check.sh`**: whether the real posture covers the real paths depends on
+    where the checkout lives (`~/repos` on a dev box, `/home/runner/work` in CI), so a passing
+    assertion would be a test of the machine. The tests exercise the *logic* — a posture covering
+    nothing is refused, one covering everything is not, a symlink listed only by its link name is
+    flagged.
+  - **`set -e` made the three-state check unreachable.** `settings_state` returns 0/1/2 and a bare
+    call returning non-zero aborts the script before `case $?` runs, so the distinction existed
+    and never fired. `|| st=$?` is what turns a return code into a value. Caught by the tests,
+    and pinned by reverting it.
+- **`~/Documents` is a useless sandbox canary on macOS.** TCC denies it to the terminal whether or
+  not any sandbox is running, so a probe that reads it always looks confined — which is how a
+  restored, sandbox-free machine was briefly misreported here as still sandboxed. Test
+  confinement against a path the posture itself governs, never one the OS already protects.
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not

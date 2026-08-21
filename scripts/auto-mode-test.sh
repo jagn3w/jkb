@@ -179,6 +179,36 @@ check_that "the posture declares forbid keys, and each was exercised ($forbid_ch
     "$([ "$forbid_checked" -gt 0 ] && echo yes || echo no)"
 cp "$tmp/good" "$settings"
 
+# --- 6c. an UNREADABLE settings file is not a missing one ----------------------------------
+# Found by installing the posture for real: `denyRead: ["~"]` covered ~/.claude/settings.json, so
+# `[ -f ]` was false, `check` reported "no settings file — run install", and install's
+# fresh-machine branch would have merged the posture into {} — dropping 45 live permission rules,
+# with no backup, because that branch believes there is nothing to back up. The write-deny is what
+# stopped it, which is luck rather than design.
+cp "$tmp/good" "$settings"
+chmod 000 "$settings"
+if [ -r "$settings" ]; then
+    echo "  skip  unreadable-file cases (running as root — chmod cannot deny us)"
+else
+    run_check
+    check_that "check refuses an unreadable settings file as DENIED, not missing" \
+        "$([ "$rc" -ne 0 ] && grep -q 'permission denied' <<<"$out" && ! grep -q 'no settings file' <<<"$out" && echo yes || echo no)"
+    check_that "that refusal does not advise running install" \
+        "$(grep -q "run: .*install" <<<"$out" && echo no || echo yes)"
+
+    set +e
+    "$tool" install >"$tmp/inst.out" 2>&1
+    rc=$?
+    set -e
+    check_that "install refuses rather than overwriting an unreadable file" \
+        "$([ "$rc" -ne 0 ] && grep -q 'refusing to overwrite' "$tmp/inst.out" && echo yes || echo no)"
+    chmod 644 "$settings"
+    check_that "the unreadable file was left completely untouched" \
+        "$(cmp -s "$tmp/good" "$settings" && echo yes || echo no)"
+fi
+chmod 644 "$settings" 2>/dev/null
+cp "$tmp/good" "$settings"
+
 # --- 7. install creates the config dir when a fresh machine has none -----------------------
 export CLAUDE_CONFIG_DIR="$tmp/fresh"
 set +e
@@ -245,6 +275,51 @@ check_that "print emits the posture file unchanged" \
     "$(diff -q <("$tool" print) "$posture" >/dev/null && echo yes || echo no)"
 check_that "install writes .require and never the .forbid section" \
     "$(jq -e 'has("require") | not' "$settings" >/dev/null && jq -e 'has("forbid") | not' "$settings" >/dev/null && echo yes || echo no)"
+
+# --- 8b. preflight detects gaps, and is machine-specific by nature -------------------------
+# Tested as LOGIC, not against this machine: whether the real posture covers the real paths
+# depends on where the checkout lives ($PWD under ~/repos on a dev box, /home/runner/work on CI),
+# so asserting "preflight passes here" would be a test of the machine. What is testable is that a
+# posture covering nothing is refused, and one covering everything is not. Deliberately NOT part
+# of ./scripts/check.sh for the same reason.
+empty_posture="$tmp/posture-empty.json"
+jq '.require.sandbox.filesystem.allowRead = [] | .require.sandbox.filesystem.allowWrite = []' \
+   "$posture" > "$empty_posture"
+wide_posture="$tmp/posture-wide.json"
+jq '.require.sandbox.filesystem.allowRead = ["/"] | .require.sandbox.filesystem.allowWrite = ["/"]' \
+   "$posture" > "$wide_posture"
+
+run_preflight() { # run_preflight <posture-file>
+    set +e
+    out="$(cd "$tmp" && cp "$1" "$tmp/pf/scripts/auto-mode-posture.json" && "$tmp/pf/scripts/auto-mode.sh" preflight 2>&1)"
+    rc=$?
+    set -e
+}
+mkdir -p "$tmp/pf/scripts"
+cp "$here/auto-mode.sh" "$tmp/pf/scripts/"
+
+run_preflight "$empty_posture"
+check_that "preflight reports gaps when the posture covers nothing" \
+    "$([ "$rc" -ne 0 ] && grep -q 'GAP' <<<"$out" && echo yes || echo no)"
+check_that "a gap names the RESOLVED path, which is the actionable form" \
+    "$(grep -qE 'resolves to|->' <<<"$out" && echo yes || echo no)"
+
+run_preflight "$wide_posture"
+check_that "preflight passes when the posture covers everything" \
+    "$([ "$rc" -eq 0 ] && echo yes || echo no)"
+
+# The symlink case, which is the one that resolving both sides would hide: allow only the
+# symlink spelling and require the tool to notice the real path is not listed.
+if [ -L /tmp ] || [ "$(cd /tmp && pwd -P)" != "/tmp" ]; then
+    sym_posture="$tmp/posture-sym.json"
+    jq '.require.sandbox.filesystem.allowWrite = ["/tmp"] | .require.sandbox.filesystem.allowRead = ["/"]' \
+       "$posture" > "$sym_posture"
+    run_preflight "$sym_posture"
+    check_that "preflight flags a symlinked path listed only by its link name" \
+        "$([ "$rc" -ne 0 ] && grep -q 'covered only if the sandbox follows symlinks' <<<"$out" && echo yes || echo no)"
+else
+    echo "  skip  symlink case (/tmp is not a symlink on this platform)"
+fi
 
 # --- 9b. --help prints the whole header ----------------------------------------------------
 # It is derived from the file rather than a line range, because the range was hardcoded, went
