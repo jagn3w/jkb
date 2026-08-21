@@ -307,6 +307,46 @@ impl TaskStatus {
             .is_some_and(Self::is_terminal)
     }
 
+    /// How far through the lifecycle this status is: `open` → `in_progress` → `needs_review` →
+    /// `done` (design D27.7), with `cancelled` alongside `done` as the other way to be finished.
+    ///
+    /// The four-state lifecycle written down as an order, so *"did this task move backwards?"*
+    /// is a question about data rather than about a list of event names. That question is the
+    /// one [`jkb_core::transition::resumed`] asks to decide whether evidence of a landing still
+    /// speaks for the work in flight: a task that has gone back to an earlier stage since a
+    /// landing is being worked on again, and that landing describes something else.
+    ///
+    /// **Only comparisons are meaningful** — the numbers are ordinal and nothing should read
+    /// them as a count or persist them. `cancelled` shares `done`'s rank because both mean
+    /// *finished*: neither is further along than the other, and a task moving between them has
+    /// not gone back to work.
+    #[must_use]
+    pub fn stage(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::InProgress => 1,
+            Self::NeedsReview => 2,
+            Self::Done | Self::Cancelled => 3,
+        }
+    }
+
+    /// Whether a move from `from` to `to` goes **backwards** through the lifecycle.
+    ///
+    /// `None` for either side — an unparseable status, or a history that starts before the
+    /// transition log did — is *not* backwards. It cannot be shown to have gone back, and the
+    /// caller that asks this retires evidence on a `true`, so an unobtainable answer must not
+    /// be spelled as the stronger one.
+    #[must_use]
+    pub fn moved_backwards(from: Option<&str>, to: Option<&str>) -> bool {
+        match (
+            from.and_then(Self::from_manual_str),
+            to.and_then(Self::from_manual_str),
+        ) {
+            (Some(from), Some(to)) => to.stage() < from.stage(),
+            _ => false,
+        }
+    }
+
     /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents.
     /// True for exactly the **terminal** statuses (`done`/`cancelled`) — the terminal
     /// set (design D27.7). A `needs_review` dependency deliberately does **not** unblock:
@@ -612,5 +652,132 @@ mod tests {
         assert!(!TaskStatus::NeedsReview.unblocks_dependents());
         assert!(!TaskStatus::Open.unblocks_dependents());
         assert!(!TaskStatus::InProgress.unblocks_dependents());
+    }
+
+    /// Exactly which `(from, to)` pairs count as going backwards — asserted here, where the rule
+    /// is declared, over **every** pair rather than through one caller's behaviour.
+    ///
+    /// This rule decides whether evidence that work landed still counts, it has been rewritten
+    /// twice, and each rewrite was caught by an end-to-end test that exercised two of the
+    /// twenty-five pairs. Reordering a rank — giving `cancelled` its own, say, which is the one
+    /// place the order is arguable — would leave every one of those green while landings quietly
+    /// stopped counting for a whole class of task.
+    #[test]
+    fn exactly_these_moves_go_backwards_through_the_lifecycle() {
+        use TaskStatus::{Cancelled, Done, InProgress, NeedsReview, Open};
+        // Ordered, so a rank change is visible as a reordering rather than as an arithmetic edit.
+        assert!(Open.stage() < InProgress.stage());
+        assert!(InProgress.stage() < NeedsReview.stage());
+        assert!(NeedsReview.stage() < Done.stage());
+        // `cancelled` and `done` are both *finished*; neither is further along than the other, so
+        // moving between them is not going back to work.
+        assert_eq!(Cancelled.stage(), Done.stage());
+
+        let backwards = |from: TaskStatus, to: TaskStatus| {
+            TaskStatus::moved_backwards(Some(from.as_str()), Some(to.as_str()))
+        };
+        for &from in TaskStatus::ALL {
+            for &to in TaskStatus::ALL {
+                let expected = to.stage() < from.stage();
+                assert_eq!(
+                    backwards(from, to),
+                    expected,
+                    "{} -> {}",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+
+        // The cases the rule was got wrong on, named so a regression reads as itself.
+        assert!(
+            backwards(Done, InProgress),
+            "a reopened task went back to work"
+        );
+        assert!(backwards(InProgress, Open), "`abandon` puts the work down");
+        assert!(
+            backwards(Cancelled, Open),
+            "reviving a cancelled task is going back"
+        );
+        assert!(backwards(NeedsReview, InProgress), "changes were requested");
+        assert!(
+            !backwards(InProgress, InProgress),
+            "a row that does not move must not supersede itself — the landing held for an open \
+             subtask is `in_progress -> in_progress`"
+        );
+        assert!(!backwards(Done, Done), "the `done -land-> done` self-loop");
+        assert!(!backwards(Done, Cancelled) && !backwards(Cancelled, Done));
+        assert!(!backwards(Open, InProgress), "starting is forwards");
+
+        // Unobtainable is not backwards: this answer retires evidence, so it must be *proven*.
+        assert!(!TaskStatus::moved_backwards(None, Some("open")));
+        assert!(!TaskStatus::moved_backwards(Some("done"), None));
+        assert!(!TaskStatus::moved_backwards(Some("nonsense"), Some("open")));
+        assert!(!TaskStatus::moved_backwards(Some("done"), Some("nonsense")));
+        assert!(!TaskStatus::moved_backwards(None, None));
+    }
+}
+
+/// [`Resolution`] is the state set of an investigation unit's machine (design S9).
+///
+/// The third machine on [`jkb_fsm`], and the one whose rules are **strategy-supplied**: two
+/// tables over this one state set, differing where the strategies genuinely differ. See
+/// `jkb_core::nstype::lifecycle`.
+impl jkb_fsm::State for Resolution {
+    const ALL: &'static [Self] = Self::ALL;
+
+    fn name(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// A unit is at rest once it has ended, however it ended. The inherent
+    /// [`Resolution::is_settled`] says exactly this and the two must agree, so it is the one
+    /// definition — a second would be a second answer.
+    fn is_settled(self) -> bool {
+        Self::is_settled(self)
+    }
+
+    /// An unresolved unit is waiting on a person to go and investigate it.
+    ///
+    /// Nothing the *system* can do moves it: evidence has to arrive from outside, as an edge
+    /// somebody links. That is unlike a task's `open`, which always has `cancel` and `start`
+    /// available — which is why the task machine leaves this at its default and this one does
+    /// not.
+    fn awaits_input(self) -> bool {
+        !Self::is_settled(self)
+    }
+}
+
+/// A task starts [`TaskStatus::Open`] — the machine's initial state, and the value
+/// `task::create` writes.
+impl Default for TaskStatus {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+/// [`TaskStatus`] **is** the task lifecycle's state set (design S2.1).
+///
+/// Implemented here rather than in `jkb-core` because the orphan rule requires it beside the
+/// enum — and that is the right home anyway: a parallel `TaskState` enum in the machine's crate
+/// would be a fourth hand-written list over the same five strings, beside the enum, `as_str`,
+/// and `staging::State`.
+///
+/// The richer state set that folds the claim in (`unstarted` / `claimed` / `implementing`) is
+/// deliberately **not** what this is. D27.1 separated *"is anyone holding this?"* from *"how far
+/// along is the work?"* precisely because they are different questions; re-fusing them in the
+/// state enum would put that back. A claim is context, and a claim change is an effect.
+impl jkb_fsm::State for TaskStatus {
+    const ALL: &'static [Self] = Self::ALL;
+
+    fn name(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// A task is at rest when it is terminal: `done` or `cancelled`. The trait calls this
+    /// *settled* rather than *terminal* because not every machine's rest state is an ending —
+    /// a synced file settles and is then edited again — but for a task the two coincide.
+    fn is_settled(self) -> bool {
+        Self::is_terminal(self)
     }
 }

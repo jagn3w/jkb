@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **553 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **590 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -662,7 +662,283 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   header states the contract. `jkb task land` is the same algorithm in Rust for the human path
   (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
 
-## A branch is a record, not a tag value (D46)
+## The lifecycle is a checkable state machine, and a landing is an event (D48)
+
+**Reviewed in three ranges (`low`, ~18 agents): 36 findings, 8 must-fix, all fixed.** What the
+reviewer caught that the machine's own checks did not, recorded because the pattern repeats:
+
+- **Absorption discarded a plan.** The idempotence rule treated any event whose destination you
+  were already in as a no-op — but arriving there another way leaves the plan unapplied.
+  `abandon` on an operator-reopened task skipped its guard *and* its claim release, reported
+  success, and the surviving claim held the task off every frontier. A row with a guard or a plan
+  is never absorbed now; the domain declares the self-loop.
+- **Two of my own tests could not fail.** One asserted `stdout contains uid` where the failure
+  path prints the uid too; one asserted a defect that is structurally unreachable for its machine.
+  Both are why `jkb task landed` never credited a swarm group for a whole branch.
+- **A guard that only reports is not a guard.** The open-subtasks rule lived in the machine's
+  `land` plan, which is applied *last* — so it narrated a landing that had already grafted and
+  disposed of the session. It belongs in the preflight, beside every other precondition.
+- **`Unknown` spelled as `No`, in the probe that protects every claim.** `pid_exists` folded "`ps`
+  would not spawn" into "that process is gone" — the exact defect `Fact` exists to prevent.
+- **A choke point with a third door.** `jkb task claim`, the verb the swarm runs on every task,
+  still wrote the claim directly; swarm work had no `start` entry at all, and the two claim verbs
+  answered `needs_review` oppositely.
+
+
+The `staging-workflow` branch took 44 review passes and ~80 must-fix findings. Sorting the
+task-lifecycle ones by *cause* rather than by site gives six groups, and each maps to a property
+the code had no way to have. Design: `openspec/changes/jkb-state-machine/`.
+
+- **The lifecycle was written down nowhere**, so about a dozen sites each derived the part their
+  own question needed — `claim::claim`'s terminal pre-check, `staging::State::from_status`,
+  `land_blocker`, `land_preflight`, `close-merged`, `task abandon`, `review record`,
+  `merge-queue.sh`, the VS Code row. *Two of them answering one question differently* is the most
+  common finding shape in the corpus, and the standing fix — make the two share a function — never
+  reaches the thirteenth site.
+- **`crates/jkb-fsm` is a dependency-free library where a lifecycle is a `&'static` table**, so it
+  can be *walked*, and walking it is what makes these checkable at all: every state reaches a
+  terminal one (`Wedged`), every state is reachable, no two rows compete (`Nondeterministic`),
+  every reconciliation carries evidence (`UnguardedReconciliation`), every refusal's advice is an
+  event the machine really accepts (`UnreachableRemedy`), every verb can be run twice
+  (`Unrepeatable`), and under every observation something can still move the object (`DeadEnd`).
+  `Machine::dot()` renders it — the artifact whose absence is the first item on the list.
+- **`Unrepeatable` was found by the fix for the absorption bug below, and is the pair to it.**
+  Correcting absorption — a row with a guard or a plan is never absorbed implicitly, because the
+  object may have arrived by another route with that plan still owed — is right, and it silently
+  turned five destinations into refusals: `land` on an already-landed task among them. That is
+  S1.6's *the verb is re-runnable* lapsing, and a lapsed guarantee is worse than one never
+  claimed, because the retry advice everywhere else assumes it. The two rules together say: **a
+  verb you run is always answerable at its own destination, an observation only where somebody
+  wrote down what re-seeing it means.** Satisfying it does not mean "make it a no-op" — a domain
+  that wants the second run to fail declares a self-loop whose guard denies, and gets a sentence
+  and a remedy instead of the silent absence of a row. Two rows here keep their guards on purpose
+  (`abandon` from `open`, `observed_landed` from `done`): those verbs may still have work to do.
+- **`Fact` is three-valued and has no method that collapses `Unknown` to a `bool`.** Nine
+  must-fixes are one unobtainable answer spelled `false`: `ahead_count` returning `0` (which means
+  *nothing to land*) for a branch it could not resolve; `has_own_commits` answering *no* when
+  `rev-list` failed; a land gate that could not tell *no findings* from *the namespace resolved to
+  nothing*. `is_yes` and `is_no` **both** mean *proven*, so a guard states its polarity in code:
+  landing needs `work_dirty.is_no()` (an unreadable checkout refuses) and `has_commits.is_yes()`.
+- **A transition yields its effects as one value.** `settle_landing` wrote the status, cleared the
+  claim, then asked git to remove a worktree git refused — leaving a task `done`, unclaimed, with
+  a live session. `Outcome::Moved` carries a `Vec<TaskEffect>` produced *with* the move, and
+  `transition::perform` is the one seam that applies it. The ordering rule that makes a git
+  failure survivable is stated once: **apply the plan last**, after every fallible external step,
+  so a failure leaves the task where it was and the verb is re-runnable (which S1.6 guarantees is
+  a no-op once it has worked).
+- **A refusal names an *event*, not a sentence.** Passes 31 and 32 are the same finding one
+  message apart — a printed remedy whose obvious argument froze the task permanently — and the
+  fix each time was to reword. `Denial::remedy` holds a `TaskEvent`, and `Machine::audit`
+  validates every remedy the machine can produce over a whole context matrix. **It caught a bad
+  remedy in this change as it was written**, and a state passed beside the context that could
+  disagree with it (fixed by `Stateful`: the state is read *out of* the observation).
+- **`task::set_status` is not a hole beside the machine — it is the `override` event**, and a
+  synced file's checkbox is `set_from_file`, a *guarded reconciliation* (the file may only speak
+  for a task it backs). Both use `Dest::Stated`, a destination the caller names. One rule keeps
+  the checks honest: **a `Stated` edge is excluded from the liveness walks**, because a state
+  whose only exit is somebody naming a different state is still wedged.
+
+### `branch_records` is gone; the history replaced it (V015, V016)
+
+- **Two facts outlive git's memory**: where a branch was cut, and that it landed. `branch_records`
+  stored them as *properties of a branch* — a mutable projection of the past, keyed by a name git
+  lets you delete, recreate and reuse — so the row had to be kept in agreement with a moving
+  world. The supersede clause, `landed_head`, the reflog instance anchor, `--forget`: every one
+  was added after a defect, and all of them existed for that reconciliation.
+- **`task_transitions` is append-only**, so it makes no claim about the present and there is
+  nothing to reconcile. A name that changes hands appends a row rather than corrupting one;
+  superseding stops being an operation. Deliberately **not** changelogged (the `blobs` precedent):
+  it *is* an audit record, and a transition later reverted by `jkb undo` stays, which is the
+  honest reading of a history.
+- **Branch names became labels on events.** `land_target` is the last `onto` recorded — reset by
+  an `abandon`, because where work lands is a property of the session doing it. Two tasks told
+  different targets are two entries with timestamps, not one row keeping whichever wrote last.
+- **`jkb task why <uid>`** prints it: every transition, who applied it, and the evidence each guard
+  fired on. Fourteen must-fixes are "held for ever with no way to see why"; that is now one command.
+
+### Evidence of a landing is spent once the task is put back to work
+
+The log removed the reconciliation problem from **writing** — an append-only history makes no
+claim about the present, so nothing has to be kept in agreement. It moved it to **reading**. Every
+caller asks a present-tense question (*has this landed?*, *where does it land?*), and turning a
+history into a present-tense answer needs a rule for when an older row stops counting — which was
+written separately in each reader, and they disagreed. `land_target` stopped at `abandon`;
+`landed` stopped at nothing. Five findings across two review rounds are that one gap.
+
+- **The rule is asked of the status ORDER, not of a list of events.** `transition::resumed` is
+  the one statement: the newest row that moved the task **backwards** through
+  `open -> in_progress -> needs_review -> done` (`TaskStatus::stage`, the D27.7 lifecycle written
+  down as an order). The obvious repair — give `landed` the same stop-list its sibling has — is a
+  fourth private rule for a fifth reader to get wrong, and one a newly-added event has to be
+  *remembered* and added to. Every row already records where it moved the task.
+- **It took two goes, and the first was a narrower rule that looked identical.** *Moved out of a
+  terminal status* is the same answer for the case it was written against — a landed task
+  reopened — and misses the one that matters most: **`abandon` is `in_progress -> open`**, neither
+  side terminal. A landing recorded while a task was held by an open subtask survived the abandon
+  that destroyed its session, and the task auto-closed over live work. Asking the order covers
+  both, plus `request_changes` and a resume out of `needs_review`, with no special case.
+- **Nothing that stands still is a resumption**, which is what stops the row recording a held
+  landing (`in_progress -> in_progress`) superseding **itself** and freezing its own task for
+  ever. Found by running it.
+- **`jkb undo` had to start recording what it did.** It restores `items.status` straight from the
+  changelog, and `task_transitions` is deliberately not changelogged — so undoing a close left the
+  landing looking live and the next `git pull` closed the task again, a loop undo could not break.
+  It now appends an `undo` transition, from the statuses observed either side of the inversion
+  rather than from what the entry claimed, and **only for a task that still exists**: inverting an
+  insert deletes the item, and the history's foreign key onto `items` failed the whole undo.
+- **A superseded landing is context, never a verdict** — and getting that wrong in *both*
+  directions took two rounds. Spelling "spent" and "never landed" the same way sent `close-merged`
+  off to ask GitHub about a pull request a locally-grafted branch never had, and reported that as
+  the reason. Then treating "spent" as *the* answer, and returning on it, left a task whose work
+  was redone and merged as a pull request permanently unclosable — printing *it will close when
+  the new work lands* after the new work had landed. A stale local graft says nothing about
+  whether the work reached its destination another way, so it falls through to the other evidence
+  and only colours the reason when that proves nothing either.
+- **`Landing` carries all of it from one read** — the landing, the resumption, the pull request
+  number — because those three were fetched separately and the third re-derived a row the first
+  had already found and thrown away, three history scans per task per `git pull`.
+- **A review asks the present tense first, and the historical question only where it has no
+  answer** — and getting that order wrong is the sharpest hole in the area, because it ends in
+  landing unreviewed commits. `live()` credits; a task still aiming at this branch is *reported*,
+  never credited, whatever it grafted before; and only a task aiming nowhere falls through to
+  `recorded()`. That last case is what `abandon` leaves — it retires the land target — and a graft
+  does not un-happen, so a session abandoned after its work reached the branch is covered.
+  Asking `recorded()` first credited a task that landed, was reopened for a must-fix, and had its
+  fix committed in a session the branch had never seen — recording that a review read work it did
+  not read, and moving the task to `needs_review` under a live session. (It does **not** follow
+  that refusing the credit stops an unreviewed landing in general: `gate_with` checks only that a
+  `reviewed=` facet *exists*, never that it is current, and D38 declines to enforce staleness on
+  purpose. It stops one only where the task had never been reviewed at all.) Asking
+  `live()` alone dropped the abandoned case into `Credit::Unrelated`, which the loop discards. The
+  discard is right and stays: that loop walks every task in the repo, so reporting `Unrelated`
+  would list most of the backlog on every run.
+- **The order is pinned where it is declared**, over all twenty-five status pairs plus the
+  `None`/garbage cases. It had been rewritten twice, checked only through `close-merged`'s
+  behaviour, and the one arguable rank — whether `cancelled` shares `done`'s — is exactly the edit
+  a later reader would make.
+- **It reaches the pull-request path too** (`pr::spent`), which is where it matters most: a merge
+  reads as `MERGED` for ever, so reopening a landed task and running `git pull` closed it again —
+  unattended, from the `post-merge` hook, over every task at once. That half **predates** the
+  recorded-landing path and predates this branch.
+- **Where it cannot be told, the task is held.** A merge with a known resumption it cannot be
+  placed against is `Undecidable`, not "live" — closing there picks the burying direction on the
+  strength of a missing field. `Live` is the default because *no resumption* is the normal case,
+  not because a missed close is cheap: a missed close costs one command, a wrong one buries work
+  in flight (D34.4).
+- **The pure half is separated from the `gh` call** so it is testable at all — a rule exercisable
+  only by shelling out to an authenticated network client is a rule nothing checks.
+
+### Auto-close is a lookup on an id that is never reused
+
+- **The inference was hard for one reason**: a squash or rebase merge rewrites the commits, so
+  containment cannot be tested, and the weaker question `is_merged` asked — *does this branch add
+  anything to trunk?* — cannot tell a branch squashed away from one that never started. Making
+  that answerable needed the whole cut-point/anchor apparatus, and it produced roughly a quarter
+  of the corpus's must-fixes.
+- **A pull request number is minted by GitHub and never reused**, so there is nothing to
+  disambiguate. `jkb task pr <uid> [number]` records or discovers it (refusing to guess when a
+  reused branch name matches two); after that the branch name is never consulted. `close-merged`
+  asks `gh`, and **everything degrades to `Fact::Unknown`, never to a `no`** — no `gh`, no
+  network, no GitHub remote, an unrecognized state — so the task is *held with the reason printed*.
+  It also produces an answer the inference could not: *closed without merging*. The field names,
+  the flags and the **uppercase** state values are verified against `gh` itself rather than from
+  memory (`gh pr view --json`'s own field list, `gh pr list --help`, and `gh`'s `display.go`); the
+  one live call is an `#[ignore]` test beside the ollama and Chrome smokes.
+- **Deleted:** `jkb-cli/src/base.rs` (932 lines), `jkb_core::branch`, `gitrepo::is_merged` /
+  `MergeState` / `merge_base` / `has_own_commits` / `is_ancestor` / the reflog-anchor plumbing,
+  `repo::landed_for_action` / `credited` / `clear_land_targets` / `measure_root_for`,
+  `jkb task base`, and ~35 tests that pinned the mechanics rather than the rules. `V016` drops
+  `branch_records` and migrates nothing, for `V013`'s own reason: importing values whose
+  reliability was the problem defeats the store they are imported into.
+- **What jkb performs, jkb records.** `jkb task land` writes a `land` transition after its gate is
+  green; `scripts/merge-queue.sh` calls `jkb task landed <branch> --onto <target>`, which now
+  closes every task on that branch. `jkb task review record` credits a task whose work jkb
+  *grafted* onto the reviewed branch — a recorded event, where it used to be a containment probe
+  that could not tell an empty session from a landed one.
+
+### The second machine: the sync journal, and what it moved
+
+`jkb-sync/src/lifecycle.rs` declares the per-file journal on the same library — a **reconciler**,
+not a lifecycle: nothing finishes, every event is `Reconciled`, and the question is never *what
+may I do next* but *which condition applies to what I just saw*. It moved the library three
+times, which is the evidence that "it generalizes" is a claim worth making:
+
+- **`is_terminal` → `is_settled`.** A synced file is never finished; it settles and is edited
+  again. Under the old name the machine either had no terminal state — making `Wedged` vacuous —
+  or had to lie about one. What the checks want is *rest*: the object owes the system nothing.
+- **`State::awaits_input`** (default `false`). A conflicted file is waiting on a person, so no
+  observation moves it; without this, `DeadEnd` fired on every such observation. A lifecycle
+  keeps the default because an operator escape (`cancel`) is always available.
+- **The initial state may be at rest.** A file an export-only mount holds no items for is nobody's
+  business.
+- What did **not** move is what carries the value — and `reconcile` refusing ambiguity turns out
+  to be the *central* property here rather than a corner case, because evaluating every
+  candidate's guard against one observation is exactly D45.5's *"a route is not a cause; the
+  condition must dominate every arm"*.
+- **The modelling found that `needs_attention` is two states** — a quarantine wants the file
+  fixed, a blocked write wants the store fixed — which `Outcome::Refused`'s own doc already
+  warned about in prose. And that a flag whose cause has gone is not always cleared (an
+  import-only mount with a store-side-only change writes no row): modelled faithfully, filed, not
+  fixed.
+- `sync_state.status` now has **one writer** (`lifecycle::status_for`), replacing four
+  hand-written spellings.
+
+### The third machine: investigation units, where the rules are strategy-supplied
+
+`jkb-core/src/nstype/lifecycle.rs` declares `items.resolution` on the same library — **two tables
+over one state set**, which is the axis neither earlier machine had. It moved the library twice
+more and found two rules that existed only in the shape of a function:
+
+- **`debugging` concludes differently, twice.** A settled result can go **stale** and return to
+  the frontier (an observation about a mutable system carries a `commit-range=`); and a tombstone
+  is **not** revived by fresh evidence, where the base table's is. Both were already true — the
+  first is one `if` in `debugging::resolution_rollup`, the second is that rollup's early return
+  versus `default_rollup`'s fall-through — and neither was discoverable from anywhere else.
+- **The strategy supplies the facts; the machine supplies the rules.** `resolution_rollup` (which
+  returned a *conclusion*) became `unit_facts`. A rollup that concludes has to encode the priority
+  of contradictory evidence in the order of its `if`s, where nothing can see it and nothing would
+  notice a reorder. As guard clauses the priority is arguable and `audit` proves it exclusive. A
+  strategy that merely *observes* differently — a `debugging` symptom is confirmed by a verified
+  fix, not a `confirms` edge — now needs no table of its own.
+- **Reachability counts a `Dest::Stated` edge; liveness still does not.** *Can the object be here*
+  is answered yes by an operator override; *can the lifecycle get it out of here* is not.
+  Collapsing them reported `abandoned` — which only a person ever sets — as unreachable dead code.
+- **`Resolution::Unresolved` declares `awaits_input`.** Nothing the system can do moves it;
+  evidence arrives from outside as an edge somebody links. Unlike a task's `open`, which always
+  has `cancel`.
+- **`UnusedEvent` is a per-machine statement**, and this is the first place two machines share one
+  event enum. The domain filters it only where *another* machine in the family declares the event,
+  and asserts the union separately — a narrow filter, so an event no table uses is still a defect.
+
+### Claim keying: an owner id is a type, and `Unknown` is not `dead`
+
+- **`jkb_types::AgentId`** replaces `split(':').nth(1)`: `Process { host, pid, run }` /
+  `Session { pid, worktree }` / **`Agent { id }`** (new — an externally-minted identity from
+  `JKB_AGENT_ID`, for a caller whose process and checkout are not the thing that persists) /
+  `Unrecognized`. Each declares what would prove it via `Liveness`, a **closed enum**, so a new
+  shape cannot be added without the compiler demanding a probe for it.
+- **`owner::is_alive` returns `Fact`.** An `agent:` id and an id we cannot read are
+  `Fact::Unknown` — *unestablished*, never *dead*. `transition::reclaim_dead` frees only claims
+  **proven** gone and returns the rest in an `unverifiable` bucket that `jkb doctor` and
+  `jkb task reclaim` report but never clear. That is a behaviour change: the old predicate treated
+  an unreadable owner as reclaimable, which silently frees a live agent's task. Of the two ways to
+  be wrong, the one that costs a command wins (D34.4).
+- **The old objection to session ids answered a different question** — whether jkb could go and
+  *ask* an agent something. A claim needs only a value stable for the life of the work; it does
+  not need to be reachable. There is still no TTL and no heartbeat.
+- **Reclaiming is a lifecycle transition** (`observed_owner_gone`, an effect-only self-loop), so it
+  appears in the task's history and obeys the same evidence rule as everything else. Its effect is
+  `ReclaimFrom(agent)`, distinct from `ReleaseClaim`, because the audit trail distinguishes the
+  holder letting go from somebody else deciding it had.
+
+## A branch is a record, not a tag value (D46) — SUPERSEDED by D48
+
+**The `branch_records` table is gone** (`V016`), and with it the cut point, the instance anchor
+and the landing columns. What survives is the *diagnosis* — an item-keyed, multi-valued, untyped,
+open-write store cannot hold a per-branch fact — and the rule it produced: prefer an invariant the
+schema enforces over one every caller must uphold. D48 applies it one level further, to the
+question the table existed to answer. `branch=`/`repo=` stay facets, for the reasons below.
+
 
 - **Re-founded by the B-series.** "Branch X was cut
   from commit Y", "X lands on Y", and "jkb merged X into Y" are facts about a *branch*. They lived

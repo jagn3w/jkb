@@ -88,8 +88,9 @@ mod tests {
         // V012 sync_state.document (a file's structure leaves the namespace tree),
         // V013 branch_records (a branch is a record, not a tag value),
         // V014 the undo watermark (undo history begins after the entries written under the
-        // audit-only contract).
-        assert_eq!(user_version, 14);
+        // audit-only contract), V015 the task lifecycle history,
+        // V016 drops branch_records (the history holds what it held, as events).
+        assert_eq!(user_version, 16);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -161,7 +162,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 14);
+        assert_eq!(user_version, 16);
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

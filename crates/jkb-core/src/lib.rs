@@ -13,7 +13,6 @@ mod store;
 
 pub mod binding;
 pub mod blob;
-pub mod branch;
 pub mod claim;
 pub mod containment;
 pub mod dsl;
@@ -21,6 +20,7 @@ pub mod edge;
 pub mod ingestion;
 pub mod investigation;
 pub mod item;
+pub mod lifecycle;
 pub mod mount;
 pub mod ns;
 pub mod nstype;
@@ -30,6 +30,7 @@ pub mod sql;
 pub mod sync_state;
 pub mod tag;
 pub mod task;
+pub mod transition;
 pub mod undo;
 pub mod view;
 

@@ -23,8 +23,7 @@ use rusqlite::{Connection, OptionalExtension};
 use jkb_types::{EdgeType, ItemId, Resolution};
 
 use crate::nstype::{
-    base_frontier, default_rollup, promise, BaseKind, DoneState, NamespaceType, NodeKindSpec,
-    VerbSpec,
+    base_frontier, lifecycle, promise, BaseKind, DoneState, NamespaceType, NodeKindSpec, VerbSpec,
 };
 use crate::query::{Query, Scope, TagPred};
 use crate::{edge, query::CmpOp, Result};
@@ -288,33 +287,31 @@ impl NamespaceType for Debugging {
         query
     }
 
-    /// The base rollup, plus the two debugging-specific corrections:
+    /// A **symptom** is confirmed by a verified fix, not by a `confirms` edge — diagnosing is not
+    /// finishing (design Dmem.6A) — and an observation about a mutable system goes stale when the
+    /// code moves out from under its `commit-range=`.
     ///
-    /// 1. A **symptom**'s outcome is defined by *fix + verify*, not by explanation. Being
-    ///    answered by a confirmed root cause is a diagnosis; the symptom resolves only once
-    ///    a fix for it has been verified against the repro, and it resolves then even though
-    ///    nothing `confirms` the symptom itself. Without this the frontier would go quiet
-    ///    the moment somebody wrote down an answer.
-    /// 2. A **stale observation** cannot confirm anything, so it does not roll a unit up to
-    ///    success. Its `supports`/`confirms` edges stay on record; they just stop counting.
-    fn resolution_rollup(&self, conn: &Connection, node: ItemId) -> Result<Resolution> {
-        let base = default_rollup(conn, node)?;
-        // Deaths and supersessions stand as-is: an obstruction does not go stale, and a
-        // refuted symptom ("not actually a bug") stays refuted.
-        if base.is_settled() && base != Resolution::Success {
-            return Ok(base);
-        }
+    /// Both are answered as *facts*; what they mean is [`lifecycle::DEBUGGING`]'s business. The
+    /// symptom rule is expressed as the pair it really is: a symptom with no verified fix is not
+    /// confirmed **and** whatever confirmed it before has gone stale, which is what returns it to
+    /// the frontier.
+    fn unit_facts(&self, conn: &Connection, node: ItemId) -> Result<lifecycle::UnitFacts> {
+        let mut facts = lifecycle::base_facts(conn, node)?;
         if kind_of(conn, node)?.as_deref() == Some(KIND_SYMPTOM) {
-            return Ok(if has_verified_fix(conn, node)? {
-                Resolution::Success
-            } else {
-                Resolution::Unresolved
-            });
+            let fixed = has_verified_fix(conn, node)?;
+            facts.confirmed = jkb_fsm::Fact::from(fixed);
+            facts.stale = jkb_fsm::Fact::from(!fixed);
+        } else {
+            facts.stale = jkb_fsm::Fact::from(is_stale(conn, node)?);
         }
-        if base == Resolution::Success && is_stale(conn, node)? {
-            return Ok(Resolution::Unresolved);
-        }
-        Ok(base)
+        Ok(facts)
+    }
+
+    /// `debugging` is the one strategy that concludes differently, and the table says how: a
+    /// settled result can go stale and return to the frontier, and a tombstone is **not** revived
+    /// by fresh evidence ("deaths and supersessions stand as-is", above).
+    fn unit_machine(&self) -> &'static super::lifecycle::UnitMachine {
+        &super::lifecycle::DEBUGGING
     }
 
     /// A stale observation contributes no rank: it is not evidence about today's code.

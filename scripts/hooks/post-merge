@@ -6,7 +6,7 @@
 #
 #   1. re-run setup.sh, so the installed `jkb` binary and the VS Code extension match what
 #      was just pulled — but ONLY when the merge touched something setup.sh installs;
-#   2. close tasks whose branch has now landed (`jkb task close-merged`).
+#   2. close tasks whose pull request has merged (`jkb task close-merged`).
 #
 # Never fails the merge. A hook that can break `git pull` is worse than the chore it
 # replaces, so every step is best-effort and reports rather than exits non-zero.

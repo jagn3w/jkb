@@ -420,34 +420,127 @@ pub fn set_status(
     task: ItemId,
     status: TaskStatus,
 ) -> Result<()> {
-    let before: Option<String> = conn
-        .prepare_cached("SELECT status FROM items WHERE id = ?1")?
-        .query_row([task.get()], |row| row.get::<_, Option<String>>(0))
-        .optional()?
-        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("task {task}"))))?;
-    conn.prepare_cached(
-        "UPDATE items SET status = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?1",
-    )?
-    .execute(params![task.get(), status.as_str()])?;
-    changelog::append(
+    state_change(
         conn,
         meta,
-        Op::Update,
-        Entity::Items,
-        &task.get().to_string(),
-        Some(&json!({ "status": before })),
-        Some(&json!({ "status": status.as_str() })),
+        task,
+        status,
+        crate::lifecycle::TaskEvent::Override,
+    )
+}
+
+/// Set a task's status because a **synced file says so** — the `tasks` serializer's
+/// `[ ]`/`[x]`/`[~]`/`[-]`.
+///
+/// The same write as [`set_status`], routed through a different event, because they are
+/// different things: one is an operator stating an answer, the other is an external authority
+/// being read. Modelling the file's word as a *reconciliation* is what puts a guard on it — the
+/// file may only speak for a task it actually backs — and what makes it show up in
+/// `jkb task why` as the file's doing rather than as somebody's decision.
+///
+/// # Errors
+/// Returns [`jkb_types::Error::NotFound`] if the task does not exist, or a database error.
+pub fn set_status_from_file(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    status: TaskStatus,
+) -> Result<()> {
+    state_change(
+        conn,
+        meta,
+        task,
+        status,
+        crate::lifecycle::TaskEvent::SetFromFile,
+    )
+}
+
+/// Move a task to `status` through the lifecycle machine.
+///
+/// Both public setters funnel here, and both use a [`jkb_fsm::Dest::Stated`] event — one where
+/// the *caller* names the destination. That is not the machine being bypassed; it is the shape
+/// those two transitions genuinely have, and being rows means they carry the same obligations
+/// as any other transition, including the claim release that a terminal status entails. That
+/// release used to be a tail on this function, which meant a second writer of the column
+/// silently did not perform it.
+fn state_change(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    status: TaskStatus,
+    event: crate::lifecycle::TaskEvent,
+) -> Result<()> {
+    let facts = observe(conn, task)?;
+    let facts = crate::lifecycle::TaskFacts {
+        stated: Some(status),
+        ..facts
+    };
+    let outcome = crate::transition::perform(
+        conn,
+        meta,
+        task,
+        &facts,
+        event,
+        &crate::transition::Labels::default(),
     )?;
-    // A terminal task holds no claim. Claiming marks work in flight, and finished work is
-    // not in flight — so the claim is cleared here rather than at each caller, which is
-    // what stops a completed task turning up later as an orphan in `jkb doctor`. Cleared
-    // regardless of holder (unlike `claim::release`) because with the work over there is
-    // nothing left to hand out and no one to protect it from.
-    if status.is_terminal() {
-        crate::claim::clear(conn, meta, task)?;
+    match outcome.refusal() {
+        Some(why) => Err(Error::Types(TypeError::Validation(why))),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The facts about a task that can be read from the database alone.
+///
+/// Everything the outside world knows — git, the filesystem, GitHub — is left
+/// [`jkb_fsm::Fact::Unknown`], which is the honest value for *not asked*. Callers that have
+/// looked fill those in; a caller that has not must not have its silence read as a `no`.
+///
+/// # Errors
+/// Returns [`jkb_types::Error::NotFound`] if the task does not exist, or a database error.
+pub fn observe(conn: &Connection, task: ItemId) -> Result<crate::lifecycle::TaskFacts> {
+    let (status, claimant, binding): (Option<String>, Option<String>, Option<String>) = conn
+        .prepare_cached(
+            "SELECT i.status, i.claimant_id, b.uri
+               FROM items i LEFT JOIN bindings b ON b.item_id = i.id
+              WHERE i.id = ?1",
+        )?
+        .query_row([task.get()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("task {task}"))))?;
+    let status = status
+        .as_deref()
+        .and_then(TaskStatus::from_db_str)
+        .unwrap_or(TaskStatus::Open);
+    Ok(crate::lifecycle::TaskFacts {
+        status,
+        claimant: claimant.as_deref().map(jkb_types::AgentId::parse),
+        file_backed: jkb_fsm::Fact::from(
+            binding.as_deref().is_some_and(|u| u.starts_with("file://")),
+        ),
+        open_subtasks: jkb_fsm::Fact::from(has_open_subtasks(conn, task)?),
+        ..crate::lifecycle::TaskFacts::default()
+    })
+}
+
+/// Whether this task has a non-terminal child (design D34.1: you work the leaves).
+///
+/// Asked of `containment`, which is where the answer lives (D35) and which is what
+/// `query::SUBTASK_CLAUSE` reads — this is that anti-join written positively, over the same
+/// table, so the land gate and the ready frontier cannot disagree about which parents are
+/// held.
+fn has_open_subtasks(conn: &Connection, task: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT 1 FROM containment ct JOIN items c ON c.id = ct.child_item_id
+              WHERE ct.parent_item_id = ?1
+                AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
+              LIMIT 1",
+        )?
+        .query_row([task.get()], |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
 /// Transition `task` to the status named by `status`, parsed from a manual string.
@@ -472,6 +565,26 @@ pub fn set_status_str(
         )))
     })?;
     set_status(conn, meta, task, parsed)
+}
+
+/// [`set_status_str`], attributed to the synced file that stated it.
+///
+/// # Errors
+/// Returns [`jkb_types::Error::Validation`] if `status` is not a settable status or the file is
+/// not this task's authority, or a database error.
+pub fn set_status_str_from_file(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    status: &str,
+) -> Result<()> {
+    let parsed = TaskStatus::from_manual_str(status).ok_or_else(|| {
+        Error::Types(TypeError::Validation(format!(
+            "cannot set status `{status}`: settable statuses are open, in_progress, \
+             needs_review, done, cancelled (blocked is derived from depends_on edges, not set)"
+        )))
+    })?;
+    set_status_from_file(conn, meta, task, parsed)
 }
 
 /// Set (or clear, with `None`) `task`'s priority.

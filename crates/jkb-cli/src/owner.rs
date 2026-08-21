@@ -1,153 +1,208 @@
-//! Claim-owner identity and the deterministic liveness probe (design D27.1/D27.2).
+//! Probing a claim owner's liveness (design D27.1/D27.2, S3.1/S3.2).
 //!
-//! A claim's `claimant_id` is a **liveness-checkable owner id** in one of two shapes.
-//! `host:pid` is a *process* owner (the coordinator may append a run segment,
-//! `host:pid:run`; subagents share their coordinator's pid, so the pid is the liveness
-//! signal); `session:<pid>:<worktree>` is a *session* owner (design D36.6), judged
-//! **only** by whether its worktree still exists — its pid is provenance, never
-//! consulted. [`self_owner`] mints this process's id; [`is_alive`] picks the right
-//! probe, and for a process owner that probe is `ps -p`, not `kill -0` (see its doc for
-//! why). There is deliberately **no** time component: a paused-but-alive owner passes.
+//! The *identity* is [`jkb_types::AgentId`] — a parsed type with a closed set of shapes, each
+//! declaring what would prove it via [`Liveness`]. This module is the other half: the probe, at
+//! the edge, where forking `ps` and touching the filesystem belong.
+//!
+//! The probe answers a [`Fact`], not a `bool`. That is the load-bearing change: an owner whose
+//! liveness cannot be established — an externally-minted `agent:` id, or a `claimant_id` in a
+//! shape we cannot read — is **unestablished**, never *dead*. Reclaiming on an unestablished
+//! answer frees a live agent's task silently; holding it reports a claim a person clears with
+//! one command. Of the two ways to be wrong, the recoverable one wins (D34.4).
+//!
+//! There is still deliberately **no time component**: no TTL, no heartbeat, so an agent paused
+//! on a permission prompt keeps its claim.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The host segment marking a **session** owner (design D36.6): `session:<pid>:<worktree>`.
-/// The pid stays in field 1 so every existing probe reads it unchanged; the worktree path
-/// is what makes the claim outlive the one-second `jkb task work` process that took it.
-const SESSION: &str = "session";
+use jkb_fsm::Fact;
+use jkb_types::{AgentId, Liveness};
 
 /// This process's owner id, `host:pid`, used as the default claim owner.
 #[must_use]
 pub fn self_owner() -> String {
-    format!("{}:{}", hostname(), std::process::id())
+    AgentId::this_process(&hostname(), std::process::id()).as_str()
 }
 
 /// The owner id for a session working in `worktree`: `session:<this pid>:<worktree>`.
 ///
 /// The pid is **provenance** — which `jkb task work` process opened the session — and is
-/// deliberately *not* a liveness signal: that process exits within a second, long before
-/// anyone reads the claim. Liveness is the worktree; see [`is_alive`].
+/// deliberately *not* a liveness signal: that process exits within a second, long before anyone
+/// reads the claim. Liveness is the worktree; see [`is_alive`].
 #[must_use]
 pub fn session_owner(worktree: &Path) -> String {
-    format!(
-        "{SESSION}:{}:{}",
-        std::process::id(),
-        worktree.to_string_lossy()
-    )
+    AgentId::session(std::process::id(), worktree).as_str()
+}
+
+/// An externally-minted agent owner, from `JKB_AGENT_ID` when the environment sets one.
+///
+/// For a caller whose process and checkout are not the thing that persists — a subagent, a
+/// resumed session, a cloud run. jkb cannot probe such an owner, and says so
+/// ([`Fact::Unknown`]) rather than guessing; the consequence is that its claim is never
+/// auto-reclaimed, which is exactly the property that makes an opaque id usable here.
+#[must_use]
+pub fn env_agent() -> Option<String> {
+    std::env::var("JKB_AGENT_ID")
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| AgentId::agent(id.trim()).as_str())
+}
+
+/// The claim owner this process should use: its agent id when one is set, else `host:pid`.
+#[must_use]
+pub fn preferred_owner() -> String {
+    env_agent().unwrap_or_else(self_owner)
 }
 
 /// The worktree a session owner id points at, or [`None`] for any other owner shape.
-///
-/// Fields 2.. are rejoined with `:` so a path containing a colon survives the round trip.
 #[must_use]
 pub fn session_worktree(owner: &str) -> Option<PathBuf> {
-    let mut parts = owner.split(':');
-    if parts.next() != Some(SESSION) {
-        return None;
-    }
-    parts.next()?; // the pid, read by `owner_pid`
-    let rest: Vec<&str> = parts.collect();
-    if rest.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(rest.join(":")))
+    AgentId::parse(owner).worktree().map(Path::to_path_buf)
 }
 
-/// Whether a process with this pid exists — the raw probe, for callers that hold a pid
-/// rather than an owner id (the land lock's stale-holder check).
+/// Whether a process with this pid exists — the raw probe, for callers that hold a pid rather
+/// than an owner id (the land lock's stale-holder check).
+///
+/// `Unknown` when `ps` could not be run at all. The land lock reads this to decide whether a
+/// holder is stale, and treating "could not ask" as "gone" there breaks a live lock.
 #[must_use]
-pub fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> Fact {
     pid_exists(pid)
 }
 
-/// Best-effort local hostname (informational; single-host — the pid is what liveness
-/// keys on). Falls back to `localhost` when the environment does not expose one. Any
-/// `:` in the raw value is replaced with `-` so the host segment can never absorb the
-/// `:pid` field (a container/k8s host like `node:1` would otherwise make [`owner_pid`]
-/// parse the wrong field).
+/// Best-effort local hostname (informational; single-host — the pid is what liveness keys on).
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("HOST").ok())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "localhost".to_owned())
-        .replace(':', "-")
 }
 
-/// The pid embedded in an owner id (`host:pid` / `host:pid:run`): the second
-/// `:`-delimited field. Returns [`None`] if the id is not in that shape. [`self_owner`]
-/// sanitizes the host segment of any `:`, so the second field is always the pid.
+/// Whether `owner` still exists — proven, disproven, or unestablished.
+///
+/// The match is over [`Liveness`], a closed enum, so a new owner shape cannot be added without
+/// the compiler demanding a probe for it. Per shape:
+///
+/// * a **process** is probed with `ps -p <pid>`, which exits 0 iff a process with that pid
+///   exists **regardless of which OS user owns it**. (`kill -0` was rejected here: it exits
+///   non-zero on `EPERM` for a foreign-owned but live process, which would wrongly reclaim a
+///   still-running agent's claim.)
+/// * a **session** is judged **only** by its worktree (design D36.6). `jkb task work` exits in
+///   under a second, so its pid is gone before anyone reads the claim; the thing that persists
+///   — and that means "this work is in flight" — is the checkout. The pid is ignored rather
+///   than consulted as a fallback, so a *recycled* pid cannot keep a removed session's claim
+///   alive after `land`/`abandon` took its worktree away.
+/// * an **external** agent, and any id we cannot read, is [`Fact::Unknown`]: nothing here can
+///   say. That is not "dead" — see the module docs.
 #[must_use]
-pub fn owner_pid(owner: &str) -> Option<u32> {
-    owner.split(':').nth(1).and_then(|p| p.parse::<u32>().ok())
-}
-
-/// Whether `owner` still exists — the deterministic liveness check.
-///
-/// Parses the pid out of the `host:pid` id and probes it with `ps -p <pid>`, which
-/// exits 0 iff a process with that pid exists — **regardless of which OS user owns it**.
-/// (`kill -0` was rejected here: it exits non-zero on `EPERM` for a foreign-owned but
-/// live process, which would wrongly reclaim a still-running agent's claim.) An owner id
-/// we cannot parse a pid from is treated as **not alive** (reclaimable) so a malformed
-/// claim never wedges a task forever.
-///
-/// A **session** owner (`session:<pid>:<worktree>`, design D36.6) is judged **only** by its
-/// worktree. `jkb task work` exits in under a second, so its pid is gone before anyone reads
-/// the claim; the thing that persists — and that means "this work is in flight" — is the
-/// checkout. Freeing the claim when a terminal closes is the wrong direction of error: the
-/// half-written branch is still there, and a swarm run or a second click would start the same
-/// task again on a second branch.
-///
-/// The pid is ignored here rather than consulted as a fallback, so a *recycled* pid cannot
-/// keep a removed session's claim alive after `land`/`abandon` took its worktree away.
-#[must_use]
-pub fn is_alive(owner: &str) -> bool {
-    if let Some(worktree) = session_worktree(owner) {
-        return worktree.exists();
+pub fn is_alive(owner: &str) -> Fact {
+    match AgentId::parse(owner).liveness() {
+        Liveness::Process(pid) => pid_exists(pid),
+        // `Path::exists` is itself lossy — it answers `false` for a permission error as well as
+        // for a missing directory — so it is asked through `try_exists`, which separates them.
+        Liveness::Worktree(dir) => Fact::observed(dir.try_exists()),
+        Liveness::External => Fact::Unknown,
     }
-    owner_pid(owner).is_some_and(pid_exists)
 }
 
 /// Whether a process with this pid exists. `ps -p <pid> -o pid=` prints the pid and exits 0
 /// if it does, 1 otherwise; it does not require ownership of the process. Dependency-free
 /// and single-host.
-fn pid_exists(pid: u32) -> bool {
-    Command::new("ps")
+///
+/// **A spawn failure is [`Fact::Unknown`], not `No`.** `is_ok_and` collapsed the two, which is
+/// the exact defect this whole type exists to prevent, sitting in the probe that protects every
+/// claim: in an environment where `ps` cannot be spawned — a stripped container, a process-table
+/// limit, `fork` denied — one `doctor --fix` would read every live `host:pid` owner as proven
+/// dead and free the lot. Exiting non-zero is an answer; failing to run is not.
+fn pid_exists(pid: u32) -> Fact {
+    pid_exists_with("ps", pid)
+}
+
+/// The probe, with the program to run named by the caller.
+///
+/// Split out **only** so the "could not spawn" arm is reachable from a test without emptying
+/// `PATH`. It was tested that way, and `PATH` is process-global while `cargo test` runs the whole
+/// binary's tests on a thread pool — so it intermittently broke sibling tests that spawn `ps` and
+/// `git`, in a crate whose gate is shared. A test that reddens the gate at random teaches people
+/// to re-run it, which is how a real failure gets waved through.
+fn pid_exists_with(prog: &str, pid: u32) -> Fact {
+    match Command::new(prog)
         .args(["-p", &pid.to_string(), "-o", "pid="])
         .output()
-        .is_ok_and(|out| out.status.success())
+    {
+        Ok(out) => Fact::from(out.status.success()),
+        Err(_) => Fact::Unknown,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_alive, owner_pid, self_owner, session_owner, session_worktree};
+    use super::{is_alive, self_owner, session_owner, session_worktree};
+    use jkb_fsm::Fact;
+    use jkb_types::AgentId;
+
+    /// The pid an owner id carries, for the tests that assert what this module mints.
+    fn owner_pid(owner: &str) -> Option<u32> {
+        match AgentId::parse(owner) {
+            AgentId::Process { pid, .. } | AgentId::Session { pid, .. } => Some(pid),
+            AgentId::Agent { .. } | AgentId::Unrecognized { .. } => None,
+        }
+    }
 
     #[test]
     fn self_owner_is_host_colon_pid() {
         let owner = self_owner();
-        let pid = owner_pid(&owner);
-        assert_eq!(pid, Some(std::process::id()));
+        assert_eq!(owner_pid(&owner), Some(std::process::id()));
     }
 
     #[test]
     fn a_live_process_is_alive() {
-        // This very process is, definitionally, alive.
-        assert!(is_alive(&self_owner()));
+        assert_eq!(is_alive(&self_owner()), Fact::Yes);
     }
 
+    /// A pid we can probe and find nothing for is **proven** dead; a shape we cannot read is
+    /// *unestablished*, which is a different answer and must not free the task.
     #[test]
-    fn a_bogus_pid_is_not_alive() {
-        // pid 2^31-ish will not exist; also an unparseable id is not alive.
-        assert!(!is_alive("host:4294967290"));
-        assert!(!is_alive("garbage"));
+    fn a_dead_pid_is_no_and_an_unreadable_owner_is_unknown() {
+        assert_eq!(is_alive("host:4294967290"), Fact::No);
+        assert_eq!(is_alive("garbage"), Fact::Unknown);
+        assert_eq!(is_alive("agent:01JBX7Q4"), Fact::Unknown);
+    }
+
+    /// A probe that **could not be run** is `Unknown`, never `No`.
+    ///
+    /// This is the defect the whole `Fact` type exists to prevent, and it was sitting in the one
+    /// probe that protects every claim: `is_ok_and` folded "`ps` would not spawn" into "that
+    /// process is gone", so one `doctor --fix` in a stripped container would free every live
+    /// `host:pid` claim in the database.
+    ///
+    /// Exercised by making the spawn fail for real — an absolute path to a program that is not
+    /// there — rather than by trusting the match arm to be right.
+    ///
+    /// It emptied `PATH` to do this at first, which works and is not confinable: `PATH` is
+    /// process-global, `cargo test` runs this binary's tests on a thread pool, and three tests
+    /// in this very module spawn `ps` while `gitrepo`'s spawn `git`. It reddened the shared gate
+    /// about one run in six, in tests with no connection to the change. Naming the program is
+    /// the same coverage with no global state.
+    #[test]
+    fn a_probe_that_could_not_run_is_unknown_not_dead() {
+        assert_eq!(
+            super::pid_exists_with("/nonexistent/jkb-not-a-program", std::process::id()),
+            Fact::Unknown,
+            "a probe that could not be spawned read as a dead owner"
+        );
+        // The same pid through the real program is proven alive — so the answer above is the
+        // spawn failing, not the pid being unfindable.
+        assert_eq!(super::pid_exists_with("ps", std::process::id()), Fact::Yes);
     }
 
     #[test]
     fn a_foreign_owned_live_process_is_alive() {
         // pid 1 (launchd/init) always exists and is owned by root. `kill -0` would exit
         // EPERM (non-zero) here when we are not root; `ps -p` reports it alive regardless.
-        assert!(is_alive("host:1"));
+        assert_eq!(is_alive("host:1"), Fact::Yes);
     }
 
     /// The claim `jkb task work` takes must survive the process that took it — otherwise
@@ -161,7 +216,11 @@ mod tests {
 
         // A dead pid but a live worktree: still claimed. The pid is provenance, not liveness.
         let orphan = format!("session:4294967290:{}", tmp.path().display());
-        assert!(is_alive(&orphan), "a live worktree keeps the claim");
+        assert_eq!(
+            is_alive(&orphan),
+            Fact::Yes,
+            "a live worktree keeps the claim"
+        );
 
         // Remove the worktree and the claim becomes reclaimable — `land`/`abandon` are the
         // only commands that do this. A live pid must NOT keep it alive: pids are recycled,
@@ -171,19 +230,26 @@ mod tests {
             std::process::id(),
             tmp.path().join("nope").display()
         );
-        assert!(!is_alive(&gone), "the worktree alone decides");
+        assert_eq!(is_alive(&gone), Fact::No, "the worktree alone decides");
 
-        // Non-session owners are unaffected: pid alone still decides.
         assert!(session_worktree("host:123").is_none());
-        assert!(!is_alive("host:4294967290"));
     }
 
     #[test]
     fn owner_pid_reads_the_second_field() {
-        // The host segment is sanitized of `:`, so field 1 is always the pid, even with a
-        // trailing run segment.
         assert_eq!(owner_pid("node-1:12345"), Some(12345));
         assert_eq!(owner_pid("host:12:run"), Some(12));
         assert_eq!(owner_pid("host"), None);
+    }
+
+    /// An externally-minted id is preferred when the environment names one, so a subagent's
+    /// claim outlives the process that took it and is never auto-reclaimed.
+    #[test]
+    fn an_env_agent_id_becomes_the_owner() {
+        // `env_agent` reads the process environment, so this asserts the shape it produces
+        // rather than mutating the environment out from under a parallel test.
+        let id = AgentId::agent("run-7").as_str();
+        assert_eq!(id, "agent:run-7");
+        assert_eq!(is_alive(&id), Fact::Unknown);
     }
 }

@@ -89,7 +89,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
 
-use jkb_types::Error as TypeError;
+use jkb_types::{Error as TypeError, ItemId};
 
 use crate::changelog::{Entity, InsertInverse, Op};
 use crate::store::WriteMeta;
@@ -502,7 +502,6 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     // that transaction, with no surface printing a txn id to escape it with.
     (Op::Update, Some(Entity::TagDefs), Inverse::Columns),
     (Op::Update, Some(Entity::Namespaces), Inverse::Columns),
-    (Op::Update, Some(Entity::BranchRecords), Inverse::Columns),
     (Op::Update, Some(Entity::Ingestions), Inverse::Columns),
     (Op::Delete, Some(Entity::Placements), Inverse::ReinsertRow),
     (
@@ -512,11 +511,6 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     ),
     (Op::Delete, Some(Entity::Edges), Inverse::ReinsertRow),
     (Op::Delete, Some(Entity::Namespaces), Inverse::ReinsertRow),
-    (
-        Op::Delete,
-        Some(Entity::BranchRecords),
-        Inverse::ReinsertRow,
-    ),
     // Any table whose inserts delete by rowid; an insert into anything else is uninvertible, not
     // deleted on a guess. The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so
     // a table-specific `insert` inverse placed after it would never be reached.
@@ -1122,6 +1116,15 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // runs behind an `is_work` filter, so `sync_state` reaches `invert_entry` unexamined.
     // Extending `blocker` to predict constraint violations instead would mean re-implementing
     // the constraint checker, which is the prediction game the previous four rounds lost.
+    // THE HISTORY HAS TO SEE THIS. `undo` restores `items.status` straight from the changelog,
+    // and `task_transitions` is deliberately not changelogged (`V015`) — so undoing a close wrote
+    // nothing there, `transition::resumed` could not tell the task had gone back to work, and the
+    // next `jkb task close-merged` closed it again. A loop `undo` itself could not break.
+    //
+    // The statuses are read **before** the inversion and again after it, so what gets recorded is
+    // what actually happened rather than what an entry said it would do.
+    let statuses_before = task_statuses(conn, &entries)?;
+
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
         match invert_entry(conn, &op, &table, &entity_id, before.as_deref()) {
@@ -1140,6 +1143,8 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         }
     }
 
+    record_status_restores(conn, meta, &statuses_before)?;
+
     changelog::append(
         conn,
         meta,
@@ -1150,6 +1155,75 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         None,
     )?;
     Ok(reverted)
+}
+
+/// Append a transition for every task whose status this inversion actually moved.
+///
+/// **Only for a task that is still there.** Inverting an insert *deletes* the item, and
+/// `task_transitions.item_id` is a foreign key onto `items` — so recording the disappearance
+/// fails the whole `jkb undo` on a constraint, which is how this first went in. There is nothing
+/// to record anyway: the row is gone, and `ON DELETE CASCADE` has just taken its history with it.
+fn record_status_restores(
+    conn: &Connection,
+    meta: &WriteMeta,
+    before: &[(i64, Option<String>)],
+) -> Result<()> {
+    for (id, was) in before {
+        let now = task_status(conn, *id)?;
+        if now.is_some() && *was != now {
+            crate::transition::record_undo(
+                conn,
+                meta,
+                ItemId::new(*id),
+                was.as_deref().unwrap_or_default(),
+                now.as_deref().unwrap_or_default(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One item's `status`, or `None` if the row is gone.
+fn task_status(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT status FROM items WHERE id = ?1")?
+        .query_row([id], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// The current status of every **task** this transaction's `items` entries name.
+///
+/// Restricted to rows that are tasks now: a status is what `transition::record_undo` records, and
+/// a history row for a non-task item would be noise nothing reads. Unparseable ids and rows that
+/// no longer exist are skipped rather than erroring — this is bookkeeping around the inversion,
+/// and it must not be what makes an otherwise-good `jkb undo` fail.
+fn task_statuses(
+    conn: &Connection,
+    entries: &[(String, String, String, Option<String>)],
+) -> Result<Vec<(i64, Option<String>)>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (_, table, entity_id, _) in entries {
+        if table != Entity::Items.as_str() {
+            continue;
+        }
+        let Ok(id) = entity_id.parse::<i64>() else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        let is_task: bool = conn
+            .prepare_cached("SELECT kind = 'task' FROM items WHERE id = ?1")?
+            .query_row([id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false);
+        if is_task {
+            out.push((id, task_status(conn, id)?));
+        }
+    }
+    Ok(out)
 }
 
 /// Restore an item deleted by `item::remove` from its changelog snapshot: the item row
@@ -2009,52 +2083,6 @@ mod tests {
             .is_none());
     }
 
-    /// The other half of the same family, one table later: `jkb task start` writes a
-    /// `branch_records` row, logged as an `insert`.
-    ///
-    /// An insert `undo` could not reverse used to make `undo_last` skip the whole transaction — so
-    /// a bare `jkb undo` after `task start` did not fail, it quietly reverted the *previous*
-    /// transaction and reported success, deleting the task itself. That is the failure mode worth
-    /// a test: not "undo errors" but "undo silently reverts the wrong thing".
-    ///
-    /// Membership is derived from `Entity::insert_inverse`, so this is a regression test for the
-    /// derivation rather than for a line in a list — and since round 6 the skip itself is gone, so
-    /// the same omission would now cost a refusal instead of this task.
-    #[test]
-    fn a_transaction_that_records_a_branch_is_the_one_undo_last_reverts() {
-        use crate::branch::{self, Cut, Supersede};
-        use crate::item;
-
-        let db = Db::open_in_memory().unwrap();
-        db.write_txn("t", |c, m| upsert(c, m, &note("the-task")))
-            .unwrap();
-        db.write_txn("t", |c, m| {
-            branch::record_cut_point(
-                c,
-                m,
-                "jkb",
-                "task/x",
-                &Cut::Fork("a".repeat(40)),
-                None,
-                Supersede::default(),
-            )
-        })
-        .unwrap();
-
-        assert!(db.write_txn("t", undo_last).unwrap() > 0);
-        assert_eq!(
-            db.read(|c| branch::get(c, "jkb", "task/x")).unwrap(),
-            None,
-            "the branch record survived the undo that claimed to have reverted its transaction"
-        );
-        assert!(
-            db.read(|c| item::id_for_uid(c, "the-task"))
-                .unwrap()
-                .is_some(),
-            "undo reverted an older transaction instead, deleting a task nobody asked about"
-        );
-    }
-
     /// **The root of the three-pass family.** A transaction carrying work with no inverse is
     /// refused; it is never swapped for an older one.
     ///
@@ -2247,7 +2275,7 @@ mod tests {
     /// give it a non-default value.
     #[test]
     fn undoing_a_delete_restores_the_whole_row_for_every_deleter() {
-        use crate::{branch, edge, ns, placement, tag};
+        use crate::{edge, ns, placement, tag};
         use jkb_types::{EdgeType, PlacementRole};
         use serde_json::json;
 
@@ -2275,18 +2303,6 @@ mod tests {
                 Some(2.5),
                 Some(&json!({ "why": "evidence" })),
             )?;
-            branch::record_cut_point(
-                c,
-                m,
-                "jkb",
-                "task/x",
-                &branch::Cut::Fork("a".repeat(40)),
-                Some(&branch::Anchor {
-                    sha: "b".repeat(40),
-                    ts: 7,
-                }),
-                branch::Supersede::default(),
-            )?;
             ns::ensure(c, "x/doomed")?;
             Ok(())
         })
@@ -2302,9 +2318,6 @@ mod tests {
             edge::unlink(c, m, item, other, EdgeType::Supports)
         });
         delete_round_trips(&db, "namespaces", |c, m| ns::remove(c, m, "x/doomed"));
-        delete_round_trips(&db, "branch_records", |c, m| {
-            branch::forget(c, m, "jkb", "task/x").map(|_| ())
-        });
     }
 
     /// Undoing an edit to an item's body restores the body **and its hash**.
@@ -2558,54 +2571,6 @@ mod tests {
         assert!(
             err.to_string().contains("non-empty before-state"),
             "the refusal does not say what is missing: {err}"
-        );
-    }
-
-    /// A **`branch_records`** update comes back too — the entity whose non-insert writes are all
-    /// upserts, so an undo of one has nothing to delete and everything to restore.
-    ///
-    /// Its own test because `record_json` deliberately emits every column rather than the ones the
-    /// statement touched, and that is only load-bearing through this arm.
-    #[test]
-    fn undoing_a_land_target_write_restores_the_record_it_replaced() {
-        use crate::branch::{self, Cut, Supersede};
-
-        let db = Db::open_in_memory().unwrap();
-        db.write_txn("t", |c, m| {
-            branch::record_cut_point(
-                c,
-                m,
-                "jkb",
-                "task/x",
-                &Cut::Fork("a".repeat(40)),
-                None,
-                Supersede::default(),
-            )
-        })
-        .unwrap();
-        db.write_txn("t", |c, m| {
-            branch::set_land_target(c, m, "jkb", "task/x", Some("batch-1"))
-        })
-        .unwrap();
-        db.write_txn("t", |c, m| {
-            branch::set_land_target(c, m, "jkb", "task/x", Some("batch-2"))
-        })
-        .unwrap();
-
-        db.write_txn("t", undo_last).unwrap();
-        let record = db
-            .read(|c| branch::get(c, "jkb", "task/x"))
-            .unwrap()
-            .expect("the record must survive: the edit is what was undone");
-        assert_eq!(
-            record.land_target.as_deref(),
-            Some("batch-1"),
-            "undoing a land-target edit did not restore the target it replaced"
-        );
-        assert_eq!(
-            record.cut_point.as_deref(),
-            Some("a".repeat(40).as_str()),
-            "the cut point was disturbed by undoing an unrelated column"
         );
     }
 

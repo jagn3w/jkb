@@ -6,10 +6,10 @@
 //!
 //! | fact | source |
 //! | --- | --- |
-//! | which branches are staging branches | `branch_records.land_target` |
-//! | which tasks are on one | that, joined to the tasks' `branch=` facets |
+//! | which branches are staging branches | the `onto` label on each task's latest transition |
+//! | which branches exist | `gitrepo::branch_refs` (D38.1: a record is never evidence one does) |
 //! | whether a session exists | `session::discover` (git worktrees) |
-//! | whether it merged to trunk | `gitrepo::is_merged` (squash-safe, D34.2) |
+//! | whether a batch is spent | every task on it is terminal (D48) |
 //! | what state a task is in | `items.status` (D27.7) |
 //!
 //! A staging *item* would add a title and a PR url and would then need reconciling against
@@ -155,28 +155,47 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     let tasks = crate::repo::repo_tasks(db, &ctx.key)?;
     let sessions = session::discover(&ctx.root)?;
 
-    // Group tasks by the branch they land on, read from each **branch's** own record (D38.1
-    // holds: which branches exist still comes from git, below — a record is never evidence one
-    // does). A task none of whose branches records a land target has never been through
-    // `task work` and is simply not in this view.
+    // Group tasks by the branch they land on, read from each task's own **history** — the last
+    // time anybody said where its work lands. A task that has never been through `task work` or
+    // `task start` has no such entry and is simply not in this view.
     //
-    // One read for the whole repo, joined in memory: this view redraws on every database write
-    // and holds a row per task (design risk 2).
+    // (D38.1 still holds: which branches *exist* comes from git, below. A recorded target is
+    // never evidence that a branch is there.)
     //
-    // A task is grouped under **every** target its branches name, not just the first. It was one
-    // one land target per task, so a task carrying two branches had one answer and the second
-    // branch's batch simply did not know about it.
-    let records = crate::repo::branch_records(db, &ctx.key)?;
+    // This used to read a `land_target` column keyed by branch, which had to be kept in agreement
+    // with a world where branches are deleted and their names reused. A history entry is a
+    // statement about a moment, so it needs no such agreement — and two tasks told different
+    // targets are now two entries with timestamps rather than one row silently keeping whichever
+    // wrote last.
+    // **One** read for the whole listing, not one per task. This view redraws on every database
+    // write and every `db.read` is a round trip to the single writer thread, so a per-task read
+    // is the N+1 shape `repo_tasks` already exists to avoid — and it replaced a batched read when
+    // the branch records went.
+    //
+    // The two per-task facts are gathered together: where the task's work lands, and whether it
+    // is held by an open subtask.
+    let ids: Vec<jkb_types::ItemId> = tasks.iter().map(|t| t.meta.id).collect();
+    let per_task: Vec<(Option<String>, bool)> = db.read(move |conn| {
+        ids.iter()
+            .map(|id| {
+                Ok((
+                    jkb_core::transition::land_target(conn, *id)?,
+                    !jkb_core::task::subtasks_all_terminal(conn, *id)?,
+                ))
+            })
+            .collect()
+    })?;
+    let held: std::collections::HashSet<jkb_types::ItemId> = tasks
+        .iter()
+        .zip(&per_task)
+        .filter(|(_, (_, open_subtasks))| *open_subtasks)
+        .map(|(t, _)| t.meta.id)
+        .collect();
+
     let mut by_onto: BTreeMap<String, Vec<&RepoTask>> = BTreeMap::new();
-    for t in &tasks {
-        let mut targets: Vec<&str> = facet_values(&t.tags, FACET_BRANCH)
-            .iter()
-            .filter_map(|b| records.get(b).and_then(|r| r.land_target.as_deref()))
-            .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        for target in targets {
-            by_onto.entry(target.to_owned()).or_default().push(t);
+    for (t, (target, _)) in tasks.iter().zip(&per_task) {
+        if let Some(target) = target {
+            by_onto.entry(target.clone()).or_default().push(t);
         }
     }
 
@@ -204,35 +223,20 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         let Some(branch_ref) = existing.get(&branch).cloned() else {
             continue;
         };
-        // A branch that adds nothing to trunk is either **landed** or **freshly cut and still
-        // empty** — refs alone cannot tell those apart, which is exactly the ambiguity D34.2
-        // records. Live work is the tie-break: a batch with a non-terminal task on it is not
-        // spent, however few commits it has yet. Without this, the branch cut by the very
-        // first `jkb task work` is hidden from the picker that exists to offer it.
-        let has_live_work = group.iter().any(|t| {
-            !State::from_status(t.meta.status.as_deref().unwrap_or_default()).is_terminal()
+        // A batch is **spent** when every task on it has finished, one way or the other. That
+        // is now the whole test, and it is the answer the old merge probe was reaching for.
+        //
+        // It used to ask `merge-tree` whether the branch added anything to trunk, and then had
+        // to hand-correct the answer, because a branch that adds nothing is either landed *or*
+        // freshly cut and still empty and refs cannot tell those apart — so live work was the
+        // tie-break, or the branch cut by the very first `jkb task work` was hidden from the
+        // picker that exists to offer it. With live work deciding both ways, the probe only
+        // ever confirmed what the statuses already said, at the cost of several git spawns per
+        // branch on a view that redraws on every database write.
+        let spent = group.iter().all(|t| {
+            State::from_status(t.meta.status.as_deref().unwrap_or_default()).is_terminal()
         });
-        // The merge probe (`merge-tree --write-tree`, several `rev-parse`s) only runs when
-        // live work has not already answered the question — and its answer is only *needed*
-        // when a merged branch would be hidden.
-        let merged = if has_live_work {
-            false
-        } else {
-            match &ctx.trunk {
-                Some(trunk) => {
-                    // The **local** ref, not `origin/<branch>` (design D34.2's preference is
-                    // right for `close-merged` and wrong here): a staging branch whose pushed
-                    // copy merged, but which has since had another task landed onto it
-                    // locally, still has commits to give. Asking the remote reported it
-                    // merged and hid it — while the row's own `ahead`, read from the local
-                    // ref, said otherwise.
-                    gitrepo::is_merged(&ctx.root, &branch, trunk, None, gitrepo::Prefer::Local)?.0
-                        == gitrepo::MergeState::Merged
-                }
-                None => false,
-            }
-        };
-        if merged && !include_merged {
+        if spent && !include_merged {
             continue;
         }
         let ahead = match &ctx.trunk {
@@ -252,7 +256,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         };
         let mut staged = Vec::new();
         for t in group {
-            staged.push(stage_task(db, ctx, &branch_ctx, t, &mut cache)?);
+            staged.push(stage_task(db, ctx, &branch_ctx, t, &held, &mut cache)?);
         }
         // Pipeline order — what is being built, then what is under review, then what is
         // finished — with a stable uid tie-break so the listing does not reshuffle between
@@ -261,7 +265,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 
         out.push(Staging {
             branch: branch.clone(),
-            merged,
+            merged: spent,
             ahead,
             checkout: worktrees
                 .iter()
@@ -336,6 +340,7 @@ fn stage_task(
     ctx: &RepoCtx,
     branch_ctx: &BranchCtx<'_>,
     t: &RepoTask,
+    held: &std::collections::HashSet<jkb_types::ItemId>,
     cache: &mut Cache,
 ) -> Result<StagedTask> {
     let BranchCtx {
@@ -400,11 +405,16 @@ fn stage_task(
     // the first run's still-open must-fix findings.
     let review_nss = facet_values(&t.tags, review::FACET_REVIEW).to_vec();
     let found = cache.findings(db, &review_nss)?;
+    // Read once for the whole listing, from `containment` — the same source the command and the
+    // machine read, so the row and the land it describes cannot disagree about which parents are
+    // held. Terminal work is past the question.
+    let open_subtasks = !terminal && held.contains(&t.meta.id);
     let worktree = sess.map(|s| s.worktree.clone());
     let verdict = review::gate_with(&found, &t.tags, &review_nss);
     let review_ok = matches!(verdict, review::GateVerdict::Passed);
     let land_blocked = land_blocker(&LandFacts {
         state,
+        open_subtasks,
         worktree: worktree.as_deref(),
         dirty,
         commits,
@@ -501,6 +511,14 @@ pub(crate) fn target_dirty_reason(
 /// command (`land_preflight`) from the same git and KB reads.
 pub(crate) struct LandFacts<'a> {
     pub(crate) state: State,
+    /// Whether the task still has a non-terminal subtask (design D34.1: you work the leaves).
+    ///
+    /// Judged **here**, with every other precondition, so the refusal happens before the graft.
+    /// It was checked only inside the machine's `land` guard, which `transition::perform` runs
+    /// *last* — after the rebase, the fast-forward, the gate and the session disposal — so the
+    /// rule reported on a branch that had already moved and a worktree that was already gone,
+    /// three lines below a comment saying a refusal must not have moved a branch first.
+    pub(crate) open_subtasks: bool,
     pub(crate) worktree: Option<&'a std::path::Path>,
     pub(crate) dirty: bool,
     /// Commits the work branch has that the staging branch does not.
@@ -570,6 +588,13 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
     if facts.commits == 0 {
         return Some("It has no commits that the staging branch does not.".to_owned());
     }
+    if facts.open_subtasks {
+        return Some(
+            "It still has open subtasks — you work the leaves, and the parent lands after them."
+                .to_owned(),
+        );
+    }
+
     if let Some(reason) = facts.target_dirty {
         return Some(reason.to_owned());
     }

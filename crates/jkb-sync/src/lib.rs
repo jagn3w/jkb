@@ -14,6 +14,7 @@
 
 mod engine;
 mod error;
+pub mod lifecycle;
 mod serializers;
 mod watch;
 

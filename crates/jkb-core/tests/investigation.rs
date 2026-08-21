@@ -11,6 +11,24 @@ use jkb_core::query::{self, Query, Scope};
 use jkb_core::{edge, item, ns, Db};
 use jkb_types::{EdgeType, ItemId, Resolution};
 
+/// What `roll_up` would derive for one unit: the strategy's facts, read by its machine.
+///
+/// The two halves are asked separately on purpose — the strategy says what it *observed*, the
+/// machine says what that *means* — so a test can be wrong about one without being wrong about
+/// both.
+fn derived(db: &Db, ns_path: &str, id: jkb_types::ItemId) -> Resolution {
+    let ns_path = ns_path.to_owned();
+    db.read(move |conn| {
+        let (_, strategy) = nstype::for_namespace(conn, &ns_path)?.unwrap();
+        let facts = strategy.unit_facts(conn, id)?;
+        Ok(match strategy.unit_machine().reconcile(&facts) {
+            jkb_fsm::Reconciliation::Fired(out) => out.state(),
+            _ => facts.resolution,
+        })
+    })
+    .unwrap()
+}
+
 /// Apply a verb and return the created unit's uid. Panics on failure — a script step that
 /// cannot run is a test failure, not a branch to handle.
 fn verb(db: &Db, ns_path: &str, call: VerbCall<'_>) -> String {
@@ -266,14 +284,8 @@ fn a_debugging_investigation_runs_from_symptom_to_verified_fix() {
     assert!(!done, "diagnosing is not finishing: {why}");
     assert!(why.contains("no fix"), "{why}");
     let symptom_id = id_of(&db, &symptom);
-    let rolled = db
-        .read(move |conn| {
-            let (_, strategy) = nstype::for_namespace(conn, "memory/jkb/flaky-sync")?.unwrap();
-            strategy.resolution_rollup(conn, symptom_id)
-        })
-        .unwrap();
     assert_eq!(
-        rolled,
+        derived(&db, "memory/jkb/flaky-sync", symptom_id),
         Resolution::Unresolved,
         "the symptom must not roll up to success on a diagnosis alone"
     );
@@ -425,13 +437,10 @@ fn observations_go_stale_when_the_code_moves_and_stop_confirming_things() {
         Ok(())
     })
     .unwrap();
-    let rolled = db
-        .read(move |conn| {
-            let (_, strategy) = nstype::for_namespace(conn, "memory/jkb/stale")?.unwrap();
-            strategy.resolution_rollup(conn, old_id)
-        })
-        .unwrap();
-    assert_eq!(rolled, Resolution::Unresolved);
+    assert_eq!(
+        derived(&db, "memory/jkb/stale", old_id),
+        Resolution::Unresolved
+    );
 }
 
 // ---- M6: a scripted `conjecture-attack` investigation ---------------------

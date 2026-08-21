@@ -71,14 +71,14 @@ fi
 start=$(date +%s)
 if ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
    && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1; then
-  # Record that jkb itself grafted this branch (design B4), so `close-merged` asks one question
-  # per BATCH instead of one per task -- and asks it about the branch whose cut point is provable.
-  # The verb refuses unless the work really is in $BASE, so this cannot claim a landing that did
-  # not happen; a failure here is reported and never fails the queue, since the commits ARE in
-  # $BASE either way and the ref-based inference still covers the task.
-  # stdout is noise here; stderr is not. The verb warns when $BASE has no usable cut point, which
-  # is the difference between a landing that closes its tasks and one that leaves them reading as
-  # still in flight — swallowing that made the only report of it invisible.
+  # Record that jkb itself grafted this branch (design D48), which is what closes the group's
+  # tasks and what lets a later `jkb task review record` of $BASE credit them: a landing is an
+  # EVENT jkb wrote, not something a reader infers from the commit graph.
+  #
+  # A failure here is reported and never fails the queue -- the commits ARE in $BASE either way,
+  # and the repair is one command. stdout is noise; stderr is not: the verb names any task it
+  # could not close (open subtasks, most often), and swallowing that would leave the caller
+  # believing a whole group was done.
   "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
     || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
   echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
