@@ -12,10 +12,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 # The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
 # reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
 echo "==> shell tests (scripts/tests)"
+ran=0
 for t in "$(dirname "$0")"/tests/*.test.sh; do
     [ -e "$t" ] || break
     bash "$t"
+    ran=$((ran + 1))
 done
+# Say it, like the cargo-deny and pnpm branches below. A header followed by nothing, then
+# "All checks passed", reads exactly like a gate that ran — which is what this file exists
+# to stop. Unlike those two, nothing here is optional: CI has no guard and fails instead.
+[ "$ran" -gt 0 ] || echo "   (skipped: no scripts/tests/*.test.sh found — CI treats this as a failure)"
 
 echo "==> tests"
 cargo test --all
