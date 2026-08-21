@@ -10,8 +10,14 @@ set -uo pipefail
 hook="$(cd "$(dirname "$0")/.." && pwd)/.claude/hooks/notify-sticky.sh"
 [ -x "$hook" ] || { echo "missing or non-executable: $hook" >&2; exit 1; }
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# Checked, not assumed: an unusable temp dir must stop the suite, never let it fall back to
+# relative paths in the checkout. `rm -rf "$tmp"` with an empty $tmp is the other half of that.
+tmp=$(mktemp -d 2>/dev/null) || tmp=""
+if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+  echo "cannot create a temp directory — refusing to run tests from the working tree" >&2
+  exit 1
+fi
+trap '[ -n "$tmp" ] && [ -d "$tmp" ] && rm -rf "$tmp"' EXIT
 
 # A stand-in for jkb-notifier that records the argv of each call, one argument per line with a
 # blank line between calls. Asserting on argv is the point: what this hook does is choose a
@@ -342,6 +348,15 @@ fi
 
 echo "==> post-merge (setup.sh rebuild trigger)"
 
+# CANARY. These fixtures run a real git hook, and a hook that escapes its temp dir does not fail
+# loudly — it silently rewrites the repository it escaped into. That happened once (see pm_run),
+# so the suite records the repo's own state before and after and refuses to call itself green if
+# anything moved. This detects an escape whatever its cause, rather than trusting the guards in
+# pm_run to be exhaustive, and it is what makes those guards testable at all.
+repo_root_for_canary="$(cd "$(dirname "$0")/.." && pwd)"
+canary_before=$(git -C "$repo_root_for_canary" status --porcelain 2>/dev/null; \
+                git -C "$repo_root_for_canary" rev-parse HEAD 2>/dev/null)
+
 # post-merge is RUN here, not pattern-matched. These assertions used to re-implement its `grep`
 # against setup.sh's answer and never execute the hook — so changing post-merge's own matching
 # (say `grep -qE` to `grep -q`) would have made every pull silently skip setup.sh with all eleven
@@ -353,9 +368,24 @@ echo "==> post-merge (setup.sh rebuild trigger)"
 pm_src="$(cd "$(dirname "$0")/.." && pwd)/scripts/hooks/post-merge"
 
 pm_run() { # pm_run <changed-paths, space-separated> <skip-paths-answer> -> "ran" | "skipped"
-  local d ans
-  d=$(mktemp -d)
+  local d ans f
   ans=$2
+
+  # THE TEMP DIR IS VALIDATED BEFORE ANYTHING IS WRITTEN, because `cd ""` SUCCEEDS in bash. When
+  # `mktemp -d` failed (a sandbox denying $TMPDIR is enough), `d` was empty, `cd "$d" || exit` did
+  # not fire, and this whole fixture ran in the REAL REPOSITORY: it `git init`-ed over the
+  # worktree, committed, overwrote tracked sources with `x`, and executed the real post-merge —
+  # which found the real scripts/setup.sh and ran it, reaching `cargo install` and `pnpm install`.
+  # That is observed behaviour, not a hypothetical. Everything below is written so that no single
+  # failure can reproduce it.
+  d=$(mktemp -d 2>/dev/null) || d=""
+  if [ -z "$d" ] || [ ! -d "$d" ]; then
+    echo "fixture-error: could not create a temp dir" >&2
+    echo fixture-error
+    return
+  fi
+  : > "$d/.pm-fixture"          # sentinel: proves cwd is the fixture, not the repo
+
   mkdir -p "$d/scripts"
   cat > "$d/scripts/setup.sh" <<STUB
 #!/bin/sh
@@ -363,27 +393,36 @@ pm_run() { # pm_run <changed-paths, space-separated> <skip-paths-answer> -> "ran
 echo ran > "$d/invoked"
 STUB
   chmod +x "$d/scripts/setup.sh"
+
+  # Every path is ABSOLUTE and every git call takes -C, so the destructive half does not depend on
+  # the working directory at all — the second layer, independent of the check above.
+  git -C "$d" init -q . && git -C "$d" config user.email t@t && git -C "$d" config user.name t
+  echo seed > "$d/seed.txt"
+  git -C "$d" add -A && git -C "$d" commit -qm one
+  git -C "$d" rev-parse HEAD > "$d/.git/ORIG_HEAD"
+  # An empty <changed-path> leaves ORIG_HEAD at HEAD, so `git diff` yields nothing — which is
+  # also what an unresolvable range produces, since line 22 of the hook swallows the failure.
+  if [ -n "$1" ]; then
+    for f in $1; do
+      mkdir -p "$d/$(dirname "$f")" && echo x > "$d/$f"
+    done
+    git -C "$d" add -A && git -C "$d" commit -qm two
+  fi
+
+  # The hook itself must run WITH the fixture as cwd (it calls `git rev-parse --show-toplevel`),
+  # so this is the one place cwd matters. The sentinel is checked after the cd rather than
+  # comparing $PWD to $d, which does not hold on macOS where /var is a symlink to /private/var.
+  #
+  # Invoked the way git does — through the shebang — NOT with `sh`. Ubuntu's /bin/sh is dash,
+  # which rejects the hook's own `set -uo pipefail` and exits before doing anything.
   (
-    cd "$d" || exit
-    git init -q . && git config user.email t@t && git config user.name t
-    echo seed > seed.txt && git add -A && git commit -qm one
-    git rev-parse HEAD > .git/ORIG_HEAD
-    # An empty <changed-path> leaves ORIG_HEAD at HEAD, so `git diff` yields nothing — which is
-    # also what an unresolvable range produces, since line 22 of the hook swallows the failure.
-    if [ -n "$1" ]; then
-      for f in $1; do
-        mkdir -p "$(dirname "$f")" && echo x > "$f"
-      done
-      git add -A && git commit -qm two
-    fi
-    # Invoked the way git does — through the shebang — NOT with `sh`. Ubuntu's /bin/sh is dash,
-    # which rejects the hook's own `set -uo pipefail` and exits before doing anything: every case
-    # then reported "skipped", failing the eight "rebuilds" assertions loudly and passing the four
-    # "does not rebuild" ones VACUOUSLY, satisfied by a hook that never ran.
+    cd "$d" || exit 1
+    [ -f .pm-fixture ] || exit 1
     PATH=/usr/bin:/bin "$pm_src" >/dev/null 2>&1
   )
+
   [ -f "$d/invoked" ] && echo ran || echo skipped
-  rm -rf "$d"
+  [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
 }
 
 skip_paths=$("$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh" --skip-paths 2>/dev/null)
@@ -438,6 +477,11 @@ check "an unreadable diff rebuilds anyway" "$(pm_run "" "$skip_paths")" "ran"
 # rather than decorative.
 check "an unreadable diff rebuilds even under an over-broad skip pattern" \
   "$(pm_run "" ".*")" "ran"
+
+canary_after=$(git -C "$repo_root_for_canary" status --porcelain 2>/dev/null; \
+               git -C "$repo_root_for_canary" rev-parse HEAD 2>/dev/null)
+check "the post-merge fixtures did not touch the real repository" \
+  "$([ "$canary_before" = "$canary_after" ] && echo intact || echo CHANGED)" "intact"
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d hook test(s) failed\n' "$failures" >&2
