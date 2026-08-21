@@ -70,15 +70,30 @@ fi
 app="${target%/Contents/MacOS/*}"
 exe="${target##*/}"
 
-# CFBundleExecutable must name the file we are about to write, or the bundle will not launch and
-# every later symptom (no notifications, no error) points somewhere else entirely.
+# Every fact about the bundle that is load-bearing AND checkable from here. Each has the same
+# failure signature — the notifier stops working and nothing says why — so a gate that measured
+# only one of them read as coverage it did not have.
+#
+#   CFBundleExecutable  must name the file we are about to write, or the bundle will not launch.
+#   CFBundleIdentifier  is FIRST in the design's list: UNUserNotificationCenter.current() refuses
+#                       a process whose main bundle has none, so `post` fails on every machine.
+#   CFBundleName        is the string the user has to find in System Settings to set Alerts; an
+#                       empty one leaves the sticky half unreachable with nothing to search for.
 check_plist() {
-  local declared
+  local declared rc=0
   declared="$(plist_string "$src/Info.plist" CFBundleExecutable)"
   if [ "$declared" != "$exe" ]; then
     echo "Info.plist CFBundleExecutable is '$declared' but the install path names '$exe'" >&2
-    return 1
+    rc=1
   fi
+  local key
+  for key in CFBundleIdentifier CFBundleName; do
+    if [ -z "$(plist_string "$src/Info.plist" "$key")" ]; then
+      echo "Info.plist $key is missing or empty" >&2
+      rc=1
+    fi
+  done
+  return "$rc"
 }
 
 # The consistency check on its own, buildable-or-not and macOS-or-not, so `scripts/test-hooks.sh`
@@ -86,7 +101,7 @@ check_plist() {
 # Darwin gate below, which is the whole point — this is the arm CI reaches.
 if [ "${check_only:-0}" -eq 1 ]; then
   check_plist || exit 1
-  note "  • plist:      CFBundleExecutable matches '$exe'"
+  note "  • plist:      executable '$exe', identifier + name present"
   exit 0
 fi
 

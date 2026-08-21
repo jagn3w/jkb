@@ -181,12 +181,31 @@ check "a refusing notifier falls back to a banner" \
   "$(osa_calls)" \
   '-e display notification "needs permission" with title "Claude Code" subtitle "wt"'
 
-# ...and the dismiss side still runs, so the notification is withdrawn if it did reach the screen
-# by some other route. Refusing to post must not also disable clearing.
+# ...and nothing is left for `dismiss` to do. The marker means "a withdrawable notification of
+# ours is on screen", so a refused post does not write one: what reached the screen was the
+# osascript banner, which no API can take back. Spawning a `remove` per tool call for an id that
+# was never posted would be pure cost.
 : > "$rec"; : > "$osa"
 PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" JKB_NOTIFY_STATE="$tmp/state" \
   REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12 '')"
-check "a refused post still leaves the session dismissable" "$(calls)" "remove --id jkb-claude-s12"
+check "a refused post leaves nothing to withdraw" "$(calls)" ""
+
+# 12a-bis. A withdraw that FAILED must not consume the marker. It used to be cleared before the
+# `remove` ran, on the reasoning that the marker is only an optimisation — but its absence gates
+# every later dismiss, so one failed withdraw (bundle mid-reinstall, notifier timing out) silently
+# disarmed `Stop` and `SessionEnd` as well and the alert stayed up for the whole session.
+run "$(payload Notification s12b 'needs permission')" >/dev/null
+: > "$rec"
+PATH="$tmp:$PATH" JKB_NOTIFIER="$tmp/notifier" NOTIFIER_FAILS=1 JKB_NOTIFY_STATE="$tmp/state" \
+  REC="$rec" OSA_REC="$osa" bash "$hook" <<<"$(payload PostToolUse s12b '')"
+check "a failed withdraw is attempted" "$(calls)" "remove --id jkb-claude-s12b"
+# The next dismiss event retries — and this one succeeds (the default stub exits 0), which is what
+# finally consumes the marker.
+run "$(payload Stop s12b '')"
+check "a failed withdraw is retried by the next dismiss event" \
+  "$(calls)" "remove --id jkb-claude-s12b"
+run "$(payload SessionEnd s12b '')"
+check "and once a retry succeeds, dismissing is free again" "$(calls)" ""
 
 # 12b. The bundle search itself. Every test above injects `JKB_NOTIFIER`, so without this the
 #      hard-coded install path is covered only by the opt-in live test — and a typo there would
@@ -289,34 +308,76 @@ fi
 
 echo "==> post-merge (setup.sh rebuild trigger)"
 
-# The trigger that decides whether a `git pull` rebuilds what setup.sh installs. It kept its own
-# copy of the path list and drifted the first time it mattered — setup.sh gained the notifier step
-# (built from macos/) and this pattern did not, so pulling a notifier change left the stale bundle
-# in place. It now asks setup.sh, and these assert the property that failed: every path setup.sh
-# builds FROM must fire the trigger.
-setup_sh="$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh"
-pm="$(cd "$(dirname "$0")/.." && pwd)/scripts/hooks/post-merge"
-build_paths=$("$setup_sh" --build-paths 2>/dev/null)
-check "setup.sh answers --build-paths" "$([ -n "$build_paths" ] && echo yes || echo no)" "yes"
+# post-merge is RUN here, not pattern-matched. These assertions used to re-implement its `grep`
+# against setup.sh's answer and never execute the hook — so changing post-merge's own matching
+# (say `grep -qE` to `grep -q`) would have made every pull silently skip setup.sh with all eleven
+# of them still green. A test that reimplements the thing it tests measures the copy.
+#
+# Each case is a throwaway git repo with a stub setup.sh that records whether it was invoked.
+# PATH deliberately excludes ~/.cargo/bin so `command -v jkb` fails and the hook's second step
+# (`jkb task close-merged`) cannot touch the real knowledge base from a test.
+pm_src="$(cd "$(dirname "$0")/.." && pwd)/scripts/hooks/post-merge"
 
-fires() { printf '%s\n' "$1" | grep -qE "$build_paths" && echo fire || echo skip; }
-for path in macos/notifier/main.swift macos/notifier/Info.plist crates/jkb-cli/src/main.rs \
-            ui/core/src/summary.ts scripts/build-notifier.sh Cargo.toml Cargo.lock; do
-  check "a pull touching $path rebuilds" "$(fires "$path")" "fire"
+pm_run() { # pm_run <changed-path> <skip-paths-answer> -> "ran" | "skipped"
+  local d ans
+  d=$(mktemp -d)
+  ans=$2
+  mkdir -p "$d/scripts"
+  cat > "$d/scripts/setup.sh" <<STUB
+#!/bin/sh
+[ "\$1" = "--skip-paths" ] && { printf '%s\\n' '$ans'; exit 0; }
+echo ran > "$d/invoked"
+STUB
+  chmod +x "$d/scripts/setup.sh"
+  (
+    cd "$d" || exit
+    git init -q . && git config user.email t@t && git config user.name t
+    echo seed > seed.txt && git add -A && git commit -qm one
+    git rev-parse HEAD > .git/ORIG_HEAD
+    # An empty <changed-path> leaves ORIG_HEAD at HEAD, so `git diff` yields nothing — which is
+    # also what an unresolvable range produces, since line 22 of the hook swallows the failure.
+    if [ -n "$1" ]; then
+      mkdir -p "$(dirname "$1")" && echo x > "$1" && git add -A && git commit -qm two
+    fi
+    PATH=/usr/bin:/bin sh "$pm_src" >/dev/null 2>&1
+  )
+  [ -f "$d/invoked" ] && echo ran || echo skipped
+  rm -rf "$d"
+}
+
+skip_paths=$("$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh" --skip-paths 2>/dev/null)
+check "setup.sh answers --skip-paths" "$([ -n "$skip_paths" ] && echo yes || echo no)" "yes"
+
+# Everything that feeds a setup.sh step must rebuild. `.claude/` is here because
+# build-notifier.sh takes its install path from .claude/hooks/notify-sticky.sh, which the previous
+# inclusion-list version did not match — the second silent drift of the same kind.
+for path in macos/notifier/main.swift .claude/hooks/notify-sticky.sh .claude/settings.json \
+            crates/jkb-cli/src/main.rs ui/core/src/summary.ts scripts/build-notifier.sh \
+            Cargo.toml; do
+  check "a pull touching $path rebuilds" "$(pm_run "$path" "$skip_paths")" "ran"
 done
+
+# Only things that provably cannot change what any step installs may be skipped.
 for path in openspec/changes/x/design.md README.md CLAUDE.md .codereviews/x/tasks.md; do
-  check "a pull touching $path does not rebuild" "$(fires "$path")" "skip"
+  check "a pull touching $path does not rebuild" "$(pm_run "$path" "$skip_paths")" "skipped"
 done
 
-# post-merge must not keep a pattern of its own — that is the whole fix, and a re-added literal
-# would pass every assertion above while drifting again on the next step.
-check "post-merge holds no path pattern of its own" \
-  "$(grep -cE "crates/\|ui/|\^\(crates" "$pm" | tr -d ' ')" "0"
+# An unanswerable trigger degrades toward doing the work: a skipped rebuild leaves a stale
+# artifact and says nothing, an unnecessary one only costs time.
+check "an unanswerable --skip-paths rebuilds anyway" "$(pm_run README.md "")" "ran"
 
-# An unanswerable trigger must degrade toward running setup.sh: a skipped rebuild is silent, an
-# unnecessary one only costs time.
-check "an empty pattern is not treated as 'matches nothing'" \
-  "$(grep -c 'if \[ -z "$build_paths" \] ||' "$pm" | tr -d ' ')" "1"
+# The other unknown, and the one that used to degrade the wrong way: `git diff` produces an empty
+# list both when nothing was pulled and when it could not resolve the range at all, and the hook
+# cannot tell those apart — so it must not read either as "nothing to do".
+check "an unreadable diff rebuilds anyway" "$(pm_run "" "$skip_paths")" "ran"
+
+# ...and it must not rely on today's skip pattern happening to reject an empty line. `printf
+# '%s\n' ""` emits one blank line, which no current alternative matches, so the inverted `grep -qv`
+# rebuilds by luck as much as by design. An over-broad pattern removes that luck, and the explicit
+# empty-`changed` guard is what still rebuilds — this is the case that makes it load-bearing
+# rather than decorative.
+check "an unreadable diff rebuilds even under an over-broad skip pattern" \
+  "$(pm_run "" ".*")" "ran"
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d hook test(s) failed\n' "$failures" >&2

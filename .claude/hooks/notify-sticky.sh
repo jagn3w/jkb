@@ -134,17 +134,20 @@ show() {
   subtitle=$(printf '%s' "$input" | jq -r '.cwd // ""' 2>/dev/null)
   subtitle=${subtitle##*/}
 
-  # Written before posting, so the dismiss side never misses a notification that did go out.
-  mkdir -p "$state_dir" 2>/dev/null && : > "$marker" 2>/dev/null
-
   # Same id as any earlier notification from this session, so a second one replaces the first
   # rather than stacking. A non-zero exit means the bundle is not installed or not yet authorized
   # — it refuses instead of posting something invisible, precisely so this can fall through to a
   # banner the user will actually see.
   find_notifier
-  if [ -n "$notifier" ]; then
+  if [ -n "$notifier" ] &&
     "$notifier" post --id "$notif_id" --title "Claude Code" --subtitle "$subtitle" \
-      --body "$message" >/dev/null 2>&1 && return
+      --body "$message" >/dev/null 2>&1; then
+    # The marker means "there is a notification of ours on screen that CAN be withdrawn", so it is
+    # written only once posting actually succeeded — and only on this branch. An osascript banner
+    # cannot be withdrawn, so marking one would buy `dismiss` nothing and cost every later tool
+    # call a look at a marker it can never act on.
+    mkdir -p "$state_dir" 2>/dev/null && : > "$marker" 2>/dev/null
+    return
   fi
 
   command -v osascript >/dev/null 2>&1 || return
@@ -158,10 +161,16 @@ dismiss() {
   # behind by a crashed session costs exactly one wasted `remove` of an id that is no longer on
   # screen, so it needs no expiry.
   [ -f "$marker" ] || return
-  rm -f "$marker" 2>/dev/null
   find_notifier
+  # The marker is CONSUMED ONLY BY A WITHDRAW THAT WORKED. It used to be cleared first, on the
+  # reasoning that it is "just an optimisation" — but its absence is authoritative for every later
+  # dismiss, so one failed `remove` (bundle mid-reinstall, notifier timing out) silently disarmed
+  # `Stop` and `SessionEnd` too, and the alert stayed up for the rest of the session. Leaving it
+  # costs two path tests per tool call and buys a retry on every subsequent dismiss event.
   [ -n "$notifier" ] || return
-  "$notifier" remove --id "$notif_id" >/dev/null 2>&1
+  if "$notifier" remove --id "$notif_id" >/dev/null 2>&1; then
+    rm -f "$marker" 2>/dev/null
+  fi
 }
 
 input=$(cat)
