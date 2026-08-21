@@ -15,8 +15,16 @@ export const state = {
   claudeRefuses: false,
   /** Make `vscode.openFolder` fail. */
   openFolderFails: false,
+  /** The Claude Code extension starts inactive; its command throws until activate() resolves. */
+  claudeActive: true,
+  /** `jkb.taskLauncher`. */
+  launcher: "auto",
+  /** Scheme/authority of this window's folder, so a remote workspace can be modelled. */
+  scheme: "file",
+  authority: "",
   calls: [],
   errors: [],
+  notices: [],
 };
 
 export function reset(folder) {
@@ -24,27 +32,57 @@ export function reset(folder) {
   state.claudeInstalled = true;
   state.claudeRefuses = false;
   state.openFolderFails = false;
+  state.claudeActive = true;
+  state.launcher = "auto";
+  state.scheme = "file";
+  state.authority = "";
   state.calls = [];
   state.errors = [];
+  state.notices = [];
 }
+
+/** A Uri-alike: `with` keeps scheme and authority, which is what the remote fix turns on. */
+const uri = (fsPath) => ({
+  scheme: state.scheme,
+  authority: state.authority,
+  fsPath,
+  path: fsPath,
+  with: (change) => uri(change.path ?? fsPath),
+});
 
 export const workspace = {
   get workspaceFolders() {
-    return state.folder === undefined ? undefined : [{ uri: { fsPath: state.folder } }];
+    return state.folder === undefined ? undefined : [{ uri: uri(state.folder) }];
   },
+  getConfiguration: () => ({ get: () => state.launcher }),
 };
 
 export const extensions = {
   getExtension(id) {
     if (!state.claudeInstalled) return undefined;
-    return { id, isActive: true, activate: async () => {} };
+    return {
+      id,
+      get isActive() {
+        return state.claudeActive;
+      },
+      // Real activation registers the extension's commands; until then they do not resolve.
+      activate: async () => {
+        state.calls.push(["activate", id]);
+        state.claudeActive = true;
+      },
+    };
   },
 };
 
 export const commands = {
   async executeCommand(name, ...args) {
     state.calls.push([name, ...args]);
-    if (name.startsWith("claude-vscode.") && state.claudeRefuses) throw new Error("refused");
+    if (name.startsWith("claude-vscode.")) {
+      if (state.claudeRefuses) throw new Error("refused");
+      // The ordering hazard `onStartupFinished` introduces: two extensions activate
+      // concurrently, and a command of one is unregistered until its activate() has run.
+      if (!state.claudeActive) throw new Error(`command '${name}' not found`);
+    }
     if (name === "vscode.openFolder" && state.openFolderFails) throw new Error("no window");
   },
 };
@@ -60,4 +98,16 @@ export class Disposable {
 
 export const window = {
   showErrorMessage: (message) => state.errors.push(message),
+  showInformationMessage: (message) => state.notices.push(message),
+  // `deliverQueuedPrompt` defaults its terminal host to `vscode.window`, so the stub has to
+  // BE one — without these the default parameter is a seam no test can reach, and the first
+  // thing it did on a real fallback was throw.
+  terminals: [],
+  createTerminal(options) {
+    state.calls.push(["createTerminal", options.name, options.cwd]);
+    return {
+      show: () => state.calls.push(["showTerminal", options.name]),
+      sendText: (text) => state.calls.push(["sendText", text]),
+    };
+  },
 };

@@ -20,6 +20,8 @@ import {
   launchClaude,
   watchQueuedPrompts,
   startSessionTerminal,
+  claudeCommand,
+  taskLauncher,
   type Launch,
   type Launcher,
   type TerminalStart,
@@ -321,6 +323,7 @@ async function workTaskWithClaude(
     worktree: session.worktree,
     uid,
     prompt,
+    session: session.session,
     launcher: taskLauncher(),
   });
   if (launch.where === "terminal") {
@@ -370,11 +373,6 @@ const STATUS_SUFFIX: Record<Launch["where"], string> = {
   blocked: "",
 };
 
-/** How the operator wants a session started; anything unrecognised reads as the default. */
-function taskLauncher(): Launcher {
-  const choice = vscode.workspace.getConfiguration("jkb").get<string>("taskLauncher");
-  return choice === "extension" || choice === "terminal" ? choice : "auto";
-}
 
 /** What Claude is asked to do in a session, in the one place that knows the session's shape. */
 function taskPrompt(uid: string, title: string, session: SessionInfo): string {
@@ -403,7 +401,7 @@ function startClaudeInTerminal(session: SessionInfo, prompt: string): TerminalSt
     vscode.window,
     session.session,
     session.worktree,
-    `claude ${shellQuote(prompt)}`,
+    claudeCommand(prompt),
   );
 }
 
@@ -507,11 +505,6 @@ function land(client: CliJkbClient, uid: string, task: StagedTask | undefined): 
   terminal.show();
   // Built by the client so it carries the configured cliPath/dbPath, like every other call.
   terminal.sendText(client.terminalCommand(["task", "land", uid]));
-}
-
-/** Single-quote a string for safe use in a POSIX shell. */
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 // ---------------------------------------------------------------------------
