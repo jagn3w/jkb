@@ -313,6 +313,12 @@ pub(crate) fn record(
         match credited_by(db, &t, branch)? {
             Credit::OwnBranch | Credit::Grafted => on_branch.push((t.meta.id, t.meta.uid.clone())),
             Credit::LandsHereButHasNot => skipped_unlanded.push(t.meta.uid.clone()),
+            // Dropped, and that is right: this loop walks **every** task in the repo, so
+            // `Unrelated` is overwhelmingly "records a different branch" — listing those would
+            // report most of the backlog on every run. The case that must not land here is a task
+            // whose work jkb really did graft onto this branch and which was then abandoned; that
+            // is answered by `credited_by` asking the *historical* question, above, not by a
+            // bucket here.
             Credit::Unrelated => {}
         }
     }
@@ -408,7 +414,13 @@ fn credited_by(db: &Db, t: &crate::repo::RepoTask, branch: &str) -> Result<Credi
         return Ok(Credit::OwnBranch);
     }
     let id = t.meta.id;
-    let landed = db.read(move |conn| jkb_core::transition::landed(conn, id))?;
+    // **The historical question, deliberately** — `recorded()`, not `live()`. *Did jkb ever graft
+    // this task's work onto this branch?* A graft does not un-happen: the reviewer read what is in
+    // the branch, whatever the task did afterwards. Asking the present-tense question here made an
+    // abandoned-after-graft task `Unrelated`, which this loop discarded silently, so `review
+    // record` stamped nothing for it and `land` later refused it for want of a review.
+    let landed =
+        db.read(move |conn| Ok(jkb_core::transition::landing(conn, id)?.recorded().cloned()))?;
     if landed
         .as_ref()
         .and_then(|r| r.labels.onto.as_deref())

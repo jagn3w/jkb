@@ -2300,10 +2300,65 @@ fn undoing_a_close_is_not_reversed_by_the_next_close_merged() {
     );
 }
 
-/// A landing that exists but is spent says so, instead of falling through to a pull-request
-/// lookup for a branch that never had one and reporting that as the reason.
+/// A review still credits work jkb grafted onto the branch, even after the session was abandoned.
+///
+/// `credited_by` asks the **historical** question — did jkb ever graft this onto this branch —
+/// because a graft does not un-happen: the reviewer read what is in the branch whatever the task
+/// did afterwards. Asking the present-tense question instead made such a task `Credit::Unrelated`,
+/// which this loop drops, so `review record` stamped nothing for it and said nothing about it,
+/// and `jkb task land` refused it much later for want of a review nobody knew was missing.
 #[test]
-fn a_spent_landing_reports_itself_rather_than_a_missing_pull_request() {
+fn a_review_credits_work_grafted_before_the_session_was_abandoned() {
+    let f = Fixture::new();
+    let t = f.add_task("grafted then abandoned");
+    let s = f.work(&t);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "a.txt", "w\n", "w");
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            &onto,
+        ])
+        .assert()
+        .success();
+    // The session is dropped afterwards — which retires the land target and, under the
+    // present-tense reading, the landing too.
+    f.jkb()
+        .args(["--global", "task", "set", &t, "--status", "in_progress"])
+        .assert()
+        .success();
+    f.jkb().args(["task", "abandon", &t]).assert().success();
+
+    f.add_finding("reviews/run-1", "something to fix");
+    f.jkb()
+        .args([
+            "task",
+            "review",
+            "record",
+            "--branch",
+            &onto,
+            "--findings",
+            "reviews/run-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&t).and(predicate::str::contains("recorded review")));
+}
+
+/// A superseded landing is **context, not a verdict**: it is reported, and the run still goes on
+/// to ask the other evidence.
+///
+/// Both halves matter and each was got wrong in turn. Reporting nothing sent `close-merged` off
+/// to ask GitHub about a pull request a locally-grafted branch never had, and printed that as the
+/// reason. Reporting it as *the* answer — returning early — then left a task whose work was redone
+/// and merged as a pull request permanently unclosable, promising it would close when the new work
+/// landed, after the new work had landed.
+#[test]
+fn a_spent_landing_is_context_and_does_not_stop_the_other_evidence() {
     let f = Fixture::new();
     let t = f.add_task("some task");
     let s = f.work(&t);
@@ -2336,11 +2391,13 @@ fn a_spent_landing_reports_itself_rather_than_a_missing_pull_request() {
     );
     assert!(
         text.contains("superseded"),
-        "a spent landing did not explain itself: {text}"
+        "the spent landing was not reported at all: {text}"
     );
+    // ...and the pull-request path still ran. Whether `gh` is installed here or not, its verdict
+    // names a pull request; an early return on the spent landing would name none.
     assert!(
-        !text.contains("pull request"),
-        "it fell through to a pull-request lookup for a locally-grafted branch: {text}"
+        text.contains("pull request"),
+        "it stopped at the spent landing instead of asking the other evidence: {text}"
     );
 }
 

@@ -653,6 +653,69 @@ mod tests {
         assert!(!TaskStatus::Open.unblocks_dependents());
         assert!(!TaskStatus::InProgress.unblocks_dependents());
     }
+
+    /// Exactly which `(from, to)` pairs count as going backwards — asserted here, where the rule
+    /// is declared, over **every** pair rather than through one caller's behaviour.
+    ///
+    /// This rule decides whether evidence that work landed still counts, it has been rewritten
+    /// twice, and each rewrite was caught by an end-to-end test that exercised two of the
+    /// twenty-five pairs. Reordering a rank — giving `cancelled` its own, say, which is the one
+    /// place the order is arguable — would leave every one of those green while landings quietly
+    /// stopped counting for a whole class of task.
+    #[test]
+    fn exactly_these_moves_go_backwards_through_the_lifecycle() {
+        use TaskStatus::{Cancelled, Done, InProgress, NeedsReview, Open};
+        // Ordered, so a rank change is visible as a reordering rather than as an arithmetic edit.
+        assert!(Open.stage() < InProgress.stage());
+        assert!(InProgress.stage() < NeedsReview.stage());
+        assert!(NeedsReview.stage() < Done.stage());
+        // `cancelled` and `done` are both *finished*; neither is further along than the other, so
+        // moving between them is not going back to work.
+        assert_eq!(Cancelled.stage(), Done.stage());
+
+        let backwards = |from: TaskStatus, to: TaskStatus| {
+            TaskStatus::moved_backwards(Some(from.as_str()), Some(to.as_str()))
+        };
+        for &from in TaskStatus::ALL {
+            for &to in TaskStatus::ALL {
+                let expected = to.stage() < from.stage();
+                assert_eq!(
+                    backwards(from, to),
+                    expected,
+                    "{} -> {}",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+
+        // The cases the rule was got wrong on, named so a regression reads as itself.
+        assert!(
+            backwards(Done, InProgress),
+            "a reopened task went back to work"
+        );
+        assert!(backwards(InProgress, Open), "`abandon` puts the work down");
+        assert!(
+            backwards(Cancelled, Open),
+            "reviving a cancelled task is going back"
+        );
+        assert!(backwards(NeedsReview, InProgress), "changes were requested");
+        assert!(
+            !backwards(InProgress, InProgress),
+            "a row that does not move must not supersede itself — the landing held for an open \
+             subtask is `in_progress -> in_progress`"
+        );
+        assert!(!backwards(Done, Done), "the `done -land-> done` self-loop");
+        assert!(!backwards(Done, Cancelled) && !backwards(Cancelled, Done));
+        assert!(!backwards(Open, InProgress), "starting is forwards");
+
+        // Unobtainable is not backwards: this answer retires evidence, so it must be *proven*.
+        assert!(!TaskStatus::moved_backwards(None, Some("open")));
+        assert!(!TaskStatus::moved_backwards(Some("done"), None));
+        assert!(!TaskStatus::moved_backwards(Some("nonsense"), Some("open")));
+        assert!(!TaskStatus::moved_backwards(Some("done"), Some("nonsense")));
+        assert!(!TaskStatus::moved_backwards(None, None));
+    }
 }
 
 /// [`Resolution`] is the state set of an investigation unit's machine (design S9).

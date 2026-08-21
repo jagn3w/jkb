@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **585 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **587 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -786,9 +786,28 @@ written separately in each reader, and they disagreed. `land_target` stopped at 
   It now appends an `undo` transition, from the statuses observed either side of the inversion
   rather than from what the entry claimed, and **only for a task that still exists**: inverting an
   insert deletes the item, and the history's foreign key onto `items` failed the whole undo.
-- **A spent landing is a third answer, not a missing one.** `Landing::{Never, Live, Spent}` —
-  spelling the last two the same way sent `close-merged` off to ask GitHub about a pull request a
-  locally-grafted branch never had, then reported that as the reason and advised recording one.
+- **A superseded landing is context, never a verdict** — and getting that wrong in *both*
+  directions took two rounds. Spelling "spent" and "never landed" the same way sent `close-merged`
+  off to ask GitHub about a pull request a locally-grafted branch never had, and reported that as
+  the reason. Then treating "spent" as *the* answer, and returning on it, left a task whose work
+  was redone and merged as a pull request permanently unclosable — printing *it will close when
+  the new work lands* after the new work had landed. A stale local graft says nothing about
+  whether the work reached its destination another way, so it falls through to the other evidence
+  and only colours the reason when that proves nothing either.
+- **`Landing` carries all of it from one read** — the landing, the resumption, the pull request
+  number — because those three were fetched separately and the third re-derived a row the first
+  had already found and thrown away, three history scans per task per `git pull`.
+- **A review asks the HISTORICAL question**, `recorded()` rather than `live()`: *did jkb ever
+  graft this onto this branch?* A graft does not un-happen, and the reviewer read what is in the
+  branch whatever the task did afterwards. Asking the present-tense question made a task that was
+  grafted and then abandoned `Credit::Unrelated`, which `review record` drops — so it stamped
+  nothing, said nothing, and `jkb task land` refused it much later for want of a review nobody
+  knew was missing. The drop itself is right and stays: that loop walks every task in the repo, so
+  reporting `Unrelated` would list most of the backlog on every run.
+- **The order is pinned where it is declared**, over all twenty-five status pairs plus the
+  `None`/garbage cases. It had been rewritten twice, checked only through `close-merged`'s
+  behaviour, and the one arguable rank — whether `cancelled` shares `done`'s — is exactly the edit
+  a later reader would make.
 - **It reaches the pull-request path too** (`pr::spent`), which is where it matters most: a merge
   reads as `MERGED` for ever, so reopening a landed task and running `git pull` closed it again —
   unattended, from the `post-merge` hook, over every task at once. That half **predates** the

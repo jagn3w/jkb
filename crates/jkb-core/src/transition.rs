@@ -371,10 +371,7 @@ pub fn record_undo(
 /// # Errors
 /// Returns a database error if the query fails.
 pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
-    Ok(match landing(conn, task)? {
-        Landing::Live(row) => Some(*row),
-        Landing::Never | Landing::Spent { .. } => None,
-    })
+    Ok(landing(conn, task)?.live().cloned())
 }
 
 /// The newest row that **put this task back to work**, or `None` if none did.
@@ -438,24 +435,69 @@ fn resumption(rows: &[TransitionRow]) -> Option<&TransitionRow> {
 /// request — for a branch the merge queue had grafted locally, which never had one. The verdict
 /// it printed named a missing pull request and advised recording one, to a reader whose task's
 /// actual situation was that its landing had been superseded.
-#[derive(Debug, Clone)]
-pub enum Landing {
-    /// No landing was ever recorded for this task.
-    Never,
-    /// One was, and it still speaks for the work in flight.
-    Live(Box<TransitionRow>),
-    /// One was, and the task has since gone back to work, so it describes work this task is no
-    /// longer doing. Carries both rows, so a caller can say *which* landing and *what* retired
-    /// it rather than only that something did.
-    Spent {
-        /// The landing that no longer counts.
-        landing: Box<TransitionRow>,
-        /// The move backwards that retired it.
-        resumed: Box<TransitionRow>,
-    },
+
+#[derive(Debug, Clone, Default)]
+pub struct Landing {
+    recorded: Option<TransitionRow>,
+    resumed: Option<TransitionRow>,
+    pr_number: Option<i64>,
 }
 
-/// The landing recorded for this task, and whether it still counts — see [`Landing`].
+impl Landing {
+    /// The landing, if it still speaks for the work in flight.
+    #[must_use]
+    pub fn live(&self) -> Option<&TransitionRow> {
+        match (&self.recorded, &self.resumed) {
+            (Some(landing), Some(back)) if back.id > landing.id => None,
+            (recorded, _) => recorded.as_ref(),
+        }
+    }
+
+    /// The landing and what retired it, if one was recorded and has since been superseded.
+    ///
+    /// **This is context, never a verdict.** A superseded landing says the local graft is stale;
+    /// it says nothing about whether the work reached its destination some other way. Treating it
+    /// as an answer — returning early on it — left a task whose work was redone and merged as a
+    /// pull request permanently unclosable, with a printed sentence promising it would close when
+    /// the new work landed, after the new work had landed.
+    #[must_use]
+    pub fn superseded(&self) -> Option<(&TransitionRow, &TransitionRow)> {
+        match (&self.recorded, &self.resumed) {
+            (Some(landing), Some(back)) if back.id > landing.id => Some((landing, back)),
+            _ => None,
+        }
+    }
+
+    /// The landing **whenever it happened**, spent or not.
+    ///
+    /// For the historical question — *did jkb ever graft this work onto that branch?* — which is
+    /// what `jkb task review record` asks: a graft does not un-happen, and the reviewer read what
+    /// is in the branch whatever the task did afterwards.
+    #[must_use]
+    pub fn recorded(&self) -> Option<&TransitionRow> {
+        self.recorded.as_ref()
+    }
+
+    /// When the task was last put back to work — see [`resumed`].
+    #[must_use]
+    pub fn resumed_at(&self) -> Option<&str> {
+        self.resumed.as_ref().map(|r| r.at.as_str())
+    }
+
+    /// The most recently recorded pull request number, if any.
+    #[must_use]
+    pub fn pr_number(&self) -> Option<i64> {
+        self.pr_number
+    }
+}
+
+/// Everything this task's history says about where its work went, from **one** read.
+///
+/// One read because its three answers are read together and were being fetched separately —
+/// `landing`, then `pull_request`, then `resumed` re-deriving a row the first call had already
+/// found and discarded. `jkb task close-merged` runs over every non-terminal task in the repo
+/// from the `post-merge` hook, so that was three full history scans per task per `git pull`,
+/// serialized on the writer thread.
 ///
 /// # Errors
 /// Returns a database error if the history cannot be read.
@@ -463,19 +505,14 @@ pub fn landing(conn: &Connection, task: ItemId) -> Result<Landing> {
     use jkb_fsm::Event as _;
     let names = [TaskEvent::Land.name(), TaskEvent::ObservedLanded.name()];
     let rows = history(conn, task)?;
-    let Some(found) = rows
-        .iter()
-        .rev()
-        .find(|r| names.contains(&r.event.as_str()) && r.labels.onto.is_some())
-    else {
-        return Ok(Landing::Never);
-    };
-    Ok(match resumption(&rows) {
-        Some(back) if back.id > found.id => Landing::Spent {
-            landing: Box::new(found.clone()),
-            resumed: Box::new(back.clone()),
-        },
-        _ => Landing::Live(Box::new(found.clone())),
+    Ok(Landing {
+        recorded: rows
+            .iter()
+            .rev()
+            .find(|r| names.contains(&r.event.as_str()) && r.labels.onto.is_some())
+            .cloned(),
+        resumed: resumption(&rows).cloned(),
+        pr_number: rows.iter().rev().find_map(|r| r.labels.pr_number),
     })
 }
 
