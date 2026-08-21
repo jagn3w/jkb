@@ -10,6 +10,7 @@ mod archive;
 mod atomic;
 mod commands;
 mod gitrepo;
+mod notify;
 mod output;
 mod owner;
 mod pr;
@@ -57,6 +58,13 @@ struct Cli {
     global: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+/// `jkb notify` verbs.
+#[derive(Subcommand)]
+enum NotifyCmd {
+    /// Read a hook payload on stdin and print the decision as JSON.
+    Plan,
 }
 
 #[derive(Subcommand)]
@@ -172,6 +180,15 @@ enum Command {
         /// Apply repairs: clear claims whose owner process no longer exists.
         #[arg(long)]
         fix: bool,
+    },
+    /// Decide what a Claude Code notification hook event should do, from the payload on stdin.
+    ///
+    /// Prints the plan as JSON and performs nothing — the machine in `notify.rs` produces
+    /// effects as data, and this is the read-only half of that seam while the shell hook still
+    /// carries out the work (design N7/N8).
+    Notify {
+        #[command(subcommand)]
+        cmd: NotifyCmd,
     },
     /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
@@ -1196,6 +1213,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index { sweep } => cmd_index(&db, sweep),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
+        Command::Notify { cmd } => notify::run(&cmd),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Ls {
             path,
