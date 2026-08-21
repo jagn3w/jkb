@@ -316,7 +316,43 @@ pub fn land_target(conn: &Connection, task: ItemId) -> Result<Option<String>> {
     Ok(out)
 }
 
-/// The landing recorded for this task, whichever route recorded it.
+/// Record that `jkb undo` moved a task's status, so the history stays a complete account of how
+/// the task got where it is.
+///
+/// `undo` restores `items.status` straight from the changelog — that is what it is for — and
+/// `task_transitions` is deliberately not changelogged (`V015`), so nothing here was written and
+/// nothing downstream could see it. That mattered because [`resumed`] reads this log to decide
+/// whether a landing still counts: undoing a close restored the task to `in_progress` and left
+/// the landing looking live, so the next `git pull` closed it again. A loop `undo` could not
+/// break, in the repo's own universal repair verb.
+///
+/// Recorded from **what was observed** — the status before the inversion and after it — rather
+/// than from what the changelog entry said it would do, so an inverse that half-applied cannot
+/// leave a row claiming otherwise.
+///
+/// # Errors
+/// Returns a database error if the insert fails.
+pub fn record_undo(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO task_transitions
+             (txn_id, item_id, at, event, from_status, to_status, agent_id)
+         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'undo', ?3, ?4, ?5)",
+    )?
+    .execute(params![meta.txn_id, task.get(), from, to, meta.actor])?;
+    Ok(())
+}
+
+/// The landing that **currently** speaks for this task's work, whichever route recorded it.
+///
+/// A present-tense question, so it answers `None` both when nothing ever landed and when what
+/// landed has since been superseded — see [`resumed`]. A caller that needs to tell those apart
+/// asks [`landing`] instead; this is the short form for callers that only need the row.
 ///
 /// **Both events, and that is the point.** `jkb task land` records `land`; the merge queue's
 /// `jkb task landed` records `observed_landed`. Matching only the first meant the swarm's whole
@@ -330,15 +366,10 @@ pub fn land_target(conn: &Connection, task: ItemId) -> Result<Option<String>> {
 /// # Errors
 /// Returns a database error if the query fails.
 pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
-    use jkb_fsm::Event as _;
-    let landing = [TaskEvent::Land.name(), TaskEvent::ObservedLanded.name()];
-    let rows = history(conn, task)?;
-    let back_to_work = resumption(&rows).map_or(i64::MIN, |r| r.id);
-    Ok(rows
-        .into_iter()
-        .rev()
-        .find(|r| landing.contains(&r.event.as_str()) && r.labels.onto.is_some())
-        .filter(|r| r.id > back_to_work))
+    Ok(match landing(conn, task)? {
+        Landing::Live(row) => Some(*row),
+        Landing::Never | Landing::Spent { .. } => None,
+    })
 }
 
 /// The newest row that **put this task back to work**, or `None` if none did.
@@ -358,19 +389,28 @@ pub fn landed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> 
 /// A row already records where it moved the task, so "did anything put this back to work?" is
 /// answerable from the data — an event added later is covered without anybody remembering it.
 ///
-/// A resumption is a **move out of a terminal status**, which is what *put back to work* means:
-/// you can only be put back if you had finished. Both halves are load-bearing, and a row that
-/// merely *is* non-terminal is not enough — the row recording a landing that was held for an open
-/// subtask is `in_progress -> in_progress`, so under the looser reading it superseded **itself**
-/// and the task it was recorded for could never close. Found by running it.
+/// A resumption is a move **backwards through the lifecycle** — `open` → `in_progress` →
+/// `needs_review` → `done` ([`TaskStatus::stage`]) — which is what *put back to work* means: the
+/// task went back to a stage it had already left, so there is work to do that was not there
+/// before.
 ///
-/// It follows that `done -land-> done` is not a resumption (nothing moved) while an operator
-/// override out of a terminal status is one whatever it is called — which is the point of asking
-/// the status rather than the event name.
+/// It was first written as *moved out of a terminal status*. That is the same rule for the case
+/// it was written against — a landed task reopened — and it misses the one that matters most:
+/// **`abandon` is `in_progress -> open`**, neither side terminal. So a landing recorded while a
+/// task was held by an open subtask survived the abandon that destroyed its session, and the task
+/// auto-closed over live work on a branch that landing had never seen. Unattended, from the
+/// `post-merge` hook, which is the worst way for it to be wrong.
 ///
-/// A row with no `from_status` — a history that starts before this table did — is not a
-/// resumption: it cannot be shown to have moved out of anything, and inventing the stronger
-/// answer would retire a landing on no evidence.
+/// Asking the *order* covers both, and covers `request_changes` and a `start` out of
+/// `needs_review` for the same reason: the work is being changed, so what landed is not what is
+/// in flight — and when it lands again it records a new row.
+///
+/// Everything else falls out with no special case. `start` from `open` moves forwards.
+/// `done -land-> done`, and the row recording a landing held for an open subtask
+/// (`in_progress -> in_progress`), do not move at all — which is what stops that row superseding
+/// **itself** and freezing its own task for ever. A row with no `from_status`, or one this build
+/// cannot parse, is not a resumption: it cannot be *shown* to have gone backwards, and a `true`
+/// here retires evidence, so the unobtainable answer must not be spelled as the stronger one.
 ///
 /// # Errors
 /// Returns a database error if the history cannot be read.
@@ -380,11 +420,57 @@ pub fn resumed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>>
 
 /// [`resumed`] over rows already in hand, so a caller needing both reads the history once.
 fn resumption(rows: &[TransitionRow]) -> Option<&TransitionRow> {
-    rows.iter().rev().find(|r| {
-        r.from_status
-            .as_deref()
-            .is_some_and(|from| TaskStatus::is_terminal_str(Some(from)))
-            && !TaskStatus::is_terminal_str(Some(&r.to_status))
+    rows.iter()
+        .rev()
+        .find(|r| TaskStatus::moved_backwards(r.from_status.as_deref(), Some(&r.to_status)))
+}
+
+/// What this task's history says about a landing, **now**.
+///
+/// Three answers, because two of them were being spelled the same way and no caller could tell
+/// them apart. [`landed`] returning `None` meant *no landing was ever recorded* and also *one was
+/// and it is spent*, so `jkb task close-merged` fell through to asking GitHub about a pull
+/// request — for a branch the merge queue had grafted locally, which never had one. The verdict
+/// it printed named a missing pull request and advised recording one, to a reader whose task's
+/// actual situation was that its landing had been superseded.
+#[derive(Debug, Clone)]
+pub enum Landing {
+    /// No landing was ever recorded for this task.
+    Never,
+    /// One was, and it still speaks for the work in flight.
+    Live(Box<TransitionRow>),
+    /// One was, and the task has since gone back to work, so it describes work this task is no
+    /// longer doing. Carries both rows, so a caller can say *which* landing and *what* retired
+    /// it rather than only that something did.
+    Spent {
+        /// The landing that no longer counts.
+        landing: Box<TransitionRow>,
+        /// The move backwards that retired it.
+        resumed: Box<TransitionRow>,
+    },
+}
+
+/// The landing recorded for this task, and whether it still counts — see [`Landing`].
+///
+/// # Errors
+/// Returns a database error if the history cannot be read.
+pub fn landing(conn: &Connection, task: ItemId) -> Result<Landing> {
+    use jkb_fsm::Event as _;
+    let names = [TaskEvent::Land.name(), TaskEvent::ObservedLanded.name()];
+    let rows = history(conn, task)?;
+    let Some(found) = rows
+        .iter()
+        .rev()
+        .find(|r| names.contains(&r.event.as_str()) && r.labels.onto.is_some())
+    else {
+        return Ok(Landing::Never);
+    };
+    Ok(match resumption(&rows) {
+        Some(back) if back.id > found.id => Landing::Spent {
+            landing: Box::new(found.clone()),
+            resumed: Box::new(back.clone()),
+        },
+        _ => Landing::Live(Box::new(found.clone())),
     })
 }
 

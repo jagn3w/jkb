@@ -28,7 +28,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use jkb_core::lifecycle;
 use jkb_core::query::{Query, Scope};
-use jkb_core::transition::{self, Reclaimed};
+use jkb_core::transition::{self, Landing, Reclaimed};
 use jkb_core::{
     binding, blob, claim, edge, investigation, item, mount, ns, nstype, placement, tag, task, undo,
     view, Db,
@@ -6555,32 +6555,57 @@ fn close_one(db: &Db, root: &Path, id: ItemId, dry_run: bool) -> Result<CloseVer
     // whenever it cannot name a PR, which is *always* for a locally-grafted branch. Asking second
     // meant this was never reached on the one path it exists for, and the task stayed held for
     // ever — with the row that would have freed it sitting in its history.
-    let recorded = db.read(move |conn| jkb_core::transition::landed(conn, id))?;
-    let number = db.read(move |conn| jkb_core::transition::pull_request(conn, id))?;
-    // When the task was last put back to work, so a merge older than that is not read as proof
-    // about the work in flight. Both evidence paths answer to the one rule.
-    let resumed = db.read(move |conn| jkb_core::transition::resumed(conn, id))?;
-    let resumed_at = resumed.as_ref().map(|r| r.at.clone());
-    let (number, merged, why) = if recorded.is_some() {
-        (number, Fact::Yes, None)
-    } else {
-        // Discover once, from the branch, and record what is found — after which the number is
-        // what is consulted and the branch name never is again.
-        let number = match number {
-            Some(n) => Some(n),
-            None => match discover_quietly(db, root, id)? {
-                Ok(found) => found,
-                Err(why) => {
-                    return Ok(CloseVerdict {
-                        uid,
-                        pr: None,
-                        held: Some(why),
-                    })
-                }
-            },
-        };
-        let (merged, why) = pr::merged_fact(root, number, resumed_at.as_deref());
-        (number, merged, why)
+    // One read of the history, giving all three answers this needs: is there a landing, does it
+    // still count, and when was the task last put back to work.
+    let (recorded, number) = db.read(move |conn| {
+        Ok((
+            jkb_core::transition::landing(conn, id)?,
+            jkb_core::transition::pull_request(conn, id)?,
+        ))
+    })?;
+    let (number, merged, why) = match &recorded {
+        Landing::Live(_) => (number, Fact::Yes, None),
+        // **A spent landing is its own answer, not a missing one.** Falling through to
+        // `discover_quietly` here asks GitHub for a pull request that a locally-grafted branch
+        // never had — a network call inside the `post-merge` hook, on every pull, for every such
+        // task — and then reports the wrong reason with a remedy (`jkb task pr`) for a problem
+        // the task does not have. That is the "held for ever, wrong reason" failure the comment
+        // above exists to prevent, re-entered one condition along.
+        Landing::Spent { landing, resumed } => {
+            let onto = landing.labels.onto.as_deref().unwrap_or("its target");
+            return Ok(CloseVerdict {
+                uid,
+                pr: None,
+                held: Some(format!(
+                    "its landing onto {onto} was superseded when the task went back to work \
+                     ({} at {}) — it will close when the new work lands",
+                    resumed.event, resumed.at
+                )),
+            });
+        }
+        Landing::Never => {
+            // Discover once, from the branch, and record what is found — after which the number
+            // is what is consulted and the branch name never is again.
+            let number = match number {
+                Some(n) => Some(n),
+                None => match discover_quietly(db, root, id)? {
+                    Ok(found) => found,
+                    Err(why) => {
+                        return Ok(CloseVerdict {
+                            uid,
+                            pr: None,
+                            held: Some(why),
+                        })
+                    }
+                },
+            };
+            // A merge older than the last resumption is not proof about the work in flight.
+            // Both evidence paths answer to the one rule.
+            let resumed_at = db.read(move |conn| jkb_core::transition::resumed(conn, id))?;
+            let (merged, why) =
+                pr::merged_fact(root, number, resumed_at.as_ref().map(|r| r.at.as_str()));
+            (number, merged, why)
+        }
     };
     let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
         // The status is re-read **inside** the transaction. This snapshots every candidate up

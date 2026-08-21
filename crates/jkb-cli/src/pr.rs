@@ -155,12 +155,14 @@ pub(crate) fn merged_fact(
             // defect this pair exists to stop. It predates the recorded-landing path — a merged
             // pull request has always re-closed a reopened task on the next `git pull`.
             //
-            // `No` rather than `Unknown`: we are not failing to establish something, we have
-            // established that this merge does not speak for the work in flight. RFC-3339 from
-            // `gh`, so the strings compare correctly; a merge with no timestamp is left alone
-            // rather than guessed at.
-            if let Some(stale) = spent(&pr, resumed_at) {
-                return (Fact::No, Some(stale));
+            // `No` where we have *established* the merge does not speak for the work in flight;
+            // `Unknown` where a resumption is known but the merge cannot be placed against it,
+            // which holds the task rather than closing it (D34.4: a missed close costs one
+            // command, a wrong one buries work).
+            match spent(&pr, resumed_at) {
+                Staleness::Spent(why) => return (Fact::No, Some(why)),
+                Staleness::Undecidable(why) => return (Fact::Unknown, Some(why)),
+                Staleness::Live => {}
             }
             let fact = pr.merged();
             let why = match fact {
@@ -191,22 +193,52 @@ pub(crate) fn merged_fact(
 /// a rule that can only be exercised by shelling out to an authenticated network client is a rule
 /// nothing checks.
 ///
-/// Deliberately narrow. It fires only on a merge we can **place in time** against a resumption we
-/// can place in time; anything missing leaves the answer alone rather than guessing, since the
-/// failure it would cause — declining to close genuinely landed work — is silent and permanent,
-/// where the other direction costs one command.
-fn spent(pr: &PullRequest, resumed_at: Option<&str>) -> Option<String> {
-    let (merged_at, resumed_at) = (pr.merged_at.as_deref()?, resumed_at?);
+/// **No resumption means the question does not arise**, which is the overwhelmingly normal case
+/// and why [`Staleness::Live`] is the default — not because a missed close is the cheap error. It
+/// is the expensive one only in the other direction: a missed close costs one command, and a
+/// wrong one buries work still in flight (D34.4, and this module's own opening paragraph).
+///
+/// So where a resumption **is** known and the merge cannot be placed against it, this returns
+/// [`Staleness::Undecidable`] and the task is held with the reason printed. Returning `Live`
+/// there would close a task on a merge that might well predate the work in flight, picking the
+/// burying direction on the strength of a missing field.
+fn spent(pr: &PullRequest, resumed_at: Option<&str>) -> Staleness {
+    let Some(resumed_at) = resumed_at else {
+        return Staleness::Live;
+    };
+    if pr.merged() != Fact::Yes {
+        // Not a merge at all; `merged_fact`'s ordinary path has the right answer for it.
+        return Staleness::Live;
+    }
+    let Some(merged_at) = pr.merged_at.as_deref() else {
+        return Staleness::Undecidable(format!(
+            "pull request #{} is merged but carries no merge time, so it cannot be told from \
+             work done before this task was put back to work at {resumed_at}",
+            pr.number
+        ));
+    };
     // RFC-3339 from `gh` and from `strftime('%Y-%m-%dT%H:%M:%fZ')` — both zero-padded, both UTC,
     // so lexical order is chronological order. Compared as strings on purpose: parsing them would
     // add a date library to answer a question the format already answers.
-    (pr.merged() == Fact::Yes && merged_at < resumed_at).then(|| {
-        format!(
+    if merged_at < resumed_at {
+        return Staleness::Spent(format!(
             "pull request #{} merged at {merged_at}, but the task was put back to work at \
              {resumed_at}",
             pr.number
-        )
-    })
+        ));
+    }
+    Staleness::Live
+}
+
+/// Whether a merge still speaks for the work in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Staleness {
+    /// It does — or no resumption is known, so the question does not arise.
+    Live,
+    /// It does not: the task went back to work after it merged.
+    Spent(String),
+    /// It cannot be told, and a resumption **is** known. Held, never closed — see [`spent`].
+    Undecidable(String),
 }
 
 /// Run `gh` in `dir`, returning stdout or a sentence explaining why we could not ask.
@@ -246,7 +278,7 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{spent, Discovery, PullRequest};
+    use super::{spent, Discovery, PullRequest, Staleness};
     use jkb_fsm::Fact;
 
     fn pr(state: &str) -> PullRequest {
@@ -317,11 +349,13 @@ mod tests {
             _ => panic!("expected ambiguity"),
         }
     }
-    /// A merge speaks for the work in flight only if nothing has put the task back to work since.
+    /// A merge speaks for the work in flight only if nothing has put the task back to work since
+    /// — and where that cannot be told, the task is **held**, not closed.
     ///
-    /// The narrowness is asserted with it: this fires on a merge and a resumption it can both
-    /// place in time, and on nothing else. Declining to close genuinely landed work is silent and
-    /// permanent, so every gap in the evidence leaves the answer alone.
+    /// The three answers are asserted apart because two of them used to be one: returning "not
+    /// spent" for a merge with no timestamp closes the task, which is the burying direction
+    /// (D34.4). `Live` is the default because no resumption is the normal case, not because a
+    /// missed close is cheap.
     #[test]
     fn a_merge_is_spent_once_the_task_has_been_put_back_to_work() {
         let merged = PullRequest {
@@ -332,28 +366,42 @@ mod tests {
             head_ref_name: None,
         };
         // Put back to work the day after it merged: the merge is about older work.
-        let why = spent(&merged, Some("2026-08-20T09:00:00Z")).expect("spent");
+        let Staleness::Spent(why) = spent(&merged, Some("2026-08-20T09:00:00Z")) else {
+            panic!("a merge older than the resumption must be spent");
+        };
         assert!(
             why.contains("#31") && why.contains("put back to work"),
             "{why}"
         );
 
         // Resumed *before* the merge — an ordinary landing of work that was in progress.
-        assert_eq!(spent(&merged, Some("2026-08-18T09:00:00Z")), None);
-        // Never resumed at all.
-        assert_eq!(spent(&merged, None), None);
-        // A merge we cannot place in time is left alone rather than assumed stale.
-        let undated = PullRequest {
-            merged_at: None,
-            ..merged.clone()
-        };
-        assert_eq!(spent(&undated, Some("2026-08-20T09:00:00Z")), None);
-        // And an open pull request is not a spent merge; it is not a merge.
+        assert_eq!(
+            spent(&merged, Some("2026-08-18T09:00:00Z")),
+            Staleness::Live
+        );
+        // Never resumed at all: the question does not arise.
+        assert_eq!(spent(&merged, None), Staleness::Live);
+        // An open pull request is not a spent merge; it is not a merge.
         let open = PullRequest {
             state: Some("OPEN".to_owned()),
             ..merged.clone()
         };
-        assert_eq!(spent(&open, Some("2026-08-20T09:00:00Z")), None);
+        assert_eq!(spent(&open, Some("2026-08-20T09:00:00Z")), Staleness::Live);
+
+        // Merged, a resumption is known, and the merge cannot be placed against it. HELD — the
+        // one case where leaving the answer alone would close a task on a merge that may well
+        // predate the work in flight.
+        let undated = PullRequest {
+            merged_at: None,
+            ..merged.clone()
+        };
+        let Staleness::Undecidable(why) = spent(&undated, Some("2026-08-20T09:00:00Z")) else {
+            panic!("an unplaceable merge with a known resumption must hold, not close");
+        };
+        assert!(why.contains("no merge time"), "{why}");
+        // ...but with no resumption known there is nothing to compare against and nothing to hold
+        // for, so it goes back to the ordinary path.
+        assert_eq!(spent(&undated, None), Staleness::Live);
     }
 }
 

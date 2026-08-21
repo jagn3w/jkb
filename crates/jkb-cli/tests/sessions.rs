@@ -2217,6 +2217,133 @@ fn a_landing_stops_counting_once_the_task_is_put_back_to_work() {
     );
 }
 
+/// Abandoning the session that produced a landing spends it — the case that broke the first
+/// version of this rule, which asked for a move out of a *terminal* status. `abandon` is
+/// `in_progress -> open`: neither side terminal, so a landing held by an open subtask survived
+/// the abandon that destroyed its session and the task auto-closed over live work.
+#[test]
+fn abandoning_a_session_spends_the_landing_it_recorded() {
+    let f = Fixture::new();
+    let t = f.add_task("parent");
+    let s = f.work(&t);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&worktree, "a.txt", "w\n", "w");
+    let out = f
+        .jkb()
+        .args(["--global", "task", "add", "child", "--under", &t, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task add --under: {out:?}");
+    let child = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            s["onto"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&t), "in_progress", "held by the subtask");
+
+    // The approach was wrong: drop the session entirely, then pick the task up again.
+    f.jkb().args(["task", "abandon", &t]).assert().success();
+    f.jkb()
+        .args(["--global", "task", "set", &child, "--status", "done"])
+        .assert()
+        .success();
+    f.work(&t);
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&t),
+        "in_progress",
+        "a landing from an abandoned session closed the task over live work"
+    );
+}
+
+/// `jkb undo` of a close puts the task back to work, and the next `close-merged` must not undo
+/// the undo. `undo` restores `items.status` from the changelog and `task_transitions` is not
+/// changelogged, so unless `undo` records what it did the staleness rule cannot see it — and the
+/// task is re-closed on the next `git pull`, in a loop `undo` itself cannot break.
+#[test]
+fn undoing_a_close_is_not_reversed_by_the_next_close_merged() {
+    let f = Fixture::new();
+    let t = f.add_task("some task");
+    let s = f.work(&t);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&worktree, "a.txt", "w\n", "w");
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            s["onto"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&t), "done");
+
+    f.jkb().args(["--global", "undo"]).assert().success();
+    assert_eq!(f.status_of(&t), "in_progress", "undo did not restore it");
+
+    f.jkb().args(["task", "close-merged"]).assert().success();
+    assert_eq!(
+        f.status_of(&t),
+        "in_progress",
+        "close-merged reversed the undo, which is a loop undo cannot break"
+    );
+}
+
+/// A landing that exists but is spent says so, instead of falling through to a pull-request
+/// lookup for a branch that never had one and reporting that as the reason.
+#[test]
+fn a_spent_landing_reports_itself_rather_than_a_missing_pull_request() {
+    let f = Fixture::new();
+    let t = f.add_task("some task");
+    let s = f.work(&t);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&worktree, "a.txt", "w\n", "w");
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            s["onto"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "set", &t, "--status", "in_progress"])
+        .assert()
+        .success();
+
+    let out = f
+        .jkb()
+        .args(["task", "close-merged", "--dry-run"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("superseded"),
+        "a spent landing did not explain itself: {text}"
+    );
+    assert!(
+        !text.contains("pull request"),
+        "it fell through to a pull-request lookup for a locally-grafted branch: {text}"
+    );
+}
+
 /// One task `close-merged` cannot decide must not stop it deciding the rest.
 ///
 /// The run is **total**: every task in the repo gets a verdict, and a task whose branch value is

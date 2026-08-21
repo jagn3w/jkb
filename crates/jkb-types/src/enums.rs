@@ -307,6 +307,46 @@ impl TaskStatus {
             .is_some_and(Self::is_terminal)
     }
 
+    /// How far through the lifecycle this status is: `open` → `in_progress` → `needs_review` →
+    /// `done` (design D27.7), with `cancelled` alongside `done` as the other way to be finished.
+    ///
+    /// The four-state lifecycle written down as an order, so *"did this task move backwards?"*
+    /// is a question about data rather than about a list of event names. That question is the
+    /// one [`jkb_core::transition::resumed`] asks to decide whether evidence of a landing still
+    /// speaks for the work in flight: a task that has gone back to an earlier stage since a
+    /// landing is being worked on again, and that landing describes something else.
+    ///
+    /// **Only comparisons are meaningful** — the numbers are ordinal and nothing should read
+    /// them as a count or persist them. `cancelled` shares `done`'s rank because both mean
+    /// *finished*: neither is further along than the other, and a task moving between them has
+    /// not gone back to work.
+    #[must_use]
+    pub fn stage(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::InProgress => 1,
+            Self::NeedsReview => 2,
+            Self::Done | Self::Cancelled => 3,
+        }
+    }
+
+    /// Whether a move from `from` to `to` goes **backwards** through the lifecycle.
+    ///
+    /// `None` for either side — an unparseable status, or a history that starts before the
+    /// transition log did — is *not* backwards. It cannot be shown to have gone back, and the
+    /// caller that asks this retires evidence on a `true`, so an unobtainable answer must not
+    /// be spelled as the stronger one.
+    #[must_use]
+    pub fn moved_backwards(from: Option<&str>, to: Option<&str>) -> bool {
+        match (
+            from.and_then(Self::from_manual_str),
+            to.and_then(Self::from_manual_str),
+        ) {
+            (Some(from), Some(to)) => to.stage() < from.stage(),
+            _ => false,
+        }
+    }
+
     /// Whether a `depends_on` edge to a task in this status **unblocks** its dependents.
     /// True for exactly the **terminal** statuses (`done`/`cancelled`) — the terminal
     /// set (design D27.7). A `needs_review` dependency deliberately does **not** unblock:

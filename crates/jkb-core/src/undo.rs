@@ -89,7 +89,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
 
-use jkb_types::Error as TypeError;
+use jkb_types::{Error as TypeError, ItemId};
 
 use crate::changelog::{Entity, InsertInverse, Op};
 use crate::store::WriteMeta;
@@ -1116,6 +1116,15 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // runs behind an `is_work` filter, so `sync_state` reaches `invert_entry` unexamined.
     // Extending `blocker` to predict constraint violations instead would mean re-implementing
     // the constraint checker, which is the prediction game the previous four rounds lost.
+    // THE HISTORY HAS TO SEE THIS. `undo` restores `items.status` straight from the changelog,
+    // and `task_transitions` is deliberately not changelogged (`V015`) — so undoing a close wrote
+    // nothing there, `transition::resumed` could not tell the task had gone back to work, and the
+    // next `jkb task close-merged` closed it again. A loop `undo` itself could not break.
+    //
+    // The statuses are read **before** the inversion and again after it, so what gets recorded is
+    // what actually happened rather than what an entry said it would do.
+    let statuses_before = task_statuses(conn, &entries)?;
+
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
         match invert_entry(conn, &op, &table, &entity_id, before.as_deref()) {
@@ -1134,6 +1143,8 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         }
     }
 
+    record_status_restores(conn, meta, &statuses_before)?;
+
     changelog::append(
         conn,
         meta,
@@ -1144,6 +1155,75 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         None,
     )?;
     Ok(reverted)
+}
+
+/// Append a transition for every task whose status this inversion actually moved.
+///
+/// **Only for a task that is still there.** Inverting an insert *deletes* the item, and
+/// `task_transitions.item_id` is a foreign key onto `items` — so recording the disappearance
+/// fails the whole `jkb undo` on a constraint, which is how this first went in. There is nothing
+/// to record anyway: the row is gone, and `ON DELETE CASCADE` has just taken its history with it.
+fn record_status_restores(
+    conn: &Connection,
+    meta: &WriteMeta,
+    before: &[(i64, Option<String>)],
+) -> Result<()> {
+    for (id, was) in before {
+        let now = task_status(conn, *id)?;
+        if now.is_some() && *was != now {
+            crate::transition::record_undo(
+                conn,
+                meta,
+                ItemId::new(*id),
+                was.as_deref().unwrap_or_default(),
+                now.as_deref().unwrap_or_default(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One item's `status`, or `None` if the row is gone.
+fn task_status(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT status FROM items WHERE id = ?1")?
+        .query_row([id], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// The current status of every **task** this transaction's `items` entries name.
+///
+/// Restricted to rows that are tasks now: a status is what `transition::record_undo` records, and
+/// a history row for a non-task item would be noise nothing reads. Unparseable ids and rows that
+/// no longer exist are skipped rather than erroring — this is bookkeeping around the inversion,
+/// and it must not be what makes an otherwise-good `jkb undo` fail.
+fn task_statuses(
+    conn: &Connection,
+    entries: &[(String, String, String, Option<String>)],
+) -> Result<Vec<(i64, Option<String>)>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (_, table, entity_id, _) in entries {
+        if table != Entity::Items.as_str() {
+            continue;
+        }
+        let Ok(id) = entity_id.parse::<i64>() else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        let is_task: bool = conn
+            .prepare_cached("SELECT kind = 'task' FROM items WHERE id = ?1")?
+            .query_row([id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false);
+        if is_task {
+            out.push((id, task_status(conn, id)?));
+        }
+    }
+    Ok(out)
 }
 
 /// Restore an item deleted by `item::remove` from its changelog snapshot: the item row

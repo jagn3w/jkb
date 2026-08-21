@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **582 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **585 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -765,22 +765,39 @@ history into a present-tense answer needs a rule for when an older row stops cou
 written separately in each reader, and they disagreed. `land_target` stopped at `abandon`;
 `landed` stopped at nothing. Five findings across two review rounds are that one gap.
 
-- **The rule is asked of the status, not of a list of events.** `transition::resumed` is the one
-  statement: the newest row that moved the task **out of** a terminal status. The obvious repair —
-  give `landed` the same stop-list its sibling has — is a fourth private rule for a fifth reader
-  to get wrong, and one that a newly-added event has to be *remembered* and added to. Every row
-  already records where it moved the task, so an event added later is covered by nobody.
-- **Both halves are load-bearing**, and the looser reading (*is* non-terminal, rather than *moved
-  out of* terminal) was wrong in a way only running it showed: the row recording a landing held
-  for an open subtask is `in_progress -> in_progress`, so it superseded **itself** and its task
-  could never close.
+- **The rule is asked of the status ORDER, not of a list of events.** `transition::resumed` is
+  the one statement: the newest row that moved the task **backwards** through
+  `open -> in_progress -> needs_review -> done` (`TaskStatus::stage`, the D27.7 lifecycle written
+  down as an order). The obvious repair — give `landed` the same stop-list its sibling has — is a
+  fourth private rule for a fifth reader to get wrong, and one a newly-added event has to be
+  *remembered* and added to. Every row already records where it moved the task.
+- **It took two goes, and the first was a narrower rule that looked identical.** *Moved out of a
+  terminal status* is the same answer for the case it was written against — a landed task
+  reopened — and misses the one that matters most: **`abandon` is `in_progress -> open`**, neither
+  side terminal. A landing recorded while a task was held by an open subtask survived the abandon
+  that destroyed its session, and the task auto-closed over live work. Asking the order covers
+  both, plus `request_changes` and a resume out of `needs_review`, with no special case.
+- **Nothing that stands still is a resumption**, which is what stops the row recording a held
+  landing (`in_progress -> in_progress`) superseding **itself** and freezing its own task for
+  ever. Found by running it.
+- **`jkb undo` had to start recording what it did.** It restores `items.status` straight from the
+  changelog, and `task_transitions` is deliberately not changelogged — so undoing a close left the
+  landing looking live and the next `git pull` closed the task again, a loop undo could not break.
+  It now appends an `undo` transition, from the statuses observed either side of the inversion
+  rather than from what the entry claimed, and **only for a task that still exists**: inverting an
+  insert deletes the item, and the history's foreign key onto `items` failed the whole undo.
+- **A spent landing is a third answer, not a missing one.** `Landing::{Never, Live, Spent}` —
+  spelling the last two the same way sent `close-merged` off to ask GitHub about a pull request a
+  locally-grafted branch never had, then reported that as the reason and advised recording one.
 - **It reaches the pull-request path too** (`pr::spent`), which is where it matters most: a merge
   reads as `MERGED` for ever, so reopening a landed task and running `git pull` closed it again —
   unattended, from the `post-merge` hook, over every task at once. That half **predates** the
   recorded-landing path and predates this branch.
-- **Deliberately narrow.** It fires only on a merge and a resumption that can both be placed in
-  time; every gap leaves the answer alone. Declining to close genuinely landed work is silent and
-  permanent, where the other direction costs one command (D34.4).
+- **Where it cannot be told, the task is held.** A merge with a known resumption it cannot be
+  placed against is `Undecidable`, not "live" — closing there picks the burying direction on the
+  strength of a missing field. `Live` is the default because *no resumption* is the normal case,
+  not because a missed close is cheap: a missed close costs one command, a wrong one buries work
+  in flight (D34.4).
 - **The pure half is separated from the `gh` call** so it is testable at all — a rule exercisable
   only by shelling out to an authenticated network client is a rule nothing checks.
 
