@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Regression test for scripts/lib.sh::git_hooks_dir.
+# Regression test for scripts/lib.sh's two answers to "where do this repo's hooks go":
+# `git_hooks_dir` (the directory git runs hooks from) and `git_hooks_override` (the
+# `core.hooksPath` that replaces it). They share a subject and an oracle, so they share a file.
 #
 # The bug it exists for: setup.sh derived the hook directory from `git rev-parse --git-dir`,
 # which in a linked worktree is `<repo>/.git/worktrees/<name>` — a directory git never reads
@@ -23,10 +25,15 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 # `--git-path hooks/…` honours core.hooksPath, and this developer has one set globally — so
-# without an isolated config the oracle answers with the user's own hooks directory. HOME +
-# GIT_CONFIG_NOSYSTEM works on every git version (GIT_CONFIG_GLOBAL needs 2.32).
+# without an isolated config the oracle answers with the user's own hooks directory and the
+# suite reddens over a regression that does not exist. HOME + GIT_CONFIG_NOSYSTEM works on
+# every git version (GIT_CONFIG_GLOBAL needs 2.32); XDG_CONFIG_HOME has to go too, because
+# git prefers `$XDG_CONFIG_HOME/git/config` over `$HOME/.gitconfig` and overriding only HOME
+# leaves the real global config visible. GIT_DIR/GIT_WORK_TREE would point every command in
+# here at somebody else's repository.
 mkdir -p "$work/home"
 export HOME="$work/home" GIT_CONFIG_NOSYSTEM=1
+unset XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE
 git_q() { git -c user.name=t -c user.email=t@example.com "$@"; }
 
 # Where git will actually run the post-merge hook from, as an absolute path.
@@ -92,10 +99,66 @@ case3() {
     fi
 }
 
-echo "==> scripts/lib.sh::git_hooks_dir"
+# --- 4. core.hooksPath is read from the repo we asked about, not from the cwd ------------
+# The must-fix this file grew for: setup.sh asked a bare `git config`, which answers for
+# whatever repository the caller happens to be standing in.
+case4() {
+    local other="$work/other" got
+    git_q init -q "$other" >/dev/null 2>&1
+    git_q -C "$other" config core.hooksPath "$work/others-hooks"
+
+    # Standing in the other repo, asking about ours: its setting must not leak.
+    got="$(cd "$other" && git_hooks_override "$main")"
+    if [ -z "$got" ]; then
+        ok "core.hooksPath: another repo's setting does not leak into ours"
+    else
+        fail "override: leak" "reported '$got' for a repo that sets nothing"
+    fi
+
+    # And the converse — ours is found from outside it, which is the miss that leaves the
+    # repo hook dead with no chainer written.
+    git_q -C "$main" config core.hooksPath "$work/our-hooks"
+    got="$(cd "$other" && git_hooks_override "$main")"
+    if [ "$got" = "$work/our-hooks" ]; then
+        ok "core.hooksPath: ours is found from outside the checkout"
+    else
+        fail "override: missed" "expected $work/our-hooks, got '$got'"
+    fi
+    git_q -C "$main" config --unset core.hooksPath
+}
+
+# --- 5. a relative core.hooksPath resolves the way git resolves it -----------------------
+# githooks(5): git chdirs to the top of the working tree before running a hook, so a relative
+# value is relative to THAT — not to wherever the installer was invoked from.
+case5() {
+    local got expected sub
+    git_q -C "$main" config core.hooksPath .githooks
+    mkdir -p "$main/.githooks" "$main/deep/nested"
+
+    expected="$(oracle_dir "$main")"
+    got="$(git_hooks_override "$main")"
+    if [ "$(abs_dir "$got")" = "$expected" ]; then
+        ok "a relative core.hooksPath: agrees with git"
+    else
+        fail "relative: path" "got $(abs_dir "$got"), git runs $expected"
+    fi
+
+    # Run from a subdirectory: the answer must not move with the caller.
+    sub="$(cd "$main/deep/nested" && git_hooks_override "$main")"
+    if [ "$(abs_dir "$sub")" = "$expected" ]; then
+        ok "a relative core.hooksPath: does not move with the caller's cwd"
+    else
+        fail "relative: cwd" "from a subdirectory it resolved to $(abs_dir "$sub")"
+    fi
+    git_q -C "$main" config --unset core.hooksPath
+}
+
+echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override"
 case1
 case2
 case3
+case4
+case5
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures failure(s)" >&2

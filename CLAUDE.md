@@ -575,9 +575,18 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   would ever run it, printed success, and left the stale one in place; the chainer's dispatch
   line had the same bug, so a pull in a worktree found no repo hook either way. The oracle is
   `git rev-parse --git-path hooks/post-merge` — what git itself will execute — and
-  `scripts/tests/git-hooks-dir.test.sh` asserts against it rather than a hand-written path.
+  `scripts/tests/git-hooks.test.sh` asserts against it rather than a hand-written path.
   Because `setup.sh` never clobbers a chainer it did not write, it now *refreshes* one it did:
   a chainer installed under the old rule would otherwise stay broken for ever.
+- **Every git question in the installer is asked of `$repo_root`, never of the cwd**
+  (`git_hooks_override`). A bare `git config --get core.hooksPath` answers for whatever
+  repository the caller is standing in: run from another project it wrote jkb's chainer into
+  *that* project, and run from outside jkb while jkb sets the key it wrote no chainer at all —
+  the dead-repo-hook failure the chainer exists to prevent, under a success message. A relative
+  value belongs to git's base too (githooks(5): git chdirs to the worktree top before running a
+  hook), so leaving `mkdir -p` to resolve it put the chainer one directory per subdirectory you
+  happened to run from. Same shape as the `--git-dir` bug one bullet up, which is why both rules
+  now live in `lib.sh` rather than at the call site.
 - **Every file `setup.sh` installs is written atomically** — `scripts/lib.sh`'s `install_exec`
   (temp file + `mv`), and `jkb service install`'s `write_atomic` for the unit. The loop above
   is why: the hook runs `setup.sh`, and `setup.sh` installs *that hook*. `cp` rewrites the

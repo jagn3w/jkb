@@ -153,9 +153,10 @@ if [ -f "$hooks_src" ]; then
     install_exec "$hooks_dir/post-merge" <"$hooks_src"
     echo "  • repo hook:  $hooks_dir/post-merge"
 
-    global_hooks="$(git config --get core.hooksPath || true)"
+    # Asked of `$repo_root`, like the hooks directory above — a bare `git config` answers for
+    # whatever repo the caller is standing in. See scripts/lib.sh.
+    global_hooks="$(git_hooks_override "$repo_root")"
     if [ -n "$global_hooks" ]; then
-      global_hooks="${global_hooks/#\~/$HOME}"
       mkdir -p "$global_hooks"
       chainer="$global_hooks/post-merge"
       # Written once, so the install and the refresh below cannot drift apart.

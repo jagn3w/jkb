@@ -106,10 +106,35 @@ case3() {
     fi
 }
 
+# --- 4. a failure AFTER the temp file exists leaves no temp file ------------------------
+# Case 3 above cannot pin this: an unwritable directory fails at `mktemp`, before there is
+# anything to clean up, so deleting install_exec's `rm -f "$tmp"` left this suite green.
+# Reading a directory is the one failure reachable after mktemp succeeds without fault
+# injection — `cat` exits 1 with "Is a directory" on both BSD and GNU userland. (`mv` onto an
+# existing directory is NOT a failure: it moves the file inside.)
+case4() {
+    local d="$work/stranded" stray
+    mkdir -p "$d/a-directory"
+    printf 'original\n' >"$d/prog"
+    if install_exec "$d/prog" <"$d/a-directory" 2>/dev/null; then
+        fail "stranded: status" "install_exec reported success though its input was unreadable"
+        return
+    fi
+    stray="$(find "$d" -name '.jkb-install.*' -print -quit)"
+    if [ -z "$stray" ]; then
+        ok "a failure after the temp file exists still leaves no temp file"
+    else
+        fail "stranded: temp" "a half-written $stray survived"
+    fi
+    [ "$(cat "$d/prog")" = "original" ] \
+        || fail "stranded: destination" "the destination was modified by a failed install"
+}
+
 echo "==> scripts/lib.sh::install_exec"
 case1
 case2
 case3
+case4
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures failure(s)" >&2
