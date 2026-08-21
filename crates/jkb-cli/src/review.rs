@@ -430,9 +430,11 @@ fn credited_by(db: &Db, t: &crate::repo::RepoTask, branch: &str) -> Result<Credi
     // coming that this review has not seen, whatever it grafted before — so it is reported, never
     // credited. Asking the historical question ahead of this credited a task that landed, was
     // reopened for a must-fix, and had its fix committed in a session this branch has never seen:
-    // `reviewed=` was stamped, the task was moved to `needs_review` under somebody's feet, and
-    // `land` would then graft commits no review ever read. That is the one direction this check
-    // must not fail in.
+    // `reviewed=` was stamped for work this review never read, and the task was moved to
+    // `needs_review` under somebody's feet. Recording a false statement is the harm; that it also
+    // unblocks the gate is true only where the task had never been reviewed before, since
+    // `gate_with` asks whether a `reviewed=` exists and not whether it is current (D38 declines
+    // to enforce staleness deliberately).
     let target = db.read(move |conn| jkb_core::transition::land_target(conn, id))?;
     if target.as_deref() == Some(branch) {
         return Ok(Credit::LandsHereButHasNot);

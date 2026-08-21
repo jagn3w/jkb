@@ -2300,6 +2300,70 @@ fn undoing_a_close_is_not_reversed_by_the_next_close_merged() {
     );
 }
 
+/// A task **retargeted** to another batch is not credited by a review of the one it landed on
+/// before — the case that makes both of arm (c)'s conditions load-bearing.
+///
+/// Its sibling above drives `land_target == the reviewed branch`, which the ladder answers one
+/// arm earlier, so deleting `target.is_none()` left the whole suite green: the guard read as
+/// redundant, which is exactly how a later cleanup deletes it. Here the land target points at a
+/// *different* branch, so arm (c) is reached and its `target.is_none()` is the only thing
+/// standing between a review of `batch-a` and a task whose work has moved to `batch-b`.
+#[test]
+fn a_task_retargeted_to_another_batch_is_not_credited_by_the_old_one() {
+    let f = Fixture::new();
+    let t = f.add_task("retargeted");
+    let s = f.work(&t);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let first = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "a.txt", "w\n", "w");
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            s["branch"].as_str().unwrap(),
+            "--onto",
+            &first,
+        ])
+        .assert()
+        .success();
+
+    // Reopened, then aimed somewhere else entirely — not abandoned, so it still aims *somewhere*.
+    f.jkb()
+        .args(["--global", "task", "set", &t, "--status", "in_progress"])
+        .assert()
+        .success();
+    git(&f.repo, &["branch", "batch-b"]);
+    f.jkb()
+        .args(["task", "work", &t, "--onto", "batch-b"])
+        .assert()
+        .success();
+
+    f.add_finding("reviews/run-1", "something to fix");
+    let out = f
+        .jkb()
+        .args([
+            "task",
+            "review",
+            "record",
+            "--branch",
+            &first,
+            "--findings",
+            "reviews/run-1",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !text.contains("recorded review"),
+        "a review of {first} credited a task whose work has moved to batch-b: {text}"
+    );
+    assert_eq!(
+        f.status_of(&t),
+        "in_progress",
+        "it was moved to needs_review by a review of a branch it no longer aims at"
+    );
+}
+
 /// A review still credits work jkb grafted onto the branch, even after the session was abandoned.
 ///
 /// `credited_by` asks the **historical** question — did jkb ever graft this onto this branch —
@@ -2353,8 +2417,8 @@ fn a_review_credits_work_grafted_before_the_session_was_abandoned() {
 /// before — its fix is in a session that branch has never seen.
 ///
 /// The two halves are one rule, and asking them in the wrong order opens the worst hole here:
-/// crediting it stamps `reviewed=`, moves the task to `needs_review` under whoever is working in
-/// its session, and lets `jkb task land` graft commits no review ever read. So the present-tense
+/// crediting it records that a review read work it never read, and moves the task to
+/// `needs_review` under whoever is working in its session. So the present-tense
 /// question credits, the land target reports, and only a task aiming nowhere falls through to the
 /// historical question.
 #[test]

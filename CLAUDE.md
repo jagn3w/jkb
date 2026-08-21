@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and the Section 17 reference block below.
-- **589 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
+- **590 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
@@ -804,8 +804,11 @@ written separately in each reader, and they disagreed. `land_target` stopped at 
   `recorded()`. That last case is what `abandon` leaves — it retires the land target — and a graft
   does not un-happen, so a session abandoned after its work reached the branch is covered.
   Asking `recorded()` first credited a task that landed, was reopened for a must-fix, and had its
-  fix committed in a session the branch had never seen: `reviewed=` stamped, the task moved to
-  `needs_review` under a live session, and `land` would then graft commits no review read. Asking
+  fix committed in a session the branch had never seen — recording that a review read work it did
+  not read, and moving the task to `needs_review` under a live session. (It does **not** follow
+  that refusing the credit stops an unreviewed landing in general: `gate_with` checks only that a
+  `reviewed=` facet *exists*, never that it is current, and D38 declines to enforce staleness on
+  purpose. It stops one only where the task had never been reviewed at all.) Asking
   `live()` alone dropped the abandoned case into `Credit::Unrelated`, which the loop discards. The
   discard is right and stays: that loop walks every task in the repo, so reporting `Unrelated`
   would list most of the backlog on every run.
