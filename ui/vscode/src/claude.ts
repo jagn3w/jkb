@@ -16,6 +16,7 @@
 // `onStartupFinished` — a window nobody has clicked the jkb icon in still has a prompt to
 // deliver.
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -120,8 +121,10 @@ interface PendingPrompt {
  *   way to find an existing panel, so there is nothing to converge on. Not idempotent, pinned
  *   by a test so this stays true rather than becoming another claim nobody rechecked.
  *
- * What is load-bearing on all three: the handed-over prompt lands *unsent*, so no agent runs
- * without a keystroke from someone looking at the window it is in.
+ * The unsent property is **the extension surfaces only** (`window`, `here`): a prompt handed
+ * to a chat panel waits in its input, so no agent runs without a keystroke from someone
+ * looking at it. The terminal surface is the opposite — `sendText` executes — which is exactly
+ * why the duplicate guard above lives there and not on the others.
  */
 export async function launchClaude(
   context: vscode.ExtensionContext,
@@ -142,7 +145,9 @@ export async function launchClaude(
   if (here !== undefined && sameDirectory(here, worktree)) {
     // This window *is* the session, so there is nothing to ask and nothing to hand over.
     const failure = await openClaudeHere(prompt);
-    return failure === undefined ? { where: "here" } : unreachable(launcher, false, failure);
+    return failure === undefined
+      ? { where: "here" }
+      : unreachable(launcher, failure.missing, failure.cause);
   }
 
   try {
@@ -303,6 +308,19 @@ function directoryOf(options: object): string | undefined {
 }
 
 /**
+ * Why Claude Code could not be started, and whether it was simply absent.
+ *
+ * The two travel together because they come from one probe. Flattening them into a string made
+ * the receiving window pass `missing: false` unconditionally, so with the extension genuinely
+ * gone it advised abandoning `jkb.taskLauncher` — the exact inversion `missing` exists to
+ * prevent — while the clicking window, which probes `getExtension` itself, got it right.
+ */
+export interface Unreached {
+  readonly cause: string;
+  readonly missing: boolean;
+}
+
+/**
  * Claude Code was wanted and could not be started: fall back, or report, per the operator.
  *
  * One place decides, so the `extension` setting cannot be honoured on three of the four
@@ -326,23 +344,26 @@ function unreachable(launcher: Launcher, missing: boolean, cause: string): Launc
  * activates — and a prompt queued for that worktree would sit unread until the window was next
  * opened cold, then fire with a stale branch and land target.
  *
- * Watching the file is what makes the second click land where the user is now looking. Every
- * window watches, and each takes only its own folder's entry, so the writer does not deliver
- * to itself and a window with nothing waiting does not write (see `takePrompt`) — no storm.
+ * Watching is what makes the second click land where the user is now looking. Every window
+ * watches the same directory and wakes on any arrival, but a window only ever reads the one
+ * file named for its own folder — and takes it by `unlink`, touching no other entry. So the
+ * wake-everyone cost is a `readFileSync` that usually ENOENTs, and no window can disturb
+ * another's prompt.
  */
 export function watchQueuedPrompts(context: vscode.ExtensionContext): vscode.Disposable {
   void deliverQueuedPrompt(context);
 
-  const file = queueFile(context);
+  const dir = queueDir(context);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let watcher: fs.FSWatcher | undefined;
   try {
     // The directory may not exist until the first prompt is queued, and `fs.watch` on a
-    // missing path throws — so make it, then watch the directory rather than the file (an
-    // atomic rename replaces the inode, which a file watch would stop following).
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    watcher = fs.watch(path.dirname(file), (_event, name) => {
-      if (name !== null && name !== path.basename(file)) return;
+    // missing path throws — so make it first. Watching the directory rather than one file is
+    // also what survives the atomic rename each write ends with, which replaces the inode.
+    fs.mkdirSync(dir, { recursive: true });
+    watcher = fs.watch(dir, () => {
+      // Any arrival wakes us; whether it is *ours* is decided by `takePrompt`, which looks
+      // only at this folder's file. Filtering on the name here would duplicate that rule.
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => void deliverQueuedPrompt(context), 300);
     });
@@ -372,35 +393,63 @@ export async function deliverQueuedPrompt(
   if (folder === undefined) return;
   const pending = takePrompt(context, folder);
   if (!pending) return;
-  const failure = await openClaudeHere(pending.prompt);
-  if (failure === undefined) return;
 
-  // This is the same "Claude Code could not be reached" question `launchClaude` asks, one
-  // window over, and it goes through the same decision. It used to report and stop, which
-  // under `auto` withheld the terminal the policy promises — in the one window whose folder
-  // already *is* the worktree, so a terminal is trivially available — and under `extension`
-  // advised running `claude` by hand, the surface the operator ruled out.
-  const outcome = unreachable(taskLauncher(), false, failure);
-  if (outcome.where === "blocked") {
-    vscode.window.showErrorMessage(
-      `jkb: could not start Claude Code for ${pending.uid} (${failure}). ` +
-        (outcome.missing
-          ? "Install the Claude Code extension"
-          : 'Set jkb.taskLauncher to "auto" to fall back to a terminal') +
-        ", then click Work this task with Claude again.",
-    );
+  // The setting is read BEFORE the extension is touched, the same order `launchClaude` uses.
+  // Consulting it only on the failure path meant a prompt queued under `auto` and delivered
+  // after the operator switched to `terminal` arrived as a chat panel — the surface they ruled
+  // out, with no report. An explicit value is honoured or reported, never quietly swapped.
+  const launcher = taskLauncher();
+  if (launcher !== "terminal") {
+    const failure = await openClaudeHere(pending.prompt);
+    if (failure === undefined) return;
+
+    // The same "Claude Code could not be reached" question `launchClaude` asks, one window
+    // over, through the same decision. It used to report and stop, which under `auto` withheld
+    // the terminal the policy promises — in the one window whose folder already *is* the
+    // worktree — and under `extension` advised the surface the operator ruled out.
+    const outcome = unreachable(launcher, failure.missing, failure.cause);
+    if (outcome.where === "blocked") {
+      vscode.window.showErrorMessage(
+        `jkb: could not start Claude Code for ${pending.uid} (${failure.cause}). ` +
+          (outcome.missing
+            ? "Install the Claude Code extension"
+            : 'Set jkb.taskLauncher to "auto" to fall back to a terminal') +
+          ", then click Work this task with Claude again.",
+      );
+      return;
+    }
+    reportTerminal(startSessionTerminal(host, pending.session, folder, claudeCommand(pending.prompt)), failure);
     return;
   }
-  const arm = startSessionTerminal(
-    host,
-    pending.session,
-    folder,
-    claudeCommand(pending.prompt),
+  reportTerminal(
+    startSessionTerminal(host, pending.session, folder, claudeCommand(pending.prompt)),
+    undefined,
   );
+}
+
+/**
+ * Say what the terminal surface just did — the one wording both windows use.
+ *
+ * Two literals in two files had already drifted, in phrasing and in whether they carried the
+ * recovery advice at all, and the `shown` arm dropped the Claude Code failure entirely: with a
+ * persistently broken extension and a terminal left over from an earlier fallback, the user
+ * was told only that a terminal was shown, never that anything had failed.
+ */
+export function reportTerminal(arm: TerminalStart, fallback: Unreached | undefined): void {
+  const why = fallback
+    ? fallback.missing
+      ? " Install the Claude Code extension to work the session in its own window instead."
+      : ` Claude Code could not be started (${fallback.cause}).`
+    : "";
+  if (arm === "started") {
+    // Nothing to say when a terminal is what was asked for and one started.
+    if (!fallback) return;
+    vscode.window.showInformationMessage(`jkb: ran \`claude\` in a terminal instead.${why}`);
+    return;
+  }
   vscode.window.showInformationMessage(
-    arm === "started"
-      ? `jkb: could not start Claude Code (${failure}) — ran \`claude\` in a terminal instead.`
-      : "jkb: this session already has a `claude` terminal — showed it, and sent nothing.",
+    "jkb: this session already has a `claude` terminal — showed it, and sent nothing. If its " +
+      `agent has finished, start the next one in that terminal yourself.${why}`,
   );
 }
 
@@ -439,9 +488,11 @@ function shellQuote(s: string): string {
  * a swallowed `catch` throws away, leaving every failure to be reported as the one cause that
  * happens to have advice attached.
  */
-async function openClaudeHere(prompt: string): Promise<string | undefined> {
+async function openClaudeHere(prompt: string): Promise<Unreached | undefined> {
   const claude = vscode.extensions.getExtension(CLAUDE_EXTENSION_ID);
-  if (!claude) return "the Claude Code extension is not installed";
+  if (!claude) {
+    return { cause: "the Claude Code extension is not installed", missing: true };
+  }
   try {
     // Its commands are registered by `activate`, and this runs at startup, where the order
     // two extensions activate in is not ours to assume.
@@ -452,27 +503,63 @@ async function openClaudeHere(prompt: string): Promise<string | undefined> {
     await vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND, undefined, prompt);
     return undefined;
   } catch (e) {
-    return causeOf(e);
+    return { cause: causeOf(e), missing: false };
   }
 }
 
 // ---------------------------------------------------------------------------
-// The hand-off queue: one JSON file in global storage, keyed by worktree.
+// The hand-off queue: one file per waiting prompt, named for its worktree.
 // ---------------------------------------------------------------------------
+//
+// One file per entry, NOT one file holding a map. Every window watches this directory now, so
+// a shared map meant every window did a read-modify-write of one file on every delivery — and
+// the lost update that allows is an entry restored *after* it was delivered, which the window
+// then delivers a second time. Per-entry files make concurrent takes independent by
+// construction, the way `containment`'s primary key made two containers unrepresentable
+// (D35): there is no shared document to lose an update to, a take is one `unlink`, and the
+// "does a take have to write the file back?" question stops existing.
+//
+// There is no migration from the map format, deliberately. This branch has never landed, so
+// no on-disk queue exists anywhere that a released build wrote — the only cost of ignoring one
+// is a stale prompt from a hand-run development build, which is one click to recreate.
+
+/** Where the entries live. One directory, so a single watch covers every arrival. */
+function queueDir(context: vscode.ExtensionContext): string {
+  return path.join(context.globalStorageUri.fsPath, "pending");
+}
+
+/** An entry's file: named for the worktree it belongs to, so takes never collide. */
+function entryFile(context: vscode.ExtensionContext, key: string): string {
+  const name = crypto.createHash("sha1").update(key).digest("hex");
+  return path.join(queueDir(context), `${name}.json`);
+}
+
+/** What is written: the key rides along so the sweep can check it without parsing a name. */
+interface QueueEntry extends PendingPrompt {
+  readonly key: string;
+}
 
 function queuePrompt(
   context: vscode.ExtensionContext,
   worktree: string,
   pending: PendingPrompt,
 ): void {
-  const queue = readQueue(context);
   const key = directoryKey(worktree);
-  queue[key] = pending;
-  // `key` is exempt from the expiry sweep below. Without that, a worktree removed outside jkb
-  // — an interrupted land, a stray rm -rf — makes the sweep drop the very entry it was handed
-  // and return normally, so the launch reports "opening its window" having stored nothing.
-  // A store that discarded what it was given must not report success.
-  writeQueue(context, queue, key);
+  const file = entryFile(context, key);
+  const entry: QueueEntry = { ...pending, key };
+  try {
+    fs.mkdirSync(queueDir(context), { recursive: true });
+    // Written aside and renamed, so a window watching the directory never reads a half-written
+    // entry. The sweep runs first and never touches this key: a store that discarded what it
+    // was handed must not go on to report success.
+    const temp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(entry, null, 2));
+    fs.renameSync(temp, file);
+  } catch (e) {
+    // Queuing is the whole mechanism, so a failure here must not pass for a queued prompt.
+    throw new Error(`could not write ${file}: ${causeOf(e)}`);
+  }
+  sweepUndeliverable(context, key);
 }
 
 /** Remove and return the prompt queued for `dir`, if any. */
@@ -480,80 +567,60 @@ function takePrompt(
   context: vscode.ExtensionContext,
   dir: string,
 ): PendingPrompt | undefined {
-  const queue = readQueue(context);
-  const key = directoryKey(dir);
-  const pending = queue[key];
-  // Nothing here: return without writing. Every VS Code window now activates at startup and
-  // calls this, so writing anyway would make each of them a read-modify-write of one shared
-  // file — and the lost update that race allows is an already-delivered prompt written back.
-  // Pruning rides on genuine writes instead, which is enough: an entry whose worktree is gone
-  // is undeliverable whether or not it is still in the file.
-  if (!pending) return undefined;
-  delete queue[key];
+  const file = entryFile(context, directoryKey(dir));
+  let entry: QueueEntry | undefined;
   try {
-    writeQueue(context, queue);
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    entry = validEntry(parsed);
   } catch {
-    // The prompt is already in hand, and delivering it matters more than the bookkeeping.
-    // The cost of not clearing it is that the next window on this worktree starts Claude
-    // again — the same prompt for the same task, which is where the button leads anyway.
+    // Missing (the common case — most windows have nothing waiting) or unreadable. Either way
+    // there is nothing to deliver, and no window writes anything to find that out.
+    return undefined;
   }
-  return pending;
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    // Already gone, or unremovable. The prompt is in hand and delivering it matters more; the
+    // cost of a failed removal is one repeat, of the same prompt for the same task.
+  }
+  return entry;
 }
 
-function queueFile(context: vscode.ExtensionContext): string {
-  return path.join(context.globalStorageUri.fsPath, "pending-prompts.json");
+/** A parsed entry, or `undefined` if it is not one — the file is shared, external input. */
+function validEntry(parsed: unknown): QueueEntry | undefined {
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const e = parsed as Partial<QueueEntry>;
+  if (typeof e.uid !== "string" || typeof e.prompt !== "string") return undefined;
+  if (typeof e.session !== "string" || typeof e.key !== "string") return undefined;
+  return { uid: e.uid, prompt: e.prompt, session: e.session, key: e.key };
 }
 
-/** The queue as it is on disk — every window shares one file, so it is re-read each time. */
-function readQueue(context: vscode.ExtensionContext): Record<string, PendingPrompt> {
-  let parsed: unknown;
+/**
+ * Drop entries whose worktree is gone — `jkb task abandon`, or a landed session.
+ *
+ * That is the whole expiry rule and no clock decides it: the entries it removes are exactly
+ * the ones no window can ever open to collect. `keep` is the entry just written, which is
+ * never swept even if its worktree has vanished, so queuing cannot silently store nothing.
+ */
+function sweepUndeliverable(context: vscode.ExtensionContext, keep: string): void {
+  let names: string[];
   try {
-    parsed = JSON.parse(fs.readFileSync(queueFile(context), "utf8"));
+    names = fs.readdirSync(queueDir(context));
   } catch {
-    // Missing (nothing queued yet) or unreadable: either way there is no prompt to deliver,
-    // and the next write replaces the file wholesale.
-    return {};
+    return;
   }
-  if (typeof parsed !== "object" || parsed === null) return {};
-  const queue: Record<string, PendingPrompt> = {};
-  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-    const entry = value as Partial<PendingPrompt>;
-    if (typeof entry?.uid === "string" && typeof entry?.prompt === "string") {
-      // `session` post-dates the first release of this file, so an entry written by an older
-      // build has none. Default it from the worktree's last segment — the shape `jkb task
-      // work` builds — rather than dropping a prompt someone is waiting on.
-      const session = typeof entry.session === "string" ? entry.session : path.basename(key);
-      queue[key] = { uid: entry.uid, prompt: entry.prompt, session };
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(queueDir(context), name);
+    try {
+      const entry = validEntry(JSON.parse(fs.readFileSync(file, "utf8")));
+      if (entry === undefined || (entry.key !== keep && !fs.existsSync(entry.key))) {
+        fs.unlinkSync(file);
+      }
+    } catch {
+      // Best-effort housekeeping: an entry that cannot be read or removed is left alone
+      // rather than failing the click that happened to trigger the sweep.
     }
-  }
-  return queue;
-}
-
-function writeQueue(
-  context: vscode.ExtensionContext,
-  queue: Record<string, PendingPrompt>,
-  keep?: string,
-): void {
-  // A worktree that is gone — `jkb task abandon`, or a landed session — can never open a
-  // window, so its prompt can never be taken. That is the whole expiry rule: the entries
-  // that expire are exactly the undeliverable ones, and no clock decides it.
-  const live: Record<string, PendingPrompt> = {};
-  for (const [dir, pending] of Object.entries(queue)) {
-    if (dir === keep || fs.existsSync(dir)) live[dir] = pending;
-  }
-  const file = queueFile(context);
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    // Written aside and renamed: another window may be reading this file, and a half-written
-    // one would read as an empty queue and silently drop a prompt. Two windows writing in the
-    // same instant can still lose the earlier entry — untreated, because a write happens only
-    // on a click or on a window opening, and losing one costs a second click.
-    const temp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(live, null, 2));
-    fs.renameSync(temp, file);
-  } catch (e) {
-    // Queuing is the whole mechanism, so a failure here must not pass for a queued prompt.
-    throw new Error(`could not write ${file}: ${causeOf(e)}`);
   }
 }
 

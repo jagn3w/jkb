@@ -93,10 +93,11 @@ and `jkb.taskLauncher` — `auto` (default), `extension`, or `terminal`; see bel
     click shows the session's existing `claude` terminal and sends nothing, and says so. A
     second click that opens a window *focuses* the one already on that worktree (VS Code
     reuses a window per folder, measured), and since nothing activates in a focused window the
-    extension **watches** the prompt queue rather than only reading it at startup. Only the
-    session's own window is not idempotent — a Claude chat there is a fresh conversation by
-    design. What holds everywhere is that a handed-over prompt waits **unsent** until someone
-    presses enter.
+    extension **watches** the prompt queue rather than only reading it at startup — so the
+    prompt lands in the window you were just sent to. That means the *window* surface converges
+    on one window but still opens a fresh chat per click, as the session's own window does;
+    only the terminal surface is fully idempotent. On the extension surfaces a handed-over
+    prompt waits **unsent** until someone presses enter; the terminal surface runs it.
 - **Land this task**: runs `jkb task land` in a terminal — the gate is a build, so its
   output is watchable.
 

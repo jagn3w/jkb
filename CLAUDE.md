@@ -1320,9 +1320,9 @@ UX then lived. The extension is the better surface, and **`jkb.taskLauncher` let
 say so or not** (`auto` | `extension` | `terminal`): `auto` is the only value that substitutes
 one surface for the other, and the two explicit values are honoured or *reported*, never
 quietly swapped. One function (`unreachable`) turns a failure into either a fallback or a
-refusal — for the failures inside `launchClaude`. **`deliverQueuedPrompt` is a fifth path that
-does not go through it** and reports rather than falling back; that is a known, filed gap, not
-a property of the design. The extension forces the window: its panel
+refusal, and **every path goes through it — including the receiving window**, which reads the
+setting before it touches the extension rather than only on the way out of a failure. The
+extension forces the window: its panel
 derives a cwd from **`workspaceFolders[0]`** and takes no directory argument, so a chat opened
 from the repo's window would work the **main checkout** — the one thing a session exists to
 keep apart (D36). So the worktree has to *be* the window's folder. `vscode.openFolder` carries
@@ -1367,8 +1367,10 @@ until that window was next opened cold, then fired with a stale branch and land 
 receiving side therefore **watches** the queue (`watchQueuedPrompts`) rather than reading it
 once at startup. The **`here`** surface is genuinely not idempotent — `primaryEditor.open(
 undefined, …)` is a fresh conversation by design and Claude Code exposes no way to find an
-existing panel — which is pinned by a test rather than asserted in prose. What holds on all
-three: a handed-over prompt lands **unsent**. Residual: a `claude` in *another* window is
+existing panel — which is pinned by a test rather than asserted in prose. What holds on the two
+extension surfaces: a handed-over prompt lands **unsent**, so nothing runs without a keystroke.
+The terminal surface is the opposite — `sendText` executes — which is why the duplicate guard
+lives there. Residual: a `claude` in *another* window is
 invisible, `vscode.window.terminals` being per-window.
 
 **The lesson worth keeping is about evidence, not windows.** This one fact was reasoned about
