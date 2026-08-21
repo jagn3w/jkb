@@ -336,7 +336,7 @@ async function workTaskWithClaude(
   } else if (launch.where === "blocked") {
     // `jkb.taskLauncher` is "extension", so a terminal is not a substitute — it is the thing
     // the operator ruled out. The session is open either way and In Flight can open a shell.
-    reportBlocked(launch, `— the session is open at ${session.worktree}`);
+    reportBlocked(launch, `The session is open at ${session.worktree}.`);
   }
   vscode.window.setStatusBarMessage(
     `jkb: ${session.resumed ? "resumed" : "opened"} session ${session.session} on ${session.branch}` +

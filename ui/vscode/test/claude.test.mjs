@@ -11,16 +11,17 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 import * as esbuild from "esbuild";
 
 const here = import.meta.dirname;
 const stub = path.join(here, "vscode-stub.mjs");
-const bundle = path.join(
-  fs.mkdtempSync(path.join(os.tmpdir(), "jkb-claude-build-")),
-  "claude.mjs",
-);
+const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "jkb-claude-build-"));
+const bundle = path.join(buildDir, "claude.mjs");
+// The per-test homes are cleaned by `fresh`; this one is module-scope and was not, so every
+// run — every `pnpm run test`, every check.sh, every CI job — still left one tree behind.
+after(() => fs.rmSync(buildDir, { recursive: true, force: true }));
 
 await esbuild.build({
   entryPoints: [path.join(here, "..", "src", "claude.ts")],
@@ -53,8 +54,8 @@ const { state, reset } = await import(stub);
 /** A fresh repo, global storage and worktree factory, so no test can depend on another. */
 function fresh(ctx) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jkb-claude-"));
-  // Removed with the test that made it. Without this the suite leaves ~23 trees per run —
-  // 1721 of them had accumulated in TMPDIR over this branch's development.
+  // Removed with the test that made it. Without this the suite leaves one tree per test —
+  // 31 of them a run, and 1721 had accumulated in TMPDIR over this branch's development.
   ctx?.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const context = { globalStorageUri: { fsPath: path.join(home, "globalStorage") } };
   const queueDir = path.join(context.globalStorageUri.fsPath, "pending");
@@ -687,6 +688,9 @@ test('the receiving window refuses under "extension" and advises installing it',
   assert.equal(state.errors.length, 1);
   assert.match(state.errors[0], /Install the Claude Code extension/);
   assert.doesNotMatch(state.errors[0], /set jkb.taskLauncher/i);
+  // The caller's context clause is the only thing naming WHICH task failed; the shared
+  // template can drop it without any other assertion noticing.
+  assert.match(state.errors[0], /task:a/);
 });
 
 test("the receiving window falls back through the real vscode.window by default", async (ctx) => {
@@ -711,4 +715,68 @@ test("the receiving window falls back through the real vscode.window by default"
 
   await queueThenDeliver("TWO");
   assert.equal(created(), 1, "a second agent was started in the same worktree");
+});
+
+// ---------------------------------------------------------------------------
+// Round 7: the reportTerminal arms, measured to be unheld by any test.
+// ---------------------------------------------------------------------------
+
+test("the auto fallback tells the operator a chat was available", async (ctx) => {
+  const t = fresh(ctx);
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+
+  // The commonest non-happy path: auto, no extension. Deleting the install advice left the
+  // suite green, so the operator could silently lose the only hint that a chat surface exists.
+  reset(work);
+  state.claudeInstalled = false;
+  const log = [];
+  await deliverQueuedPrompt(t.context, host(log));
+  assert.equal(log.filter(([k]) => k === "created").length, 1);
+  assert.ok(
+    state.notices.some((m) => /Install the Claude Code extension/.test(m)),
+    state.notices.join(" | "),
+  );
+});
+
+test("a terminal-launcher delivery onto an existing terminal still says nothing was sent", async (ctx) => {
+  const t = fresh(ctx);
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+
+  // launcher: terminal has no fallback to report, so the only thing reportTerminal has to say
+  // on this path is the shown arm — and dropping the wrapper entirely left 41 tests green.
+  reset(work);
+  state.launcher = "terminal";
+  const log = [];
+  const existing = {
+    name: `claude: ${path.basename(work)}`,
+    creationOptions: { cwd: work },
+    show: () => log.push(["shown"]),
+  };
+  await deliverQueuedPrompt(t.context, host(log, [existing]));
+  assert.deepEqual(log, [["shown"]]);
+  assert.equal(state.notices.length, 1, "the shown arm reported nothing");
+});
+
+test("the shown arm says how to recover the prompt it did not deliver", async (ctx) => {
+  const t = fresh(ctx);
+  const work = t.worktree("task-a");
+  await launchClaude(t.context, first(work, "task:a", "PROMPT"));
+
+  reset(work);
+  const log = [];
+  const existing = {
+    name: `claude: ${path.basename(work)}`,
+    creationOptions: { cwd: work },
+    show: () => log.push(["shown"]),
+  };
+  state.launcher = "terminal";
+  await deliverQueuedPrompt(t.context, host(log, [existing]));
+  // The entry was consumed and nothing was sent, so the prompt is gone. Clicking again lands
+  // on this same arm, which is why the advice has to be to clear the terminal first.
+  assert.deepEqual(t.queue(), {});
+  const notice = state.notices.join(" | ");
+  assert.match(notice, /not delivered/);
+  assert.match(notice, /Close that terminal/);
 });

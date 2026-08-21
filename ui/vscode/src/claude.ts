@@ -412,7 +412,7 @@ export async function deliverQueuedPrompt(
     // worktree — and under `extension` advised the surface the operator ruled out.
     const outcome = unreachable(launcher, failure);
     if (outcome.where === "blocked") {
-      reportBlocked(outcome, `for ${pending.uid}`);
+      reportBlocked(outcome, `The task is ${pending.uid}.`);
       return;
     }
     reportTerminal(startSessionTerminal(host, pending.session, folder, claudeCommand(pending.prompt)), failure);
@@ -431,16 +431,17 @@ export async function deliverQueuedPrompt(
  * files, both had to be edited when `missing` arrived, and they came out differently worded.
  * `where` is the bit only the caller knows — which task, or which checkout is now sitting open.
  */
-export function reportBlocked(
-  blocked: { readonly cause: string; readonly missing: boolean },
-  where: string,
-): void {
+export function reportBlocked(blocked: Unreached, context: string): void {
+  // The template owns its whole first sentence and takes the caller's context as a trailing
+  // clause. Splicing free text into the middle left the cause parenthesis attached to a
+  // worktree path — "the session is open at /… (no window)." — so the shared wording read
+  // correctly for one of its two callers only.
   vscode.window.showErrorMessage(
-    `jkb: could not start Claude Code ${where} (${blocked.cause}). ` +
+    `jkb: could not start Claude Code (${blocked.cause}). ` +
       (blocked.missing
         ? "Install the Claude Code extension"
         : 'Set jkb.taskLauncher to "auto" to fall back to a terminal') +
-      ", then click Work this task with Claude again.",
+      `, then click Work this task with Claude again. ${context}`,
   );
 }
 
@@ -464,9 +465,15 @@ export function reportTerminal(arm: TerminalStart, fallback: Unreached | undefin
     vscode.window.showInformationMessage(`jkb: ran \`claude\` in a terminal instead.${why}`);
     return;
   }
+  // The shown arm SENDS NOTHING, and when it ran from a delivery the prompt that produced it
+  // has already been taken off the queue — so this click's prompt, with its own branch and
+  // land target, is gone. Its sibling `reportBlocked` ends with a recovery sentence and this
+  // did not. "Click again" is not the recovery here: a second click finds the same terminal
+  // and lands right back on this arm, so the recovery has to be to clear that terminal first.
   vscode.window.showInformationMessage(
-    "jkb: this session already has a `claude` terminal — showed it, and sent nothing. If its " +
-      `agent has finished, start the next one in that terminal yourself.${why}`,
+    "jkb: this session already has a `claude` terminal — showed it, and sent nothing, so this " +
+      "prompt was not delivered. Close that terminal (or exit its agent) and click Work this " +
+      `task with Claude again to start a fresh one.${why}`,
   );
 }
 
