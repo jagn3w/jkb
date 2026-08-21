@@ -1,0 +1,87 @@
+# Dev container: Claude Code unattended, behind two boundaries
+
+The "both layers" configuration of design D49 — a container **and** Claude Code's own sandbox
+nested inside it. `../scripts/auto-mode.sh` alone is the host-only configuration; this adds the
+one property the host cannot express.
+
+## What each layer is for
+
+| | Container | Nested sandbox (`sandbox.enabled`) |
+|---|---|---|
+| File access | **default-deny by the kernel** — an unmounted host path does not exist in here, so `Read`/`Glob`/`Grep`/`Edit` are bounded by the mount namespace, not by permission rules | default-deny for **Bash** via `denyRead`/`allowRead` |
+| Network | coarse: an IP allowlist (`init-firewall.sh`) | precise: a hostname allowlist at a proxy (`strictAllowlist`) |
+| Bash | not confined beyond the container | per-command confinement |
+| Fails when | the mount list is edited carelessly | it cannot start (missing deps, wrong container flags) |
+
+They fail for different reasons, which is the whole argument for running both. The container's
+egress filter exists precisely because the sandbox's is *inside the layer that might not start*:
+a container's default egress is unrestricted, so a container whose nested sandbox failed silently
+would be a **downgrade** on exfiltration versus the host.
+
+## The measurements this is built on
+
+Taken in a Linux VM (Ubuntu 26.04, kernel 7.0, Docker 29.7), with a no-container baseline first so
+a failure is attributable to the container profile and not the kernel.
+
+- **Stock Docker cannot run the nested sandbox.** `bwrap` fails at namespace creation as root
+  *and* as non-root, with `--cap-add SYS_ADMIN`, and with AppArmor disabled.
+- **The blocker is seccomp, and the fix is narrow.** Neither `--privileged` nor
+  `seccomp=unconfined` is needed: Docker's default profile plus an unconditional allow for 14
+  namespace/mount syscalls is sufficient (`generate-seccomp.sh`). Those syscalls are only
+  reachable *inside* the user namespace `bwrap` creates, where the process holds no privilege over
+  the host.
+- **Non-root is load-bearing, not hygiene.** With seccomp disabled entirely, *root* in a container
+  still cannot create a mount/net/pid namespace directly — only the `--unshare-user` variants
+  work. Non-root passes everything.
+
+## Using it
+
+Needs a container runtime on the host (Docker Desktop, OrbStack, colima, or Apple's `container`),
+which macOS does not ship. Then "Reopen in Container" in VS Code, or:
+
+```sh
+docker build -t jkb-dev .devcontainer
+./.devcontainer/verify.sh          # inside the container: assert it is what it claims
+```
+
+`setup.sh` runs on create: firewall first (the lifecycle is postCreate → postStart, so leaving it
+to `postStartCommand` would run the whole of create with open egress), then the posture, then
+`verify.sh`.
+
+## The mount list is the security boundary
+
+Everything absent from `devcontainer.json`'s `mounts` does not exist inside the container. Add to
+it one path at a time and never mount all of `$HOME`. `verify.sh` asserts the mounted set is
+**exactly** what is declared — exhaustively, from `/proc/self/mountinfo`, rather than by listing
+paths that ought to be absent, because a list of absences can never be complete.
+
+Only `~/.claude/.credentials.json` is mounted, never `~/.claude`: that directory holds
+`settings.json`, which **is** the posture, and a process the posture bounds must not be able to
+read or write the file that decides whether it is bounded at all.
+
+By default only **this repo** is mounted, not all of `~/repos` — the tightest useful default. To
+work across repos, change `workspaceMount` to bind `${localEnv:HOME}/repos` at
+`/home/vscode/repos` and add the extra paths to `verify.sh`'s expected set, deliberately.
+
+## Verifying it
+
+- `verify.sh` — inside the container: non-root, bwrap works, the mount set is exactly as declared,
+  `~/.claude` is not a host mount, egress is denied *and* the allowlist still works, posture intact.
+- `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
+  fails naming it. A guard nobody has watched fail is not a guard.
+- `check-config.sh` — host-side, no Docker, part of `./scripts/check.sh`. Its real job is the
+  seccomp profile: it is **generated**, and a generator whose patch no-ops against a changed
+  upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
+
+## What is still not established
+
+That the nested sandbox actually **engages** for a tool call. `bwrap` working is the mechanism,
+not the product, and the obvious credential-free probe does not discriminate: with
+`failIfUnavailable: true` in a stock container — where `bwrap` provably cannot run — Claude Code
+still reached the auth check rather than erroring at startup. So the sandbox is checked lazily, or
+auth precedes it. Settle it inside a live session with `printenv CLAUDE_CODE_SANDBOXED`, or
+`../scripts/auto-mode.sh probe`.
+
+Costs, stated: on macOS this is a Linux VM, so bind-mount IO is slower and the toolchain is the
+container's, not your host's. `~/repos` mounted is still writable and push-able — the container's
+win is bounded to what you did **not** mount.

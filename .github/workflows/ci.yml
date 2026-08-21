@@ -78,6 +78,10 @@ jobs:
       - name: auto-mode posture
         run: ./scripts/auto-mode-test.sh
 
+      # The dev container's static configuration checks (design D49): seconds, no Docker needed.
+      - name: devcontainer config
+        run: ./.devcontainer/check-config.sh
+
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny

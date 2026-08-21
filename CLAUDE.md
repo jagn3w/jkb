@@ -1303,6 +1303,56 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   egress and that socket overlay are unverified without a live session, and both fail in the safe
   direction.
 
+## Both layers: the dev container with the sandbox nested inside (D49)
+
+`.devcontainer/` is the "both" configuration of D48 — a container **and** Claude Code's own
+sandbox running inside it. `scripts/auto-mode.sh` alone is host-only; this adds the one property
+the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7, D49).
+
+- **The container's job is file access; the sandbox's job is everything else.** An unmounted host
+  path does not exist in the container, so the in-process tools (`Read`/`Glob`/`Grep`/`Edit`) are
+  bounded by the **mount namespace** rather than by permission rules — default-deny by the kernel,
+  which the deny-beats-allow rule model cannot express at all. The nested sandbox still supplies
+  per-command Bash confinement and the precise hostname allowlist.
+- **The egress firewall exists because `strictAllowlist` lives inside the layer that might not
+  start.** A container's default egress is unrestricted, so a container whose nested sandbox
+  failed silently would be a **downgrade** on exfiltration versus the host. `init-firewall.sh` is
+  coarse (IP-level) and independent; the sandbox is precise (hostname at a proxy) and in-process.
+  Coarse-but-independent under precise-but-fragile is the point — they fail for different reasons.
+  - **One allowlist, not two.** The firewall reads `.require.sandbox.network.allowedDomains` out
+    of `scripts/auto-mode-posture.json` — the same file the sandbox posture comes from. Two egress
+    lists that can disagree is how the tighter one ends up decorative.
+  - **A wildcard cannot be pinned to an IP**, so the firewall skips `*.rust-lang.org` and says so;
+    the posture therefore also names `static.rust-lang.org` concretely. Without that the toolchain
+    download is blocked by the coarse layer while looking allowlisted in the file.
+  - **It is installed into the image, root-owned, with sudoers granting exactly that one path.** A
+    script the agent can edit, that the agent can also `sudo`, is a root shell with extra steps.
+  - **Order:** the Dev Containers lifecycle is postCreate → postStart, so `setup.sh` raises the
+    firewall as its *first* act. Leaving it to `postStartCommand` alone would run the whole of
+    create — including a toolchain download — with open egress.
+- **Measured, not assumed** (Ubuntu 26.04 / kernel 7.0 / Docker 29.7, baseline outside a container
+  first): **stock Docker cannot run the nested sandbox** — `bwrap` fails at namespace creation as
+  root and as non-root, with `--cap-add SYS_ADMIN`, and with AppArmor off. The blocker is
+  **seccomp**, and neither `--privileged` nor `seccomp=unconfined` is required: the default profile
+  plus 14 namespace/mount syscalls suffices. **Non-root is load-bearing, not hygiene** — with
+  seccomp fully disabled, *root* in a container still cannot create a mount/net/pid namespace
+  directly.
+- **The mount list is the security boundary, and it is asserted exhaustively.** `verify.sh` reads
+  `/proc/self/mountinfo` and fails if the mounted set is anything other than what
+  `devcontainer.json` declares — rather than listing paths that ought to be absent, which is the
+  "enumerate the secrets" shape the host posture is *forced* into and the container is not. Only
+  `~/.claude/.credentials.json` is mounted, never `~/.claude`: that directory holds the posture,
+  and a process the posture bounds must not read or write the file deciding whether it is bounded.
+- **Every guard has been watched failing.** `mutate-verify.sh` breaks each property in turn — an
+  undeclared mount, the host `~/.claude` mounted, stock seccomp, no `NET_ADMIN`, running as root —
+  and requires `verify.sh` to fail naming it. It needs a Docker host, so it is an `#[ignore]`-class
+  test; `check-config.sh` is the host-side half that runs in `check.sh`, and its real job is the
+  **generated** seccomp profile: a patch that no-ops against a changed upstream yields a profile
+  that parses, applies, and leaves the sandbox unable to start.
+- **Still not established:** that the nested sandbox actually *engages* for a tool call. `bwrap`
+  working is the mechanism, not the product, and the credential-free probe does not discriminate
+  (see D48.7). Settle it in a live session with `printenv CLAUDE_CODE_SANDBOXED`.
+
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
 `/review-log` used to wrap the host's `/code-review`, which reports to the user rather than

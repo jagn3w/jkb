@@ -53,4 +53,11 @@ else
     echo "   (skipped: jq not installed — 'brew install jq'; CI runs this gate)"
 fi
 
+# The dev container's configuration (design D49). Static only — no Docker — so it belongs in the
+# gate; the parts that need a container are .devcontainer/verify.sh and mutate-verify.sh. It
+# mainly guards the GENERATED seccomp profile, whose patch silently no-opping against a changed
+# upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
+echo "==> devcontainer config"
+"$(dirname "$0")/../.devcontainer/check-config.sh"
+
 echo "All checks passed."

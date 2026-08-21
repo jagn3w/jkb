@@ -1,0 +1,67 @@
+{
+  "name": "jkb (sandboxed Claude)",
+  "build": { "dockerfile": "Dockerfile" },
+
+  // Non-root is load-bearing, not hygiene: measured, root in a container cannot create a
+  // mount/net/pid namespace directly even with seccomp off, so bubblewrap — and therefore Claude
+  // Code's nested sandbox — works only as a normal user.
+  "remoteUser": "vscode",
+
+  "runArgs": [
+    // Docker's default profile plus the 14 namespace/mount syscalls bubblewrap needs. NOT
+    // `seccomp=unconfined` and NOT `--privileged`: both were measured unnecessary, and each
+    // discards far more than it buys. See generate-seccomp.sh.
+    "--security-opt", "seccomp=${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json",
+
+    // For init-firewall.sh. Scoped to this container's own network namespace, so it cannot touch
+    // host networking.
+    "--cap-add=NET_ADMIN",
+
+    // Belt and braces on the thing containers are worst at: a fork bomb or runaway build in here
+    // should not take the machine down with it.
+    "--pids-limit", "4096"
+  ],
+
+  // THE MOUNT LIST IS THE SECURITY BOUNDARY. Everything absent from it does not exist inside the
+  // container, which is what makes file access default-deny by the kernel rather than by a
+  // permission rule. Add to it deliberately, one path at a time, and never mount all of $HOME.
+  //
+  // The paths are chosen so the SAME scripts/auto-mode-posture.json works here and on the host:
+  // it is written `~`-relative, and ~/repos and ~/.jkb land where it expects them.
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/vscode/repos/jkb,type=bind",
+  "workspaceFolder": "/home/vscode/repos/jkb",
+  "mounts": [
+    // The knowledge base. Shared with the host deliberately — it is the point of jkb — and every
+    // write to it goes through the audited writer-actor, so damage here is undoable.
+    "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
+
+    // ONLY the credential file, never all of ~/.claude. Mounting the directory would expose the
+    // host's settings.json — which IS the posture — to a process the posture is meant to bound.
+    // Read-only, and the sandbox additionally denies it to sandboxed commands.
+    "source=${localEnv:HOME}/.claude/.credentials.json,target=/home/vscode/.claude/.credentials.json,type=bind,readonly",
+
+    // Sessions, history and auto-memory persist in a named volume rather than on the host, so
+    // restarting the container does not lose context and the host stays untouched.
+    "source=jkb-claude-state,target=/home/vscode/.claude-state,type=volume",
+    // Cargo's registry cache, so a rebuild is not a re-download every time.
+    "source=jkb-cargo-registry,target=/home/vscode/.cargo/registry,type=volume"
+  ],
+
+  "containerEnv": {
+    // Keep the posture's own paths meaningful inside the container.
+    "JKB_DB": "/home/vscode/.jkb/jkb.db"
+  },
+
+  // Order matters, and the lifecycle is postCreate BEFORE postStart — so the firewall cannot be
+  // left to postStart alone or the whole of postCreate runs with unrestricted egress. setup.sh
+  // raises it as its first act; postStart raises it again because iptables rules live in the
+  // container's network namespace and do not survive a restart.
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "anthropic.claude-code"]
+    }
+  }
+}

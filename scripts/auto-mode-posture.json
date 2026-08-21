@@ -52,10 +52,13 @@
           "api.github.com",
           "codeload.github.com",
           "*.githubusercontent.com",
+          "objects.githubusercontent.com",
+          "raw.githubusercontent.com",
           "crates.io",
           "index.crates.io",
           "static.crates.io",
           "*.rust-lang.org",
+          "static.rust-lang.org",
           "registry.npmjs.org",
           "get.pnpm.io",
           "registry.ollama.ai"

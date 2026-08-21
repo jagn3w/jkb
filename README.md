@@ -274,6 +274,14 @@ that is not yours, add `--strict-mcp-config`.
 that can edit it can switch off its own sandbox. `~/.claude/projects/**` stays writable, so
 auto-memory still works.
 
+**Both layers, in a container.** `.devcontainer/` runs Claude Code's sandbox *nested inside* a
+dev container, which adds the one thing the host posture cannot express: file access that is
+default-deny **by the kernel**, since an unmounted host path does not exist in the container at
+all. It needs a container runtime (macOS ships none) and a non-root user plus a targeted seccomp
+profile — measured requirements, not folklore: stock Docker cannot run the nested sandbox, and
+neither `--privileged` nor `seccomp=unconfined` is needed. See
+[`.devcontainer/README.md`](.devcontainer/README.md).
+
 Stated consequence: with `~/.ssh` unreadable, `git push` over SSH fails inside the sandbox —
 the right default for an unattended agent. Set `JKB_AUTO_MODE_SSH_AGENT=1` before
 `auto-mode.sh run` to allow the ssh-agent *socket* instead: the agent can authenticate, but can
