@@ -359,13 +359,13 @@ pub fn record_undo(
 /// a landing is proof about the past, and every caller asks a present-tense question — *has this
 /// task landed?* Turning a history into a present-tense answer needs a rule for when an older row
 /// stops counting, and that rule was written separately in each reader. They disagreed:
-/// [`land_target`] stopped at `abandon`, [`landed`] stopped at nothing. So a task that landed and
+/// [`land_target`] stopped at `abandon`, the landing read stopped at nothing. So a task that landed and
 /// was then deliberately reopened still read as landed, and `jkb task close-merged` — which runs
 /// unattended from a `post-merge` hook, over every task at once — closed it again while somebody
 /// had a live session on it.
 ///
-/// **Asked of the status, not of a list of events.** The obvious repair was to give [`landed`]
-/// the same stop-list its sibling has, and that is the shape that caused this: a fourth private
+/// **Asked of the status, not of a list of events.** The obvious repair was to give the landing
+/// read the same stop-list its sibling has, and that is the shape that caused this: a fourth private
 /// rule for a fifth reader to get wrong, and one a new event has to be remembered and added to.
 /// A row already records where it moved the task, so "did anything put this back to work?" is
 /// answerable from the data — an event added later is covered without anybody remembering it.
@@ -529,7 +529,7 @@ pub fn note(
 /// because a guard about the *task* denied while the fact about the *work* stood.
 ///
 /// The merge queue is the case: it grafts a whole branch, and a task on it that still has open
-/// subtasks must not close (D34.4). Recording that as a `note` lost it — [`landed`] matches on
+/// subtasks must not close (D34.4). Recording that as a `note` lost it — [`landing`] matches on
 /// the event name, and no reader could tell that row from `jkb task start --onto` writing down
 /// where work is going to land. So the task was held, the subtask finished, and nothing ever
 /// re-ran the verb: `close-merged` then asked GitHub for a pull request that never existed,

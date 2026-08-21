@@ -2062,7 +2062,7 @@ fn the_row_and_the_command_talk_about_the_same_branch() {
 /// The merge queue grafts a whole branch locally, so there is no pull request to ask about — the
 /// recorded landing is the only evidence that exists. A group task with an open subtask is
 /// rightly not closed at that moment (D34.4), and the previous shape of this recorded the graft
-/// as a `note`: a row `transition::landed` does not match and nothing else reads, indistinguishable
+/// as a `note`: a row `transition::landing` does not match and nothing else reads, indistinguishable
 /// from the one `jkb task start --onto` writes. So the subtask finished, nothing re-ran the verb,
 /// and `close-merged` asked GitHub for a pull request that never existed. Held for ever.
 ///
