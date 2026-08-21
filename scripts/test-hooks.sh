@@ -339,7 +339,11 @@ STUB
     if [ -n "$1" ]; then
       mkdir -p "$(dirname "$1")" && echo x > "$1" && git add -A && git commit -qm two
     fi
-    PATH=/usr/bin:/bin sh "$pm_src" >/dev/null 2>&1
+    # Invoked the way git does — through the shebang — NOT with `sh`. Ubuntu's /bin/sh is dash,
+    # which rejects the hook's own `set -uo pipefail` and exits before doing anything: every case
+    # then reported "skipped", failing the eight "rebuilds" assertions loudly and passing the four
+    # "does not rebuild" ones VACUOUSLY, satisfied by a hook that never ran.
+    PATH=/usr/bin:/bin "$pm_src" >/dev/null 2>&1
   )
   [ -f "$d/invoked" ] && echo ran || echo skipped
   rm -rf "$d"
