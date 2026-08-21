@@ -516,17 +516,6 @@ pub fn landing(conn: &Connection, task: ItemId) -> Result<Landing> {
     })
 }
 
-/// The pull request recorded for this task, if any — the most recently recorded one.
-///
-/// # Errors
-/// Returns a database error if the query fails.
-pub fn pull_request(conn: &Connection, task: ItemId) -> Result<Option<i64>> {
-    Ok(history(conn, task)?
-        .into_iter()
-        .rev()
-        .find_map(|r| r.labels.pr_number))
-}
-
 /// Append a fact to a task's history without moving it.
 ///
 /// For something that *happened* but is not a transition — most importantly, learning which

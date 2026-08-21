@@ -4511,7 +4511,7 @@ fn cmd_task_why(db: &Db, uid: &str, json: bool) -> Result<()> {
 /// Errors if the uid does not resolve, or a read or write fails.
 fn cmd_task_pr(db: &Db, uid: &str, number: Option<i64>, json: bool) -> Result<()> {
     let id = resolve_task_uid(db, uid)?;
-    let recorded = db.read(move |conn| jkb_core::transition::pull_request(conn, id))?;
+    let recorded = db.read(move |conn| Ok(jkb_core::transition::landing(conn, id)?.pr_number()))?;
     let number = match number {
         Some(n) => Some(n),
         None if recorded.is_some() => recorded,
