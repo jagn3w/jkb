@@ -39,22 +39,31 @@ export function reset(folder) {
   state.calls = [];
   state.errors = [];
   state.notices = [];
+  window.terminals.length = 0;
 }
 
 /** A Uri-alike: `with` keeps scheme and authority, which is what the remote fix turns on. */
-const uri = (fsPath) => ({
-  scheme: state.scheme,
-  authority: state.authority,
-  fsPath,
-  path: fsPath,
-  with: (change) => uri(change.path ?? fsPath),
+const uri = (fields) => ({
+  ...fields,
+  fsPath: fields.path,
+  // Merges over the receiver, as vscode.Uri.with does. Re-reading the globals instead meant
+  // the remote test's scheme/authority assertions described the knobs it had set rather than
+  // what the code passed — a mutation that forced scheme back to "file" stayed green.
+  with: (change) => uri({ ...fields, ...change }),
 });
+const folderOf = (fsPath) =>
+  uri({ scheme: state.scheme, authority: state.authority, path: fsPath });
 
 export const workspace = {
   get workspaceFolders() {
-    return state.folder === undefined ? undefined : [{ uri: uri(state.folder) }];
+    return state.folder === undefined ? undefined : [{ uri: folderOf(state.folder) }];
   },
-  getConfiguration: () => ({ get: () => state.launcher }),
+  // Section and key are honoured. Returning `state.launcher` for anything meant the code could
+  // read `getConfiguration("claude").get("launcherTypo")` with all tests green — and in real
+  // VS Code that is `undefined`, silently putting every operator back on the default.
+  getConfiguration: (section) => ({
+    get: (key) => (section === "jkb" && key === "taskLauncher" ? state.launcher : undefined),
+  }),
 };
 
 export const extensions = {
@@ -93,7 +102,7 @@ export const commands = {
   },
 };
 
-export const Uri = { file: (fsPath) => ({ fsPath }) };
+export const Uri = { file: (fsPath) => uri({ scheme: "file", authority: "", path: fsPath }) };
 
 /** Real VS Code's Disposable: a class wrapping a teardown callback. */
 export class Disposable {
@@ -108,12 +117,19 @@ export const window = {
   // `deliverQueuedPrompt` defaults its terminal host to `vscode.window`, so the stub has to
   // BE one — without these the default parameter is a seam no test can reach, and the first
   // thing it did on a real fallback was throw.
+  // A REAL TerminalHost: created terminals join `terminals`, so the default-parameter path —
+  // the only one where sendText actually runs — is exercised against a populated list. While
+  // it stayed empty, a receiving window blind to its own terminal passed every test.
   terminals: [],
   createTerminal(options) {
     state.calls.push(["createTerminal", options.name, options.cwd]);
-    return {
+    const terminal = {
+      name: options.name,
+      creationOptions: { cwd: options.cwd },
       show: () => state.calls.push(["showTerminal", options.name]),
       sendText: (text) => state.calls.push(["sendText", text]),
     };
+    window.terminals.push(terminal);
+    return terminal;
   },
 };
