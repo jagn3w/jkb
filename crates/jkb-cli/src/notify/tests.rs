@@ -132,7 +132,7 @@ fn a_second_prompt_re_posts() {
 // the real `Request::perform` against a stub notifier that records its argv, because what this
 // code does is choose a command line and write a record.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A throwaway state directory plus a notifier that appends its argv to a file.
 struct Fixture {
@@ -202,28 +202,13 @@ impl Drop for Fixture {
     }
 }
 
-fn with_state_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
-    // `Remember` writes under the state dir, which is read from the environment. Tests in one
-    // binary share it, so this is set and restored around the call rather than left behind.
-    let previous = std::env::var("JKB_NOTIFY_STATE").ok();
-    std::env::set_var("JKB_NOTIFY_STATE", dir);
-    let out = body();
-    match previous {
-        Some(v) => std::env::set_var("JKB_NOTIFY_STATE", v),
-        None => std::env::remove_var("JKB_NOTIFY_STATE"),
-    }
-    out
-}
-
 /// Posting records the tool, so a later `PostToolUse` can tell its own prompt from a concurrent
 /// one — and the record names the owner, which is the only thing `sweep` can ask about liveness.
 #[test]
 fn posting_records_the_tool_and_the_owner() {
     let f = Fixture::new("post");
     let req = f.request(NotifEvent::Needed, "s1");
-    with_state_dir(&f.dir, || {
-        req.perform(&[NotifEffect::Post, NotifEffect::Remember]);
-    });
+    req.perform(&[NotifEffect::Post, NotifEffect::Remember]);
     assert_eq!(
         f.calls(),
         "post --id jkb-claude-s1 --title Claude Code --subtitle wt --body Claude needs your permission to use Bash"
@@ -241,13 +226,11 @@ fn posting_records_the_tool_and_the_owner() {
 #[test]
 fn withdrawing_clears_the_record() {
     let f = Fixture::new("withdraw");
-    with_state_dir(&f.dir, || {
-        f.request(NotifEvent::Needed, "s1")
-            .perform(&[NotifEffect::Remember]);
-        assert!(f.marker("s1").is_some());
-        f.request(NotifEvent::ToolFinished, "s1")
-            .perform(&[NotifEffect::Withdraw, NotifEffect::Forget]);
-    });
+    f.request(NotifEvent::Needed, "s1")
+        .perform(&[NotifEffect::Remember]);
+    assert!(f.marker("s1").is_some());
+    f.request(NotifEvent::ToolFinished, "s1")
+        .perform(&[NotifEffect::Withdraw, NotifEffect::Forget]);
     assert_eq!(f.calls(), "remove --id jkb-claude-s1");
     assert!(f.marker("s1").is_none(), "the record is gone");
 }
@@ -257,7 +240,7 @@ fn withdrawing_clears_the_record() {
 #[test]
 fn the_decision_and_the_effects_agree_about_a_concurrent_tool() {
     let f = Fixture::new("concurrent");
-    with_state_dir(&f.dir, || {
+    {
         f.request(NotifEvent::Needed, "s1")
             .perform(&[NotifEffect::Remember]);
 
@@ -270,7 +253,7 @@ fn the_decision_and_the_effects_agree_about_a_concurrent_tool() {
 
         req.finished_tool = "Bash".to_owned();
         req.perform(machine().apply(&req.ctx(), req.event).effects());
-    });
+    }
     assert_eq!(f.calls(), "remove --id jkb-claude-s1");
     assert!(f.marker("s1").is_none());
 }
@@ -315,13 +298,7 @@ fn the_sweep_spares_everything_it_cannot_prove_dead() {
     .expect("live");
     std::fs::write(f.dir.join("unknown"), "Bash\n\n").expect("unknown");
 
-    let previous = std::env::var("JKB_NOTIFIER").ok();
-    std::env::set_var("JKB_NOTIFIER", &f.notifier);
-    with_state_dir(&f.dir, super::sweep);
-    match previous {
-        Some(v) => std::env::set_var("JKB_NOTIFIER", v),
-        None => std::env::remove_var("JKB_NOTIFIER"),
-    }
+    super::sweep_in(&f.dir, Some(&f.notifier));
 
     assert_eq!(f.calls(), "remove --id jkb-claude-dead");
     assert!(
@@ -336,4 +313,34 @@ fn the_sweep_spares_everything_it_cannot_prove_dead() {
         f.marker("unknown").is_some(),
         "an unprovable owner keeps its record: Unknown refuses"
     );
+}
+
+/// The banner is the path that runs when the notifier is unusable, and its script is built by
+/// string concatenation out of Claude's own message text — which can carry every character that
+/// ends an `AppleScript` string early. Getting it wrong means no notification at all, silently.
+#[test]
+fn the_banner_script_escapes_and_folds() {
+    let script = super::banner_script("say \"hi\" \\ now\nplease", "wt");
+    assert_eq!(
+        script,
+        r#"display notification "say \"hi\" \\ now please" with title "Claude Code" subtitle "wt""#
+    );
+
+    // ...and checked against a real compiler where there is one, rather than only against our own
+    // idea of the grammar. Absent off macOS, so the suite skips it there.
+    if std::process::Command::new("osacompile")
+        .arg("-h")
+        .output()
+        .is_ok()
+    {
+        let out = std::process::Command::new("osacompile")
+            .args(["-o", "/dev/null", "-e", &script])
+            .output()
+            .expect("osacompile runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

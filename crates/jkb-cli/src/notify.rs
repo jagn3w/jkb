@@ -567,7 +567,12 @@ impl Request {
                 NotifEffect::Remember => {
                     let tool = self.prompted_tool.clone().unwrap_or_default();
                     let owner = std::os::unix::process::parent_id();
-                    if std::fs::create_dir_all(state_dir()).is_ok() {
+                    // Beside the marker this request already holds — NOT `state_dir()` again.
+                    // Re-reading the global here made the write and the path it was written for
+                    // two different answers to one question, and made every test that exercised
+                    // it mutate process-wide state while the others ran.
+                    let dir = self.marker.parent().unwrap_or(std::path::Path::new("."));
+                    if std::fs::create_dir_all(dir).is_ok() {
                         let _ = std::fs::write(&self.marker, format!("{tool}\n{owner}\n"));
                     }
                 }
@@ -594,19 +599,27 @@ fn event_for(name: &str) -> Option<NotifEvent> {
 /// folded because `AppleScript` has no escape for one inside a string literal, so one would end
 /// the statement mid-string.
 fn banner(message: &str, subtitle: &str) {
+    let _ = Proc::new("osascript")
+        .args(["-e", &banner_script(message, subtitle)])
+        .output();
+}
+
+/// The `AppleScript` a banner runs, as a value so it can be compiled in a test rather than only
+/// fired and hoped for. The shell version was checked with `osacompile`; that coverage came back
+/// here when the code did.
+fn banner_script(message: &str, subtitle: &str) -> String {
     let quote = |s: &str| {
-        let s: String = s
+        let folded: String = s
             .chars()
             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
             .collect();
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        format!("\"{}\"", folded.replace('\\', "\\\\").replace('"', "\\\""))
     };
-    let script = format!(
+    format!(
         "display notification {} with title \"Claude Code\" subtitle {}",
         quote(message),
         quote(subtitle)
-    );
-    let _ = Proc::new("osascript").args(["-e", &script]).output();
+    )
 }
 
 /// Is the session that posted this still running? By owner-existence, never by age (D27).
@@ -631,11 +644,17 @@ fn session_alive(rec: &Record) -> Fact {
 /// other event is scoped to a session id that will never occur again, so without this an
 /// Alerts-style notification — which waits for ever by design — sits on screen naming a session
 /// that no longer exists.
+fn sweep() {
+    sweep_in(&state_dir(), notifier_path().as_deref());
+}
+
+/// The sweep proper, over a stated directory and notifier — so it is drivable without touching
+/// the environment, which is both testable and one less global read.
 ///
 /// It goes through [`Machine::reconcile`] rather than calling the guard itself, so two conditions
 /// that both applied would be **reported** rather than resolved by whichever arm ran first.
-fn sweep() {
-    let Ok(entries) = std::fs::read_dir(state_dir()) else {
+fn sweep_in(dir: &std::path::Path, notifier: Option<&std::path::Path>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let machine = machine();
@@ -655,7 +674,7 @@ fn sweep() {
             finished_tool: String::new(),
             message: String::new(),
             subtitle: String::new(),
-            notifier: notifier_path(),
+            notifier: notifier.map(std::path::Path::to_path_buf),
             recorded: None,
         };
         let ctx = NotifCtx {
