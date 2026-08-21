@@ -632,3 +632,29 @@ test("the shown arm still reports why Claude Code failed", async () => {
   // Showing a terminal must not swallow the fact that the extension is broken.
   assert.ok(state.notices.some((m) => /refused|could not/i.test(m)), state.notices.join(" | "));
 });
+
+test("the Claude extension is activated before its command is used", async () => {
+  const t = fresh();
+  const work = t.worktree("task-a");
+  reset(work);
+  // `onStartupFinished` activates jkb-explorer and Claude Code concurrently, and the order is
+  // not ours to assume: until Claude Code's activate() has run, its command is unregistered.
+  state.claudeActive = false;
+
+  assert.deepEqual(await launchClaude(t.context, first(work, "task:a", "PROMPT")), {
+    where: "here",
+  });
+  assert.deepEqual(state.calls, [
+    ["activate", "anthropic.claude-code"],
+    ["claude-vscode.primaryEditor.open", undefined, "PROMPT"],
+  ]);
+});
+
+test("a window with no workspace folder delivers nothing and does not throw", async () => {
+  const t = fresh();
+  // The empty window `onStartupFinished` now activates in — the only case that reaches
+  // deliverQueuedPrompt's `folder === undefined` guard.
+  reset(undefined);
+  await deliverQueuedPrompt(t.context);
+  assert.deepEqual(state.calls, []);
+});
