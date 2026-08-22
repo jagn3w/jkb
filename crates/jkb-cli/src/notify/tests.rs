@@ -94,7 +94,11 @@ fn an_unusable_notifier_falls_back_to_a_banner() {
         c.notifier_usable = fact;
         let out = m.apply(&c, NotifEvent::Needed);
         assert_eq!(out.state(), NotifState::Absent, "{fact:?}");
-        assert_eq!(out.effects(), &[NotifEffect::Banner], "{fact:?}");
+        assert_eq!(
+            out.effects(),
+            &[NotifEffect::Withdraw, NotifEffect::Banner, NotifEffect::Forget],
+            "the destination is `absent`, so the record must not be left saying otherwise: {fact:?}"
+        );
     }
 }
 
@@ -181,6 +185,9 @@ impl Fixture {
             message: "Claude needs your permission to use Bash".to_owned(),
             subtitle: "wt".to_owned(),
             notifier: Some(self.notifier.clone()),
+            // A process that certainly exists, so a record written here is one the sweep will
+            // correctly leave alone — the property the old assertion could not see.
+            owner: std::process::id().to_string(),
         }
     }
 
@@ -208,7 +215,8 @@ impl Drop for Fixture {
 fn posting_records_the_tool_and_the_owner() {
     let f = Fixture::new("post");
     let req = f.request(NotifEvent::Needed, "s1");
-    req.perform(&[NotifEffect::Post, NotifEffect::Remember]);
+    req.perform(&[NotifEffect::Post, NotifEffect::Remember])
+        .expect("post and remember");
     assert_eq!(
         f.calls(),
         "post --id jkb-claude-s1 --title Claude Code --subtitle wt --body Claude needs your permission to use Bash"
@@ -216,9 +224,19 @@ fn posting_records_the_tool_and_the_owner() {
     let record = f.marker("s1").expect("a record");
     let mut lines = record.lines();
     assert_eq!(lines.next(), Some("Bash"));
-    assert!(
-        lines.next().is_some_and(|p| p.parse::<u32>().is_ok()),
-        "the record names an owner pid: {record:?}"
+
+    // The owner must be a process that is actually ALIVE. Asserting only that it parses was
+    // satisfied by the shim's own already-dead bash pid, which is how a wrong owner read as
+    // covered while the sweep withdrew live sessions' prompts.
+    let owner = lines.next().expect("an owner").to_owned();
+    let rec = super::Record {
+        tool: "Bash".to_owned(),
+        owner,
+    };
+    assert_eq!(
+        super::session_alive(&rec),
+        Fact::Yes,
+        "the recorded owner is alive: {record:?}"
     );
 }
 
@@ -227,10 +245,12 @@ fn posting_records_the_tool_and_the_owner() {
 fn withdrawing_clears_the_record() {
     let f = Fixture::new("withdraw");
     f.request(NotifEvent::Needed, "s1")
-        .perform(&[NotifEffect::Remember]);
+        .perform(&[NotifEffect::Remember])
+        .expect("remember");
     assert!(f.marker("s1").is_some());
     f.request(NotifEvent::ToolFinished, "s1")
-        .perform(&[NotifEffect::Withdraw, NotifEffect::Forget]);
+        .perform(&[NotifEffect::Withdraw, NotifEffect::Forget])
+        .expect("withdraw and forget");
     assert_eq!(f.calls(), "remove --id jkb-claude-s1");
     assert!(f.marker("s1").is_none(), "the record is gone");
 }
@@ -242,17 +262,18 @@ fn the_decision_and_the_effects_agree_about_a_concurrent_tool() {
     let f = Fixture::new("concurrent");
     {
         f.request(NotifEvent::Needed, "s1")
-            .perform(&[NotifEffect::Remember]);
+            .perform(&[NotifEffect::Remember])
+            .expect("remember");
 
         let mut req = f.request(NotifEvent::ToolFinished, "s1");
         req.recorded = super::Record::read(&f.dir.join("s1"));
         req.finished_tool = "Read".to_owned();
-        req.perform(machine().apply(&req.ctx(), req.event).effects());
+        let _ = req.perform(machine().apply(&req.ctx(), req.event).effects());
         assert_eq!(f.calls(), "", "a different tool must withdraw nothing");
         assert!(f.marker("s1").is_some(), "and must not clear the record");
 
         req.finished_tool = "Bash".to_owned();
-        req.perform(machine().apply(&req.ctx(), req.event).effects());
+        let _ = req.perform(machine().apply(&req.ctx(), req.event).effects());
     }
     assert_eq!(f.calls(), "remove --id jkb-claude-s1");
     assert!(f.marker("s1").is_none());
@@ -342,5 +363,94 @@ fn the_banner_script_escapes_and_folds() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+/// **The plan-shape rule, over every plan the table can produce.** Screen effects before record
+/// effects, so a plan that stops part-way always leaves the record describing something still on
+/// screen — recoverable — and never the reverse, where the record is gone and nothing remembers
+/// the notification exists. A rule each plan had to remember would drift; this walks them.
+#[test]
+fn plans_change_the_screen_before_the_record() {
+    let m = machine();
+    let facts = [Fact::Yes, Fact::No, Fact::Unknown];
+    for &at in <NotifState as jkb_fsm::State>::ALL {
+        for &event in <NotifEvent as jkb_fsm::Event>::ALL {
+            for usable in facts {
+                for matches in facts {
+                    for named in [true, false] {
+                        let c = NotifCtx {
+                            at,
+                            notifier_usable: usable,
+                            tool_named: named,
+                            tool_matches: matches,
+                            session_alive: Fact::No,
+                        };
+                        let effects = m.apply(&c, event).effects().to_vec();
+                        let first_record =
+                            effects.iter().position(|e| !NotifEffect::touches_screen(e));
+                        let last_screen = effects.iter().rposition(NotifEffect::touches_screen);
+                        if let (Some(r), Some(sc)) = (first_record, last_screen) {
+                            assert!(
+                                sc < r,
+                                "{at:?}/{event:?} plans a screen effect after a record one: \
+                                 {effects:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A plan that cannot be carried out stops, rather than applying the half it can. With no
+/// notifier the withdrawal is impossible, so the record — the only thing that remembers the
+/// notification exists — must survive for the next event to retry.
+#[test]
+fn a_plan_that_cannot_be_carried_out_keeps_the_record() {
+    let f = Fixture::new("failfast");
+    f.request(NotifEvent::Needed, "s1")
+        .perform(&[NotifEffect::Remember])
+        .expect("remember");
+
+    let mut req = f.request(NotifEvent::SessionGone, "s1");
+    req.notifier = None;
+    let stopped = req.perform(&[NotifEffect::Withdraw, NotifEffect::Forget]);
+
+    assert_eq!(
+        stopped,
+        Err(NotifEffect::Withdraw),
+        "it stops at the impossible effect"
+    );
+    assert!(
+        f.marker("s1").is_some(),
+        "and does NOT go on to delete the record that is the only route back"
+    );
+}
+
+/// Exactly one hook event drives the sweep, and `sweep_event_name` names *that* entry.
+///
+/// Its `map_or` default would otherwise reinstate the literal `"SessionStart"` when the table
+/// stopped containing it — a hardcoded name reappearing exactly where the point was to remove it.
+#[test]
+fn the_sweep_event_is_the_one_the_table_names() {
+    let sweepers: Vec<&str> = super::HOOK_EVENTS
+        .iter()
+        .filter(|(_, e)| e.is_none())
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        sweepers.len(),
+        1,
+        "exactly one event drives the sweep: {sweepers:?}"
+    );
+    assert_eq!(super::sweep_event_name(), sweepers[0]);
+
+    // ...and every other entry maps to a machine event, so a name in the table is never inert.
+    for (name, event) in super::HOOK_EVENTS {
+        if event.is_some() {
+            assert_eq!(super::event_for(name), *event, "{name}");
+        }
     }
 }

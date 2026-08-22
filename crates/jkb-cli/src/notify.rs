@@ -106,6 +106,15 @@ impl Event for NotifEvent {
 /// Something the caller must perform. Produced *with* the move, as one value, so half a
 /// transition cannot be applied — clearing the record without withdrawing, or withdrawing
 /// without clearing, are both real defects from this feature's history.
+///
+/// Each effect changes **the screen** or **the record**, and that split carries a rule: within a
+/// plan, every screen effect comes before every record effect, and [`Request::perform`] stops at
+/// the first one it cannot carry out. Together those mean a partly-applied plan always leaves the
+/// record describing something that is still on screen — recoverable, because the next event
+/// tries again — and never the reverse, which is unrecoverable: the record is the only thing that
+/// remembers a notification exists. `plans_change_the_screen_before_the_record` walks every plan
+/// the table can produce and holds it to that, so it is a property of the machine rather than a
+/// rule each plan has to remember.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifEffect {
     /// Post (or replace) this session's notification through the notifier bundle.
@@ -118,6 +127,17 @@ pub enum NotifEffect {
     Remember,
     /// Forget that record.
     Forget,
+}
+
+impl NotifEffect {
+    /// Whether this effect changes what the user can see, as opposed to what we remember.
+    ///
+    /// Read by `plans_change_the_screen_before_the_record`, which is where the ordering rule is
+    /// enforced — the production path relies on the rule holding, not on asking per effect.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn touches_screen(&self) -> bool {
+        matches!(self, Self::Post | Self::Withdraw | Self::Banner)
+    }
 }
 
 /// What a guard reads. The state lives **in here** and is read out via [`Stateful`], never passed
@@ -166,11 +186,22 @@ fn needed_dest(c: &NotifCtx) -> Option<NotifState> {
 }
 
 /// What a `Needed` does: post and record, or fall back to a banner nobody can withdraw.
+///
+/// The fallback ends in `Forget` because its destination is `Absent`, and a destination the
+/// record contradicts is the divergence this whole design is built to avoid: arriving here from
+/// `AwaitingTool` — the notifier stopped being usable between one prompt and the next — used to
+/// leave the record saying `awaiting_tool` while the machine reported `absent`, so nothing would
+/// ever withdraw the notification still on screen. `Withdraw` leads because `remove` works on a
+/// notifier that is merely unauthorized, and screen effects precede record effects.
 fn needed_plan(c: &NotifCtx) -> Vec<NotifEffect> {
     if c.notifier_usable.is_yes() {
         vec![NotifEffect::Post, NotifEffect::Remember]
     } else {
-        vec![NotifEffect::Banner]
+        vec![
+            NotifEffect::Withdraw,
+            NotifEffect::Banner,
+            NotifEffect::Forget,
+        ]
     }
 }
 
@@ -369,6 +400,12 @@ use crate::NotifyCmd;
 /// If stdin cannot be read or does not parse as a hook payload.
 pub fn run(cmd: &NotifyCmd) -> Result<()> {
     match cmd {
+        NotifyCmd::Events => {
+            for (name, _) in HOOK_EVENTS {
+                println!("{name}");
+            }
+            Ok(())
+        }
         NotifyCmd::Plan => plan(),
         NotifyCmd::Hook => hook(),
         NotifyCmd::Sweep => {
@@ -457,11 +494,19 @@ struct Request {
     message: String,
     subtitle: String,
     notifier: Option<PathBuf>,
+    /// The process whose existence answers "is this session still alive?" — resolved once, here
+    /// at the edge, so nothing below reads the environment for it.
+    owner: String,
 }
 
 /// The per-session record: the tool the prompt named, and the process to ask about liveness.
 ///
-/// The owner is the hook's **parent** — Claude Code itself, since the shim `exec`s into `jkb`.
+/// The owner is handed over by the shim (`JKB_HOOK_OWNER`), which measurement shows is the
+/// `claude` process itself. **`jkb` cannot ask for it**: its own parent is the shim, a bash script
+/// that exits milliseconds later, so recording that made every record read as *provably dead* and
+/// the next session's sweep withdrew a live session's pending prompt — the exact harm this
+/// feature exists to prevent.
+///
 /// Liveness is by owner-existence, never by age, which is D27's rule for claims and holds for the
 /// same reason here: a paused-but-alive session must keep the notification it is waiting on. A
 /// recycled pid reads as alive, which leaves an orphan up — the safe direction.
@@ -512,6 +557,7 @@ impl Request {
             finished_tool: field("tool_name"),
             subtitle: cwd.rsplit('/').next().unwrap_or_default().to_owned(),
             notifier: notifier_path(),
+            owner: owner_id(),
             marker,
             message,
         }))
@@ -545,54 +591,116 @@ impl Request {
         }
     }
 
-    /// Carry out a plan. Every step is best-effort and silent: a hook must not disturb the
-    /// session, and there is nowhere for a complaint to go that is not the transcript.
-    fn perform(&self, effects: &[NotifEffect]) {
+    /// Carry out a plan, **stopping at the first effect that could not be carried out**.
+    ///
+    /// It used to skip what it could not do and continue, which is performing half a transition —
+    /// the thing the plan-as-one-value design exists to prevent. Concretely: with no notifier,
+    /// `Withdraw` was skipped and `Forget` still ran, deleting the only record that could ever
+    /// bring that notification down. Stopping instead leaves the record intact for the next event
+    /// to retry, and the screen-before-record ordering makes that the *only* way a plan can be
+    /// left partly applied.
+    ///
+    /// Silent either way: a hook must not disturb the session, and there is nowhere for a
+    /// complaint to go that is not the transcript. The returned effect is for tests and `plan`.
+    fn perform(&self, effects: &[NotifEffect]) -> Result<(), NotifEffect> {
         for effect in effects {
             match effect {
                 NotifEffect::Post => {
-                    if let Some(bin) = &self.notifier {
-                        let _ = Proc::new(bin)
-                            .args(["post", "--id", &self.id, "--title", "Claude Code"])
-                            .args(["--subtitle", &self.subtitle, "--body", &self.message])
-                            .output();
+                    let bin = self.notifier.as_ref().ok_or(NotifEffect::Post)?;
+                    let ok = Proc::new(bin)
+                        .args(["post", "--id", &self.id, "--title", "Claude Code"])
+                        .args(["--subtitle", &self.subtitle, "--body", &self.message])
+                        .output()
+                        .is_ok_and(|o| o.status.success());
+                    if !ok {
+                        return Err(NotifEffect::Post);
                     }
                 }
                 NotifEffect::Withdraw => {
-                    if let Some(bin) = &self.notifier {
-                        let _ = Proc::new(bin).args(["remove", "--id", &self.id]).output();
+                    let bin = self.notifier.as_ref().ok_or(NotifEffect::Withdraw)?;
+                    let ok = Proc::new(bin)
+                        .args(["remove", "--id", &self.id])
+                        .output()
+                        .is_ok_and(|o| o.status.success());
+                    if !ok {
+                        return Err(NotifEffect::Withdraw);
                     }
                 }
                 NotifEffect::Banner => banner(&self.message, &self.subtitle),
                 NotifEffect::Remember => {
                     let tool = self.prompted_tool.clone().unwrap_or_default();
-                    let owner = std::os::unix::process::parent_id();
+                    let owner = &self.owner;
                     // Beside the marker this request already holds — NOT `state_dir()` again.
                     // Re-reading the global here made the write and the path it was written for
                     // two different answers to one question, and made every test that exercised
                     // it mutate process-wide state while the others ran.
                     let dir = self.marker.parent().unwrap_or(std::path::Path::new("."));
-                    if std::fs::create_dir_all(dir).is_ok() {
-                        let _ = std::fs::write(&self.marker, format!("{tool}\n{owner}\n"));
-                    }
+                    std::fs::create_dir_all(dir).map_err(|_| NotifEffect::Remember)?;
+                    std::fs::write(&self.marker, format!("{tool}\n{owner}\n"))
+                        .map_err(|_| NotifEffect::Remember)?;
                 }
-                NotifEffect::Forget => {
-                    let _ = std::fs::remove_file(&self.marker);
-                }
+                NotifEffect::Forget => match std::fs::remove_file(&self.marker) {
+                    Ok(()) => {}
+                    // Already gone is the outcome Forget wanted.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(NotifEffect::Forget),
+                },
             }
         }
+        Ok(())
     }
 }
 
-fn event_for(name: &str) -> Option<NotifEvent> {
-    match name {
-        "Notification" => Some(NotifEvent::Needed),
-        "PostToolUse" => Some(NotifEvent::ToolFinished),
-        "UserPromptSubmit" => Some(NotifEvent::UserActed),
-        "Stop" => Some(NotifEvent::TurnEnded),
-        "SessionEnd" => Some(NotifEvent::SessionEnded),
-        _ => None,
+/// The process whose existence answers "is this session still alive?".
+///
+/// Refuses anything it cannot tell apart from this invocation's own short-lived ancestry, and
+/// answers with an empty string when there is nothing trustworthy — which reads back as
+/// [`Fact::Unknown`], so the sweep does nothing. Getting this wrong in the other direction takes
+/// a live session's notification off the screen, so the default has to be to do nothing.
+fn owner_id() -> String {
+    let Ok(owner) = std::env::var("JKB_HOOK_OWNER") else {
+        return String::new();
+    };
+    let Ok(pid) = owner.trim().parse::<u32>() else {
+        return String::new();
+    };
+    // The shim is our parent and dies with this call; so does anything claiming to be us.
+    if pid == 0 || pid == std::os::unix::process::parent_id() || pid == std::process::id() {
+        return String::new();
     }
+    pid.to_string()
+}
+
+/// The Claude Code hook events this command answers to, and the ONE place they are spelled.
+///
+/// `SessionStart` maps to no machine event — it drives the sweep over records other sessions
+/// left — but it belongs here because the question this table answers is "which registrations
+/// must exist", and a name that drifts out of `.claude/settings.json` or the shim is silent in
+/// the worst way: renaming the `SessionStart` literal alone disabled the sweep permanently with
+/// every check still green. `jkb notify events` prints it so `scripts/test-hooks.sh` can diff all
+/// three spellings instead of two.
+const HOOK_EVENTS: &[(&str, Option<NotifEvent>)] = &[
+    ("Notification", Some(NotifEvent::Needed)),
+    ("PostToolUse", Some(NotifEvent::ToolFinished)),
+    ("UserPromptSubmit", Some(NotifEvent::UserActed)),
+    ("Stop", Some(NotifEvent::TurnEnded)),
+    ("SessionEnd", Some(NotifEvent::SessionEnded)),
+    ("SessionStart", None),
+];
+
+/// The name that drives the sweep, taken from the table above so it cannot drift from it.
+fn sweep_event_name() -> &'static str {
+    HOOK_EVENTS
+        .iter()
+        .find(|(_, e)| e.is_none())
+        .map_or("SessionStart", |(n, _)| n)
+}
+
+fn event_for(name: &str) -> Option<NotifEvent> {
+    HOOK_EVENTS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .and_then(|(_, e)| *e)
 }
 
 /// The plain `osascript` banner: visible, auto-hiding, impossible to withdraw. Newlines are
@@ -675,6 +783,8 @@ fn sweep_in(dir: &std::path::Path, notifier: Option<&std::path::Path>) {
             message: String::new(),
             subtitle: String::new(),
             notifier: notifier.map(std::path::Path::to_path_buf),
+            // The sweep never writes a record, only withdraws and forgets.
+            owner: String::new(),
             recorded: None,
         };
         let ctx = NotifCtx {
@@ -689,7 +799,7 @@ fn sweep_in(dir: &std::path::Path, notifier: Option<&std::path::Path>) {
             session_alive: session_alive(&rec),
         };
         if let Reconciliation::Fired(out) = machine.reconcile(&ctx) {
-            req.perform(out.effects());
+            let _ = req.perform(out.effects());
         }
     }
 }
@@ -734,7 +844,7 @@ fn hook() -> Result<()> {
         .ok()
         .and_then(|v| v.get("hook_event_name")?.as_str().map(str::to_owned))
         .as_deref()
-        == Some("SessionStart")
+        == Some(sweep_event_name())
     {
         sweep();
         return Ok(());
@@ -742,7 +852,7 @@ fn hook() -> Result<()> {
     let Some(req) = Request::parse(&raw)? else {
         return Ok(());
     };
-    req.perform(machine().apply(&req.ctx(), req.event).effects());
+    let _ = req.perform(machine().apply(&req.ctx(), req.event).effects());
     Ok(())
 }
 

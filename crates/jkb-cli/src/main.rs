@@ -64,11 +64,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum NotifyCmd {
     /// Read a hook payload on stdin and print the decision as JSON, performing nothing.
+    /// The dry run: `hook` is what carries the plan out.
     Plan,
     /// Read a hook payload on stdin, decide, and carry it out. What the hook shim calls.
     Hook,
     /// Withdraw notifications left behind by sessions that are provably gone.
     Sweep,
+    /// Print the Claude Code hook events this command answers to, for the registration
+    /// cross-check in `scripts/test-hooks.sh`.
+    Events,
 }
 
 #[derive(Subcommand)]
@@ -187,9 +191,8 @@ enum Command {
     },
     /// Decide what a Claude Code notification hook event should do, from the payload on stdin.
     ///
-    /// Prints the plan as JSON and performs nothing — the machine in `notify.rs` produces
-    /// effects as data, and this is the read-only half of that seam while the shell hook still
-    /// carries out the work (design N7/N8).
+    /// Runs before the database is opened, because it needs none and fires after every tool call
+    /// (design N7).
     Notify {
         #[command(subcommand)]
         cmd: NotifyCmd,
@@ -1121,6 +1124,18 @@ fn main() {
 
 #[allow(clippy::too_many_lines)] // a flat command dispatcher; one arm per subcommand
 fn run(cli: Cli) -> Result<()> {
+    // Commands that touch NO database are dispatched before it is opened, and this is
+    // structural rather than a remembered ordering: `open_db` verifies fifteen migrations and
+    // spawns the writer thread — 110 ms against the real database — and `notify hook` runs after
+    // EVERY tool call, which is the cost design N7 measured and rejected. Worse than slow: when a
+    // newer branch's migration locks an older binary out of the shared database (a documented
+    // state), `open_db` returns Err and the arm below is never reached, so nothing posts and —
+    // the expensive half — nothing ever withdraws, leaving an Alerts-style notification on screen
+    // for good.
+    if let Command::Notify { cmd } = &cli.command {
+        return notify::run(cmd);
+    }
+
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
     // (best-effort, silent). Skipped for explicit `jkb commands …` so it never fights the
     // user's own install/uninstall.
@@ -1166,6 +1181,11 @@ fn run(cli: Cli) -> Result<()> {
     let global = cli.global;
 
     match cli.command {
+        // Dispatched above, before the database is opened — this arm is the correct answer if
+        // that ever stops happening, not a silent fallthrough to the database path. Which of the
+        // two runs is pinned by `notify_needs_no_database` in tests/cli.rs, so the fast path is
+        // load-bearing rather than an optimisation someone can quietly drop.
+        Command::Notify { cmd } => notify::run(&cmd),
         Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
         Command::Query {
             terms,
@@ -1217,7 +1237,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index { sweep } => cmd_index(&db, sweep),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
-        Command::Notify { cmd } => notify::run(&cmd),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Ls {
             path,

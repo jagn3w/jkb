@@ -75,7 +75,12 @@ cat > "$tmp/goodjkb/jkb" <<STUB
 #!/bin/sh
 printf '%s ' "\$@" >> "$tmp/jkbcalls"
 printf '\n' >> "$tmp/jkbcalls"
-printf 'notifier=%s\n' "\${JKB_NOTIFIER:-none}" >> "$tmp/jkbcalls"
+# Printed ONLY when the shim actually exported it. It used to print `notifier=none` otherwise,
+# and the assertion just grepped for a line starting `notifier=` — so deleting the shim's export
+# left the test green, which is the one thing it exists to catch.
+[ -n "\${JKB_NOTIFIER:-}" ] && printf 'notifier=%s\n' "\$JKB_NOTIFIER" >> "$tmp/jkbcalls"
+[ -n "\${JKB_HOOK_OWNER:-}" ] && printf 'owner=%s\n' "\$JKB_HOOK_OWNER" >> "$tmp/jkbcalls"
+exit 0
 STUB
 chmod +x "$tmp/goodjkb/jkb"
 
@@ -86,8 +91,14 @@ PAYLOAD='{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash"}'
 #    exiting 2 stopped the session dead — observed live, not hypothesised.
 hook_run "$PAYLOAD" "$tmp/oldjkb:/usr/bin:/bin"
 check "a jkb that rejects the subcommand still exits 0" "$?" "0"
-hook_run "$PAYLOAD" "/usr/bin:/bin"
+# HOME and CARGO_HOME too: the shim falls back to `${CARGO_HOME:-$HOME/.cargo}/bin/jkb`, so
+# overriding PATH alone found the developer's real binary and this branch was never taken.
+hook_out=$(printf '%s' "$PAYLOAD" | PATH="/usr/bin:/bin" HOME="$tmp/nohome" \
+  CARGO_HOME="$tmp/nohome/.cargo" JKB_NOTIFY_STATE="$tmp/state" bash "$hook" 2>/dev/null)
 check "no jkb at all still exits 0" "$?" "0"
+check "and it is really absent" \
+  "$(PATH=/usr/bin:/bin HOME="$tmp/nohome" CARGO_HOME="$tmp/nohome/.cargo" \
+     command -v jkb >/dev/null 2>&1 && echo found || echo absent)" "absent"
 hook_run "$PAYLOAD" "$tmp/goodjkb:/usr/bin:/bin"
 check "a working jkb still exits 0" "$?" "0"
 
@@ -106,7 +117,14 @@ hook_run "$PAYLOAD" "$tmp/goodjkb:/usr/bin:/bin"
 check "the shim delegates to jkb notify hook" \
   "$(head -1 "$tmp/jkbcalls" | sed 's/ *$//')" "notify hook"
 check "and passes the notifier path it resolved" \
-  "$(grep -c '^notifier=' "$tmp/jkbcalls" | tr -d ' ')" "1"
+  "$(sed -n 's/^notifier=//p' "$tmp/jkbcalls" | head -1)" \
+  "$(bash "$hook" --notifier-path)"
+
+# The owner is the session's, and jkb CANNOT ask for it — its own parent is this shim, which
+# exits milliseconds later. Recording that made every record read as provably dead, so the next
+# session's sweep withdrew a live session's pending prompt.
+check "and passes an owner that is not the shim itself" \
+  "$(sed -n 's/^owner=//p' "$tmp/jkbcalls" | head -1 | grep -cE '^[0-9]+$' | tr -d ' ')" "1"
 
 # 4. Malformed input still exits 0 and says nothing.
 hook_run 'not json' "$tmp/goodjkb:/usr/bin:/bin"
@@ -161,6 +179,17 @@ registered=$(jq -r --arg h "notify-sticky.sh" '
   | $event' "$settings" 2>/dev/null | sort -u)
 check "every event the hook handles is registered in settings.json" \
   "$(comm -23 <(printf '%s\n' "$handled") <(printf '%s\n' "$registered") | tr '\n' ' ' | sed 's/ *$//')" ""
+# The names also appear in the Rust dispatcher, which the shim cannot see. `jkb notify events`
+# prints what it answers to, so all THREE spellings are diffed rather than two — renaming the
+# `"SessionStart"` literal in `hook()` disabled the sweep permanently with every check green.
+if [ -x "$(cd "$(dirname "$0")/.." && pwd)/target/debug/jkb" ]; then
+  rust_events=$("$(cd "$(dirname "$0")/.." && pwd)/target/debug/jkb" notify events 2>/dev/null | sort)
+  check "the hook's events and jkb's agree" \
+    "$(comm -3 <(printf '%s\n' "$handled") <(printf '%s\n' "$rust_events") | tr -d '[:space:]')" ""
+else
+  printf '  --  %s\n' "jkb events cross-check (target/debug/jkb not built)"
+fi
+
 check "every event registered in settings.json is handled by the hook" \
   "$(comm -13 <(printf '%s\n' "$handled") <(printf '%s\n' "$registered") | tr '\n' ' ' | sed 's/ *$//')" ""
 

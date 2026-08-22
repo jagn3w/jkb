@@ -146,5 +146,10 @@ find_notifier
 # non-zero blocks the tool call — so an older `jkb` without this subcommand, which clap rejects
 # with status 2, stops the session dead. That is exactly what happened the first time this shim
 # ran. Whatever jkb does, this exits 0.
-JKB_NOTIFIER="$notifier" "$jkb_bin" notify hook >/dev/null 2>&1
+#
+# `$PPID` here is the process that invoked the hook, and measurement says that is `claude`
+# itself — a process that outlives this shim by the whole session. jkb cannot ask for it: its own
+# parent is THIS script, which exits milliseconds later, and recording that made every record read
+# as provably dead, so the next session's sweep withdrew a live session's pending prompt.
+JKB_NOTIFIER="$notifier" JKB_HOOK_OWNER="$PPID" "$jkb_bin" notify hook >/dev/null 2>&1
 exit 0

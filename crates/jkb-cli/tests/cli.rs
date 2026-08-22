@@ -2899,4 +2899,27 @@ fn the_cli_fixture_does_not_inherit_a_repository() {
     let tmp = TempDir::new().unwrap();
     let cmd = jkb(&tmp.path().join("x.db"));
     common::assert_isolated("the cli fixture", &cmd);
+/// `notify` must run before the database is opened.
+///
+/// It fires after EVERY tool call, and `open_db` verifies fifteen migrations and starts the
+/// writer thread — measured at 110 ms against the real database, the cost design N7 rejected.
+/// The sharper half is correctness: when a newer branch's migration locks an older binary out of
+/// the shared database — a state CLAUDE.md documents — opening it fails, and if that happened
+/// first the hook would post nothing and, worse, never withdraw, leaving a sticky notification on
+/// screen for good. Pointed at a file that is not a database at all, which is the strongest form
+/// of "this open would fail".
+#[test]
+fn notify_needs_no_database() {
+    let dir = TempDir::new().expect("tempdir");
+    let not_a_db = dir.path().join("not-a-database");
+    std::fs::write(&not_a_db, b"this is not a sqlite file").expect("write");
+
+    // `assert_cmd::Command` rather than the `std::process::Command` this file otherwise uses,
+    // because the payload arrives on stdin.
+    assert_cmd::Command::cargo_bin("jkb")
+        .expect("binary")
+        .args(["--db", not_a_db.to_str().expect("path"), "notify", "hook"])
+        .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
+        .assert()
+        .success();
 }
