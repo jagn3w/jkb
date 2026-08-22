@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 ///
 /// **Workflows carry it too, and that is the whole guard.** `~/.claude/workflows/` is shared with
 /// everything else the user runs, and both writers here are unconditional — the auto-install
-/// fires on any `jkb` invocation whose stamp does not match and `fs::write`s the set with no
+/// fires on any `jkb` invocation whose stamp does not match and writes the set with no
 /// existence check, no prompt and no backup, while `uninstall` `remove_file`s it and prints
 /// "removed" having never checked it wrote that file. Under a bare stem that destroys a user's
 /// own `code-review.js`, a name far likelier to be taken than `task-swarm`. A prefixed name is
@@ -144,13 +144,20 @@ fn write_all(base: &Path, verbose: bool) -> Result<()> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         for (stem, body) in kind.set {
             let path = asset_path(base, kind, stem);
-            std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+            // Atomic, via the shared seam: a running `/task-swarm` or `/review` workflow
+            // reads these very files, and this runs unattended — a `git pull` fires the
+            // post-merge hook, which runs setup.sh, which reinstalls the binary, whose next
+            // invocation reconciles the bundle. `fs::write` truncates in place, so a reader
+            // in that window sees a half-written script.
+            crate::atomic::write(&path, body.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
             if verbose {
                 println!("wrote {}", path.display());
             }
         }
     }
-    std::fs::write(stamp_path(base), fingerprint()).context("writing asset stamp")?;
+    crate::atomic::write(&stamp_path(base), fingerprint().as_bytes())
+        .context("writing asset stamp")?;
     Ok(())
 }
 
@@ -289,7 +296,8 @@ fn uninstall_from(base: &Path) -> Result<()> {
     if base.exists() {
         // Mark the current bundle reconciled so auto-install won't re-add these until the
         // binary ships a different set.
-        std::fs::write(stamp_path(base), fingerprint()).context("writing asset stamp")?;
+        crate::atomic::write(&stamp_path(base), fingerprint().as_bytes())
+            .context("writing asset stamp")?;
         println!(
             "removed. Auto-install won't re-add them until the next `jkb` upgrade; set \
              JKB_NO_AUTO_COMMANDS=1 to disable auto-install entirely."

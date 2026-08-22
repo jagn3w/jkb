@@ -22,18 +22,15 @@ ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; failures=$((failures + 1)); }
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# chmod first: case 3 makes a directory unwritable, and an interrupt before it restores
+# the mode would otherwise leave `rm -rf` unable to clean up.
+trap 'chmod -R u+rwx "$work" 2>/dev/null; rm -rf "$work"' EXIT
 
-# Any temp file install_exec left in <dir>, or nothing. A plain glob rather than `find
-# -quit`, which is a GNU/BSD extension: this suite gates CI on Linux and is developed on
-# macOS, so it sticks to what both are guaranteed to have.
-stray_in() {
-    local f
-    for f in "$1"/.jkb-install.*; do
-        [ -e "$f" ] && printf '%s\n' "$f" && return 0
-    done
-    return 0
-}
+# Every entry in <dir>, sorted — the whole directory, never a search for a name we expect.
+# Looking for `.jkb-install.*` meant the assertion knew install_exec's temp template: rename
+# it and these cases pass whether or not anything is cleaned up. Asserting the exact contents
+# holds whatever the temp file is called, which is what the Rust twin does.
+entries_in() { ls -A "$1" 2>/dev/null | sort; }
 
 # --- 1. a script survives being replaced, by a longer version, while it is running -------
 case1() {
@@ -85,10 +82,10 @@ PROG
     else
         fail "mode: exec bit" "$d/prog is not runnable (caller no longer chmods it)"
     fi
-    if [ -z "$(stray_in "$d")" ]; then
-        ok "no temp file is left behind"
+    if [ "$(entries_in "$d")" = "prog" ]; then
+        ok "a successful install leaves the installed file and nothing else"
     else
-        fail "mode: temp" "a .jkb-install.* temp file survived a successful install"
+        fail "mode: temp" "expected just 'prog', found: $(entries_in "$d" | tr '\n' ' ')"
     fi
 }
 
@@ -124,21 +121,38 @@ case3() {
 # injection — `cat` exits 1 with "Is a directory" on both BSD and GNU userland. (`mv` onto an
 # existing directory is NOT a failure: it moves the file inside.)
 case4() {
-    local d="$work/stranded" stray
+    local d="$work/stranded" before
     mkdir -p "$d/a-directory"
     printf 'original\n' >"$d/prog"
+    before="$(entries_in "$d")"
     if install_exec "$d/prog" <"$d/a-directory" 2>/dev/null; then
         fail "stranded: status" "install_exec reported success though its input was unreadable"
         return
     fi
-    stray="$(stray_in "$d")"
-    if [ -z "$stray" ]; then
+    if [ "$(entries_in "$d")" = "$before" ]; then
         ok "a failure after the temp file exists still leaves no temp file"
     else
-        fail "stranded: temp" "a half-written $stray survived"
+        fail "stranded: temp" "the directory gained: $(entries_in "$d" | tr '\n' ' ')"
     fi
     [ "$(cat "$d/prog")" = "original" ] \
         || fail "stranded: destination" "the destination was modified by a failed install"
+}
+
+# --- 5. a destination that is a directory is refused, not filled ------------------------
+# `mv file dir` moves the file INSIDE dir and exits 0, so without an explicit refusal this
+# installs nothing, strands a temp file in a stranger's hook directory, and reports success.
+# A directory-style hook manager keeps `post-merge/` as exactly such a folder. The Rust twin
+# `write_atomic` fails here because `fs::rename` does; the two implementations must agree.
+case5() {
+    local d="$work/dirdest"
+    mkdir -p "$d/post-merge"
+    if printf '#!/bin/sh\n' | install_exec "$d/post-merge" 2>/dev/null; then
+        fail "dirdest: status" "install_exec reported success installing onto a directory"
+    elif [ -n "$(entries_in "$d/post-merge")" ]; then
+        fail "dirdest: contents" "it wrote into the directory: $(entries_in "$d/post-merge" | tr '\n' ' ')"
+    else
+        ok "a destination that is a directory is refused, and nothing is written into it"
+    fi
 }
 
 echo "==> scripts/lib.sh::install_exec"
@@ -146,6 +160,7 @@ case1
 case2
 case3
 case4
+case5
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures failure(s)" >&2

@@ -72,7 +72,7 @@ pub fn install(db: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        write_atomic(&path, &unit)?;
+        crate::atomic::write(&path, unit.as_bytes())?;
         println!("wrote {}", path.display());
         match manager {
             Manager::Launchd => println!("activate with: launchctl load {}", path.display()),
@@ -107,43 +107,6 @@ pub fn uninstall(db: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Write `contents` to `path` atomically: a temp file in the same directory, then a rename.
-///
-/// `fs::write` truncates the destination and rewrites it in place, so anything reading it
-/// meanwhile — `launchctl load`, `systemctl --user daemon-reload`, or a second
-/// `jkb service install` racing this one — can see a half-written unit and decline to start
-/// the job, with the only trace in the supervisor's own log. A rename swaps the directory
-/// entry in one step, so every reader sees the whole old unit or the whole new one.
-/// (`setup.sh` re-runs this on every pull that touched `scripts/`, from the post-merge hook.)
-///
-/// This is the same rule `scripts/lib.sh`'s `install_exec` follows for the git hooks, where
-/// it is sharper still: the file being replaced there is one bash is currently executing.
-/// Its other half holds here too: on **any** failure the destination is left exactly as it
-/// was and the temp file goes with us, so a full disk cannot strew half-written units named
-/// after dead pids through the supervisor's directory.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(
-        path.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("unit")),
-    );
-    // The pid keeps two concurrent installs off one another's temp file.
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = dir.join(tmp_name);
-    // Both fallible steps clean up through one path — a write that fails part-way leaves a
-    // temp file just as surely as a failed rename does.
-    let installed = std::fs::write(&tmp, contents)
-        .with_context(|| format!("writing {}", tmp.display()))
-        .and_then(|()| {
-            std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
-        });
-    if installed.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    installed
 }
 
 /// Every `(label, install path, contents)` for the current platform.
@@ -331,8 +294,8 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit, write_atomic,
-        xml_escape, LABEL, REAP_LABEL,
+        launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit, xml_escape, LABEL,
+        REAP_LABEL,
     };
     use std::path::Path;
 
@@ -383,64 +346,6 @@ mod tests {
         let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
-    }
-
-    /// Pins the *mechanism*, not just the result: reverting `write_atomic` to a plain
-    /// `std::fs::write` passes every assertion about the file's final contents, because
-    /// writing does work — it is the reader mid-load that an in-place rewrite corrupts.
-    /// So the test holds one open, the way `launchctl load` does.
-    #[test]
-    #[cfg(unix)]
-    fn write_atomic_installs_by_rename_never_rewriting_the_unit_in_place() {
-        use std::io::Read;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(format!("{LABEL}.plist"));
-        write_atomic(&path, "first").expect("first install");
-
-        // A supervisor that opened the unit just before the reinstall lands. A rename gives
-        // it the whole old unit; an in-place rewrite gives it whatever the truncation left.
-        let mut reader = std::fs::File::open(&path).expect("open the installed unit");
-        write_atomic(&path, "second").expect("replacing install");
-        let mut seen = String::new();
-        reader
-            .read_to_string(&mut seen)
-            .expect("read through the open handle");
-        assert_eq!(
-            seen, "first",
-            "the reinstall rewrote the unit a reader was already holding"
-        );
-
-        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "second");
-        // A surviving temp file is a half-written unit left in the supervisor's directory.
-        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
-            .expect("read_dir")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != &format!("{LABEL}.plist"))
-            .collect();
-        assert!(leftovers.is_empty(), "temp files survived: {leftovers:?}");
-    }
-
-    /// The twin of `install-exec.test.sh`'s "a failed install leaves the destination
-    /// untouched". A rename onto an existing directory is the one failure reachable without
-    /// fault injection, and it exercises the cleanup both fallible steps now share.
-    #[test]
-    fn a_failed_write_atomic_leaves_no_temp_file_behind() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // A directory where the unit should go: the rename cannot replace it.
-        let path = dir.path().join(format!("{LABEL}.plist"));
-        std::fs::create_dir(&path).expect("occupy the destination");
-
-        write_atomic(&path, "unit").expect_err("installing over a directory should fail");
-
-        let strays: Vec<String> = std::fs::read_dir(dir.path())
-            .expect("read_dir")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != &format!("{LABEL}.plist"))
-            .collect();
-        assert!(strays.is_empty(), "a failed install left {strays:?} behind");
     }
 
     #[test]

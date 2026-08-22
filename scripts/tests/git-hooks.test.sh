@@ -22,7 +22,7 @@ ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; failures=$((failures + 1)); }
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'chmod -R u+rwx "$work" 2>/dev/null; rm -rf "$work"' EXIT
 
 # `--git-path hooks/…` honours core.hooksPath, and this developer has one set globally — so
 # without an isolated config the oracle answers with the user's own hooks directory and the
@@ -153,12 +153,93 @@ case5() {
     git_q -C "$main" config --unset core.hooksPath
 }
 
-echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override"
+# --- 6. a hooks path inside the working tree is excluded locally -------------------------
+# A relative `core.hooksPath` resolves inside the tree, so the chainer is untracked there:
+# every `jkb task work` session then reads dirty and `jkb task land` refuses it, and deleting
+# the file does not help because the next pull recreates it. `.git/info/exclude` is the
+# local, unpushed write the project already sanctions for this (D36 does it for `.jkb/`).
+case6() {
+    local r="$work/intree" chainer got status
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    chainer="$(git_hooks_override "$r")/post-merge"
+    mkdir -p "$(dirname "$chainer")"
+    printf '#!/bin/sh\nexit 0\n' >"$chainer"
+
+    status="$(git_q -C "$r" status --porcelain)"
+    [ -n "$status" ] || fail "exclude: premise" "the chainer did not make the tree dirty to begin with"
+
+    got="$(git_exclude_locally "$r" "$chainer")"
+    if [ "$got" = "/.githooks/post-merge" ]; then
+        ok "a chainer inside the working tree: excluded locally"
+    else
+        fail "exclude: pattern" "expected /.githooks/post-merge, got '$got'"
+    fi
+    if [ -z "$(git_q -C "$r" status --porcelain)" ]; then
+        ok "the working tree is clean again, so a session can land"
+    else
+        fail "exclude: dirty" "still dirty: $(git_q -C "$r" status --porcelain | tr '\n' ' ')"
+    fi
+    # Twice must not duplicate the line — setup.sh runs on every qualifying pull.
+    got="$(git_exclude_locally "$r" "$chainer")"
+    if [ -z "$got" ] && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
+        ok "running it again adds nothing"
+    else
+        fail "exclude: idempotence" "second run printed '$got' and the pattern appears $(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude") time(s)"
+    fi
+}
+
+# --- 7. a hooks path outside the working tree is left alone -------------------------------
+# The ordinary case: an absolute core.hooksPath is nobody's working tree, so there is nothing
+# to hide and nothing should be written to .git/info/exclude.
+case7() {
+    local r="$work/outside" got before after
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    # `git init` ships a commented default exclude file, so "unchanged" is the assertion,
+    # not "empty".
+    before="$(cat "$r/.git/info/exclude" 2>/dev/null)"
+    got="$(git_exclude_locally "$r" "$work/elsewhere/post-merge")"
+    after="$(cat "$r/.git/info/exclude" 2>/dev/null)"
+    if [ -z "$got" ] && [ "$before" = "$after" ]; then
+        ok "a hooks path outside the tree: nothing excluded"
+    else
+        fail "outside: wrote" "printed '$got'; exclude file changed=$([ "$before" = "$after" ] && echo no || echo YES)"
+    fi
+}
+
+# --- 8. a `~user/` core.hooksPath expands the way git expands it -------------------------
+# git expands `~user/` through passwd, not through $HOME. The hand-rolled `${v/#~/$HOME}`
+# this replaced stripped the tilde and concatenated, producing `/Users/jagnewjagnew/hooks`
+# for `~jagnew/hooks` — a directory git never looks in, which setup.sh then created and
+# reported success for. The plain `~/` form is NOT a discriminator: both spellings get it
+# right. Compared as strings, never resolved, so nothing outside the sandbox is touched.
+case8() {
+    local r="$work/tilde" user got expected
+    user="$(id -un)" || { printf '  skip could not determine the current user name\n'; return; }
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath "~$user/jkb-hooks-probe"
+
+    expected="$(dirname "$(git -C "$r" rev-parse --git-path hooks/post-merge)")"
+    got="$(git_hooks_override "$r")"
+    if [ "$got" = "$expected" ]; then
+        ok "a ~user/ core.hooksPath: expands the way git expands it"
+    else
+        fail "tilde: path" "got '$got', git uses '$expected'"
+    fi
+}
+
+echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + git_exclude_locally"
 case1
 case2
 case3
 case4
 case5
+case6
+case7
+case8
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures failure(s)" >&2

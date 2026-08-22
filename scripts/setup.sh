@@ -159,43 +159,29 @@ if [ -f "$hooks_src" ]; then
     if [ -n "$global_hooks" ]; then
       mkdir -p "$global_hooks"
       chainer="$global_hooks/post-merge"
-      # Written once, so the install and the refresh below cannot drift apart.
-      chainer_body() {
-        cat <<'CHAIN'
-#!/bin/sh
-# Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
-# repo-local hook if one exists (mirrors the commit-msg chainer).
-#
-# `--git-common-dir`, not `--git-dir`: in a linked worktree the latter is the per-worktree
-# directory, which holds no hooks. Git resolves `hooks/` against the common dir.
-common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
-[ -n "$common_dir" ] || exit 0
-repo_hook="$common_dir/hooks/post-merge"
-[ -x "$repo_hook" ] && exec "$repo_hook" "$@"
-exit 0
-CHAIN
-      }
-      # Atomic for install_exec's reason, plus its own: this file is on the path of every
-      # repo's `git pull`, so a half-written one breaks merges far outside this checkout.
-      if [ ! -f "$chainer" ]; then
-        chainer_body | install_exec "$chainer"
-        echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)"
-      elif grep -q "Global post-merge chainer" "$chainer" 2>/dev/null; then
-        # One of ours. Refresh it rather than leaving it: chainers written before the
-        # `--git-common-dir` fix dispatch to the per-worktree directory, so they find no
-        # repo hook in any worktree — silently, which is the failure this whole block exists
-        # to prevent. A stranger's chainer is still never clobbered.
-        if chainer_body | cmp -s - "$chainer"; then
-          echo "  • chainer:    $chainer (up to date)"
-        else
-          chainer_body | install_exec "$chainer"
-          echo "  • chainer:    $chainer (refreshed)"
-        fi
-      else
-        # Something else is already there; do not clobber it, but say so, because a chainer
-        # that does not dispatch means the repo hook never runs.
-        grep -q "hooks/post-merge" "$chainer" 2>/dev/null \
-          || warn "$chainer exists but may not chain to the repo hook — check it by hand"
+      # The body and the three arms live in lib.sh so a shell test can drive them; this is
+      # only the reporting. Atomic for install_exec's reason plus its own: the chainer is on
+      # the path of every repo's `git pull`, so a half-written one breaks merges far outside
+      # this checkout.
+      case "$(install_chainer "$chainer")" in
+        installed)  echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)" ;;
+        up-to-date) echo "  • chainer:    $chainer (up to date)" ;;
+        refreshed)  echo "  • chainer:    $chainer (refreshed — it predated the worktree fix)" ;;
+        foreign)
+          # Not byte-for-byte something jkb wrote, so it is not ours to replace — it may be
+          # your own file, or ours with your edits in it. Say so, because a chainer that does
+          # not dispatch means the repo hook never runs.
+          warn "$chainer was not written by jkb (or has been edited) — left untouched."
+          warn "  if it does not exec \"\$(git rev-parse --git-common-dir)/hooks/post-merge\", the repo hook never runs." ;;
+        *) warn "could not install the chainer at $chainer" ;;
+      esac
+      # A relative core.hooksPath resolves inside the working tree, where an untracked
+      # chainer makes every session read dirty and blocks `jkb task land`.
+      excluded="$(git_exclude_locally "$repo_root" "$chainer")"
+      # `if`, not `[ … ] && echo`: under `set -e` a false test as the head of an `&&` list
+      # makes the list fail, and the list IS the statement — so the script exits.
+      if [ -n "$excluded" ]; then
+        echo "  • excluded:   $excluded (inside the working tree; added to .git/info/exclude)"
       fi
     fi
   else
@@ -214,5 +200,12 @@ say "setup complete"
 echo "  • jkb:        $(command -v jkb)"
 echo "  • database:   $db"
 echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
-[ "$do_extension" -eq 1 ] && echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
-[ "$do_service" -eq 1 ] && echo "  • watcher:    running; file edits under mounts auto-sync"
+# `if`, not `[ … ] && echo`: a false test leaves the list's status non-zero, and as the last
+# statement that becomes the script's own — so `setup.sh --no-service` reported failure, and
+# the post-merge hook's `|| echo "setup.sh failed"` would have believed it.
+if [ "$do_extension" -eq 1 ]; then
+  echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
+fi
+if [ "$do_service" -eq 1 ]; then
+  echo "  • watcher:    running; file edits under mounts auto-sync"
+fi

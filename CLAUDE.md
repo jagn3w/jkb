@@ -134,7 +134,8 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
   workspace-wide; the *only* `#[allow(unsafe_code)]` is the `sqlite-vec` FFI
   registration in `jkb-index`'s `vector.rs` (`register()`). Do not add others.
 - **Lints are gates.** clippy `pedantic` is on; `./scripts/check.sh` runs
-  `fmt --check`, `clippy -D warnings`, tests, and `cargo deny`. Keep it green.
+  `fmt --check`, `clippy -D warnings`, the `scripts/tests/*.test.sh` shell tests, tests,
+  and `cargo deny`. Keep it green.
 - **Errors:** `thiserror` in libraries, `anyhow` at the binary edge. No
   `unwrap`/`expect` outside tests.
 - **IDs are newtypes** so `ItemId`/`NamespaceId` can't be crossed.
@@ -227,7 +228,7 @@ Raw `cargo build|test|clippy|fmt|check` is denied by a PreToolUse hook
 ```sh
 ./scripts/build.sh
 ./scripts/test.sh       # e.g. ./scripts/test.sh -p jkb-core
-./scripts/check.sh      # fmt --check + clippy -D warnings + test + cargo-deny + the ui build
+./scripts/check.sh      # fmt --check + clippy -D warnings + shell tests + test + cargo-deny + ui
 ```
 
 `check.sh` skips `cargo-deny` gracefully when it is not installed
@@ -598,6 +599,35 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   i.e. exactly the pulls that update the hook, when nobody is watching. `mv` is a rename: it
   swaps the directory entry and leaves the running process's inode alone. Pinned by
   `scripts/tests/install-exec.test.sh`, which `check.sh` and CI both run.
+- **The chainer is replaced only when jkb wrote every byte of it** (`lib.sh`'s
+  `install_chainer`, four outcomes: `installed`/`up-to-date`/`refreshed`/`foreign`). Ownership
+  is byte equality against a body jkb actually emits — `chainer_body`, or a frozen `_vN` of a
+  body it used to emit — never a marker inside the file. The first attempt grepped for the
+  chainer's own comment line, which is a *proxy* for the claim rather than the claim: a user
+  who adds a line to jkb's chainer still matches it, so the refresh arm replaced their file
+  unattended on an ordinary `git pull`, with no backup and the same message as the intended
+  upgrade. Byte equality cannot be satisfied by a file jkb did not write, so `foreign` is the
+  safe default and nothing is overwritten to find out. Changing `chainer_body` means moving the
+  outgoing body to the next `chainer_body_vN`; forgetting is not silent — the old chainer stops
+  being recognised and is reported, never clobbered.
+- **The body and the install arms live in `lib.sh`, not inline in `setup.sh`.** While they were
+  a heredoc plus three inline arms nothing could execute them: reverting the chainer's dispatch
+  to `--git-dir` left the whole gate green while every pull inside a worktree silently stopped
+  running the repo hook — and `check.sh` and `ci.yml` both justify the shell-test stage on
+  exactly the claim that these installs are unreachable from a Rust test. They were unreachable
+  from everything. `scripts/tests/chainer.test.sh` drives all four outcomes and runs the
+  installed chainer in both a plain checkout and a worktree.
+- **A hooks path inside the working tree is excluded locally** (`git_exclude_locally`). A
+  relative `core.hooksPath` resolves inside the tree, so the untracked chainer made every
+  `jkb task work` session read dirty and `jkb task land` refuse it — and deleting it did not
+  help, since the next pull recreates it. `.git/info/exclude` is the local, unpushed write D36
+  already sanctions for `.jkb/`; editing someone's tracked `.gitignore` is not.
+- **The atomic write is one seam, `jkb_cli::atomic::write`**, used by `service::install` and by
+  `commands::write_all`. The shell half was fixed first, the service unit second, and the
+  `~/.claude/{workflows,commands}` assets were still truncating in place — on a path setup.sh
+  itself triggers, since a pull runs the hook, which runs setup.sh, which reinstalls the binary,
+  whose next invocation reconciles that bundle, and a running `/task-swarm` or `/review` reads
+  those files. Three installers, one rule, so it is not a rule each new installer must remember.
 
 ## Parallel task sessions (D36) — driving tasks by hand, safely
 

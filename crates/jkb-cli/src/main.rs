@@ -7,6 +7,7 @@
 //! current directory (design D19), overridable with `--global`.
 
 mod archive;
+mod atomic;
 mod commands;
 mod gitrepo;
 mod output;

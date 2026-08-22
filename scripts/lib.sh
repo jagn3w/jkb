@@ -26,6 +26,15 @@
 install_exec() {
     local dest="$1" dir tmp
     dir="$(dirname "$dest")"
+    # `mv file dir` does not fail — it moves the file INSIDE the directory. So without this
+    # a <dest> that is a directory (a directory-style hook manager keeps `post-merge/` as a
+    # folder of scripts) installs nothing, strands a hidden temp file in there, and returns
+    # success. Refuse before writing; the Rust twin `service::write_atomic` errors here
+    # because `fs::rename` does, and the two must agree.
+    if [ -e "$dest" ] && [ ! -f "$dest" ]; then
+        printf 'install_exec: %s exists and is not a regular file\n' "$dest" >&2
+        return 1
+    fi
     # The temp name is deliberately unrelated to <dest> (and hidden) so a half-written file
     # is never mistaken for the thing being installed — e.g. a git hook.
     tmp="$(mktemp "$dir/.jkb-install.XXXXXX")" || return 1
@@ -44,7 +53,7 @@ install_exec() {
 # `--git-dir` goes where git never looks, the installer reports success, and the stale hook
 # keeps running. `jkb task work` puts every session in a worktree, so that is the normal
 # case here rather than a corner one. `git rev-parse --git-path hooks/post-merge` is the
-# authority, and scripts/tests/git-hooks-dir.test.sh checks this against it.
+# authority, and scripts/tests/git-hooks.test.sh checks this against it.
 #
 # The path comes back relative to <repo_root> for an ordinary checkout (`.git`) and absolute
 # for a worktree, so it is normalised here rather than at each call site.
@@ -75,9 +84,13 @@ git_hooks_dir() {
 # scripts/tests/git-hooks.test.sh check the result against git's own answer.
 git_hooks_override() {
     local repo_root="$1" configured top
-    configured="$(git -C "$repo_root" config --get core.hooksPath 2>/dev/null)" || return 0
+    # `--path` makes git do its own expansion: `~/x` via $HOME and `~user/x` via passwd,
+    # which a hand-rolled `${v/#\~/$HOME}` gets wrong for the second form — it produced
+    # `/Users/jagnewjagnew/hooks` for `~jagnew/hooks`, a directory git never looks in, and
+    # setup.sh then created it and reported success. A relative value stays relative, so the
+    # branch below is unaffected.
+    configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)" || return 0
     [ -n "$configured" ] || return 0
-    configured="${configured/#\~/$HOME}"
     case "$configured" in
         /*) ;;
         *)
@@ -87,4 +100,119 @@ git_hooks_override() {
             ;;
     esac
     printf '%s\n' "$configured"
+}
+
+# --- the global post-merge chainer -------------------------------------------------------
+# `core.hooksPath` REPLACES .git/hooks, so a repo-local hook is silently dead whenever one is
+# configured. setup.sh therefore also installs a chainer there that dispatches back to the
+# repo hook. Both the body and the install arms live here, not inline in setup.sh, so
+# scripts/tests/chainer.test.sh can drive them: while they were a heredoc plus three inline
+# arms, reverting the dispatch line below to `--git-dir` left the entire gate green — and
+# check.sh and ci.yml both justify the shell-test stage on exactly that reachability claim.
+
+# chainer_body — the chainer jkb installs today.
+chainer_body() {
+    cat <<'CHAIN'
+#!/bin/sh
+# Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
+# repo-local hook if one exists (mirrors the commit-msg chainer).
+#
+# `--git-common-dir`, not `--git-dir`: in a linked worktree the latter is the per-worktree
+# directory, which holds no hooks. Git resolves `hooks/` against the common dir.
+#
+# Written by jkb's scripts/setup.sh. Edit it and jkb will stop updating it — by design: it
+# can only recognise its own work byte-for-byte, and refuses to overwrite anything else.
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+[ -n "$common_dir" ] || exit 0
+repo_hook="$common_dir/hooks/post-merge"
+[ -x "$repo_hook" ] && exec "$repo_hook" "$@"
+exit 0
+CHAIN
+}
+
+# chainer_body_v1 — FROZEN. The chainer shipped before the `--git-common-dir` fix; it
+# dispatches to `--git-dir`, so under it a pull inside any worktree finds no repo hook.
+# Kept verbatim so `install_chainer` can recognise one and upgrade it.
+#
+# Changing `chainer_body` means adding the outgoing body here as the next `_vN`, and to
+# `chainer_known_bodies`. Skipping that step is not silent: the old chainer stops being
+# recognised and is reported as foreign — it is never overwritten.
+chainer_body_v1() {
+    cat <<'CHAIN'
+#!/bin/sh
+# Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
+# repo-local hook if one exists (mirrors the commit-msg chainer).
+repo_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/post-merge"
+[ -x "$repo_hook" ] && exec "$repo_hook" "$@"
+exit 0
+CHAIN
+}
+
+chainer_known_bodies="chainer_body chainer_body_v1"
+
+# install_chainer <path> — install/refresh the chainer, printing exactly one word:
+#
+#   installed   there was nothing there
+#   up-to-date  already byte-identical to chainer_body
+#   refreshed   byte-identical to a KNOWN OLDER body, so jkb wrote it and upgraded it
+#   foreign     anything else — left completely alone
+#
+# Ownership is byte equality against a body jkb actually wrote, never a marker inside the
+# file. A grep for the comment line was the first attempt and it is a proxy for the claim
+# rather than the claim: a user who adds a line to *our* chainer still matches it, and the
+# refresh arm then replaced their file, unattended, on an ordinary `git pull`, with no
+# backup and the same "(refreshed)" message as the intended upgrade. Byte equality IS the
+# claim "we wrote every byte of this", so it cannot be satisfied by a file we did not write.
+install_chainer() {
+    local dest="$1" body
+    if [ ! -e "$dest" ]; then
+        chainer_body | install_exec "$dest" || return 1
+        printf 'installed\n'
+        return 0
+    fi
+    if [ ! -f "$dest" ]; then
+        printf 'foreign\n'
+        return 0
+    fi
+    if chainer_body | cmp -s - "$dest"; then
+        printf 'up-to-date\n'
+        return 0
+    fi
+    for body in $chainer_known_bodies; do
+        if "$body" | cmp -s - "$dest"; then
+            chainer_body | install_exec "$dest" || return 1
+            printf 'refreshed\n'
+            return 0
+        fi
+    done
+    printf 'foreign\n'
+}
+
+# git_exclude_locally <repo_root> <absolute path> — add <path> to the repo's
+# `.git/info/exclude` if it sits inside the working tree and is not excluded already.
+# Idempotent; prints the pattern it added, nothing if there was no need.
+#
+# For the chainer under a RELATIVE `core.hooksPath` (`core.hooksPath = .githooks`), which
+# git resolves inside the working tree. Untracked, it makes every `jkb task work` session
+# read dirty, and `jkb task land` refuses a dirty target — recreated by the next pull, so
+# deleting it does not help. `.git/info/exclude` is the local, unpushed write the project
+# already sanctions for exactly this (D36 does it for `.jkb/`); editing the tracked
+# `.gitignore` of someone's repo is not.
+git_exclude_locally() {
+    local repo_root="$1" path="$2" top common rel exclude
+    top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    [ -n "$top" ] || return 0
+    case "$path" in
+        "$top"/*) rel="/${path#"$top"/}" ;;
+        *) return 0 ;;   # outside the working tree: nothing to hide
+    esac
+    common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
+    exclude="$common/info/exclude"
+    mkdir -p "$common/info" || return 0
+    if [ -f "$exclude" ] && grep -qxF "$rel" "$exclude"; then
+        return 0
+    fi
+    printf '%s\n' "$rel" >>"$exclude" || return 0
+    printf '%s\n' "$rel"
 }
