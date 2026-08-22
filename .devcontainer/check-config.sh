@@ -79,6 +79,40 @@ else
     bad "generate-seccomp.sh's list no longer yields: ${missing_core[*]} — the checks above are vacuous"
 fi
 
+# CARGO_TARGET_DIR is named in four files that cannot reference one another (JSON has no
+# variables), and it was already wrong once: it sat BESIDE the allowlisted ~/.cargo rather than
+# under it, so denyRead blanketed every sandboxed build while both runtime guards reported the
+# container healthy. The rule is generic — the path every site names must be the same one, and it
+# must fall under a posture write root — so a future edit to any single site is caught here rather
+# than by a build dying inside a container.
+posture="$here/../scripts/auto-mode-posture.json"
+user="$(jq -r '.remoteUser // "root"' <<<"$dc")"
+home="/home/$user"
+target="$(jq -r '.containerEnv.CARGO_TARGET_DIR // ""' <<<"$dc")"
+if [ -z "$target" ]; then
+    bad "devcontainer.json sets no containerEnv.CARGO_TARGET_DIR — cargo would write into the bind mount"
+else
+    sites_ok=1
+    grep -qF "target=$target,type=volume" <<<"$dc" || { bad "no volume is mounted at CARGO_TARGET_DIR ($target) — a named volume whose path the image lacks is created root-owned"; sites_ok=0; }
+    grep -qF "mkdir -p $target" "$here/Dockerfile" || { bad "Dockerfile does not pre-create $target — Docker seeds volume ownership from the image, so this is what stops EACCES"; sites_ok=0; }
+    grep -qF "$target" "$here/verify.sh" || { bad "verify.sh no longer names $target, so it would not notice the mount going missing"; sites_ok=0; }
+    [ "$sites_ok" -eq 1 ] && ok "every site names the same CARGO_TARGET_DIR ($target)"
+
+    # `~` in the posture is the container user's home. Match at a component boundary: `~/.cargo`
+    # must not be read as covering `~/.cargo-target`, which is the exact mistake being guarded.
+    covered=0
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        root="${entry/#\~/$home}"
+        case "$target" in "$root"|"$root"/*) covered=1; break ;; esac
+    done < <(jq -r '.require.sandbox.filesystem.allowWrite[]?' "$posture" 2>/dev/null)
+    if [ "$covered" -eq 1 ]; then
+        ok "CARGO_TARGET_DIR falls under a posture allowWrite root"
+    else
+        bad "CARGO_TARGET_DIR ($target) is under no allowWrite root — sandboxed builds in the container will be denied"
+    fi
+fi
+
 # The firewall reads the SAME allowlist the sandbox posture uses. If that path or key moves, the
 # firewall silently allowlists nothing and default-denies everything, which reads as "very secure"
 # right up until nothing works.
