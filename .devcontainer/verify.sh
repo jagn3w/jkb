@@ -34,25 +34,44 @@ fi
 # EVERY mount point the kernel reports, minus the runtime's own fixed set — NOT the ones that
 # happen to live under /home/vscode. Filtering by target prefix made this a list of absences with
 # two entries: mounting /var/run/docker.sock (root on the host) or $HOME at /host passed cleanly.
-EXPECTED="/home/vscode/repos/jkb
-/home/vscode/.jkb
-/home/vscode/.claude-state
-/home/vscode/.cargo/target"
+#
+# The expected set is DERIVED from devcontainer.json rather than transcribed beside it. A
+# hand-kept copy went stale the first time the mounts changed: renaming the cargo target volume
+# deleted the registry line with it, so a correctly-built container failed this very assertion
+# after a full toolchain build. Two lists that must agree is the defect; there is now one list.
+# Deriving does not weaken it — the question this asks is "does the running container match what
+# it declares", and editing the declaration changes nothing until a human rebuilds.
+DC="$(cd "$(dirname "$0")" && pwd)/devcontainer.json"
+# The devcontainer spec allows a mount as either a comma-separated string or an object, and the
+# two are interchangeable at any time — so read both. Handling only strings would turn a purely
+# cosmetic edit of devcontainer.json into a container that cannot verify itself.
+EXPECTED="$(sed 's://.*$::' "$DC" 2>/dev/null \
+    | jq -r '[(.workspaceMount // empty)] + (.mounts // [])
+             | .[]
+             | if type == "string" then capture("target=(?<t>[^,]+)").t else .target end' \
+      2>/dev/null | sort -u)"
 # What every container has regardless of configuration. Anything outside this and EXPECTED is
 # something a human added to devcontainer.json and must be looked at.
 RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets'
 actual="$(awk '{print $5}' /proc/self/mountinfo | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
-unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED" | sort -u))"
-if [ -z "$unexpected" ]; then
-    ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked)"
+# A failed derivation would make every real mount look undeclared — a true failure, but reported
+# as the wrong thing. Say which it is, so the fix is not looked for in devcontainer.json's mounts.
+if [ -z "$EXPECTED" ]; then
+    bad "could not derive the declared mounts from $DC — the check below cannot mean anything"
 else
-    bad "UNDECLARED mounts: $(tr '\n' ' ' <<<"$unexpected")"
+    unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED"))"
+    if [ -z "$unexpected" ]; then
+        ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked against $(printf '%s\n' "$EXPECTED" | grep -c . ) declared)"
+    else
+        bad "UNDECLARED mounts: $(tr '\n' ' ' <<<"$unexpected")"
+    fi
 fi
 
 #    ...and the one that would quietly undo the whole posture: ~/.claude must NOT be a host mount.
 #    The container writes its own settings.json there (that is the posture, installed by setup.sh);
 #    what must never appear is the HOST's, which the agent would then be able to read and which is
-#    the file that decides whether it is sandboxed at all. Only the credential file is bind-mounted.
+#    the file that decides whether it is sandboxed at all. Nothing under ~/.claude is mounted from
+#    the host at all — not even the credential file, which is why you log in inside the container.
 claude_mounts="$(awk '$5 == "/home/vscode/.claude" {print $5}' /proc/self/mountinfo)"
 assert "~/.claude is the container's own, not a host mount" \
     "$([ -z "$claude_mounts" ] && echo yes || echo no)"

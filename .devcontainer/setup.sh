@@ -9,17 +9,26 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # script — including a toolchain download — with unrestricted egress. postStart raises it again
 # on every later start, because iptables rules do not survive a container restart.
 say "egress firewall"
-sudo -n /usr/local/bin/init-firewall.sh "$repo/scripts/auto-mode-posture.json"
+sudo -n /usr/local/bin/init-firewall.sh
 
 # Claude Code writes sessions, history and auto-memory under ~/.claude. That lives in a named
-# volume so it survives a rebuild without putting anything on the host; the credential file is the
-# one thing bind-mounted in, so the symlink has to go around it rather than over it.
+# volume so it survives a rebuild without putting anything on the host. NOTHING under ~/.claude is
+# mounted from the host — not even the credential file — which is why you authenticate inside the
+# container, and therefore why the credential and account-state files must be linked out here too.
+# Without them, devcontainer.json's promise that a login survives a rebuild is false: they would
+# sit in the container's writable layer and go with it.
 say "claude state"
-mkdir -p /home/vscode/.claude-state
+mkdir -p /home/vscode/.claude-state /home/vscode/.claude
 for d in projects sessions history file-history shell-snapshots todos statsig; do
     mkdir -p "/home/vscode/.claude-state/$d"
     ln -sfn "/home/vscode/.claude-state/$d" "/home/vscode/.claude/$d" 2>/dev/null || true
 done
+# The two whole-file pieces of login state. Linked while still dangling — Claude Code creates
+# each on first write and follows the symlink into the volume. Re-linked on every create, which
+# is the repair if a writer ever replaces one via temp-file-and-rename rather than writing in
+# place; that would drop the link and cost one re-login, never anything on the host.
+ln -sfn /home/vscode/.claude-state/.credentials.json /home/vscode/.claude/.credentials.json 2>/dev/null || true
+ln -sfn /home/vscode/.claude-state/claude.json /home/vscode/.claude.json 2>/dev/null || true
 
 say "auto-mode posture"
 # The same posture file the host uses. It ends by running `check`, so a merge that did not take

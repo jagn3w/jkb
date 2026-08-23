@@ -13,15 +13,41 @@
 # for. The nested sandbox filters by hostname at a proxy and is precise. Coarse-but-independent
 # under precise-but-in-the-same-process is the point: they fail for different reasons.
 #
-# ONE SOURCE OF TRUTH: the allowlist is read from scripts/auto-mode-posture.json, the same file
-# the sandbox posture comes from. Two egress lists that could disagree is how the tighter one ends
-# up decorative.
+# ONE SOURCE OF TRUTH: the allowlist comes from scripts/auto-mode-posture.json, the same file the
+# sandbox posture comes from. Two egress lists that could disagree is how the tighter one ends up
+# decorative. It is read at container CREATE and snapshotted (see below), so what this enforces is
+# that file as it stood when the container was built, not as it stands now.
 set -euo pipefail
 
-POSTURE="${1:-/workspaces/jkb/scripts/auto-mode-posture.json}"
-[ -r "$POSTURE" ] || { echo "init-firewall: cannot read posture $POSTURE" >&2; exit 1; }
-
 say() { printf '[firewall] %s\n' "$*"; }
+
+# THE ALLOWLIST THIS RUNS ON IS NOT THE ONE IN THE WORKSPACE. It used to be: the caller passed a
+# path, and the path passed was the repo's own copy — bind-mounted, under allowWrite, writable by
+# the agent this layer exists to bound. Appending a domain there and waiting for the next container
+# start had root add it to the ipset. A backstop the bounded party can edit is not a backstop.
+#
+# So the workspace copy is read exactly ONCE, at container create, before any agent session exists,
+# and snapshotted somewhere only root can write. Every later run reads the snapshot. A rebuild is
+# what re-reads the repo — which is right, because widening egress should be a human act, and
+# rebuilding is one. The argument is gone entirely rather than defaulted, so the sudoers entry can
+# forbid arguments outright; a grant naming no argument accepts every argument.
+readonly WORKSPACE_POSTURE=/home/vscode/repos/jkb/scripts/auto-mode-posture.json
+readonly SNAPSHOT=/usr/local/share/jkb-egress-allowlist.json
+
+[ "$#" -eq 0 ] || { echo "init-firewall: takes no arguments (the allowlist is $SNAPSHOT)" >&2; exit 2; }
+
+if [ ! -e "$SNAPSHOT" ]; then
+    [ -r "$WORKSPACE_POSTURE" ] || { echo "init-firewall: cannot read $WORKSPACE_POSTURE to snapshot" >&2; exit 1; }
+    install -o root -g root -m 0444 "$WORKSPACE_POSTURE" "$SNAPSHOT"
+    say "snapshotted the egress allowlist from the workspace (first run in this container)"
+elif ! cmp -s "$WORKSPACE_POSTURE" "$SNAPSHOT" 2>/dev/null; then
+    # Reported, never acted on. Divergence is the normal state after someone edits the posture,
+    # and the honest response is to say the coarse layer is still on the old list — silence here
+    # would let a legitimate edit look applied when the firewall never saw it.
+    say "NOTE: $WORKSPACE_POSTURE differs from the snapshot this firewall runs on."
+    say "      The coarse layer keeps the snapshot until the container is REBUILT."
+fi
+POSTURE="$SNAPSHOT"
 
 # Idempotent regardless of whether an iptables rule still references the set. `destroy` cannot run
 # while the OUTPUT rule points at it, and the subsequent `create` then failed "set with the same

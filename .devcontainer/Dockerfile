@@ -31,7 +31,7 @@ RUN apt-get update -qq \
 # agent can also sudo, is a root shell with extra steps.
 COPY --chown=root:root init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod 0755 /usr/local/bin/init-firewall.sh \
-    && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh\n' > /etc/sudoers.d/init-firewall \
+    && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh ""\n' > /etc/sudoers.d/init-firewall \
     && chmod 0440 /etc/sudoers.d/init-firewall
 
 # --- non-root from here on ------------------------------------------------------------------

@@ -1332,6 +1332,20 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     assertion would be a test of the machine. The tests exercise the *logic* — a posture covering
     nothing is refused, one covering everything is not, a symlink listed only by its link name is
     flagged.
+  - **It asked the deny side against `$HOME` while the posture declares five deny roots.** The
+    posture also blankets `/Volumes`, `/media`, `/mnt` and `/run/media`, so a cargo home on an
+    external volume — or, on WSL, anything under `/mnt/c`, which is where the Windows filesystem
+    lives — was reported "outside denyRead", `install` was not refused, and every sandboxed build
+    then failed to read its own registry. Exactly the two-readers-of-one-fact shape this file
+    argues against everywhere else, in the tool whose whole job is to predict that breakage.
+    `denyRead` is now read from the posture like its allow-side siblings.
+  - **`cd ""` succeeds in bash, which quietly made an empty posture list mean `$PWD`.** jq prints
+    nothing for an empty array, a here-string of nothing is still **one empty line**, and the
+    resulting empty entry resolved to the current directory and entered the list as an allowed
+    prefix — so a posture covering *nothing* reported the checkout as covered. Found by writing the
+    deny-side test above and watching it fail; fixing it then exposed the other half, since arrays
+    that had always held at least one element could now be genuinely empty and `"${arr[@]}"` under
+    `set -u` on bash 3.2 aborts the script. Both halves were latent behind the same masking bug.
   - **`set -e` made the three-state check unreachable.** `settings_state` returns 0/1/2 and a bare
     call returning non-zero aborts the script before `case $?` runs, so the distinction existed
     and never fired. `|| st=$?` is what turns a return code into a value. Caught by the tests,
@@ -1377,6 +1391,20 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   negative "no restricted entry still names these", the precondition that the file exists — and
   where a harness judges other guards, give it a **negative control**: an unmutated run must be
   reported MISSED, or the matcher is matching something present when nothing is wrong.
+  - **The next round's must-fix was inside that round's fix, and it is the same shape one level
+    up.** Removing the credential mount and renaming the cargo volume deleted **three** lines of
+    `verify.sh`'s hand-written mount list where two were intended, dropping `.cargo/registry` — so
+    a correctly-built container failed its own verifier, after the full toolchain build, because
+    `setup.sh` ends by running it. Two lists that must agree **is** the defect: the list is now
+    **derived** from `devcontainer.json` (both the string and object mount spellings), so there is
+    one. A `CARGO_TARGET_DIR` guard added an hour earlier pinned a single string in that very file
+    and could not see the list beside it — a guard aimed at the instance, not the class.
+  - **A skip decided per-assertion is not a skip.** `run` refuses on a Linux host without
+    bubblewrap, correctly — but the argv assertions ran unconditionally, so the shared gate went
+    red for a fact about the machine; and the drift assertion three lines below asked only for a
+    non-zero exit and no argv file, which is *exactly* what that dependency refusal produces. It
+    would have reported a pass having never exercised the refusal it names. The group is skipped as
+    a group, announced, and the drift assertion now matches the refusal **text**.
 - **Two more were the posture not covering what the machine needs**, the D48.10 shape again in a
   new place: `CARGO_TARGET_DIR` was a *sibling* of the allowlisted `~/.cargo`, and `covered()`
   matches at component boundaries, so `denyRead: ["~"]` blanketed every sandboxed build in the
@@ -1390,8 +1418,16 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
 - **The credential mount could not work on macOS.** `~/.claude/.credentials.json` is Linux/WSL
   only — macOS keeps credentials in the Keychain — and a bind mount with a missing source is a
   hard error, so the container never started on the host this repo is developed on. Removed
-  entirely: authenticate *inside* the container, into the state volume, which also fixes the
-  read-only mount that `claude login` could not have written.
+  entirely: authenticate *inside* the container (`claude auth login`), into the state volume,
+  which also fixes the read-only mount that a login could not have written.
+  - **Removing a mount left the plumbing shaped around it.** `setup.sh`'s symlink loop linked only
+    the *directories* under `~/.claude`, because the credential file was the one thing bind-mounted
+    and the loop had to go around it. With the mount gone, nothing linked it — so an in-container
+    login sat in the writable layer and died with the next rebuild, while `devcontainer.json`
+    promised the opposite. `.credentials.json` and `~/.claude.json` are now linked into the volume
+    too, dangling until first write. The residual is stated rather than designed away: a writer
+    that replaces a file by temp-and-rename would drop the link, which costs one re-login at the
+    next create and can never reach the host.
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not
@@ -1427,6 +1463,17 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
     download is blocked by the coarse layer while looking allowlisted in the file.
   - **It is installed into the image, root-owned, with sudoers granting exactly that one path.** A
     script the agent can edit, that the agent can also `sudo`, is a root shell with extra steps.
+  - **…and that argument was the hole the script itself closed for the script.** The caller passed
+    the allowlist's path, and the path passed was the repo's own copy — bind-mounted, under
+    `allowWrite`, writable by the agent this layer exists to bound. Appending a domain and waiting
+    for the next container start had root add it to the ipset. The sudoers entry made it worse
+    rather than better: **a command naming no argument accepts every argument**, so any readable
+    JSON on the box was a valid allowlist. Now the workspace copy is read exactly **once**, at
+    container create, before any agent session exists, and snapshotted root-owned; every later run
+    reads the snapshot, the script **refuses** arguments, and sudoers pins it to none (`… ""`). A
+    rebuild is what re-reads the repo, which is the right ceremony for widening egress. Divergence
+    between the two is **reported and never acted on** — silence would let a legitimate edit look
+    applied when the coarse layer never saw it.
   - **Order:** the Dev Containers lifecycle is postCreate → postStart, so `setup.sh` raises the
     firewall as its *first* act. Leaving it to `postStartCommand` alone would run the whole of
     create — including a toolchain download — with open egress.

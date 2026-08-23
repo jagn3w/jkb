@@ -284,44 +284,62 @@ export CLAUDE_ARGV_OUT="$tmp/argv"
 
 export CLAUDE_CONFIG_DIR="$tmp/claude"
 cp "$tmp/good" "$settings"
-rm -f "$CLAUDE_ARGV_OUT"
-set +e
-"$tool" run --model sonnet >/dev/null 2>&1
-rc=$?
-set -e
-check_that "run launches auto mode and passes user args through" \
-    "$([ "$rc" -eq 0 ] && [ "$(tr '\n' ' ' < "$CLAUDE_ARGV_OUT")" = "--permission-mode auto --model sonnet " ] && echo yes || echo no)"
 
-rm -f "$CLAUDE_ARGV_OUT"
-set +e
-JKB_AUTO_MODE_SSH_AGENT=1 SSH_AUTH_SOCK="$tmp/agent.sock" "$tool" run >/dev/null 2>&1
-set -e
-# macOS passes the overlay; Linux must refuse to pretend. `allowUnixSockets` is documented
-# macOS-only, so an overlay emitted there would be a flag that reports success and does nothing.
-if [ "$(uname -s)" = "Darwin" ]; then
-    check_that "the opt-in ssh-agent overlay names the socket and nothing else" \
-        "$(grep -qF "{\"sandbox\":{\"network\":{\"allowUnixSockets\":[\"$tmp/agent.sock\"]}}}" "$CLAUDE_ARGV_OUT" && echo yes || echo no)"
-elif [ -s "$CLAUDE_ARGV_OUT" ] && grep -q -- "--permission-mode" "$CLAUDE_ARGV_OUT"; then
-    # Only meaningful once `run` actually reached the exec: absence of the overlay in a file that
-    # was never written is not evidence of anything.
-    check_that "the ssh-agent overlay is NOT emitted on Linux, where it would be inert" \
-        "$(grep -q "allowUnixSockets" "$CLAUDE_ARGV_OUT" && echo no || echo yes)"
-else
-    # `run` refuses on this host (no bwrap/socat), so it never execs and there is no argv to
-    # inspect. Announced rather than passed — a skip that reads as a pass is how a Linux-only
-    # branch goes untested forever.
-    echo "  skip  ssh-agent overlay (run did not exec here: $( [ -s "$CLAUDE_ARGV_OUT" ] && echo 'no argv' || echo 'missing bwrap/socat' ))"
+# `run` hard-refuses on a Linux host without bubblewrap/socat — correctly, since the sandbox
+# cannot start there — so EVERY assertion below would fail for a reason that is about the machine
+# and not about the code, reddening a gate that check.sh and CI both run. Decide once, here, and
+# skip the whole group together: deciding per-assertion is how the drift assertion below came to
+# be satisfiable by the dependency refusal instead of by the refusal it names.
+run_skip=""
+if [ "$(uname -s)" = "Linux" ]; then
+    for dep in bwrap socat; do
+        command -v "$dep" >/dev/null 2>&1 || run_skip="${run_skip:+$run_skip }$dep"
+    done
 fi
 
-rm -f "$CLAUDE_ARGV_OUT"
-jq '.sandbox.enabled = false' "$tmp/good" > "$settings"
-set +e
-"$tool" run >/dev/null 2>&1
-rc=$?
-set -e
-check_that "run refuses to launch a drifted posture, and execs nothing" \
-    "$([ "$rc" -ne 0 ] && [ ! -e "$CLAUDE_ARGV_OUT" ] && echo yes || echo no)"
-cp "$tmp/good" "$settings"
+if [ -n "$run_skip" ]; then
+    echo "  skip  the three \`run\` assertions — this host is missing: $run_skip (apt install bubblewrap socat)"
+else
+    rm -f "$CLAUDE_ARGV_OUT"
+    set +e
+    "$tool" run --model sonnet >/dev/null 2>&1
+    rc=$?
+    set -e
+    check_that "run launches auto mode and passes user args through" \
+        "$([ "$rc" -eq 0 ] && [ "$(tr '\n' ' ' < "$CLAUDE_ARGV_OUT")" = "--permission-mode auto --model sonnet " ] && echo yes || echo no)"
+
+    rm -f "$CLAUDE_ARGV_OUT"
+    set +e
+    JKB_AUTO_MODE_SSH_AGENT=1 SSH_AUTH_SOCK="$tmp/agent.sock" "$tool" run >/dev/null 2>&1
+    set -e
+    # macOS passes the overlay; Linux must refuse to pretend. `allowUnixSockets` is documented
+    # macOS-only, so an overlay emitted there would be a flag that reports success and does nothing.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        check_that "the opt-in ssh-agent overlay names the socket and nothing else" \
+            "$(grep -qF "{\"sandbox\":{\"network\":{\"allowUnixSockets\":[\"$tmp/agent.sock\"]}}}" "$CLAUDE_ARGV_OUT" && echo yes || echo no)"
+    else
+        # Absence of the overlay in a file that was never written is not evidence of anything, so
+        # establish that `run` reached the exec before reading meaning into what is not there.
+        check_that "run reached the exec, so the overlay's absence below means something" \
+            "$([ -s "$CLAUDE_ARGV_OUT" ] && grep -q -- "--permission-mode" "$CLAUDE_ARGV_OUT" && echo yes || echo no)"
+        check_that "the ssh-agent overlay is NOT emitted on Linux, where it would be inert" \
+            "$(grep -q "allowUnixSockets" "$CLAUDE_ARGV_OUT" && echo no || echo yes)"
+    fi
+
+    rm -f "$CLAUDE_ARGV_OUT"
+    jq '.sandbox.enabled = false' "$tmp/good" > "$settings"
+    set +e
+    "$tool" run >"$tmp/run.out" 2>"$tmp/run.err"
+    rc=$?
+    set -e
+    # The refusal TEXT is the discriminating half. A non-zero exit with no argv file is also what
+    # every other way of failing to launch produces — a missing dependency, a missing stub — so
+    # asserting only that reports a pass having never exercised the drift refusal.
+    check_that "run refuses to launch a drifted posture, and execs nothing" \
+        "$([ "$rc" -ne 0 ] && [ ! -e "$CLAUDE_ARGV_OUT" ] \
+           && grep -q "posture NOT intact" "$tmp/run.err" && echo yes || echo no)"
+    cp "$tmp/good" "$settings"
+fi
 
 # --- 9. print is the posture, verbatim -----------------------------------------------------
 check_that "print emits the posture file unchanged" \
@@ -368,6 +386,28 @@ check_that "even a passing preflight names what it cannot check" \
     "$(grep -q 'not checked here' <<<"$out" && grep -q 'setuid' <<<"$out" && echo yes || echo no)"
 check_that "a passing preflight does not claim the machine is simply workable" \
     "$(grep -q 'no FILESYSTEM gaps' <<<"$out" && echo yes || echo no)"
+
+# The DENY side must come from the posture, not from an assumption that it is $HOME. These two
+# postures differ ONLY in denyRead and must disagree about the same paths; a preflight that
+# hardcodes $HOME answers both identically and fails the second. Not hypothetical — the posture
+# also denies /Volumes, /media, /mnt and /run/media, so a cargo home on an external volume, or
+# anything under /mnt/c on WSL, was reported covered and install went ahead into the breakage.
+nodeny_posture="$tmp/posture-nodeny.json"
+jq '.require.sandbox.filesystem.allowRead = [] | .require.sandbox.filesystem.allowWrite = []
+    | .require.sandbox.filesystem.denyRead = []' "$posture" > "$nodeny_posture"
+alldeny_posture="$tmp/posture-alldeny.json"
+jq '.require.sandbox.filesystem.allowRead = [] | .require.sandbox.filesystem.allowWrite = []
+    | .require.sandbox.filesystem.denyRead = ["/"]' "$posture" > "$alldeny_posture"
+
+# Matched with a regex spanning the colour reset, not the literal two spaces: the printf puts an
+# ANSI escape between "GAP" and "readable", so `grep 'GAP  readable'` can never match and the
+# assertion would hold whatever preflight printed.
+run_preflight "$nodeny_posture"
+check_that "a path under no denyRead root is not reported as a read gap" \
+    "$(grep -q 'outside denyRead' <<<"$out" && ! grep -qE 'GAP.*readable' <<<"$out" && echo yes || echo no)"
+run_preflight "$alldeny_posture"
+check_that "the same path IS a read gap once the posture denies its root" \
+    "$(grep -qE 'GAP.*readable' <<<"$out" && ! grep -q 'outside denyRead' <<<"$out" && echo yes || echo no)"
 
 # The symlink case, which is the one that resolving both sides would hide: allow only the
 # symlink spelling and require the tool to notice the real path is not listed.

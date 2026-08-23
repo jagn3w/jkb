@@ -69,7 +69,7 @@
   // raises it as its first act; postStart raises it again because iptables rules live in the
   // container's network namespace and do not survive a restart.
   "postCreateCommand": "bash .devcontainer/setup.sh",
-  "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json",
+  "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh",
 
   "customizations": {
     "vscode": {

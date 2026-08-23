@@ -253,14 +253,22 @@ cmd_preflight() {
     [ -n "${SHELL:-}" ] && need_read+=("$HOME/.$(basename "$SHELL")rc")
 
     # Expand a posture entry to an absolute, symlink-resolved prefix.
+    #
+    # The `[ -n "$e" ]` guard is load-bearing, not defensive tidying. An empty posture list makes
+    # jq print nothing, a here-string of nothing is still ONE empty line, and `cd ""` SUCCEEDS in
+    # bash without moving — so the empty entry resolved to $PWD and quietly entered the list as an
+    # allowed (or denied) prefix. Every path under the current directory then read as covered by a
+    # posture that covers nothing.
     local -a allow_w=() allow_r=()
     local e real
     while IFS= read -r e; do
+        [ -n "$e" ] || continue
         e="${e/#\~/$HOME}"
         real="$(cd "$e" 2>/dev/null && pwd -P)" || real="$e"
         allow_w+=("$real")
     done <<<"$(jq -r '.require.sandbox.filesystem.allowWrite[]?' "$posture")"
     while IFS= read -r e; do
+        [ -n "$e" ] || continue
         e="${e/#\~/$HOME}"
         real="$(cd "$e" 2>/dev/null && pwd -P)" || real="$e"
         allow_r+=("$real")
@@ -288,15 +296,32 @@ cmd_preflight() {
     # mismatch that denied /tmp on the live install, where the sandbox matched the real path and
     # the posture said the symlink. A path that is covered only after resolution is a latent gap.
     local -a lit_w=() lit_r=()
-    while IFS= read -r e; do lit_w+=("${e/#\~/$HOME}"); done <<<"$(jq -r '.require.sandbox.filesystem.allowWrite[]?' "$posture")"
-    while IFS= read -r e; do lit_r+=("${e/#\~/$HOME}"); done <<<"$(jq -r '.require.sandbox.filesystem.allowRead[]?' "$posture")"
+    while IFS= read -r e; do [ -n "$e" ] && lit_w+=("${e/#\~/$HOME}"); done <<<"$(jq -r '.require.sandbox.filesystem.allowWrite[]?' "$posture")"
+    while IFS= read -r e; do [ -n "$e" ] && lit_r+=("${e/#\~/$HOME}"); done <<<"$(jq -r '.require.sandbox.filesystem.allowRead[]?' "$posture")"
+
+    # The DENY roots, read from the posture rather than assumed to be $HOME. They are not: the
+    # posture also blankets /Volumes, /media, /mnt and /run/media, so a machine whose CARGO_HOME
+    # lives on an external volume — or, on WSL, anything under /mnt/c — was told "outside denyRead"
+    # and install proceeded into exactly the breakage preflight exists to predict. Both spellings
+    # are collected and a path under EITHER counts as denied, which errs toward reporting a gap.
+    local -a deny_r=()
+    while IFS= read -r e; do
+        [ -n "$e" ] || continue
+        e="${e/#\~/$HOME}"
+        deny_r+=("$e")
+        # `|| true`: a deny root that does not exist on this machine (/media on macOS, /Volumes on
+        # Linux) makes the cd fail, and a bare failing && chain at the end of a loop body aborts
+        # the whole script under `set -e` — the same trap that made settings_state unreachable.
+        real="$(cd "$e" 2>/dev/null && pwd -P)" || real=""
+        [ -n "$real" ] && [ "$real" != "$e" ] && deny_r+=("$real") || true
+    done <<<"$(jq -r '.require.sandbox.filesystem.denyRead[]?' "$posture")"
 
     local gaps=0 p rp
     echo "==> preflight: does the posture cover what this machine needs?"
     for p in "${need_write[@]}"; do
         rp="$(resolve "$p")"
-        if covered "$rp" "${lit_w[@]}"; then printf '  \033[32mok\033[0m   writable: %s\n' "$p"
-        elif covered "$rp" "${allow_w[@]}"; then
+        if covered "$rp" ${lit_w[@]+"${lit_w[@]}"}; then printf '  \033[32mok\033[0m   writable: %s\n' "$p"
+        elif covered "$rp" ${allow_w[@]+"${allow_w[@]}"}; then
             printf '  \033[31mGAP\033[0m  writable: %s resolves to %s, which is covered only if the sandbox follows symlinks — list %s literally\n' "$p" "$rp" "$rp"; gaps=$((gaps+1))
         else printf '  \033[31mGAP\033[0m  writable: %s -> %s is in no allowWrite entry\n' "$p" "$rp"; gaps=$((gaps+1)); fi
     done
@@ -304,8 +329,8 @@ cmd_preflight() {
         rp="$(resolve "$p")"
         # readable if covered by allowRead OR by allowWrite (a writable tree is readable), or if
         # it simply is not under a denyRead root at all.
-        if covered "$rp" "${lit_r[@]}" "${lit_w[@]}"; then printf '  \033[32mok\033[0m   readable: %s\n' "$p"
-        elif ! covered "$rp" "$HOME"; then printf '  \033[32mok\033[0m   readable: %s (outside denyRead)\n' "$p"
+        if covered "$rp" ${lit_r[@]+"${lit_r[@]}"} ${lit_w[@]+"${lit_w[@]}"}; then printf '  \033[32mok\033[0m   readable: %s\n' "$p"
+        elif ! covered "$rp" ${deny_r[@]+"${deny_r[@]}"}; then printf '  \033[32mok\033[0m   readable: %s (outside denyRead)\n' "$p"
         else printf '  \033[31mGAP\033[0m  readable: %s -> %s is under denyRead and in no allowRead entry\n' "$p" "$rp"; gaps=$((gaps+1)); fi
     done
     preflight_blind_spots

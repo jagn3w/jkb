@@ -22,7 +22,7 @@ run() { # run <label> <expect-substring> <docker args...>
   local label="$1" expect="$2"; shift 2
   local out rc
   out="$(docker run --rm "$@" "$IMAGE" bash -c '
-      sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json >/dev/null 2>&1
+      sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
       ./.devcontainer/verify.sh' 2>&1)"
   rc=$?

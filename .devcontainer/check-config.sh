@@ -79,7 +79,26 @@ else
     bad "generate-seccomp.sh's list no longer yields: ${missing_core[*]} — the checks above are vacuous"
 fi
 
-# CARGO_TARGET_DIR is named in four files that cannot reference one another (JSON has no
+# Every mount point the container declares, derived the same way verify.sh derives it. verify.sh
+# no longer keeps a hand-written copy of this list — a transcribed one went stale the moment the
+# mounts changed, dropping the cargo registry and failing a correctly-built container — so what is
+# checked here is that the DERIVATION still yields the mounts the container cannot work without.
+# An empty or truncated result would make verify.sh's boundary assertion meaningless.
+mount_targets="$(jq -r '[(.workspaceMount // empty)] + (.mounts // [])
+                        | .[]
+                        | if type == "string" then capture("target=(?<t>[^,]+)").t else .target end' \
+                 <<<"$dc" 2>/dev/null | sort -u)"
+missing_mounts=()
+for m in /home/vscode/repos/jkb /home/vscode/.jkb; do
+    grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
+done
+if [ ${#missing_mounts[@]} -eq 0 ]; then
+    ok "the mount list parses and declares the load-bearing mounts ($(grep -c . <<<"$mount_targets") targets)"
+else
+    bad "the declared mount set is missing ${missing_mounts[*]} — verify.sh derives its boundary from this list"
+fi
+
+# CARGO_TARGET_DIR is named in three files that cannot reference one another (JSON has no
 # variables), and it was already wrong once: it sat BESIDE the allowlisted ~/.cargo rather than
 # under it, so denyRead blanketed every sandboxed build while both runtime guards reported the
 # container healthy. The rule is generic — the path every site names must be the same one, and it
@@ -93,9 +112,8 @@ if [ -z "$target" ]; then
     bad "devcontainer.json sets no containerEnv.CARGO_TARGET_DIR — cargo would write into the bind mount"
 else
     sites_ok=1
-    grep -qF "target=$target,type=volume" <<<"$dc" || { bad "no volume is mounted at CARGO_TARGET_DIR ($target) — a named volume whose path the image lacks is created root-owned"; sites_ok=0; }
+    grep -qx "$target" <<<"$mount_targets" || { bad "no volume is mounted at CARGO_TARGET_DIR ($target) — a named volume whose path the image lacks is created root-owned"; sites_ok=0; }
     grep -qF "mkdir -p $target" "$here/Dockerfile" || { bad "Dockerfile does not pre-create $target — Docker seeds volume ownership from the image, so this is what stops EACCES"; sites_ok=0; }
-    grep -qF "$target" "$here/verify.sh" || { bad "verify.sh no longer names $target, so it would not notice the mount going missing"; sites_ok=0; }
     [ "$sites_ok" -eq 1 ] && ok "every site names the same CARGO_TARGET_DIR ($target)"
 
     # `~` in the posture is the container user's home. Match at a component boundary: `~/.cargo`
@@ -121,6 +139,28 @@ if jq -e '.require.sandbox.network.allowedDomains | length > 0' "$here/../script
 else
     bad "posture has no .require.sandbox.network.allowedDomains — the firewall would deny everything"
 fi
+
+# The firewall is the layer that holds when the nested sandbox does not, so the party it bounds
+# must not be able to choose what it enforces. Two halves, and BOTH are needed: a sudoers command
+# naming no argument accepts every argument, so pinning it to none is what stops any readable JSON
+# being passed; and the script must refuse an argument rather than merely ignore one, or the two
+# statements disagree about which is authoritative.
+if grep -qF 'init-firewall.sh ""' "$here/Dockerfile"; then
+    ok "sudoers grants init-firewall.sh with no arguments permitted"
+else
+    bad "the sudoers grant does not pin the argument list — any readable JSON path would be accepted as the allowlist"
+fi
+if grep -qF 'takes no arguments' "$here/init-firewall.sh"; then
+    ok "init-firewall.sh refuses arguments (its allowlist is the root-owned snapshot)"
+else
+    bad "init-firewall.sh still accepts a posture path — the agent-writable workspace copy could be passed to it"
+fi
+callers_ok=1
+for caller in "$here/setup.sh" "$here/devcontainer.json"; do
+    grep -q 'init-firewall\.sh[^"]*auto-mode-posture\.json' "$caller" && {
+        bad "$(basename "$caller") still passes a posture path to init-firewall.sh"; callers_ok=0; }
+done
+[ "$callers_ok" -eq 1 ] && ok "no caller passes an allowlist path to the firewall"
 
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi
