@@ -1463,6 +1463,22 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
     download is blocked by the coarse layer while looking allowlisted in the file.
   - **It is installed into the image, root-owned, with sudoers granting exactly that one path.** A
     script the agent can edit, that the agent can also `sudo`, is a root shell with extra steps.
+  - **…and all of that was decorative, because the base image grants blanket passwordless root.**
+    `mcr.microsoft.com/devcontainers/base` ships `/etc/sudoers.d/vscode` containing
+    `vscode ALL=(root) NOPASSWD:ALL`, so the agent could flush the firewall, delete the allowlist
+    snapshot, rewrite the root-owned script, or simply `sudo -i`. Every root-ownership protection
+    in this design rests on the agent not being able to become root, and none of them checked.
+    Removed in the Dockerfile, with `visudo -c` failing the **build** on a malformed result — a
+    broken sudoers file locks out the one grant the firewall needs. **Found only by running
+    `sudo -n -l` inside the container**: two review passes and every static check missed it,
+    because nothing in the repo *says* the base image grants it. The general lesson is the one
+    this section keeps relearning one level up — a guard is worth what its weakest bypass is
+    worth, and the bypass here was inherited rather than written.
+  - **The check for it asks sudo, not the file.** `verify.sh` requires that every command `vscode`
+    may run as root names the firewall, so a blanket grant re-added by *any* route — a rebuilt
+    base image, a feature, a helpful `RUN` line — fails it. `mutate-verify.sh` restores the grant
+    in a one-layer image built `FROM` the real one and requires that failure, since a sudoers
+    entry cannot be broken with a `docker run` flag.
   - **…and that argument was the hole the script itself closed for the script.** The caller passed
     the allowlist's path, and the path passed was the repo's own copy — bind-mounted, under
     `allowWrite`, writable by the agent this layer exists to bound. Appending a domain and waiting

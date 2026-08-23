@@ -55,18 +55,38 @@ it one path at a time and never mount all of `$HOME`. `verify.sh` asserts the mo
 **exactly** what is declared — exhaustively, from `/proc/self/mountinfo`, rather than by listing
 paths that ought to be absent, because a list of absences can never be complete.
 
-Only `~/.claude/.credentials.json` is mounted, never `~/.claude`: that directory holds
-`settings.json`, which **is** the posture, and a process the posture bounds must not be able to
-read or write the file that decides whether it is bounded at all.
+**Nothing** under `~/.claude` is mounted from the host — not `settings.json`, which **is** the
+posture and which a process the posture bounds must not be able to read or write, and not the
+credential file either. Authenticate inside the container (`claude auth login`); `setup.sh` links
+the credential and account-state files into the `.claude-state` volume, so a login survives a
+rebuild without anything of the host's being visible.
+
+The expected set is **derived** from `devcontainer.json`, so adding a mount is a one-file change
+and cannot drift out of step with the verifier. It used to be transcribed into `verify.sh` as
+well, and the first time the mounts changed the copy went stale and a correctly-built container
+failed its own verifier.
 
 By default only **this repo** is mounted, not all of `~/repos` — the tightest useful default. To
 work across repos, change `workspaceMount` to bind `${localEnv:HOME}/repos` at
-`/home/vscode/repos` and add the extra paths to `verify.sh`'s expected set, deliberately.
+`/home/vscode/repos`, deliberately.
+
+## Root is not reachable from inside
+
+The mount boundary, the root-owned firewall, its allowlist snapshot and the pinned sudoers
+argument are all protections against a process that cannot become root — so `vscode` may run
+exactly one command as root, `init-firewall.sh`, with no arguments. The base image ships
+`/etc/sudoers.d/vscode` granting `NOPASSWD:ALL`, which would make every one of those bypassable
+with a single `sudo`; the Dockerfile removes it and `verify.sh` asks *sudo itself* what is
+permitted, so a blanket grant re-added by any route fails.
+
+The cost is real and intended: you cannot `sudo apt install` inside the container. Add packages to
+the Dockerfile and rebuild, or `docker exec -u root` from the host.
 
 ## Verifying it
 
 - `verify.sh` — inside the container: non-root, bwrap works, the mount set is exactly as declared,
-  `~/.claude` is not a host mount, egress is denied *and* the allowlist still works, posture intact.
+  `~/.claude` is not a host mount, root is reachable only for the firewall, egress is denied *and*
+  the allowlist still works, posture intact.
 - `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
   fails naming it. A guard nobody has watched fail is not a guard.
 - `check-config.sh` — host-side, no Docker, part of `./scripts/check.sh`. Its real job is the

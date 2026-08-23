@@ -32,7 +32,17 @@ RUN apt-get update -qq \
 COPY --chown=root:root init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod 0755 /usr/local/bin/init-firewall.sh \
     && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh ""\n' > /etc/sudoers.d/init-firewall \
-    && chmod 0440 /etc/sudoers.d/init-firewall
+    && chmod 0440 /etc/sudoers.d/init-firewall \
+    # ...and the grant above means nothing while THIS file exists. The devcontainers base image
+    # ships /etc/sudoers.d/vscode containing `vscode ALL=(root) NOPASSWD:ALL`, so the agent could
+    # already run anything as root: flush the firewall, delete the allowlist snapshot, rewrite the
+    # script above, or just `sudo -i`. Every root-ownership protection in this design — and the
+    # sentence three lines up about a root shell with extra steps — was decorative until this line.
+    # Found by running `sudo -n -l` inside the container; nothing static would have shown it.
+    && rm -f /etc/sudoers.d/vscode \
+    # A malformed sudoers file locks sudo out entirely, which would break the firewall at every
+    # start. Fail the BUILD instead.
+    && visudo -c >/dev/null
 
 # --- non-root from here on ------------------------------------------------------------------
 USER vscode

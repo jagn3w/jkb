@@ -76,6 +76,22 @@ claude_mounts="$(awk '$5 == "/home/vscode/.claude" {print $5}' /proc/self/mounti
 assert "~/.claude is the container's own, not a host mount" \
     "$([ -z "$claude_mounts" ] && echo yes || echo no)"
 
+# 3b. ROOT IS REACHABLE OR IT IS NOT, and everything above depends on which. The mount boundary,
+#     the root-owned firewall, its allowlist snapshot and the pinned sudoers argument are all
+#     protections against a process that cannot become root — and the devcontainers base image
+#     ships /etc/sudoers.d/vscode granting `NOPASSWD:ALL`, so until that is removed the agent can
+#     undo every one of them with a single sudo. Asked of sudo itself rather than of the file,
+#     because what matters is the policy in force: every command vscode may run as root must be
+#     the firewall. A blanket grant re-added by any route fails here.
+sudo_entries="$(sudo -n -l 2>/dev/null | grep -E '^\s*\(' || true)"
+if [ -z "$sudo_entries" ]; then
+    ok "no passwordless root is granted at all"
+elif [ -z "$(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries")" ]; then
+    ok "the only command permitted as root is the firewall ($(grep -c . <<<"$sudo_entries") grant(s))"
+else
+    bad "vscode may run more than the firewall as root: $(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries" | tr -s ' ' | tr '\n' ';')"
+fi
+
 # 4. ...and these must be present, or the container is merely empty rather than confined.
 assert "workspace is mounted"       "$([ -f /home/vscode/repos/jkb/Cargo.toml ] && echo yes || echo no)"
 assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || echo no)"

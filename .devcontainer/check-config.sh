@@ -150,6 +150,15 @@ if grep -qF 'init-firewall.sh ""' "$here/Dockerfile"; then
 else
     bad "the sudoers grant does not pin the argument list — any readable JSON path would be accepted as the allowlist"
 fi
+# ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
+# base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
+# delete the allowlist snapshot or rewrite the root-owned script. verify.sh asks sudo itself at
+# runtime, which is the real check; this catches the removal being dropped from the Dockerfile.
+if grep -qF 'rm -f /etc/sudoers.d/vscode' "$here/Dockerfile"; then
+    ok "the base image's blanket NOPASSWD:ALL grant is removed"
+else
+    bad "the Dockerfile no longer removes /etc/sudoers.d/vscode — the agent can sudo anything, and every root-ownership guard here is bypassable"
+fi
 if grep -qF 'takes no arguments' "$here/init-firewall.sh"; then
     ok "init-firewall.sh refuses arguments (its allowlist is the root-owned snapshot)"
 else

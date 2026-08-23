@@ -18,10 +18,19 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
 # matched `ok  ~/.claude is the container's own, not a host mount` — two of five mutations
 # reported CAUGHT with the guard deleted, and the summary line said "every guard fired".
+# Some properties cannot be broken with a docker flag — a sudoers grant lives in the image — so
+# the mutation is a one-layer image built FROM it. Set RUN_IMAGE to use the variant.
+RUN_IMAGE=""
+mutant() { # mutant <tag> <root-shell-command>
+  printf 'FROM %s\nUSER root\nRUN %s\nUSER vscode\n' "$IMAGE" "$2" | docker build -q -t "$1" - >/dev/null 2>&1 \
+    && RUN_IMAGE="$1"
+}
+
 run() { # run <label> <expect-substring> <docker args...>
   local label="$1" expect="$2"; shift 2
-  local out rc
-  out="$(docker run --rm "$@" "$IMAGE" bash -c '
+  local out rc img="${RUN_IMAGE:-$IMAGE}"
+  RUN_IMAGE=""
+  out="$(docker run --rm "$@" "$img" bash -c '
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
       ./.devcontainer/verify.sh' 2>&1)"
@@ -54,6 +63,13 @@ run "no NET_ADMIN (firewall cannot come up)" "NON-allowlisted host was permitted
     --security-opt seccomp="$SEC" --user vscode "${BASE[@]}"
 run "runs as root" "runs as a non-root user" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user root "${BASE[@]}"
+
+# The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
+# firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
+# Dockerfile removes it; this puts it back and requires verify.sh to notice.
+mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/sudoers.d/vscode && chmod 0440 /etc/sudoers.d/vscode"
+run "blanket passwordless root is restored" "may run more than the firewall as root" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
 
 # The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher
 # is matching something that is present when nothing is wrong — which is precisely the defect
