@@ -562,3 +562,59 @@ fn the_id_and_marker_are_scoped_to_the_session() {
     assert_eq!(req.id, "jkb-claude-___");
     assert_eq!(req.marker.parent(), Some(f.dir.as_path()));
 }
+
+/// The owner rule, which is the whole of the fifth review's must-fix.
+///
+/// Recording a pid that dies with this invocation made every record read as *provably dead*, so
+/// the next session's sweep withdrew a live session's pending prompt. Everything it cannot tell
+/// apart from its own short-lived ancestry must come back empty, which reads as `Unknown` and
+/// makes the sweep do nothing — the only safe default, because the other direction takes a live
+/// notification off the screen.
+#[test]
+fn an_owner_that_dies_with_this_call_is_refused() {
+    const PARENT: u32 = 111;
+    const ME: u32 = 222;
+
+    assert_eq!(
+        super::owner_from("999", PARENT, ME),
+        "999",
+        "a third process is the owner"
+    );
+
+    for (raw, why) in [
+        ("111", "the shim, which exits the moment this call returns"),
+        ("222", "this process, which is the shim's child"),
+        ("0", "not a process"),
+        ("", "nothing was passed"),
+        ("-1", "not a pid"),
+        ("abc", "not a number"),
+        ("4294967296", "beyond u32"),
+    ] {
+        assert_eq!(super::owner_from(raw, PARENT, ME), "", "{why}");
+    }
+}
+
+/// ...and an empty owner reads back as `Unknown`, not as death.
+#[test]
+fn an_empty_owner_is_unknown_not_dead() {
+    let rec = super::Record {
+        tool: "Bash".to_owned(),
+        owner: String::new(),
+    };
+    assert_eq!(super::session_alive(&rec), Fact::Unknown);
+    assert!(
+        !machine()
+            .apply(
+                &NotifCtx {
+                    at: NotifState::AwaitingTool,
+                    notifier_usable: Fact::Unknown,
+                    tool_named: true,
+                    tool_matches: Fact::Unknown,
+                    session_alive: super::session_alive(&rec),
+                },
+                NotifEvent::SessionGone
+            )
+            .moved(),
+        "so the sweep leaves it alone"
+    );
+}

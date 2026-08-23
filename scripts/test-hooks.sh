@@ -390,6 +390,36 @@ canary_after=$(git -C "$repo_root_for_canary" status --porcelain 2>/dev/null; \
 check "the post-merge fixtures did not touch the real repository" \
   "$([ "$canary_before" = "$canary_after" ] && echo intact || echo CHANGED)" "intact"
 
+# The hooks directory, in a real WORKTREE — which is the mode this project works in, and the one
+# the answer used to be wrong for. `--git-dir` there is .git/worktrees/<name>, where git never
+# looks for hooks, so setup.sh installed into a path git ignores while printing it as success and
+# D34.5's post-merge automation was silently off in every `jkb task work` session.
+echo "==> setup.sh (hooks directory)"
+hd_repo=$(mktemp -d) || hd_repo=""
+if [ -z "$hd_repo" ] || [ ! -d "$hd_repo" ]; then
+  fail "hooks-dir fixture: could not create a temp dir"
+else
+  (
+    cd "$hd_repo" || exit 1
+    git init -q . && git config user.email t@t && git config user.name t
+    echo seed > seed.txt && git add -A && git commit -qm one
+    git worktree add -q wt -b side
+  ) >/dev/null 2>&1
+  setup="$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh"
+  check "in a plain checkout it is git's own answer" \
+    "$("$setup" --hooks-dir "$hd_repo")" \
+    "$(git -C "$hd_repo" rev-parse --path-format=absolute --git-common-dir)"
+  check "in a WORKTREE it is still the common dir, not --git-dir" \
+    "$("$setup" --hooks-dir "$hd_repo/wt")" \
+    "$(git -C "$hd_repo/wt" rev-parse --path-format=absolute --git-common-dir)"
+  # ...and the two really do differ there, or the assertion above proves nothing.
+  check "and --git-dir would have been somewhere else" \
+    "$([ "$(git -C "$hd_repo/wt" rev-parse --path-format=absolute --git-dir)" \
+        = "$(git -C "$hd_repo/wt" rev-parse --path-format=absolute --git-common-dir)" ] \
+       && echo same || echo different)" "different"
+  [ -n "$hd_repo" ] && [ -d "$hd_repo" ] && rm -rf "$hd_repo"
+fi
+
 if [ "$failures" -ne 0 ]; then
   printf '\n%d hook test(s) failed\n' "$failures" >&2
   exit 1

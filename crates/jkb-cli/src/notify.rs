@@ -672,14 +672,21 @@ impl Request {
 /// [`Fact::Unknown`], so the sweep does nothing. Getting this wrong in the other direction takes
 /// a live session's notification off the screen, so the default has to be to do nothing.
 fn owner_id() -> String {
-    let Ok(owner) = std::env::var("JKB_HOOK_OWNER") else {
-        return String::new();
-    };
-    let Ok(pid) = owner.trim().parse::<u32>() else {
+    owner_from(
+        std::env::var("JKB_HOOK_OWNER").unwrap_or_default().trim(),
+        std::os::unix::process::parent_id(),
+        std::process::id(),
+    )
+}
+
+/// The decision itself, with the two pids it must reject handed in — so the rule that carries the
+/// whole must-fix can be tested, which it could not be while it read the environment.
+fn owner_from(raw: &str, parent: u32, me: u32) -> String {
+    let Ok(pid) = raw.parse::<u32>() else {
         return String::new();
     };
     // The shim is our parent and dies with this call; so does anything claiming to be us.
-    if pid == 0 || pid == std::os::unix::process::parent_id() || pid == std::process::id() {
+    if pid == 0 || pid == parent || pid == me {
         return String::new();
     }
     pid.to_string()
