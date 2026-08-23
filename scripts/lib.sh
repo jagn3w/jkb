@@ -278,7 +278,10 @@ install_git_hooks() {
     case "$outcome" in
         installed|up-to-date|refreshed)
             excluded="$(git_exclude_locally "$repo_root" "$chainer")"
-            [ -n "$excluded" ] && printf 'excluded=%s\n' "$excluded"
+            # `if`, not `[ … ] && printf` — the rule this file states one function above.
+            if [ -n "$excluded" ]; then
+                printf 'excluded=%s\n' "$excluded"
+            fi
             ;;
     esac
     return 0

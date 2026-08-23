@@ -212,6 +212,28 @@ case8() {
         || fail "foreign: clobbered" "the user's hook was overwritten"
 }
 
+# --- 9. install_git_hooks outside a git repo ---------------------------------------------
+# setup.sh renders `error=` as a warning and carries on. Untested, that arm was a branch
+# wearing the costume of a safeguard.
+case9() {
+    local d="$work/norepo" out status
+    mkdir -p "$d/plain"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    out="$(install_git_hooks "$d/plain" "$d/src" 2>/dev/null)"; status=$?
+    if [ "$status" -ne 0 ]; then
+        ok "outside a git repo it fails"
+    else
+        fail "norepo: status" "reported success outside a repo"
+    fi
+    case "$out" in
+        error=*) ok "and says why, in the form setup.sh renders" ;;
+        *) fail "norepo: output" "expected an error= line, got: '$out'" ;;
+    esac
+    [ -e "$d/plain/hooks" ] \
+        && fail "norepo: wrote" "it created a hooks directory outside a repo" \
+        || ok "and writes nothing"
+}
+
 echo "==> scripts/lib.sh::install_chainer"
 case1
 case1b
@@ -222,5 +244,6 @@ case5
 case6
 case7
 case8
+case9
 
 finish
