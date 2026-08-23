@@ -80,6 +80,9 @@ printf '\n' >> "$tmp/jkbcalls"
 # left the test green, which is the one thing it exists to catch.
 [ -n "\${JKB_NOTIFIER:-}" ] && printf 'notifier=%s\n' "\$JKB_NOTIFIER" >> "$tmp/jkbcalls"
 [ -n "\${JKB_HOOK_OWNER:-}" ] && printf 'owner=%s\n' "\$JKB_HOOK_OWNER" >> "$tmp/jkbcalls"
+# This stub is a direct child of the shim, so OUR parent IS the shim — the discriminator the
+# owner assertion needs, and it is free.
+printf 'shim=%s\n' "\$PPID" >> "$tmp/jkbcalls"
 exit 0
 STUB
 chmod +x "$tmp/goodjkb/jkb"
@@ -123,8 +126,15 @@ check "and passes the notifier path it resolved" \
 # The owner is the session's, and jkb CANNOT ask for it — its own parent is this shim, which
 # exits milliseconds later. Recording that made every record read as provably dead, so the next
 # session's sweep withdrew a live session's pending prompt.
-check "and passes an owner that is not the shim itself" \
-  "$(sed -n 's/^owner=//p' "$tmp/jkbcalls" | head -1 | grep -cE '^[0-9]+$' | tr -d ' ')" "1"
+# NOT merely "is a number" — that stayed green when the shim recorded `$$`, its own pid, which
+# is the exact defect this guards: a process that exits milliseconds later makes every record
+# read as provably dead, so the next session's sweep withdraws a live session's prompt.
+owner_seen=$(sed -n 's/^owner=//p' "$tmp/jkbcalls" | head -1)
+shim_seen=$(sed -n 's/^shim=//p' "$tmp/jkbcalls" | head -1)
+check "and passes a numeric owner" "$(printf '%s' "$owner_seen" | grep -cE '^[0-9]+$' | tr -d ' ')" "1"
+check "and it is NOT the shim itself" \
+  "$([ -n "$owner_seen" ] && [ "$owner_seen" != "$shim_seen" ] && echo different || echo same)" \
+  "different"
 
 # 4. Malformed input still exits 0 and says nothing.
 hook_run 'not json' "$tmp/goodjkb:/usr/bin:/bin"

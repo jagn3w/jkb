@@ -94,11 +94,7 @@ fn an_unusable_notifier_falls_back_to_a_banner() {
         c.notifier_usable = fact;
         let out = m.apply(&c, NotifEvent::Needed);
         assert_eq!(out.state(), NotifState::Absent, "{fact:?}");
-        assert_eq!(
-            out.effects(),
-            &[NotifEffect::Withdraw, NotifEffect::Banner, NotifEffect::Forget],
-            "the destination is `absent`, so the record must not be left saying otherwise: {fact:?}"
-        );
+        assert_eq!(out.effects(), &[NotifEffect::Banner], "{fact:?}");
     }
 }
 
@@ -215,6 +211,7 @@ impl Drop for Fixture {
 fn posting_records_the_tool_and_the_owner() {
     let f = Fixture::new("post");
     let req = f.request(NotifEvent::Needed, "s1");
+    let handed_in = req.owner.clone();
     req.perform(&[NotifEffect::Post, NotifEffect::Remember])
         .expect("post and remember");
     assert_eq!(
@@ -225,10 +222,18 @@ fn posting_records_the_tool_and_the_owner() {
     let mut lines = record.lines();
     assert_eq!(lines.next(), Some("Bash"));
 
-    // The owner must be a process that is actually ALIVE. Asserting only that it parses was
-    // satisfied by the shim's own already-dead bash pid, which is how a wrong owner read as
-    // covered while the sweep withdrew live sessions' prompts.
+    // The owner written must be the one HANDED IN. Asserting only that it was alive was
+    // satisfied by any live ancestor: revert `Remember` to `parent_id()` and under `cargo test`
+    // that is cargo, alive for the whole run — so this passed while production went back to
+    // recording the shim's bash pid, which dies milliseconds later and makes the next sweep
+    // withdraw a live session's pending prompt.
     let owner = lines.next().expect("an owner").to_owned();
+    assert_eq!(
+        owner, handed_in,
+        "the record carries the owner the request was given: {record:?}"
+    );
+
+    // Liveness is a supplement — it says the fixture is realistic, not that the rule holds.
     let rec = super::Record {
         tool: "Bash".to_owned(),
         owner,
@@ -236,7 +241,7 @@ fn posting_records_the_tool_and_the_owner() {
     assert_eq!(
         super::session_alive(&rec),
         Fact::Yes,
-        "the recorded owner is alive: {record:?}"
+        "and that owner is real: {record:?}"
     );
 }
 

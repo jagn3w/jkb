@@ -187,21 +187,25 @@ fn needed_dest(c: &NotifCtx) -> Option<NotifState> {
 
 /// What a `Needed` does: post and record, or fall back to a banner nobody can withdraw.
 ///
-/// The fallback ends in `Forget` because its destination is `Absent`, and a destination the
-/// record contradicts is the divergence this whole design is built to avoid: arriving here from
-/// `AwaitingTool` — the notifier stopped being usable between one prompt and the next — used to
-/// leave the record saying `awaiting_tool` while the machine reported `absent`, so nothing would
-/// ever withdraw the notification still on screen. `Withdraw` leads because `remove` works on a
-/// notifier that is merely unauthorized, and screen effects precede record effects.
+/// **REVERTED to `[Banner]`, and not re-patched.** It was briefly `[Withdraw, Banner, Forget]`,
+/// to stop the record saying `awaiting_tool` while the destination said `absent`. That fixed a
+/// divergence and caused a worse defect: with no notifier bundle at all, `perform` cannot apply
+/// `Withdraw`, stops there, and the banner never goes out — so a permission prompt produced *no
+/// notification whatsoever*, which is worse than before any of this existed.
+///
+/// Keeping the record is also the safer half of the divergence it was meant to fix. A record that
+/// still names the notification is the route BACK: the next `TurnEnded` or `UserActed` finds
+/// `awaiting_tool` and plans `[Withdraw, Forget]`, so what is on screen still comes down. Clearing
+/// it would have made the machine's story tidy and the notification unreachable.
+///
+/// The divergence itself is real and stays open as a finding rather than being fixed here — the
+/// honest repair is to the *destination* (stay put when we could not post), which is a design
+/// change, and this round has already shown what re-patching a plan under time pressure costs.
 fn needed_plan(c: &NotifCtx) -> Vec<NotifEffect> {
     if c.notifier_usable.is_yes() {
         vec![NotifEffect::Post, NotifEffect::Remember]
     } else {
-        vec![
-            NotifEffect::Withdraw,
-            NotifEffect::Banner,
-            NotifEffect::Forget,
-        ]
+        vec![NotifEffect::Banner]
     }
 }
 
