@@ -16,18 +16,11 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/lib.sh
 . "$repo_root/scripts/lib.sh"
+# shellcheck source=scripts/tests/harness.sh
+. "$(dirname "$0")/harness.sh"
 
-failures=0
-ok()   { printf '  ok   %s\n' "$1"; }
-fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; failures=$((failures + 1)); }
-
-work="$(mktemp -d)"
-trap 'chmod -R u+rwx "$work" 2>/dev/null; rm -rf "$work"' EXIT
-
-mkdir -p "$work/home"
-export HOME="$work/home" GIT_CONFIG_NOSYSTEM=1
-unset XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE
-git_q() { git -c user.name=t -c user.email=t@example.com "$@"; }
+work="$(new_workdir)"
+isolate_git "$work/home"
 
 # --- 1. install, then re-install ---------------------------------------------------------
 case1() {
@@ -43,6 +36,27 @@ case1() {
     [ "$got" = "up-to-date" ] \
         && ok "running it again: up-to-date" \
         || fail "fresh: idempotence" "second run reported '$got'"
+}
+
+# --- 1b. right bytes, wrong mode ----------------------------------------------------------
+# `up-to-date` is the only arm that skips install_exec, so it is the only one where the mode
+# is not set as a side effect. A restore from backup or an `rsync` without `-p` lands here at
+# 644; git skips a non-executable hook, so reporting "up to date" would mean the repo hook
+# silently never runs — the exact failure the chainer exists to prevent.
+case1b() {
+    local d="$work/mode" got
+    mkdir -p "$d"
+    chainer_body >"$d/post-merge"
+    chmod 644 "$d/post-merge"
+    got="$(install_chainer "$d/post-merge")"
+    if [ "$got" = "up-to-date" ]; then
+        fail "mode: outcome" "reported up-to-date for a chainer git will not execute"
+    else
+        ok "a non-executable chainer is not reported healthy"
+    fi
+    [ -x "$d/post-merge" ] \
+        && ok "and it is made executable" \
+        || fail "mode: still 644" "the chainer is still not executable after install_chainer"
 }
 
 # --- 2. a chainer from before the worktree fix is upgraded -------------------------------
@@ -138,15 +152,75 @@ case6() {
         || fail "dispatch: worktree" "expected REPO-HOOK-RAN, got '$out'"
 }
 
+# --- 7. install_git_hooks: the whole block setup.sh runs, in a worktree ------------------
+# Pass 4's coverage gap: every test drove the helpers, nothing drove the block that calls
+# them, so reverting the hooks directory to `--git-dir` left the entire gate green while the
+# headline fix was undone. The oracle is git's own answer.
+case7() {
+    local d="$work/block" main wt out hook
+    mkdir -p "$d"
+    main="$d/main"
+    git_q init -q "$main" >/dev/null 2>&1
+    git_q -C "$main" commit -q --allow-empty -m init
+    git_q -C "$main" worktree add -q "$d/wt" -b side >/dev/null 2>&1
+    wt="$d/wt"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+
+    # Run it the way a session does: against the WORKTREE, which is where the bug lived.
+    out="$(install_git_hooks "$wt" "$d/src")"
+    hook="${out#repo-hook=}"; hook="${hook%%$'\n'*}"
+    if [ "$hook" = "$(git -C "$wt" rev-parse --git-path hooks/post-merge)" ]; then
+        ok "install_git_hooks puts the hook where git runs hooks from, from a worktree"
+    else
+        fail "block: path" "installed at '$hook', git runs '$(git -C "$wt" rev-parse --git-path hooks/post-merge)'"
+    fi
+    [ -x "$hook" ] && ok "and it is executable" || fail "block: mode" "$hook is not executable"
+
+    # No core.hooksPath here, so it must report no chainer and exclude nothing.
+    case "$out" in
+        *chainer=*|*excluded=*) fail "block: extra" "reported a chainer with no core.hooksPath: $out" ;;
+        *) ok "with no core.hooksPath it installs only the repo hook" ;;
+    esac
+}
+
+# --- 8. install_git_hooks does not hide a chainer it does not own -------------------------
+# Two adjacent statements used to take opposite positions: `foreign` says the file is not
+# ours to touch, and the exclude ran anyway — hiding the user's own hook from `git status`
+# and `git add -A` permanently.
+case8() {
+    local d="$work/foreignblock" repo out
+    mkdir -p "$d"
+    repo="$d/repo"
+    git_q init -q "$repo" >/dev/null 2>&1
+    git_q -C "$repo" commit -q --allow-empty -m init
+    git_q -C "$repo" config core.hooksPath .githooks
+    mkdir -p "$repo/.githooks"
+    printf '#!/bin/sh\n# my own hook\n' >"$repo/.githooks/post-merge"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+
+    out="$(install_git_hooks "$repo" "$d/src")"
+    case "$out" in
+        *"chainer=foreign"*) ok "a foreign chainer is reported as foreign" ;;
+        *) fail "foreign: outcome" "expected chainer=foreign, got: $out" ;;
+    esac
+    case "$out" in
+        *excluded=*) fail "foreign: excluded" "jkb hid a chainer it had just declared not its own" ;;
+        *) ok "and it is not added to .git/info/exclude" ;;
+    esac
+    grep -q 'my own hook' "$repo/.githooks/post-merge" \
+        && ok "the user's hook is untouched" \
+        || fail "foreign: clobbered" "the user's hook was overwritten"
+}
+
 echo "==> scripts/lib.sh::install_chainer"
 case1
+case1b
 case2
 case3
 case4
 case5
 case6
+case7
+case8
 
-if [ "$failures" -ne 0 ]; then
-    echo "$failures failure(s)" >&2
-    exit 1
-fi
+finish

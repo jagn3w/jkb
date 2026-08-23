@@ -143,50 +143,29 @@ fi
 say "installing git hooks"
 hooks_src="$repo_root/scripts/hooks/post-merge"
 if [ -f "$hooks_src" ]; then
-  # `git_hooks_dir`, not `rev-parse --git-dir`: in a worktree those differ and only the
-  # former is where git looks. See scripts/lib.sh.
-  hooks_dir="$(git_hooks_dir "$repo_root" || true)"
-  if [ -n "$hooks_dir" ]; then
-    mkdir -p "$hooks_dir"
-    # `install_exec`, never `cp`: the hook we are replacing is very often the process that
-    # invoked this script, and a `cp` rewrites its inode underneath the running shell.
-    install_exec "$hooks_dir/post-merge" <"$hooks_src"
-    echo "  • repo hook:  $hooks_dir/post-merge"
-
-    # Asked of `$repo_root`, like the hooks directory above — a bare `git config` answers for
-    # whatever repo the caller is standing in. See scripts/lib.sh.
-    global_hooks="$(git_hooks_override "$repo_root")"
-    if [ -n "$global_hooks" ]; then
-      mkdir -p "$global_hooks"
-      chainer="$global_hooks/post-merge"
-      # The body and the three arms live in lib.sh so a shell test can drive them; this is
-      # only the reporting. Atomic for install_exec's reason plus its own: the chainer is on
-      # the path of every repo's `git pull`, so a half-written one breaks merges far outside
-      # this checkout.
-      case "$(install_chainer "$chainer")" in
-        installed)  echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)" ;;
-        up-to-date) echo "  • chainer:    $chainer (up to date)" ;;
-        refreshed)  echo "  • chainer:    $chainer (refreshed — it predated the worktree fix)" ;;
-        foreign)
-          # Not byte-for-byte something jkb wrote, so it is not ours to replace — it may be
-          # your own file, or ours with your edits in it. Say so, because a chainer that does
-          # not dispatch means the repo hook never runs.
-          warn "$chainer was not written by jkb (or has been edited) — left untouched."
-          warn "  if it does not exec \"\$(git rev-parse --git-common-dir)/hooks/post-merge\", the repo hook never runs." ;;
-        *) warn "could not install the chainer at $chainer" ;;
-      esac
-      # A relative core.hooksPath resolves inside the working tree, where an untracked
-      # chainer makes every session read dirty and blocks `jkb task land`.
-      excluded="$(git_exclude_locally "$repo_root" "$chainer")"
-      # `if`, not `[ … ] && echo`: under `set -e` a false test as the head of an `&&` list
-      # makes the list fail, and the list IS the statement — so the script exits.
-      if [ -n "$excluded" ]; then
-        echo "  • excluded:   $excluded (inside the working tree; added to .git/info/exclude)"
-      fi
-    fi
-  else
-    warn "not a git repo; skipping hook install"
-  fi
+  # The whole block lives in lib.sh (`install_git_hooks`), which reports what it did as
+  # `key=value` lines; this is only the rendering. Inline, none of it was reachable from a
+  # test — reverting the hooks directory to `--git-dir` left the entire gate green.
+  while IFS= read -r line; do
+    case "$line" in
+      repo-hook=*) echo "  • repo hook:  ${line#repo-hook=}" ;;
+      excluded=*)  echo "  • excluded:   ${line#excluded=} (inside the working tree; added to .git/info/exclude)" ;;
+      chainer=*)
+        rest="${line#chainer=}"; outcome="${rest%% *}"; path="${rest#* }"
+        case "$outcome" in
+          installed)  echo "  • chainer:    $path (core.hooksPath is set, so this is required)" ;;
+          up-to-date) echo "  • chainer:    $path (up to date)" ;;
+          refreshed)  echo "  • chainer:    $path (refreshed)" ;;
+          foreign)
+            # Not byte-for-byte something jkb wrote, so it is not ours to replace — it may be
+            # your own file, or ours with your edits in it.
+            warn "$path was not written by jkb (or has been edited) — left untouched."
+            warn "  if it does not exec \"\$(git rev-parse --git-common-dir)/hooks/post-merge\", the repo hook never runs." ;;
+          *) warn "could not install the chainer at $path" ;;
+        esac ;;
+      error=*) warn "${line#error=}; skipping hook install" ;;
+    esac
+  done < <(install_git_hooks "$repo_root" "$hooks_src" || true)
 fi
 
 # --- shared claude memory (opt-in) -------------------------------------------
@@ -200,9 +179,10 @@ say "setup complete"
 echo "  • jkb:        $(command -v jkb)"
 echo "  • database:   $db"
 echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
-# `if`, not `[ … ] && echo`: a false test leaves the list's status non-zero, and as the last
-# statement that becomes the script's own — so `setup.sh --no-service` reported failure, and
-# the post-merge hook's `|| echo "setup.sh failed"` would have believed it.
+# `if`, not `[ … ] && echo`. `set -e` does NOT exit here — it exempts every command in an
+# `&&` list but the last — but the list's status is still non-zero, and as the final statement
+# that becomes the script's own. So `setup.sh --no-service` exited 1, and the post-merge hook's
+# `|| echo "setup.sh failed"` would have believed it.
 if [ "$do_extension" -eq 1 ]; then
   echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
 fi

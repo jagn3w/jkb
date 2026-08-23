@@ -367,9 +367,62 @@ fn mark(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSET_PREFIX, BUNDLED_COMMANDS, BUNDLED_WORKFLOWS};
+
+    use super::{
+        asset_path, ensure_into, install_into, stamp_path, ASSET_PREFIX, BUNDLED_COMMANDS,
+        BUNDLED_WORKFLOWS, KINDS,
+    };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+
+    /// The auto-install must replace an asset by rename, never by truncating it in place.
+    ///
+    /// This is the writer that fires on **every** `jkb` invocation, unattended — a `git pull`
+    /// runs the post-merge hook, which runs setup.sh, which reinstalls the binary, whose next
+    /// invocation lands here — while a `/task-swarm` or `/review` run is reading
+    /// `jkb-code-review.js`. Without this, reverting `write_all` to `std::fs::write` leaves the
+    /// whole suite green: `atomic::write`'s own tests exercise the seam in isolation, and
+    /// nothing asserted that either installer goes through it. `ASSET_PREFIX`'s doc records
+    /// this file regressing in exactly that shape once already.
+    #[test]
+    #[cfg(unix)]
+    fn the_auto_install_replaces_assets_by_rename_not_in_place() {
+        use std::io::Read;
+        const PREVIOUS: &str = "// the version that was installed before this upgrade\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        install_into(base).expect("first install");
+
+        // Stand the asset in for an OLDER version of itself. The bundle bodies are fixed, so
+        // without this the reinstall writes byte-identical content and the assertion cannot
+        // tell a rename from a truncate-and-rewrite — it passed under `fs::write` when first
+        // written, which is the failure mode this test exists to catch in other code.
+        let kind = &KINDS[0];
+        let (stem, body) = kind.set[0];
+        let path = asset_path(base, kind, stem);
+        std::fs::write(&path, PREVIOUS).expect("plant an older version");
+
+        // A running workflow holding its script open across the upgrade.
+        let mut reader = std::fs::File::open(&path).expect("open an installed asset");
+
+        std::fs::write(stamp_path(base), "stale").expect("stale the stamp");
+        ensure_into(base).expect("auto-install");
+
+        let mut seen = String::new();
+        reader
+            .read_to_string(&mut seen)
+            .expect("read through the open handle");
+        assert_eq!(
+            seen, PREVIOUS,
+            "the auto-install rewrote an asset a reader was already holding"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            body,
+            "the upgrade did not land"
+        );
+    }
 
     fn stems(set: &'static [(&'static str, &'static str)]) -> BTreeSet<&'static str> {
         set.iter().map(|(stem, _)| *stem).collect()

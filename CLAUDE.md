@@ -622,6 +622,17 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   `jkb task work` session read dirty and `jkb task land` refuse it — and deleting it did not
   help, since the next pull recreates it. `.git/info/exclude` is the local, unpushed write D36
   already sanctions for `.jkb/`; editing someone's tracked `.gitignore` is not.
+- **The whole hook block is `lib.sh`'s `install_git_hooks`, reporting `key=value` lines**;
+  setup.sh only renders them. Every test drove the helpers and nothing drove the block that
+  calls them, so reverting the hooks directory to `--git-dir` left the gate green with the
+  headline fix undone. The same move as the chainer body one bullet up, for the same reason.
+- **An append to `.git/info/exclude` writes its separator first.** A file not ending in a
+  newline — a hand-edited one usually does not — had its last rule fused with ours (`*.log` +
+  `/.githooks/post-merge`), destroying a rule the user owns while our own pattern stayed inert,
+  under a success message. `session::ensure_excluded` computes the same `sep`: one rule, an
+  implementation in each language, and the shell copy was written without consulting the Rust
+  one. Excluding is also gated on the chainer being **ours** — hiding a `foreign` file would
+  take the opposite position on ownership from the line that just refused to touch it.
 - **The atomic write is one seam, `jkb_cli::atomic::write`**, used by `service::install` and by
   `commands::write_all`. The shell half was fixed first, the service unit second, and the
   `~/.claude/{workflows,commands}` assets were still truncating in place — on a path setup.sh

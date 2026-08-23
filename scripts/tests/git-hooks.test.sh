@@ -16,25 +16,11 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/lib.sh
 . "$repo_root/scripts/lib.sh"
+# shellcheck source=scripts/tests/harness.sh
+. "$(dirname "$0")/harness.sh"
 
-failures=0
-ok()   { printf '  ok   %s\n' "$1"; }
-fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; failures=$((failures + 1)); }
-
-work="$(mktemp -d)"
-trap 'chmod -R u+rwx "$work" 2>/dev/null; rm -rf "$work"' EXIT
-
-# `--git-path hooks/…` honours core.hooksPath, and this developer has one set globally — so
-# without an isolated config the oracle answers with the user's own hooks directory and the
-# suite reddens over a regression that does not exist. HOME + GIT_CONFIG_NOSYSTEM works on
-# every git version (GIT_CONFIG_GLOBAL needs 2.32); XDG_CONFIG_HOME has to go too, because
-# git prefers `$XDG_CONFIG_HOME/git/config` over `$HOME/.gitconfig` and overriding only HOME
-# leaves the real global config visible. GIT_DIR/GIT_WORK_TREE would point every command in
-# here at somebody else's repository.
-mkdir -p "$work/home"
-export HOME="$work/home" GIT_CONFIG_NOSYSTEM=1
-unset XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE
-git_q() { git -c user.name=t -c user.email=t@example.com "$@"; }
+work="$(new_workdir)"
+isolate_git "$work/home"
 
 # Where git will actually run the post-merge hook from, as an absolute path.
 oracle_dir() {
@@ -159,16 +145,29 @@ case5() {
 # the file does not help because the next pull recreates it. `.git/info/exclude` is the
 # local, unpushed write the project already sanctions for this (D36 does it for `.jkb/`).
 case6() {
-    local r="$work/intree" chainer got status
+    local r="$work/intree" chainer got override
     git_q init -q "$r" >/dev/null 2>&1
     git_q -C "$r" commit -q --allow-empty -m init
     git_q -C "$r" config core.hooksPath .githooks
-    chainer="$(git_hooks_override "$r")/post-merge"
-    mkdir -p "$(dirname "$chainer")"
+    # Guard the premise before building a path out of it. This used to be
+    # `chainer="$(git_hooks_override "$r")/post-merge"` unguarded, so a regression that made
+    # the function return nothing turned the target into `/post-merge` — writing at the
+    # filesystem root — and the case then carried on to print a vacuous `ok`.
+    # Canonicalised on both sides: `--show-toplevel` reports the real path, and on macOS the
+    # temp dir is reached through the /var -> /private/var symlink.
+    override="$(git_hooks_override "$r")"
+    if [ "$(abs_dir "$override")" != "$(abs_dir "$r")/.githooks" ]; then
+        fail "exclude: premise" "git_hooks_override returned '$override', not <repo>/.githooks"
+        return
+    fi
+    chainer="$override/post-merge"
+    mkdir -p "$override"
     printf '#!/bin/sh\nexit 0\n' >"$chainer"
 
-    status="$(git_q -C "$r" status --porcelain)"
-    [ -n "$status" ] || fail "exclude: premise" "the chainer did not make the tree dirty to begin with"
+    if [ -z "$(git_q -C "$r" status --porcelain)" ]; then
+        fail "exclude: premise" "the chainer did not make the tree dirty to begin with"
+        return
+    fi
 
     got="$(git_exclude_locally "$r" "$chainer")"
     if [ "$got" = "/.githooks/post-merge" ]; then
@@ -187,6 +186,39 @@ case6() {
         ok "running it again adds nothing"
     else
         fail "exclude: idempotence" "second run printed '$got' and the pattern appears $(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude") time(s)"
+    fi
+}
+
+# --- 6b. an exclude file that does not end in a newline keeps its last rule ---------------
+# The pass-4 must-fix. Appending without a separator fused the user's last rule with ours
+# (`*.log` + `/.githooks/post-merge`), destroying a rule they own and cannot recover, while
+# our own pattern still did not take effect — under a success message.
+case6b() {
+    local r="$work/nonewline" chainer override
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    override="$(git_hooks_override "$r")"
+    if [ "$(abs_dir "$override")" != "$(abs_dir "$r")/.githooks" ]; then
+        fail "nonewline: premise" "git_hooks_override returned '$override', not <repo>/.githooks"
+        return
+    fi
+    chainer="$override/post-merge"
+    mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
+    # No trailing newline, exactly as a hand-edited file often is.
+    printf '# my rules\n*.log' >"$r/.git/info/exclude"
+
+    git_exclude_locally "$r" "$chainer" >/dev/null
+
+    if [ "$(grep -c '^\*\.log$' "$r/.git/info/exclude")" = "1" ]; then
+        ok "an exclude file with no trailing newline keeps its last rule"
+    else
+        fail "nonewline: eaten" "the user's rule became: $(tail -2 "$r/.git/info/exclude" | tr '\n' '|')"
+    fi
+    if [ "$(git_q -C "$r" check-ignore "$chainer" >/dev/null 2>&1; echo $?)" = "0" ]; then
+        ok "and our own pattern actually takes effect"
+    else
+        fail "nonewline: inert" "git does not ignore the chainer: $(cat "$r/.git/info/exclude" | tr '\n' '|')"
     fi
 }
 
@@ -217,7 +249,7 @@ case7() {
 # right. Compared as strings, never resolved, so nothing outside the sandbox is touched.
 case8() {
     local r="$work/tilde" user got expected
-    user="$(id -un)" || { printf '  skip could not determine the current user name\n'; return; }
+    user="$(id -un)" || { skip "could not determine the current user name"; return; }
     git_q init -q "$r" >/dev/null 2>&1
     git_q -C "$r" commit -q --allow-empty -m init
     git_q -C "$r" config core.hooksPath "~$user/jkb-hooks-probe"
@@ -238,10 +270,8 @@ case3
 case4
 case5
 case6
+case6b
 case7
 case8
 
-if [ "$failures" -ne 0 ]; then
-    echo "$failures failure(s)" >&2
-    exit 1
-fi
+finish

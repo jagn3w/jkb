@@ -16,21 +16,10 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/lib.sh
 . "$repo_root/scripts/lib.sh"
+# shellcheck source=scripts/tests/harness.sh
+. "$(dirname "$0")/harness.sh"
 
-failures=0
-ok()   { printf '  ok   %s\n' "$1"; }
-fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; failures=$((failures + 1)); }
-
-work="$(mktemp -d)"
-# chmod first: case 3 makes a directory unwritable, and an interrupt before it restores
-# the mode would otherwise leave `rm -rf` unable to clean up.
-trap 'chmod -R u+rwx "$work" 2>/dev/null; rm -rf "$work"' EXIT
-
-# Every entry in <dir>, sorted — the whole directory, never a search for a name we expect.
-# Looking for `.jkb-install.*` meant the assertion knew install_exec's temp template: rename
-# it and these cases pass whether or not anything is cleaned up. Asserting the exact contents
-# holds whatever the temp file is called, which is what the Rust twin does.
-entries_in() { ls -A "$1" 2>/dev/null | sort; }
+work="$(new_workdir)"
 
 # --- 1. a script survives being replaced, by a longer version, while it is running -------
 case1() {
@@ -97,7 +86,7 @@ case3() {
     mkdir -p "$d"
     printf 'original\n' >"$d/prog"
     if [ "$(id -u)" = "0" ]; then
-        printf '  skip an unwritable directory cannot be simulated as root\n'
+        skip "an unwritable directory cannot be simulated as root"
         return
     fi
     chmod 500 "$d"
@@ -142,7 +131,7 @@ case4() {
 # `mv file dir` moves the file INSIDE dir and exits 0, so without an explicit refusal this
 # installs nothing, strands a temp file in a stranger's hook directory, and reports success.
 # A directory-style hook manager keeps `post-merge/` as exactly such a folder. The Rust twin
-# `write_atomic` fails here because `fs::rename` does; the two implementations must agree.
+# `atomic::write` fails here because `fs::rename` does; the two implementations must agree.
 case5() {
     local d="$work/dirdest"
     mkdir -p "$d/post-merge"
@@ -162,7 +151,4 @@ case3
 case4
 case5
 
-if [ "$failures" -ne 0 ]; then
-    echo "$failures failure(s)" >&2
-    exit 1
-fi
+finish

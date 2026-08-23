@@ -29,7 +29,7 @@ install_exec() {
     # `mv file dir` does not fail — it moves the file INSIDE the directory. So without this
     # a <dest> that is a directory (a directory-style hook manager keeps `post-merge/` as a
     # folder of scripts) installs nothing, strands a hidden temp file in there, and returns
-    # success. Refuse before writing; the Rust twin `service::write_atomic` errors here
+    # success. Refuse before writing; the Rust twin `jkb_cli::atomic::write` errors here
     # because `fs::rename` does, and the two must agree.
     if [ -e "$dest" ] && [ ! -f "$dest" ]; then
         printf 'install_exec: %s exists and is not a regular file\n' "$dest" >&2
@@ -174,8 +174,19 @@ install_chainer() {
         printf 'foreign\n'
         return 0
     fi
-    if chainer_body | cmp -s - "$dest"; then
+    # `-x` as well as the bytes: git skips a hook that is not executable, so "the bytes match"
+    # is not the claim being made — "git will run our chainer" is. This is the only arm that
+    # skips install_exec, so it is the only one where the mode is not set as a side effect;
+    # a restore from backup or an `rsync` without `-p` lands here at mode 644 and would be
+    # reported healthy while the repo hook silently never runs.
+    if [ -x "$dest" ] && chainer_body | cmp -s - "$dest"; then
         printf 'up-to-date\n'
+        return 0
+    fi
+    # Right bytes, wrong mode: ours, so re-install it (install_exec chmods).
+    if chainer_body | cmp -s - "$dest"; then
+        chainer_body | install_exec "$dest" || return 1
+        printf 'refreshed\n'
         return 0
     fi
     for body in $chainer_known_bodies; do
@@ -213,6 +224,62 @@ git_exclude_locally() {
     if [ -f "$exclude" ] && grep -qxF "$rel" "$exclude"; then
         return 0
     fi
+    # Separator first. An exclude file that does not end in a newline — hand-edited ones
+    # often do not — would otherwise have its last rule fused with ours (`*.log` +
+    # `/.githooks/post-merge` = `*.log/.githooks/post-merge`), destroying a rule the user
+    # owns and cannot get back, while our own pattern still does not take effect. The next
+    # run appends a correct second line, so it self-heals for jkb and never for them.
+    # `session::ensure_excluded` (crates/jkb-cli/src/session.rs) computes the same `sep` for
+    # the same reason — this is one rule with an implementation in each language.
+    if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then
+        printf '\n' >>"$exclude" || return 0
+    fi
     printf '%s\n' "$rel" >>"$exclude" || return 0
     printf '%s\n' "$rel"
+}
+
+# install_git_hooks <repo_root> <hooks_src> — install the repo post-merge hook, plus a chainer
+# when `core.hooksPath` redirects git away from it. Prints one `key=value` line per action:
+#
+#   repo-hook=<path>          the hook, installed where git actually runs hooks from
+#   chainer=<outcome> <path>  installed | up-to-date | refreshed | foreign | failed
+#   excluded=<pattern>        the chainer sat inside the working tree and was hidden locally
+#   error=<reason>            nothing was done
+#
+# setup.sh renders those; the machine-readable form is what lets a shell test drive the whole
+# block. It is here rather than inline in setup.sh for the reason the chainer body already
+# moved: nothing runs setup.sh, so an inline arm is reachable from no test, and reverting the
+# hooks directory to `--git-dir` left the entire gate green while every pull inside a worktree
+# stopped running the repo hook.
+install_git_hooks() {
+    local repo_root="$1" hooks_src="$2" hooks_dir chainer outcome excluded override
+
+    hooks_dir="$(git_hooks_dir "$repo_root")" || { printf 'error=not a git repo\n'; return 1; }
+    mkdir -p "$hooks_dir" || { printf 'error=cannot create %s\n' "$hooks_dir"; return 1; }
+    # `install_exec`, never `cp`: the hook being replaced is very often the process that
+    # invoked us, and `cp` rewrites its inode underneath the running shell.
+    install_exec "$hooks_dir/post-merge" <"$hooks_src" || {
+        printf 'error=could not install %s/post-merge\n' "$hooks_dir"; return 1; }
+    printf 'repo-hook=%s\n' "$hooks_dir/post-merge"
+
+    override="$(git_hooks_override "$repo_root")"
+    [ -n "$override" ] || return 0
+
+    mkdir -p "$override" || { printf 'error=cannot create %s\n' "$override"; return 1; }
+    chainer="$override/post-merge"
+    outcome="$(install_chainer "$chainer")"
+    [ -n "$outcome" ] || outcome=failed
+    printf 'chainer=%s %s\n' "$outcome" "$chainer"
+
+    # Only hide a file we own. Excluding a `foreign` chainer would take the opposite position
+    # on ownership from the line above it: jkb would declare the file not its to touch and
+    # then write a permanent ignore rule for it, hiding the user's own hook from `git status`
+    # and `git add -A` for good.
+    case "$outcome" in
+        installed|up-to-date|refreshed)
+            excluded="$(git_exclude_locally "$repo_root" "$chainer")"
+            [ -n "$excluded" ] && printf 'excluded=%s\n' "$excluded"
+            ;;
+    esac
+    return 0
 }
