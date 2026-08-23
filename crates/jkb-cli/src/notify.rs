@@ -527,7 +527,21 @@ impl Record {
 }
 
 impl Request {
+    /// Build a request from the payload, reading every ambient value at the edge.
+    ///
+    /// The state directory, notifier and owner arrive as arguments rather than being fetched from
+    /// the environment in here, because this is the payload-to-observation layer and it had no
+    /// tests for exactly that reason — every defect the fifth review found lives on this path.
     fn parse(raw: &str) -> Result<Option<Self>> {
+        Self::parse_with(raw, &state_dir(), notifier_path().as_deref(), &owner_id())
+    }
+
+    fn parse_with(
+        raw: &str,
+        state_dir: &std::path::Path,
+        notifier: Option<&std::path::Path>,
+        owner: &str,
+    ) -> Result<Option<Self>> {
         let payload: serde_json::Value =
             serde_json::from_str(raw).context("the hook payload is not JSON")?;
         let field = |k: &str| {
@@ -546,7 +560,7 @@ impl Request {
             return Ok(None);
         }
 
-        let marker = state_dir().join(&session);
+        let marker = state_dir.join(&session);
         let cwd = field("cwd");
         let message = field("message");
         Ok(Some(Self {
@@ -556,8 +570,8 @@ impl Request {
             prompted_tool: tool_in(&message),
             finished_tool: field("tool_name"),
             subtitle: cwd.rsplit('/').next().unwrap_or_default().to_owned(),
-            notifier: notifier_path(),
-            owner: owner_id(),
+            notifier: notifier.map(std::path::Path::to_path_buf),
+            owner: owner.to_owned(),
             marker,
             message,
         }))

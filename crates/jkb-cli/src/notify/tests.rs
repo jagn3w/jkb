@@ -454,3 +454,111 @@ fn the_sweep_event_is_the_one_the_table_names() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The payload → observation layer. It had no tests, and every defect the fifth review found
+// lived on it: a pid that was already dead, a plan that skipped half itself, a state read from a
+// record nothing had written. `parse_with` takes its ambient values as arguments so this can be
+// driven at all.
+
+fn parse(f: &Fixture, payload: &str) -> super::Request {
+    super::Request::parse_with(payload, &f.dir, Some(&f.notifier), "4242")
+        .expect("parses")
+        .expect("an event we act on")
+}
+
+/// The state the machine sees comes from the record and nothing else, in all three shapes.
+#[test]
+fn the_observed_state_comes_from_the_record() {
+    let f = Fixture::new("observe");
+    let payload = r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash"}"#;
+
+    assert_eq!(parse(&f, payload).ctx().at, NotifState::Absent, "no record");
+
+    std::fs::write(f.dir.join("s1"), "Bash\n4242\n").expect("w");
+    assert_eq!(
+        parse(&f, payload).ctx().at,
+        NotifState::AwaitingTool,
+        "a tool was named"
+    );
+
+    std::fs::write(f.dir.join("s1"), "\n4242\n").expect("w");
+    assert_eq!(
+        parse(&f, payload).ctx().at,
+        NotifState::AwaitingUser,
+        "none was"
+    );
+}
+
+/// A payload that names no session, or an event we do not act on, produces no request at all —
+/// rather than one addressed at an empty id.
+///
+/// An id that merely *contains* unusable characters is not rejected: `"///"` sanitises to
+/// `"___"`, which is non-empty, deterministic and confined to the state directory. Real session
+/// ids are UUIDs, whose only non-alphanumeric character is `-`, which survives untouched.
+#[test]
+fn an_unusable_payload_produces_no_request() {
+    let f = Fixture::new("unusable");
+    for payload in [
+        r#"{"hook_event_name":"PostToolUse","session_id":""}"#,
+        r#"{"hook_event_name":"PreToolUse","session_id":"s1"}"#,
+        r#"{"session_id":"s1"}"#,
+        "{}",
+    ] {
+        let got = super::Request::parse_with(payload, &f.dir, None, "").expect("parses");
+        assert!(got.is_none(), "{payload}");
+    }
+}
+
+/// Fields the payload omits must not become a wrong observation: a missing `tool_name` cannot
+/// match a recorded tool, and a missing message names no tool.
+#[test]
+fn missing_payload_fields_observe_as_unknown() {
+    let f = Fixture::new("missing");
+    std::fs::write(f.dir.join("s1"), "Bash\n4242\n").expect("w");
+
+    let req = parse(&f, r#"{"hook_event_name":"PostToolUse","session_id":"s1"}"#);
+    assert_eq!(
+        req.ctx().tool_matches,
+        Fact::Unknown,
+        "no tool_name is not a mismatch"
+    );
+    assert!(
+        !machine().apply(&req.ctx(), req.event).moved(),
+        "so it withdraws nothing"
+    );
+
+    let req = parse(
+        &f,
+        r#"{"hook_event_name":"Notification","session_id":"s2"}"#,
+    );
+    assert!(!req.ctx().tool_named);
+    assert_eq!(req.subtitle, "", "an absent cwd is empty, not a panic");
+}
+
+/// The notification id is the session's, so parallel worktree sessions cannot clear each other's
+/// — and a path-like id cannot escape the state directory.
+#[test]
+fn the_id_and_marker_are_scoped_to_the_session() {
+    let f = Fixture::new("scoped");
+    let req = parse(
+        &f,
+        r#"{"hook_event_name":"PostToolUse","session_id":"../../etc/passwd","tool_name":"B"}"#,
+    );
+    assert_eq!(req.id, "jkb-claude-______etc_passwd");
+    assert_eq!(
+        req.marker.parent(),
+        Some(f.dir.as_path()),
+        "stays inside the state dir"
+    );
+
+    // The other half of the rule the sibling test's doc claims: an id made only of unusable
+    // characters is still usable once sanitised. Only one that sanitises to NOTHING is refused,
+    // because there is then no session to address.
+    let req = parse(
+        &f,
+        r#"{"hook_event_name":"PostToolUse","session_id":"///","tool_name":"B"}"#,
+    );
+    assert_eq!(req.id, "jkb-claude-___");
+    assert_eq!(req.marker.parent(), Some(f.dir.as_path()));
+}
