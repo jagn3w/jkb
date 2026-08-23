@@ -520,7 +520,7 @@ mod tests {
     ///
     /// The one test that watches the config directory rather than the bundled bodies, and it runs
     /// **each writer by name**. Both are unconditional — the auto-install fires on any `jkb`
-    /// invocation whose stamp does not match and `fs::write`s the whole set with no existence
+    /// invocation whose stamp does not match and rewrites the whole set with no existence
     /// check, no prompt and no backup, and `uninstall` `remove_file`s it while printing "removed"
     /// — so under the bare stem workflows used to carry, `jkb <anything>` destroyed a user's own
     /// `~/.claude/workflows/code-review.js` and `jkb commands uninstall` then deleted it.
