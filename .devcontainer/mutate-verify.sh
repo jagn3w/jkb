@@ -21,15 +21,35 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # Some properties cannot be broken with a docker flag — a sudoers grant lives in the image — so
 # the mutation is a one-layer image built FROM it. Set RUN_IMAGE to use the variant.
 RUN_IMAGE=""
+MUTANT_FAILED=0
+# A build failure must NOT fall through to the base image: the mutation would then run against an
+# unmutated container, verify.sh would correctly pass, and the harness would report the guard as
+# broken. A tooling failure reported as a guard failure sends you to read the wrong code.
 mutant() { # mutant <tag> <root-shell-command>
-  printf 'FROM %s\nUSER root\nRUN %s\nUSER vscode\n' "$IMAGE" "$2" | docker build -q -t "$1" - >/dev/null 2>&1 \
-    && RUN_IMAGE="$1"
+  local err
+  if err="$(printf 'FROM %s\nUSER root\nRUN %s\nUSER vscode\n' "$IMAGE" "$2" \
+            | docker build -q -t "$1" - 2>&1)"; then
+    RUN_IMAGE="$1"
+  else
+    RUN_IMAGE=""
+    MUTANT_FAILED=1
+    fails=$((fails+1))
+    printf '  BUILD-FAILED  could not build mutant %s — the mutation below was NOT applied\n' "$1"
+    sed 's/^/                /' <<<"$err" | tail -3
+  fi
 }
 
 run() { # run <label> <expect-substring> <docker args...>
   local label="$1" expect="$2"; shift 2
   local out rc img="${RUN_IMAGE:-$IMAGE}"
   RUN_IMAGE=""
+  # ...and if its mutant did not build, do NOT quietly test the base image instead: an unmutated
+  # container passes verify.sh, which this would then report as the guard failing to fire.
+  if [ "$MUTANT_FAILED" = 1 ]; then
+    MUTANT_FAILED=0
+    printf '  SKIPPED  %s  (mutant image did not build; deliberately NOT run against the base)\n' "$label"
+    return
+  fi
   out="$(docker run --rm "$@" "$img" bash -c '
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       . ./.devcontainer/lib.sh && dc_link_state /home/vscode

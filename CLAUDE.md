@@ -1341,11 +1341,18 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     `denyRead` is now read from the posture like its allow-side siblings.
   - **`cd ""` succeeds in bash, which quietly made an empty posture list mean `$PWD`.** jq prints
     nothing for an empty array, a here-string of nothing is still **one empty line**, and the
-    resulting empty entry resolved to the current directory and entered the list as an allowed
-    prefix — so a posture covering *nothing* reported the checkout as covered. Found by writing the
-    deny-side test above and watching it fail; fixing it then exposed the other half, since arrays
-    that had always held at least one element could now be genuinely empty and `"${arr[@]}"` under
-    `set -u` on bash 3.2 aborts the script. Both halves were latent behind the same masking bug.
+    resulting empty entry resolved to the current directory and entered the list as a prefix.
+    **It never produced a false pass** — reproduced against a posture covering nothing, `$PWD`
+    still reports a GAP, because the arrays feeding the *covered* branch are built without `cd`
+    and `covered()` skips an empty prefix. What it produced was the wrong **remedy**: the checkout
+    matched the resolved-only list, so the gap advised "covered only if the sandbox follows
+    symlinks, list it literally" instead of "is in no allowWrite entry" — and on the deny side it
+    would have been a false GAP, over-strict rather than under. (An earlier version of this bullet
+    claimed the checkout read as *covered*. That was wrong, and wrong in the dangerous direction;
+    a reviewer caught it and the paragraph now records what running it shows.) Fixing it exposed
+    the other half: arrays that had always held at least one element could now be genuinely empty,
+    and `"${arr[@]}"` under `set -u` on bash 3.2 aborts the script. Both were latent behind the
+    same masking bug.
   - **`set -e` made the three-state check unreachable.** `settings_state` returns 0/1/2 and a bare
     call returning non-zero aborts the script before `case $?` runs, so the distinction existed
     and never fired. `|| st=$?` is what turns a return code into a value. Caught by the tests,
