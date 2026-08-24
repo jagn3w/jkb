@@ -96,6 +96,16 @@ def merge($a; $b):
 # key made `check` fail permanently while its own remedy printed "already installed (no change)".
 reduce ($want[0].forbid | keys_unsorted[]) as $k
     (merge($got[0]; $want[0].require); delpaths([$k | split(".")]))
+# ...then RETIRE what the posture has withdrawn. The merge above is add-only for arrays, which is
+# deliberate (your own permissions.allow entries must survive a re-install) but it means an entry
+# REMOVED from `require` stays in an already-installed file for ever, and `check` tolerates it
+# because subset semantics ignore extras. Same shape as the reason `forbid` exists: a subset check
+# cannot express emptiness, and a subset merge cannot express removal.
+| reduce (($want[0].retire // {}) | keys_unsorted[]) as $k (.;
+    ($k | split(".")) as $p
+    | if (getpath($p) | type) == "array"
+      then setpath($p; getpath($p) - $want[0].retire[$k])
+      else . end)
 '
 
 # Every posture leaf that the settings do not carry, as {path, want, got}. A missing key and an
@@ -130,6 +140,22 @@ leaves($want[0].require; $got[0]; "")
 # `permissions.additionalDirectories` widens the in-process permission scope past the workspace —
 # both are additive, so requiring `[]` in the posture would assert nothing at all under subset
 # semantics. Hence a second, separate rule rather than a key in `require`.
+# Entries the posture has WITHDRAWN and which must no longer be present. Distinct from `forbid`,
+# which is about a whole key being empty or absent; this is about individual array members that
+# were once installed and are now known to be wrong — an inert rule, a domain that should never
+# have been allowlisted. Without it the only repair is editing settings.json by hand, which is the
+# thing this script exists to stop people doing.
+readonly JQ_RETIRE='
+[($want[0].retire // {}) | to_entries[]]
+| map(. as $e
+      | ($e.key | split(".")) as $path
+      | (($got[0] | getpath($path)) // []) as $v
+      | (if ($v | type) == "array" then ($v - ($v - $e.value)) else [] end) as $still
+      | if ($still | length) == 0 then []
+        else [{path: ("." + $e.key), retired: $still}] end)
+| add // []
+'
+
 readonly JQ_FORBID='
 [$want[0].forbid | to_entries[]]
 | map(. as $e
@@ -361,11 +387,13 @@ BLIND
 
 cmd_check() {
     read_settings
-    local diff extra
+    local diff extra stale
     diff="$(jq -n --slurpfile want "$posture" --slurpfile got "$settings" "$JQ_DIFF")"
     extra="$(jq -n --slurpfile want "$posture" --slurpfile got "$settings" "$JQ_FORBID")"
+    stale="$(jq -n --slurpfile want "$posture" --slurpfile got "$settings" "$JQ_RETIRE")"
 
-    if [ "$(jq 'length' <<<"$diff")" -eq 0 ] && [ "$(jq 'length' <<<"$extra")" -eq 0 ]; then
+    if [ "$(jq 'length' <<<"$diff")" -eq 0 ] && [ "$(jq 'length' <<<"$extra")" -eq 0 ] \
+       && [ "$(jq 'length' <<<"$stale")" -eq 0 ]; then
         echo "posture intact in $settings"
         case "$(uname -s)" in
             Darwin|Linux) ;;
@@ -380,6 +408,7 @@ cmd_check() {
     printf '\033[31mposture NOT intact\033[0m in %s — do not run auto mode:\n' "$settings" >&2
     jq -r '.[] | "  \(.path): want \(.want|tojson), have \(.got|tojson)"' <<<"$diff" >&2
     jq -r '.[] | "  \(.path): must be empty or absent (\(.why)), have \(.have|tojson)"' <<<"$extra" >&2
+    jq -r '.[] | "  \(.path): still holds retired entr(y|ies) \(.retired|tojson) — the posture withdrew them"' <<<"$stale" >&2
     echo >&2
     echo "Repair with: $0 install" >&2
     return 1

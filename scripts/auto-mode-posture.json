@@ -36,10 +36,7 @@
         "Read(~/Downloads/**)",
         "Edit(~/.claude/settings.json)",
         "Edit(~/.claude/settings.local.json)",
-        "Edit(~/.claude/plugins/**)",
-        "Write(~/.claude/settings.json)",
-        "Write(~/.claude/settings.local.json)",
-        "Write(~/.claude/plugins/**)"
+        "Edit(~/.claude/plugins/**)"
       ]
     },
     "sandbox": {
@@ -222,6 +219,13 @@
         ]
       }
     }
+  },
+  "retire": {
+    "permissions.deny": [
+      "Write(~/.claude/settings.json)",
+      "Write(~/.claude/settings.local.json)",
+      "Write(~/.claude/plugins/**)"
+    ]
   },
   "forbid": {
     "sandbox.excludedCommands": "commands excluded from the sandbox \u2014 a bypass list, must be empty",

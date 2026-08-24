@@ -1229,6 +1229,29 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   only bound the unsandboxed tools have. Adding a key to either half extends the check *and* the
   **tests**, which generate their cases from the posture file (flip every boolean, drop every
   list entry, populate every forbid key).
+- **Installing it for real found two things no amount of checking could.** `install` ran clean
+  (preflight green, 45 pre-existing allow rules and the theme preserved, `/tmp`, `$TMPDIR` and
+  `mktemp` all still working — the three failures of the first attempt, absent), and then:
+  - **Three `Write(...)` deny rules were inert, and Claude Code says so on every session start**:
+    *"Write(path) is not matched by file permission checks — only Edit(path) rules are. Use
+    Edit(path) instead (Edit rules cover all file-editing tools)."* The `Edit(...)` rules for the
+    same three paths were already there, so nothing was unprotected — but an inert rule in a
+    security posture reads as protection, and a warning printed at every start is how people learn
+    to ignore warnings. **The `claude doctor` schema check could not catch it**: the rules are
+    schema-valid, and what is wrong is their *semantics*. Only running it surfaced them.
+  - **A subset merge cannot express removal**, which is the same shape as the reason `forbid`
+    exists (a subset check cannot express emptiness). Deleting those three rules from `require`
+    did nothing: the merge is add-only for arrays — deliberately, so your own `permissions.allow`
+    survives a re-install — so an entry once installed stays for ever while `check` tolerates it
+    as an extra. The posture gained a third half, **`retire`**: array members it has withdrawn,
+    removed by `install` and reported as drift by `check`. Without it the only repair is editing
+    `settings.json` by hand, which is the thing this script exists to stop people doing.
+  - **And the agent locked itself out, exactly as designed.** The first `install` succeeded because
+    the deny rule was not yet in force; the repairing `install` could not write, and said so:
+    *"the posture denies writes to itself, so installing or repairing it is deliberately a human
+    action."* That property had only ever been asserted in a comment. It is now demonstrated — and
+    it means a posture repair is the operator's to run, which is the correct end state and worth
+    knowing before you need it.
   - `jq` gotcha, pinned by a test: `false // x` is `x`, so the obvious spelling of "the value, or
     null if absent" turns every correct `false` into a failure — and the strongest setting here
     (`allowUnsandboxedCommands`) is exactly that shape. Use `has`, never `//`.

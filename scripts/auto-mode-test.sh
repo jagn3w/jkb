@@ -348,6 +348,49 @@ check_that "run refuses to launch a drifted posture, and execs nothing" \
        && grep -q "posture NOT intact" "$tmp/run.err" && echo yes || echo no)"
 cp "$tmp/good" "$settings"
 
+# --- 6c. `retire`: the posture can WITHDRAW an entry it once installed ----------------------
+# The merge is add-only for arrays so your own permissions.allow survives a re-install — which
+# means an entry deleted from `require` would otherwise sit in an installed file for ever, with
+# `check` tolerating it under subset semantics. Found live: three Write(...) deny rules that
+# Claude Code reports as inert at every session start, uninstallable by any amount of re-running.
+cp "$tmp/good" "$settings"
+retire_posture="$tmp/posture-retire.json"
+jq '.retire = {"permissions.allow": ["Bash(jkb grep *)"]}' "$posture" > "$retire_posture"
+mkdir -p "$tmp/rt/scripts"; cp "$here/auto-mode.sh" "$tmp/rt/scripts/"; cp "$retire_posture" "$tmp/rt/scripts/auto-mode-posture.json"
+
+check_that "a retired entry that IS installed is reported as drift" \
+    "$(set +e; out="$("$tmp/rt/scripts/auto-mode.sh" check 2>&1)"; rc=$?; set -e
+       [ "$rc" -ne 0 ] && grep -q 'retired' <<<"$out" && echo yes || echo no)"
+
+"$tmp/rt/scripts/auto-mode.sh" install --force >/dev/null 2>&1 || true
+check_that "install removes the retired entry" \
+    "$(jq -e '[.permissions.allow[] | select(. == "Bash(jkb grep *)")] | length == 0' "$settings" >/dev/null && echo yes || echo no)"
+check_that "install leaves the OTHER entries in that array alone" \
+    "$(jq -e '.permissions.allow | index("Bash(git diff *)") != null' "$settings" >/dev/null && echo yes || echo no)"
+check_that "check passes once the retired entry is gone" \
+    "$("$tmp/rt/scripts/auto-mode.sh" check >/dev/null 2>&1 && echo yes || echo no)"
+
+# Retiring something that was never installed must be a silent no-op, not drift.
+jq '.retire = {"permissions.allow": ["Bash(never-installed *)"]}' "$posture" > "$tmp/rt/scripts/auto-mode-posture.json"
+check_that "retiring an entry that is not present is a no-op" \
+    "$("$tmp/rt/scripts/auto-mode.sh" check >/dev/null 2>&1 && echo yes || echo no)"
+cp "$tmp/good" "$settings"
+
+# --- 8c. no inert rules ---------------------------------------------------------------------
+# Claude Code REPORTS these at session start: "Write(path) is not matched by file permission
+# checks — only Edit(path) rules are. Use Edit(path) instead (Edit rules cover all file-editing
+# tools)." Three were in the posture and it took a live session to surface them, because a schema
+# check validates shape and not rule semantics. An inert rule in a security posture is worse than
+# a missing one: it reads as protection, and the warning it prints on every start is how people
+# learn to ignore warnings.
+check_that "the posture declares no inert Write(...) deny rules" \
+    "$(jq -e '[.require.permissions.deny[] | select(startswith("Write("))] | length == 0' "$posture" >/dev/null && echo yes || echo no)"
+# ...and the paths those rules named must still be covered, by the form that works.
+check_that "the posture's self-protecting paths are denied via Edit(...), which does bind" \
+    "$(jq -e '[.require.permissions.deny[]] as $d
+              | ["Edit(~/.claude/settings.json)","Edit(~/.claude/settings.local.json)","Edit(~/.claude/plugins/**)"]
+              | all(. as $r | $d | index($r))' "$posture" >/dev/null && echo yes || echo no)"
+
 # --- 9. print is the posture, verbatim -----------------------------------------------------
 check_that "print emits the posture file unchanged" \
     "$(diff -q <("$tool" print) "$posture" >/dev/null && echo yes || echo no)"
