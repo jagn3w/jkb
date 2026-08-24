@@ -1240,9 +1240,17 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   - **`CLAUDE_CODE_SANDBOXED` is not the test, and this file used to say it was.** It was **unset**
     throughout the measurement above. `auto-mode.sh sandboxed` asks the kernel instead — a control
     write inside an allowWrite root, a canary write to `$HOME` — and reports CONFINED / NOT CONFINED
-    / **INCONCLUSIVE**, the third being what an absent canary means when the control also failed.
-    The verdict is a **pure function** of those two observations precisely so the unconfined arm is
-    testable from a confined machine; all four combinations are pinned.
+    / **INCONCLUSIVE**. Three rounds reported CONFINED for refusals that were nothing to do with
+    the sandbox — a directory squatting the canary path, an absent `$HOME`, a read-only `$HOME`,
+    then a writable `allowWrite` subdirectory *beneath* an unwritable one — each fix adding another
+    observation to establish the premise *a write to `$HOME` would otherwise have landed*. **That
+    premise is not establishable from inside**: the sandbox intercepts `access(2)` too, so
+    `[ -w $HOME ]` reports policy rather than permissions and every side channel is filtered by the
+    thing being detected. The **errno answers it directly and subsumes all of them** — `EACCES` is
+    the permission bits, `ENOENT` is no parent, `EISDIR` is something in the way, and only `EPERM`
+    (seatbelt) or `EROFS` (a bubblewrap read-only bind) is policy. Compared numerically, so no
+    locale or wording is involved. The verdict stays a **pure function** so the unconfined arm is
+    testable from a confined machine, and the classifier is pinned against real kernel answers.
   - Costs nothing and needs no session, unlike `probe` — which remains the fuller check (egress and
     credential reads as well) and which correctly reported **INCONCLUSIVE** here rather than a pass,
     because a subprocess `claude` has no credentials in an agent session (`loggedIn: false` even

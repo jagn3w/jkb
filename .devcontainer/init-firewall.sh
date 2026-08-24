@@ -59,12 +59,47 @@ jq empty "$POSTURE" 2>/dev/null || {
     exit 1
 }
 
-# Idempotent regardless of whether an iptables rule still references the set. `destroy` cannot run
-# while the OUTPUT rule points at it, and the subsequent `create` then failed "set with the same
-# name already exists" under `set -e` — which aborted postStart on every fresh container create,
-# because postCreate has already installed the rule by then.
+# EVERY REFUSAL MUST LEAVE MORE FILTERING THAN IT FOUND, NOT LESS. The refusals below used to
+# `exit 1` before any rule was installed — and iptables rules do NOT survive a container restart
+# (that is why postStart re-raises them), so a container that started offline kept UNFILTERED
+# egress while the script printed "Refusing". The refusal path was less safe than the success path,
+# which is the one direction this layer must never go.
+fail_closed() { # fail_closed <message...>
+    printf 'init-firewall: %s\n' "$*" >&2
+    # DNS and loopback stay open so the container can be diagnosed and can retry; everything else
+    # is denied. Deliberately does not depend on the `allowed` set having any contents.
+    iptables -F OUTPUT 2>/dev/null || true
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    if iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
+        echo "  egress is DENIED (fail-closed). Fix the cause and re-run to restore the allowlist." >&2
+    else
+        echo "  AND the deny-all chain could not be installed — egress may be unfiltered." >&2
+    fi
+    exit 1
+}
+
+# Validated BEFORE any live state is touched. `|| declared=0`: a snapshot that is valid JSON but
+# not an object makes jq exit non-zero, and a bare assignment from a failing command substitution
+# aborts the whole script under `set -e` — the unexplained no-output exit the `jq empty` guard
+# above was added to eliminate, one line further down.
+declared="$(jq -r '.require.sandbox.network.allowedDomains | length' "$POSTURE" 2>/dev/null)" || declared=0
+case "$declared" in ''|*[!0-9]*) declared=0 ;; esac
+if [ "$declared" -eq 0 ]; then
+    fail_closed "$POSTURE declares no allowed domains (empty, truncated, or missing
+  .require.sandbox.network.allowedDomains). Rebuild the container to re-snapshot it."
+fi
+
+# `allowed` must exist for the match-set rule to reference; the new contents are built in a SCRATCH
+# set and swapped in only once they are known good, so a refusal leaves the live allowlist intact.
+# `-exist` rather than destroy/create: `destroy` cannot run while the OUTPUT rule points at the set,
+# and the subsequent `create` then failed "set with the same name already exists" under `set -e`,
+# aborting postStart on every fresh create because postCreate has already installed the rule.
 ipset create -exist allowed hash:net
-ipset flush allowed
+ipset create -exist allowed-new hash:net
+ipset flush allowed-new
 
 skipped=()
 resolved=0
@@ -79,27 +114,24 @@ while IFS= read -r domain; do
     ips="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)"
     if [ -z "$ips" ]; then skipped+=("$domain (no A record)"); continue; fi
     while IFS= read -r ip; do
-        [ -n "$ip" ] && ipset add allowed "$ip" 2>/dev/null && resolved=$((resolved + 1))
+        [ -n "$ip" ] && ipset add allowed-new "$ip" 2>/dev/null && resolved=$((resolved + 1))
     done <<<"$ips"
 done <<<"$(jq -r '.require.sandbox.network.allowedDomains[]?' "$POSTURE")"
 
-# An empty, truncated or key-less snapshot yields ZERO allowed addresses, and the rules below
-# would still install and still print "default-deny is active" — technically true and useless: the
-# container can reach nothing, and the reason is a corrupt allowlist rather than a policy anyone
-# chose. Refuse instead of reporting success, and say which of the two it is.
-declared="$(jq -r '.require.sandbox.network.allowedDomains | length' "$POSTURE" 2>/dev/null)"
-case "$declared" in ''|*[!0-9]*) declared=0 ;; esac
-if [ "$declared" -eq 0 ]; then
-    echo "init-firewall: $POSTURE declares no allowed domains (empty, truncated, or missing" >&2
-    echo "  .require.sandbox.network.allowedDomains). Refusing to raise a firewall that would" >&2
-    echo "  block everything and report success. Rebuild the container to re-snapshot." >&2
-    exit 1
-fi
+# Resolving nothing yields an empty set, and the rules below would still install and still print
+# "default-deny is active" — technically true and useless: the container can reach nothing, and the
+# reason is a dead resolver rather than a policy anyone chose. Refuse, fail closed, and leave the
+# previous allowlist in place so a re-run at a better moment restores it.
 if [ "$resolved" -eq 0 ]; then
-    echo "init-firewall: $declared domain(s) declared but NONE resolved to an address — DNS is" >&2
-    echo "  unavailable or every entry is a wildcard. Refusing: egress would be total-deny." >&2
-    exit 1
+    ipset destroy allowed-new 2>/dev/null || true
+    fail_closed "$declared domain(s) declared but NONE resolved to an address — DNS is unavailable
+  or every entry is a wildcard. The previous allowlist, if any, is left untouched."
 fi
+# Swap the freshly built set into place. Until this line the LIVE allowlist is untouched, so a
+# refusal above cannot black-hole a running container — which the script's own advice to re-run it
+# would otherwise do at exactly the moment resolution is flaky.
+ipset swap allowed-new allowed
+ipset destroy allowed-new 2>/dev/null || true
 say "allowed $resolved addresses from $declared domains"
 [ ${#skipped[@]} -eq 0 ] || say "not pinned at the IP layer (the sandbox matches these by name): ${skipped[*]}"
 

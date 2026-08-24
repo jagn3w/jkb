@@ -12,6 +12,7 @@ REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 IMAGE="${1:-jkb-dev}"
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
+printf '{}' > "$scratch/home/settings.json"
 SEC="$REPO/.devcontainer/seccomp-bwrap.json"
 BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)
 # A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
@@ -83,6 +84,12 @@ run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts"
 run "the host's ~/.claude is mounted in" "is a host mount" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
     -v "$scratch/home":/home/vscode/.claude
+# ...and at a SUBPATH, which is the case the equality test waved through and the prefix match was
+# added for. Mounting only at the exact path left that change unwatched: deleting the prefix clause
+# would have kept the harness green. settings.json is the worst one — it IS the posture.
+run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
+    -v "$scratch/home/settings.json":/home/vscode/.claude/settings.json
 run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
     --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
 run "no NET_ADMIN (firewall cannot come up)" "NON-allowlisted host was permitted" \
@@ -96,7 +103,13 @@ run "runs as root" "runs as a non-root user" \
 # The script sudo runs as root, and the allowlist beside it, are protected only by the directory
 # they live in — which the base image owns, not this repo. `chmod 777` is the whole exploit.
 mutant jkb-dev-writable-usrlocal "chmod 0777 /usr/local/bin /usr/local/share"
-run "/usr/local is writable by the agent" "is writable by" \
+run "/usr/local/{bin,share} are writable by the agent" "is writable by" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+
+# The PARENT, which governs replacing them — the previous mutant could not see this, because it
+# chmod'd the two paths already covered.
+mutant jkb-dev-writable-usrlocal-parent "chmod 0777 /usr/local"
+run "/usr/local itself is writable by the agent" "is writable by" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
 
 mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/sudoers.d/vscode && chmod 0440 /etc/sudoers.d/vscode"

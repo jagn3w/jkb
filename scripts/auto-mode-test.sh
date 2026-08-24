@@ -376,112 +376,48 @@ check_that "retiring an entry that is not present is a no-op" \
     "$("$tmp/rt/scripts/auto-mode.sh" check >/dev/null 2>&1 && echo yes || echo no)"
 cp "$tmp/good" "$settings"
 
-# --- 8d. the confinement verdict, all four combinations -------------------------------------
-# `sandboxed` answers "is this shell confined" from the kernel rather than from
-# CLAUDE_CODE_SANDBOXED, which was UNSET on a machine whose sandbox was demonstrably enforcing —
-# $HOME writes refused with EPERM, ~/.zsh_history unreadable, ~/.gitconfig and ~/.zshrc fine. That
-# variable had been this script's own recommended test. The verdict is a pure function precisely so
-# both the confined and unconfined answers are testable from one state, which is the only way the
-# UNCONFINED arm gets exercised at all.
-# `bash -c CMD NAME` sets $0 to NAME. auto-mode.sh derives its own directory from $0 to find the
-# posture, so without this the source dies before defining anything and every case below "fails"
-# for a reason that has nothing to do with the verdict.
-# `set --` before sourcing is load-bearing: a sourced script INHERITS the caller's positional
-# parameters, so auto-mode.sh's own dispatch saw $1="yes", hit its `unknown command` arm and exited
-# before defining anything — every case below then failed for a reason that was not the verdict.
-verdict() { bash -c 'a=$1; b=$2; c=$3; d=$4; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b" "$c" "$d"' \
-                   "$tool" "$1" "$2" "$3" "$4"; }
-check_that "control ok + canary refused  => CONFINED" \
-    "$([ "$(verdict yes yes yes yes)" = CONFINED ] && echo yes || echo no)"
-check_that "control ok + canary WROTE    => UNCONFINED" \
-    "$([ "$(verdict yes no yes yes)" = UNCONFINED ] && echo yes || echo no)"
-check_that "control failed               => INCONCLUSIVE, never a pass" \
-    "$([ "$(verdict no yes yes yes)" = INCONCLUSIVE ] && echo yes || echo no)"
-# A directory (or anything else) at the canary path makes the write fail for a reason that is not
-# the sandbox, and `rm -f` cannot clear it — so an UNCONFINED machine would report CONFINED. The
-# control does not cover it: the control writes somewhere else entirely.
-check_that "canary path occupied      => INCONCLUSIVE, not a counterfeit CONFINED" \
-    "$([ "$(verdict yes yes no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
-check_that "canary occupied outranks a canary that appears to have been written" \
-    "$([ "$(verdict yes no no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+# --- 8d. the confinement verdict, over every class the canary can end in ---------------------
+# Three rounds reported CONFINED for refusals that had nothing to do with the sandbox, each fix
+# adding another observation to establish "a write to $HOME would otherwise have landed". That
+# premise is not establishable from inside: the sandbox intercepts access(2) too, so `[ -w $HOME ]`
+# reports policy rather than permissions. The canary's own errno answers it directly and subsumes
+# every case — which is why this table is short where the previous one kept growing.
+verdict() { bash -c 'a=$1; b=$2; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b"' \
+                   "$tool" "$1" "$2"; }
+check_that "the canary wrote                => NOT CONFINED" \
+    "$([ "$(verdict yes wrote)" = UNCONFINED ] && echo yes || echo no)"
+check_that "refused by POLICY               => CONFINED" \
+    "$([ "$(verdict yes policy)" = CONFINED ] && echo yes || echo no)"
+check_that "refused by PERMISSIONS (EACCES) => INCONCLUSIVE, not a counterfeit CONFINED" \
+    "$([ "$(verdict yes permissions)" = INCONCLUSIVE ] && echo yes || echo no)"
+check_that "no parent to write into (ENOENT)=> INCONCLUSIVE" \
+    "$([ "$(verdict yes absent)" = INCONCLUSIVE ] && echo yes || echo no)"
+check_that "unattributable                  => INCONCLUSIVE" \
+    "$([ "$(verdict yes unattributable)" = INCONCLUSIVE ] && echo yes || echo no)"
+check_that "the control dominates every class" \
+    "$([ "$(verdict no policy)" = INCONCLUSIVE ] && [ "$(verdict no wrote)" = INCONCLUSIVE ] && echo yes || echo no)"
 
-# The premise: an absent, read-only or quota-full $HOME refuses the canary exactly as a sandbox
-# would, and the outer control cannot see it because it writes to $PWD — a different filesystem
-# object. Reproduced twice on an unsandboxed machine printing CONFINED, so both live cases are
-# pinned below as well as the pure function.
-check_that "no write landed in \$HOME      => INCONCLUSIVE, not a counterfeit CONFINED" \
-    "$([ "$(verdict yes yes yes no)" = INCONCLUSIVE ] && echo yes || echo no)"
-check_that "the premise outranks a canary that appears to have been written" \
-    "$([ "$(verdict yes no yes no)" = INCONCLUSIVE ] && echo yes || echo no)"
+# ...and the classifier itself, against real kernel answers rather than named classes.
+klass() { bash -c 'a=$1; set --; source "$0" >/dev/null 2>&1; canary_class_of "$a"' "$tool" "$1"; }
+amh="$tmp/klass"; mkdir -p "$amh/ro" "$amh/ok" "$amh/dir/blocker"; chmod 555 "$amh/ro"
+check_that "classifier: a writable path reads as 'wrote'" \
+    "$([ "$(klass "$amh/ok/f")" = wrote ] && echo yes || echo no)"
+check_that "classifier: a permission-denied path reads as 'permissions', never 'policy'" \
+    "$([ "$(klass "$amh/ro/f")" = permissions ] && echo yes || echo no)"
+check_that "classifier: an absent parent reads as 'absent'" \
+    "$([ "$(klass "$amh/gone/f")" = absent ] && echo yes || echo no)"
+check_that "classifier: a directory in the way is not 'policy'" \
+    "$([ "$(klass "$amh/dir/blocker")" != policy ] && echo yes || echo no)"
 
-amhome="$tmp/amhome"
-mkdir -p "$amhome/ro" "$amhome/parent"; chmod 555 "$amhome/ro"
-check_that "a read-only \$HOME is INCONCLUSIVE, not CONFINED" \
-    "$(set +e; HOME="$amhome/ro" "$tool" sandboxed >/dev/null 2>&1; [ $? -eq 2 ] && echo yes || echo no)"
-check_that "an absent \$HOME is INCONCLUSIVE, not CONFINED" \
-    "$(set +e; HOME="$amhome/parent/gone" "$tool" sandboxed >/dev/null 2>&1; [ $? -eq 2 ] && echo yes || echo no)"
-chmod 755 "$amhome/ro"
-
-check_that "control failed + canary wrote => INCONCLUSIVE (the control dominates)" \
-    "$([ "$(verdict no no yes yes)" = INCONCLUSIVE ] && echo yes || echo no)"
-
-# --- 6d. every `retire` entry the POSTURE declares, generated ------------------------------
-# Synthesized cases exercised the mechanism but never the shipped block: `jq 'del(.retire)'` and a
-# typo'd key both left the whole suite green, which would leave the three inert Write(...) rules in
-# every installed settings.json for ever while `check` printed "posture intact" — the exact state
-# the retire half was written to end. Generated from the posture, like the boolean and array halves.
-retire_keys="$(jq -r '(.retire // {}) | keys_unsorted[]' "$posture")"
-check_that "the posture declares at least one retire key to generate from" \
-    "$([ -n "$retire_keys" ] && echo yes || echo no)"
-
-cp "$tmp/good" "$settings"
-retired_checked=0
-while IFS= read -r rk; do
-    [ -n "$rk" ] || continue
-    # The key must name a real array in freshly-installed settings. Asserting against the posture
-    # would not catch a typo, since JQ_RETIRE reads the same typo and would agree with it.
-    if ! jq -e --arg k "$rk" 'getpath($k | split(".")) | type == "array"' "$settings" >/dev/null 2>&1; then
-        bad "retire key .$rk does not name an array in installed settings — it can never remove anything"
-        continue
-    fi
-    while IFS= read -r member; do
-        [ -n "$member" ] || continue
-        # Plant the retired entry plus a neighbour, then require check to name it and install to
-        # remove it while the neighbour survives.
-        jq --arg k "$rk" --argjson m "$member" \
-           'setpath($k | split("."); (getpath($k | split(".")) + [$m, "ZZ-neighbour-sentinel"]))' \
-           "$tmp/good" > "$settings"
-        run_check
-        if [ "$rc" -eq 0 ] || ! grep -qF "$(jq -r . <<<"$member")" <<<"$out"; then
-            bad "a planted retired entry ($rk: $member) was not reported by check"
-            continue
-        fi
-        "$tool" install --force >/dev/null 2>&1 || true
-        if jq -e --arg k "$rk" --argjson m "$member" \
-              '(getpath($k | split(".")) | index($m) | not)
-               and (getpath($k | split(".")) | index("ZZ-neighbour-sentinel") != null)' \
-              "$settings" >/dev/null 2>&1; then
-            retired_checked=$((retired_checked + 1))
-        else
-            bad "install did not remove $rk: $member (or removed its neighbour with it)"
-        fi
-    done <<<"$(jq -c --arg k "$rk" '.retire[$k][]' "$posture")"
-done <<<"$retire_keys"
-check_that "every retire entry the posture declares ($retired_checked) is removed individually" \
-    "$([ "$retired_checked" -gt 0 ] && echo yes || echo no)"
-cp "$tmp/good" "$settings"
-
-# A posture that both requires and retires an entry is unsatisfiable — the merge adds it and then
-# removes it, check reports it permanently missing, and install exits non-zero unable to repair
-# what it just wrote. Refused at load, before any of that.
-mkdir -p "$tmp/ct/scripts"; cp "$here/auto-mode.sh" "$tmp/ct/scripts/"
-jq '.retire = {"permissions.ask": ["WebFetch"]}' "$posture" > "$tmp/ct/scripts/auto-mode-posture.json"
-check_that "a require/retire contradiction is refused, by name" \
-    "$(set +e; out="$("$tmp/ct/scripts/auto-mode.sh" check 2>&1)"; rc=$?; set -e
-       [ "$rc" -ne 0 ] && grep -q 'both require and retire' <<<"$out" && grep -q 'permissions.ask' <<<"$out" && echo yes || echo no)"
-jq '.retire = {"permissions.allow": ["Bash(never-required *)"]}' "$posture" > "$tmp/ct/scripts/auto-mode-posture.json"
-check_that "a retire entry that require does NOT name is accepted" \
-    "$("$tmp/ct/scripts/auto-mode.sh" check >/dev/null 2>&1 && echo yes || echo no)"
+# The live shapes that produced a false CONFINED in rounds two, three and four.
+mkdir -p "$amh/sub/repos"; chmod 555 "$amh/sub"
+for pair in "ro:a read-only \$HOME" "sub:a writable allowWrite subdir under an unwritable \$HOME" \
+            "gone/nope:an absent \$HOME"; do
+    d="${pair%%:*}"; what="${pair#*:}"
+    check_that "$what is INCONCLUSIVE, not CONFINED" \
+        "$(set +e; HOME="$amh/$d" "$tool" sandboxed >/dev/null 2>&1; [ $? -eq 2 ] && echo yes || echo no)"
+done
+chmod 755 "$amh/ro" "$amh/sub"
 
 # --- 8c. no inert rules ---------------------------------------------------------------------
 # Claude Code REPORTS these at session start: "Write(path) is not matched by file permission

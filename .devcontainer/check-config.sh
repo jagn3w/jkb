@@ -15,12 +15,15 @@ bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 echo "==> devcontainer config"
 command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0; }
 
-# devcontainer.json permits // comments; strip them the way the spec's parsers do.
-strip() { sed 's://.*$::' "$1"; }
-if strip "$here/devcontainer.json" | jq empty 2>/dev/null; then ok "devcontainer.json parses"
+# Sourced HERE rather than 80 lines down, so this file has one copy of the comment-stripping rule
+# instead of a verbatim `strip()` beside the `dc_strip()` it later sources — two halves of one file
+# parsing the same input through two copies that can disagree.
+# shellcheck source=/dev/null
+. "$here/lib.sh"
+if dc_strip "$here/devcontainer.json" | jq empty 2>/dev/null; then ok "devcontainer.json parses"
 else bad "devcontainer.json does not parse"; fi
 
-dc="$(strip "$here/devcontainer.json")"
+dc="$(dc_strip "$here/devcontainer.json")"
 for want in '"remoteUser": "vscode"' '--cap-add=NET_ADMIN'; do
     if grep -qF -e "$want" <<<"$dc"; then ok "declares $want"
     else bad "devcontainer.json no longer declares $want"; fi
@@ -97,8 +100,6 @@ fi
 # mounts changed, dropping the cargo registry and failing a correctly-built container — so what is
 # checked here is that the DERIVATION still yields the mounts the container cannot work without.
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
-# shellcheck source=/dev/null
-. "$here/lib.sh"
 mount_targets="$(dc_mount_targets "$here/devcontainer.json")"
 missing_mounts=()
 for m in /home/vscode/repos/jkb /home/vscode/.jkb; do

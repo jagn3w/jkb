@@ -87,8 +87,13 @@ assert "nothing under ~/.claude is a host mount${claude_mounts:+ (found: $(tr '\
 #     it, is a root shell by the sudoers entry's own permission — and unlink/replace is governed by
 #     the containing DIRECTORY, so the directories are asserted, not just the files.
 unwritable_ok=1
-for path in /usr/local/bin /usr/local/bin/init-firewall.sh /usr/local/share \
-            /usr/local/share/jkb-egress-allowlist.json; do
+# /usr/local is in the list because it governs REPLACING bin and share: `mv /usr/local/bin aside
+# && mkdir /usr/local/bin && cp evil .../init-firewall.sh` needs write on the PARENT, not on the
+# two directories, and every path below would still test unwritable while the sudoers entry ran the
+# agent's script as root. Debian ships /usr/local as root:staff drwxrwsr-x, so this is one group
+# membership away on a floating base tag.
+for path in /usr/local /usr/local/bin /usr/local/bin/init-firewall.sh /usr/local/share \
+            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d; do
     # A path that does not exist yet (the snapshot, before the first raise) cannot be replaced
     # either, so absence is fine; what must never be true is that it exists AND is writable.
     if [ -e "$path" ] && [ -w "$path" ]; then
