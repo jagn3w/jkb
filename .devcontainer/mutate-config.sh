@@ -42,6 +42,14 @@ run() { # run <label> <expect-substring>
     local label="$1" expect="$2" out rc
     EXPECTS+=("$expect")
     out="$(cd "$work/t" && ./.devcontainer/check-config.sh 2>&1)"; rc=$?
+    judge "$label" "$expect" "$out" "$rc"
+}
+
+# Separated from executing so the control can judge the SAME run it health-checked, rather than
+# starting a second one that could differ from it. See mutate-verify.sh for the failure this
+# prevents.
+judge() { # judge <label> <expect> <output> <rc>
+    local label="$1" expect="$2" out="$3" rc="$4"
     # FIXED-STRING match, both conditions on the SAME line. The regex form escaped only some ERE
     # metacharacters, so an expect containing parentheses — "host bind source(s) parsed" — silently
     # matched "sources" instead and reported a working guard as MISSED. There is nothing to escape
@@ -222,7 +230,7 @@ if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     echo "  An assertion nothing breaks is the defect this harness exists to catch."
 else
     printf '  %s failure paths in check-config.sh, %s mutations, count pinned\n' \
-        "$bad_sites" "${#EXPECTS[@]}"   # the control has not run yet, so this is mutations only
+        "$bad_sites" "${#EXPECTS[@]}"
 fi
 
 echo
@@ -243,7 +251,8 @@ if [ "$control_rc" -ne 0 ] || ! grep -q "devcontainer config checks passed" <<<"
     exit 1
 fi
 
-run "control: nothing mutated (MISSED is correct here)" "remoteUser is root"
+judge "control: nothing mutated (MISSED is correct here)" "remoteUser is root" \
+      "$control_out" "$control_rc"
 if [ "$fails" -gt "$before" ]; then
     self_ok=1; fails="$before"
     echo "  (correct: an unmutated config does not trip the matcher)"
@@ -255,4 +264,6 @@ fi
 echo
 [ "$self_ok" -eq 1 ] || { printf '\033[31mthe matcher reports CAUGHT for a healthy config — no result here is trustworthy\033[0m\n'; exit 1; }
 [ "$fails" -eq 0 ] || { printf '\033[31m%d check-config assertion(s) did not fire\033[0m\n' "$fails"; exit 1; }
-printf '\033[32m%s mutations caught over %s failure paths, and the matcher was shown to discriminate\033[0m\n' "$((${#EXPECTS[@]} - 1))" "$bad_sites"
+# No `- 1`: the control is judged directly rather than through run(), so it no longer registers an
+# expect, and EXPECTS is exactly the mutations.
+printf '\033[32m%s mutations caught over %s failure paths, and the matcher was shown to discriminate\033[0m\n' "${#EXPECTS[@]}" "$bad_sites"

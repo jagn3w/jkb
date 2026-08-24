@@ -74,6 +74,16 @@ run() { # run <label> <expect-substring> <docker args...>
   fi
   out="$(docker run --rm "$@" "$img" bash -c "$SUBJECT" 2>&1)"
   rc=$?
+  judge "$label" "$expect" "$out" "$rc"
+}
+
+# Judging is separated from executing precisely so ONE container run can be judged twice — the
+# control needs to assert the container was healthy AND that the matcher stays quiet about it, and
+# doing that as two runs let a transient fault land between them: the pre-run certified a healthy
+# container, the second hit a DNS blip on verify.sh's live curl, and the matcher was then shown a
+# BROKEN container while the harness printed "shown to discriminate".
+judge() { # judge <label> <expect> <output> <rc>
+  local label="$1" expect="$2" out="$3" rc="$4"
   # The FAIL marker and the label on the SAME line: that rendering exists only on the fail path.
   # FIXED-STRING match, both conditions on the SAME line. The regex form escaped only some ERE
   # metacharacters, so an expect containing parentheses — "host bind source(s) parsed" — silently
@@ -142,6 +152,7 @@ before="$fails"
 # Run the base container directly first: the control below is satisfied by a MISSED, and a
 # container that never started is ALSO a MISSED. Without this, a host with no docker — or a broken
 # image — reported "a healthy container does not trip the matcher" having observed nothing at all.
+# ONE execution, judged twice: health first, then the matcher over the same captured output.
 control_out="$(docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT" 2>&1)"
 control_rc=$?
 if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_out"; then
@@ -151,7 +162,8 @@ if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_o
     exit 1
 fi
 
-run "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" "${HEALTHY[@]}"
+judge "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" \
+      "$control_out" "$control_rc"
 if [ "$fails" -gt "$before" ]; then
   self_ok=1; fails="$before"      # a MISSED here is the expected result, not a failure
   echo "  (correct: a healthy container does not trip the matcher)"
