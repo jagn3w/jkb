@@ -229,6 +229,20 @@ echo
 echo "==> self-test: an unmutated tree must be reported MISSED"
 before="$fails"
 seed
+# THE CONTROL MUST OBSERVE A HEALTHY SUBJECT, not merely fail to trip. `run` reports MISSED when
+# check-config.sh passes cleanly AND when it cannot run at all — a missing tree, a missing tool —
+# so accepting MISSED on its own blesses a run in which nothing was exercised. Same rule as
+# mutate-verify.sh, which had the same hole; a harness that judges other guards has to hold itself
+# to the standard it enforces.
+control_out="$(cd "$work/t" && ./.devcontainer/check-config.sh 2>&1)"
+control_rc=$?
+if [ "$control_rc" -ne 0 ] || ! grep -q "devcontainer config checks passed" <<<"$control_out"; then
+    printf '\033[31mthe unmutated config does not pass check-config.sh (exit %s) — every MISSED above is\n' "$control_rc"
+    printf 'unattributable, because a subject that cannot run looks exactly like a guard that did not fire\033[0m\n'
+    sed 's/^/    /' <<<"$control_out" | grep -E "FAIL|failed|not found" | head -5
+    exit 1
+fi
+
 run "control: nothing mutated (MISSED is correct here)" "remoteUser is root"
 if [ "$fails" -gt "$before" ]; then
     self_ok=1; fails="$before"
