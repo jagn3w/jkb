@@ -18,6 +18,9 @@
         "Read(~/.pypirc)",
         "Read(~/.cargo/credentials.toml)",
         "Read(~/.claude/.credentials.json)",
+        "Read(~/.claude-state/.credentials.json)",
+        "Read(~/.claude-state/claude.json)",
+        "Read(~/.claude.json)",
         "Read(~/.local/share/keyrings/**)",
         "Read(~/.pki/**)",
         "Read(~/.config/gcloud/**)",
@@ -170,6 +173,18 @@
           },
           {
             "path": "~/.claude/.credentials.json",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.claude-state/.credentials.json",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.claude-state/claude.json",
+            "mode": "deny"
+          },
+          {
+            "path": "~/.claude.json",
             "mode": "deny"
           },
           {

@@ -98,6 +98,40 @@ else
     bad "the declared mount set is missing ${missing_mounts[*]} — verify.sh derives its boundary from this list"
 fi
 
+# DERIVING THE EXPECTED SET MADE THE BOUNDARY SELF-CERTIFYING, and this is the other half of it.
+# verify.sh can now only answer "does the running container match what it declares"; adding a
+# mount to devcontainer.json makes it declared, so the runtime check would accept the two mounts
+# verify.sh's own comment names as the reason it exists. What must still be answered is "is the
+# declaration acceptable", and that belongs here, in the gate a human reads in a diff.
+forbidden=()
+while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    case "$t" in
+        # ~/.claude holds settings.json, which IS the posture. A process the posture bounds must
+        # not read or write the file deciding whether it is bounded — at that path or under it.
+        /home/vscode/.claude|/home/vscode/.claude/*) forbidden+=("$t (inside the posture's own directory)") ;;
+        */docker.sock)                               forbidden+=("$t (the docker socket is root on the host)") ;;
+    esac
+done <<<"$mount_targets"
+# ...and the source side, which the target cannot show: a bind may carry any host path in under an
+# innocuous name. Volumes are container-managed and reach no host filesystem, so only binds count.
+while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    case "$src" in
+        '${localWorkspaceFolder}'|'${localEnv:HOME}/.jkb') ;;
+        *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
+    esac
+done <<<"$(jq -r '[(.workspaceMount // empty)] + (.mounts // [])
+                  | .[]
+                  | if type == "string" then (capture("source=(?<s>[^,]+)").s + "|" + (capture("type=(?<t>[^,]+)").t // "bind"))
+                    else ((.source // "") + "|" + (.type // "bind")) end
+                  | select(endswith("|bind")) | sub("\\|bind$"; "")' <<<"$dc" 2>/dev/null)"
+if [ ${#forbidden[@]} -eq 0 ]; then
+    ok "every declared mount is acceptable (no posture directory, no docker socket, binds from the reviewed set)"
+else
+    for f in "${forbidden[@]}"; do bad "devcontainer.json declares a mount that must not exist: $f"; done
+fi
+
 # CARGO_TARGET_DIR is named in three files that cannot reference one another (JSON has no
 # variables), and it was already wrong once: it sat BESIDE the allowlisted ~/.cargo rather than
 # under it, so denyRead blanketed every sandboxed build while both runtime guards reported the
@@ -164,12 +198,20 @@ if grep -qF 'takes no arguments' "$here/init-firewall.sh"; then
 else
     bad "init-firewall.sh still accepts a posture path — the agent-writable workspace copy could be passed to it"
 fi
+# Match ANY argument, not a path spelled a particular way. The first version used `[^"]*` to reach
+# `auto-mode-posture.json` on the same line, which cannot cross the double quote in setup.sh's own
+# `init-firewall.sh "$repo/scripts/..."` — so reverting setup.sh wholesale to the code this guard
+# exists to prevent still printed `ok`. It caught the JSON spelling and never the shell one.
 callers_ok=1
 for caller in "$here/setup.sh" "$here/devcontainer.json"; do
-    grep -q 'init-firewall\.sh[^"]*auto-mode-posture\.json' "$caller" && {
-        bad "$(basename "$caller") still passes a posture path to init-firewall.sh"; callers_ok=0; }
+    # Anything that STARTS a word after the command is an argument — including a quote, which is
+    # how the old setup.sh spelled it. Only a redirect, pipe, separator or end of line is not.
+    if grep -nE 'init-firewall\.sh[[:space:]]+[^;|&>#[:space:]]' "$caller" >/dev/null; then
+        bad "$(basename "$caller") passes an argument to init-firewall.sh — sudoers permits none, and the allowlist is the root-owned snapshot"
+        callers_ok=0
+    fi
 done
-[ "$callers_ok" -eq 1 ] && ok "no caller passes an allowlist path to the firewall"
+[ "$callers_ok" -eq 1 ] && ok "no caller passes an argument to the firewall"
 
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi

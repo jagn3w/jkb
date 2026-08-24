@@ -72,8 +72,10 @@ fi
 #    what must never appear is the HOST's, which the agent would then be able to read and which is
 #    the file that decides whether it is sandboxed at all. Nothing under ~/.claude is mounted from
 #    the host at all — not even the credential file, which is why you log in inside the container.
-claude_mounts="$(awk '$5 == "/home/vscode/.claude" {print $5}' /proc/self/mountinfo)"
-assert "~/.claude is the container's own, not a host mount" \
+#    Matched as a PREFIX, not for equality: a bind at ~/.claude/settings.json is the posture file
+#    itself and an equality test waves it through, which is the one mount that matters most here.
+claude_mounts="$(awk '$5 == "/home/vscode/.claude" || index($5, "/home/vscode/.claude/") == 1 {print $5}' /proc/self/mountinfo)"
+assert "nothing under ~/.claude is a host mount${claude_mounts:+ (found: $(tr '\n' ' ' <<<"$claude_mounts"))}" \
     "$([ -z "$claude_mounts" ] && echo yes || echo no)"
 
 # 3b. ROOT IS REACHABLE OR IT IS NOT, and everything above depends on which. The mount boundary,
@@ -83,6 +85,21 @@ assert "~/.claude is the container's own, not a host mount" \
 #     undo every one of them with a single sudo. Asked of sudo itself rather than of the file,
 #     because what matters is the policy in force: every command vscode may run as root must be
 #     the firewall. A blanket grant re-added by any route fails here.
+#     The grant is only as good as the file it names. Replacing the script, or the snapshot beside
+#     it, is a root shell by the sudoers entry's own permission — and unlink/replace is governed by
+#     the containing DIRECTORY, so the directories are asserted, not just the files.
+unwritable_ok=1
+for path in /usr/local/bin /usr/local/bin/init-firewall.sh /usr/local/share \
+            /usr/local/share/jkb-egress-allowlist.json; do
+    # A path that does not exist yet (the snapshot, before the first raise) cannot be replaced
+    # either, so absence is fine; what must never be true is that it exists AND is writable.
+    if [ -e "$path" ] && [ -w "$path" ]; then
+        bad "$path is writable by $(id -un) — the firewall sudo runs as root can be replaced"
+        unwritable_ok=0
+    fi
+done
+[ "$unwritable_ok" -eq 1 ] && ok "the root-owned firewall and its allowlist cannot be replaced from here"
+
 sudo_entries="$(sudo -n -l 2>/dev/null | grep -E '^\s*\(' || true)"
 if [ -z "$sudo_entries" ]; then
     ok "no passwordless root is granted at all"

@@ -54,7 +54,7 @@ run "an undeclared host mount is added" "UNDECLARED mounts" \
 run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
     -v "$scratch/home":/host
-run "the host's ~/.claude is mounted in" "not a host mount" \
+run "the host's ~/.claude is mounted in" "is a host mount" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
     -v "$scratch/home":/home/vscode/.claude
 run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
@@ -67,6 +67,12 @@ run "runs as root" "runs as a non-root user" \
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
 # Dockerfile removes it; this puts it back and requires verify.sh to notice.
+# The script sudo runs as root, and the allowlist beside it, are protected only by the directory
+# they live in — which the base image owns, not this repo. `chmod 777` is the whole exploit.
+mutant jkb-dev-writable-usrlocal "chmod 0777 /usr/local/bin /usr/local/share"
+run "/usr/local is writable by the agent" "is writable by" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+
 mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/sudoers.d/vscode && chmod 0440 /etc/sudoers.d/vscode"
 run "blanket passwordless root is restored" "may run more than the firewall as root" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
