@@ -31,6 +31,17 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # reported CAUGHT with the guard deleted, and the summary line said "every guard fired".
 # Some properties cannot be broken with a docker flag — a sudoers grant lives in the image — so
 # the mutation is a one-layer image built FROM it. Set RUN_IMAGE to use the variant.
+# ONE definition of what is run inside the container, and one of the healthy flag set. These were
+# duplicated between run() and the control's pre-run, which meant the control could certify a
+# configuration the mutations never used — a control that is not about the same thing is not a
+# control.
+SUBJECT='
+      sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
+      . ./.devcontainer/lib.sh && dc_link_state /home/vscode
+      ./scripts/auto-mode.sh install --force >/dev/null 2>&1
+      ./.devcontainer/verify.sh'
+HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}")
+
 RUN_IMAGE=""
 MUTANT_FAILED=0
 # A build failure must NOT fall through to the base image: the mutation would then run against an
@@ -61,11 +72,7 @@ run() { # run <label> <expect-substring> <docker args...>
     printf '  SKIPPED  %s  (mutant image did not build; deliberately NOT run against the base)\n' "$label"
     return
   fi
-  out="$(docker run --rm "$@" "$img" bash -c '
-      sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
-      . ./.devcontainer/lib.sh && dc_link_state /home/vscode
-      ./scripts/auto-mode.sh install --force >/dev/null 2>&1
-      ./.devcontainer/verify.sh' 2>&1)"
+  out="$(docker run --rm "$@" "$img" bash -c "$SUBJECT" 2>&1)"
   rc=$?
   # The FAIL marker and the label on the SAME line: that rendering exists only on the fail path.
   # FIXED-STRING match, both conditions on the SAME line. The regex form escaped only some ERE
@@ -135,12 +142,7 @@ before="$fails"
 # Run the base container directly first: the control below is satisfied by a MISSED, and a
 # container that never started is ALSO a MISSED. Without this, a host with no docker — or a broken
 # image — reported "a healthy container does not trip the matcher" having observed nothing at all.
-control_out="$(docker run --rm --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode \
-                 "${BASE[@]}" "$IMAGE" bash -c '
-      sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
-      . ./.devcontainer/lib.sh && dc_link_state /home/vscode
-      ./scripts/auto-mode.sh install --force >/dev/null 2>&1
-      ./.devcontainer/verify.sh' 2>&1)"
+control_out="$(docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT" 2>&1)"
 control_rc=$?
 if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_out"; then
     printf '\033[31mthe unmutated container does not pass verify.sh (exit %s) — every MISSED above is\n' "$control_rc"
@@ -149,8 +151,7 @@ if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_o
     exit 1
 fi
 
-run "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+run "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" "${HEALTHY[@]}"
 if [ "$fails" -gt "$before" ]; then
   self_ok=1; fails="$before"      # a MISSED here is the expected result, not a failure
   echo "  (correct: a healthy container does not trip the matcher)"
