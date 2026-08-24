@@ -84,12 +84,11 @@ run() { # run <label> <expect-substring> <docker args...>
 # BROKEN container while the harness printed "shown to discriminate".
 judge() { # judge <label> <expect> <output> <rc>
   local label="$1" expect="$2" out="$3" rc="$4"
-  # The FAIL marker and the label on the SAME line: that rendering exists only on the fail path.
-  # FIXED-STRING match, both conditions on the SAME line. The regex form escaped only some ERE
-  # metacharacters, so an expect containing parentheses — "host bind source(s) parsed" — silently
-  # matched "sources" instead and reported a working guard as MISSED. There is nothing to escape
-  # here, so nothing to get wrong. `-e` because an expect may start with `-`, which grep
-# otherwise reads as an option — "--security-opt" reported a working guard as MISSED.
+  # A mutation is CAUGHT only when the subject FAILS and says why, with both on the SAME line:
+  # `assert()` prints the same label on its ok and fail paths, so matching the label alone reported
+  # guards as caught while they were deleted. Fixed-string, because the regex form escaped only
+  # some ERE metacharacters and silently mis-matched "host bind source(s) parsed"; `-e`, because an
+  # expect may start with a dash, which grep would otherwise read as an option.
   if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
     printf '  CAUGHT   %s\n' "$label"
   else
