@@ -84,10 +84,9 @@ fi
 # mounts changed, dropping the cargo registry and failing a correctly-built container — so what is
 # checked here is that the DERIVATION still yields the mounts the container cannot work without.
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
-mount_targets="$(jq -r '[(.workspaceMount // empty)] + (.mounts // [])
-                        | .[]
-                        | if type == "string" then capture("target=(?<t>[^,]+)").t else .target end' \
-                 <<<"$dc" 2>/dev/null | sort -u)"
+# shellcheck source=/dev/null
+. "$here/lib.sh"
+mount_targets="$(dc_mount_targets "$here/devcontainer.json")"
 missing_mounts=()
 for m in /home/vscode/repos/jkb /home/vscode/.jkb; do
     grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
@@ -121,11 +120,7 @@ while IFS= read -r src; do
         '${localWorkspaceFolder}'|'${localEnv:HOME}/.jkb') ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
-done <<<"$(jq -r '[(.workspaceMount // empty)] + (.mounts // [])
-                  | .[]
-                  | if type == "string" then (capture("source=(?<s>[^,]+)").s + "|" + (capture("type=(?<t>[^,]+)").t // "bind"))
-                    else ((.source // "") + "|" + (.type // "bind")) end
-                  | select(endswith("|bind")) | sub("\\|bind$"; "")' <<<"$dc" 2>/dev/null)"
+done <<<"$(dc_mount_sources "$here/devcontainer.json" | sed -n 's/|bind$//p')"
 if [ ${#forbidden[@]} -eq 0 ]; then
     ok "every declared mount is acceptable (no posture directory, no docker socket, binds from the reviewed set)"
 else
@@ -146,7 +141,13 @@ if [ -z "$target" ]; then
     bad "devcontainer.json sets no containerEnv.CARGO_TARGET_DIR — cargo would write into the bind mount"
 else
     sites_ok=1
-    grep -qx "$target" <<<"$mount_targets" || { bad "no volume is mounted at CARGO_TARGET_DIR ($target) — a named volume whose path the image lacks is created root-owned"; sites_ok=0; }
+    # Declared AND a volume. Rewriting this to use the derived target list dropped the
+    # `type=volume` half, leaving a check whose own failure message is about volumes but which a
+    # plain bind satisfies — and a bind is the case that breaks: it carries the host's uids, so
+    # where the host uid is not 1000 the build dies with EACCES minutes in.
+    grep -qx "$target" <<<"$mount_targets" || { bad "nothing is mounted at CARGO_TARGET_DIR ($target) — a named volume whose path the image lacks is created root-owned"; sites_ok=0; }
+    [ "$(dc_type_for_target "$here/devcontainer.json" "$target")" = volume ] \
+        || { bad "CARGO_TARGET_DIR ($target) is not declared type=volume — a bind mount carries the host's uids and the build dies with EACCES"; sites_ok=0; }
     grep -qF "mkdir -p $target" "$here/Dockerfile" || { bad "Dockerfile does not pre-create $target — Docker seeds volume ownership from the image, so this is what stops EACCES"; sites_ok=0; }
     [ "$sites_ok" -eq 1 ] && ok "every site names the same CARGO_TARGET_DIR ($target)"
 

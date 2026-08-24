@@ -286,19 +286,22 @@ export CLAUDE_CONFIG_DIR="$tmp/claude"
 cp "$tmp/good" "$settings"
 
 # `run` hard-refuses on a Linux host without bubblewrap/socat — correctly, since the sandbox
-# cannot start there — so EVERY assertion below would fail for a reason that is about the machine
-# and not about the code, reddening a gate that check.sh and CI both run. Decide once, here, and
-# skip the whole group together: deciding per-assertion is how the drift assertion below came to
-# be satisfiable by the dependency refusal instead of by the refusal it names.
+# cannot start there — so the assertions that need it to REACH THE EXEC would fail for a reason
+# about the machine, reddening a gate check.sh and CI both run. Decide once and skip those
+# together. The dependency list is read out of auto-mode.sh rather than restated: two copies of
+# "which tools does the sandbox need" is one more than can be kept in agreement.
+run_deps="$(sed -n '/^missing_sandbox_deps()/,/^}/p' "$here/auto-mode.sh" | sed -n 's/.*for dep in \([^;]*\); do.*/\1/p')"
 run_skip=""
 if [ "$(uname -s)" = "Linux" ]; then
-    for dep in bwrap socat; do
+    for dep in $run_deps; do
         command -v "$dep" >/dev/null 2>&1 || run_skip="${run_skip:+$run_skip }$dep"
     done
 fi
+check_that "the dependency list was read out of auto-mode.sh, not guessed" \
+    "$([ -n "$run_deps" ] && echo yes || echo no)"
 
 if [ -n "$run_skip" ]; then
-    echo "  skip  the three \`run\` assertions — this host is missing: $run_skip (apt install bubblewrap socat)"
+    echo "  skip  the exec-dependent \`run\` assertions — this host is missing: $run_skip (apt install bubblewrap socat)"
 else
     rm -f "$CLAUDE_ARGV_OUT"
     set +e
@@ -326,20 +329,24 @@ else
             "$(grep -q "allowUnixSockets" "$CLAUDE_ARGV_OUT" && echo no || echo yes)"
     fi
 
-    rm -f "$CLAUDE_ARGV_OUT"
-    jq '.sandbox.enabled = false' "$tmp/good" > "$settings"
-    set +e
-    "$tool" run >"$tmp/run.out" 2>"$tmp/run.err"
-    rc=$?
-    set -e
-    # The refusal TEXT is the discriminating half. A non-zero exit with no argv file is also what
-    # every other way of failing to launch produces — a missing dependency, a missing stub — so
-    # asserting only that reports a pass having never exercised the drift refusal.
-    check_that "run refuses to launch a drifted posture, and execs nothing" \
-        "$([ "$rc" -ne 0 ] && [ ! -e "$CLAUDE_ARGV_OUT" ] \
-           && grep -q "posture NOT intact" "$tmp/run.err" && echo yes || echo no)"
     cp "$tmp/good" "$settings"
 fi
+
+# OUTSIDE the skip group, deliberately: cmd_run runs cmd_check BEFORE the dependency gate, so a
+# drifted posture is refused whether or not bubblewrap exists. Skipping this with the others put
+# the one assertion guarding the check-before-exec ordering out of reach on exactly the hosts CI
+# uses. The refusal TEXT is the discriminating half — a non-zero exit with no argv file is also
+# what a missing dependency or a missing stub produces.
+rm -f "$CLAUDE_ARGV_OUT"
+jq '.sandbox.enabled = false' "$tmp/good" > "$settings"
+set +e
+"$tool" run >"$tmp/run.out" 2>"$tmp/run.err"
+rc=$?
+set -e
+check_that "run refuses to launch a drifted posture, and execs nothing" \
+    "$([ "$rc" -ne 0 ] && [ ! -e "$CLAUDE_ARGV_OUT" ] \
+       && grep -q "posture NOT intact" "$tmp/run.err" && echo yes || echo no)"
+cp "$tmp/good" "$settings"
 
 # --- 9. print is the posture, verbatim -----------------------------------------------------
 check_that "print emits the posture file unchanged" \

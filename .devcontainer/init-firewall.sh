@@ -49,6 +49,16 @@ elif ! cmp -s "$WORKSPACE_POSTURE" "$SNAPSHOT" 2>/dev/null; then
 fi
 POSTURE="$SNAPSHOT"
 
+# Parse it HERE, once, rather than letting the first `jq` in the loop below fail under `set -e` —
+# that exited 5 with no output at all, which in postCreate is an unexplained abort. A snapshot
+# that will not parse is a real state (a truncated write, a half-copied file), and the operator
+# needs to be told which file to look at.
+jq empty "$POSTURE" 2>/dev/null || {
+    echo "init-firewall: $POSTURE is not valid JSON — the egress allowlist cannot be read." >&2
+    echo "  Rebuild the container to re-snapshot it from the workspace posture." >&2
+    exit 1
+}
+
 # Idempotent regardless of whether an iptables rule still references the set. `destroy` cannot run
 # while the OUTPUT rule points at it, and the subsequent `create` then failed "set with the same
 # name already exists" under `set -e` — which aborted postStart on every fresh container create,
@@ -73,7 +83,24 @@ while IFS= read -r domain; do
     done <<<"$ips"
 done <<<"$(jq -r '.require.sandbox.network.allowedDomains[]?' "$POSTURE")"
 
-say "allowed $resolved addresses from $(jq -r '.require.sandbox.network.allowedDomains | length' "$POSTURE") domains"
+# An empty, truncated or key-less snapshot yields ZERO allowed addresses, and the rules below
+# would still install and still print "default-deny is active" — technically true and useless: the
+# container can reach nothing, and the reason is a corrupt allowlist rather than a policy anyone
+# chose. Refuse instead of reporting success, and say which of the two it is.
+declared="$(jq -r '.require.sandbox.network.allowedDomains | length' "$POSTURE" 2>/dev/null)"
+case "$declared" in ''|*[!0-9]*) declared=0 ;; esac
+if [ "$declared" -eq 0 ]; then
+    echo "init-firewall: $POSTURE declares no allowed domains (empty, truncated, or missing" >&2
+    echo "  .require.sandbox.network.allowedDomains). Refusing to raise a firewall that would" >&2
+    echo "  block everything and report success. Rebuild the container to re-snapshot." >&2
+    exit 1
+fi
+if [ "$resolved" -eq 0 ]; then
+    echo "init-firewall: $declared domain(s) declared but NONE resolved to an address — DNS is" >&2
+    echo "  unavailable or every entry is a wildcard. Refusing: egress would be total-deny." >&2
+    exit 1
+fi
+say "allowed $resolved addresses from $declared domains"
 [ ${#skipped[@]} -eq 0 ] || say "not pinned at the IP layer (the sandbox matches these by name): ${skipped[*]}"
 
 # Flush first so a re-run is idempotent rather than additive.

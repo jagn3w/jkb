@@ -32,6 +32,7 @@ run() { # run <label> <expect-substring> <docker args...>
   RUN_IMAGE=""
   out="$(docker run --rm "$@" "$img" bash -c '
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
+      . ./.devcontainer/lib.sh && dc_link_state /home/vscode
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
       ./.devcontainer/verify.sh' 2>&1)"
   rc=$?

@@ -18,6 +18,19 @@ egress filter exists precisely because the sandbox's is *inside the layer that m
 a container's default egress is unrestricted, so a container whose nested sandbox failed silently
 would be a **downgrade** on exfiltration versus the host.
 
+### Editing the allowlist takes a rebuild
+
+Both layers read their domains from `scripts/auto-mode-posture.json`, but they read it at
+different moments. The **sandbox** picks up an edit the next time the posture is installed. The
+**firewall** reads it once, at container create, and snapshots it somewhere only root can write —
+because that file lives in the bind-mounted workspace, where the agent this layer exists to bound
+can edit it. Handing the workspace copy to a root-run script would let an agent widen its own
+egress by appending a line and waiting for a restart.
+
+So: **add a domain, then Rebuild Container.** A restart is not enough. The firewall says so on
+every raise when the two differ, and refuses outright if the snapshot is empty or unparseable
+rather than raising a firewall that blocks everything and reports success.
+
 ## The measurements this is built on
 
 Taken in a Linux VM (Ubuntu 26.04, kernel 7.0, Docker 29.7), with a no-container baseline first so

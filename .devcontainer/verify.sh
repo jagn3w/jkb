@@ -41,15 +41,13 @@ fi
 # after a full toolchain build. Two lists that must agree is the defect; there is now one list.
 # Deriving does not weaken it — the question this asks is "does the running container match what
 # it declares", and editing the declaration changes nothing until a human rebuilds.
-DC="$(cd "$(dirname "$0")" && pwd)/devcontainer.json"
-# The devcontainer spec allows a mount as either a comma-separated string or an object, and the
-# two are interchangeable at any time — so read both. Handling only strings would turn a purely
-# cosmetic edit of devcontainer.json into a container that cannot verify itself.
-EXPECTED="$(sed 's://.*$::' "$DC" 2>/dev/null \
-    | jq -r '[(.workspaceMount // empty)] + (.mounts // [])
-             | .[]
-             | if type == "string" then capture("target=(?<t>[^,]+)").t else .target end' \
-      2>/dev/null | sort -u)"
+# Derived through .devcontainer/lib.sh, the SAME function check-config.sh uses on the host, so
+# the gate that reviews the boundary and the check that enforces it cannot read it differently.
+here_dc="$(cd "$(dirname "$0")" && pwd)"
+DC="$here_dc/devcontainer.json"
+# shellcheck source=/dev/null
+. "$here_dc/lib.sh"
+EXPECTED="$(dc_mount_targets "$DC")"
 # What every container has regardless of configuration. Anything outside this and EXPECTED is
 # something a human added to devcontainer.json and must be looked at.
 RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets'
@@ -100,14 +98,46 @@ for path in /usr/local/bin /usr/local/bin/init-firewall.sh /usr/local/share \
 done
 [ "$unwritable_ok" -eq 1 ] && ok "the root-owned firewall and its allowlist cannot be replaced from here"
 
-sudo_entries="$(sudo -n -l 2>/dev/null | grep -E '^\s*\(' || true)"
-if [ -z "$sudo_entries" ]; then
-    ok "no passwordless root is granted at all"
+#     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing
+#     them reported the friendliest one: sudo missing, PAM broken or sudoers unparseable all
+#     produced an empty list and read as "no passwordless root". Worse, an unparseable sudoers is
+#     a state in which the FIREWALL cannot run either, so silence there is the wrong direction.
+sudo_raw="$(sudo -n -l 2>&1)"; sudo_rc=$?
+sudo_entries="$(grep -E '^[[:space:]]*\(' <<<"$sudo_raw" || true)"
+if [ "$sudo_rc" -ne 0 ] && [ -z "$sudo_entries" ]; then
+    # `sudo -n -l` exits non-zero when the user may run NOTHING, which is a legitimate hardened
+    # state — but only if sudo is actually working. Tell that apart from a broken sudo.
+    if grep -qiE 'not allowed to run sudo|may not run sudo' <<<"$sudo_raw"; then
+        ok "sudo works and grants this user nothing at all"
+    else
+        bad "sudo -n -l failed for a reason that is not 'nothing granted' (rc $sudo_rc): $(head -1 <<<"$sudo_raw") — the firewall cannot run either"
+    fi
+elif [ -z "$sudo_entries" ]; then
+    bad "sudo -n -l succeeded but listed no grants — cannot establish what this user may run as root"
 elif [ -z "$(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries")" ]; then
     ok "the only command permitted as root is the firewall ($(grep -c . <<<"$sudo_entries") grant(s))"
 else
     bad "vscode may run more than the firewall as root: $(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries" | tr -s ' ' | tr '\n' ';')"
 fi
+
+# 3c. The login-state links. devcontainer.json and the README both promise a login survives a
+#     rebuild, and that promise is entirely these two symlinks — without them the credentials sit
+#     in the writable layer and go with it. A promise made in two documents and checked nowhere is
+#     the shape this change keeps finding, so it is checked here.
+links_ok=1
+for pair in "/home/vscode/.claude/.credentials.json:/home/vscode/.claude-state/.credentials.json" \
+            "/home/vscode/.claude.json:/home/vscode/.claude-state/claude.json"; do
+    link="${pair%%:*}"; want="${pair##*:}"
+    if [ ! -L "$link" ]; then
+        # A regular file here means the login is NOT persisted — the exact failure, not cosmetic.
+        bad "$link is $( [ -e "$link" ] && echo "a regular file" || echo "missing" ), not a link into the state volume — a login here would not survive a rebuild"
+        links_ok=0
+    elif [ "$(readlink "$link")" != "$want" ]; then
+        bad "$link points at $(readlink "$link"), not $want"
+        links_ok=0
+    fi
+done
+[ "$links_ok" -eq 1 ] && ok "login state is linked into the persistent volume"
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.
 assert "workspace is mounted"       "$([ -f /home/vscode/repos/jkb/Cargo.toml ] && echo yes || echo no)"
