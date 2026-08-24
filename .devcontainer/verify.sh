@@ -125,6 +125,15 @@ fi
 #     in the writable layer and go with it. A promise made in two documents and checked nowhere is
 #     the shape this change keeps finding, so it is checked here.
 links_ok=1
+#     Every link, not only the two whole-file ones. A real directory at a link site is silently
+#     declined by `ln -sfn`, so asserting the files alone left seven ways for state to stay in the
+#     container layer and vanish on rebuild with nothing reporting it.
+for d in projects sessions history file-history shell-snapshots todos statsig; do
+    if [ ! -L "/home/vscode/.claude/$d" ]; then
+        bad "~/.claude/$d is not a link into the state volume — that state would not survive a rebuild"
+        links_ok=0
+    fi
+done
 for pair in "/home/vscode/.claude/.credentials.json:/home/vscode/.claude-state/.credentials.json" \
             "/home/vscode/.claude.json:/home/vscode/.claude-state/claude.json"; do
     link="${pair%%:*}"; want="${pair##*:}"

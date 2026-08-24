@@ -59,6 +59,20 @@ dc_link_state() { # dc_link_state [home]
     local d
     for d in projects sessions history file-history shell-snapshots todos statsig; do
         mkdir -p "$h/.claude-state/$d"
+        # `ln -sfn` REPLACES a regular file but silently declines a real directory, leaving that
+        # state in the container layer to die with the next rebuild — and nothing noticed, because
+        # only the two file links were asserted. Migrate anything already there into the volume
+        # first, so the link can be made and no data is dropped to achieve it.
+        if [ -d "$h/.claude/$d" ] && [ ! -L "$h/.claude/$d" ]; then
+            # `.` glob so dotfiles come too; a failure here must not silently lose the directory.
+            if ! (shopt -s dotglob nullglob 2>/dev/null || setopt dotglob 2>/dev/null || true
+                  mv "$h/.claude/$d"/* "$h/.claude-state/$d"/ 2>/dev/null); then :; fi
+            rmdir "$h/.claude/$d" 2>/dev/null || {
+                echo "dc_link_state: $h/.claude/$d is a non-empty directory that could not be migrated;" >&2
+                echo "  leaving it alone — this state will NOT survive a rebuild." >&2
+                continue
+            }
+        fi
         ln -sfn "$h/.claude-state/$d" "$h/.claude/$d" 2>/dev/null || true
     done
     # The two whole-file pieces of login state, linked while still dangling: Claude Code creates
