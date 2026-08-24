@@ -21,10 +21,23 @@ if strip "$here/devcontainer.json" | jq empty 2>/dev/null; then ok "devcontainer
 else bad "devcontainer.json does not parse"; fi
 
 dc="$(strip "$here/devcontainer.json")"
-for want in '"remoteUser": "vscode"' 'seccomp=${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json' '--cap-add=NET_ADMIN'; do
+for want in '"remoteUser": "vscode"' '--cap-add=NET_ADMIN'; do
     if grep -qF -e "$want" <<<"$dc"; then ok "declares $want"
     else bad "devcontainer.json no longer declares $want"; fi
 done
+
+# The seccomp profile is asserted as a FLAG/VALUE PAIR in runArgs, not as a string present
+# somewhere in the file. Grepping for the value alone passed when the `--security-opt` flag was
+# deleted and the value left orphaned — Docker would then apply its default profile, bubblewrap
+# would fail, and the config still read as declaring a profile. Found by mutate-config.sh.
+if jq -e --arg v "seccomp=\${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json" \
+      '[.runArgs // [] | to_entries[] | select(.value == "--security-opt") | .key]
+       | any(. as $i | ($ARGS.named.v) == ($in_args[$i+1] // ""))' \
+      --argjson in_args "$(jq -c '.runArgs // []' <<<"$dc")" <<<"$dc" >/dev/null 2>&1; then
+    ok "runArgs pairs --security-opt with the seccomp profile"
+else
+    bad "devcontainer.json does not pair --security-opt with seccomp=\${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json — Docker would apply its default profile and bubblewrap could not start"
+fi
 
 # Non-root is load-bearing (root cannot create a mount namespace in a container), so a
 # `"remoteUser": "root"` would break the nested sandbox while looking like a simplification.

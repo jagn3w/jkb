@@ -1406,6 +1406,19 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     **derived** from `devcontainer.json` (both the string and object mount spellings), so there is
     one. A `CARGO_TARGET_DIR` guard added an hour earlier pinned a single string in that very file
     and could not see the list beside it — a guard aimed at the instance, not the class.
+  - **The third round found the same class again, so the fix stopped being a fix and became a
+    harness.** `verify.sh` had `mutate-verify.sh` watching it fail; `check-config.sh` had nothing,
+    and rounds two and three each found an assertion in it that could not fail — a regex that
+    could not cross a shell quote and so never caught the exact code it existed to prevent, and a
+    rewrite that dropped the `type=volume` half of its own check while keeping the failure message
+    about volumes. Hand-mutating after each round works until nobody does it.
+    `.devcontainer/mutate-config.sh` breaks each config property in turn (18 of them) and requires
+    a FAIL naming it, with the same negative control — and it needs no Docker, so unlike
+    `mutate-verify.sh` it runs in `check.sh` and CI. **It found a live one on its first run**: the
+    seccomp assertion grepped for the `seccomp=…` value anywhere in the file, so deleting the
+    `--security-opt` flag and orphaning its value passed — Docker would apply its default profile,
+    bubblewrap would fail, and the config still read as declaring one. It is asserted as a
+    flag/value pair in `runArgs` now.
   - **A skip decided per-assertion is not a skip.** `run` refuses on a Linux host without
     bubblewrap, correctly — but the argv assertions ran unconditionally, so the shared gate went
     red for a fact about the machine; and the drift assertion three lines below asked only for a

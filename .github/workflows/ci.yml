@@ -82,6 +82,11 @@ jobs:
       - name: devcontainer config
         run: ./.devcontainer/check-config.sh
 
+      # Each of those assertions, watched failing. No Docker needed; the container-level harness
+      # (mutate-verify.sh) is the one that cannot run here.
+      - name: devcontainer config guards fire
+        run: ./.devcontainer/mutate-config.sh
+
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny

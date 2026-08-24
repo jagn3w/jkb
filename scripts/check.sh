@@ -60,4 +60,9 @@ fi
 echo "==> devcontainer config"
 "$(dirname "$0")/../.devcontainer/check-config.sh"
 
+# ...and every assertion in it, watched failing. check-config.sh had no such harness while
+# verify.sh did, and three review rounds each found the same defect in it — an assertion that
+# cannot fail. Needs no Docker either, so it belongs in the gate rather than beside mutate-verify.
+"$(dirname "$0")/../.devcontainer/mutate-config.sh"
+
 echo "All checks passed."
