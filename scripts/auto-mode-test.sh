@@ -376,6 +376,30 @@ check_that "retiring an entry that is not present is a no-op" \
     "$("$tmp/rt/scripts/auto-mode.sh" check >/dev/null 2>&1 && echo yes || echo no)"
 cp "$tmp/good" "$settings"
 
+# --- 8d. the confinement verdict, all four combinations -------------------------------------
+# `sandboxed` answers "is this shell confined" from the kernel rather than from
+# CLAUDE_CODE_SANDBOXED, which was UNSET on a machine whose sandbox was demonstrably enforcing —
+# $HOME writes refused with EPERM, ~/.zsh_history unreadable, ~/.gitconfig and ~/.zshrc fine. That
+# variable had been this script's own recommended test. The verdict is a pure function precisely so
+# both the confined and unconfined answers are testable from one state, which is the only way the
+# UNCONFINED arm gets exercised at all.
+# `bash -c CMD NAME` sets $0 to NAME. auto-mode.sh derives its own directory from $0 to find the
+# posture, so without this the source dies before defining anything and every case below "fails"
+# for a reason that has nothing to do with the verdict.
+# `set --` before sourcing is load-bearing: a sourced script INHERITS the caller's positional
+# parameters, so auto-mode.sh's own dispatch saw $1="yes", hit its `unknown command` arm and exited
+# before defining anything — every case below then failed for a reason that was not the verdict.
+verdict() { bash -c 'a=$1; b=$2; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b"' \
+                   "$tool" "$1" "$2"; }
+check_that "control ok + canary refused  => CONFINED" \
+    "$([ "$(verdict yes yes)" = CONFINED ] && echo yes || echo no)"
+check_that "control ok + canary WROTE    => UNCONFINED" \
+    "$([ "$(verdict yes no)" = UNCONFINED ] && echo yes || echo no)"
+check_that "control failed               => INCONCLUSIVE, never a pass" \
+    "$([ "$(verdict no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+check_that "control failed + canary wrote => INCONCLUSIVE (the control dominates)" \
+    "$([ "$(verdict no no)" = INCONCLUSIVE ] && echo yes || echo no)"
+
 # --- 8c. no inert rules ---------------------------------------------------------------------
 # Claude Code REPORTS these at session start: "Write(path) is not matched by file permission
 # checks — only Edit(path) rules are. Use Edit(path) instead (Edit rules cover all file-editing

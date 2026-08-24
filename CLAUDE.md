@@ -1229,6 +1229,25 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   only bound the unsandboxed tools have. Adding a key to either half extends the check *and* the
   **tests**, which generate their cases from the posture file (flip every boolean, drop every
   list entry, populate every forbid key).
+- **The sandbox engages — established on the host, with a control** (D48.14). This was the last
+  open question of D48/D49, and it is settled for the host: with the posture installed, a `$HOME`
+  write is refused with **`EPERM`** while a control write inside `~/repos` succeeds. Neither TCC nor
+  ordinary permissions explains that — `$HOME` is `drwxr-x---` owned by the user — and the read side
+  tracks the posture exactly across three plain dotfiles of identical TCC status: `~/.gitconfig` and
+  `~/.zshrc` readable (both `allowRead`), `~/.zsh_history` denied. The container case is separate
+  and still open: it needs an authenticated session *inside* the container, because the sandbox
+  wraps commands Claude Code runs and a plain `docker run` shell has no Claude Code in it.
+  - **`CLAUDE_CODE_SANDBOXED` is not the test, and this file used to say it was.** It was **unset**
+    throughout the measurement above. `auto-mode.sh sandboxed` asks the kernel instead — a control
+    write inside an allowWrite root, a canary write to `$HOME` — and reports CONFINED / NOT CONFINED
+    / **INCONCLUSIVE**, the third being what an absent canary means when the control also failed.
+    The verdict is a **pure function** of those two observations precisely so the unconfined arm is
+    testable from a confined machine; all four combinations are pinned.
+  - Costs nothing and needs no session, unlike `probe` — which remains the fuller check (egress and
+    credential reads as well) and which correctly reported **INCONCLUSIVE** here rather than a pass,
+    because a subprocess `claude` has no credentials in an agent session (`loggedIn: false` even
+    with the sandbox explicitly overridden off, which is what attributes it to auth and not to the
+    posture).
 - **Installing it for real found two things no amount of checking could.** `install` ran clean
   (preflight green, 45 pre-existing allow rules and the theme preserved, `/tmp`, `$TMPDIR` and
   `mktemp` all still working — the three failures of the first attempt, absent), and then:
@@ -1579,7 +1598,8 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
   breaks git, because the gitdir it names is not there.
 - **Still not established:** that the nested sandbox actually *engages* for a tool call. `bwrap`
   working is the mechanism, not the product, and the credential-free probe does not discriminate
-  (see D48.7). Settle it in a live session with `printenv CLAUDE_CODE_SANDBOXED`.
+  (see D48.7). Settle it in a live session with `./scripts/auto-mode.sh sandboxed`, **not** with
+  `printenv CLAUDE_CODE_SANDBOXED` — see the measurement under D48 below.
 
 ## Code review (D37) — our own reviewer, because the host's is not composable
 

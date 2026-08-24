@@ -108,12 +108,25 @@ the Dockerfile and rebuild, or `docker exec -u root` from the host.
 
 ## What is still not established
 
-That the nested sandbox actually **engages** for a tool call. `bwrap` working is the mechanism,
+That the **nested** sandbox engages for a tool call *in here*. `bwrap` working is the mechanism,
 not the product, and the obvious credential-free probe does not discriminate: with
 `failIfUnavailable: true` in a stock container — where `bwrap` provably cannot run — Claude Code
 still reached the auth check rather than erroring at startup. So the sandbox is checked lazily, or
-auth precedes it. Settle it inside a live session with `printenv CLAUDE_CODE_SANDBOXED`, or
-`../scripts/auto-mode.sh probe`.
+auth precedes it.
+
+Settling it needs a live, authenticated session **inside** the container, then
+`../scripts/auto-mode.sh sandboxed`. Running that from a plain `docker run` shell answers a
+different question and will say NOT CONFINED, correctly: the sandbox wraps commands *Claude Code*
+runs, and there is no Claude Code in that shell.
+
+**On the host this is now established**, which is the useful precedent: with the posture installed,
+a `$HOME` write was refused with `EPERM` (not `EACCES`, and `$HOME` is `drwxr-x---` owned by the
+user, so ordinary permissions allowed it), while a control write inside `~/repos` succeeded — and
+`~/.zsh_history` was unreadable while the allowlisted `~/.gitconfig` and `~/.zshrc` were fine, three
+plain dotfiles with identical TCC status differing only in the posture.
+
+Use `auto-mode.sh sandboxed` for this, **never** `printenv CLAUDE_CODE_SANDBOXED`: that variable was
+**unset** throughout the measurement above. It had been this repo's recommended test.
 
 ## On a Linux host
 

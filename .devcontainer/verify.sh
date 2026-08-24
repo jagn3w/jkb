@@ -167,7 +167,9 @@ fi
 
 echo
 echo "  note: that the sandbox actually ENGAGES for a tool call is not asserted here — it needs a"
-echo "  live session. Inside one, run:  printenv CLAUDE_CODE_SANDBOXED   (set == sandboxed), or"
+echo "  live session. Inside one, run:  ./scripts/auto-mode.sh sandboxed   (control + canary, no"
+echo "  cost; do NOT use printenv CLAUDE_CODE_SANDBOXED, which was unset on a host whose sandbox"
+echo "  was provably enforcing), or"
 echo "  ./scripts/auto-mode.sh probe   for the full write/egress/credential probe."
 echo
 if [ "$fail" -ne 0 ]; then printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"; exit 1; fi

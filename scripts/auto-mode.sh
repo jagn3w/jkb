@@ -8,6 +8,7 @@
 #   ./scripts/auto-mode.sh install          # merge it into ~/.claude/settings.json
 #   ./scripts/auto-mode.sh check            # is the posture still intact? (exit 1 if not)
 #   ./scripts/auto-mode.sh run [args…]      # check, then exec `claude --permission-mode auto`
+#   ./scripts/auto-mode.sh sandboxed        # is THIS shell confined? (no session, no cost)
 #   ./scripts/auto-mode.sh probe            # live end-to-end smoke (costs a real session)
 #
 # TWO LAYERS, BECAUSE THEY FAIL DIFFERENTLY. `--permission-mode auto` is a *classifier*: it
@@ -381,8 +382,70 @@ preflight_blind_spots() {
     - the domain allowlist is not compared against what this machine actually reaches; a missing
       host shows up as a failed request at the moment you needed it.
     - whether the sandbox ENGAGES at all is not established here — that needs a live session
-      (`auto-mode.sh probe`, or `printenv CLAUDE_CODE_SANDBOXED` inside one).
+      (`auto-mode.sh sandboxed` answers it for the shell you are in, at no cost; `probe`
+      does the full write/egress/credential run in a fresh session).
 BLIND
+}
+
+# Is the shell this runs in actually confined? A PURE function of two observations, so both the
+# confined and unconfined verdicts are testable without having to be in both states.
+#
+#   control_ok      a write INSIDE an allowWrite root succeeded (commands are really running)
+#   canary_blocked  a write OUTSIDE every allowWrite root was refused
+#
+# The control is what separates "denied by the sandbox" from "never ran". Without it an absent
+# canary reads as confinement when the truth may be that nothing executed at all.
+confinement_verdict() { # confinement_verdict <control_ok yes|no> <canary_blocked yes|no>
+    case "$1:$2" in
+        no:*)      echo INCONCLUSIVE ;;   # the control failed; nothing below means anything
+        yes:yes)   echo CONFINED ;;
+        yes:no)    echo UNCONFINED ;;
+    esac
+}
+
+# WHY NOT `printenv CLAUDE_CODE_SANDBOXED`. Because it is unset on a machine whose sandbox is
+# demonstrably enforcing: measured here, with the posture installed, `$HOME` writes refused with
+# EPERM and `~/.zsh_history` unreadable while `~/.gitconfig` and `~/.zshrc` (both allowRead) were
+# fine. That variable was this file's own recommended test, and it reports the friendly answer.
+# Ask the kernel instead.
+cmd_sandboxed() {
+    local control canary control_ok canary_blocked verdict
+    # $PWD is where the caller is working, so it is the honest control; fall back to a temp dir if
+    # the caller happens to be standing somewhere unwritable for ordinary reasons.
+    control="$(pwd)/.auto-mode-control-$$"
+    if { printf 'x' > "$control"; } 2>/dev/null; then control_ok=yes; rm -f "$control"
+    elif control="${TMPDIR:-/tmp}/auto-mode-control-$$"; { printf 'x' > "$control"; } 2>/dev/null; then
+        control_ok=yes; rm -f "$control"
+    else control_ok=no; fi
+
+    # NOT dot-prefixed: `~/.jkb-…` shares a prefix with the allowed `~/.jkb`, and a near-miss like
+    # that is how a probe comes to lie.
+    canary="$HOME/auto-mode-canary-$$"
+    rm -f "$canary" 2>/dev/null
+    if { printf 'x' > "$canary"; } 2>/dev/null; then canary_blocked=no; rm -f "$canary"
+    else canary_blocked=yes; fi
+
+    verdict="$(confinement_verdict "$control_ok" "$canary_blocked")"
+    printf '  control (write inside an allowWrite root): %s\n' "$control_ok"
+    printf '  canary  (write to $HOME, allowed by unix perms, in no allowWrite root): %s\n' \
+        "$([ "$canary_blocked" = yes ] && echo refused || echo SUCCEEDED)"
+    printf '  CLAUDE_CODE_SANDBOXED: %s   (informational only — see the note above)\n' \
+        "${CLAUDE_CODE_SANDBOXED:-unset}"
+    echo
+    case "$verdict" in
+        CONFINED)
+            printf '\033[32mCONFINED\033[0m — this shell cannot write outside the posture allowlist.\n'
+            return 0 ;;
+        UNCONFINED)
+            printf '\033[31mNOT CONFINED\033[0m — a write outside every allowWrite root succeeded.\n' >&2
+            echo "Bash here is not sandboxed. Check 'sandbox.enabled' and that this session was" >&2
+            echo "started after the posture was installed; settings are read at session start." >&2
+            return 1 ;;
+        *)
+            printf '\033[33mINCONCLUSIVE\033[0m — even the in-bounds control write failed.\n' >&2
+            echo "Nothing was learned: the commands may not have run at all." >&2
+            return 2 ;;
+    esac
 }
 
 cmd_check() {
@@ -509,6 +572,7 @@ case "${1-}" in
     check)   shift; cmd_check "$@" ;;
     run)     shift; cmd_run "$@" ;;
     probe)   shift; cmd_probe "$@" ;;
+    sandboxed) shift; cmd_sandboxed "$@" ;;
     -h|--help|"") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
     *) die "unknown command: $1 (see --help)" ;;
 esac
