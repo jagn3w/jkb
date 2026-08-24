@@ -79,6 +79,22 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq / apt install jq)."
 [ -f "$posture" ] || die "posture file missing: $posture"
 
+# A posture that both REQUIRES and RETIRES the same entry is unsatisfiable: the merge adds it and
+# then removes it, `check` reports it permanently missing, and `install` exits non-zero without
+# being able to repair what it just wrote. Caught here, once, rather than as a confusing drift
+# report on somebody's machine.
+contradiction="$(jq -r '
+  (.retire // {}) | to_entries[]
+  | .key as $k | .value as $retired
+  | ($k | split(".")) as $path
+  | (($ARGS.named.req | getpath($path)) // []) as $required
+  | ($retired - ($retired - $required))
+  | select(length > 0)
+  | "  .\($k): \(. | tojson)"
+' --argjson req "$(jq -c '.require' "$posture")" "$posture" 2>/dev/null)"
+[ -z "$contradiction" ] || die "posture names the same entr(y|ies) in both require and retire, which can never be satisfied:
+$contradiction"
+
 # Deep merge, posture wins. Objects merge key-by-key; arrays UNION preserving the existing
 # order and appending only what is new (so the user's own permissions.allow entries survive a
 # re-install unshuffled, which is what makes `install` idempotent byte-for-byte); scalars are
@@ -395,11 +411,19 @@ BLIND
 #
 # The control is what separates "denied by the sandbox" from "never ran". Without it an absent
 # canary reads as confinement when the truth may be that nothing executed at all.
-confinement_verdict() { # confinement_verdict <control_ok yes|no> <canary_blocked yes|no>
-    case "$1:$2" in
-        no:*)      echo INCONCLUSIVE ;;   # the control failed; nothing below means anything
-        yes:yes)   echo CONFINED ;;
-        yes:no)    echo UNCONFINED ;;
+#   canary_clear    the canary PATH was empty before the attempt
+#
+# The third is not padding. A directory at the canary path makes the write fail for a reason that
+# has nothing to do with the sandbox, `rm -f` cannot remove it, and the control does not cover the
+# case because the control writes somewhere else — so an unconfined machine reports CONFINED. It
+# is the same shape as the control itself: an observation is only interpretable once the thing
+# that could counterfeit it has been excluded.
+confinement_verdict() { # confinement_verdict <control_ok> <canary_blocked> <canary_clear>
+    case "$1:$3:$2" in
+        no:*)        echo INCONCLUSIVE ;;   # the control failed; nothing else means anything
+        yes:no:*)    echo INCONCLUSIVE ;;   # something occupies the canary path
+        yes:yes:yes) echo CONFINED ;;
+        yes:yes:no)  echo UNCONFINED ;;
     esac
 }
 
@@ -409,7 +433,7 @@ confinement_verdict() { # confinement_verdict <control_ok yes|no> <canary_blocke
 # fine. That variable was this file's own recommended test, and it reports the friendly answer.
 # Ask the kernel instead.
 cmd_sandboxed() {
-    local control canary control_ok canary_blocked verdict
+    local control canary control_ok canary_blocked canary_clear verdict
     # $PWD is where the caller is working, so it is the honest control; fall back to a temp dir if
     # the caller happens to be standing somewhere unwritable for ordinary reasons.
     control="$(pwd)/.auto-mode-control-$$"
@@ -422,10 +446,12 @@ cmd_sandboxed() {
     # that is how a probe comes to lie.
     canary="$HOME/auto-mode-canary-$$"
     rm -f "$canary" 2>/dev/null
+    # ...and confirm nothing is sitting there, or a refusal to write cannot be attributed.
+    if [ -e "$canary" ] || [ -L "$canary" ]; then canary_clear=no; else canary_clear=yes; fi
     if { printf 'x' > "$canary"; } 2>/dev/null; then canary_blocked=no; rm -f "$canary"
     else canary_blocked=yes; fi
 
-    verdict="$(confinement_verdict "$control_ok" "$canary_blocked")"
+    verdict="$(confinement_verdict "$control_ok" "$canary_blocked" "$canary_clear")"
     printf '  control (write inside an allowWrite root): %s\n' "$control_ok"
     printf '  canary  (write to $HOME, allowed by unix perms, in no allowWrite root): %s\n' \
         "$([ "$canary_blocked" = yes ] && echo refused || echo SUCCEEDED)"
@@ -442,8 +468,13 @@ cmd_sandboxed() {
             echo "started after the posture was installed; settings are read at session start." >&2
             return 1 ;;
         *)
-            printf '\033[33mINCONCLUSIVE\033[0m — even the in-bounds control write failed.\n' >&2
-            echo "Nothing was learned: the commands may not have run at all." >&2
+            printf '\033[33mINCONCLUSIVE\033[0m — the observation cannot be attributed.\n' >&2
+            if [ "$canary_clear" = no ]; then
+                echo "Something already occupies $canary, so a refusal to write it proves nothing." >&2
+                echo "Remove it and re-run." >&2
+            else
+                echo "Even the in-bounds control write failed: the commands may not have run at all." >&2
+            fi
             return 2 ;;
     esac
 }

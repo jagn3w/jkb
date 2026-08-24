@@ -389,16 +389,36 @@ cp "$tmp/good" "$settings"
 # `set --` before sourcing is load-bearing: a sourced script INHERITS the caller's positional
 # parameters, so auto-mode.sh's own dispatch saw $1="yes", hit its `unknown command` arm and exited
 # before defining anything — every case below then failed for a reason that was not the verdict.
-verdict() { bash -c 'a=$1; b=$2; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b"' \
-                   "$tool" "$1" "$2"; }
+verdict() { bash -c 'a=$1; b=$2; c=$3; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b" "$c"' \
+                   "$tool" "$1" "$2" "$3"; }
 check_that "control ok + canary refused  => CONFINED" \
-    "$([ "$(verdict yes yes)" = CONFINED ] && echo yes || echo no)"
+    "$([ "$(verdict yes yes yes)" = CONFINED ] && echo yes || echo no)"
 check_that "control ok + canary WROTE    => UNCONFINED" \
-    "$([ "$(verdict yes no)" = UNCONFINED ] && echo yes || echo no)"
+    "$([ "$(verdict yes no yes)" = UNCONFINED ] && echo yes || echo no)"
 check_that "control failed               => INCONCLUSIVE, never a pass" \
-    "$([ "$(verdict no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+    "$([ "$(verdict no yes yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+# A directory (or anything else) at the canary path makes the write fail for a reason that is not
+# the sandbox, and `rm -f` cannot clear it — so an UNCONFINED machine would report CONFINED. The
+# control does not cover it: the control writes somewhere else entirely.
+check_that "canary path occupied      => INCONCLUSIVE, not a counterfeit CONFINED" \
+    "$([ "$(verdict yes yes no)" = INCONCLUSIVE ] && echo yes || echo no)"
+check_that "canary occupied outranks a canary that appears to have been written" \
+    "$([ "$(verdict yes no no)" = INCONCLUSIVE ] && echo yes || echo no)"
+
 check_that "control failed + canary wrote => INCONCLUSIVE (the control dominates)" \
-    "$([ "$(verdict no no)" = INCONCLUSIVE ] && echo yes || echo no)"
+    "$([ "$(verdict no no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+
+# A posture that both requires and retires an entry is unsatisfiable — the merge adds it and then
+# removes it, check reports it permanently missing, and install exits non-zero unable to repair
+# what it just wrote. Refused at load, before any of that.
+mkdir -p "$tmp/ct/scripts"; cp "$here/auto-mode.sh" "$tmp/ct/scripts/"
+jq '.retire = {"permissions.ask": ["WebFetch"]}' "$posture" > "$tmp/ct/scripts/auto-mode-posture.json"
+check_that "a require/retire contradiction is refused, by name" \
+    "$(set +e; out="$("$tmp/ct/scripts/auto-mode.sh" check 2>&1)"; rc=$?; set -e
+       [ "$rc" -ne 0 ] && grep -q 'both require and retire' <<<"$out" && grep -q 'permissions.ask' <<<"$out" && echo yes || echo no)"
+jq '.retire = {"permissions.allow": ["Bash(never-required *)"]}' "$posture" > "$tmp/ct/scripts/auto-mode-posture.json"
+check_that "a retire entry that require does NOT name is accepted" \
+    "$("$tmp/ct/scripts/auto-mode.sh" check >/dev/null 2>&1 && echo yes || echo no)"
 
 # --- 8c. no inert rules ---------------------------------------------------------------------
 # Claude Code REPORTS these at session start: "Write(path) is not matched by file permission
