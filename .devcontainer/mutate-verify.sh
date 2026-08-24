@@ -13,12 +13,22 @@ REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 # "N guard(s) did not fire" — a security-shaped alarm for what is only a fact about the shell.
 # Docker Desktop installs to ~/.docker/bin, which an interactive profile may export and a plain
 # shell may not, so this is the normal way to meet it rather than an exotic one.
-command -v docker >/dev/null 2>&1 || {
+# USABILITY, not presence. `command -v docker` succeeds on the far more common host state — Docker
+# Desktop installed but not running — and every mutation then printed MISSED with exit 125 before
+# the control finally said they were unattributable. Ten container starts to deliver the exact
+# ten-broken-guards alarm this block exists to remove, for the same fact about the host that the
+# PATH case reports as a clean skip.
+if ! command -v docker >/dev/null 2>&1; then
     echo "=== container guards ==="
     echo "   (skipped: docker is not on PATH — try: export PATH=\"\$HOME/.docker/bin:\$PATH\")"
     echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
     exit 0
-}
+elif ! docker info >/dev/null 2>&1; then
+    echo "=== container guards ==="
+    echo "   (skipped: the Docker daemon is not reachable — is Docker Desktop running?)"
+    echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
+    exit 0
+fi
 IMAGE="${1:-jkb-dev}"
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
@@ -40,6 +50,11 @@ SUBJECT='
       . ./.devcontainer/lib.sh && dc_link_state /home/vscode
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
       ./.devcontainer/verify.sh'
+# The baseline every ADDITIVE mutation runs in, and the control with it. The three subtractive
+# mutations below deliberately spell a reduced set instead — that is what they are testing — and
+# being the only sites that do so makes them visibly the odd ones. Before this, HEALTHY was used
+# by the control alone while ten sites wrote the flags by hand, so tightening the baseline at the
+# run sites would have left the control certifying a container the mutations never ran in.
 HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}")
 
 RUN_IMAGE=""
@@ -55,7 +70,11 @@ mutant() { # mutant <tag> <root-shell-command>
   else
     RUN_IMAGE=""
     MUTANT_FAILED=1
-    fails=$((fails+1))
+    # Its OWN counter. Counting it in `fails` made the summary say "N guard(s) did not fire" for a
+    # Docker registry outage — sending the reader to audit the container's guarantees over a
+    # network blip. That is the rule the comment above states for the fall-through case, and it was
+    # not applied one route over.
+    build_failures=$((build_failures+1))
     printf '  BUILD-FAILED  could not build mutant %s — the mutation below was NOT applied\n' "$1"
     sed 's/^/                /' <<<"$err" | tail -3
   fi
@@ -98,23 +117,24 @@ judge() { # judge <label> <expect> <output> <rc>
   fi
 }
 fails=0
+build_failures=0
 echo "=== mutations of the container's own guarantees (each must be CAUGHT) ==="
 run "an undeclared host mount is added" "UNDECLARED mounts" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
+    "${HEALTHY[@]}" \
     -v "$scratch/home/Documents":/home/vscode/Documents
 # Outside /home/vscode entirely — the case the old target-prefix filter could not see at all,
 # and the most valuable one: /var/run/docker.sock is root on the host.
 run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
+    "${HEALTHY[@]}" \
     -v "$scratch/home":/host
 run "the host's ~/.claude is mounted in" "is a host mount" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
+    "${HEALTHY[@]}" \
     -v "$scratch/home":/home/vscode/.claude
 # ...and at a SUBPATH, which is the case the equality test waved through and the prefix match was
 # added for. Mounting only at the exact path left that change unwatched: deleting the prefix clause
 # would have kept the harness green. settings.json is the worst one — it IS the posture.
 run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}" \
+    "${HEALTHY[@]}" \
     -v "$scratch/home/settings.json":/home/vscode/.claude/settings.json
 run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
     --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
@@ -130,17 +150,17 @@ run "runs as root" "runs as a non-root user" \
 # they live in — which the base image owns, not this repo. `chmod 777` is the whole exploit.
 mutant jkb-dev-writable-usrlocal "chmod 0777 /usr/local/bin /usr/local/share"
 run "/usr/local/{bin,share} are writable by the agent" "is writable by" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+    "${HEALTHY[@]}"
 
 # The PARENT, which governs replacing them — the previous mutant could not see this, because it
 # chmod'd the two paths already covered.
 mutant jkb-dev-writable-usrlocal-parent "chmod 0777 /usr/local"
 run "/usr/local itself is writable by the agent" "is writable by" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+    "${HEALTHY[@]}"
 
 mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/sudoers.d/vscode && chmod 0440 /etc/sudoers.d/vscode"
 run "blanket passwordless root is restored" "may run more than the firewall as root" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+    "${HEALTHY[@]}"
 
 # The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher
 # is matching something that is present when nothing is wrong — which is precisely the defect
@@ -173,5 +193,7 @@ fi
 
 echo
 [ "$self_ok" -eq 1 ] || { printf '\033[31mthe matcher reports CAUGHT for a healthy container — no result here is trustworthy\033[0m\n'; exit 1; }
+[ "$build_failures" -eq 0 ] || printf '\033[33m%d mutation(s) could not be built — nothing was verified for them\033[0m\n' "$build_failures"
 [ "$fails" -eq 0 ] || { printf '\033[31m%d guard(s) did not fire\033[0m\n' "$fails"; exit 1; }
+[ "$build_failures" -eq 0 ] || exit 1
 printf '\033[32mevery guard fired, and the matcher was shown to discriminate\033[0m\n'
