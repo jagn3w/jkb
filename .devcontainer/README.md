@@ -100,6 +100,11 @@ the Dockerfile and rebuild, or `docker exec -u root` from the host.
 - `verify.sh` — inside the container: non-root, bwrap works, the mount set is exactly as declared,
   `~/.claude` is not a host mount, root is reachable only for the firewall, egress is denied *and*
   the allowlist still works, posture intact.
+- **Run these from your own terminal, not from an agent session.** Once the host posture is
+  installed the Docker CLI is unreachable — `~/.docker/bin` is under `denyRead: ["~"]` and in no
+  `allowRead` entry, so it fails with `Operation not permitted`. That is the posture working: an
+  unattended agent that can talk to Docker can mount `/` into a container and is root on the host.
+  Allowlisting it to make the harness runnable would trade the boundary for convenience.
 - `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
   fails naming it. A guard nobody has watched fail is not a guard.
 - `check-config.sh` — host-side, no Docker, part of `./scripts/check.sh`. Its real job is the

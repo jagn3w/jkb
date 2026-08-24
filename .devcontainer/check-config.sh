@@ -133,7 +133,15 @@ while IFS= read -r src; do
         '${localWorkspaceFolder}'|'${localEnv:HOME}/.jkb') ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
-done <<<"$(dc_mount_sources "$here/devcontainer.json" | sed -n 's/|bind$//p')"
+done <<<"$(dc_mount_sources "$here/devcontainer.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
+# ...and certify the source derivation produced something, the way the target list is certified
+# above. An include-match on `|bind` skipped any other type spelling entirely, and an empty result
+# made "every declared mount is acceptable" pass with the host's ~/.ssh bound in — a guard that
+# fails OPEN. Excluding volumes instead means an unrecognised type is reviewed, not waved through.
+bind_sources="$(dc_mount_sources "$here/devcontainer.json" | sed -n '/|volume$/!s/|[^|]*$//p' | grep -c .)"
+if [ "$bind_sources" -lt 2 ]; then
+    bad "only $bind_sources host bind source(s) parsed — the workspace and ~/.jkb are both binds, so the review below saw less than the config declares"
+fi
 if [ ${#forbidden[@]} -eq 0 ]; then
     ok "every declared mount is acceptable (no posture directory, no docker socket, binds from the reviewed set)"
 else

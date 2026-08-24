@@ -17,6 +17,13 @@
 # when nothing is wrong.
 set -uo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
+# The subject of this harness skips itself when jq is absent, so without the same precondition a
+# machine without jq gets every mutation MISSED and a red shared gate — a security-shaped alarm for
+# what is only a fact about the host. Every other machine-dependent gate step degrades to a named
+# skip; this must too.
+for t in jq python3; do
+    command -v "$t" >/dev/null 2>&1 || { echo "==> devcontainer config guards"; echo "   (skipped: $t not installed; CI runs this gate)"; exit 0; }
+done
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 fails=0
 
@@ -30,10 +37,17 @@ seed() {
 
 DC() { printf '%s' "$work/t/.devcontainer/devcontainer.json"; }
 
+EXPECTS=()
 run() { # run <label> <expect-substring>
     local label="$1" expect="$2" out rc
+    EXPECTS+=("$expect")
     out="$(cd "$work/t" && ./.devcontainer/check-config.sh 2>&1)"; rc=$?
-    if [ "$rc" -ne 0 ] && grep -E "FAIL.*$(sed 's/[][\.*^$/]/\\&/g' <<<"$expect")" <<<"$out" >/dev/null; then
+    # FIXED-STRING match, both conditions on the SAME line. The regex form escaped only some ERE
+    # metacharacters, so an expect containing parentheses — "host bind source(s) parsed" — silently
+    # matched "sources" instead and reported a working guard as MISSED. There is nothing to escape
+    # here, so nothing to get wrong. `-e` because an expect may start with `-`, which grep
+# otherwise reads as an option — "--security-opt" reported a working guard as MISSED.
+    if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
         printf '  CAUGHT   %s\n' "$label"
     else
         fails=$((fails+1))
@@ -156,6 +170,61 @@ seed; sub_dc '"postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh"' \
              '"postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json"'
 run "a caller passes the workspace posture (bare path)" "passes an argument to init-firewall.sh"
 
+seed; printf '{oops' > "$(DC)"
+run "devcontainer.json stops parsing" "does not parse"
+
+seed; printf '{oops' > "$work/t/.devcontainer/seccomp-bwrap.json"
+run "the seccomp profile stops parsing" "does not parse"
+
+seed; sub_dc '"CARGO_TARGET_DIR"' '"CARGO_TARGET_DIR_TYPO"'
+run "containerEnv.CARGO_TARGET_DIR disappears" "sets no containerEnv.CARGO_TARGET_DIR"
+
+seed; jq_dc '.mounts |= map(select(test("jkb-cargo-target") | not))'
+run "nothing is mounted at CARGO_TARGET_DIR" "nothing is mounted at CARGO_TARGET_DIR"
+
+seed; python3 - "$work/t/.devcontainer/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('mkdir -p /home/vscode/.cargo/target', 'mkdir -p /home/vscode/.unused', 1))
+PYX
+run "the Dockerfile stops pre-creating CARGO_TARGET_DIR" "does not pre-create"
+
+seed; printf '\nif then fi\n' >> "$work/t/.devcontainer/setup.sh"
+run "a devcontainer script gains a syntax error" "has a syntax error"
+
+# The source half of the mount review depends on lib.sh producing anything at all. mutate-config
+# did not mutate lib.sh, so neither this nor the fail-open shape it protects was ever watched.
+seed; python3 - "$work/t/.devcontainer/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('dc_mount_sources() { # dc_mount_sources <devcontainer.json>',
+                             'dc_mount_sources() { return 0; #', 1))
+PYX
+run "the bind-source derivation returns nothing" "host bind source(s) parsed"
+
+# COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
+# while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
+# (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
+# the gate green under a line stating it had been watched failing.
+#
+# Pinned by COUNT, not by matching message text: three failure paths build their message in a
+# variable, so the text a mutation matches does not appear at the `bad` call at all, and a matcher
+# that cannot see them reports false gaps. A count cannot say WHICH path is unwatched, but it
+# cannot be fooled either, and it forces the decision at the moment an assertion is added.
+echo
+echo "==> coverage"
+bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
+PINNED_BAD_SITES=22
+if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
+    fails=$((fails+1))
+    printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
+    echo "  Add a mutation for the new one (or drop the stale one) and update PINNED_BAD_SITES."
+    echo "  An assertion nothing breaks is the defect this harness exists to catch."
+else
+    printf '  %s failure paths in check-config.sh, %s mutations, count pinned\n' \
+        "$bad_sites" "${#EXPECTS[@]}"   # the control has not run yet, so this is mutations only
+fi
+
 echo
 echo "==> self-test: an unmutated tree must be reported MISSED"
 before="$fails"
@@ -172,4 +241,4 @@ fi
 echo
 [ "$self_ok" -eq 1 ] || { printf '\033[31mthe matcher reports CAUGHT for a healthy config — no result here is trustworthy\033[0m\n'; exit 1; }
 [ "$fails" -eq 0 ] || { printf '\033[31m%d check-config assertion(s) did not fire\033[0m\n' "$fails"; exit 1; }
-printf '\033[32mevery check-config assertion fired, and the matcher was shown to discriminate\033[0m\n'
+printf '\033[32m%s mutations caught over %s failure paths, and the matcher was shown to discriminate\033[0m\n' "$((${#EXPECTS[@]} - 1))" "$bad_sites"

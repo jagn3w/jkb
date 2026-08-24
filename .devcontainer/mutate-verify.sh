@@ -57,7 +57,12 @@ run() { # run <label> <expect-substring> <docker args...>
       ./.devcontainer/verify.sh' 2>&1)"
   rc=$?
   # The FAIL marker and the label on the SAME line: that rendering exists only on the fail path.
-  if [ "$rc" -ne 0 ] && grep -E "FAIL.*$(sed 's/[][\.*^$/]/\\&/g' <<<"$expect")" <<<"$out" >/dev/null; then
+  # FIXED-STRING match, both conditions on the SAME line. The regex form escaped only some ERE
+  # metacharacters, so an expect containing parentheses — "host bind source(s) parsed" — silently
+  # matched "sources" instead and reported a working guard as MISSED. There is nothing to escape
+  # here, so nothing to get wrong. `-e` because an expect may start with `-`, which grep
+# otherwise reads as an option — "--security-opt" reported a working guard as MISSED.
+  if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
     printf '  CAUGHT   %s\n' "$label"
   else
     fails=$((fails+1))

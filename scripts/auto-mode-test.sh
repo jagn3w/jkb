@@ -389,24 +389,87 @@ cp "$tmp/good" "$settings"
 # `set --` before sourcing is load-bearing: a sourced script INHERITS the caller's positional
 # parameters, so auto-mode.sh's own dispatch saw $1="yes", hit its `unknown command` arm and exited
 # before defining anything — every case below then failed for a reason that was not the verdict.
-verdict() { bash -c 'a=$1; b=$2; c=$3; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b" "$c"' \
-                   "$tool" "$1" "$2" "$3"; }
+verdict() { bash -c 'a=$1; b=$2; c=$3; d=$4; set --; source "$0" >/dev/null 2>&1; confinement_verdict "$a" "$b" "$c" "$d"' \
+                   "$tool" "$1" "$2" "$3" "$4"; }
 check_that "control ok + canary refused  => CONFINED" \
-    "$([ "$(verdict yes yes yes)" = CONFINED ] && echo yes || echo no)"
+    "$([ "$(verdict yes yes yes yes)" = CONFINED ] && echo yes || echo no)"
 check_that "control ok + canary WROTE    => UNCONFINED" \
-    "$([ "$(verdict yes no yes)" = UNCONFINED ] && echo yes || echo no)"
+    "$([ "$(verdict yes no yes yes)" = UNCONFINED ] && echo yes || echo no)"
 check_that "control failed               => INCONCLUSIVE, never a pass" \
-    "$([ "$(verdict no yes yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+    "$([ "$(verdict no yes yes yes)" = INCONCLUSIVE ] && echo yes || echo no)"
 # A directory (or anything else) at the canary path makes the write fail for a reason that is not
 # the sandbox, and `rm -f` cannot clear it — so an UNCONFINED machine would report CONFINED. The
 # control does not cover it: the control writes somewhere else entirely.
 check_that "canary path occupied      => INCONCLUSIVE, not a counterfeit CONFINED" \
-    "$([ "$(verdict yes yes no)" = INCONCLUSIVE ] && echo yes || echo no)"
+    "$([ "$(verdict yes yes no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
 check_that "canary occupied outranks a canary that appears to have been written" \
-    "$([ "$(verdict yes no no)" = INCONCLUSIVE ] && echo yes || echo no)"
+    "$([ "$(verdict yes no no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+
+# The premise: an absent, read-only or quota-full $HOME refuses the canary exactly as a sandbox
+# would, and the outer control cannot see it because it writes to $PWD — a different filesystem
+# object. Reproduced twice on an unsandboxed machine printing CONFINED, so both live cases are
+# pinned below as well as the pure function.
+check_that "no write landed in \$HOME      => INCONCLUSIVE, not a counterfeit CONFINED" \
+    "$([ "$(verdict yes yes yes no)" = INCONCLUSIVE ] && echo yes || echo no)"
+check_that "the premise outranks a canary that appears to have been written" \
+    "$([ "$(verdict yes no yes no)" = INCONCLUSIVE ] && echo yes || echo no)"
+
+amhome="$tmp/amhome"
+mkdir -p "$amhome/ro" "$amhome/parent"; chmod 555 "$amhome/ro"
+check_that "a read-only \$HOME is INCONCLUSIVE, not CONFINED" \
+    "$(set +e; HOME="$amhome/ro" "$tool" sandboxed >/dev/null 2>&1; [ $? -eq 2 ] && echo yes || echo no)"
+check_that "an absent \$HOME is INCONCLUSIVE, not CONFINED" \
+    "$(set +e; HOME="$amhome/parent/gone" "$tool" sandboxed >/dev/null 2>&1; [ $? -eq 2 ] && echo yes || echo no)"
+chmod 755 "$amhome/ro"
 
 check_that "control failed + canary wrote => INCONCLUSIVE (the control dominates)" \
-    "$([ "$(verdict no no yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+    "$([ "$(verdict no no yes yes)" = INCONCLUSIVE ] && echo yes || echo no)"
+
+# --- 6d. every `retire` entry the POSTURE declares, generated ------------------------------
+# Synthesized cases exercised the mechanism but never the shipped block: `jq 'del(.retire)'` and a
+# typo'd key both left the whole suite green, which would leave the three inert Write(...) rules in
+# every installed settings.json for ever while `check` printed "posture intact" — the exact state
+# the retire half was written to end. Generated from the posture, like the boolean and array halves.
+retire_keys="$(jq -r '(.retire // {}) | keys_unsorted[]' "$posture")"
+check_that "the posture declares at least one retire key to generate from" \
+    "$([ -n "$retire_keys" ] && echo yes || echo no)"
+
+cp "$tmp/good" "$settings"
+retired_checked=0
+while IFS= read -r rk; do
+    [ -n "$rk" ] || continue
+    # The key must name a real array in freshly-installed settings. Asserting against the posture
+    # would not catch a typo, since JQ_RETIRE reads the same typo and would agree with it.
+    if ! jq -e --arg k "$rk" 'getpath($k | split(".")) | type == "array"' "$settings" >/dev/null 2>&1; then
+        bad "retire key .$rk does not name an array in installed settings — it can never remove anything"
+        continue
+    fi
+    while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        # Plant the retired entry plus a neighbour, then require check to name it and install to
+        # remove it while the neighbour survives.
+        jq --arg k "$rk" --argjson m "$member" \
+           'setpath($k | split("."); (getpath($k | split(".")) + [$m, "ZZ-neighbour-sentinel"]))' \
+           "$tmp/good" > "$settings"
+        run_check
+        if [ "$rc" -eq 0 ] || ! grep -qF "$(jq -r . <<<"$member")" <<<"$out"; then
+            bad "a planted retired entry ($rk: $member) was not reported by check"
+            continue
+        fi
+        "$tool" install --force >/dev/null 2>&1 || true
+        if jq -e --arg k "$rk" --argjson m "$member" \
+              '(getpath($k | split(".")) | index($m) | not)
+               and (getpath($k | split(".")) | index("ZZ-neighbour-sentinel") != null)' \
+              "$settings" >/dev/null 2>&1; then
+            retired_checked=$((retired_checked + 1))
+        else
+            bad "install did not remove $rk: $member (or removed its neighbour with it)"
+        fi
+    done <<<"$(jq -c --arg k "$rk" '.retire[$k][]' "$posture")"
+done <<<"$retire_keys"
+check_that "every retire entry the posture declares ($retired_checked) is removed individually" \
+    "$([ "$retired_checked" -gt 0 ] && echo yes || echo no)"
+cp "$tmp/good" "$settings"
 
 # A posture that both requires and retires an entry is unsatisfiable — the merge adds it and then
 # removes it, check reports it permanently missing, and install exits non-zero unable to repair

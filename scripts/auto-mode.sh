@@ -260,6 +260,15 @@ cmd_install() {
 
     # Back up only a file that both existed and is about to change, so neither a re-run nor a
     # fresh machine litters the config dir with backups of nothing.
+    local retiring
+    retiring="$(jq -n --slurpfile want "$posture" --slurpfile got "$settings" "$JQ_RETIRE" \
+                | jq -r '.[] | .path as $p | .retired[] | "\($p): \(.)"' 2>/dev/null)"
+    # Name the deletions. `check` lists each retired entry it finds, but `install` is the surface
+    # that actually REMOVES them from a global settings file, and it was the one saying nothing.
+    if [ -n "$retiring" ]; then
+        printf 'retiring %s withdrawn entr(y|ies) from %s:\n' "$(grep -c . <<<"$retiring")" "$settings"
+        sed 's/^/  /' <<<"$retiring"
+    fi
     mv "$merged" "$settings" 2>/dev/null || die "cannot write $settings (permission denied). The posture denies writes to itself, so installing or repairing it is deliberately a human action — run this from your own terminal, not from inside an agent session."
     echo "posture installed in $settings"
     if [ "$existed" -eq 1 ]; then
@@ -412,18 +421,27 @@ BLIND
 # The control is what separates "denied by the sandbox" from "never ran". Without it an absent
 # canary reads as confinement when the truth may be that nothing executed at all.
 #   canary_clear    the canary PATH was empty before the attempt
+#   home_writable   a write did land INSIDE $HOME, at a path the posture allows
 #
-# The third is not padding. A directory at the canary path makes the write fail for a reason that
-# has nothing to do with the sandbox, `rm -f` cannot remove it, and the control does not cover the
-# case because the control writes somewhere else — so an unconfined machine reports CONFINED. It
-# is the same shape as the control itself: an observation is only interpretable once the thing
-# that could counterfeit it has been excluded.
-confinement_verdict() { # confinement_verdict <control_ok> <canary_blocked> <canary_clear>
-    case "$1:$3:$2" in
-        no:*)        echo INCONCLUSIVE ;;   # the control failed; nothing else means anything
-        yes:no:*)    echo INCONCLUSIVE ;;   # something occupies the canary path
-        yes:yes:yes) echo CONFINED ;;
-        yes:yes:no)  echo UNCONFINED ;;
+# The last two are not padding; each excludes a way the canary could fail while proving nothing.
+# A directory at the canary path makes the write fail for a reason unrelated to the sandbox and
+# `rm -f` cannot clear it. And an absent, read-only or quota-full $HOME refuses the canary just as
+# a sandbox would — reproduced, twice, on an unsandboxed machine reporting CONFINED — because the
+# outer control writes to $PWD, a different filesystem object, so it establishes only that commands
+# run and never that a write to $HOME would otherwise have landed. That premise is what the canary
+# asserts, so it has to be established rather than assumed.
+#
+# The premise is probed with a path INSIDE $HOME that the posture ALLOWS, so the two writes differ
+# by policy alone. Deliberately not by parsing the failure: seatbelt refuses with EPERM, bubblewrap
+# surfaces an unmounted path as ENOENT and a read-only bind as EROFS, and a classifier tuned to one
+# platform is how this tool would start lying on the other.
+confinement_verdict() { # confinement_verdict <control_ok> <canary_blocked> <canary_clear> <home_writable>
+    case "$1:$4:$3:$2" in
+        no:*)            echo INCONCLUSIVE ;;   # the control failed; nothing else means anything
+        yes:no:*)        echo INCONCLUSIVE ;;   # $HOME could not be written even where allowed
+        yes:yes:no:*)    echo INCONCLUSIVE ;;   # something occupies the canary path
+        yes:yes:yes:yes) echo CONFINED ;;
+        yes:yes:yes:no)  echo UNCONFINED ;;
     esac
 }
 
@@ -444,6 +462,22 @@ cmd_sandboxed() {
 
     # NOT dot-prefixed: `~/.jkb-…` shares a prefix with the allowed `~/.jkb`, and a near-miss like
     # that is how a probe comes to lie.
+    # Establish the canary's premise: a write that lands inside $HOME at a path the posture allows.
+    # The probe path is read FROM the posture rather than hardcoded, so this keeps working if the
+    # allowlist changes; if the posture allows nothing under $HOME the premise cannot be
+    # established at all, and that is reported rather than guessed at.
+    local probe_root probe home_writable=no
+    probe_root="$(jq -r --arg h "$HOME/" '.require.sandbox.filesystem.allowWrite[]?
+                   | sub("^~/"; $h) | select(startswith($h))' "$posture" 2>/dev/null | head -1)"
+    if [ -n "$probe_root" ] && [ -d "$HOME" ]; then
+        probe="$probe_root/.auto-mode-premise-$$"
+        # `|| true`: a bare failing command aborts the whole script under `set -e`, and a
+        # read-only $HOME is precisely the case this probe exists to detect — so failing to
+        # create the directory must be an ANSWER here, not an exit.
+        mkdir -p "$probe_root" 2>/dev/null || true
+        if { printf 'x' > "$probe"; } 2>/dev/null; then home_writable=yes; rm -f "$probe"; fi
+    fi
+
     canary="$HOME/auto-mode-canary-$$"
     rm -f "$canary" 2>/dev/null
     # ...and confirm nothing is sitting there, or a refusal to write cannot be attributed.
@@ -451,8 +485,10 @@ cmd_sandboxed() {
     if { printf 'x' > "$canary"; } 2>/dev/null; then canary_blocked=no; rm -f "$canary"
     else canary_blocked=yes; fi
 
-    verdict="$(confinement_verdict "$control_ok" "$canary_blocked" "$canary_clear")"
+    verdict="$(confinement_verdict "$control_ok" "$canary_blocked" "$canary_clear" "$home_writable")"
     printf '  control (write inside an allowWrite root): %s\n' "$control_ok"
+    printf '  premise (write inside $HOME where the posture allows it: %s): %s\n' \
+        "${probe_root:-none declared}" "$home_writable"
     printf '  canary  (write to $HOME, allowed by unix perms, in no allowWrite root): %s\n' \
         "$([ "$canary_blocked" = yes ] && echo refused || echo SUCCEEDED)"
     printf '  CLAUDE_CODE_SANDBOXED: %s   (informational only — see the note above)\n' \
@@ -469,7 +505,12 @@ cmd_sandboxed() {
             return 1 ;;
         *)
             printf '\033[33mINCONCLUSIVE\033[0m — the observation cannot be attributed.\n' >&2
-            if [ "$canary_clear" = no ]; then
+            if [ "$home_writable" = no ]; then
+                echo "No write landed inside \$HOME even where the posture allows one" >&2
+                echo "(${probe_root:-no allowWrite entry is under \$HOME}), so the canary refusing" >&2
+                echo "proves nothing: an absent, read-only or full \$HOME refuses it exactly as a" >&2
+                echo "sandbox would." >&2
+            elif [ "$canary_clear" = no ]; then
                 echo "Something already occupies $canary, so a refusal to write it proves nothing." >&2
                 echo "Remove it and re-run." >&2
             else

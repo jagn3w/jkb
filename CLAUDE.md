@@ -1248,6 +1248,12 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     because a subprocess `claude` has no credentials in an agent session (`loggedIn: false` even
     with the sandbox explicitly overridden off, which is what attributes it to auth and not to the
     posture).
+- **The posture makes Docker unreachable, and that is the right answer.** After installing it,
+  `~/.docker/bin/docker` fails with `Operation not permitted` — the directory is under
+  `denyRead: ["~"]` and in no `allowRead` entry. An unattended agent that can reach Docker can
+  mount `/` into a container and is root on the host, so this is the boundary doing its job; the
+  cost is that `.devcontainer/verify.sh` and `mutate-verify.sh` become **human-run** steps, which
+  is now stated where they are documented rather than discovered when they stop working.
 - **Installing it for real found two things no amount of checking could.** `install` ran clean
   (preflight green, 45 pre-existing allow rules and the theme preserved, `/tmp`, `$TMPDIR` and
   `mktemp` all still working — the three failures of the first attempt, absent), and then:
