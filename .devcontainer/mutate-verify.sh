@@ -9,6 +9,16 @@
 # live in check-config.sh.
 set -uo pipefail
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Without this, a host with no docker on PATH reports every guard as MISSED and exits 1 saying
+# "N guard(s) did not fire" — a security-shaped alarm for what is only a fact about the shell.
+# Docker Desktop installs to ~/.docker/bin, which an interactive profile may export and a plain
+# shell may not, so this is the normal way to meet it rather than an exotic one.
+command -v docker >/dev/null 2>&1 || {
+    echo "=== container guards ==="
+    echo "   (skipped: docker is not on PATH — try: export PATH=\"\$HOME/.docker/bin:\$PATH\")"
+    echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
+    exit 0
+}
 IMAGE="${1:-jkb-dev}"
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
@@ -122,6 +132,23 @@ run "blanket passwordless root is restored" "may run more than the firewall as r
 echo
 echo "=== self-test: an unmutated container must be reported MISSED ==="
 before="$fails"
+# Run the base container directly first: the control below is satisfied by a MISSED, and a
+# container that never started is ALSO a MISSED. Without this, a host with no docker — or a broken
+# image — reported "a healthy container does not trip the matcher" having observed nothing at all.
+control_out="$(docker run --rm --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode \
+                 "${BASE[@]}" "$IMAGE" bash -c '
+      sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
+      . ./.devcontainer/lib.sh && dc_link_state /home/vscode
+      ./scripts/auto-mode.sh install --force >/dev/null 2>&1
+      ./.devcontainer/verify.sh' 2>&1)"
+control_rc=$?
+if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_out"; then
+    printf '\033[31mthe unmutated container does not pass verify.sh (exit %s) — every MISSED above is\n' "$control_rc"
+    printf 'unattributable, because a container that cannot run looks exactly like a guard that did not fire\033[0m\n'
+    sed 's/^/    /' <<<"$control_out" | grep -E "FAIL|failed|not found|Error" | head -5
+    exit 1
+fi
+
 run "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
 if [ "$fails" -gt "$before" ]; then
