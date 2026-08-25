@@ -43,7 +43,7 @@
   // lives at `<repo>/.jkb/work/<session>`, inside the mount but not at `~/repos/<name>`) would
   // start the agent in the MAIN checkout instead, silently, with every guard still passing —
   // keeping those two apart being the entire point of a session. See check-workspace.sh.
-  "initializeCommand": "bash .devcontainer/check-workspace.sh ${localWorkspaceFolder}",
+  "initializeCommand": "bash .devcontainer/check-workspace.sh \"${localWorkspaceFolder}\"",
   "workspaceMount": "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
   "workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}",
   "mounts": [

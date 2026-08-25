@@ -102,10 +102,18 @@ pub struct Report {
     /// Marker files that could not be read. Reported rather than removed: a file we cannot parse
     /// may be a torn write, and deleting it would discard the only record of a live worktree.
     pub unreadable: Vec<PathBuf>,
+    /// Another sweep held the lock, so this one looked at nothing.
+    ///
+    /// Distinct from an empty sweep for the reason every other unestablished answer here is:
+    /// "there was nothing to do" and "I did not look" are different facts, and printing the
+    /// first for the second is what this module keeps being corrected for.
+    pub skipped: bool,
 }
 
 impl Report {
-    /// Whether the sweep did anything at all.
+    /// Whether the sweep did anything at all. A skipped sweep counts as empty: whoever holds the
+    /// lock is doing this sweep's work, and the service must not narrate that race every quarter
+    /// hour. The one-shot caller says so explicitly instead.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.archived.is_empty()
@@ -444,8 +452,9 @@ pub fn dir_size(dir: &Path) -> u64 {
 fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
     let Some(want) = entry.head.as_deref() else {
         return Err(
-            "the record predates instance identity, so the tree cannot be shown to be \
-                    the one it describes"
+            "no HEAD was recorded for it — an older record, or a checkout whose HEAD did not \
+                    resolve when it was written — so it cannot be shown to be the tree the record \
+                    describes"
                 .to_owned(),
         );
     };
@@ -495,7 +504,10 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
     // act on it. A sweep that finds the lock held reports nothing and returns — the other process
     // is doing this one's work, which is not a failure.
     let Some(_lock) = SweepLock::acquire(db)? else {
-        return Ok(Report::default());
+        return Ok(Report {
+            skipped: true,
+            ..Report::default()
+        });
     };
     let now = now_secs();
     let store = entries(db)?;
@@ -850,6 +862,66 @@ mod tests {
         assert_eq!(left.len(), 1, "one record, not the original plus an update");
         assert_eq!(left[0].0, marker, "and it is the file the sweep read");
         assert!(left[0].1.archive.is_some(), "carrying where the tree went");
+    }
+
+    #[test]
+    fn a_deferred_disposal_records_the_head_the_worktree_is_actually_on() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, _) = session(&repo, "sess");
+
+        // Force `stow` to fail without needing a sandbox: a regular file where the archive
+        // directory must be created. Nothing moves, which is the deferred arm's whole premise.
+        fs::write(repo.join(".jkb/archive"), b"in the way").expect("write");
+
+        // The caller moves the branch before disposing — `land` resets it to what actually
+        // landed. The record must name the commit the tree is on AFTERWARDS: recorded before,
+        // the reaper finds a tree that is not on the commit the record names, concludes it is a
+        // different session reusing the name, and holds it for ever.
+        fs::write(wt.join("more.txt"), "landed").expect("write");
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "what landed"]);
+        let after = git(&wt, &["rev-parse", "HEAD"]);
+
+        let out = dispose(&db, &repo, &wt, &branch, "task:t", true).expect("dispose");
+        assert!(
+            matches!(out, Disposed::Deferred(_)),
+            "nothing could be moved"
+        );
+        assert!(wt.exists(), "and nothing was");
+
+        let records = entries(&db).expect("entries").records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].1.head.as_deref(),
+            Some(after.as_str()),
+            "the record names the commit the tree is on now"
+        );
+
+        // ...which is what lets the reaper act on it once the obstruction is gone.
+        fs::remove_file(repo.join(".jkb/archive")).expect("rm");
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(r.archived.len(), 1, "held for no reason: {:?}", r.held);
+    }
+
+    #[test]
+    fn a_sweep_that_could_not_take_the_lock_says_so_rather_than_reporting_nothing_to_do() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        // A live holder: this process. `acquire` respects a lock whose holder is not proven gone.
+        fs::create_dir_all(store_dir(&db)).expect("mk");
+        fs::write(
+            store_dir(&db).join(".sweep.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("write");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(
+            r.skipped,
+            "it did not look, and that is not the same as finding nothing"
+        );
     }
 
     #[test]

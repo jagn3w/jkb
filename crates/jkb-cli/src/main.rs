@@ -6257,7 +6257,9 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
     for path in &r.unreadable {
         println!("unreadable record {} (left alone)", path.display());
     }
-    if r.is_empty() && r.retained == 0 {
+    if r.skipped {
+        println!("another sweep is already running here; this one looked at nothing");
+    } else if r.is_empty() && r.retained == 0 {
         println!("nothing to reap");
     } else if r.retained > 0 {
         // The size, because the alternative signal is a full disk: a session worktree carries the
@@ -6308,6 +6310,24 @@ fn dispose_session(
         // what actually landed; the worktree is verified clean just above, so nothing is lost.
         gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
     } else {
+        // THE RESET COMES FIRST, and the ordering is load-bearing rather than tidy. `graft`
+        // rebased a detached HEAD, so the branch still points at its pre-rebase commits — left
+        // there, a session this cannot archive reads as N commits ahead of a target that already
+        // contains its work. Moving it is cosmetic; doing it AFTER `dispose` is not, because
+        // `dispose` records the worktree's HEAD as the record's instance identity and the reset
+        // changes exactly that. The reaper would then find a tree that is not on the commit the
+        // record names, correctly conclude it is a different session reusing the name, and hold
+        // it for ever — defeating the whole deferred path with a message that reads as a guard
+        // working. Reset first and `dispose` records whatever HEAD actually is, in either arm.
+        //
+        // Best-effort: the worktree is verified clean above, so nothing is lost either way, and a
+        // landing must not be undone by a cosmetic ref move.
+        if let Err(reset) = gitrepo::reset_hard(&sess.worktree, landed.grafted) {
+            eprintln!(
+                "note: could not point {} at what landed: {reset}",
+                landed.branch
+            );
+        }
         // The one disposal both `land` and `abandon` call — see `archive::dispose` for why that
         // matters. A landing's branch is a duplicate of commits now in the target, so it goes.
         match archive::dispose(
@@ -6319,18 +6339,7 @@ fn dispose_session(
             true,
         )? {
             archive::Disposed::Archived(dest) => disposal = Disposal::Archived(dest),
-            archive::Disposed::Deferred(why) => {
-                // The branch still points at its pre-rebase commits, which reads as "ahead of a
-                // target that already has this work". Cosmetic, and it lasts only until the
-                // reaper deletes the branch — so a failure here is reported and undoes nothing.
-                if let Err(reset) = gitrepo::reset_hard(&sess.worktree, landed.grafted) {
-                    eprintln!(
-                        "note: could not point {} at what landed: {reset}",
-                        landed.branch
-                    );
-                }
-                disposal = Disposal::Deferred(why);
-            }
+            archive::Disposed::Deferred(why) => disposal = Disposal::Deferred(why),
         }
     }
 

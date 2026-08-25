@@ -202,22 +202,25 @@ fn two_sessions_are_worked_in_parallel_and_land_in_sequence() {
     // above while destroying the files — so the files themselves are what is asserted, not just
     // that a directory appeared.
     let archive = f.repo.join(".jkb/archive");
-    let mut recovered: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&archive).expect("an archive directory exists") {
-        let dir = entry.expect("readable").path();
-        for want in ["a.txt", "b.txt"] {
-            if dir.join(want).exists() {
-                recovered.push(want.to_owned());
-            }
-        }
-    }
-    recovered.sort();
+    let archived: Vec<PathBuf> = std::fs::read_dir(&archive)
+        .expect("an archive directory exists")
+        .map(|e| e.expect("readable").path())
+        .collect();
     assert_eq!(
-        recovered,
-        vec!["a.txt".to_owned(), "b.txt".to_owned()],
-        "both landed sessions are recoverable from {}",
-        archive.display()
+        archived.len(),
+        2,
+        "one archive per landed session: {archived:?}"
     );
+    // Asked as "is this file recoverable from SOME archive", not counted: each session is
+    // archived at what it landed, so the second — cut from the batch after the first landed —
+    // legitimately carries both files.
+    for want in ["a.txt", "b.txt"] {
+        assert!(
+            archived.iter().any(|d| d.join(want).exists()),
+            "{want} is recoverable from {}",
+            archive.display()
+        );
+    }
 }
 
 /// A local trunk ahead of its remote is the ordinary case. Cutting the batch from
