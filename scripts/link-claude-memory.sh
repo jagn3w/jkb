@@ -76,7 +76,11 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-note() { printf '  %s\n' "$*"; }
+# Progress goes to STDERR. `link_one`'s stdout is its state word and nothing else: `run` captures
+# it, and with the notes mixed in the state never equalled `linked`, so every clean run exited 1
+# with its own report eaten — including the "migrated N file(s)" line, the only word a user gets
+# that their memory was moved.
+note() { printf '  %s\n' "$*" >&2; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 
 
@@ -150,6 +154,17 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
             echo collision
             return 0
         fi
+        # The store must hold plain files, and THIS is the path that fills it — checking only
+        # what is already there left the one route that can plant a redirecting symlink
+        # unguarded. Checked in the same all-or-nothing pass as the collisions.
+        for entry in "$link"/*; do
+            if [ -L "$entry" ] || { [ ! -f "$entry" ] && [ ! -d "$entry" ]; }; then
+                shopt -u dotglob nullglob
+                warn "$key: $(basename "$entry") is not a plain file — nothing moved, nothing linked"
+                echo unsafe
+                return 0
+            fi
+        done
         for entry in "$link"/*; do
             base="$(basename "$entry")"
             if mv "$entry" "$dest/$base" 2>/dev/null; then
@@ -206,12 +221,15 @@ status_of() { # status_of <home> <store> <repo-path>
     slug="$(slugify "$path")"
     link="$h/.claude/projects/$slug/memory"
     dest="$s/$key"
+    # THE STORE FIRST, in the same order `link_one` asks — this used to test the link first, so a
+    # linked repo whose store had been poisoned reported `linked`, and `verify.sh` consults this
+    # one. Two orderings of one rule is two rules.
+    if [ -L "$dest" ] || [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+        echo unsafe; return 0
+    fi
     if [ -L "$link" ]; then
         [ "$(readlink "$link")" = "$dest" ] && { echo linked; return 0; }
         echo foreign; return 0
-    fi
-    if [ -L "$dest" ] || [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
-        echo unsafe; return 0
     fi
     if [ -d "$link" ]; then
         local entry
@@ -270,6 +288,12 @@ if [ "$self_test" -eq 1 ]; then
         "$([ -L "$t/.claude/projects/$(slugify "$t/repos/other")/memory" ] && echo yes || echo no)"
     check "--status agrees with what was done" \
         "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = linked ] && echo yes || echo no)"
+    # The other half of run()'s contract, and the half that was missing: a clean run must SUCCEED.
+    # `note` used to write to stdout, which `run` captures, so the state never equalled `linked`
+    # and every clean run exited 1 — the "needs attention" assertion below passed unconditionally
+    # and could not have failed.
+    check "a clean run succeeds" \
+        "$(run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1 && echo yes || echo no)"
 
     # Idempotent: the verb runs on every container create and on every host re-run.
     run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
@@ -301,6 +325,26 @@ if [ "$self_test" -eq 1 ]; then
         "$([ ! -L "$link" ] && echo yes || echo no)"
     check "and says so" \
         "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
+
+    # The MIGRATION is the path that fills the store, so it must apply the same purity rule as
+    # the store check — otherwise the one route that can plant a redirecting symlink is unguarded.
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"; mkdir -p "$link"
+    ln -s "$t/elsewhere/leak" "$link/one.md"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a symlink is not migrated into the store" \
+        "$([ ! -e "$t/.jkb/claude-memory/jkb/one.md" ] && echo yes || echo no)"
+    check "and the local copy is left exactly as it was" \
+        "$([ -L "$link/one.md" ] && echo yes || echo no)"
+
+    # A poisoned store must not read as healthy just because the link happens to exist —
+    # `verify.sh` consults `status_of`, so the two must ask in the same order.
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"
+    mkdir -p "$t/.jkb/claude-memory/jkb" "$(dirname "$link")"
+    ln -s "$t/.jkb/claude-memory/jkb" "$link"
+    ln -s "$t/elsewhere/leak" "$t/.jkb/claude-memory/jkb/one.md"
+    check "a linked repo with a poisoned store reports unsafe, not linked" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
+    rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"
 
     # A symlink somebody else made is reported, never retargeted.
     rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"

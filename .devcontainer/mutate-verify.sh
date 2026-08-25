@@ -156,7 +156,7 @@ run "runs as root" "runs as a non-root user" \
 # docker.sock-shaped mount two cases above — so the refusal is watched here rather than argued for
 # in a comment. No extra `-v` is needed: what is under test is that verify.sh refuses to ACCEPT
 # the name, which it must do whether or not something is mounted there.
-run "a --declare outside every declared target" "is not inside any mount" \
+run "a --declare outside every declared target" "is not inside any host BIND" \
     -e JKB_VERIFY_DECLARE=/host "${HEALTHY[@]}"
 
 # Auto-memory sharing is a README promise whose entire mechanism is one symlink, which is exactly

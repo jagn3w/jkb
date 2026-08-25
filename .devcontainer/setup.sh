@@ -27,9 +27,13 @@ dc_link_state /home/vscode
 # host's `/Users/.../repos/jkb` and the two sides would never see each other's. The shared store is
 # `~/.jkb/claude-memory/<repo>/` — inside the bind mount that already exists, so no mount is added
 # and the `~/.claude` prohibition is untouched. See the script's header for why the obvious bind is
-# refused. Not fatal: memory that is not shared is a lesser container, not a broken one.
+# refused. A repo the linker DECLINES to link — a name that exists on both sides, a store holding
+# something that is not a plain file — is a state it recognises and reports, and `verify.sh` passes
+# on those: they want a person, not a rebuild. What is not tolerated is the linker failing to run
+# at all, which `verify.sh` fails on, so this must not hide a non-zero exit behind a comment
+# claiming the opposite. It reports and continues; verify.sh decides.
 say "shared claude memory"
-"$repo/scripts/link-claude-memory.sh" || true
+"$repo/scripts/link-claude-memory.sh" || echo "  (some repos need attention — see above)" >&2
 
 say "auto-mode posture"
 # The same posture file the host uses. It ends by running `check`, so a merge that did not take

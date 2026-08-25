@@ -132,6 +132,26 @@ open(p, 'w').write(s.replace('"initializeCommand"', '"initializeCommandTypo"', 1
 PYX
 run "the workspace-folder preflight is dropped" "no initializeCommand running check-workspace.sh"
 
+# The harm the rule is really about: a literal path is INSIDE the mount target and still opens
+# whichever checkout sits there. "Inside the target" alone let this through.
+seed; sub_dc '"workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}"' \
+             '"workspaceFolder": "/home/vscode/repos/jkb"'
+run "workspaceFolder becomes a literal path again" "is a literal path, not derived"
+
+# ...and the parse the two checks above stand on. The object form is legal and interchangeable,
+# and a `target=` regex that understood only the string form failed OPEN on it.
+seed; jq_dc '.workspaceMount = {"source": "${localEnv:HOME}/repos", "target": "/home/vscode/repos", "type": "bind"} | .workspaceFolder = "/somewhere/else"'
+run "workspaceMount is written in its object form" "is not inside the workspaceMount target"
+
+# A mutation harness whose expectation no longer matches its subject reports MISSED for ever.
+# mutate-verify.sh needs Docker so this gate cannot run it; the strings are checkable statically.
+seed; python3 - "$work/t/.devcontainer/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"is not inside any host BIND"', '"a string verify.sh never prints"', 1))
+PYX
+run "a mutate-verify expectation goes stale" "expects text verify.sh never prints"
+
 seed; jq_dc '.mounts += ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"]'
 run "the docker socket is mounted in" "docker socket is root on the host"
 
@@ -235,7 +255,7 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=24
+PINNED_BAD_SITES=27
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

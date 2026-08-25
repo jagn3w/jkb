@@ -236,16 +236,28 @@ case "$mem_state" in
         ok "auto-memory is not shared for $(basename "$mem_repo") ($mem_state) — run scripts/link-claude-memory.sh to see what it wants"
         ;;
     unlinked|"")
-        bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — memory written in here would be invisible on the host" ;;
+        # FATAL, and setup.sh's comment now says the same. `unlinked` is not the linker declining
+        # — a collision and a poisoned store have their own words above and pass — it means the
+        # linker did not run or could not answer, and the README promises this works. The two
+        # files used to state opposite rules about the same state.
+        bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — the linker did not run or could not answer; memory written in here would be invisible on the host" ;;
     *)
         bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
 esac
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.
-# Derived from where this script lives, not spelled. `workspaceFolder` follows the folder you
-# opened now that ~/repos is mounted whole, so a hard-coded /home/vscode/repos/jkb would assert
-# something about a DIFFERENT checkout than the one being verified — and pass while doing it.
-assert "workspace is mounted ($mem_repo)" "$([ -f "$mem_repo/Cargo.toml" ] && echo yes || echo no)"
+# THE MOUNT, asked of the kernel. A hard-coded /home/vscode/repos/jkb asserted something about a
+# different checkout once ~/repos is mounted whole; deriving it from where this script lives went
+# too far the other way and asserted that the directory containing the running script contains a
+# Cargo.toml — true by construction on every path that can execute this, so the property was
+# asserted nowhere. What must hold is that the declared workspace target is really a mount point
+# and this checkout is inside it.
+ws_target="$(dc_mount_targets "$DC" | grep -x '/home/vscode/repos' || true)"
+ws_mounted=no
+if [ -n "$ws_target" ] && printf '%s\n' "$actual" | grep -qx "$ws_target"; then
+    case "$mem_repo" in "$ws_target"/?*) ws_mounted=yes ;; *) ;; esac
+fi
+assert "the workspace bind is mounted and $mem_repo is inside it" "$ws_mounted"
 assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || echo no)"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a

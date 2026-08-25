@@ -117,13 +117,32 @@ fi
 # there — for a `jkb task work` session, the main checkout instead of the session — and every
 # runtime guard still passes, because the wrong repo is a perfectly good repo. The `initializeCommand`
 # is what makes the derived form safe, so its absence is a failure of this rule, not a separate one.
-ws_target="$(jq -r '.workspaceMount // ""' <<<"$dc" | sed -n 's/.*target=\([^,]*\).*/\1/p')"
+# Parsed through jq, handling BOTH the string and object forms of `workspaceMount` — the spec
+# allows either and they are interchangeable at any time. A `target=` regex understood only the
+# string form, and when it yielded nothing the case below degenerated to "does it start with a
+# slash", which every plausible value passes: a guard that fails open on a purely cosmetic edit.
+ws_target="$(jq -r 'if (.workspaceMount // "") | type == "string"
+                    then ((.workspaceMount // "") | capture("target=(?<t>[^,]+)").t)
+                    else (.workspaceMount.target // "") end' <<<"$dc" 2>/dev/null)"
 ws_folder="$(jq -r '.workspaceFolder // ""' <<<"$dc")"
 ws_ok=1
+if [ -z "$ws_target" ] || [ -z "$ws_folder" ]; then
+    bad "could not read workspaceMount's target and workspaceFolder from devcontainer.json — the checks below cannot mean anything"
+    ws_ok=0
+else
 case "$ws_folder" in
     "$ws_target"/?*) ;;
     *) bad "workspaceFolder ($ws_folder) is not inside the workspaceMount target ($ws_target) — the container would open a directory the mount does not place there"; ws_ok=0 ;;
 esac
+# ...and DERIVED, which is the property that actually matters. Inside the target is not enough:
+# a literal `/home/vscode/repos/jkb` is inside it and is exactly the harm the comment above
+# names — it opens whichever checkout sits there, so a session worktree starts the agent in the
+# main one. The folder has to follow the folder that was opened.
+case "$ws_folder" in
+    *'${localWorkspaceFolderBasename}'*) ;;
+    *) bad "workspaceFolder ($ws_folder) is a literal path, not derived from \${localWorkspaceFolderBasename} — it would open whichever checkout happens to sit there rather than the one you opened"; ws_ok=0 ;;
+esac
+fi
 if ! grep -qF 'check-workspace.sh' <<<"$(jq -r '.initializeCommand // ""' <<<"$dc")"; then
     bad "devcontainer.json has no initializeCommand running check-workspace.sh — a folder that is not \$HOME/repos/<name> would open a DIFFERENT checkout than the one you clicked, silently"
     ws_ok=0
@@ -254,6 +273,22 @@ for caller in "$here/setup.sh" "$here/devcontainer.json"; do
     fi
 done
 [ "$callers_ok" -eq 1 ] && ok "no caller passes an argument to the firewall"
+
+# EVERY EXPECT STRING mutate-verify.sh greps for must be one verify.sh can actually print.
+# That harness needs Docker, so it does not run in this gate — and a stale expect there is a
+# mutation that reports MISSED for ever, which is a guard nobody has seen fire dressed as a guard.
+# It went stale the moment a refusal was reworded, and nothing said so. Checked here, statically,
+# because the strings are just text in two files.
+stale_expects=()
+while IFS= read -r want; do
+    [ -n "$want" ] || continue
+    grep -qF -e "$want" "$here/verify.sh" || stale_expects+=("$want")
+done < <(sed -n 's/^run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
+if [ ${#stale_expects[@]} -eq 0 ]; then
+    ok "every mutate-verify expectation is a string verify.sh prints ($(sed -n 's/^run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh" | grep -c .) checked)"
+else
+    bad "mutate-verify.sh expects text verify.sh never prints: ${stale_expects[*]} — those mutations can only ever report MISSED"
+fi
 
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi

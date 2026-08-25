@@ -5193,7 +5193,7 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
 /// list what is in flight, or configure the gate that guards a landing.
 fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Work { uid, onto } => cmd_task_work(db, &uid, onto.as_deref(), json),
+        TaskCmd::Work { uid, onto } => cmd_task_work(db, db_path, &uid, onto.as_deref(), json),
         TaskCmd::Land {
             uid,
             gate,
@@ -5238,7 +5238,7 @@ enum TagMode {
 ///
 /// Idempotent by construction: the task's own `branch=` tag names its session, so a second
 /// invocation hands back the same worktree instead of forking the work onto a second branch.
-fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<()> {
+fn cmd_task_work(db: &Db, db_path: &Path, uid: &str, onto: Option<&str>, json: bool) -> Result<()> {
     let ctx = repo::repo_ctx()?;
     let cwd = std::env::current_dir()?;
     let id = resolve_task_uid(db, uid)?;
@@ -5310,6 +5310,25 @@ fn cmd_task_work(db: &Db, uid: &str, onto: Option<&str>, json: bool) -> Result<(
     let resumed = sessions.iter().any(|s| s.branch == branch);
     if !resumed {
         open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?;
+    }
+
+    // THIS SESSION IS ALIVE, so cancel any pending removal of it. `jkb task abandon` from inside
+    // a session cannot dispose of its own worktree, so it defers and reopens the task — and
+    // without this the operator returning to that task gets the same directory handed back with
+    // a reaper still holding a record for it. The sweep then either archives the checkout they
+    // are sitting in and force-deletes its branch, or, once they commit, refuses for ever on the
+    // grounds that it is a different session reusing the name. A record has to be cancellable by
+    // the thing that makes it wrong, not only by something destructive happening.
+    //
+    // Unconditional, not gated on `resumed`: a fresh session at a path some older record names
+    // is the same hazard, and cancelling a record for a worktree that is being handed out right
+    // now is correct in both cases.
+    match archive::revoke(db_path, &worktree) {
+        Ok(true) => println!("cancelled the pending removal of {}", worktree.display()),
+        Ok(false) => {}
+        // Reported, never fatal: the session is open and usable, and the worst case is a sweep
+        // that holds on it and says so.
+        Err(e) => eprintln!("note: could not cancel the pending removal of this session: {e:#}"),
     }
 
     // Record where the work is happening, exactly as `task start` does (D34.1), plus the
@@ -6223,8 +6242,9 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
                     .collect::<Vec<_>>(),
                 "deleted": r.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "cleared": r.cleared,
-                "retained": r.retained,
-                "retained_bytes": r.retained_bytes,
+                "skipped": r.skipped,
+                "retained": r.retained.len(),
+                "retained_bytes": r.retained.iter().map(|p| archive::dir_size(p)).sum::<u64>(),
                 "unreadable": r.unreadable.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })
         );
@@ -6259,16 +6279,16 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
     }
     if r.skipped {
         println!("another sweep is already running here; this one looked at nothing");
-    } else if r.is_empty() && r.retained == 0 {
+    } else if r.is_empty() && r.retained.is_empty() {
         println!("nothing to reap");
-    } else if r.retained > 0 {
+    } else if !r.retained.is_empty() {
         // The size, because the alternative signal is a full disk: a session worktree carries the
         // repo's build output, which on a Rust repo is gigabytes, and it is kept for the whole
         // retention window. `--retain-days` is the knob if that matters more than the safety net.
         println!(
             "{} archive(s) still inside the retention window ({})",
-            r.retained,
-            human_bytes(r.retained_bytes)
+            r.retained.len(),
+            human_bytes(r.retained.iter().map(|p| archive::dir_size(p)).sum())
         );
     }
 }
@@ -6336,7 +6356,12 @@ fn dispose_session(
             &sess.worktree,
             landed.branch,
             landed.uid,
-            true,
+            archive::Plan {
+                // A landing's branch is a duplicate of commits now in the target.
+                delete_branch: true,
+                // Verified clean a few lines above, and nothing has run since.
+                accept_dirty: false,
+            },
         )? {
             archive::Disposed::Archived(dest) => disposal = Disposal::Archived(dest),
             archive::Disposed::Deferred(why) => disposal = Disposal::Deferred(why),
@@ -6503,40 +6528,27 @@ fn cmd_task_abandon(
         }
     }
 
-    let mut deferred: Option<String> = None;
-    if let Some(sess) = &sess {
-        if !force {
-            anyhow::ensure!(
-                !gitrepo::is_dirty(&sess.worktree)?,
-                "{} has uncommitted changes — commit them, or pass --force to discard them",
-                sess.worktree.display()
-            );
-        }
-        // ARCHIVED, not removed — the same rule `land` follows, through the same function.
-        // `git worktree remove` unlinks the tree and stops at the first refusal, so run from
-        // inside a sandboxed session this verb gutted the checkout it was asked to drop. It is
-        // also the verb an operator naturally reaches for to clear the directory a deferred
-        // landing leaves behind, which made it the likeliest route to that state.
-        //
-        // The branch is deleted only below, and only when asked: an abandoned branch holds the
-        // only copy of real work, which is why `--force` here discards a dirty tree but never
-        // the commits.
-        if let archive::Disposed::Deferred(why) =
-            archive::dispose(db_path, &ctx.root, &sess.worktree, &branch, uid, false)?
-        {
-            deferred = Some(why);
-        }
-    }
+    let deferred = abandon_session(
+        db_path,
+        &ctx,
+        sess.as_ref(),
+        &branch,
+        uid,
+        delete_branch,
+        force,
+    )?;
     // Deleting the branch leaves the history alone, and that is correct: an entry says what
     // happened at a moment, and a branch deleted afterwards does not make it untrue. Nothing is
     // keyed by the name, so the next `jkb task work` cutting a **new** branch under the same
     // name cannot inherit anything from the old one — which is what the cut point this used to
     // have to forget was for.
-    let mut branch_deleted = false;
     if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
-        branch_deleted = true;
     }
+    // Read from git rather than from what this function did: `dispose` deletes the branch itself
+    // when it archived the tree, so a flag set here would report `false` for a branch that is
+    // gone. Asked once, after everything that could have removed it.
+    let branch_deleted = delete_branch && !gitrepo::has_branch(&ctx.root, &branch)?;
     // Release, and reopen unless the task is already finished.
     //
     // The land target is cleared **only** when the task is reopened, which is exactly when it
@@ -6627,6 +6639,61 @@ fn cmd_task_abandon(
         },
         json,
     )
+}
+
+/// Dispose of an abandoned session, if there is one, and say why not when it could not be moved.
+///
+/// Split out so `cmd_task_abandon` stays readable; the decision itself is the caller's and is
+/// recorded in the [`archive::Plan`], which is what the sweep applies later.
+fn abandon_session(
+    db_path: &Path,
+    ctx: &repo::RepoCtx,
+    sess: Option<&session::Session>,
+    branch: &str,
+    uid: &str,
+    delete_branch: bool,
+    force: bool,
+) -> Result<Option<String>> {
+    let Some(sess) = sess else { return Ok(None) };
+    {
+        if !force {
+            anyhow::ensure!(
+                !gitrepo::is_dirty(&sess.worktree)?,
+                "{} has uncommitted changes — commit them, or pass --force to discard them",
+                sess.worktree.display()
+            );
+        }
+        // ARCHIVED, not removed — the same rule `land` follows, through the same function.
+        // `git worktree remove` unlinks the tree and stops at the first refusal, so run from
+        // inside a sandboxed session this verb gutted the checkout it was asked to drop. It is
+        // also the verb an operator naturally reaches for to clear the directory a deferred
+        // landing leaves behind, which made it the likeliest route to that state.
+        //
+        // The branch is deleted only below, and only when asked: an abandoned branch holds the
+        // only copy of real work, which is why `--force` here discards a dirty tree but never
+        // the commits.
+        if let archive::Disposed::Deferred(why) = archive::dispose(
+            db_path,
+            &ctx.root,
+            &sess.worktree,
+            branch,
+            uid,
+            archive::Plan {
+                // THE OPERATOR'S decision, recorded so the sweep applies it rather than
+                // land's. An abandoned branch holds the only copy of real work, and the
+                // reaper used to force-delete it a quarter of an hour after this verb had
+                // printed "branch kept".
+                delete_branch,
+                // `--force` means exactly "I accept what is uncommitted in there".
+                // Unrecorded, the sweep's own dirty check held the record for ever over the
+                // question the operator had already answered.
+                accept_dirty: force,
+            },
+        )? {
+            return Ok(Some(why));
+        }
+    }
+    Ok(None)
 }
 
 /// What `abandon` actually did, so the report is built from outcomes rather than from the flags

@@ -41,6 +41,29 @@ pub const RETAIN_DAYS: u64 = 30;
 
 const SECS_PER_DAY: u64 = 86_400;
 
+/// What the verb that ended a session decided to do with it.
+///
+/// THE RECORD CARRIES THE DECISION THAT PRODUCED IT. Without this the sweep applied `land`'s
+/// defaults to every record, and `jkb task abandon` — which keeps the branch, because an
+/// abandoned branch holds the only copy of real work — printed "branch kept" and then had that
+/// branch force-deleted by the reaper a quarter of an hour later. The same for `--force`, whose
+/// whole meaning is "I accept the uncommitted work in there": unrecorded, the sweep's own dirty
+/// check held the record for ever instead.
+///
+/// Both default to the safe answer on a record written before they existed: keep the branch, and
+/// do not touch a dirty tree.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct Plan {
+    /// Delete the branch once the tree is out of the way — now if the disposal archives it, or
+    /// later when the sweep does.
+    #[serde(default)]
+    pub delete_branch: bool,
+    /// The operator has already accepted whatever is uncommitted in the tree, so the sweep's
+    /// dirty check must not re-litigate a decision a person took.
+    #[serde(default)]
+    pub accept_dirty: bool,
+}
+
 /// One worktree the system owes an archive, and then a deletion.
 ///
 /// The same record covers both halves of the life cycle, so there is no second index to keep in
@@ -56,6 +79,9 @@ pub struct Entry {
     pub branch: String,
     /// The task this session was for — reported, never re-read as authority.
     pub uid: String,
+    /// What the verb decided. See [`Plan`].
+    #[serde(default, flatten)]
+    pub plan: Plan,
     /// When the landing recorded this, in seconds since the Unix epoch.
     pub recorded_at: u64,
     /// The commit the worktree was on when the record was written.
@@ -89,16 +115,17 @@ pub struct Report {
     /// Records dropped because there was nothing left to act on.
     pub cleared: Vec<String>,
     /// Archives still inside the retention window.
-    pub retained: usize,
-    /// What those archives occupy, in bytes.
     ///
-    /// Reported because the alternative signal is a full disk. A session worktree carries the
-    /// repo's build output — on this repo, gigabytes — and archiving keeps it for the retention
-    /// window. Deliberately REPORTED rather than pruned: `git clean -X` would delete exactly the
-    /// regenerable files and would also delete a gitignored `.env`, and this whole mechanism
-    /// exists because a delete that was not asked for is the failure being designed against.
-    /// Shorten the window with `--retain-days` if the size is what matters more.
-    pub retained_bytes: u64,
+    /// The PATHS, not a byte count: the count is only ever printed, and computing it in the sweep
+    /// meant a full stat-walk of every archive every fifteen minutes for a number the watch loop
+    /// then discarded unprinted. Whoever prints it walks it (`archive::dir_size`).
+    ///
+    /// Size is reported at all because the alternative signal is a full disk — a session worktree
+    /// carries the repo's build output, gigabytes on this repo, kept for the retention window.
+    /// Deliberately reported rather than pruned: `git clean -X` deletes exactly the regenerable
+    /// files and also deletes a gitignored `.env`, and unrequested deletion is the failure this
+    /// whole mechanism is designed against. Shorten `--retain-days` if size matters more.
+    pub retained: Vec<PathBuf>,
     /// Marker files that could not be read. Reported rather than removed: a file we cannot parse
     /// may be a torn write, and deleting it would discard the only record of a live worktree.
     pub unreadable: Vec<PathBuf>,
@@ -208,6 +235,35 @@ pub struct Store {
     pub unreadable: Vec<PathBuf>,
 }
 
+/// Cancel the pending removal of `worktree`, if one is recorded.
+///
+/// A RECORD IS A PROMISE WITH A CANCEL. Without this the only way a record ended was something
+/// destructive happening, and a session legitimately brought back to life still had one: `jkb
+/// task abandon` from inside a session defers, the task reopens, `jkb task work` hands the same
+/// directory back — and the sweep then either archives the checkout the operator is sitting in
+/// and force-deletes its branch, or, once they commit, holds it for ever insisting it is a
+/// different session reusing the name. Neither is recoverable by anything the operator is told.
+///
+/// Only a record that has not been archived yet can be cancelled: once the tree has been moved
+/// the record is what says where it went, and the retention sweep owns it.
+///
+/// # Errors
+/// Returns an error if the store cannot be read or the record cannot be removed.
+pub fn revoke(db: &Path, worktree: &Path) -> Result<bool> {
+    let path = marker_path(db, worktree);
+    match fs::read(&path) {
+        Ok(body) => {
+            if serde_json::from_slice::<Entry>(&body).is_ok_and(|e| e.archive.is_some()) {
+                return Ok(false);
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    Ok(true)
+}
+
 /// Every record currently in the store, with the marker file each came from.
 ///
 /// # Errors
@@ -295,7 +351,7 @@ pub fn dispose(
     worktree: &Path,
     branch: &str,
     uid: &str,
-    delete_branch: bool,
+    plan: Plan,
 ) -> Result<Disposed> {
     let head = gitrepo::rev(worktree, "HEAD")
         .with_context(|| format!("reading HEAD in {}", worktree.display()))?;
@@ -305,6 +361,7 @@ pub fn dispose(
         branch: branch.to_owned(),
         uid: uid.to_owned(),
         recorded_at: now_secs(),
+        plan,
         head,
         archive: None,
         archived_at: None,
@@ -325,7 +382,7 @@ pub fn dispose(
                 );
             }
             let _ = gitrepo::prune_worktrees(repo_root);
-            if delete_branch {
+            if plan.delete_branch {
                 if let Err(e) = gitrepo::delete_branch(repo_root, branch, true) {
                     eprintln!("note: could not delete {branch}: {e}");
                 }
@@ -394,22 +451,31 @@ impl SweepLock {
             {
                 Ok(mut f) => {
                     use std::io::Write;
-                    let _ = write!(f, "{}", std::process::id());
+                    let _ = write!(f, "{}", crate::owner::self_owner());
                     return Ok(Some(Self { path }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     let holder = fs::read_to_string(&path).unwrap_or_default();
-                    let dead = holder
-                        .trim()
-                        .parse::<u32>()
-                        .map_or(jkb_fsm::Fact::Unknown, crate::owner::pid_alive)
-                        .is_no();
+                    // `host:pid`, judged by `owner::is_alive`, which answers `Fact`. A BARE pid
+                    // was wrong here in a way it is not for `LandLock`: this store is shared
+                    // across the host/container bind on purpose, and pid 812 in the container is
+                    // a different process from pid 812 on the host — so the lock excluded nothing
+                    // at exactly the boundary where two sweepers meet, and could declare a live
+                    // one dead. An owner on another host is `Unknown`, and unknown respects.
+                    let dead = crate::owner::is_alive(holder.trim()).is_no();
                     if !dead {
                         // Not an error: the other sweep is doing this sweep's work. A service
                         // tick that says "someone else is on it" must not read as a failure.
                         return Ok(None);
                     }
-                    let _ = fs::remove_file(&path);
+                    // RE-READ BEFORE UNLINKING, which is the half of `LandLock`'s shape this
+                    // dropped: two sweeps that both judge one stale lock would otherwise both
+                    // remove it, and the second's remove would take the first's fresh lock with
+                    // it. Removing only while the content is still what was judged makes that a
+                    // race one of them loses instead of one they both win.
+                    if fs::read_to_string(&path).unwrap_or_default() == holder {
+                        let _ = fs::remove_file(&path);
+                    }
                 }
                 Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
             }
@@ -483,9 +549,18 @@ fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
         Ok(None) => return Err("its HEAD does not resolve".to_owned()),
         Err(e) => return Err(format!("git could not read its HEAD: {e}")),
     }
+    if entry.plan.accept_dirty {
+        // The operator passed `--force`: they have already decided about whatever is in there,
+        // and asking again would hold this record for ever over the very thing they answered.
+        return Ok(());
+    }
     match gitrepo::is_dirty(&entry.worktree) {
         Ok(false) => Ok(()),
-        Ok(true) => Err("it has uncommitted changes".to_owned()),
+        Ok(true) => Err(
+            "it has uncommitted changes — commit them, or drop the session with \
+             `jkb task abandon <uid> --force`, which records that you accept them"
+                .to_owned(),
+        ),
         Err(e) => Err(format!("git could not check it for changes: {e}")),
     }
 }
@@ -526,8 +601,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             }
             let age = now.saturating_sub(entry.archived_at.unwrap_or(now));
             if age < retain_days.saturating_mul(SECS_PER_DAY) {
-                report.retained += 1;
-                report.retained_bytes += dir_size(&dir);
+                report.retained.push(dir);
                 continue;
             }
             if let Err(why) = removable(&dir) {
@@ -576,7 +650,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             // Gone already. Tidy git's registration and the branch, then stop tracking.
             if !dry_run {
                 let _ = gitrepo::prune_worktrees(&entry.repo_root);
-                delete_branch_if_any(&entry.repo_root, &entry.branch);
+                delete_branch_if_any(&entry);
             }
             drop_marker(&marker, dry_run, &mut report, &entry.uid);
             continue;
@@ -615,7 +689,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
                     continue;
                 }
                 let _ = gitrepo::prune_worktrees(&entry.repo_root);
-                delete_branch_if_any(&entry.repo_root, &entry.branch);
+                delete_branch_if_any(&entry);
                 report.archived.push((entry.uid.clone(), dest));
             }
             Err(e) => report.held.push((
@@ -640,9 +714,9 @@ fn drop_marker(marker: &Path, dry_run: bool, report: &mut Report, uid: &str) {
 /// Deleting the branch is tidiness, not correctness: its commits are in the target by the time
 /// anything here runs. A branch somebody checked out elsewhere, or already deleted, is not an
 /// error worth stopping an unattended sweep for.
-fn delete_branch_if_any(repo_root: &Path, branch: &str) {
-    if !branch.is_empty() {
-        let _ = gitrepo::delete_branch(repo_root, branch, true);
+fn delete_branch_if_any(entry: &Entry) {
+    if entry.plan.delete_branch && !entry.branch.is_empty() {
+        let _ = gitrepo::delete_branch(&entry.repo_root, &entry.branch, true);
     }
 }
 
@@ -687,6 +761,7 @@ mod tests {
             branch: String::new(),
             uid: "task:t".into(),
             recorded_at: 0,
+            plan: Plan::default(),
             head: None,
             archive: None,
             archived_at: None,
@@ -831,7 +906,7 @@ mod tests {
 
         // Still inside the window: the sweep must NOT delete it.
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
-        assert_eq!(r.retained, 1);
+        assert_eq!(r.retained.len(), 1);
         assert!(dest.exists(), "a fresh archive is kept");
         assert!(r.deleted.is_empty());
 
@@ -884,7 +959,18 @@ mod tests {
         git(&wt, &["commit", "-qm", "what landed"]);
         let after = git(&wt, &["rev-parse", "HEAD"]);
 
-        let out = dispose(&db, &repo, &wt, &branch, "task:t", true).expect("dispose");
+        let out = dispose(
+            &db,
+            &repo,
+            &wt,
+            &branch,
+            "task:t",
+            Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+        )
+        .expect("dispose");
         assert!(
             matches!(out, Disposed::Deferred(_)),
             "nothing could be moved"
@@ -922,6 +1008,90 @@ mod tests {
             r.skipped,
             "it did not look, and that is not the same as finding nothing"
         );
+    }
+
+    #[test]
+    fn the_sweep_applies_the_plan_the_verb_recorded_not_lands_defaults() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        // `jkb task abandon` without --delete-branch: the branch holds the only copy of the work,
+        // and the verb tells the operator it kept it. The sweep must not contradict that.
+        let e = Entry {
+            plan: Plan {
+                delete_branch: false,
+                accept_dirty: false,
+            },
+            ..session_entry(&repo, &wt, &branch, &head)
+        };
+        record(&db, &e).expect("record");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(
+            r.archived.len(),
+            1,
+            "the tree is still archived: {:?}",
+            r.held
+        );
+        assert!(
+            gitrepo::rev(&repo, &branch).expect("rev").is_some(),
+            "but the branch the verb said it kept is still there"
+        );
+    }
+
+    #[test]
+    fn an_accepted_dirty_tree_does_not_hold_the_sweep_for_ever() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        // `--force` is the operator saying they accept what is uncommitted in there. Asking again
+        // would hold this record for ever over the very question they answered.
+        let e = Entry {
+            plan: Plan {
+                delete_branch: true,
+                accept_dirty: true,
+            },
+            ..session_entry(&repo, &wt, &branch, &head)
+        };
+        record(&db, &e).expect("record");
+        fs::write(wt.join("scratch.txt"), "unsaved").expect("write");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(r.archived.len(), 1, "held anyway: {:?}", r.held);
+        assert!(
+            r.archived[0].1.join("scratch.txt").exists(),
+            "and the uncommitted work went into the archive rather than being destroyed"
+        );
+    }
+
+    #[test]
+    fn a_record_can_be_cancelled_while_it_is_still_pending() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+
+        assert!(
+            revoke(&db, &wt).expect("revoke"),
+            "a pending record is cancellable"
+        );
+        assert!(entries(&db).expect("entries").records.is_empty());
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(r.archived.is_empty(), "and the live session is left alone");
+        assert!(wt.exists());
+
+        // ...but once the tree has been moved the record is what says where it went, so it is
+        // the retention sweep's and cancelling it would strand the archive.
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(
+            !revoke(&db, &wt).expect("revoke"),
+            "an archived record is not cancellable"
+        );
+        assert_eq!(entries(&db).expect("entries").records.len(), 1);
     }
 
     #[test]

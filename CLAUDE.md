@@ -1696,6 +1696,34 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   and writes, including back into `~/.claude`). `verify.sh` **asks** it for the state rather than
   inferring breakage from a missing link — the linker leaves the link absent on purpose in states
   it recognises, so the inference failed `postCreate` for a state the design calls normal.
+- **The record carries the decision that produced it (`archive::Plan`), and can be cancelled.**
+  Three findings in review 2 were one cause: `dispose` took `delete_branch` as an argument and
+  threw it away, so the reaper applied *land's* defaults to an `abandon` record and force-deleted
+  the branch the verb had just printed "kept" for; `--force`'s acceptance of a dirty tree was
+  likewise unrecorded, so the sweep's own dirty check held that record for ever; and nothing could
+  revoke a record, so `jkb task work` resuming a deferred session got the directory back with a
+  reaper still holding a claim on it — which then either archived the checkout the operator was
+  sitting in or, once they committed, refused for ever as "a different session reusing the name".
+  `Plan` is part of the `Entry`, `archive::revoke` is the cancel, and `task work` calls it.
+- **A guard whose expectation no longer matches its subject is a guard nobody has seen fire.**
+  Rewording verify.sh's `--declare` refusal left `mutate-verify.sh` grepping for text it never
+  prints — and that harness needs Docker, so the gate could not notice. `check-config.sh` now
+  checks statically that every expectation is a string verify.sh can print. Same round: an
+  assertion that the workspace is mounted had been rewritten to say the directory containing the
+  running script contains a `Cargo.toml`, true by construction; and a self-test assertion could
+  not fail because `note` wrote to the stdout `run` was capturing, so every clean link run exited
+  1 with its own report eaten.
+- **`init-firewall.sh` discovers its workspace instead of naming it.** The hard-coded
+  `~/repos/jkb` was a statement about whichever checkout sat there once the mount widened — it
+  would snapshot another checkout's egress allowlist as the root-owned list every later start
+  runs on. It cannot be told which (the sudoers grant forbids arguments, and an environment
+  variable is agent-settable), so one repo carrying `scripts/auto-mode-posture.json` is the
+  answer and two is a refusal — on the **first raise only**, because a later raise that exits
+  non-zero leaves the rules unapplied, and unapplied rules mean unrestricted egress.
+- **A remedy the machine does not accept is worse than no remedy.** `check-workspace.sh` advised
+  setting `JKB_REPOS_DIR`, read by nothing else in the tree: following the advice switched the
+  preflight off without moving the mount, producing the exact silent wrong-checkout open the file
+  exists to prevent. One statement of where repos live, and it is `devcontainer.json`'s.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

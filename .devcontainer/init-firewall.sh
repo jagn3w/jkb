@@ -31,21 +31,56 @@ say() { printf '[firewall] %s\n' "$*"; }
 # what re-reads the repo — which is right, because widening egress should be a human act, and
 # rebuilding is one. The argument is gone entirely rather than defaulted, so the sudoers entry can
 # forbid arguments outright; a grant naming no argument accepts every argument.
-readonly WORKSPACE_POSTURE=/home/vscode/repos/jkb/scripts/auto-mode-posture.json
 readonly SNAPSHOT=/usr/local/share/jkb-egress-allowlist.json
+
+# WHICH workspace, now that all of ~/repos is mounted. This was `/home/vscode/repos/jkb/...`, and
+# under the widened mount that literal is a statement about whichever checkout happens to sit
+# there: open `~/repos/jkb-wip` and the firewall would snapshot the OTHER checkout's posture, on
+# another branch, and install it as the list every later start runs on — while `verify.sh`'s own
+# posture check looked at the right repo and passed. Where nothing is named `jkb` it was simply
+# unreadable and container creation died.
+#
+# It cannot be told which one: the sudoers grant forbids arguments outright (a grant naming no
+# argument accepts every argument), and an environment variable is agent-settable, which is the
+# same hole one step over. So it is DISCOVERED, and ambiguity refuses rather than picks: a repo
+# carrying `scripts/auto-mode-posture.json` is the marker, one match is the answer, and two — two
+# jkb checkouts, or a planted decoy — is a question only a human can settle.
+find_workspace_posture() {
+    local d hits=()
+    for d in /home/vscode/repos/*/; do
+        [ -r "$d/scripts/auto-mode-posture.json" ] && hits+=("$d/scripts/auto-mode-posture.json")
+    done
+    [ "${#hits[@]}" -eq 1 ] || return 1
+    printf '%s' "${hits[0]}"
+}
 
 [ "$#" -eq 0 ] || { echo "init-firewall: takes no arguments (the allowlist is $SNAPSHOT)" >&2; exit 2; }
 
 if [ ! -e "$SNAPSHOT" ]; then
-    [ -r "$WORKSPACE_POSTURE" ] || { echo "init-firewall: cannot read $WORKSPACE_POSTURE to snapshot" >&2; exit 1; }
-    install -o root -g root -m 0444 "$WORKSPACE_POSTURE" "$SNAPSHOT"
-    say "snapshotted the egress allowlist from the workspace (first run in this container)"
-elif ! cmp -s "$WORKSPACE_POSTURE" "$SNAPSHOT" 2>/dev/null; then
-    # Reported, never acted on. Divergence is the normal state after someone edits the posture,
-    # and the honest response is to say the coarse layer is still on the old list — silence here
-    # would let a legitimate edit look applied when the firewall never saw it.
-    say "NOTE: $WORKSPACE_POSTURE differs from the snapshot this firewall runs on."
-    say "      The coarse layer keeps the snapshot until the container is REBUILT."
+    # FIRST RAISE ONLY. Refusing here fails container creation, which is the correct direction:
+    # an egress allowlist that cannot be established must not be guessed at, and nothing has run
+    # in the container yet.
+    workspace_posture="$(find_workspace_posture)" || {
+        echo "init-firewall: could not identify one workspace posture under /home/vscode/repos" >&2
+        echo "  (looked for */scripts/auto-mode-posture.json; found none, or more than one)." >&2
+        echo "  The egress allowlist is snapshotted from it once, at create, and must not be guessed." >&2
+        exit 1
+    }
+    install -o root -g root -m 0444 "$workspace_posture" "$SNAPSHOT"
+    say "snapshotted the egress allowlist from $workspace_posture (first run in this container)"
+# EVERY LATER RAISE reads only the snapshot, so the lookup below is for the drift NOTE alone and
+# must never refuse: exiting non-zero here would leave the rules unapplied, and unapplied rules
+# mean unrestricted egress — the opposite of failing closed.
+elif workspace_posture="$(find_workspace_posture)"; then
+    if ! cmp -s "$workspace_posture" "$SNAPSHOT" 2>/dev/null; then
+        # Reported, never acted on. Divergence is the normal state after someone edits the
+        # posture, and the honest response is to say the coarse layer is still on the old list —
+        # silence here would let a legitimate edit look applied when the firewall never saw it.
+        say "NOTE: $workspace_posture differs from the snapshot this firewall runs on."
+        say "      The coarse layer keeps the snapshot until the container is REBUILT."
+    fi
+else
+    say "NOTE: could not identify one workspace posture to compare the snapshot against."
 fi
 POSTURE="$SNAPSHOT"
 
