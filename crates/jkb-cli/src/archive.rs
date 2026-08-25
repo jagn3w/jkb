@@ -58,6 +58,17 @@ pub struct Entry {
     pub uid: String,
     /// When the landing recorded this, in seconds since the Unix epoch.
     pub recorded_at: u64,
+    /// The commit the worktree was on when the record was written.
+    ///
+    /// This is the record's **instance identity**, and it is why the sweep can be trusted to act
+    /// on a path. A path and a branch name are both reusable: remove a deferred worktree by hand,
+    /// reopen the task and `jkb task work` recreates a session at the same path on the same
+    /// branch — and a sweep keyed on those two would archive that live tree and force-delete its
+    /// branch. A commit is not reused, so a tree that is not still sitting on the one the landing
+    /// recorded is not the tree this record is about. `None` only for a record written before this
+    /// field existed, which is held rather than acted on for the same reason.
+    #[serde(default)]
+    pub head: Option<String>,
     /// Where the tree was moved to, once it has been.
     #[serde(default)]
     pub archive: Option<PathBuf>,
@@ -79,6 +90,15 @@ pub struct Report {
     pub cleared: Vec<String>,
     /// Archives still inside the retention window.
     pub retained: usize,
+    /// What those archives occupy, in bytes.
+    ///
+    /// Reported because the alternative signal is a full disk. A session worktree carries the
+    /// repo's build output — on this repo, gigabytes — and archiving keeps it for the retention
+    /// window. Deliberately REPORTED rather than pruned: `git clean -X` would delete exactly the
+    /// regenerable files and would also delete a gitignored `.env`, and this whole mechanism
+    /// exists because a delete that was not asked for is the failure being designed against.
+    /// Shorten the window with `--retain-days` if the size is what matters more.
+    pub retained_bytes: u64,
     /// Marker files that could not be read. Reported rather than removed: a file we cannot parse
     /// may be a torn write, and deleting it would discard the only record of a live worktree.
     pub unreadable: Vec<PathBuf>,
@@ -236,6 +256,92 @@ pub fn stow(repo_root: &Path, worktree: &Path, at: u64) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// What became of a worktree this process tried to dispose of.
+pub enum Disposed {
+    /// Moved into the repo's archive.
+    Archived(PathBuf),
+    /// Nothing moved — this process may not unlink the tree — and a record was left for the
+    /// reaper. Carries the refusal, because "it did not work" without the reason is what makes an
+    /// operator go looking in the wrong place.
+    Deferred(String),
+}
+
+/// Dispose of one session worktree, and leave a record either way.
+///
+/// THE ONE DISPOSAL every verb calls. `land` and `abandon` both end a session, and having them
+/// end it two different ways is how `abandon` kept the recursive `git worktree remove` this
+/// module exists to replace — so from inside a sandboxed session the verb an operator reaches
+/// for to clear a leftover directory was the one that gutted it. A rule each call site has to
+/// remember is the defect; this is the callee that remembers it.
+///
+/// `delete_branch` is the caller's, because the two verbs genuinely differ: a landing's branch is
+/// a duplicate of commits now in the target, while an abandoned branch holds the only copy of
+/// real work and is kept unless the operator says otherwise.
+///
+/// # Errors
+/// Returns an error only if the worktree's HEAD cannot be read, which is the one thing this
+/// cannot proceed without: it is the identity the sweep later checks before acting on the path.
+pub fn dispose(
+    db: &Path,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    uid: &str,
+    delete_branch: bool,
+) -> Result<Disposed> {
+    let head = gitrepo::rev(worktree, "HEAD")
+        .with_context(|| format!("reading HEAD in {}", worktree.display()))?;
+    let mut entry = Entry {
+        worktree: worktree.to_path_buf(),
+        repo_root: repo_root.to_path_buf(),
+        branch: branch.to_owned(),
+        uid: uid.to_owned(),
+        recorded_at: now_secs(),
+        head,
+        archive: None,
+        archived_at: None,
+    };
+    match stow(repo_root, worktree, entry.recorded_at) {
+        Ok(dest) => {
+            entry.archive = Some(dest.clone());
+            entry.archived_at = Some(entry.recorded_at);
+            // Written BEFORE the two git commands, which can fail: this is the only thing that
+            // says where the tree went, and an archive nothing records is never swept. A failure
+            // here is reported rather than returned — the tree is safely out of the way and the
+            // caller's work succeeded, so the cost is disk, and bailing would cost the landing.
+            if let Err(e) = record(db, &entry) {
+                eprintln!(
+                    "note: archived to {} but the removal record could not be written ({e}) — it \
+                     will not be swept automatically; delete it by hand when you no longer want it",
+                    dest.display()
+                );
+            }
+            let _ = gitrepo::prune_worktrees(repo_root);
+            if delete_branch {
+                if let Err(e) = gitrepo::delete_branch(repo_root, branch, true) {
+                    eprintln!("note: could not delete {branch}: {e}");
+                }
+            }
+            Ok(Disposed::Archived(dest))
+        }
+        // A SESSION CANNOT ARCHIVE ITSELF, and that is the ordinary case rather than an error:
+        // the refusal covers the session's own working directories, and every other process — the
+        // watcher service, another session, a terminal — moves it freely (measured across five
+        // live worktrees). The rename changed nothing, so the caller's work is simply completed
+        // and the tree is handed to `jkb task reap`.
+        Err(e) => {
+            if let Err(rec) = record(db, &entry) {
+                eprintln!(
+                    "note: {} could not be archived from here ({e}) and the removal record could \
+                     not be written either ({rec}) — remove the directory by hand",
+                    worktree.display()
+                );
+            }
+            Ok(Disposed::Deferred(e.to_string()))
+        }
+    }
+}
+
 /// Whether this process may unlink `path` — asked of the kernel, not inferred.
 ///
 /// `remove_dir` on a non-empty directory is the exact probe: it cannot succeed, so it destroys
@@ -252,6 +358,129 @@ fn removable(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Exclusive access to the record store for the duration of one sweep.
+///
+/// Two sweeps racing do lose each other's work, and not hypothetically: the service runs one every
+/// quarter hour and `jkb doctor --fix` runs another on demand. Both read the same pending record;
+/// the first archives it and writes the record back; the second finds the worktree gone, takes the
+/// "nothing left to act on" arm and **deletes the record the first just wrote** — leaving an
+/// archive directory nothing tracks and nothing will ever delete.
+///
+/// Same shape as `session::LandLock`, including its rule: a lock is stale only when its holder is
+/// **proven** gone. An unparseable pid and a probe that could not run are both unestablished, and
+/// breaking a live sweep's lock on an unestablished answer is what the lock exists to prevent.
+struct SweepLock {
+    path: PathBuf,
+}
+
+impl SweepLock {
+    fn acquire(db: &Path) -> Result<Option<Self>> {
+        let dir = store_dir(db);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(".sweep.lock");
+        for _ in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(Some(Self { path }));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let holder = fs::read_to_string(&path).unwrap_or_default();
+                    let dead = holder
+                        .trim()
+                        .parse::<u32>()
+                        .map_or(jkb_fsm::Fact::Unknown, crate::owner::pid_alive)
+                        .is_no();
+                    if !dead {
+                        // Not an error: the other sweep is doing this sweep's work. A service
+                        // tick that says "someone else is on it" must not read as a failure.
+                        return Ok(None);
+                    }
+                    let _ = fs::remove_file(&path);
+                }
+                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for SweepLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Bytes under `dir`. Best-effort: anything unreadable simply does not count, because this is a
+/// number printed for a person and never a value anything decides on.
+pub fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_size(&entry.path());
+        } else if meta.is_file() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Whether the tree at `entry.worktree` is still the session this record is about.
+///
+/// Three questions, all of which must answer yes, and any of which failing HOLDS: git still
+/// registers that path as a worktree of this repo, it is still sitting on the commit the landing
+/// recorded, and it has nothing uncommitted. The first two establish identity — a path and a
+/// branch name are reusable, a commit is not — and the third is the ordinary safety rule: work
+/// nobody has committed is not something to move out from under whoever is writing it.
+fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
+    let Some(want) = entry.head.as_deref() else {
+        return Err(
+            "the record predates instance identity, so the tree cannot be shown to be \
+                    the one it describes"
+                .to_owned(),
+        );
+    };
+    let registered = gitrepo::worktrees(&entry.repo_root)
+        .map_err(|e| format!("git could not list this repo's worktrees: {e}"))?
+        .into_iter()
+        // Canonical comparison: git reports `/private/var/...` where the record holds
+        // `/var/...` on macOS, and a raw equality answers "not registered" for the very
+        // directory you are standing in.
+        .any(|w| crate::session::same_path(&w.path, &entry.worktree));
+    if !registered {
+        return Err(format!(
+            "{} is no longer a registered worktree of this repo",
+            entry.worktree.display()
+        ));
+    }
+    match gitrepo::rev(&entry.worktree, "HEAD") {
+        Ok(Some(head)) if head == want => {}
+        Ok(Some(head)) => {
+            return Err(format!(
+            "it is on {} now, not the {want} the landing recorded — this is a different session \
+                 reusing the name",
+            &head[..head.len().min(8)]
+        ))
+        }
+        Ok(None) => return Err("its HEAD does not resolve".to_owned()),
+        Err(e) => return Err(format!("git could not read its HEAD: {e}")),
+    }
+    match gitrepo::is_dirty(&entry.worktree) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("it has uncommitted changes".to_owned()),
+        Err(e) => Err(format!("git could not check it for changes: {e}")),
+    }
+}
+
 /// Archive what is owed, then delete archives past `retain_days`.
 ///
 /// Never fails as a whole for one bad record: a repo that has moved, a worktree somebody removed
@@ -261,6 +490,13 @@ fn removable(path: &Path) -> Result<(), String> {
 /// # Errors
 /// Returns an error only if the record store itself cannot be listed.
 pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
+    // One sweep at a time, held across the reads as well as the writes: what races here is the
+    // DECISION as much as the write, because two sweeps that both read one pending record both
+    // act on it. A sweep that finds the lock held reports nothing and returns — the other process
+    // is doing this one's work, which is not a failure.
+    let Some(_lock) = SweepLock::acquire(db)? else {
+        return Ok(Report::default());
+    };
     let now = now_secs();
     let store = entries(db)?;
     let mut report = Report {
@@ -279,6 +515,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             let age = now.saturating_sub(entry.archived_at.unwrap_or(now));
             if age < retain_days.saturating_mul(SECS_PER_DAY) {
                 report.retained += 1;
+                report.retained_bytes += dir_size(&dir);
                 continue;
             }
             if let Err(why) = removable(&dir) {
@@ -304,8 +541,23 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         }
 
         // Not archived yet: this is the deferred half of a landing.
+        //
+        // A REPO WE CANNOT SEE IS UNKNOWN, NOT SETTLED. This used to clear the record, and the
+        // case is ordinary rather than exotic: `~/.jkb` is bind-mounted into the dev container, so
+        // both sides share one store while the same repo is `/home/vscode/repos/jkb` there and
+        // `~/repos/jkb` here. A container-recorded landing swept on the host would have had its
+        // record deleted while the worktree sat untouched — never archived, never reported, and
+        // listed as in flight for ever. Same for a repo on a drive that is not mounted today.
+        // Holding costs a line of output; clearing costs the only record of a live worktree.
         if !entry.repo_root.exists() {
-            drop_marker(&marker, dry_run, &mut report, &entry.uid);
+            report.held.push((
+                entry.uid.clone(),
+                format!(
+                    "{} is not reachable from here, so whether anything is owed cannot be \
+                     established — the record is kept",
+                    entry.repo_root.display()
+                ),
+            ));
             continue;
         }
         if !entry.worktree.exists() {
@@ -317,6 +569,16 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             drop_marker(&marker, dry_run, &mut report, &entry.uid);
             continue;
         }
+        // Identity, before anything destructive. A record names a path and a branch, and both are
+        // reusable names; establishing that the tree is still the one it describes is what makes
+        // acting on them safe.
+        if let Err(why) = still_the_recorded_session(&entry) {
+            report.held.push((
+                entry.uid.clone(),
+                format!("{}: {why}", entry.worktree.display()),
+            ));
+            continue;
+        }
         if dry_run {
             report
                 .archived
@@ -325,12 +587,11 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         }
         match stow(&entry.repo_root, &entry.worktree, now) {
             Ok(dest) => {
-                let _ = gitrepo::prune_worktrees(&entry.repo_root);
-                delete_branch_if_any(&entry.repo_root, &entry.branch);
                 entry.archive = Some(dest.clone());
                 entry.archived_at = Some(now);
-                // The record is updated BEFORE the tree is reported archived, so a crash here
-                // leaves a marker pointing at where the tree actually is.
+                // THE RECORD IS WRITTEN FIRST, before the two git commands below, because those
+                // can fail and this is the only thing that says where the tree went. Written back
+                // to the SAME file it was read from, so no second copy can appear.
                 if let Err(e) = record_at(&marker, &entry) {
                     report.held.push((
                         entry.uid.clone(),
@@ -339,9 +600,11 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
                             dest.display()
                         ),
                     ));
-                } else {
-                    report.archived.push((entry.uid.clone(), dest));
+                    continue;
                 }
+                let _ = gitrepo::prune_worktrees(&entry.repo_root);
+                delete_branch_if_any(&entry.repo_root, &entry.branch);
+                report.archived.push((entry.uid.clone(), dest));
             }
             Err(e) => report.held.push((
                 entry.uid.clone(),
@@ -412,8 +675,63 @@ mod tests {
             branch: String::new(),
             uid: "task:t".into(),
             recorded_at: 0,
+            head: None,
             archive: None,
             archived_at: None,
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            // The developer's global config signs commits and sets core.hooksPath; either would
+            // fail this fixture for reasons that have nothing to do with archiving.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// A repo with one real session worktree, which is what the sweep now requires before it will
+    /// act: the identity check asks git whether the path is a registered worktree and whether it
+    /// is still on the commit the record names.
+    fn session(repo: &Path, name: &str) -> (PathBuf, String, String) {
+        std::fs::create_dir_all(repo).expect("mk");
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base").expect("write");
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", "base"]);
+        let wt = repo.join(".jkb/work").join(name);
+        let branch = format!("task/{name}");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        (wt, branch, head)
+    }
+
+    fn session_entry(repo: &Path, wt: &Path, branch: &str, head: &str) -> Entry {
+        Entry {
+            head: Some(head.to_owned()),
+            branch: branch.to_owned(),
+            ..entry(wt, repo)
         }
     }
 
@@ -485,13 +803,16 @@ mod tests {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
         let repo = t.path().join("repo");
-        let wt = repo.join(".jkb/work/sess");
-        fs::create_dir_all(&wt).expect("mk");
-        fs::write(wt.join("f"), b"x").expect("write");
-        record(&db, &entry(&wt, &repo)).expect("record");
+        let (wt, branch, head) = session(&repo, "sess");
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
-        assert_eq!(r.archived.len(), 1, "the pending tree is archived");
+        assert_eq!(
+            r.archived.len(),
+            1,
+            "the pending tree is archived: {:?}",
+            r.held
+        );
         assert!(!wt.exists());
         let dest = r.archived[0].1.clone();
         assert!(dest.exists(), "and the archive is where the report says");
@@ -515,17 +836,13 @@ mod tests {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
         let repo = t.path().join("repo");
-        let wt = repo.join(".jkb/work/sess");
-        fs::create_dir_all(&wt).expect("mk");
+        let (wt, branch, head) = session(&repo, "sess");
         // A marker under a name `marker_path` would not choose — an older scheme, or one written
         // by hand. The update must land HERE, not beside it.
         fs::create_dir_all(store_dir(&db)).expect("mk");
         let marker = store_dir(&db).join("legacy-name.json");
-        fs::write(
-            &marker,
-            serde_json::to_vec(&entry(&wt, &repo)).expect("json"),
-        )
-        .expect("write");
+        let e = session_entry(&repo, &wt, &branch, &head);
+        fs::write(&marker, serde_json::to_vec(&e).expect("json")).expect("write");
 
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.archived.len(), 1);
@@ -536,16 +853,106 @@ mod tests {
     }
 
     #[test]
+    fn a_session_reusing_the_recorded_name_is_held_rather_than_archived() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+
+        // The deferred worktree is removed by hand and a NEW session is opened at the same path
+        // on the same branch — which is what reopening the task and running `jkb task work` does.
+        // A sweep keyed on path and branch alone would archive this live tree and force-delete
+        // its branch; the commit is what tells them apart.
+        git(
+            &repo,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        git(&repo, &["branch", "-D", &branch]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join("new-work.txt"), "in progress").expect("write");
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "different work"]);
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(r.archived.is_empty(), "the live session was not archived");
+        assert_eq!(r.held.len(), 1, "it is held, with the reason: {:?}", r.held);
+        assert!(
+            wt.join("new-work.txt").exists(),
+            "and its work is untouched"
+        );
+        assert!(
+            gitrepo::rev(&repo, &branch).expect("rev").is_some(),
+            "and its branch survives"
+        );
+    }
+
+    #[test]
+    fn uncommitted_work_in_a_recorded_session_holds_the_sweep() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        std::fs::write(wt.join("scratch.txt"), "unsaved").expect("write");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(r.archived.is_empty(), "nothing is moved out from under it");
+        assert_eq!(r.held.len(), 1, "{:?}", r.held);
+        assert!(wt.join("scratch.txt").exists());
+    }
+
+    #[test]
+    fn a_repo_this_process_cannot_see_holds_its_record_instead_of_clearing_it() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        // The ordinary cross-boundary case: a landing recorded inside the dev container names
+        // /home/vscode/repos/jkb, and the host sweeps the same shared store.
+        let e = Entry {
+            head: Some("deadbeef".into()),
+            ..entry(
+                Path::new("/home/vscode/repos/jkb/.jkb/work/s"),
+                Path::new("/home/vscode/repos/jkb"),
+            )
+        };
+        record(&db, &e).expect("record");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(r.cleared.is_empty(), "an unreachable repo settles nothing");
+        assert_eq!(r.held.len(), 1, "{:?}", r.held);
+        assert_eq!(
+            entries(&db).expect("entries").records.len(),
+            1,
+            "the record survives for whichever side can see the repo"
+        );
+    }
+
+    #[test]
     fn a_dry_run_reports_without_moving_or_deleting_anything() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
         let repo = t.path().join("repo");
-        let wt = repo.join(".jkb/work/sess");
-        fs::create_dir_all(&wt).expect("mk");
-        record(&db, &entry(&wt, &repo)).expect("record");
+        let (wt, branch, head) = session(&repo, "sess");
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
         let r = reap(&db, RETAIN_DAYS, true).expect("reap");
-        assert_eq!(r.archived.len(), 1, "it says what it would do");
+        assert_eq!(
+            r.archived.len(),
+            1,
+            "it says what it would do: {:?}",
+            r.held
+        );
         assert!(wt.exists(), "and the tree has not moved");
         let left = entries(&db).expect("entries").records;
         assert_eq!(left.len(), 1, "and the record survives for the real run");

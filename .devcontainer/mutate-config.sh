@@ -118,6 +118,20 @@ run "the generator's syscall list stops parsing" "no longer yields"
 seed; jq_dc 'del(.mounts[] | select(test("/home/vscode/.jkb")))'
 run "the knowledge-base mount is dropped" "declared mount set is missing"
 
+seed; sub_dc '"workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}"' \
+             '"workspaceFolder": "/home/vscode/elsewhere/jkb"'
+run "workspaceFolder leaves the workspace mount" "is not inside the workspaceMount target"
+
+# The other half of the same rule. A literal workspaceFolder is only safe because a folder that
+# cannot be placed under the mount is refused before the container is created; drop the refusal
+# and opening a session worktree silently starts the agent in the main checkout instead.
+seed; python3 - "$(DC)" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"initializeCommand"', '"initializeCommandTypo"', 1))
+PYX
+run "the workspace-folder preflight is dropped" "no initializeCommand running check-workspace.sh"
+
 seed; jq_dc '.mounts += ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"]'
 run "the docker socket is mounted in" "docker socket is root on the host"
 
@@ -221,7 +235,7 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=22
+PINNED_BAD_SITES=24
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

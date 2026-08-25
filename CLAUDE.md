@@ -1669,6 +1669,33 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   process finishes it. `jkb service install` now writes **two** units — `com.jkb.sync` and
   `com.jkb.reap` — kept apart so a wedged file watcher does not also stop every deferred landing.
   `jkb doctor` reports what is outstanding; `--fix` sweeps it.
+- **The reviewer found the second disposal route, and it is the shape this repo keeps meeting.**
+  `jkb task abandon` still called `git worktree remove` — the verb an operator reaches for to clear
+  the directory a deferred landing leaves behind was the one that gutted it. Both verbs now go
+  through `archive::dispose`, which is the callee that remembers the rule instead of two call sites
+  that must. Its `delete_branch` is the caller's, because a landing's branch is a duplicate of
+  commits already in the target while an abandoned branch holds the only copy.
+- **A record names a path and a branch, and both are reusable names**, so the sweep establishes
+  identity before acting: git still registers that path as a worktree, it is still on the commit
+  the landing recorded (`Entry.head`), and it is clean. Remove a deferred worktree by hand and
+  `jkb task work` recreates a session at the same path on the same branch; a sweep keyed on those
+  two would archive the live tree and force-delete its branch. A commit id is not reused.
+- **Unknown is not settled, and one sweep runs at a time.** A repo root the sweep cannot reach used
+  to clear the record — ordinary once host and container share `~/.jkb` at different paths, and it
+  deleted the only record of a live worktree. Two concurrent sweeps did lose each other's updates
+  (the second finds the worktree gone and drops the record the first just wrote), so a `SweepLock`
+  covers the reads as well as the writes, with `LandLock`'s rule that a lock is stale only when its
+  holder is **proven** gone.
+- **`workspaceFolder` follows the folder you opened, and `initializeCommand` refuses one the mount
+  cannot place.** A literal path under the target opens whichever repo sits there — for a session
+  worktree, the main checkout — silently, with every guard passing, because the wrong repo is a
+  perfectly good repo. `check-config.sh` asserts both halves and `mutate-config.sh` watches each
+  fail.
+- **The memory linker decides the whole migration before moving anything**, and refuses a store
+  holding anything but plain files (a symlink planted by either side redirects the other's reads
+  and writes, including back into `~/.claude`). `verify.sh` **asks** it for the state rather than
+  inferring breakage from a missing link — the linker leaves the link absent on purpose in states
+  it recognises, so the inference failed `postCreate` for a state the design calls normal.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

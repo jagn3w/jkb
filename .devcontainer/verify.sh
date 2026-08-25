@@ -75,6 +75,10 @@ fi
 # the gate that reviews the boundary and the check that enforces it cannot read it differently.
 here_dc="$(cd "$(dirname "$0")" && pwd)"
 DC="$here_dc/devcontainer.json"
+# The checkout being verified: the one this script is in. Every assertion below that used to name
+# /home/vscode/repos/jkb reads this instead — with all of ~/repos mounted, that literal is a
+# statement about whichever repo happens to sit there, which is not necessarily this one.
+mem_repo="$(cd "$here_dc/.." && pwd)"
 # shellcheck source=/dev/null
 . "$here_dc/lib.sh"
 EXPECTED="$(dc_mount_targets "$DC")"
@@ -94,13 +98,20 @@ for t in ${DECLARED_EXTRA[@]+"${DECLARED_EXTRA[@]}"}; do
     nested=no
     while IFS= read -r d; do
         [ -n "$d" ] || continue
-        case "$t" in "$d"/?*) nested=yes; break ;; esac
+        case "$t" in "$d"/?*) ;; *) continue ;; esac
+        # ...and only inside a BIND. A named volume is container-managed and reaches no host
+        # filesystem, which is exactly why check-config.sh reviews bind sources and waves volumes
+        # through — so "inside a declared region" cannot mean inside a volume: a bind nested under
+        # ~/.cargo/target would be a host mount at a place nobody reviewed. `dc_type_for_target`
+        # is lib.sh's own answer to that question, used here rather than derived a second way.
+        [ "$(dc_type_for_target "$DC" "$d")" = bind ] || continue
+        nested=yes; break
     done <<<"$EXPECTED"
     if [ "$nested" = yes ]; then
         EXPECTED="$(printf '%s\n%s\n' "$EXPECTED" "$t" | sort -u)"
         extra=$((extra+1))
     else
-        bad "--declare $t is not inside any mount $DC declares — only a bind NESTED in a declared target may be declared on the command line"
+        bad "--declare $t is not inside any host BIND $DC declares — only a mount nested in a declared bind may be named here (a named volume reaches no host filesystem, so nothing under one is reviewable this way)"
     fi
 done
 if [ -z "$EXPECTED" ]; then
@@ -210,21 +221,31 @@ done
 #     promise the README makes, and a promise checked nowhere is how this one would rot.
 #     The slug comes from the linking script itself rather than being spelled again here — one
 #     guess about another program's private encoding is enough.
-mem_slug="$(/home/vscode/repos/jkb/scripts/link-claude-memory.sh --print-slug /home/vscode/repos/jkb 2>/dev/null)"
-mem_link="/home/vscode/.claude/projects/$mem_slug/memory"
-mem_want="/home/vscode/.jkb/claude-memory/jkb"
-if [ -z "$mem_slug" ]; then
-    bad "could not derive the memory slug — scripts/link-claude-memory.sh did not answer"
-elif [ ! -L "$mem_link" ]; then
-    bad "auto-memory is not linked into the shared store ($mem_link is $( [ -e "$mem_link" ] && echo "not a link" || echo missing )) — memory written in here would be invisible on the host"
-elif [ "$(readlink "$mem_link")" != "$mem_want" ]; then
-    bad "auto-memory points at $(readlink "$mem_link"), not $mem_want"
-else
-    ok "auto-memory is shared with the host through ~/.jkb"
-fi
+#     ASKED OF THE LINKER, not inferred from the link's absence. The linker deliberately leaves
+#     the link absent in states it recognises — a name that exists on both sides is a collision it
+#     refuses to resolve, and a store holding a symlink is one it refuses to follow — so reading
+#     "no link" as "the mechanism is broken" made a state its own design calls normal fail this
+#     check, and with it postCreate, and with that the container. One rule, stated in one place.
+mem_state="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+case "$mem_state" in
+    linked)
+        ok "auto-memory is shared with the host through ~/.jkb" ;;
+    collision|unsafe|foreign)
+        # Not a FAIL: the container works, one repo's memory just is not shared until a person
+        # settles it. Said plainly, because a state nobody is told about is one nobody fixes.
+        ok "auto-memory is not shared for $(basename "$mem_repo") ($mem_state) — run scripts/link-claude-memory.sh to see what it wants"
+        ;;
+    unlinked|"")
+        bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — memory written in here would be invisible on the host" ;;
+    *)
+        bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
+esac
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.
-assert "workspace is mounted"       "$([ -f /home/vscode/repos/jkb/Cargo.toml ] && echo yes || echo no)"
+# Derived from where this script lives, not spelled. `workspaceFolder` follows the folder you
+# opened now that ~/repos is mounted whole, so a hard-coded /home/vscode/repos/jkb would assert
+# something about a DIFFERENT checkout than the one being verified — and pass while doing it.
+assert "workspace is mounted ($mem_repo)" "$([ -f "$mem_repo/Cargo.toml" ] && echo yes || echo no)"
 assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || echo no)"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
@@ -243,7 +264,7 @@ fi
 
 # 6. The inner posture. `check` is the drift rule from D48; here it also proves the posture
 #    survived being installed into a fresh container HOME.
-if /home/vscode/repos/jkb/scripts/auto-mode.sh check >/dev/null 2>&1; then
+if "$mem_repo/scripts/auto-mode.sh" check >/dev/null 2>&1; then
     ok "Claude Code posture is intact"
 else
     bad "Claude Code posture is NOT intact (scripts/auto-mode.sh check)"

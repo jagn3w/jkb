@@ -5216,7 +5216,7 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
             uid,
             force,
             delete_branch,
-        } => cmd_task_abandon(db, &uid, force, delete_branch, json),
+        } => cmd_task_abandon(db, db_path, &uid, force, delete_branch, json),
         TaskCmd::Sessions => cmd_task_sessions(db, json),
         TaskCmd::Gate { cmd, clear } => cmd_task_gate(db, cmd.as_deref(), clear, json),
         _ => unreachable!("cmd_task_mutate routes only session subcommands here"),
@@ -6224,6 +6224,7 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
                 "deleted": r.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "cleared": r.cleared,
                 "retained": r.retained,
+                "retained_bytes": r.retained_bytes,
                 "unreadable": r.unreadable.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })
         );
@@ -6259,9 +6260,13 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
     if r.is_empty() && r.retained == 0 {
         println!("nothing to reap");
     } else if r.retained > 0 {
+        // The size, because the alternative signal is a full disk: a session worktree carries the
+        // repo's build output, which on a Rust repo is gigabytes, and it is kept for the whole
+        // retention window. `--retain-days` is the knob if that matters more than the safety net.
         println!(
-            "{} archive(s) still inside the retention window",
-            r.retained
+            "{} archive(s) still inside the retention window ({})",
+            r.retained,
+            human_bytes(r.retained_bytes)
         );
     }
 }
@@ -6303,50 +6308,45 @@ fn dispose_session(
         // what actually landed; the worktree is verified clean just above, so nothing is lost.
         gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
     } else {
-        let mut entry = archive::Entry {
-            worktree: sess.worktree.clone(),
-            repo_root: ctx.root.clone(),
-            branch: landed.branch.to_owned(),
-            uid: landed.uid.to_owned(),
-            recorded_at: archive::now_secs(),
-            archive: None,
-            archived_at: None,
-        };
-        match archive::stow(&ctx.root, &sess.worktree, entry.recorded_at) {
-            Ok(dest) => {
-                gitrepo::prune_worktrees(&ctx.root)?;
-                gitrepo::delete_branch(&ctx.root, landed.branch, true)?;
-                entry.archive = Some(dest.clone());
-                entry.archived_at = Some(entry.recorded_at);
-                // Recorded even on the happy path, so the retention sweep has one place to look
-                // and there is no second index of archives to keep in agreement with this one.
-                archive::record(db_path, &entry)?;
-                disposal = Disposal::Archived(dest);
-            }
-            // A SESSION CANNOT ARCHIVE ITSELF, and that is the ordinary case rather than an
-            // error: the refusal covers the session's own working directories, and every other
-            // process — the watcher service, another session, a terminal — moves it freely
-            // (measured across five live worktrees). The rename changed nothing, so the landing
-            // is simply completed and the tree is handed to `jkb task reap`. Recording it is
-            // fallible and therefore happens HERE, before the plan: a landed task whose worktree
-            // nothing is tracking is the state this record exists to prevent.
-            Err(e) => {
-                archive::record(db_path, &entry)?;
+        // The one disposal both `land` and `abandon` call — see `archive::dispose` for why that
+        // matters. A landing's branch is a duplicate of commits now in the target, so it goes.
+        match archive::dispose(
+            db_path,
+            &ctx.root,
+            &sess.worktree,
+            landed.branch,
+            landed.uid,
+            true,
+        )? {
+            archive::Disposed::Archived(dest) => disposal = Disposal::Archived(dest),
+            archive::Disposed::Deferred(why) => {
                 // The branch still points at its pre-rebase commits, which reads as "ahead of a
-                // target that already has this work". Cosmetic, and it lasts only until the reaper
-                // deletes the branch — so a failure here is reported and does not undo a landing.
+                // target that already has this work". Cosmetic, and it lasts only until the
+                // reaper deletes the branch — so a failure here is reported and undoes nothing.
                 if let Err(reset) = gitrepo::reset_hard(&sess.worktree, landed.grafted) {
                     eprintln!(
                         "note: could not point {} at what landed: {reset}",
                         landed.branch
                     );
                 }
-                disposal = Disposal::Deferred(e.to_string());
+                disposal = Disposal::Deferred(why);
             }
         }
     }
 
     Ok(disposal)
+}
+
+/// Bytes as a person reads them. Reported only — nothing decides on this number.
+fn human_bytes(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = n as f64;
+    for (unit, scale) in [("GB", 1e9), ("MB", 1e6), ("kB", 1e3)] {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes / scale);
+        }
+    }
+    format!("{n} B")
 }
 
 /// What actually became of the session worktree. Three of these used to be one `bool`, which is
@@ -6435,6 +6435,7 @@ fn tail_lines(text: &str, n: usize) -> String {
 /// `task abandon` — drop a session without landing it (design D36.6).
 fn cmd_task_abandon(
     db: &Db,
+    db_path: &Path,
     uid: &str,
     force: bool,
     delete_branch: bool,
@@ -6493,6 +6494,7 @@ fn cmd_task_abandon(
         }
     }
 
+    let mut deferred: Option<String> = None;
     if let Some(sess) = &sess {
         if !force {
             anyhow::ensure!(
@@ -6501,7 +6503,20 @@ fn cmd_task_abandon(
                 sess.worktree.display()
             );
         }
-        gitrepo::worktree_remove(&ctx.root, &sess.worktree, force)?;
+        // ARCHIVED, not removed — the same rule `land` follows, through the same function.
+        // `git worktree remove` unlinks the tree and stops at the first refusal, so run from
+        // inside a sandboxed session this verb gutted the checkout it was asked to drop. It is
+        // also the verb an operator naturally reaches for to clear the directory a deferred
+        // landing leaves behind, which made it the likeliest route to that state.
+        //
+        // The branch is deleted only below, and only when asked: an abandoned branch holds the
+        // only copy of real work, which is why `--force` here discards a dirty tree but never
+        // the commits.
+        if let archive::Disposed::Deferred(why) =
+            archive::dispose(db_path, &ctx.root, &sess.worktree, &branch, uid, false)?
+        {
+            deferred = Some(why);
+        }
     }
     // Deleting the branch leaves the history alone, and that is correct: an entry says what
     // happened at a moment, and a branch deleted afterwards does not make it untrue. Nothing is
@@ -6590,25 +6605,71 @@ fn cmd_task_abandon(
     })?;
     let _: Vec<()> = shared;
 
+    report_abandon(
+        &ctx,
+        uid,
+        &branch,
+        &AbandonOutcome {
+            reopened,
+            final_status: &final_status,
+            worktree_removed: sess.is_some() && deferred.is_none(),
+            branch_deleted,
+            deferred: deferred.as_deref(),
+        },
+        json,
+    )
+}
+
+/// What `abandon` actually did, so the report is built from outcomes rather than from the flags
+/// that were asked for.
+struct AbandonOutcome<'a> {
+    reopened: bool,
+    final_status: &'a str,
+    /// The checkout is no longer where it was — archived, or there was none.
+    worktree_removed: bool,
+    branch_deleted: bool,
+    /// Why the checkout could not be archived from here, if it could not.
+    deferred: Option<&'a str>,
+}
+
+fn report_abandon(
+    ctx: &repo::RepoCtx,
+    uid: &str,
+    branch: &str,
+    out: &AbandonOutcome<'_>,
+    json: bool,
+) -> Result<()> {
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "uid": uid, "abandoned": true, "branch": branch, "reopened": reopened,
-                "status": final_status,
+                "uid": uid, "abandoned": true, "branch": branch, "reopened": out.reopened,
+                "status": out.final_status,
                 // What happened, not what was asked for: `--delete-branch` on a branch that was
                 // already gone deletes nothing.
-                "worktree_removed": sess.is_some(), "branch_deleted": branch_deleted,
+                "worktree_removed": out.worktree_removed,
+                "branch_deleted": out.branch_deleted,
+                "worktree_deferred": out.deferred,
             })
         );
-    } else if !reopened {
-        println!("abandoned the session for {uid}; it stays {final_status}");
-        if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
-            println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
-        }
     } else {
-        println!("abandoned {uid}; it is open again");
-        if !delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
+        if out.reopened {
+            println!("abandoned {uid}; it is open again");
+        } else {
+            println!(
+                "abandoned the session for {uid}; it stays {}",
+                out.final_status
+            );
+        }
+        if let Some(why) = out.deferred {
+            println!(
+                "  the checkout could not be archived from in here ({why}), so it is recorded for \
+                 `jkb task reap`, which the watcher service runs"
+            );
+        }
+        // Asked of git, not of the flag: `--delete-branch` on a branch that could not be
+        // deleted used to print nothing at all, which reads as "it is gone".
+        if !out.branch_deleted && gitrepo::has_branch(&ctx.root, branch)? {
             println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
         }
     }
@@ -6760,6 +6821,17 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
         if let Some(dir) = &e.archive {
             println!("  {} — archived at {}", e.uid, dir.display());
         }
+    }
+    if !archived.is_empty() {
+        // What the safety net costs, said out loud. A landed session's checkout carries the
+        // repo's build output, so this is the number that decides whether 30 days is the right
+        // window here — and the alternative way to learn it is a full disk.
+        let bytes: u64 = archived
+            .iter()
+            .filter_map(|(_, e)| e.archive.as_deref())
+            .map(archive::dir_size)
+            .sum();
+        println!("  {} held until they age out", human_bytes(bytes));
     }
     for path in &store.unreadable {
         println!("  unreadable record {}", path.display());

@@ -35,9 +35,17 @@
   // agent runs under on the host — a difference nothing had decided, and one that made a
   // cross-repo task simply impossible in here rather than deliberately refused. Everything the
   // posture does NOT grant is still absent by the kernel: ~/.ssh, ~/Documents, ~/.aws, the rest
-  // of $HOME. `workspaceFolder` still opens jkb, so this assumes the checkout is ~/repos/jkb.
+  // of $HOME.
+  //
+  // `workspaceFolder` FOLLOWS the folder you opened, and `initializeCommand` refuses one this
+  // mount cannot represent. A literal `/home/vscode/repos/jkb` here would be a different thing
+  // from the mount's target for every folder except one: opening a `jkb task work` session (which
+  // lives at `<repo>/.jkb/work/<session>`, inside the mount but not at `~/repos/<name>`) would
+  // start the agent in the MAIN checkout instead, silently, with every guard still passing —
+  // keeping those two apart being the entire point of a session. See check-workspace.sh.
+  "initializeCommand": "bash .devcontainer/check-workspace.sh ${localWorkspaceFolder}",
   "workspaceMount": "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
-  "workspaceFolder": "/home/vscode/repos/jkb",
+  "workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}",
   "mounts": [
     // The knowledge base. Shared with the host deliberately — it is the point of jkb — and every
     // write to it goes through the audited writer-actor, so damage here is undoable.

@@ -111,6 +111,25 @@ else
     bad "the declared mount set is missing ${missing_mounts[*]} — verify.sh derives its boundary from this list"
 fi
 
+# The workspace folder must be INSIDE the workspace mount's target, and the folder that decides it
+# must be refused when it cannot be. These are one rule in two halves and both are needed: a
+# `workspaceFolder` that is a literal path under the target opens whatever repo happens to sit
+# there — for a `jkb task work` session, the main checkout instead of the session — and every
+# runtime guard still passes, because the wrong repo is a perfectly good repo. The `initializeCommand`
+# is what makes the derived form safe, so its absence is a failure of this rule, not a separate one.
+ws_target="$(jq -r '.workspaceMount // ""' <<<"$dc" | sed -n 's/.*target=\([^,]*\).*/\1/p')"
+ws_folder="$(jq -r '.workspaceFolder // ""' <<<"$dc")"
+ws_ok=1
+case "$ws_folder" in
+    "$ws_target"/?*) ;;
+    *) bad "workspaceFolder ($ws_folder) is not inside the workspaceMount target ($ws_target) — the container would open a directory the mount does not place there"; ws_ok=0 ;;
+esac
+if ! grep -qF 'check-workspace.sh' <<<"$(jq -r '.initializeCommand // ""' <<<"$dc")"; then
+    bad "devcontainer.json has no initializeCommand running check-workspace.sh — a folder that is not \$HOME/repos/<name> would open a DIFFERENT checkout than the one you clicked, silently"
+    ws_ok=0
+fi
+[ "$ws_ok" -eq 1 ] && ok "the workspace folder is inside the mount, and a folder that is not is refused before create"
+
 # DERIVING THE EXPECTED SET MADE THE BOUNDARY SELF-CERTIFYING, and this is the other half of it.
 # verify.sh can now only answer "does the running container match what it declares"; adding a
 # mount to devcontainer.json makes it declared, so the runtime check would accept the two mounts

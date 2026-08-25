@@ -55,6 +55,7 @@ repos=""
 store=""
 dry=0
 self_test=0
+status_repo=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -65,6 +66,7 @@ while [ "$#" -gt 0 ]; do
         # to remove, and this one is a guess about another program's encoding — the worst kind
         # to have two of.
         --print-slug) shift; slugify "${1:-}"; printf '\n'; exit 0 ;;
+        --status)     shift; status_repo="${1:-}" ;;
         --home)      shift; home="${1:-}" ;;
         --repos)     shift; repos="${1:-}" ;;
         --store)     shift; store="${1:-}" ;;
@@ -79,6 +81,17 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 
 
 # One repo. Kept separate from the loop so the self-test can drive it directly.
+#
+# Prints one word — the STATE it left that repo in — and exits 0 for every state it recognises,
+# because "the linker ran and correctly declined" is not a failure and must not read as one.
+# `verify.sh` consumes that word: it used to infer breakage from the link's absence, which is a
+# state this function produces on purpose, so a normal collision failed container creation.
+#
+#   linked     the memory directory is a symlink into the store
+#   collision  a name exists on both sides; nothing was moved and no link was made
+#   foreign    something else already owns that path; left exactly as it was
+#   unsafe     the store holds something other than plain files (see below)
+#   error      the state could not be established
 link_one() { # link_one <projects-dir> <store-dir> <repo-path>
     local projects="$1" store_dir="$2" path="${3%/}"
     local key slug link dest
@@ -89,55 +102,88 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
 
     if [ "$dry" -eq 1 ]; then
         note "would link $link -> $dest"
+        echo linked
         return 0
     fi
-    mkdir -p "$dest" || { warn "$key: cannot create $dest"; return 1; }
+    mkdir -p "$dest" || { warn "$key: cannot create $dest"; echo error; return 0; }
+
+    # THE STORE MUST HOLD PLAIN FILES. It is written by agents on both sides of a boundary the
+    # rest of this design spends its effort maintaining, and a symlink planted in it by either
+    # side redirects the other's reads and writes wherever it points — including back into
+    # ~/.claude, the one directory nothing here may share. Memory is prose in files; a link, a
+    # socket or a device in there is not memory and is not something to quietly follow.
+    if [ -L "$dest" ] || [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+        warn "$key: $dest holds something that is not a plain file — refusing to link until it does"
+        echo unsafe
+        return 0
+    fi
 
     if [ -L "$link" ]; then
         local current
         current="$(readlink "$link")"
         if [ "$current" = "$dest" ]; then
             note "$key: already linked"
+            echo linked
             return 0
         fi
         warn "$key: $link already points at $current — left alone; remove it by hand to relink"
-        return 1
+        echo foreign
+        return 0
     fi
 
-    # A real directory here is memory written before the store existed. Move it in file by file,
-    # never over something already in the store: a collision means both sides learned something
-    # under one name, and choosing between them is not this script's call.
+    # A real directory here is memory written before the store existed. DECIDED IN FULL BEFORE
+    # ANYTHING MOVES: a scan first, and if any name exists on both sides nothing is moved and no
+    # link is made. Migrating what it could and then refusing the link left that side holding only
+    # the colliding file, with its MEMORY.md index pointing at notes it could no longer read —
+    # which is worse than never having run, the one outcome this must not produce.
     if [ -d "$link" ]; then
-        local moved=0 kept=0 entry base
+        local collisions=() entry base moved=0
         shopt -s dotglob nullglob
         for entry in "$link"/*; do
             base="$(basename "$entry")"
-            if [ -e "$dest/$base" ]; then
-                kept=$((kept+1))
-            elif mv "$entry" "$dest/$base" 2>/dev/null; then
+            [ -e "$dest/$base" ] && collisions+=("$base")
+        done
+        if [ "${#collisions[@]}" -gt 0 ]; then
+            shopt -u dotglob nullglob
+            warn "$key: ${collisions[*]} exist(s) on both sides — nothing moved, nothing linked;"
+            warn "  merge by hand, then re-run. Store: $dest  Local: $link"
+            echo collision
+            return 0
+        fi
+        for entry in "$link"/*; do
+            base="$(basename "$entry")"
+            if mv "$entry" "$dest/$base" 2>/dev/null; then
                 moved=$((moved+1))
             else
-                kept=$((kept+1))
+                shopt -u dotglob nullglob
+                warn "$key: could not move $base — stopping with the rest left in place"
+                echo error
+                return 0
             fi
         done
         shopt -u dotglob nullglob
         if ! rmdir "$link" 2>/dev/null; then
-            warn "$key: migrated $moved file(s), but $kept could not be moved — $link is left as it is"
-            return 1
+            warn "$key: $link could not be replaced by a link — left as it is"
+            echo error
+            return 0
         fi
         [ "$moved" -eq 0 ] || note "$key: migrated $moved file(s) into the store"
     elif [ -e "$link" ]; then
         warn "$key: $link exists and is not a directory — left alone"
-        return 1
+        echo foreign
+        return 0
     fi
 
-    mkdir -p "$(dirname "$link")" || { warn "$key: cannot create $(dirname "$link")"; return 1; }
-    ln -s "$dest" "$link" || { warn "$key: could not create the link"; return 1; }
+    mkdir -p "$(dirname "$link")" || { warn "$key: cannot create $(dirname "$link")"; echo error; return 0; }
+    ln -s "$dest" "$link" || { warn "$key: could not create the link"; echo error; return 0; }
     note "$key: linked $link -> $dest"
+    echo linked
 }
 
+# Every repo, and the state each was left in. Returns non-zero when any repo needs a person —
+# a caller that cannot tell a clean run from one that linked nothing has no reason to check.
 run() { # run <home> <repos> <store>
-    local h="$1" r="$2" s="$3" d
+    local h="$1" r="$2" s="$3" d state rc=0
     local projects="$h/.claude/projects"
     if [ ! -d "$r" ]; then
         warn "no repos directory at $r — nothing to link"
@@ -145,9 +191,42 @@ run() { # run <home> <repos> <store>
     fi
     for d in "$r"/*/; do
         [ -d "$d" ] || continue
-        link_one "$projects" "$s" "$d"
+        state="$(link_one "$projects" "$s" "$d")"
+        [ "$state" = linked ] || rc=1
     done
-    return 0
+    return "$rc"
+}
+
+# The state of ONE repo, printed as a single word and nothing else. `verify.sh` asks this rather
+# than inferring breakage from a missing symlink, so the container check and this script state the
+# same rule instead of opposite ones.
+status_of() { # status_of <home> <store> <repo-path>
+    local h="$1" s="$2" path="${3%/}" key slug link dest
+    key="$(basename "$path")"
+    slug="$(slugify "$path")"
+    link="$h/.claude/projects/$slug/memory"
+    dest="$s/$key"
+    if [ -L "$link" ]; then
+        [ "$(readlink "$link")" = "$dest" ] && { echo linked; return 0; }
+        echo foreign; return 0
+    fi
+    if [ -L "$dest" ] || [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+        echo unsafe; return 0
+    fi
+    if [ -d "$link" ]; then
+        local entry
+        shopt -s dotglob nullglob
+        for entry in "$link"/*; do
+            if [ -e "$dest/$(basename "$entry")" ]; then
+                shopt -u dotglob nullglob
+                echo collision; return 0
+            fi
+        done
+        shopt -u dotglob nullglob
+        echo unlinked; return 0
+    fi
+    [ -e "$link" ] && { echo foreign; return 0; }
+    echo unlinked
 }
 
 # --- self-test ---------------------------------------------------------------
@@ -167,8 +246,11 @@ if [ "$self_test" -eq 1 ]; then
     got="$(slugify /Users/jagnew/repos/jkb/.jkb/work/mount-all-of-repos-into-the-dev)"
     want="-Users-jagnew-repos-jkb--jkb-work-mount-all-of-repos-into-the-dev"
     check "the slug rule reproduces the observed key" "$([ "$got" = "$want" ] && echo yes || echo no)"
-    check "a container path keys separately from the host one" \
-        "$([ "$(slugify /home/vscode/repos/jkb)" != "$(slugify /Users/you/repos/jkb)" ] && echo yes || echo no)"
+    # The CONTAINER key, by value. Asserting merely that two different inputs give two different
+    # outputs cannot fail under a character-wise mapping — it was a test in the shape of a test.
+    # This is the literal `verify.sh` and the README both name, so a change to either shows here.
+    check "the container path keys to -home-vscode-repos-jkb" \
+        "$([ "$(slugify /home/vscode/repos/jkb)" = "-home-vscode-repos-jkb" ] && echo yes || echo no)"
 
     mkdir -p "$t/repos/jkb" "$t/repos/other"
     # Pre-existing memory, as an un-migrated host has.
@@ -186,24 +268,43 @@ if [ "$self_test" -eq 1 ]; then
         "$([ "$(cat "$t/.jkb/claude-memory/jkb/one.md" 2>/dev/null)" = hello ] && echo yes || echo no)"
     check "every repo under the repos dir is linked" \
         "$([ -L "$t/.claude/projects/$(slugify "$t/repos/other")/memory" ] && echo yes || echo no)"
+    check "--status agrees with what was done" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = linked ] && echo yes || echo no)"
 
     # Idempotent: the verb runs on every container create and on every host re-run.
     run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
     check "re-running changes nothing and keeps the content" \
         "$([ -L "$link" ] && [ "$(cat "$t/.jkb/claude-memory/jkb/one.md" 2>/dev/null)" = hello ] && echo yes || echo no)"
 
-    # A collision must be REPORTED and both copies kept — the whole point of not picking a winner.
-    rm "$link"; mkdir -p "$link"; echo theirs > "$link/one.md"; echo new > "$link/two.md"
+    # A COLLISION MOVES NOTHING. Migrating what it could and then refusing the link left this
+    # side holding only the colliding file, with its index naming notes it could no longer read.
+    rm "$link"; mkdir -p "$link"
+    echo theirs > "$link/one.md"; echo new > "$link/two.md"
     run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
     check "a colliding name is not overwritten in the store" \
         "$([ "$(cat "$t/.jkb/claude-memory/jkb/one.md" 2>/dev/null)" = hello ] && echo yes || echo no)"
-    check "the colliding copy is left where it is, not deleted" \
+    check "the colliding copy is left where it is" \
         "$([ "$(cat "$link/one.md" 2>/dev/null)" = theirs ] && echo yes || echo no)"
-    check "the non-colliding file beside it still moved into the store" \
-        "$([ -f "$t/.jkb/claude-memory/jkb/two.md" ] && echo yes || echo no)"
+    check "and so is every file beside it — nothing moved at all" \
+        "$([ -f "$link/two.md" ] && [ ! -f "$t/.jkb/claude-memory/jkb/two.md" ] && echo yes || echo no)"
+    check "the state is reported as a collision, not as breakage" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = collision ] && echo yes || echo no)"
+    check "run() reports that a repo needs attention" \
+        "$(run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1 && echo no || echo yes)"
+
+    # A symlink in the store redirects the other side's reads and writes wherever it points.
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"
+    mkdir -p "$t/.jkb/claude-memory/jkb" "$t/elsewhere"
+    ln -s "$t/elsewhere/leak" "$t/.jkb/claude-memory/jkb/one.md"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a store holding a symlink is refused, not linked into" \
+        "$([ ! -L "$link" ] && echo yes || echo no)"
+    check "and says so" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
 
     # A symlink somebody else made is reported, never retargeted.
-    rm -rf "$link"; mkdir -p "$t/elsewhere"; ln -s "$t/elsewhere" "$link"
+    rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"
+    rm -rf "$link"; ln -s "$t/elsewhere" "$link"
     run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
     check "a foreign symlink is left pointing where it pointed" \
         "$([ "$(readlink "$link")" = "$t/elsewhere" ] && echo yes || echo no)"
@@ -217,5 +318,9 @@ fi
 # --- the verb ----------------------------------------------------------------
 repos="${repos:-$home/repos}"
 store="${store:-$home/.jkb/claude-memory}"
+if [ -n "$status_repo" ]; then
+    status_of "$home" "$store" "$status_repo"
+    exit 0
+fi
 echo "==> shared claude memory ($store)"
 run "$home" "$repos" "$store"
