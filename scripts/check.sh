@@ -42,4 +42,27 @@ else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"
 fi
 
+# The auto-mode posture (design D48) is committed data that a script consumes, so it is part of
+# the gate too: the tests are hermetic (a temp CLAUDE_CONFIG_DIR, no session, no network) and
+# they generate their drift cases FROM the posture file, so a key added there is covered without
+# anyone remembering to add a case. Skipped gracefully when jq is absent; CI always runs it.
+echo "==> auto-mode posture (scripts/auto-mode.sh)"
+if command -v jq >/dev/null 2>&1; then
+    "$(dirname "$0")/auto-mode-test.sh"
+else
+    echo "   (skipped: jq not installed — 'brew install jq'; CI runs this gate)"
+fi
+
+# The dev container's configuration (design D49). Static only — no Docker — so it belongs in the
+# gate; the parts that need a container are .devcontainer/verify.sh and mutate-verify.sh. It
+# mainly guards the GENERATED seccomp profile, whose patch silently no-opping against a changed
+# upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
+echo "==> devcontainer config"
+"$(dirname "$0")/../.devcontainer/check-config.sh"
+
+# ...and every assertion in it, watched failing. check-config.sh had no such harness while
+# verify.sh did, and three review rounds each found the same defect in it — an assertion that
+# cannot fail. Needs no Docker either, so it belongs in the gate rather than beside mutate-verify.
+"$(dirname "$0")/../.devcontainer/mutate-config.sh"
+
 echo "All checks passed."

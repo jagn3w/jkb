@@ -13,7 +13,7 @@
 //! agent heartbeat, precisely so a paused-but-alive agent (e.g. blocked on a permission
 //! prompt) is never reclaimed. The `claimant_id` is a liveness-checkable owner id
 //! (`host:pid`+run, or `session:<pid>:<worktree>`); the probe lives at the CLI/coordinator
-//! edge (`owner::is_alive` — `ps -p` for a process owner, worktree existence for a
+//! edge (`owner::is_alive` — `kill(pid, 0)` for a process owner, worktree existence for a
 //! session owner) — this
 //! module only records who holds what. Every seam here is **changelogged** (op
 //! `claim`/`release`) for audit; they are not auto-reverted by undo (which inverts only

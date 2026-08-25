@@ -1145,6 +1145,476 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   enforced: making every post-review fixup force a re-review is the fastest way to make people
   reach for `--no-review` by reflex.
 
+## Unattended Claude: the sandbox is the guarantee, the classifier is the ergonomics (D48)
+
+Running the IDE and the CLI with no permission prompts, with a boundary that holds when the
+model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; design in
+`openspec/changes/jkb-safe-auto-mode/`.
+
+- **Claude Code already ships the boundary, so we do not build one.** 2.1.237 embeds
+  `@anthropic-ai/sandbox-runtime`: every Bash command is re-executed under `sandbox-exec` with a
+  generated seatbelt profile (macOS) or `bubblewrap` + seccomp (Linux), with a settings schema
+  covering `filesystem.{allowWrite,denyWrite,denyRead,allowRead,disabled}`,
+  `network.{allowedDomains,strictAllowlist,allowUnixSockets,…}` and `credentials.{files,envVars}`.
+  That is strictly more targeted than a container — per-command OS confinement **plus** an egress
+  allowlist **plus** credential denial, on the host, with the host toolchain.
+- **Two layers, because they fail differently.** `--permission-mode auto` is a **classifier**
+  (`claude auto-mode defaults` prints its rules as English prose): it decides what is worth
+  asking about, it can be wrong, and it buys ergonomics. The sandbox bounds what happens when it
+  is wrong, and it buys the guarantee. `autoAllowBashIfSandboxed` joins them — a sandboxed
+  command is never shown to the classifier, so the OS boundary **is** the check.
+- **`bypassPermissions` is the wrong mode, precisely.** The sandbox confines Bash and its
+  children; it does **not** confine the in-process tools — the schema says so about
+  `strictAllowlist` ("in-process tools such as WebFetch are not gated by this setting"). Skipping
+  permissions leaves Read/Edit/Write/WebFetch unbounded, a hole the shape of the file-editing
+  tools. `auto` keeps the classifier over exactly what the kernel does not cover, and the
+  posture's `permissions.deny` rules close the named paths in **both** layers at once (the schema
+  merges `Read(...)` deny rules into `filesystem.denyRead`, `Edit(...)` into `denyWrite`) — one
+  list, two enforcers, rather than two lists that drift.
+- **The posture is user-level, and Claude Code enforces that.** Several keys are honored only
+  from user/managed/`--settings`, and the binary carries an **operator-posture guard** that
+  refuses to run when a repo's `.claude/settings.json` negates `sandbox.enabled`,
+  `sandbox.failIfUnavailable`, `sandbox.allowUnsandboxedCommands` or `disableAllHooks`
+  ("operator posture belongs in the user-level settings.json"), and likewise refuses a project
+  `env` block (`BASH_ENV`/`LD_PRELOAD`/`NODE_OPTIONS`/`GIT_*` are unsandboxed-exec inlets). So a
+  cloned repo cannot switch it off — and installing the posture into a repo would silently drop
+  half of it. It also has to hold in **every** repo under `~/repos`, which is why this is not jkb
+  configuration.
+- **Four settings, each closing one silent degradation.** `failIfUnavailable: true` is the hard
+  gate: its default is `false`, under which a *warning* prints and commands run **unsandboxed** —
+  the exact failure of believing you are protected. `allowUnsandboxedCommands: false` deletes the
+  `dangerouslyDisableSandbox` parameter, or one argument steps outside and in auto mode nobody is
+  asked. `network.strictAllowlist: true` **denies** rather than prompting, because a prompt in
+  auto mode is a question nobody answers. `enabled: true` is the rest.
+- **File access is an allowlist, both ways.** Writes were already default-deny (workspace only),
+  so `filesystem.allowWrite` *is* the allowlist. Reads are default-deny too:
+  `denyRead: ["~", "/Volumes"]` blankets the user's data and `allowRead` — which takes precedence
+  over `denyRead` — re-opens the work roots and the toolchain. System paths (`/usr`, `/bin`,
+  `/Library`) are deliberately **not** denied: a command that cannot read its own dynamic linker
+  cannot run, so "allowlist everything" is not a posture but an inoperative machine; what is
+  denied by default is *your data*, which is what a leak is about. The in-process `Read` tool
+  **cannot** be made default-deny — Claude Code's rule model is deny-beats-allow with no
+  re-allow, so a blanket `Read(~/**)` could never be punched through for `~/repos` — so there it
+  is an enumerated deny list plus an empty `additionalDirectories`, and the stronger option
+  (deny the `Read` tool outright, read through sandboxed `cat`/`rg`) is offered, not imposed.
+- **What actually runs unsandboxed**, since that is the residual worth naming: `Read`/`Glob`/
+  `Grep` (bounded by deny rules only), `Write`/`Edit`/`NotebookEdit` (deny rules + the permission
+  scope), `WebFetch`/`WebSearch` (the schema states in-process tools are **not** gated by
+  `strictAllowlist`), **MCP servers** (long-lived processes started at session start, never
+  per-command wrapped — `jkb mcp` is one), **hooks** (not evidenced as sandboxed anywhere in the
+  binary), and the `claude` process itself. Bash and everything it spawns — which is where the
+  real capability lives — is the sandboxed part. Three keys answer what can be answered:
+  `permissions.ask: ["WebFetch"]` (Read-anything ∘ WebFetch-anywhere is read-everything-send-
+  anywhere outside the kernel boundary — the one composition that defeats the posture, so it is
+  the single surviving prompt), `disableBypassPermissionsMode: "disable"` (the in-process layer
+  is the *only* bound on those tools, so being able to switch it off is being able to remove
+  them all), and `defaultMode: "auto"` (without it every IDE session starts prompting, and the
+  ergonomic half of the ask is silently unmet).
+- **The one place the obvious sketch inverts.** Granting `~/.claude` write access is the grant
+  that must not be made: `~/.claude/settings.json` **is** the posture, so an agent that can write
+  it can disable its own sandbox next session, and the guard above does not defend the file it
+  lives in. The deny is kept narrow — `~/.claude/projects/**` stays writable (the auto-memory),
+  and a repo's own `.claude/settings.json` stays writable because it cannot weaken the posture.
+- **`check` is two generic rules, not a list of assertions.** Claude Code enforces the boundary;
+  re-checking its enforcement here would be a second model of the world. What is ours is that
+  **the posture is a file and files drift** — Claude Code appends to `permissions.allow` on every
+  "always allow", `/statusline` edits the same file, `claude auto-mode reset` rewrites a section.
+  So the posture file has two halves and `check` asks two questions. **`require`** (what `install`
+  merges): is it a **deep subset** of the effective settings? Arrays are subset-by-membership,
+  never equality, so domains you add yourself are fine. **`forbid`**: is each named key empty or
+  absent? That second rule exists because **a subset check cannot express emptiness** — a posture
+  entry of `excludedCommands: []` would assert nothing, and `excludedCommands` is the sandbox's
+  own bypass list ("all bash commands must run in the sandbox unless they are explicitly listed
+  in excludedCommands"); `permissions.additionalDirectories` is the other, since it widens the
+  only bound the unsandboxed tools have. Adding a key to either half extends the check *and* the
+  **tests**, which generate their cases from the posture file (flip every boolean, drop every
+  list entry, populate every forbid key).
+- **The sandbox engages — established on the host, with a control** (D48.14). This was the last
+  open question of D48/D49, and it is settled for the host: with the posture installed, a `$HOME`
+  write is refused with **`EPERM`** while a control write inside `~/repos` succeeds. Neither TCC nor
+  ordinary permissions explains that — `$HOME` is `drwxr-x---` owned by the user — and the read side
+  tracks the posture exactly across three plain dotfiles of identical TCC status: `~/.gitconfig` and
+  `~/.zshrc` readable (both `allowRead`), `~/.zsh_history` denied. The container case is separate
+  and still open: it needs an authenticated session *inside* the container, because the sandbox
+  wraps commands Claude Code runs and a plain `docker run` shell has no Claude Code in it.
+  - **`CLAUDE_CODE_SANDBOXED` is not the test, and this file used to say it was.** It was **unset**
+    throughout the measurement above. `auto-mode.sh sandboxed` asks the kernel instead — a control
+    write inside an allowWrite root, a canary write to `$HOME` — and reports CONFINED / NOT CONFINED
+    / **INCONCLUSIVE**. Three rounds reported CONFINED for refusals that were nothing to do with
+    the sandbox — a directory squatting the canary path, an absent `$HOME`, a read-only `$HOME`,
+    then a writable `allowWrite` subdirectory *beneath* an unwritable one — each fix adding another
+    observation to establish the premise *a write to `$HOME` would otherwise have landed*. **That
+    premise is not establishable from inside**: the sandbox intercepts `access(2)` too, so
+    `[ -w $HOME ]` reports policy rather than permissions and every side channel is filtered by the
+    thing being detected. The **errno answers it directly and subsumes all of them** — `EACCES` is
+    the permission bits, `ENOENT` is no parent, `EISDIR` is something in the way, and only `EPERM`
+    (seatbelt) or `EROFS` (a bubblewrap read-only bind) is policy. Compared numerically, so no
+    locale or wording is involved. The verdict stays a **pure function** so the unconfined arm is
+    testable from a confined machine, and the classifier is pinned against real kernel answers.
+  - Costs nothing and needs no session, unlike `probe` — which remains the fuller check (egress and
+    credential reads as well) and which correctly reported **INCONCLUSIVE** here rather than a pass,
+    because a subprocess `claude` has no credentials in an agent session (`loggedIn: false` even
+    with the sandbox explicitly overridden off, which is what attributes it to auth and not to the
+    posture).
+- **The posture makes Docker unreachable, and that is the right answer.** After installing it,
+  `~/.docker/bin/docker` fails with `Operation not permitted` — the directory is under
+  `denyRead: ["~"]` and in no `allowRead` entry. An unattended agent that can reach Docker can
+  mount `/` into a container and is root on the host, so this is the boundary doing its job; the
+  cost is that `.devcontainer/verify.sh` and `mutate-verify.sh` become **human-run** steps, which
+  is now stated where they are documented rather than discovered when they stop working.
+- **Installing it for real found two things no amount of checking could.** `install` ran clean
+  (preflight green, 45 pre-existing allow rules and the theme preserved, `/tmp`, `$TMPDIR` and
+  `mktemp` all still working — the three failures of the first attempt, absent), and then:
+  - **Three `Write(...)` deny rules were inert, and Claude Code says so on every session start**:
+    *"Write(path) is not matched by file permission checks — only Edit(path) rules are. Use
+    Edit(path) instead (Edit rules cover all file-editing tools)."* The `Edit(...)` rules for the
+    same three paths were already there, so nothing was unprotected — but an inert rule in a
+    security posture reads as protection, and a warning printed at every start is how people learn
+    to ignore warnings. **The `claude doctor` schema check could not catch it**: the rules are
+    schema-valid, and what is wrong is their *semantics*. Only running it surfaced them.
+  - **A subset merge cannot express removal**, which is the same shape as the reason `forbid`
+    exists (a subset check cannot express emptiness). Deleting those three rules from `require`
+    did nothing: the merge is add-only for arrays — deliberately, so your own `permissions.allow`
+    survives a re-install — so an entry once installed stays for ever while `check` tolerates it
+    as an extra. The posture gained a third half, **`retire`**: array members it has withdrawn,
+    removed by `install` and reported as drift by `check`. Without it the only repair is editing
+    `settings.json` by hand, which is the thing this script exists to stop people doing.
+  - **And the agent locked itself out, exactly as designed.** The first `install` succeeded because
+    the deny rule was not yet in force; the repairing `install` could not write, and said so:
+    *"the posture denies writes to itself, so installing or repairing it is deliberately a human
+    action."* That property had only ever been asserted in a comment. It is now demonstrated — and
+    it means a posture repair is the operator's to run, which is the correct end state and worth
+    knowing before you need it.
+  - `jq` gotcha, pinned by a test: `false // x` is `x`, so the obvious spelling of "the value, or
+    null if absent" turns every correct `false` into a failure — and the strongest setting here
+    (`allowUnsandboxedCommands`) is exactly that shape. Use `has`, never `//`.
+- **The posture is validated against Claude Code's own schema.** `claude doctor` reports settings
+  violations for the directory it runs in, so the tests hand it the committed `require` block in
+  a temp project and fail on `Invalid settings` — a typo'd key or an out-of-range enum installs
+  cleanly, is ignored at runtime, and is indistinguishable from a posture in force. That check
+  was **inert when first written**: the stub `claude` the `run` tests put on `PATH` shadowed the
+  real binary, so it was validating against a stub that prints nothing, and only the mutation run
+  found it. Resolve the real binary before the stub exists.
+- **`probe` takes its verdict from the filesystem, not the transcript** — what a model narrates
+  about its own confinement is not evidence. It needs a real billed session, so it is this
+  change's `#[ignore]` test and is never in `check.sh`. **Two files, because one cannot tell the
+  two failures apart**: "the canary is absent" is evidence the *sandbox* denied the write only if
+  the session ran the command at all, and with the sandbox off — the state the probe exists to
+  detect — Bash is no longer auto-allowed, so the **classifier** gets the out-of-bounds write and
+  will very likely refuse it, and an absent canary would read as a clean pass. A control file
+  written inside the workspace separates "denied at the boundary" from "never ran", and the
+  second is reported **inconclusive**, never as a pass. The canary is deliberately not
+  dot-prefixed: `~/.jkb-…` shares a prefix with the allowed `~/.jkb`, and that near-miss is how a
+  probe comes to lie.
+- **The container: measured, and the first answer here was wrong.** This section originally
+  argued a container "buys nothing, because the sketch mounts `~/repos` and `~/.claude` and that
+  *is* the blast radius". That is right about **Bash** and wrong about everything else — the
+  generalisation was the error. For the in-process tools a container is not a second copy of the
+  seatbelt: it puts the `claude` process itself in a mount namespace, so `Read`/`Glob`/`Grep`/
+  `Edit` become default-deny **by the kernel**, which is exactly what the deny-beats-allow rule
+  model cannot express. Genuine depth, and it closes the hole above.
+  - **Whether the layers compose was measured** (Lima VM, Ubuntu 26.04 / kernel 7.0, Docker 29.7),
+    with a no-container baseline first so a failure is attributable to the container profile and
+    not the kernel. **Stock Docker cannot host it** — not root, not non-root, not with
+    `--cap-add SYS_ADMIN`, not with AppArmor off; `bwrap` fails at namespace creation every time.
+    The blocker is **seccomp**, and the fix is narrower than the folklore: neither `--privileged`
+    nor `seccomp=unconfined` is required. Docker's *default* profile plus an unconditional allow
+    for `clone, clone3, unshare, setns, mount, umount2, pivot_root, mount_setattr, open_tree,
+    move_mount, fsopen, fsconfig, fsmount, fspick` suffices — and those are then usable only
+    *inside* the user namespace `bwrap` creates, where the process holds no privilege over the
+    host. It must also run **non-root**: with seccomp off, root in a container still cannot create
+    a mount/net/pid namespace directly. Dev Containers already default to non-root.
+  - **Two questions, and only one is about Docker.** Docker hosts limited mounts trivially — that
+    is where the default-deny read property comes from, and it needs no seccomp work. The table is
+    about the *different* question of running Claude Code's own sandbox **nested inside** such a
+    container. "Stock Docker cannot host it" conflated them: false of the mounts, true only of the
+    nesting. **Container-only is available today**; the seccomp profile is the price of keeping
+    both layers, not of admission.
+  - **Not established:** that Claude Code *itself* engages or refuses in a container. Two probes
+    failed instructively. `claude -p` with an **invalid** key hangs with zero output — and hangs
+    identically with no sandbox config, so the control proved it was the fake key; with **no** key
+    it exits in a second (`Not logged in`), so Claude Code runs fine in a stock container. That
+    suggested a credential-free discriminator, since `failIfUnavailable` is documented to error at
+    startup and so should precede auth — **it does not**: in a stock container, where bwrap
+    provably cannot create a namespace, it still printed `Not logged in`. So the sandbox is
+    checked lazily, or auth precedes it; either way the probe cannot discriminate and the
+    prediction behind it was wrong. Settling it needs a real session plus one `printenv
+    CLAUDE_CODE_SANDBOXED` — i.e. credentials inside the container, which is the credential
+    owner's call.
+  - **What it does not buy:** `~/repos` mounted is still writable and push-able — the win is
+    bounded to what you did not mount. And container egress is unrestricted by default, so if the
+    inner sandbox ever fails to start you lose `strictAllowlist`; a container without its own
+    iptables/ipset allowlist is a **downgrade** on egress. On macOS both container paths are a
+    Linux VM, so the native loop (pinned rustup, `sqlite-vec` FFI, headless Chrome, launchd,
+    worktrees under `~/repos`) has to be re-plumbed. That cost is unchanged; what changed is that
+    the security argument now favours the container where it did not before.
+- **Cross-platform, with the differences named rather than smoothed over.** The posture file is
+  `~`-relative and carries both platforms' paths; macOS-only keys (`allowAppleEvents`,
+  `enableWeakerNetworkIsolation`, `allowUnixSockets`) are inert on Linux and harmless. What
+  actually differs: the mechanism is **bubblewrap + seccomp**, so `bubblewrap` and `socat` must be
+  installed — `check` **warns** and `run` **refuses**, deliberately split, because "has the posture
+  drifted" and "can this machine honour it" are different questions with different fixes and one
+  exit code must not mean both. `denyRead` covers `/media`, `/mnt` and `/run/media` as well as
+  `/Volumes` — `/mnt` being the most valuable entry on WSL, where the Windows filesystem lives —
+  and `~/.cache` is in `allowRead`/`allowWrite` because without it a Linux build cannot read its
+  own caches, and a posture too tight to work is one that gets switched off.
+  - **`JKB_AUTO_MODE_SSH_AGENT` is macOS-only, and now says so.** `allowUnixSockets` is documented
+    "Ignored on Linux (seccomp cannot filter by path)", so the overlay was a flag that reported
+    success and did nothing — a guard that cannot fire. Linux's only lever is
+    `allowAllUnixSockets`, all-or-nothing, which is not something to switch on behind a flag whose
+    name promises a single socket. The test is branched per platform and each branch was run on
+    its own platform, not inferred.
+- **`preflight` exists because every live breakage was knowable without installing.** The first
+  real install denied its own settings file, `$TMPDIR` and `/tmp`, and all three are facts about
+  the machine's *resolved* paths rather than about the settings file — so no amount of checking
+  the posture could find them. `auto-mode.sh preflight` resolves what the machine actually needs
+  (`$TMPDIR`, the real path of `/tmp`, `$PWD`, the settings file, the toolchain roots) and reports
+  any that no `allowRead`/`allowWrite` entry covers; `install` runs it and **refuses** on a gap
+  (`--force` overrides). Verified by reverting the posture to the version that broke the machine:
+  it names all three, each with its fix.
+  - **It compares against the entries AS WRITTEN, not only resolved.** Resolving both sides makes
+    `/tmp` and `/private/tmp` agree, which would have hidden the exact symlink mismatch that
+    denied `/tmp` — the sandbox matched the real path while the posture named the link. A path
+    covered *only* after resolution is reported as a latent gap, not as covered.
+  - **A passing preflight names what it cannot check.** `install` refuses on its verdict, which
+    makes it read as authoritative, so "no gaps — this posture is workable" claimed far more than
+    a filesystem-path check supports. It now says "no FILESYSTEM gaps" and prints the four blind
+    spots every run: setuid-root exec (refused under any posture, not configurable, surfacing as
+    an opaque exec denial — it cost a peer session a red gate), unix sockets, the unvalidated
+    domain allowlist, and whether the sandbox engages at all. Same rule as everywhere else here —
+    an unstated gap in a tool something gates on is indistinguishable from coverage.
+  - **Deliberately not in `check.sh`**: whether the real posture covers the real paths depends on
+    where the checkout lives (`~/repos` on a dev box, `/home/runner/work` in CI), so a passing
+    assertion would be a test of the machine. The tests exercise the *logic* — a posture covering
+    nothing is refused, one covering everything is not, a symlink listed only by its link name is
+    flagged.
+  - **It asked the deny side against `$HOME` while the posture declares five deny roots.** The
+    posture also blankets `/Volumes`, `/media`, `/mnt` and `/run/media`, so a cargo home on an
+    external volume — or, on WSL, anything under `/mnt/c`, which is where the Windows filesystem
+    lives — was reported "outside denyRead", `install` was not refused, and every sandboxed build
+    then failed to read its own registry. Exactly the two-readers-of-one-fact shape this file
+    argues against everywhere else, in the tool whose whole job is to predict that breakage.
+    `denyRead` is now read from the posture like its allow-side siblings.
+  - **`cd ""` succeeds in bash, which quietly made an empty posture list mean `$PWD`.** jq prints
+    nothing for an empty array, a here-string of nothing is still **one empty line**, and the
+    resulting empty entry resolved to the current directory and entered the list as a prefix.
+    **It never produced a false pass** — reproduced against a posture covering nothing, `$PWD`
+    still reports a GAP, because the arrays feeding the *covered* branch are built without `cd`
+    and `covered()` skips an empty prefix. What it produced was the wrong **remedy**: the checkout
+    matched the resolved-only list, so the gap advised "covered only if the sandbox follows
+    symlinks, list it literally" instead of "is in no allowWrite entry" — and on the deny side it
+    would have been a false GAP, over-strict rather than under. (An earlier version of this bullet
+    claimed the checkout read as *covered*. That was wrong, and wrong in the dangerous direction;
+    a reviewer caught it and the paragraph now records what running it shows.) Fixing it exposed
+    the other half: arrays that had always held at least one element could now be genuinely empty,
+    and `"${arr[@]}"` under `set -u` on bash 3.2 aborts the script. Both were latent behind the
+    same masking bug.
+  - **`set -e` made the three-state check unreachable.** `settings_state` returns 0/1/2 and a bare
+    call returning non-zero aborts the script before `case $?` runs, so the distinction existed
+    and never fired. `|| st=$?` is what turns a return code into a value. Caught by the tests,
+    and pinned by reverting it.
+- **`~/Documents` is a useless sandbox canary on macOS.** TCC denies it to the terminal whether or
+  not any sandbox is running, so a probe that reads it always looks confined — which is how a
+  restored, sandbox-free machine was briefly misreported here as still sandboxed. Test
+  confinement against a path the posture itself governs, never one the OS already protects.
+- **The liveness probe stopped shelling out (D48.12), and the dilemma dissolved.** `ps` is
+  setuid-root on macOS, a sandboxed process cannot exec setuid, so under this posture
+  `owner::pid_exists` could never run and every `host:pid` owner read as `Fact::Unknown`. The only
+  sandbox-level lever was `sandbox.excludedCommands`, which runs a command **wholly outside** the
+  sandbox — and `forbid` requires that list empty precisely because `require` cannot bound it
+  (subset semantics would let `["ps"]` become `["ps","bash"]`). Neither was needed: `ps` was
+  chosen over `kill -0` because it reports processes it does not own (D27.2), and that reasoning
+  is about the **shell builtin**, which collapses `EPERM` and `ESRCH` into one non-zero exit. The
+  *syscall* separates them, and **`EPERM` is positive evidence of existence** — the kernel refuses
+  because the process is there and is not ours. `rustix::process::test_kill_process` is a safe
+  wrapper (no `unsafe`, and rustix was already in the tree), so the probe needs no subprocess, no
+  `PATH`, and no setuid binary.
+  - **Better with no sandbox in the picture at all**, which is the test that keeps it from being
+    chosen for the wrong reason: no fork/exec per probe, no `PATH` dependency, identical on macOS
+    and Linux. The mapping is a pure function, so the `Unknown` arm — the one that protects every
+    claim — is an ordinary assertion instead of needing a deliberately-broken spawn (the previous
+    version reached it by naming a nonexistent program, after an earlier one emptied `PATH` and
+    reddened the shared gate one run in six).
+  - **A pid outside `pid_t` is `No`, not `Unknown`**: no process can carry that id, so its absence
+    is established rather than unobserved. That preserves the prior behaviour exactly.
+  - **Untested:** whether a sandbox profile permits `kill(pid, 0)` against a *foreign-owned*
+    process. It barely matters in practice — jkb's claimants are the same user's processes, so the
+    live answers are `Ok`/`ESRCH`, neither of which needs privilege — and a denial would return
+    `EPERM`, i.e. "alive", which is the safe direction (never reclaims live work).
+- **A review round found six must-fix and eight concerns, and four of them were one shape**
+  (D48.13): an assertion that matched text present on **both** the pass and fail paths, or read a
+  file nothing had written. `mutate-verify.sh` grepped a label `verify.sh` prints identically
+  either way, so 2 of 5 mutations reported CAUGHT with the guard deleted — under a summary line
+  reading "every guard fired". `verify.sh`'s mount check filtered `mountinfo` by target prefix, so
+  it *was* the list of absences this file claims it is not; `/var/run/docker.sock` passed. The
+  seccomp assertion was satisfied by the generator's own trailing allow group, true by
+  construction. And a Linux-only test grepped an argv file `run` never creates, passing having
+  observed nothing. The fix is the same in all four: **assert on a discriminating signal** — a
+  non-zero exit plus the FAIL-only rendering, the full mount set minus the runtime's own, the
+  negative "no restricted entry still names these", the precondition that the file exists — and
+  where a harness judges other guards, give it a **negative control**: an unmutated run must be
+  reported MISSED, or the matcher is matching something present when nothing is wrong.
+  - **The next round's must-fix was inside that round's fix, and it is the same shape one level
+    up.** Removing the credential mount and renaming the cargo volume deleted **three** lines of
+    `verify.sh`'s hand-written mount list where two were intended, dropping `.cargo/registry` — so
+    a correctly-built container failed its own verifier, after the full toolchain build, because
+    `setup.sh` ends by running it. Two lists that must agree **is** the defect: the list is now
+    **derived** from `devcontainer.json` (both the string and object mount spellings), so there is
+    one. A `CARGO_TARGET_DIR` guard added an hour earlier pinned a single string in that very file
+    and could not see the list beside it — a guard aimed at the instance, not the class.
+  - **The third round found the same class again, so the fix stopped being a fix and became a
+    harness.** `verify.sh` had `mutate-verify.sh` watching it fail; `check-config.sh` had nothing,
+    and rounds two and three each found an assertion in it that could not fail — a regex that
+    could not cross a shell quote and so never caught the exact code it existed to prevent, and a
+    rewrite that dropped the `type=volume` half of its own check while keeping the failure message
+    about volumes. Hand-mutating after each round works until nobody does it.
+    `.devcontainer/mutate-config.sh` breaks each config property in turn (18 of them) and requires
+    a FAIL naming it, with the same negative control — and it needs no Docker, so unlike
+    `mutate-verify.sh` it runs in `check.sh` and CI. **It found a live one on its first run**: the
+    seccomp assertion grepped for the `seccomp=…` value anywhere in the file, so deleting the
+    `--security-opt` flag and orphaning its value passed — Docker would apply its default profile,
+    bubblewrap would fail, and the config still read as declaring one. It is asserted as a
+    flag/value pair in `runArgs` now.
+  - **A skip decided per-assertion is not a skip.** `run` refuses on a Linux host without
+    bubblewrap, correctly — but the argv assertions ran unconditionally, so the shared gate went
+    red for a fact about the machine; and the drift assertion three lines below asked only for a
+    non-zero exit and no argv file, which is *exactly* what that dependency refusal produces. It
+    would have reported a pass having never exercised the refusal it names. The group is skipped as
+    a group, announced, and the drift assertion now matches the refusal **text**.
+- **Two more were the posture not covering what the machine needs**, the D48.10 shape again in a
+  new place: `CARGO_TARGET_DIR` was a *sibling* of the allowlisted `~/.cargo`, and `covered()`
+  matches at component boundaries, so `denyRead: ["~"]` blanketed every sandboxed build in the
+  container while both guards reported it healthy. Moved inside `~/.cargo/target`, and `preflight`
+  now reads `CARGO_TARGET_DIR` so the class is checkable rather than latent.
+- **`install`'s preflight gate turned CI red**, which is the coupling CLAUDE.md already says to
+  avoid: preflight asks about the *machine*, and the hermetic suite drove `install` through it, so
+  on a runner (`/home/runner/work/...`, under no allowWrite root) install wrote nothing and two
+  assertions passed **vacuously** on the empty result. The suite now passes `--force`, and the gate
+  gets one deliberate test of its own instead of being exercised incidentally by all of them.
+- **The credential mount could not work on macOS.** `~/.claude/.credentials.json` is Linux/WSL
+  only — macOS keeps credentials in the Keychain — and a bind mount with a missing source is a
+  hard error, so the container never started on the host this repo is developed on. Removed
+  entirely: authenticate *inside* the container (`claude auth login`), into the state volume,
+  which also fixes the read-only mount that a login could not have written.
+  - **Removing a mount left the plumbing shaped around it.** `setup.sh`'s symlink loop linked only
+    the *directories* under `~/.claude`, because the credential file was the one thing bind-mounted
+    and the loop had to go around it. With the mount gone, nothing linked it — so an in-container
+    login sat in the writable layer and died with the next rebuild, while `devcontainer.json`
+    promised the opposite. `.credentials.json` and `~/.claude.json` are now linked into the volume
+    too, dangling until first write. The residual is stated rather than designed away: a writer
+    that replaces a file by temp-and-rename would drop the link, which costs one re-login at the
+    next create and can never reach the host.
+- **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
+  not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
+  processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not
+  yours). Any allowlisted host is an exfiltration channel — egress control bounds *where*, not
+  *what*. And a posture too tight to work gets switched off, which is why `check` tolerates
+  entries you add and `probe` reports inconclusive rather than pass. `~/.ssh` being unreadable means SSH pushes
+  fail inside the sandbox (correct for an unattended agent; `JKB_AUTO_MODE_SSH_AGENT=1` allows the
+  agent **socket** instead of the key, so it can authenticate but never read it). `localhost`
+  egress and that socket overlay are unverified without a live session, and both fail in the safe
+  direction.
+
+## Both layers: the dev container with the sandbox nested inside (D49)
+
+`.devcontainer/` is the "both" configuration of D48 — a container **and** Claude Code's own
+sandbox running inside it. `scripts/auto-mode.sh` alone is host-only; this adds the one property
+the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7, D49).
+
+- **The container's job is file access; the sandbox's job is everything else.** An unmounted host
+  path does not exist in the container, so the in-process tools (`Read`/`Glob`/`Grep`/`Edit`) are
+  bounded by the **mount namespace** rather than by permission rules — default-deny by the kernel,
+  which the deny-beats-allow rule model cannot express at all. The nested sandbox still supplies
+  per-command Bash confinement and the precise hostname allowlist.
+- **The egress firewall exists because `strictAllowlist` lives inside the layer that might not
+  start.** A container's default egress is unrestricted, so a container whose nested sandbox
+  failed silently would be a **downgrade** on exfiltration versus the host. `init-firewall.sh` is
+  coarse (IP-level) and independent; the sandbox is precise (hostname at a proxy) and in-process.
+  Coarse-but-independent under precise-but-fragile is the point — they fail for different reasons.
+  - **One allowlist, not two.** The firewall reads `.require.sandbox.network.allowedDomains` out
+    of `scripts/auto-mode-posture.json` — the same file the sandbox posture comes from. Two egress
+    lists that can disagree is how the tighter one ends up decorative.
+  - **A wildcard cannot be pinned to an IP**, so the firewall skips `*.rust-lang.org` and says so;
+    the posture therefore also names `static.rust-lang.org` concretely. Without that the toolchain
+    download is blocked by the coarse layer while looking allowlisted in the file.
+  - **It is installed into the image, root-owned, with sudoers granting exactly that one path.** A
+    script the agent can edit, that the agent can also `sudo`, is a root shell with extra steps.
+  - **…and all of that was decorative, because the base image grants blanket passwordless root.**
+    `mcr.microsoft.com/devcontainers/base` ships `/etc/sudoers.d/vscode` containing
+    `vscode ALL=(root) NOPASSWD:ALL`, so the agent could flush the firewall, delete the allowlist
+    snapshot, rewrite the root-owned script, or simply `sudo -i`. Every root-ownership protection
+    in this design rests on the agent not being able to become root, and none of them checked.
+    Removed in the Dockerfile, with `visudo -c` failing the **build** on a malformed result — a
+    broken sudoers file locks out the one grant the firewall needs. **Found only by running
+    `sudo -n -l` inside the container**: two review passes and every static check missed it,
+    because nothing in the repo *says* the base image grants it. The general lesson is the one
+    this section keeps relearning one level up — a guard is worth what its weakest bypass is
+    worth, and the bypass here was inherited rather than written.
+  - **The check for it asks sudo, not the file.** `verify.sh` requires that every command `vscode`
+    may run as root names the firewall, so a blanket grant re-added by *any* route — a rebuilt
+    base image, a feature, a helpful `RUN` line — fails it. `mutate-verify.sh` restores the grant
+    in a one-layer image built `FROM` the real one and requires that failure, since a sudoers
+    entry cannot be broken with a `docker run` flag.
+  - **…and that argument was the hole the script itself closed for the script.** The caller passed
+    the allowlist's path, and the path passed was the repo's own copy — bind-mounted, under
+    `allowWrite`, writable by the agent this layer exists to bound. Appending a domain and waiting
+    for the next container start had root add it to the ipset. The sudoers entry made it worse
+    rather than better: **a command naming no argument accepts every argument**, so any readable
+    JSON on the box was a valid allowlist. Now the workspace copy is read exactly **once**, at
+    container create, before any agent session exists, and snapshotted root-owned; every later run
+    reads the snapshot, the script **refuses** arguments, and sudoers pins it to none (`… ""`). A
+    rebuild is what re-reads the repo, which is the right ceremony for widening egress. Divergence
+    between the two is **reported and never acted on** — silence would let a legitimate edit look
+    applied when the coarse layer never saw it.
+  - **Order:** the Dev Containers lifecycle is postCreate → postStart, so `setup.sh` raises the
+    firewall as its *first* act. Leaving it to `postStartCommand` alone would run the whole of
+    create — including a toolchain download — with open egress.
+- **Measured, not assumed** (Ubuntu 26.04 / kernel 7.0 / Docker 29.7, baseline outside a container
+  first): **stock Docker cannot run the nested sandbox** — `bwrap` fails at namespace creation as
+  root and as non-root, with `--cap-add SYS_ADMIN`, and with AppArmor off. The blocker is
+  **seccomp**, and neither `--privileged` nor `seccomp=unconfined` is required: the default profile
+  plus 14 namespace/mount syscalls suffices. **Non-root is load-bearing, not hygiene** — with
+  seccomp fully disabled, *root* in a container still cannot create a mount/net/pid namespace
+  directly.
+- **The mount list is the security boundary, and it is asserted exhaustively.** `verify.sh` reads
+  `/proc/self/mountinfo` and fails if the mounted set is anything other than what
+  `devcontainer.json` declares — rather than listing paths that ought to be absent, which is the
+  "enumerate the secrets" shape the host posture is *forced* into and the container is not. Only
+  `~/.claude/.credentials.json` is mounted, never `~/.claude`: that directory holds the posture,
+  and a process the posture bounds must not read or write the file deciding whether it is bounded.
+- **Every guard has been watched failing.** `mutate-verify.sh` breaks each property in turn — an
+  undeclared mount, the host `~/.claude` mounted, stock seccomp, no `NET_ADMIN`, running as root —
+  and requires `verify.sh` to fail naming it. It needs a Docker host, so it is an `#[ignore]`-class
+  test; `check-config.sh` is the host-side half that runs in `check.sh`, and its real job is the
+  **generated** seccomp profile: a patch that no-ops against a changed upstream yields a profile
+  that parses, applies, and leaves the sandbox unable to start.
+- **Three defects found only by building and running it**, none of which static review would have
+  caught. (1) `jkb` was not installed in the container at all — the explorer extension spawns it
+  and every workflow verb needs it; `setup.sh` now builds and installs it, and `jkb 0.1.0` was
+  confirmed running inside. (2) **A named volume whose path does not exist in the image is created
+  root-owned**, so cargo died with `EACCES` minutes into the first build; every volume mount point
+  is now created in the Dockerfile, which is what makes Docker seed ownership from it. (3) Cargo's
+  `target/` moved off the bind mount into a volume — required by (2)'s uid mismatch, and
+  independently right because it is the heaviest write path and a macOS bind mount is a VM
+  filesystem crossing.
+  - **An out-of-memory build does not say so.** `rustc` is SIGKILLed and cargo reports a bare
+    `(signal: 9, SIGKILL: kill)`. Diagnosed from `dmesg` rather than guessed at, twice — the first
+    diagnosis was right about OOM and wrong about the cause, since the test VM was holding a 2.9 GB
+    copy of the repo on tmpfs. Worth knowing because the symptom names neither memory nor the fix.
+- **Where VS Code runs does not matter; where the `claude` process runs does.** Under Dev
+  Containers the UI is on the host and the server, extension host and terminals are in the
+  container. The Claude Code extension declares no `extensionKind` and has a Node `main`, so VS
+  Code runs it as a **workspace** extension — in the container — and `devcontainer.json` lists it
+  so the linux build is installed inside (a host copy is platform-specific and separate).
+- **Open the repo root, not a session worktree.** `jkb task work` puts worktrees at
+  `<repo>/.jkb/work/<session>` and a linked worktree's `.git` is a *file* pointing into
+  `<repo>/.git/worktrees/…`. Mounting the root puts both ends inside; mounting only the worktree
+  breaks git, because the gitdir it names is not there.
+- **Still not established:** that the nested sandbox actually *engages* for a tool call. `bwrap`
+  working is the mechanism, not the product, and the credential-free probe does not discriminate
+  (see D48.7). Settle it in a live session with `./scripts/auto-mode.sh sandboxed`, **not** with
+  `printenv CLAUDE_CODE_SANDBOXED` — see the measurement under D48 below.
+
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
 `/review-log` used to wrap the host's `/code-review`, which reports to the user rather than

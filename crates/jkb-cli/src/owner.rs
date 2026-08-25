@@ -2,7 +2,7 @@
 //!
 //! The *identity* is [`jkb_types::AgentId`] — a parsed type with a closed set of shapes, each
 //! declaring what would prove it via [`Liveness`]. This module is the other half: the probe, at
-//! the edge, where forking `ps` and touching the filesystem belong.
+//! the edge, where probing processes and touching the filesystem belong.
 //!
 //! The probe answers a [`Fact`], not a `bool`. That is the load-bearing change: an owner whose
 //! liveness cannot be established — an externally-minted `agent:` id, or a `claimant_id` in a
@@ -14,10 +14,11 @@
 //! on a permission prompt keeps its claim.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use jkb_fsm::Fact;
 use jkb_types::{AgentId, Liveness};
+use rustix::io::Errno;
+use rustix::process::{self, Pid};
 
 /// This process's owner id, `host:pid`, used as the default claim owner.
 #[must_use]
@@ -64,7 +65,7 @@ pub fn session_worktree(owner: &str) -> Option<PathBuf> {
 /// Whether a process with this pid exists — the raw probe, for callers that hold a pid rather
 /// than an owner id (the land lock's stale-holder check).
 ///
-/// `Unknown` when `ps` could not be run at all. The land lock reads this to decide whether a
+/// `Unknown` when liveness could not be established at all. The land lock reads this to decide whether a
 /// holder is stale, and treating "could not ask" as "gone" there breaks a live lock.
 #[must_use]
 pub fn pid_alive(pid: u32) -> Fact {
@@ -85,10 +86,10 @@ fn hostname() -> String {
 /// The match is over [`Liveness`], a closed enum, so a new owner shape cannot be added without
 /// the compiler demanding a probe for it. Per shape:
 ///
-/// * a **process** is probed with `ps -p <pid>`, which exits 0 iff a process with that pid
-///   exists **regardless of which OS user owns it**. (`kill -0` was rejected here: it exits
-///   non-zero on `EPERM` for a foreign-owned but live process, which would wrongly reclaim a
-///   still-running agent's claim.)
+/// * a **process** is probed with `kill(pid, 0)`, which reports existence **regardless of which
+///   OS user owns it**: `EPERM` means the process is there and is not ours, which is as good an
+///   answer as `Ok`. (The shell's `kill -0` is what was rejected, and rightly — it collapses
+///   `EPERM` and `ESRCH` into one non-zero exit. `pid_exists` below has the full history.)
 /// * a **session** is judged **only** by its worktree (design D36.6). `jkb task work` exits in
 ///   under a second, so its pid is gone before anyone reads the claim; the thing that persists
 ///   — and that means "this work is in flight" — is the checkout. The pid is ignored rather
@@ -107,32 +108,43 @@ pub fn is_alive(owner: &str) -> Fact {
     }
 }
 
-/// Whether a process with this pid exists. `ps -p <pid> -o pid=` prints the pid and exits 0
-/// if it does, 1 otherwise; it does not require ownership of the process. Dependency-free
-/// and single-host.
+/// Whether a process with this pid exists, asked of the kernel rather than of a program:
+/// `kill(pid, 0)` runs the existence and permission checks and sends no signal.
 ///
-/// **A spawn failure is [`Fact::Unknown`], not `No`.** `is_ok_and` collapsed the two, which is
-/// the exact defect this whole type exists to prevent, sitting in the probe that protects every
-/// claim: in an environment where `ps` cannot be spawned — a stripped container, a process-table
-/// limit, `fork` denied — one `doctor --fix` would read every live `host:pid` owner as proven
-/// dead and free the lot. Exiting non-zero is an answer; failing to run is not.
+/// **`EPERM` means alive**, and that is the whole reason this is a syscall. The kernel refuses
+/// because the process is *there* and belongs to someone else, so the error is positive evidence
+/// of existence. The shell's `kill -0` throws that away — it collapses `EPERM` and `ESRCH` into
+/// one non-zero exit, which would read a running agent's claim as dead and free it (D27.2) — so
+/// `ps -p` was used instead, because it reports processes it does not own. But `ps` is
+/// setuid-root on macOS, and a sandboxed process cannot exec a setuid binary at all: under the
+/// D48 posture the probe could never run, and every `host:pid` owner became [`Fact::Unknown`]
+/// (D48.10). Asking the kernel keeps what `ps` was chosen for and needs no subprocess, no `PATH`,
+/// and no setuid binary.
+///
+/// A pid that cannot be represented is [`Fact::No`], not `Unknown`: no process can carry an id
+/// outside `pid_t`, so its absence is established rather than merely unobserved.
 fn pid_exists(pid: u32) -> Fact {
-    pid_exists_with("ps", pid)
+    let Ok(raw) = i32::try_from(pid) else {
+        return Fact::No;
+    };
+    let Some(pid) = Pid::from_raw(raw) else {
+        return Fact::No;
+    };
+    liveness_from(process::test_kill_process(pid))
 }
 
-/// The probe, with the program to run named by the caller.
-///
-/// Split out **only** so the "could not spawn" arm is reachable from a test without emptying
-/// `PATH`. It was tested that way, and `PATH` is process-global while `cargo test` runs the whole
-/// binary's tests on a thread pool — so it intermittently broke sibling tests that spawn `ps` and
-/// `git`, in a crate whose gate is shared. A test that reddens the gate at random teaches people
-/// to re-run it, which is how a real failure gets waved through.
-fn pid_exists_with(prog: &str, pid: u32) -> Fact {
-    match Command::new(prog)
-        .args(["-p", &pid.to_string(), "-o", "pid="])
-        .output()
-    {
-        Ok(out) => Fact::from(out.status.success()),
+/// The result-to-fact mapping, kept pure so every arm is reachable from a test — including errnos
+/// that cannot be provoked on demand, which is what the old subprocess seam existed to reach and
+/// could only do by breaking `PATH` for the whole test binary.
+fn liveness_from(probe: Result<(), Errno>) -> Fact {
+    match probe {
+        // Exists. `Ok` is ours to signal; `EPERM` is someone else's — the kernel refused
+        // *because* the process is there, which is the distinction `kill -0` loses.
+        Ok(()) | Err(Errno::PERM) => Fact::Yes,
+        // No such process.
+        Err(Errno::SRCH) => Fact::No,
+        // Anything else was not established, and a probe that could not answer must never be
+        // read as "dead" — one `doctor --fix` would free every live claim.
         Err(_) => Fact::Unknown,
     }
 }
@@ -171,37 +183,65 @@ mod tests {
         assert_eq!(is_alive("agent:01JBX7Q4"), Fact::Unknown);
     }
 
-    /// A probe that **could not be run** is `Unknown`, never `No`.
+    /// A probe that **could not answer** is `Unknown`, never `No`.
     ///
-    /// This is the defect the whole `Fact` type exists to prevent, and it was sitting in the one
-    /// probe that protects every claim: `is_ok_and` folded "`ps` would not spawn" into "that
-    /// process is gone", so one `doctor --fix` in a stripped container would free every live
-    /// `host:pid` claim in the database.
+    /// This is the defect the whole `Fact` type exists to prevent, sitting in the one probe that
+    /// protects every claim: fold "could not establish" into "that process is gone" and one
+    /// `doctor --fix` frees every live `host:pid` claim in the database.
     ///
-    /// Exercised by making the spawn fail for real — an absolute path to a program that is not
-    /// there — rather than by trusting the match arm to be right.
-    ///
-    /// It emptied `PATH` to do this at first, which works and is not confinable: `PATH` is
-    /// process-global, `cargo test` runs this binary's tests on a thread pool, and three tests
-    /// in this very module spawn `ps` while `gitrepo`'s spawn `git`. It reddened the shared gate
-    /// about one run in six, in tests with no connection to the change. Naming the program is
-    /// the same coverage with no global state.
+    /// It is reached directly now. The previous version had to make a spawn fail for real — an
+    /// absolute path to a program that is not there — because the only way in was through the
+    /// subprocess. (An earlier version emptied `PATH`, which is process-global while `cargo test`
+    /// runs this binary on a thread pool, and reddened the shared gate about one run in six in
+    /// tests with no connection to the change.) With the probe a syscall, the mapping is a pure
+    /// function and every arm is an ordinary assertion.
     #[test]
-    fn a_probe_that_could_not_run_is_unknown_not_dead() {
+    fn a_probe_that_could_not_answer_is_unknown_not_dead() {
+        use rustix::io::Errno;
+        assert_eq!(super::liveness_from(Err(Errno::NOMEM)), Fact::Unknown);
+        assert_eq!(super::liveness_from(Err(Errno::INVAL)), Fact::Unknown);
+    }
+
+    /// `EPERM` is the distinction the shell's `kill -0` loses, and the reason `ps` was reached
+    /// for in the first place: the kernel refuses because the process is **there** and is not
+    /// ours. Reading it as dead reclaims a running agent's work (D27.2).
+    #[test]
+    fn eperm_means_alive_and_esrch_means_dead() {
+        use rustix::io::Errno;
+        assert_eq!(super::liveness_from(Err(Errno::PERM)), Fact::Yes);
+        assert_eq!(super::liveness_from(Err(Errno::SRCH)), Fact::No);
+        assert_eq!(super::liveness_from(Ok(())), Fact::Yes);
+    }
+
+    /// A pid that really is gone, driven through the syscall.
+    ///
+    /// Every other dead-pid fixture here is `4294967290`, which is not representable as `pid_t`
+    /// and short-circuits before `kill` is ever called — so `ESRCH` -> [`Fact::No`], the one
+    /// verdict that frees another agent's claim, had no coverage at all. A child that has been
+    /// spawned and reaped gives a pid that was real a moment ago and certainly is not now.
+    #[test]
+    fn a_reaped_child_is_established_dead() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        child
+            .wait()
+            .expect("reap it, so it is gone rather than a zombie");
         assert_eq!(
-            super::pid_exists_with("/nonexistent/jkb-not-a-program", std::process::id()),
-            Fact::Unknown,
-            "a probe that could not be spawned read as a dead owner"
+            is_alive(&format!("host:{pid}")),
+            Fact::No,
+            "a reaped pid must reach the kernel and come back ESRCH"
         );
-        // The same pid through the real program is proven alive — so the answer above is the
-        // spawn failing, not the pid being unfindable.
-        assert_eq!(super::pid_exists_with("ps", std::process::id()), Fact::Yes);
     }
 
     #[test]
     fn a_foreign_owned_live_process_is_alive() {
-        // pid 1 (launchd/init) always exists and is owned by root. `kill -0` would exit
-        // EPERM (non-zero) here when we are not root; `ps -p` reports it alive regardless.
+        // pid 1 (launchd/init) always exists and is owned by root, so unless we ARE root the
+        // kernel answers `EPERM` — which is the whole point: the refusal is evidence the process
+        // exists. This is the case the shell's `kill -0` gets wrong by reading its non-zero exit
+        // as "gone", and the case `ps` was originally brought in to recover.
         assert_eq!(is_alive("host:1"), Fact::Yes);
     }
 
