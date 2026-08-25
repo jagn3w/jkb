@@ -995,19 +995,77 @@ mod tests {
     fn a_sweep_that_could_not_take_the_lock_says_so_rather_than_reporting_nothing_to_do() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
-        // A live holder: this process. `acquire` respects a lock whose holder is not proven gone.
+        // A live holder, written the way `acquire` writes it. A BARE pid would pass this test
+        // for the wrong reason: `owner::is_alive` cannot parse one, so it answers `Unknown` and
+        // the lock is respected — which a garbage string achieves equally well. The id has to be
+        // one the liveness probe actually recognises, or the test is about parsing, not liveness.
         fs::create_dir_all(store_dir(&db)).expect("mk");
-        fs::write(
-            store_dir(&db).join(".sweep.lock"),
-            std::process::id().to_string(),
-        )
-        .expect("write");
+        let lock = store_dir(&db).join(".sweep.lock");
+        fs::write(&lock, crate::owner::self_owner()).expect("write");
+        assert!(
+            crate::owner::is_alive(&crate::owner::self_owner()).is_yes(),
+            "the fixture's holder must be recognised as ALIVE, or this asserts nothing"
+        );
 
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
         assert!(
             r.skipped,
             "it did not look, and that is not the same as finding nothing"
         );
+
+        // ...and a holder PROVEN gone is taken over, or one crashed sweep wedges the machine's
+        // reaper for ever. pid 2^22 is above every default pid_max, so it cannot be running.
+        fs::write(&lock, "nohost:4194304").expect("write");
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(!r.skipped, "a dead holder's lock is taken over");
+    }
+
+    #[test]
+    fn a_record_written_before_the_plan_existed_still_reads_and_keeps_the_branch() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        fs::create_dir_all(store_dir(&db)).expect("mk");
+        // Exactly the shape this shipped with before `Plan`: no `delete_branch`, no
+        // `accept_dirty`. It has to parse, and it has to default to the SAFE answers — keep the
+        // branch, do not touch a dirty tree — because the record cannot say what was decided.
+        fs::write(
+            store_dir(&db).join("legacy.json"),
+            br#"{"worktree":"/r/.jkb/work/s","repo_root":"/r","branch":"task/s",
+                 "uid":"task:t","recorded_at":1,"head":"abc","archive":null,"archived_at":null}"#,
+        )
+        .expect("write");
+
+        let store = entries(&db).expect("entries");
+        assert!(store.unreadable.is_empty(), "an older record still parses");
+        assert_eq!(store.records.len(), 1);
+        let plan = store.records[0].1.plan;
+        assert!(
+            !plan.delete_branch,
+            "a record that cannot say defaults to keeping the branch"
+        );
+        assert!(!plan.accept_dirty, "and to not touching uncommitted work");
+    }
+
+    #[test]
+    fn a_record_round_trips_through_the_store() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let e = Entry {
+            plan: Plan {
+                delete_branch: true,
+                accept_dirty: true,
+            },
+            head: Some("cafe".into()),
+            ..entry(Path::new("/r/.jkb/work/s"), Path::new("/r"))
+        };
+        record(&db, &e).expect("record");
+        let back = entries(&db).expect("entries").records.pop().expect("one").1;
+        assert!(
+            back.plan.delete_branch && back.plan.accept_dirty,
+            "the plan survives the store"
+        );
+        assert_eq!(back.head.as_deref(), Some("cafe"));
+        assert_eq!(back.worktree, e.worktree);
     }
 
     #[test]

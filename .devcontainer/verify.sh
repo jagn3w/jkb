@@ -27,7 +27,8 @@ assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 #
 # So the exception is NAMED rather than inferred, and it is bounded two ways. It only ADDS to the
 # derived set, so it can never switch a check off; and it is refused unless the value is a strict
-# descendant of a target devcontainer.json already declares, so `--declare /host`,
+# descendant of a target devcontainer.json declares AS A BIND — not a volume, which reaches no
+# host filesystem and is therefore a region nobody reviewed sources for — so `--declare /host`,
 # `--declare /var/run/docker.sock` and `--declare /home/vscode/.claude/settings.json` — the exact
 # mutations mutate-verify.sh exists to catch — cannot be waved through by it. The count is printed
 # in the ok line below, because an override nobody can see is indistinguishable from a rule that

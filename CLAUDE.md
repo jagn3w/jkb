@@ -1636,7 +1636,8 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   still exfiltration, and the source cannot be checked from inside (Docker Desktop for macOS
   reports the path inside the VM, which is why `dc_mount_sources` is host-side only). So
   `verify.sh --declare <target>` **adds** to the derived set and is **refused** unless the value is
-  a strict descendant of something already declared — `/host`, the docker socket and
+  a strict descendant of something already declared **as a bind** (not a volume, which reaches no
+  host filesystem, so nothing nested under one is reviewable this way) — `/host`, the docker socket and
   `~/.claude/settings.json` are all refused by verify.sh itself, which is exactly the mutation set
   the harness exists to catch. The count prints in the passing line (D38's `--no-review` lesson).
   A blanket rule would have weakened the *shipped* container; this weakens only the harness, and
