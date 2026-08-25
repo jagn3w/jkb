@@ -1776,7 +1776,89 @@ package's `typecheck` is `--noEmit`, so a bare `pnpm -r run typecheck` cannot re
 `@jkb/core` on a clean tree (nothing emits its `.d.ts`) — `-r run build` is topological, so
 core emits before the adapter checks. `check.sh` skips the UI when pnpm is missing (it lives
 under `PNPM_HOME`, which `~/.zshrc` only exports for interactive shells); the CI job never
-skips.
+skips. **`pnpm run test` runs beside the build**, in both — `node --test` over
+`ui/vscode/test/*.test.mjs`, no framework and no new dependency. A test bundles its module
+with esbuild (already there for the extension bundle) and aliases `vscode` to a stub, so it
+needs neither a running VS Code nor `dist/`; the stub is kept **external** to the bundle, or
+the recorders the test reads are a second copy the code never touches. That fits glue over an
+API we do not own: what it pins is our half — which command is asked for, with which
+arguments, and the state kept between two windows.
+
+**A session is worked in its own VS Code window, in the Claude Code extension.** "Work this
+task with Claude" used to run `claude <prompt>` in a terminal — a terminal is where the whole
+UX then lived. The extension is the better surface, and **`jkb.taskLauncher` lets the operator
+say so or not** (`auto` | `extension` | `terminal`): `auto` is the only value that substitutes
+one surface for the other, and the two explicit values are honoured or *reported*, never
+quietly swapped. One function (`unreachable`) turns a failure into either a fallback or a
+refusal, and **every path goes through it — including the receiving window**, which reads the
+setting before it touches the extension rather than only on the way out of a failure. The
+extension forces the window: its panel
+derives a cwd from **`workspaceFolders[0]`** and takes no directory argument, so a chat opened
+from the repo's window would work the **main checkout** — the one thing a session exists to
+keep apart (D36). So the worktree has to *be* the window's folder. `vscode.openFolder` carries
+no payload and the new window is a different extension host, so the prompt is handed over
+through a queue in global storage (`ui/vscode/src/claude.ts`) — **one file per waiting prompt**
+under `<globalStorage>/pending/`, named `sha1(realpath(worktree)).json`: click writes one, the
+opened window takes it by `unlink` — which is why the extension now
+activates `onStartupFinished` rather than when its view is first shown. An entry expires when
+its worktree is gone, which is exactly the set that can never be delivered; no clock decides
+it. Without the Claude Code extension installed the terminal remains the fallback, where it is
+still the whole feature rather than a degraded one. The prompt lands in the chat input and is
+not sent — the extension offers no way to submit it, and seeing what is about to be asked is
+the better half of that trade.
+
+Three things this got wrong on the first pass, all found by `/review-log` and all worth
+keeping written down. **The command is `claude-vscode.primaryEditor.open`, never
+`editor.open`** — the latter is `(session, prompt, column) => { if (column !==
+ViewColumn.Active) setPreferredLocation("panel"); … }`, and that setter writes
+`claudeCode.preferredLocation` with `ConfigurationTarget.Global`. Calling it without a column
+rewrites the user's global settings on **every** hand-off, moving Claude Code out of their
+sidebar for every window and project; jkb does not edit other people's configuration, which is
+the same rule that kept D46 from writing a git ref. **Clicking twice asks nothing; each surface converges on what
+exists.** The guard wanted here is "is an agent live on this checkout", which is *not
+obtainable* — no API reports another window's folder, and D27/D36.6 deliberately refused the
+heartbeat that would track a live process. `resumed` is the nearest signal and it is the wrong
+one: a session opened yesterday and closed is equally resumed, so a confirmation keyed on it
+fires on every ordinary return to a task and catches nothing, which is how a guard becomes a
+reflex click (the D38 lesson about `--no-review`). A first attempt did exactly that, and put
+the question on the *extension* path — where VS Code opens one window per folder and the
+handed-over prompt lands **unsent**, so a duplicate is merely possible — while leaving the
+*terminal* path, where `sendText` makes a second agent certain, to fork silently. So the
+question is gone and idempotence replaces it — **on the terminal surface**, where
+`startSessionTerminal` finds the session's own `claude: <session>` terminal (matched on name,
+cwd and `exitStatus`, since In Flight's plain shell shares the cwd and a dead tab looks
+identical to a live one) and shows it without sending, the caller saying so rather than
+reporting a launch that did not happen. On the **window** surface it was finally
+*measured* rather than argued: `code --new-window <folder>` twice leaves VS Code's window count
+unchanged, so `forceNewWindow` does **not** defeat folder reuse and a second click focuses the
+session's window. (CLI entry point, not this API — strong evidence, not a guarantee, and
+written down that way.) That killed the hazard three passes had been designing against, and
+exposed the real defect: nothing *activates* in a focused window, so a queued prompt sat unread
+until that window was next opened cold, then fired with a stale branch and land target. The
+receiving side therefore **watches** the queue (`watchQueuedPrompts`) rather than reading it
+once at startup. The **`here`** surface is genuinely not idempotent — `primaryEditor.open(
+undefined, …)` is a fresh conversation by design and Claude Code exposes no way to find an
+existing panel — which is pinned by a test rather than asserted in prose. What holds on the two
+extension surfaces: a handed-over prompt lands **unsent**, so nothing runs without a keystroke.
+The terminal surface is the opposite — `sendText` executes — which is why the duplicate guard
+lives there. Residual: a `claude` in *another* window is
+invisible, `vscode.window.terminals` being per-window.
+
+**The lesson worth keeping is about evidence, not windows.** This one fact was reasoned about
+across three review rounds and three fix rounds; a two-command probe settled it in under a
+minute. A claim was even *removed* from a comment for being unverifiable and then reinstated
+two commits later as the foundation of a redesign. When a design rests on what another program
+does, measure it before building on it, and record the measurement with its method and its
+limits so the next reader knows what kind of thing it is. **The queue is one file per entry, not one file holding a map.** It
+was a map, and every window watching the directory then meant every window did a
+read-modify-write of one shared file on each delivery — whose lost update is an
+already-delivered prompt resurrected and delivered twice. Per-entry files make that
+unrepresentable rather than rule-avoided: there is no shared document to lose an update to, a
+take is one `unlink` touching no other entry, and "must a take write the file back?" stops
+being a question anyone can get wrong. Same move as `containment`'s primary key (D35). Expiry
+is `sweepUndeliverable` on worktree existence, running after a write and never touching the
+entry it was just handed. No migration was written and none is owed: the branch had not
+landed, so no released build ever wrote the map.
 
 Deferred: item/document body editing, drag re-placement, live refresh, in-tree search, the
 web-app package.

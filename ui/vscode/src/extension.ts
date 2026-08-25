@@ -16,7 +16,19 @@ import {
   type TreeChild,
 } from "@jkb/core";
 
-import { CliJkbClient } from "./cliClient.js";
+import {
+  launchClaude,
+  watchQueuedPrompts,
+  startSessionTerminal,
+  reportTerminal,
+  reportBlocked,
+  claudeCommand,
+  taskLauncher,
+  type Launch,
+  type Launcher,
+  type TerminalStart,
+} from "./claude.js";
+import { CliJkbClient, type SessionInfo } from "./cliClient.js";
 import { JkbDecorationProvider } from "./decorations.js";
 import { InFlightProvider, type FlightNode } from "./inflight.js";
 import { DetailsPanel } from "./detailsPanel.js";
@@ -55,7 +67,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("jkb.search", () => searchNodes(client, tree)),
     vscode.commands.registerCommand("jkb.workTask", (child?: TreeChild) =>
-      workTaskWithClaude(client, child),
+      workTaskWithClaude(context, client, child),
     ),
     vscode.commands.registerCommand("jkb.landTask", (child?: TreeChild) =>
       landTask(client, child),
@@ -87,6 +99,13 @@ export function activate(context: vscode.ExtensionContext): void {
       openFindings(client, node),
     ),
   );
+
+  // This window may be the one "Work this task with Claude" just opened on a session worktree.
+  // `vscode.openFolder` carries no payload, so the prompt was left in a queue for it — which
+  // is also why the extension activates at startup rather than on its first view. It keeps
+  // watching afterwards because VS Code *reuses* a window for an already-open folder, so a
+  // later click focuses this window without activating anything.
+  context.subscriptions.push(watchQueuedPrompts(context));
 }
 
 /**
@@ -266,13 +285,25 @@ function repoFolder(): string | undefined {
 }
 
 /**
- * Open the task's isolated session and start Claude inside it.
+ * Open the task's isolated session and start Claude Code in it.
  *
  * Each task gets its own git worktree and branch, so several of these can run at once
  * without sharing a checkout, and the task is claimed so nothing else — another click, a
  * swarm run — starts it a second time (design D36). Clicking twice returns the same session.
+ *
+ * The session opens as its own VS Code window with a Claude Code chat in it, rather than as a
+ * `claude` terminal in this one: the Claude Code extension runs in the window's first
+ * workspace folder and takes no directory argument, so the session's worktree has to *be*
+ * that folder (see `claude.ts`). A window is also the surface the work wants — the worktree's
+ * own file tree, source control and terminals, beside the chat driving them. The terminal
+ * remains the fallback for a machine without the extension, where it is still the whole
+ * feature rather than a degraded one.
  */
-async function workTaskWithClaude(client: CliJkbClient, child?: TreeChild): Promise<void> {
+async function workTaskWithClaude(
+  context: vscode.ExtensionContext,
+  client: CliJkbClient,
+  child?: TreeChild,
+): Promise<void> {
   const uid = taskUid(child, "work");
   if (!uid) return;
   const cwd = repoFolder();
@@ -289,25 +320,69 @@ async function workTaskWithClaude(client: CliJkbClient, child?: TreeChild): Prom
     return;
   }
 
-  const prompt =
-    `Work on this jkb task. uid: ${uid}. Title: "${child?.label ?? uid}". ` +
+  const prompt = taskPrompt(uid, child?.label ?? uid, session);
+  const launch = await launchClaude(context, {
+    worktree: session.worktree,
+    uid,
+    prompt,
+    session: session.session,
+    launcher: taskLauncher(),
+  });
+  if (launch.where === "terminal") {
+    // One reporter for both windows: which arm the terminal took, and why it was a fallback if
+    // it was. Two literals in two files drifted in wording and in the advice they carried, and
+    // the shown arm silently dropped the Claude Code failure altogether.
+    reportTerminal(startClaudeInTerminal(session, prompt), launch.fallback);
+  } else if (launch.where === "blocked") {
+    // `jkb.taskLauncher` is "extension", so a terminal is not a substitute — it is the thing
+    // the operator ruled out. The session is open either way and In Flight can open a shell.
+    reportBlocked(launch, `The session is open at ${session.worktree}.`);
+  }
+  vscode.window.setStatusBarMessage(
+    `jkb: ${session.resumed ? "resumed" : "opened"} session ${session.session} on ${session.branch}` +
+      STATUS_SUFFIX[launch.where],
+    4000,
+  );
+}
+
+/** What the status line adds about where the session's Claude ended up. */
+const STATUS_SUFFIX: Record<Launch["where"], string> = {
+  here: "",
+  // Not "opened its window": VS Code may have focused one that was already up.
+  window: " — opening its window",
+  terminal: "",
+  blocked: "",
+};
+
+
+/** What Claude is asked to do in a session, in the one place that knows the session's shape. */
+function taskPrompt(uid: string, title: string, session: SessionInfo): string {
+  return (
+    `Work on this jkb task. uid: ${uid}. Title: "${title}". ` +
     `You are in an isolated git worktree on branch ${session.branch}, which will land on ` +
     `${session.onto} — other tasks are being worked in parallel in their own worktrees, so ` +
     `stay inside this directory and change nothing outside it. ` +
     `Read the full task with \`jkb task show ${uid}\`, implement it end-to-end following the ` +
     `repo's conventions (see CLAUDE.md), verify it, and COMMIT here. ` +
     `Do not mark the task done and do not merge or rebase onto ${session.onto} — landing is ` +
-    `\`jkb task land ${uid}\`, which the human runs, and which marks the task done itself.`;
+    `\`jkb task land ${uid}\`, which the human runs, and which marks the task done itself.`
+  );
+}
 
-  const terminal = vscode.window.createTerminal({
-    name: `claude: ${session.session.slice(0, 24)}`,
-    cwd: session.worktree,
-  });
-  terminal.show();
-  terminal.sendText(`claude ${shellQuote(prompt)}`);
-  vscode.window.setStatusBarMessage(
-    `jkb: ${session.resumed ? "resumed" : "opened"} session ${session.session} on ${session.branch}`,
-    4000,
+/**
+ * Run `claude` in a terminal in the worktree — the operator's choice, or the fallback.
+ *
+ * The find-or-create decision belongs to `startSessionTerminal` in `claude.ts`, beside the
+ * name it matches on; this supplies the command and passes on which arm it took. Three lines
+ * of guard at a call site that no test can reach is how a rule gets deleted by a later edit
+ * with the suite still green — which is what the reviewer demonstrated here.
+ */
+function startClaudeInTerminal(session: SessionInfo, prompt: string): TerminalStart {
+  return startSessionTerminal(
+    vscode.window,
+    session.session,
+    session.worktree,
+    claudeCommand(prompt),
   );
 }
 
@@ -345,7 +420,7 @@ async function pickStagingBranch(
   const create = {
     label: "$(add) New staging branch…",
     description: "cut a fresh branch from trunk",
-    value: " new",
+    value: "\0new",
   };
   const existing = branches.map((b) => ({
     label: `$(git-branch) ${b.branch}`,
@@ -362,7 +437,7 @@ async function pickStagingBranch(
     placeHolder: "Where should this task's work land?",
   });
   if (!pick) return undefined;
-  if (pick.value !== " new") return pick.value;
+  if (pick.value !== "\0new") return pick.value;
 
   const name = await vscode.window.showInputBox({
     prompt: "Name for the new staging branch (cut from trunk)",
@@ -411,11 +486,6 @@ function land(client: CliJkbClient, uid: string, task: StagedTask | undefined): 
   terminal.show();
   // Built by the client so it carries the configured cliPath/dbPath, like every other call.
   terminal.sendText(client.terminalCommand(["task", "land", uid]));
-}
-
-/** Single-quote a string for safe use in a POSIX shell. */
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 // ---------------------------------------------------------------------------
