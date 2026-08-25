@@ -45,11 +45,19 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # duplicated between run() and the control's pre-run, which meant the control could certify a
 # configuration the mutations never used — a control that is not about the same thing is not a
 # control.
+# `--declare` is the nested-bind exception, and this harness is the reason it exists. BASE mounts
+# the repo AT /home/vscode/repos/jkb, which devcontainer.json now declares only the parent of —
+# and the parent cannot be mounted instead, because in a `jkb task work` session $REPO's parent is
+# `.jkb/work`, so the checkout would land at /home/vscode/repos/<session>. verify.sh accepts the
+# name only because it is strictly inside a declared target; see its comment for why nesting is
+# not granted automatically. Read from the environment so a mutation can supply a BAD declaration
+# and watch the refusal fire — one SUBJECT, as the comment above requires.
 SUBJECT='
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       . ./.devcontainer/lib.sh && dc_link_state /home/vscode
+      [ -n "${JKB_SKIP_MEMORY_LINK:-}" ] || ./scripts/link-claude-memory.sh >/dev/null 2>&1
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
-      ./.devcontainer/verify.sh'
+      ./.devcontainer/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
 # The baseline every ADDITIVE mutation runs in, and the control with it. The three subtractive
 # mutations below deliberately spell a reduced set instead — that is what they are testing — and
 # being the only sites that do so makes them visibly the odd ones. Before this, HEALTHY was used
@@ -142,6 +150,20 @@ run "no NET_ADMIN (firewall cannot come up)" "NON-allowlisted host was permitted
     --security-opt seccomp="$SEC" --user vscode "${BASE[@]}"
 run "runs as root" "runs as a non-root user" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user root "${BASE[@]}"
+
+# The nested-bind exception must not be usable as a general one. A `--declare` naming anything
+# OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the
+# docker.sock-shaped mount two cases above — so the refusal is watched here rather than argued for
+# in a comment. No extra `-v` is needed: what is under test is that verify.sh refuses to ACCEPT
+# the name, which it must do whether or not something is mounted there.
+run "a --declare outside every declared target" "is not inside any mount" \
+    -e JKB_VERIFY_DECLARE=/host "${HEALTHY[@]}"
+
+# Auto-memory sharing is a README promise whose entire mechanism is one symlink, which is exactly
+# the shape 3c exists for. Skip the linking step and the assertion must say so — otherwise the
+# container reports healthy while everything an agent learns in here dies with it.
+run "auto-memory is not linked into the shared store" "auto-memory is not linked" \
+    -e JKB_SKIP_MEMORY_LINK=1 "${HEALTHY[@]}"
 
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The

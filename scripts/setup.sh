@@ -9,7 +9,12 @@
 #   5. installs the repo's post-merge git hook into this repo's .git/hooks — and, when
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #
-# Flags: --no-extension, --no-service, --no-scaffold, --db <path>, -h/--help.
+# Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
+#
+# --link-memory is opt-in, and deliberately not the default: it writes symlinks under
+# ~/.claude/projects so the dev container and the host share one auto-memory store, and this
+# script is re-run by the post-merge hook. A `git pull` must not quietly rearrange somebody's
+# ~/.claude. See scripts/link-claude-memory.sh.
 # Everything is best-effort per step: a missing optional tool warns and continues.
 set -euo pipefail
 
@@ -17,6 +22,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 do_extension=1
 do_service=1
 do_scaffold=1
+link_memory=0
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -24,9 +30,10 @@ while [ "$#" -gt 0 ]; do
     --no-extension) do_extension=0 ;;
     --no-service) do_service=0 ;;
     --no-scaffold) do_scaffold=0 ;;
+    --link-memory) link_memory=1 ;;
     --db) shift; db="$1" ;;
     -h|--help)
-      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -156,6 +163,13 @@ CHAIN
   else
     warn "not a git repo; skipping hook install"
   fi
+fi
+
+# --- shared claude memory (opt-in) -------------------------------------------
+# Only when asked. This writes under ~/.claude/projects, and setup.sh is what the post-merge hook
+# re-runs after a `git pull` — jkb does not rearrange other people's configuration behind them.
+if [ "$link_memory" -eq 1 ]; then
+  "$repo_root/scripts/link-claude-memory.sh" || warn "some repos could not be linked (see above)"
 fi
 
 say "setup complete"

@@ -28,7 +28,15 @@
   //
   // The paths are chosen so the SAME scripts/auto-mode-posture.json works here and on the host:
   // it is written `~`-relative, and ~/repos and ~/.jkb land where it expects them.
-  "workspaceMount": "source=${localWorkspaceFolder},target=/home/vscode/repos/jkb,type=bind",
+  //
+  // ALL of ~/repos, not just this repo. That is a widening, and the argument for it is
+  // consistency rather than convenience: the posture already grants ~/repos in both `allowRead`
+  // and `allowWrite`, so a container holding only jkb was TIGHTER than the boundary the same
+  // agent runs under on the host — a difference nothing had decided, and one that made a
+  // cross-repo task simply impossible in here rather than deliberately refused. Everything the
+  // posture does NOT grant is still absent by the kernel: ~/.ssh, ~/Documents, ~/.aws, the rest
+  // of $HOME. `workspaceFolder` still opens jkb, so this assumes the checkout is ~/repos/jkb.
+  "workspaceMount": "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
   "workspaceFolder": "/home/vscode/repos/jkb",
   "mounts": [
     // The knowledge base. Shared with the host deliberately — it is the point of jkb — and every

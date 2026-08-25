@@ -1615,6 +1615,66 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
   (see D48.7). Settle it in a live session with `./scripts/auto-mode.sh sandboxed`, **not** with
   `printenv CLAUDE_CODE_SANDBOXED` — see the measurement under D48 below.
 
+## The dev container mounts ~/repos, and a session worktree is archived (D49)
+
+The container follow-up bucket. Design in `.devcontainer/README.md`; the container harnesses are
+`check-config.sh` + `mutate-config.sh` (static, in the gate) and `verify.sh` + `mutate-verify.sh`
+(need Docker).
+
+- **`workspaceMount` binds all of `~/repos`**, not just this repo. The argument is *consistency*,
+  not convenience: `scripts/auto-mode-posture.json` already grants `~/repos` in both `allowRead`
+  and `allowWrite`, so a container holding only jkb was **tighter** than the boundary the same
+  agent runs under on the host — a difference nothing had decided, which made a cross-repo task
+  impossible rather than deliberately refused. `workspaceFolder` still opens
+  `/home/vscode/repos/jkb`, so this assumes the checkout is `~/repos/jkb`.
+- **A nested bind must be NAMED, never inferred.** `verify.sh` compares exact mount points with no
+  prefix logic (prefix filtering is what once let `$HOME` at `/host` through), so once the declared
+  target is the parent, `mutate-verify.sh`'s own `-v $REPO:/home/vscode/repos/jkb` is undeclared —
+  and it cannot mount the parent instead, because in a `jkb task work` session `$REPO`'s parent is
+  `.jkb/work`. The tempting rule — *nested is fine* — is wrong: a mount point and a mount SOURCE
+  are independent, `-v ~/.ssh:/home/vscode/repos/jkb/secrets` is inside the declared region and is
+  still exfiltration, and the source cannot be checked from inside (Docker Desktop for macOS
+  reports the path inside the VM, which is why `dc_mount_sources` is host-side only). So
+  `verify.sh --declare <target>` **adds** to the derived set and is **refused** unless the value is
+  a strict descendant of something already declared — `/host`, the docker socket and
+  `~/.claude/settings.json` are all refused by verify.sh itself, which is exactly the mutation set
+  the harness exists to catch. The count prints in the passing line (D38's `--no-review` lesson).
+  A blanket rule would have weakened the *shipped* container; this weakens only the harness, and
+  only where a path is written down in a diff.
+- **Auto-memory is shared through `~/.jkb`, with no new mount.** Claude Code keys memory by the
+  project's absolute path, so one repo has two keys (`-Users-…-repos-jkb` /
+  `-home-vscode-repos-jkb`) and widening the workspace mount does not change that. Binding the
+  host's memory dir is the one mount forbidden everywhere in this design (`~/.claude` holds
+  `settings.json`, which IS the posture), it collides with `dc_link_state`'s symlink, and the slug
+  is inexpressible in `devcontainer.json`. So `scripts/link-claude-memory.sh` symlinks each side's
+  `memory` dir at `~/.jkb/claude-memory/<repo>/` — inside the bind that already exists. It migrates
+  file by file and **never overwrites**: a name on both sides is left alone and reported. Opt-in on
+  the host (`setup.sh --link-memory`), because `post-merge` re-runs `setup.sh` and a `git pull`
+  must not rearrange somebody's `~/.claude`. Stated plainly: agent-writable prose flowing from a
+  bounded context to a less bounded one is a channel, argued for rather than added by reflex.
+- **A session worktree is ARCHIVED, never deleted** (`jkb-cli/src/archive.rs`). `git worktree
+  remove` unlinks recursively and stops at the first refusal; from inside a sandboxed session that
+  refusal is `<worktree>/.claude/settings.json` — Claude Code protects a project's policy files
+  from the agent whose policy they are — and 152 files were already gone, with the error naming the
+  *directory* and not the 62,421 lines. Disposal is now one atomic `fs::rename` into
+  `<repo>/.jkb/archive/<session>-<stamp>`: partial destruction stops being representable rather
+  than being guarded against. `jkb task reap` deletes an archive once it is 30 days old, probing
+  with `remove_dir` first (`EPERM` vs `ENOTEMPTY`) so it never begins a walk it cannot finish.
+- **The refusal is scoped to the session's OWN working directories, and that is what makes
+  deferral work.** Measured across five live worktrees: only the session's own tree answers
+  `EPERM`; every other one answers `ENOTEMPTY`. And the deny is **not** ours — `auto-mode-posture
+  .json` names only `~/.claude/*` — so there is no knob, and there should not be: a session that
+  could write its own `.claude/hooks/` could run anything. So `land` never blocks: it grafts,
+  records the worktree it could not move, applies its plan (D48's ordering intact), and any other
+  process finishes it. `jkb service install` now writes **two** units — `com.jkb.sync` and
+  `com.jkb.reap` — kept apart so a wedged file watcher does not also stop every deferred landing.
+  `jkb doctor` reports what is outstanding; `--fix` sweeps it.
+- **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
+  attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
+  over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
+  not by parsing `status --porcelain` — whose leading status column is exactly what the trimming
+  capture helper eats.
+
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
 `/review-log` used to wrap the host's `/code-review`, which reports to the user rather than

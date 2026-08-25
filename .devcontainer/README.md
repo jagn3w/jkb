@@ -79,9 +79,57 @@ and cannot drift out of step with the verifier. It used to be transcribed into `
 well, and the first time the mounts changed the copy went stale and a correctly-built container
 failed its own verifier.
 
-By default only **this repo** is mounted, not all of `~/repos` — the tightest useful default. To
-work across repos, change `workspaceMount` to bind `${localEnv:HOME}/repos` at
-`/home/vscode/repos`, deliberately.
+All of **`~/repos`** is mounted, at `/home/vscode/repos`, and `workspaceFolder` opens
+`/home/vscode/repos/jkb` inside it — so this assumes your checkout is `~/repos/jkb`. The argument
+for the width is consistency, not convenience: `scripts/auto-mode-posture.json` already grants
+`~/repos` in both `allowRead` and `allowWrite`, so a container holding only jkb was *tighter* than
+the boundary the same agent runs under on the host. That difference was nothing anyone had
+decided, and it made a cross-repo task impossible in here rather than deliberately refused.
+Everything the posture does not grant is still absent by the kernel: `~/.ssh`, `~/.aws`,
+`~/Documents`, the rest of `$HOME`.
+
+### A nested bind must be named
+
+`verify.sh` compares exact mount points, with no prefix logic — filtering by prefix is what once
+let `$HOME` at `/host` through. So a bind *inside* a declared target is undeclared, and
+`mutate-verify.sh` needs exactly one: it spells its own docker flags and must mount the repo at
+`/home/vscode/repos/jkb`, because in a `jkb task work` session the repo's parent directory is
+`.jkb/work` and mounting it would put the checkout at `/home/vscode/repos/<session>`.
+
+Nesting is **not** granted automatically. A mount point and a mount source are independent —
+`-v ~/.ssh:/home/vscode/repos/jkb/secrets` is inside the declared region and is still
+exfiltration — and the source cannot be checked from inside the container, because on Docker
+Desktop for macOS `/proc/self/mountinfo` reports the path inside the VM rather than the host path.
+So the exception is named instead: `verify.sh --declare <mount-point>` **adds** to the derived set
+(it can never switch a check off) and is **refused** unless the value is a strict descendant of a
+target `devcontainer.json` already declares. `--declare /host`, `--declare /var/run/docker.sock`
+and `--declare /home/vscode/.claude/settings.json` are therefore all refused by `verify.sh`
+itself, and `mutate-verify.sh` watches that refusal fire. The count appears in the passing line,
+because an override nobody can see is indistinguishable from a rule that does not exist.
+
+### Auto-memory is shared through `~/.jkb`, not through a mount
+
+Claude Code keys auto-memory by the project's **absolute path** —
+`~/.claude/projects/<slug>/memory/`, where `<slug>` is that path with every character outside
+`[A-Za-z0-9-]` replaced by `-`. So one repo has two keys, `-Users-you-repos-jkb` on the host and
+`-home-vscode-repos-jkb` in here, and widening the workspace mount does not change that: the key
+comes from where the repo *is*, not from what is in it.
+
+The obvious fix — bind the host's memory directory in — is the one mount this design forbids, for
+the reason above. So the store lives at **`~/.jkb/claude-memory/<repo>/`** instead, inside the
+bind that already exists and is already reviewed, and each side symlinks its own slug's `memory`
+directory at it. `scripts/link-claude-memory.sh` does both sides; `setup.sh` runs it on every
+container create, and on the host it is opt-in (`./scripts/setup.sh --link-memory`) because it
+writes under `~/.claude` and the `post-merge` hook re-runs `setup.sh` after every pull. Nothing it
+does overwrites: existing memory is migrated file by file, a name that exists on both sides is
+left alone and reported, and a symlink pointing elsewhere is never retargeted. `verify.sh` asserts
+the link, and `mutate-verify.sh` watches that assertion fail.
+
+Stated plainly, because it is a hole in "the boundary is what you did not mount": memory is
+agent-**writable** prose that is injected into context, so a shared store is a channel from
+container sessions into the less-confined host ones. Same person's agents at both ends, prose
+rather than code, and it travels through a directory that was already shared — but it is a
+channel, and it is opt-in on the host for that reason.
 
 ## Root is not reachable from inside
 
@@ -170,3 +218,25 @@ it points at is not there.
 Costs, stated: on macOS this is a Linux VM, so bind-mount IO is slower and the toolchain is the
 container's, not your host's. `~/repos` mounted is still writable and push-able — the container's
 win is bounded to what you did **not** mount.
+
+## A session worktree is archived, not deleted
+
+`jkb task land` used to finish with `git worktree remove`, which unlinks the tree recursively
+and stops at the first refusal. Run from inside a sandboxed agent session that refusal comes at
+`<worktree>/.claude/settings.json` — Claude Code protects a project's policy files from the agent
+whose policy they are — by which point 152 files were gone. The verb reported an error about the
+*directory* and said nothing about the 62,421 lines it had already removed.
+
+Disposal is a **rename** now: the whole tree moves to `<repo>/.jkb/archive/<session>-<stamp>` in
+one atomic operation, so there is no partial state for a failure to leave behind, and a worktree
+disposed of by mistake is still there to move back. Deleting it is a separate, later decision —
+`jkb task reap` removes archives older than 30 days, and probes each with `remove_dir` first so it
+never begins a walk it cannot finish.
+
+The refusal is scoped to the session's **own** working directories: measured across five live
+worktrees, only the session's own tree answers `EPERM`, every other one answers `ENOTEMPTY`. So
+`land` never blocks on it — it grafts, applies its plan, records what it could not move, and any
+other process finishes the job. `jkb service install` installs that reaper beside the sync
+watcher (`com.jkb.reap`), as a second unit rather than another job for the watcher: a wedged file
+watcher must not also stop every deferred landing on the machine from completing. `jkb doctor`
+reports what is outstanding and `jkb doctor --fix` sweeps it.

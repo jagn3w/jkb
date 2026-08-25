@@ -6,6 +6,7 @@
 //! Read/task/query commands default their namespace scope to the mount covering the
 //! current directory (design D19), overridable with `--global`.
 
+mod archive;
 mod commands;
 mod gitrepo;
 mod output;
@@ -894,6 +895,27 @@ enum TaskCmd {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Archive session worktrees a landing could not move, and delete aged-out archives.
+    ///
+    /// A session cannot remove its OWN worktree — Claude Code protects a project's `.claude`
+    /// policy files from the agent whose policy they are, and the refusal propagates up to the
+    /// directory containing them — so `land` records what it could not move and this finishes
+    /// the job from anywhere else. Disposal is a rename into `<repo>/.jkb/archive`, never a
+    /// delete; the delete happens here, once an archive is past `--retain-days`.
+    Reap {
+        /// Delete archives older than this many days.
+        #[arg(long, default_value_t = archive::RETAIN_DAYS)]
+        retain_days: u64,
+        /// Report what would happen and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep sweeping, for the installed service. Ctrl-C stops it.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between sweeps under `--watch`.
+        #[arg(long, default_value_t = 900)]
+        interval_secs: u64,
+    },
     /// Reclaim claims whose owner is **proven** gone (the deterministic crash-recovery scan).
     /// Keeps every other claim — one whose owner is alive, one in `--keep`, and one whose owner
     /// cannot be established at all, which is reported and never cleared, since treating an
@@ -1128,7 +1150,7 @@ fn run(cli: Cli) -> Result<()> {
             CommandsCmd::Uninstall => commands::uninstall(),
             CommandsCmd::List => commands::list(),
         },
-        Command::Task { cmd } => cmd_task(&db, cmd, global, json),
+        Command::Task { cmd } => cmd_task(&db, &db_path, cmd, global, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index { sweep } => cmd_index(&db, sweep),
@@ -3109,12 +3131,18 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               --onto <branch> names the STAGING branch it lands on; omit it
                               and jkb joins the batch in flight, or cuts one from trunk.
   jkb task land <uid>         rebase the session onto its target, run the repo's gate, and
-                              on green mark the task done and remove the session. Serial:
+                              on green mark the task done and ARCHIVE the session (moved to
+                              .jkb/archive, deleted after 30 days — never deleted here). Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
                               REFUSES a task with no recorded review, or whose review left a
                               must-fix finding open — anything at priority <= 1, so !p0 blocks
                               as well as !p1. --no-review records a waiver.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
+  jkb task reap               finish landings that could not move their own worktree, and
+                              delete archives past 30 days. A session may not unlink its own
+                              .claude policy files, so it cannot archive itself — land records
+                              it and this, run anywhere else, finishes it. The watcher service
+                              installed by `jkb service install` runs it on a timer.
   jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
       If you are inside a session, land is the human's call — commit, and say you are done.
@@ -4132,7 +4160,7 @@ fn cmd_task_add(
     Ok(())
 }
 
-fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
+fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::Add {
             text,
@@ -4197,7 +4225,13 @@ fn cmd_task(db: &Db, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
         | TaskCmd::Land { .. }
         | TaskCmd::Abandon { .. }
         | TaskCmd::Sessions
-        | TaskCmd::Gate { .. }) => cmd_task_session(db, cmd, json)?,
+        | TaskCmd::Gate { .. }) => cmd_task_session(db, db_path, cmd, json)?,
+        TaskCmd::Reap {
+            retain_days,
+            dry_run,
+            watch,
+            interval_secs,
+        } => cmd_task_reap(db_path, retain_days, dry_run, watch, interval_secs, json)?,
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
@@ -4415,6 +4449,7 @@ fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Claim { .. }
         | TaskCmd::Start { .. }
         | TaskCmd::Release { .. }
+        | TaskCmd::Reap { .. }
         | TaskCmd::Reclaim { .. } => unreachable!(),
     }
     Ok(())
@@ -5156,7 +5191,7 @@ fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
 
 /// Dispatch the parallel-session subcommands (design D36): open a session, land it, drop it,
 /// list what is in flight, or configure the gate that guards a landing.
-fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
+fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::Work { uid, onto } => cmd_task_work(db, &uid, onto.as_deref(), json),
         TaskCmd::Land {
@@ -5167,6 +5202,7 @@ fn cmd_task_session(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             no_review,
         } => cmd_task_land(
             db,
+            db_path,
             &uid,
             LandFlags {
                 gate: gate.clone(),
@@ -5778,7 +5814,25 @@ fn land_preflight(
         // verdict at length and is where `--no-review` records a waiver instead of refusing.
         verdict: None,
     }) {
-        anyhow::bail!("{uid} cannot land. {reason}");
+        // A tree that is only MISSING files is not work in progress, and the two want opposite
+        // advice: "commit them in the session first" over 152 deletions commits the wreckage of a
+        // part-way removal. Said as an extra sentence rather than by changing `land_blocker`,
+        // which is the one shared rule the In Flight row renders too — the verdict is identical,
+        // only the remedy differs, and only when the difference is observable.
+        let hint = match sess
+            .as_ref()
+            .filter(|_| dirty)
+            .map(|s| gitrepo::deletions_only(&s.worktree))
+        {
+            Some(Ok(Some(n))) => format!(
+                " Those {n} change(s) are deletions of tracked files and nothing else — a \
+                 part-way removal, not work. `git -C {} restore .` puts them all back.",
+                sess.as_ref()
+                    .map_or_else(String::new, |s| s.worktree.display().to_string())
+            ),
+            _ => String::new(),
+        };
+        anyhow::bail!("{uid} cannot land. {reason}{hint}");
     }
     // Unreachable: `land_blocker` refuses `worktree: None` above. Written as an error rather
     // than an `expect` so the no-panic rule holds even if that arm is ever weakened.
@@ -5791,7 +5845,7 @@ fn land_preflight(
     })
 }
 
-fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
+fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
     let LandFlags {
         gate: gate_flag,
         no_gate,
@@ -5874,6 +5928,7 @@ fn cmd_task_land(db: &Db, uid: &str, flags: LandFlags, json: bool) -> Result<()>
 
     settle_landing(
         db,
+        db_path,
         id,
         &ctx,
         &sess,
@@ -5920,6 +5975,7 @@ struct Landed<'a> {
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
 fn settle_landing(
     db: &Db,
+    db_path: &Path,
     id: ItemId,
     ctx: &repo::RepoCtx,
     sess: &session::Session,
@@ -5966,28 +6022,7 @@ fn settle_landing(
         uid = landed.uid,
     );
 
-    // Dispose of the session FIRST, because it is the fallible half. `worktree_remove` without
-    // `--force` is refused by git on a dirty tree, and doing it after the status write left
-    // the task marked `done` with its claim freed and its worktree still there — a state both
-    // escape hatches then refuse ("is done — there is nothing to land", "abandoning it would
-    // reopen finished work"), recoverable only by hand-editing the status.
-    let mut cleaned = false;
-    if disposed_already {
-        // Somebody removed it while the gate ran. Nothing to dispose of, and prune the
-        // registration so git stops listing a worktree whose directory is gone.
-        let _ = gitrepo::prune_worktrees(&ctx.root);
-        cleaned = true;
-    } else if landed.keep_worktree {
-        // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
-        // commits. Left there, the kept session reads as N commits ahead of a target that
-        // already contains its work, and a second `land` re-runs the whole graft. Move it to
-        // what actually landed; the worktree is verified clean just above, so nothing is lost.
-        gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
-    } else {
-        gitrepo::worktree_remove(&ctx.root, &sess.worktree, false)?;
-        gitrepo::delete_branch(&ctx.root, landed.branch, true)?;
-        cleaned = true;
-    }
+    let disposal = dispose_session(db_path, ctx, sess, &landed, disposed_already)?;
 
     // Landed: the task is done, the claim is free, and the session branch is a duplicate of
     // commits now in `onto`.
@@ -6054,21 +6089,42 @@ fn settle_landing(
         );
     }
 
+    report_landing(&landed, sess, &disposal, kept_status.as_ref(), json);
+    Ok(())
+}
+
+/// Say what happened, never what was intended. Two claims here were once simply false:
+/// `"{uid} is done"` after a status the transaction deliberately left as `cancelled`, and
+/// "removed session and its branch" in the arm that had only run `git worktree prune` because
+/// somebody else had already removed the directory.
+fn report_landing(
+    landed: &Landed<'_>,
+    sess: &session::Session,
+    disposal: &Disposal,
+    kept_status: Option<&(jkb_types::TaskStatus, String)>,
+    json: bool,
+) {
     // Reported from what actually happened, never from what was intended. Two claims here were
     // simply false: `"{uid} is done"` after a status this transaction deliberately left as
     // `cancelled`, and "removed session and its branch" in the arm that only ran
     // `git worktree prune` because somebody else had already removed the directory.
-    let status = kept_status
-        .as_ref()
-        .map_or("done", |(s, _)| jkb_fsm::State::name(*s));
+    let status = kept_status.map_or("done", |(s, _)| jkb_fsm::State::name(*s));
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "uid": landed.uid, "landed": true, "branch": landed.branch, "onto": landed.onto,
                 "commits": landed.ahead, "gate": landed.gate, "gate_source": landed.gate_source,
-                "session_removed": cleaned, "status": status,
-                "branch_deleted": cleaned && !disposed_already,
+                "session_removed": disposal.session_gone(), "status": status,
+                "branch_deleted": matches!(disposal, Disposal::Archived(_)),
+                "session_archived": match &disposal {
+                    Disposal::Archived(dest) => Some(dest.display().to_string()),
+                    _ => None,
+                },
+                "session_deferred": match &disposal {
+                    Disposal::Deferred(why) => Some(why.clone()),
+                    _ => None,
+                },
             })
         );
     } else {
@@ -6076,13 +6132,243 @@ fn settle_landing(
             "landed: {} → {} ({} commit(s)); {} is {status}",
             landed.branch, landed.onto, landed.ahead, landed.uid
         );
-        if cleaned && disposed_already {
-            println!("  session was already gone; pruned its registration");
-        } else if cleaned {
-            println!("  removed session {} and its branch", sess.name);
+        match &disposal {
+            Disposal::AlreadyGone => {
+                println!("  session was already gone; pruned its registration");
+            }
+            Disposal::Archived(dest) => {
+                println!(
+                    "  archived session {} to {} (deleted after {} days); removed its branch",
+                    sess.name,
+                    dest.display(),
+                    archive::RETAIN_DAYS
+                );
+            }
+            // Said plainly rather than buried: the landing is complete, and what is left is a
+            // directory somebody else will move. Reading this as a failure is what sent the last
+            // operator to re-run a land that had nothing left to do.
+            Disposal::Deferred(why) => {
+                println!(
+                    "  session {} could not be archived from in here ({why}), so it is recorded \
+                     for `jkb task reap`, which the watcher service runs. The landing is done; \
+                     run `jkb task reap` from a terminal to finish it now.",
+                    sess.name
+                );
+            }
+            Disposal::Kept => println!("  kept session {} and its branch", sess.name),
+        }
+    }
+}
+
+/// `task reap` — archive worktrees a landing could not move, then delete archives past the
+/// retention window (design D49).
+///
+/// Takes the database **path** rather than a handle: it touches no rows. The records live beside
+/// the database precisely so this needs no repo context and one service sweeps every repo on the
+/// machine.
+fn cmd_task_reap(
+    db_path: &Path,
+    retain_days: u64,
+    dry_run: bool,
+    watch: bool,
+    interval_secs: u64,
+    json: bool,
+) -> Result<()> {
+    if !watch {
+        report_reap(
+            &archive::reap(db_path, retain_days, dry_run)?,
+            dry_run,
+            json,
+        );
+        return Ok(());
+    }
+    // The service form. Ctrl-C stops it, the same shared-flag shape `sync --watch` uses.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&stop);
+    let _ = ctrlc::set_handler(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+    // Never zero: a sweep every 0 seconds is a busy loop that would keep a laptop awake.
+    let interval = std::time::Duration::from_secs(interval_secs.max(60));
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        match archive::reap(db_path, retain_days, dry_run) {
+            // Silence when there is nothing to say: this runs every quarter hour for ever, and a
+            // log that says "nothing to do" 96 times a day is a log nobody reads the rest of.
+            Ok(r) if r.is_empty() => {}
+            Ok(r) => report_reap(&r, dry_run, json),
+            // A sweep that failed must not stop the service — the next one may well succeed, and
+            // this is the process that finishes every deferred landing on the machine.
+            Err(e) => eprintln!("reap: {e:#}"),
+        }
+        // Slept in slices so Ctrl-C is answered promptly rather than up to `interval` later.
+        let deadline = std::time::Instant::now() + interval;
+        while std::time::Instant::now() < deadline
+            && !stop.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
     Ok(())
+}
+
+fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": dry_run,
+                "archived": r.archived.iter()
+                    .map(|(uid, p)| serde_json::json!({ "uid": uid, "archive": p.display().to_string() }))
+                    .collect::<Vec<_>>(),
+                "held": r.held.iter()
+                    .map(|(uid, why)| serde_json::json!({ "uid": uid, "reason": why }))
+                    .collect::<Vec<_>>(),
+                "deleted": r.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "cleared": r.cleared,
+                "retained": r.retained,
+                "unreadable": r.unreadable.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            })
+        );
+        return;
+    }
+    // Two verb forms rather than one prefix: a `{would}` prefix produces "would archived", and
+    // this is the line an operator reads to decide whether to run it for real.
+    let (archive_verb, delete_verb) = if dry_run {
+        ("would archive", "would delete")
+    } else {
+        ("archived", "deleted")
+    };
+    for (uid, dest) in &r.archived {
+        println!("{archive_verb} {uid} → {}", dest.display());
+    }
+    for path in &r.deleted {
+        println!(
+            "{delete_verb} {} (past the retention window)",
+            path.display()
+        );
+    }
+    for uid in &r.cleared {
+        println!("cleared {uid} (nothing left to archive)");
+    }
+    // Held is the normal state when this is run from the session that owns the worktree, so it
+    // says what would move it rather than reading as a failure.
+    for (uid, why) in &r.held {
+        println!("held {uid}: {why}");
+    }
+    for path in &r.unreadable {
+        println!("unreadable record {} (left alone)", path.display());
+    }
+    if r.is_empty() && r.retained == 0 {
+        println!("nothing to reap");
+    } else if r.retained > 0 {
+        println!(
+            "{} archive(s) still inside the retention window",
+            r.retained
+        );
+    }
+}
+
+/// What becomes of the session worktree once its commits are on the target.
+///
+/// Split out of [`settle_landing`] because it is the whole of the fallible half: everything here
+/// runs BEFORE the task's plan is applied, so a refusal leaves the task exactly where it was and
+/// the verb is re-runnable (D48).
+fn dispose_session(
+    db_path: &Path,
+    ctx: &repo::RepoCtx,
+    sess: &session::Session,
+    landed: &Landed<'_>,
+    disposed_already: bool,
+) -> Result<Disposal> {
+    // Dispose of the session FIRST, because it is the fallible half. Doing it after the status
+    // write left the task marked `done` with its claim freed and its worktree still there — a
+    // state both escape hatches then refuse ("is done — there is nothing to land", "abandoning it
+    // would reopen finished work"), recoverable only by hand-editing the status.
+    //
+    // DISPOSAL IS A RENAME, not a recursive delete. `git worktree remove` unlinks the tree and
+    // stops at the first refusal, so landing from a sandboxed agent session — where Claude Code
+    // protects the worktree's own `.claude` policy files from the agent whose policy they are —
+    // gutted 152 files and then reported an error about the *directory*. `archive::stow` moves
+    // the whole tree into `<repo>/.jkb/archive` in one atomic `rename`: it either happens or
+    // nothing happens, and a worktree disposed of by mistake is still there to be moved back.
+    // Deleting it is a separate, later decision, taken by `jkb task reap` once it has aged out.
+    let mut disposal = Disposal::Kept;
+    if disposed_already {
+        // Somebody removed it while the gate ran. Nothing to dispose of, and prune the
+        // registration so git stops listing a worktree whose directory is gone.
+        let _ = gitrepo::prune_worktrees(&ctx.root);
+        disposal = Disposal::AlreadyGone;
+    } else if landed.keep_worktree {
+        // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
+        // commits. Left there, the kept session reads as N commits ahead of a target that
+        // already contains its work, and a second `land` re-runs the whole graft. Move it to
+        // what actually landed; the worktree is verified clean just above, so nothing is lost.
+        gitrepo::reset_hard(&sess.worktree, landed.grafted)?;
+    } else {
+        let mut entry = archive::Entry {
+            worktree: sess.worktree.clone(),
+            repo_root: ctx.root.clone(),
+            branch: landed.branch.to_owned(),
+            uid: landed.uid.to_owned(),
+            recorded_at: archive::now_secs(),
+            archive: None,
+            archived_at: None,
+        };
+        match archive::stow(&ctx.root, &sess.worktree, entry.recorded_at) {
+            Ok(dest) => {
+                gitrepo::prune_worktrees(&ctx.root)?;
+                gitrepo::delete_branch(&ctx.root, landed.branch, true)?;
+                entry.archive = Some(dest.clone());
+                entry.archived_at = Some(entry.recorded_at);
+                // Recorded even on the happy path, so the retention sweep has one place to look
+                // and there is no second index of archives to keep in agreement with this one.
+                archive::record(db_path, &entry)?;
+                disposal = Disposal::Archived(dest);
+            }
+            // A SESSION CANNOT ARCHIVE ITSELF, and that is the ordinary case rather than an
+            // error: the refusal covers the session's own working directories, and every other
+            // process — the watcher service, another session, a terminal — moves it freely
+            // (measured across five live worktrees). The rename changed nothing, so the landing
+            // is simply completed and the tree is handed to `jkb task reap`. Recording it is
+            // fallible and therefore happens HERE, before the plan: a landed task whose worktree
+            // nothing is tracking is the state this record exists to prevent.
+            Err(e) => {
+                archive::record(db_path, &entry)?;
+                // The branch still points at its pre-rebase commits, which reads as "ahead of a
+                // target that already has this work". Cosmetic, and it lasts only until the reaper
+                // deletes the branch — so a failure here is reported and does not undo a landing.
+                if let Err(reset) = gitrepo::reset_hard(&sess.worktree, landed.grafted) {
+                    eprintln!(
+                        "note: could not point {} at what landed: {reset}",
+                        landed.branch
+                    );
+                }
+                disposal = Disposal::Deferred(e.to_string());
+            }
+        }
+    }
+
+    Ok(disposal)
+}
+
+/// What actually became of the session worktree. Three of these used to be one `bool`, which is
+/// how "removed session and its branch" got printed by the arm that had only run `worktree prune`.
+enum Disposal {
+    /// Somebody else removed it while the gate ran.
+    AlreadyGone,
+    /// Moved into the repo's archive; the branch is deleted and the retention sweep owns it now.
+    Archived(PathBuf),
+    /// Nothing moved — this process may not unlink the tree — and a record was left for the
+    /// reaper. Carries the refusal, because "it did not work" without the reason is what makes
+    /// an operator go looking in the wrong place.
+    Deferred(String),
+    /// `--keep-worktree`: the session stays, by request.
+    Kept,
+}
+
+impl Disposal {
+    /// Whether the session directory is no longer where it was.
+    fn session_gone(&self) -> bool {
+        matches!(self, Self::AlreadyGone | Self::Archived(_))
+    }
 }
 
 /// The working tree to graft in: wherever `onto` is already checked out, else a checkout of
@@ -6442,6 +6728,52 @@ fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<
 /// Every session is listed, not just some subset flagged as neglected — nothing here can tell
 /// a session you are working in from one you walked away from (design D36.6), and a report
 /// that guesses would tell you to abandon the work you are doing.
+/// Worktrees a landing disposed of, or could not (design D49).
+///
+/// Reported by `doctor` because both halves are otherwise invisible: a deferred removal is a
+/// session directory sitting where a completed landing left it, and an archive is disk that will
+/// be deleted on a schedule nobody was told about. `--fix` runs the same sweep the service runs,
+/// which is the whole point of the record living beside the database rather than in a repo.
+fn report_worktree_removals(db_path: &Path, fix: bool) {
+    let store = match archive::entries(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("worktree removals: unknown ({e})");
+            return;
+        }
+    };
+    if store.records.is_empty() && store.unreadable.is_empty() {
+        println!("worktree removals: none pending");
+        return;
+    }
+    let (archived, pending): (Vec<_>, Vec<_>) =
+        store.records.iter().partition(|(_, e)| e.archive.is_some());
+    println!(
+        "worktree removals: {} awaiting archive, {} archived",
+        pending.len(),
+        archived.len()
+    );
+    for (_, e) in &pending {
+        println!("  {} — {} not yet moved", e.uid, e.worktree.display());
+    }
+    for (_, e) in &archived {
+        if let Some(dir) = &e.archive {
+            println!("  {} — archived at {}", e.uid, dir.display());
+        }
+    }
+    for path in &store.unreadable {
+        println!("  unreadable record {}", path.display());
+    }
+    if fix {
+        match archive::reap(db_path, archive::RETAIN_DAYS, false) {
+            Ok(r) => report_reap(&r, false, false),
+            Err(e) => println!("  sweep failed: {e}"),
+        }
+    } else if !pending.is_empty() {
+        println!("  run `jkb doctor --fix` or `jkb task reap` (the watcher service runs it)");
+    }
+}
+
 fn report_sessions(db: &Db) {
     let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
@@ -7224,6 +7556,8 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
     // orphaned. Doctor lists every one, because nothing observable distinguishes a session
     // you are working in from one you walked away from.
     report_sessions(db);
+
+    report_worktree_removals(db_path, fix);
 
     // Cloud-sync-folder warning (design D23).
     match jkb_core::cloud_sync_warning(db_path) {

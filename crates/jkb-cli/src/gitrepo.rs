@@ -465,6 +465,46 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
     Ok(git(dir, &["status", "--porcelain"])?.is_some_and(|s| !s.is_empty()))
 }
 
+/// How many tracked files are deleted in the working tree, when that is **all** that is wrong.
+///
+/// `Some(n)` means: `n` tracked files are missing, nothing is staged, nothing is modified and
+/// nothing is untracked — a tree somebody (or something) part-way removed, recoverable in full
+/// with one `git restore .`. `None` means the dirt is real work.
+///
+/// This exists because of a real incident: a `git worktree remove` refused part-way through left
+/// 152 deletions, and the next landing refused with "it has uncommitted changes — commit them in
+/// the session first", which would have committed 62,421 deleted lines. The two states need
+/// opposite advice, so they must not read the same. `jkb task land` no longer creates that state
+/// — disposal is an atomic rename now — but nothing stops a stale binary, an interrupted `rm`, or
+/// a hand-run `git worktree remove` from doing so.
+///
+/// # Errors
+/// Returns an error if `git status` cannot be run here.
+pub fn deletions_only(dir: &Path) -> Result<Option<usize>> {
+    // Asked as four questions with no whitespace in the answers, rather than by parsing
+    // `status --porcelain` — whose leading status column is exactly what a trimmed capture eats,
+    // so the first entry of every listing would read as the wrong code.
+    let lines = |args: &[&str]| -> Result<Option<usize>> {
+        // A `git` that exits non-zero here means the question was not answered. Unknown must not
+        // be spelled the same as none: it returns `None` from the caller, which is *no advice*.
+        Ok(git(dir, args)?.map(|s| s.lines().filter(|l| !l.trim().is_empty()).count()))
+    };
+    let (Some(staged), Some(untracked), Some(unstaged), Some(deleted)) = (
+        lines(&["diff", "--cached", "--name-only"])?,
+        lines(&["ls-files", "--others", "--exclude-standard"])?,
+        lines(&["diff", "--name-only"])?,
+        lines(&["diff", "--name-only", "--diff-filter=D"])?,
+    ) else {
+        return Ok(None);
+    };
+    // A staged change of any kind is deliberate — staging a deletion included — and an untracked
+    // file is work `git restore .` would not bring back and must not be advised over.
+    if staged > 0 || untracked > 0 || unstaged != deleted {
+        return Ok(None);
+    }
+    Ok((deleted > 0).then_some(deleted))
+}
+
 /// How many commits `branch` has that `onto` does not. Both must be refs this repository can
 /// resolve — see [`branch_refs`].
 ///
@@ -699,7 +739,7 @@ pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_branch, key, trunk};
+    use super::{current_branch, deletions_only, key, trunk};
     use std::path::Path;
     use std::process::Command;
 
@@ -884,6 +924,34 @@ mod tests {
         assert_eq!(name("v1.0"), NotABranch, "a tag was accepted as a branch");
         assert_eq!(name("HEAD"), NotABranch);
         assert_eq!(name("no-such-thing"), Unknown);
+    }
+
+    #[test]
+    fn a_part_way_removal_is_told_apart_from_work_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        assert_eq!(
+            deletions_only(dir).unwrap(),
+            None,
+            "a clean tree owes no advice"
+        );
+
+        // The incident's shape: tracked files missing, nothing staged, nothing untracked.
+        std::fs::remove_file(dir.join("base.txt")).unwrap();
+        assert_eq!(
+            deletions_only(dir).unwrap(),
+            Some(1),
+            "deletions alone are recoverable with `git restore .`"
+        );
+
+        // One real edit beside them and it is work again — the advice must flip back.
+        std::fs::write(dir.join("new.txt"), "mine").unwrap();
+        assert_eq!(
+            deletions_only(dir).unwrap(),
+            None,
+            "an untracked file beside the deletions is work, and must not be restored over"
+        );
     }
 
     #[test]

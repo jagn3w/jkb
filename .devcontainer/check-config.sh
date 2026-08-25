@@ -102,7 +102,7 @@ fi
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
 mount_targets="$(dc_mount_targets "$here/devcontainer.json")"
 missing_mounts=()
-for m in /home/vscode/repos/jkb /home/vscode/.jkb; do
+for m in /home/vscode/repos /home/vscode/.jkb; do
     grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
 done
 if [ ${#missing_mounts[@]} -eq 0 ]; then
@@ -131,7 +131,7 @@ done <<<"$mount_targets"
 while IFS= read -r src; do
     [ -n "$src" ] || continue
     case "$src" in
-        '${localWorkspaceFolder}'|'${localEnv:HOME}/.jkb') ;;
+        '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb') ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
 done <<<"$(dc_mount_sources "$here/devcontainer.json" | sed -n '/|volume$/!s/|[^|]*$//p')"

@@ -12,6 +12,36 @@ ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 
+# `--declare <mount-point>`: a mount point the CALLER declares, for the one case devcontainer.json
+# cannot express — a bind NESTED inside a declared target. `mutate-verify.sh` is that case: it
+# spells its own docker flags, and it must mount the repo at /home/vscode/repos/jkb because in a
+# `jkb task work` session the repo's parent directory is `.jkb/work`, not a repos dir, so mounting
+# the parent would put the checkout at /home/vscode/repos/<session>.
+#
+# Nesting is NOT granted automatically, and that is the whole design decision here. A mount point
+# and a mount SOURCE are independent: `-v ~/.ssh:/home/vscode/repos/jkb/secrets` sits inside a
+# declared region and is still exfiltration. Nor can the source be checked from in here — on
+# Docker Desktop for macOS /proc/self/mountinfo reports the path inside the VM, not the host path,
+# which is why lib.sh's `dc_mount_sources` is used only by check-config.sh, on the host, where the
+# sources are literal strings in the JSON.
+#
+# So the exception is NAMED rather than inferred, and it is bounded two ways. It only ADDS to the
+# derived set, so it can never switch a check off; and it is refused unless the value is a strict
+# descendant of a target devcontainer.json already declares, so `--declare /host`,
+# `--declare /var/run/docker.sock` and `--declare /home/vscode/.claude/settings.json` — the exact
+# mutations mutate-verify.sh exists to catch — cannot be waved through by it. The count is printed
+# in the ok line below, because an override nobody can see is indistinguishable from a rule that
+# does not exist (D38).
+DECLARED_EXTRA=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --declare)   shift; [ $# -gt 0 ] || { echo "verify.sh: --declare needs a mount point" >&2; exit 2; }
+                     DECLARED_EXTRA+=("$1"); shift ;;
+        --declare=*) DECLARED_EXTRA+=("${1#--declare=}"); shift ;;
+        *)           echo "usage: verify.sh [--declare <mount-point>]..." >&2; exit 2 ;;
+    esac
+done
+
 echo "==> container posture"
 
 # 1. Non-root. Load-bearing, not hygiene: root in a container cannot create a mount namespace
@@ -54,12 +84,31 @@ RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\
 actual="$(awk '{print $5}' /proc/self/mountinfo | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
 # A failed derivation would make every real mount look undeclared — a true failure, but reported
 # as the wrong thing. Say which it is, so the fix is not looked for in devcontainer.json's mounts.
+#
+# The caller's own declarations are folded in HERE, after the derivation and never instead of it,
+# and each is refused unless it is strictly inside something already derived. `$d/*` is a strict
+# descendant test on purpose: `--declare` cannot restate a declared target (which would be a
+# no-op) and cannot name one of its ancestors (which would widen the set upwards).
+extra=0
+for t in ${DECLARED_EXTRA[@]+"${DECLARED_EXTRA[@]}"}; do
+    nested=no
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        case "$t" in "$d"/?*) nested=yes; break ;; esac
+    done <<<"$EXPECTED"
+    if [ "$nested" = yes ]; then
+        EXPECTED="$(printf '%s\n%s\n' "$EXPECTED" "$t" | sort -u)"
+        extra=$((extra+1))
+    else
+        bad "--declare $t is not inside any mount $DC declares — only a bind NESTED in a declared target may be declared on the command line"
+    fi
+done
 if [ -z "$EXPECTED" ]; then
     bad "could not derive the declared mounts from $DC — the check below cannot mean anything"
 else
     unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED"))"
     if [ -z "$unexpected" ]; then
-        ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked against $(printf '%s\n' "$EXPECTED" | grep -c . ) declared)"
+        ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked against $(printf '%s\n' "$EXPECTED" | grep -c . ) declared$([ "$extra" -gt 0 ] && printf ', %s of them nested and named with --declare' "$extra"))"
     else
         bad "UNDECLARED mounts: $(tr '\n' ' ' <<<"$unexpected")"
     fi
@@ -152,6 +201,27 @@ for pair in "/home/vscode/.claude/.credentials.json:/home/vscode/.claude-state/.
     fi
 done
 [ "$links_ok" -eq 1 ] && ok "login state is linked into the persistent volume"
+
+# 3d. Auto-memory reaches the host, and the state volume does NOT give you this: Claude Code keys
+#     memory by the project's ABSOLUTE PATH, so this container's /home/vscode/repos/jkb is a
+#     different key from the host's, and widening the workspace mount does not change that. The
+#     shared store lives inside the ~/.jkb bind that already exists, so nothing under ~/.claude is
+#     mounted and the assertion above still holds. Asserted here for the reason 3c is: it is a
+#     promise the README makes, and a promise checked nowhere is how this one would rot.
+#     The slug comes from the linking script itself rather than being spelled again here — one
+#     guess about another program's private encoding is enough.
+mem_slug="$(/home/vscode/repos/jkb/scripts/link-claude-memory.sh --print-slug /home/vscode/repos/jkb 2>/dev/null)"
+mem_link="/home/vscode/.claude/projects/$mem_slug/memory"
+mem_want="/home/vscode/.jkb/claude-memory/jkb"
+if [ -z "$mem_slug" ]; then
+    bad "could not derive the memory slug — scripts/link-claude-memory.sh did not answer"
+elif [ ! -L "$mem_link" ]; then
+    bad "auto-memory is not linked into the shared store ($mem_link is $( [ -e "$mem_link" ] && echo "not a link" || echo missing )) — memory written in here would be invisible on the host"
+elif [ "$(readlink "$mem_link")" != "$mem_want" ]; then
+    bad "auto-memory points at $(readlink "$mem_link"), not $mem_want"
+else
+    ok "auto-memory is shared with the host through ~/.jkb"
+fi
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.
 assert "workspace is mounted"       "$([ -f /home/vscode/repos/jkb/Cargo.toml ] && echo yes || echo no)"
