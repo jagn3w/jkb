@@ -196,6 +196,28 @@ fn two_sessions_are_worked_in_parallel_and_land_in_sequence() {
         .success()
         .stdout(predicate::str::contains("no sessions"));
     assert!(!wa.exists() && !wb.exists());
+
+    // ...but the trees were ARCHIVED, not deleted (design D49). This is the promise the whole
+    // rename-instead-of-unlink change exists for, and the old code satisfied every assertion
+    // above while destroying the files — so the files themselves are what is asserted, not just
+    // that a directory appeared.
+    let archive = f.repo.join(".jkb/archive");
+    let mut recovered: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&archive).expect("an archive directory exists") {
+        let dir = entry.expect("readable").path();
+        for want in ["a.txt", "b.txt"] {
+            if dir.join(want).exists() {
+                recovered.push(want.to_owned());
+            }
+        }
+    }
+    recovered.sort();
+    assert_eq!(
+        recovered,
+        vec!["a.txt".to_owned(), "b.txt".to_owned()],
+        "both landed sessions are recoverable from {}",
+        archive.display()
+    );
 }
 
 /// A local trunk ahead of its remote is the ordinary case. Cutting the batch from

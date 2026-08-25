@@ -125,13 +125,20 @@ pub fn archive_root(repo_root: &Path) -> PathBuf {
 /// One record per file, named for the worktree it is about. Per-entry files rather than one
 /// document holding a map: two processes sweeping at once then cannot lose each other's updates,
 /// and a take is one `remove_file` touching nothing else.
+///
+/// The readable part is a slug, and the slug alone is **not** an identity: mapping every
+/// non-alphanumeric character to `-` makes `~/repos/a-b/.jkb/work/s` and `~/repos/a/b/.jkb/work/s`
+/// the same name, and the second record would then overwrite the first — silently leaving one
+/// landed worktree that nothing ever archives. The hash is what makes the name unique; the slug
+/// is there so a person can tell the files apart.
 fn marker_path(db: &Path, worktree: &Path) -> PathBuf {
-    let slug: String = worktree
-        .to_string_lossy()
+    let raw = worktree.to_string_lossy();
+    let slug: String = raw
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    store_dir(db).join(format!("{slug}.json"))
+    let digest = jkb_core::blob::hash_bytes(raw.as_bytes());
+    store_dir(db).join(format!("{slug}-{}.json", &digest[..8]))
 }
 
 /// Write (or replace) the record for one worktree.
@@ -408,6 +415,24 @@ mod tests {
             archive: None,
             archived_at: None,
         }
+    }
+
+    #[test]
+    fn two_worktrees_whose_slugs_collide_keep_separate_records() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        // Identical once every non-alphanumeric character becomes `-`, which is why the name
+        // cannot be the slug alone.
+        let a = Path::new("/r/a-b/.jkb/work/s");
+        let b = Path::new("/r/a/b/.jkb/work/s");
+        record(&db, &entry(a, Path::new("/r/a-b"))).expect("a");
+        record(&db, &entry(b, Path::new("/r/a/b"))).expect("b");
+
+        let records = entries(&db).expect("entries").records;
+        assert_eq!(records.len(), 2, "neither record overwrote the other");
+        let mut seen: Vec<&Path> = records.iter().map(|(_, e)| e.worktree.as_path()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![b, a]);
     }
 
     #[test]
