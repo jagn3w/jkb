@@ -7039,8 +7039,13 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
             .iter()
             .filter_map(|(_, e)| e.archive.as_deref())
             .partition(|dir| dir.exists());
-        let bytes: u64 = seen.iter().copied().map(archive::dir_size).sum();
-        println!("  {} held until they age out", human_bytes(bytes));
+        // Only when there is something to have measured. With every archive on the other side of
+        // the container bind, "0 B held until they age out" printed beside "1 whose size is
+        // unknown" reads as "these occupy nothing" — a measurement of none where none was taken.
+        if !seen.is_empty() {
+            let bytes: u64 = seen.iter().copied().map(archive::dir_size).sum();
+            println!("  {} held until they age out", human_bytes(bytes));
+        }
         if !unseen.is_empty() {
             println!(
                 "  and {} archive(s) whose size is unknown from here (their repo is not reachable)",

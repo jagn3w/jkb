@@ -126,11 +126,7 @@ pub fn is_alive(owner: &str) -> Fact {
         // `Path::exists` is itself lossy — it answers `false` for a permission error as well as
         // for a missing directory — so it is asked through `try_exists`, which separates them.
         // And an absence is only proof where the place it would be is visible; see `absent_here`.
-        Liveness::Worktree(dir) => match absent_here(&dir) {
-            Fact::No => Fact::Yes, // it is there
-            Fact::Yes => Fact::No, // it is gone, and this machine can see that it is gone
-            Fact::Unknown => Fact::Unknown,
-        },
+        Liveness::Worktree(dir) => present_here(&dir),
         // An owner on another host and an external agent are the same answer for the same
         // reason: nothing here can establish it. Never "dead" — see the module docs.
         Liveness::Process { .. } | Liveness::External => Fact::Unknown,
@@ -152,7 +148,7 @@ pub fn is_alive(owner: &str) -> Fact {
 ///
 /// A pid that cannot be represented is [`Fact::No`], not `Unknown`: no process can carry an id
 /// outside `pid_t`, so its absence is established rather than merely unobserved.
-/// Whether `path` is **provably** absent from this machine.
+/// Whether `path` is there, as far as this machine can establish.
 ///
 /// AN ABSENCE IS ONLY PROOF WHERE YOU CAN SEE THE PLACE IT WOULD BE — the same rule the archive
 /// sweep applies to a record whose repo it cannot reach. `Liveness::Process` was host-qualified so
@@ -170,15 +166,19 @@ pub fn is_alive(owner: &str) -> Fact {
 /// Deliberately conservative at the edge: if the parent is gone too — someone removed `.jkb/work`
 /// wholesale — this answers `Unknown` and the claim is reported rather than freed. Of the two ways
 /// to be wrong, the one that costs a command wins (D34.4).
-fn absent_here(path: &Path) -> Fact {
+/// Answers the question the caller asks, rather than its inverse: the first version returned
+/// "is it absent" and every arm was then flipped at the call site, which is one edit away from
+/// reading backwards in the probe that decides whether a claim may be freed.
+fn present_here(path: &Path) -> Fact {
     match path.try_exists() {
-        Ok(true) => Fact::No,
+        Ok(true) => Fact::Yes,
         Err(_) => Fact::Unknown,
         Ok(false) => match path.parent() {
             // A path with no parent is `/`, whose absence is not a thing to reason about.
             None => Fact::Unknown,
+            // The place it would be is visible, so it really is gone.
             Some(parent) => match parent.try_exists() {
-                Ok(true) => Fact::Yes,
+                Ok(true) => Fact::No,
                 _ => Fact::Unknown,
             },
         },

@@ -1347,6 +1347,50 @@ mod tests {
         assert_eq!(r.archived.len(), 1, "held for no reason: {:?}", r.held);
     }
 
+    /// A sweep that only OBSERVED is empty, and what it observed is a stable fingerprint.
+    ///
+    /// The `--watch` service prints when `is_empty()` is false or the observation changed. A held
+    /// record whose repo is on the other side of the container bind is permanently unreachable and
+    /// permanently held, so counting it as activity made the service re-report and re-walk every
+    /// retained archive every interval, for ever, about something no sweep will ever change.
+    #[test]
+    fn observing_is_not_acting_and_an_unchanged_observation_is_one_fingerprint() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        // A container-written record: this machine cannot reach the repo, so it is held for ever.
+        let e = Entry {
+            head: Some("abc".into()),
+            ..entry(
+                Path::new("/home/vscode/repos/jkb/.jkb/work/s"),
+                Path::new("/home/vscode/repos/jkb"),
+            )
+        };
+        record(&db, &e).expect("record");
+
+        let first = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(first.held.len(), 1, "it is held: {:?}", first.held);
+        assert!(
+            first.is_empty(),
+            "but nothing was DONE, so the watcher has no action to report"
+        );
+
+        let second = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(
+            first.observed(),
+            second.observed(),
+            "and an unchanged observation reads the same, so it is said once rather than hourly"
+        );
+
+        // A new thing to observe changes the fingerprint, so it is not silence either.
+        fs::write(store_dir(&db).join("torn.json"), b"{not json").expect("write");
+        let third = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_ne!(
+            second.observed(),
+            third.observed(),
+            "something new to say must break the silence"
+        );
+    }
+
     #[test]
     fn a_sweep_that_could_not_take_the_lock_says_so_rather_than_reporting_nothing_to_do() {
         let t = tempfile::tempdir().expect("tempdir");
