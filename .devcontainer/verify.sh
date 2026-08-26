@@ -57,10 +57,13 @@ if [ ! -r /proc/self/mountinfo ]; then
     echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
     echo "  file exists for — could not be checked at all." >&2
     echo >&2
-    echo "  In VS Code: Reopen in Container, then ./.devcontainer/verify.sh" >&2
-    echo "  Or:         docker run --rm -v \"\$PWD\":/home/vscode/repos/jkb -w /home/vscode/repos/jkb \\" >&2
-    echo "                  jkb-dev ./.devcontainer/verify.sh --declare /home/vscode/repos/jkb" >&2
-    echo "  The full guard harness (needs Docker): ./.devcontainer/mutate-verify.sh" >&2
+    echo "  In VS Code:  Reopen in Container, then ./.devcontainer/verify.sh" >&2
+    echo "  With Docker: ./.devcontainer/mutate-verify.sh --control   (one healthy run)" >&2
+    echo "               ./.devcontainer/mutate-verify.sh             (every guard, watched failing)" >&2
+    echo >&2
+    echo "  Do NOT hand-roll the docker run: it needs the seccomp profile, NET_ADMIN, both binds" >&2
+    echo "  and a preamble that raises the firewall and installs the posture. A command missing" >&2
+    echo "  any of those prints a dozen FAILs that read as a broken container." >&2
     exit 2
 fi
 

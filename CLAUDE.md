@@ -1801,6 +1801,13 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   emptiness since the day it was derived; `actual` never was, in the one assertion the file exists
   for. The read is now kept separate from the result, and an unreadable table is a FAIL. Found by
   running the script in the wrong place, which is the sort of thing no amount of reading finds.
+- **There is one way to ask whether the container is healthy, and it is not a `docker run` you
+  write yourself.** A hand-rolled one printed in a refusal message omitted the seccomp profile,
+  `NET_ADMIN`, the `~/.jkb` bind and the whole preamble that raises the firewall and installs the
+  posture — so it produced a dozen FAILs that read as a broken container instead of as a wrong
+  command. `mutate-verify.sh --control` reuses the exact flags and preamble every mutation runs
+  against, so "is my container ok" and "did that guard fire" cannot be answered about two
+  different containers.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

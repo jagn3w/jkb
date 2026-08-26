@@ -186,6 +186,13 @@ the Dockerfile and rebuild, or `docker exec -u root` from the host.
   Allowlisting it to make the harness runnable would trade the boundary for convenience.
 - `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
   fails naming it. A guard nobody has watched fail is not a guard.
+- `mutate-verify.sh --control` — **the one way to ask "is this container healthy" from outside**.
+  One healthy run, printed verbatim, using the same flags and the same preamble every mutation
+  runs against. Do not hand-roll the `docker run`: it needs the seccomp profile, `NET_ADMIN`, both
+  binds, and a preamble that raises the firewall, links the state and the memory store, and
+  installs the posture — and a command missing any of those prints a dozen FAILs that read as a
+  broken container rather than as a wrong invocation. (`verify.sh` itself is for use *inside* the
+  container, where the lifecycle has already done all of that; it refuses to run anywhere else.)
 - `check-config.sh` — host-side, no Docker, part of `./scripts/check.sh`. Its real job is the
   seccomp profile: it is **generated**, and a generator whose patch no-ops against a changed
   upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.

@@ -2,7 +2,15 @@
 # Each case breaks ONE property the container is supposed to have. verify.sh must fail, and must
 # fail naming that property — a guard nobody has watched fail is not a guard.
 #
-#   ./.devcontainer/mutate-verify.sh [image]
+#   ./.devcontainer/mutate-verify.sh [image]           every guard, each watched failing
+#   ./.devcontainer/mutate-verify.sh --control [image]  ONE healthy run, for "is this container ok"
+#
+# `--control` exists because assembling that `docker run` by hand goes wrong: it needs the seccomp
+# profile, NET_ADMIN, both binds, and a preamble that raises the firewall, links the state, links
+# the memory store and installs the posture — and a command missing any of those produces a dozen
+# FAILs that read as a broken container. That is the same "a container that cannot run looks
+# exactly like a guard that did not fire" this file already guards its own control against, so the
+# correct invocation is here, defined ONCE, rather than written out in prose somewhere.
 #
 # Needs a Docker host and the image built (`docker build -t jkb-dev .devcontainer`), so it is this
 # change's #[ignore] test and is never part of ./scripts/check.sh — the host-side static checks
@@ -29,6 +37,8 @@ elif ! docker info >/dev/null 2>&1; then
     echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
     exit 0
 fi
+CONTROL_ONLY=0
+if [ "${1:-}" = --control ]; then CONTROL_ONLY=1; shift; fi
 IMAGE="${1:-jkb-dev}"
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
@@ -64,6 +74,24 @@ SUBJECT='
 # by the control alone while ten sites wrote the flags by hand, so tightening the baseline at the
 # run sites would have left the control certifying a container the mutations never ran in.
 HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}")
+
+# One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
+# runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
+# containers.
+if [ "$CONTROL_ONLY" -eq 1 ]; then
+    echo "=== one healthy container (the same subject every mutation runs against) ==="
+    docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT"
+    rc=$?
+    echo
+    if [ "$rc" -eq 0 ]; then
+        echo "the container is what it claims to be (verify.sh exit 0)"
+    else
+        echo "verify.sh exited $rc — the FAIL lines above are real, and about THIS container." >&2
+        echo "  Note the knowledge base here is an empty scratch directory, not your ~/.jkb:" >&2
+        echo "  this checks the container, not your data." >&2
+    fi
+    exit "$rc"
+fi
 
 RUN_IMAGE=""
 MUTANT_FAILED=0
