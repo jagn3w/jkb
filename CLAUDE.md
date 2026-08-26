@@ -1794,6 +1794,13 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   back out with, so it is **accepted and stated** rather than mitigated — and the round-1
   comparison that chose `~/.jkb` over a dedicated bind was made without this, so it is worth
   re-deciding rather than inheriting.
+- **`verify.sh` refuses to run outside the container, and never passes on a table it could not
+  read.** Run on the macOS host it printed fourteen confident FAILs about a machine that was never
+  the subject — and two `ok` lines, because `/proc/self/mountinfo` does not exist there, so the
+  mount-boundary check compared an EMPTY set and passed. `EXPECTED` had been guarded against
+  emptiness since the day it was derived; `actual` never was, in the one assertion the file exists
+  for. The read is now kept separate from the result, and an unreadable table is a FAIL. Found by
+  running the script in the wrong place, which is the sort of thing no amount of reading finds.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

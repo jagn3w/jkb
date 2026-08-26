@@ -43,6 +43,27 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# INSIDE THE CONTAINER, OR NOT AT ALL. Every assertion below is about a Linux container's kernel
+# state, and run anywhere else they do not fail — they answer about a machine that was never the
+# subject. On the macOS host this printed fourteen confident FAILs (no `~/.claude` links, sudo
+# wants a password, the knowledge base "not mounted") and, worse, two `ok` lines: `/proc/self/
+# mountinfo` does not exist there, so the mount-boundary check compared an EMPTY set and passed.
+# A report an operator could act on, about nothing.
+#
+# The mount table is the load-bearing input rather than a proxy for the platform: if it cannot be
+# read, the one assertion this file exists for cannot mean anything, whatever else is true.
+if [ ! -r /proc/self/mountinfo ]; then
+    echo "verify.sh asserts what a running container is, and must run INSIDE one." >&2
+    echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
+    echo "  file exists for — could not be checked at all." >&2
+    echo >&2
+    echo "  In VS Code: Reopen in Container, then ./.devcontainer/verify.sh" >&2
+    echo "  Or:         docker run --rm -v \"\$PWD\":/home/vscode/repos/jkb -w /home/vscode/repos/jkb \\" >&2
+    echo "                  jkb-dev ./.devcontainer/verify.sh --declare /home/vscode/repos/jkb" >&2
+    echo "  The full guard harness (needs Docker): ./.devcontainer/mutate-verify.sh" >&2
+    exit 2
+fi
+
 echo "==> container posture"
 
 # 1. Non-root. Load-bearing, not hygiene: root in a container cannot create a mount namespace
@@ -86,7 +107,17 @@ EXPECTED="$(dc_mount_targets "$DC")"
 # What every container has regardless of configuration. Anything outside this and EXPECTED is
 # something a human added to devcontainer.json and must be looked at.
 RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets'
-actual="$(awk '{print $5}' /proc/self/mountinfo | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
+# The READ is kept separate from the result, because "there were no mounts" and "the table could
+# not be read" are different facts and the second must never be spelled like the first. `EXPECTED`
+# has been guarded that way since it was derived; `actual` was not, so an unreadable table made
+# the boundary check pass having compared nothing.
+if mountinfo="$(cat /proc/self/mountinfo 2>/dev/null)" && [ -n "$mountinfo" ]; then
+    mounts_readable=yes
+    actual="$(awk '{print $5}' <<<"$mountinfo" | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
+else
+    mounts_readable=no
+    actual=""
+fi
 # A failed derivation would make every real mount look undeclared — a true failure, but reported
 # as the wrong thing. Say which it is, so the fix is not looked for in devcontainer.json's mounts.
 #
@@ -115,7 +146,9 @@ for t in ${DECLARED_EXTRA[@]+"${DECLARED_EXTRA[@]}"}; do
         bad "--declare $t is not inside any host BIND $DC declares — only a mount nested in a declared bind may be named here (a named volume reaches no host filesystem, so nothing under one is reviewable this way)"
     fi
 done
-if [ -z "$EXPECTED" ]; then
+if [ "$mounts_readable" != yes ]; then
+    bad "could not read /proc/self/mountinfo — the mount boundary was not checked, which is not the same as finding it clean"
+elif [ -z "$EXPECTED" ]; then
     bad "could not derive the declared mounts from $DC — the check below cannot mean anything"
 else
     unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED"))"
