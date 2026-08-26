@@ -1322,6 +1322,35 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_refuses_while_a_sweep_holds_the_lock() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+
+        // A sweep already in flight is working from a snapshot taken before this cancellation:
+        // it would archive the checkout `task work` is at that moment handing back, and re-write
+        // the record this deleted. Refusing is the honest outcome — the caller says so and the
+        // operator re-runs — because a cancellation that silently lost the race is worse.
+        fs::write(
+            store_dir(&db).join(".sweep.lock"),
+            crate::owner::self_owner(),
+        )
+        .expect("write");
+
+        assert!(
+            revoke(&db, &wt).is_err(),
+            "a cancellation that cannot exclude the sweep must say so, not report success"
+        );
+        assert_eq!(
+            entries(&db).expect("entries").records.len(),
+            1,
+            "and the record it could not safely remove is still there"
+        );
+    }
+
+    #[test]
     fn a_session_reusing_the_recorded_name_is_held_rather_than_archived() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");

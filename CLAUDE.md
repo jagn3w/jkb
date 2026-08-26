@@ -1712,7 +1712,8 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   prints — and that harness needs Docker, so the gate could not notice. `check-config.sh` now
   checks statically that every expectation is a string verify.sh can print. Same round: an
   assertion that the workspace is mounted had been rewritten to say the directory containing the
-  running script contains a `Cargo.toml`, true by construction; and a self-test assertion could
+  running script contains a `Cargo.toml`, true by construction (its third wording, below, is the
+  one the harness accepted); and a self-test assertion could
   not fail because `note` wrote to the stdout `run` was capturing, so every clean link run exited
   1 with its own report eaten.
 - **`init-firewall.sh` discovers its workspace instead of naming it.** The hard-coded
@@ -1726,6 +1727,43 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   setting `JKB_REPOS_DIR`, read by nothing else in the tree: following the advice switched the
   preflight off without moving the mount, producing the exact silent wrong-checkout open the file
   exists to prevent. One statement of where repos live, and it is `devcontainer.json`'s.
+- **The sweep may only delete inside the tree it owns.** The worst defect on this branch, and it
+  survived two reviews: the retention arm passed whatever absolute path a record's `archive` field
+  named to `remove_dir_all`. The record store lives in `~/.jkb`, which is bind-mounted into the
+  container and granted in the posture's `allowWrite`, while the host's reaper is a launchd agent
+  outside every sandbox — so an agent-writable JSON file steered an unsandboxed recursive delete
+  at any directory, past a probe that answers "permitted" for any ordinary one. Corruption reaches
+  the same place with no adversary. Both paths are constrained to `<repo>/.jkb/{work,archive}`,
+  checked **once above both arms** (D45.5's rule: a condition that dominates every arm belongs
+  above the dispatch) — the pending arm had a guard and the archived arm had nothing.
+- **A refusal that installs no rule is not a refusal.** Two guards in `init-firewall.sh` exited
+  before any iptables rule was applied, and rules do not survive a container restart — so a
+  truncated snapshot, the state one of those guards' own comments calls real, left unrestricted
+  egress on every later start, permanently (the snapshot is root-owned and 0444). `fail_closed` is
+  defined above every refusal now and `check-config.sh` fails the gate on an `exit 1` in that file
+  outside it. That guard's own first version anchored its pattern to the start of a line and
+  walked past `|| exit 1` — the exact shape it existed for; the mutation caught it.
+- **A pid is meaningless without the host that issued it.** `Liveness::Process` carried only the
+  pid, so a claim (or a sweep lock) written inside the container was probed against this machine's
+  process table: a live owner reported dead and freed, or a dead one reported alive. It carries
+  the host, and a foreign one is `Unknown`, which frees nothing. `hostname()` also stopped falling
+  back to the literal `"localhost"` — which both sides of the boundary answered, so the rule's two
+  sides gave the same name and the rule was not one.
+- **The container is where deferral is normal, and it had no finisher.** A session cannot archive
+  its own checkout, so every `land` in there records one — and the host's reaper correctly holds
+  those records, because it cannot see `/home/vscode/...`. There is no init system in the
+  container to run a service, so `postStartCommand` sweeps once per start, best-effort behind the
+  firewall raise.
+- **The container harness settled two findings no amount of reading would have.** `verify.sh`'s
+  workspace assertion went through three wordings — a hard-coded path (describes whichever
+  checkout sits there), the script's own directory (true wherever it can run), and the declared
+  target in `mountinfo` (which the harness's own bind layout never produces, so every mutation
+  reported CAUGHT and then the control failed and the run judged nothing). It asks whether this
+  checkout is inside a mount point that is both mounted and declared, `--declare` folded in. And
+  the harness's negative control could not fail: the health check establishes the control's exit
+  code is 0 and `judge` reports CAUGHT only on non-zero, so `MATCHER IS BROKEN` was unreachable —
+  in the file whose whole job is finding guards that cannot fire. It asks the discriminating half
+  instead: the label must appear in a healthy container and must not be on a `FAIL` line.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
