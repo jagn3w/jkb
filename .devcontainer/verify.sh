@@ -283,6 +283,10 @@ case "$mem_state" in
         # settles it. Said plainly, because a state nobody is told about is one nobody fixes.
         ok "auto-memory is not shared for $(basename "$mem_repo") ($mem_state) — run scripts/link-claude-memory.sh to see what it wants"
         ;;
+    error)
+        # The linker ran and could not finish for this repo. Distinct from `unlinked`, which is
+        # "no link and no reason", and from the declining states above, which want a person.
+        bad "auto-memory could not be linked (state: error) — see scripts/link-claude-memory.sh's output in the create log" ;;
     unlinked|"")
         # FATAL, and setup.sh's comment now says the same. `unlinked` is not the linker declining
         # — a collision and a poisoned store have their own words above and pass — it means the

@@ -279,13 +279,15 @@ done
 # egress with a message. Two guards had that shape (an unparseable snapshot, an unidentifiable
 # workspace posture), both in the file whose entire job is to be the layer that holds when the
 # nested sandbox does not. `exit 1` inside `fail_closed` itself is the one legitimate site.
-# Comments are stripped first and `exit 1` is matched ANYWHERE on the line, not just at its
-# start: the shape this is about is `... || exit 1`, which an anchored pattern walks straight
-# past — the guard's own first version did exactly that and reported the mutation as MISSED.
+# Comments are stripped first and any NONZERO exit is matched ANYWHERE on the line, not just at
+# its start. Two ways this was too narrow: an anchored pattern walked straight past `... || exit 1`
+# (its own first version, reported MISSED by the mutation), and matching the literal `1` walked
+# past the `exit 2` the argument refusal used — a refusal leaving no rules, which is the one thing
+# this checks for.
 stray_exits="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
     /^fail_closed\(\) \{/ { infn = 1 }
     infn && /^\}/           { infn = 0; next }
-    !infn && /(^|[^[:alnum:]_])exit[[:space:]]+1([^[:alnum:]_]|$)/ { print FNR }
+    !infn && /(^|[^[:alnum:]_])exit[[:space:]]+[1-9]/ { print FNR }
 ')"
 if [ -z "$stray_exits" ]; then
     ok "every refusal in init-firewall.sh goes through fail_closed"

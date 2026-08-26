@@ -103,7 +103,7 @@ find_workspace_posture() {
     printf '%s' "${hits[0]}"
 }
 
-[ "$#" -eq 0 ] || { echo "init-firewall: takes no arguments (the allowlist is $SNAPSHOT)" >&2; exit 2; }
+[ "$#" -eq 0 ] || fail_closed "takes no arguments (the allowlist is $SNAPSHOT)."
 
 if [ ! -e "$SNAPSHOT" ]; then
     # FIRST RAISE ONLY. Refusing here fails container creation, which is the correct direction:
@@ -170,7 +170,18 @@ while IFS= read -r domain; do
         \**) skipped+=("$domain"); continue ;;
         localhost|127.0.0.1|::1) continue ;;   # loopback never leaves the container
     esac
-    ips="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)"
+    # `|| ips=""` IS THE WHOLE POINT of this line, not tidiness. `getent` exits 2 for a name with
+    # no A record and `pipefail` carries that out of the pipeline; a BARE assignment is a simple
+    # command in no conditional context, so `errexit` aborts — and with `set -E` the ERR trap sends
+    # that to `fail_closed`. Measured: one unresolvable domain took the whole raise to deny-all
+    # with no allowlist at all, blaming "an unexpected failure at line 173", while the two arms
+    # written for exactly this (the per-domain skip below, and the "NONE resolved" refusal) became
+    # unreachable. Reopen a container offline, or with any one of the fifteen posture domains
+    # temporarily NXDOMAIN, and nothing works until the next container start.
+    #
+    # The other two substitutions in this file already carry a fallback, and the one at line 122 is
+    # in a conditional context; measured, those shapes do not trip the trap.
+    ips="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)" || ips=""
     if [ -z "$ips" ]; then skipped+=("$domain (no A record)"); continue; fi
     while IFS= read -r ip; do
         [ -n "$ip" ] && ipset add allowed-new "$ip" 2>/dev/null && resolved=$((resolved + 1))

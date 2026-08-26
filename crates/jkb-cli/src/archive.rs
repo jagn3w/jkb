@@ -27,6 +27,7 @@
 //! `remove_dir`, whose `EPERM`-versus-`ENOTEMPTY` answer is exactly the discrimination above, so
 //! the sweep never starts a walk it cannot finish either.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,9 @@ pub struct Report {
     pub deleted: Vec<PathBuf>,
     /// Records dropped because there was nothing left to act on.
     pub cleared: Vec<String>,
+    /// Pending records replaced by a later disposal of the same worktree. Their decision was
+    /// superseded, so applying it would carry out an instruction the operator withdrew.
+    pub superseded: Vec<String>,
     /// Archives still inside the retention window.
     ///
     /// The PATHS, not a byte count: the count is only ever printed, and computing it in the sweep
@@ -139,16 +143,39 @@ pub struct Report {
 }
 
 impl Report {
-    /// Whether the sweep did anything at all. A skipped sweep counts as empty: whoever holds the
-    /// lock is doing this sweep's work, and the service must not narrate that race every quarter
-    /// hour. The one-shot caller says so explicitly instead.
+    /// What this sweep OBSERVED but could not act on, as a stable fingerprint.
+    ///
+    /// A watcher prints an observation when it CHANGES, not every interval: a record whose repo
+    /// is on the other side of the container bind is permanently unreachable and permanently
+    /// held, and counting it as activity made the service re-report and re-walk every retained
+    /// archive every interval, for ever, about something no sweep will ever change. Silencing it
+    /// outright would be the other error — a torn record needs saying once.
+    #[must_use]
+    pub fn observed(&self) -> String {
+        let mut lines: Vec<String> = self
+            .held
+            .iter()
+            .map(|(uid, why)| format!("h {uid} {why}"))
+            .chain(self.unreadable.iter().map(|p| format!("u {}", p.display())))
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// Whether the sweep did anything at all — ACTED, not merely observed.
+    ///
+    /// `held` is deliberately not counted. A held record is the steady state on a machine that
+    /// shares `~/.jkb` across the container bind: the other side's records are permanently
+    /// unreachable and permanently held, so counting them made the `--watch` service re-report
+    /// and re-walk every retained archive every interval, for ever, about something no sweep will
+    /// ever change. A skipped sweep is likewise empty: whoever holds the lock is doing this
+    /// sweep's work, and the one-shot caller says so explicitly instead.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.archived.is_empty()
-            && self.held.is_empty()
+            && self.superseded.is_empty()
             && self.deleted.is_empty()
             && self.cleared.is_empty()
-            && self.unreadable.is_empty()
     }
 }
 
@@ -166,6 +193,19 @@ pub struct Held {
     pub path: PathBuf,
     /// Its holder, verbatim. Empty when the lock could not be read.
     pub holder: String,
+}
+
+/// Who holds the sweep lock, if anyone — without touching it.
+///
+/// # Errors
+/// Returns an error if the lock exists and cannot be read.
+pub fn lock_holder(db: &Path) -> Result<Option<String>> {
+    let path = store_dir(db).join(".sweep.lock");
+    match fs::read_to_string(&path) {
+        Ok(holder) => Ok(Some(holder.trim().to_owned())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Remove the sweep lock, whoever holds it. Returns the holder it displaced, if any.
@@ -780,6 +820,58 @@ fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
     }
 }
 
+/// Which pending record governs each worktree: the newest, by `recorded_at`, ties broken by
+/// marker path so the choice is deterministic rather than whichever the directory listing yielded.
+///
+/// ONE DISPOSAL'S DECISION APPLIES. Giving each disposal its own marker fixed an archived record
+/// being overwritten, and opened this: `abandon --delete-branch`, change your mind, `abandon`
+/// again without it — two pending records for one tree, each carrying its own `Plan`, and the
+/// older one still force-deletes the branch the later run printed "kept" for. That is exactly the
+/// regression `Plan` was added to prevent, arriving by a different route.
+///
+/// ARCHIVED records are never superseded: each names a distinct archive that still has to be
+/// swept, so they are a set of facts rather than competing instructions.
+fn governing_pending(records: &[(PathBuf, Record)]) -> BTreeMap<PathBuf, PathBuf> {
+    let mut best: BTreeMap<PathBuf, (u64, PathBuf)> = BTreeMap::new();
+    for (marker, record) in records {
+        if record.archive.is_some() {
+            continue;
+        }
+        let candidate = (record.recorded_at, marker.clone());
+        match best.get(&record.worktree) {
+            Some(current) if *current >= candidate => {}
+            _ => {
+                best.insert(record.worktree.clone(), candidate);
+            }
+        }
+    }
+    best.into_iter().map(|(k, (_, m))| (k, m)).collect()
+}
+
+/// Drop a pending record a later disposal of the same worktree replaced. Returns whether it did.
+fn superseded(
+    governing: &BTreeMap<PathBuf, PathBuf>,
+    entry: &Entry,
+    marker: &Path,
+    dry_run: bool,
+    report: &mut Report,
+) -> bool {
+    if entry.archive.is_some() {
+        return false;
+    }
+    if governing
+        .get(&entry.worktree)
+        .is_none_or(|winner| winner == marker)
+    {
+        return false;
+    }
+    if !dry_run {
+        let _ = fs::remove_file(marker);
+    }
+    report.superseded.push(entry.uid.clone());
+    true
+}
+
 /// Archive what is owed, then delete archives past `retain_days`.
 ///
 /// Never fails as a whole for one bad record: a repo that has moved, a worktree somebody removed
@@ -819,8 +911,13 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         ));
     }
 
+    let governing = governing_pending(&store.records);
+
     for (marker, record) in store.records {
         let mut entry = record.clone_entry();
+        if superseded(&governing, &entry, &marker, dry_run, &mut report) {
+            continue;
+        }
         // CAN THIS PROCESS SEE THE REPO AT ALL, before either arm looks at the record. Above the
         // dispatch because the condition dominates both — the pending arm had it and the archived
         // arm did not, so each side of the container bind destroyed the other's archived records:
@@ -1497,6 +1594,71 @@ mod tests {
             1,
             "the record survives for whichever side can see the repo"
         );
+    }
+
+    #[test]
+    fn a_withdrawn_decision_does_not_still_delete_the_branch() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+
+        // `abandon --delete-branch` defers, then the operator changes their mind and abandons
+        // again without it. Two pending records for one tree, each carrying its own Plan — and
+        // the older one would still force-delete the branch the later run printed "kept" for.
+        let mut first = session_entry(&repo, &wt, &branch, &head);
+        first.plan.delete_branch = true;
+        first.recorded_at = 1;
+        record(&db, &first).expect("first");
+        let mut second = session_entry(&repo, &wt, &branch, &head);
+        second.plan.delete_branch = false;
+        second.recorded_at = 2;
+        record(&db, &second).expect("second");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(
+            r.superseded.len(),
+            1,
+            "the withdrawn decision is dropped: {r:?}"
+        );
+        assert_eq!(r.archived.len(), 1, "and the tree is archived once");
+        assert!(
+            gitrepo::rev(&repo, &branch).expect("rev").is_some(),
+            "the branch the LATER disposal said it kept is still there"
+        );
+        assert_eq!(
+            entries(&db).expect("entries").records.len(),
+            1,
+            "one record survives, and it is the archived one"
+        );
+    }
+
+    #[test]
+    fn two_archived_records_for_one_worktree_are_both_kept() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let wt = repo.join(".jkb/work/sess");
+        // Archived records are facts, not competing instructions: each names a distinct archive
+        // that still has to be swept, so superseding one would strand it for ever.
+        // Fresh, or the retention arm deletes them and there is nothing left to be retained —
+        // which is a true outcome for a 1970 timestamp and not what this test is about.
+        let fresh = now_secs();
+        for (n, stamp) in [(0u64, fresh), (1, fresh + 1)] {
+            let e = Entry {
+                archive: Some(archive_root(&repo).join(format!("sess-{n}"))),
+                archived_at: Some(stamp),
+                head: Some("abc".into()),
+                recorded_at: stamp,
+                ..entry(&wt, &repo)
+            };
+            fs::create_dir_all(e.archive.as_ref().expect("set")).expect("mk");
+            record(&db, &e).expect("record");
+        }
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(r.superseded.is_empty(), "neither archive is superseded");
+        assert_eq!(r.retained.len(), 2, "both are tracked to their retention");
     }
 
     #[test]

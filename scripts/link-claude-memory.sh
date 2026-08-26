@@ -83,10 +83,11 @@ while [ "$#" -gt 0 ]; do
         --dry-run)   dry=1 ;;
         --self-test) self_test=1 ;;
         --status)     shift; status_repo="${1:-}" ;;
-        # Where to record the state each repo was in BEFORE this run repaired anything. The
-        # repair downgrades its own alarm — removing a live link into a poisoned store turns
-        # `exposed` into `unsafe` — so a check that runs afterwards must read what was found,
-        # not what was left.
+        # Where to record the state each repo was left in. Read by `verify.sh`, which would
+        # otherwise have to re-derive it AFTER the repair — and the repair clears its own alarm:
+        # removing a live link into a poisoned store turns `exposed` into `unsafe`. The outcome
+        # `link_one` returns says `exposed` for exactly that case, so recording the outcome keeps
+        # the alarm without recording a snapshot taken before the work.
         --status-file) shift; status_file="${1:-}" ;;
         --home)      shift; home="${1:-}" ;;
         --repos)     shift; repos="${1:-}" ;;
@@ -239,7 +240,7 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
 # Every repo, and the state each was left in. Returns non-zero when any repo needs a person —
 # a caller that cannot tell a clean run from one that linked nothing has no reason to check.
 run() { # run <home> <repos> <store>
-    local h="$1" r="$2" s="$3" d state found rc=0
+    local h="$1" r="$2" s="$3" d state rc=0
     local projects="$h/.claude/projects"
     if [ ! -d "$r" ]; then
         warn "no repos directory at $r — nothing to link"
@@ -247,10 +248,14 @@ run() { # run <home> <repos> <store>
     fi
     for d in "$r"/*/; do
         [ -d "$d" ] || continue
-        # Asked BEFORE `link_one` runs, because `link_one` repairs — see `--status-file`.
-        found="$(status_of "$h" "$s" "$d")"
+        # THE STATE THIS RUN PRODUCED, not one observed at a different moment. It used to record
+        # `status_of`'s answer from BEFORE `link_one` — meant to preserve the `exposed` alarm that
+        # the repair itself clears — and that made a successful FIRST-EVER link record `unlinked`,
+        # which `verify.sh` treats as fatal. So every new container failed `postCreate` once, on a
+        # feature working correctly. `link_one` already returns `exposed` when it breaks a live
+        # link, so the pre-state bought nothing the outcome does not already say.
         state="$(link_one "$projects" "$s" "$d")"
-        [ -z "$status_file" ] || printf '%s %s\n' "$(basename "${d%/}")" "$found" >> "$status_file"
+        [ -z "$status_file" ] || printf '%s %s\n' "$(basename "${d%/}")" "$state" >> "$status_file"
         [ "$state" = linked ] || rc=1
     done
     return "$rc"
@@ -375,13 +380,19 @@ if [ "$self_test" -eq 1 ]; then
 
     # The MIGRATION is the path that fills the store, so it must apply the same purity rule as
     # the store check — otherwise the one route that can plant a redirecting symlink is unguarded.
-    rm -rf "$link" "$t/.jkb/claude-memory/jkb"; mkdir -p "$link"
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"; mkdir -p "$link" "$t/elsewhere"
+    # The target EXISTS, and both assertions ask about the link rather than through it. With a
+    # dangling target `-e` dereferenced to false and read as "not migrated"; and `-L "$link/one.md"`
+    # resolved through the newly created `$link -> $dest` to the migrated symlink and was true
+    # either way. Both stayed green with the guard deleted — measured — so the one guard on the
+    # route that can plant a redirect into the store was pinned by nothing.
+    : > "$t/elsewhere/leak"
     ln -s "$t/elsewhere/leak" "$link/one.md"
     run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
     check "a symlink is not migrated into the store" \
-        "$([ ! -e "$t/.jkb/claude-memory/jkb/one.md" ] && echo yes || echo no)"
-    check "and the local copy is left exactly as it was" \
-        "$([ -L "$link/one.md" ] && echo yes || echo no)"
+        "$([ ! -L "$t/.jkb/claude-memory/jkb/one.md" ] && [ ! -e "$t/.jkb/claude-memory/jkb/one.md" ] && echo yes || echo no)"
+    check "and no link was made over the local copy" \
+        "$([ ! -L "$link" ] && [ -L "$link/one.md" ] && echo yes || echo no)"
 
     # A poisoned store must not read as healthy just because the link happens to exist —
     # `verify.sh` consults `status_of`, so the two must ask in the same order.

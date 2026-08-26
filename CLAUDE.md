@@ -1825,6 +1825,39 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   about the command. The control did its job, and doing its job that late is the defect; the image
   and the argument count are checked up front now, the same shape as the docker-on-PATH and
   daemon-reachable checks already there for exactly this reason.
+- **One idea closes three of round 5's findings: when several members of a set could answer, name
+  which one is authoritative instead of letting whichever is reached answer.**
+  - *Which variant carries the host question.* `Liveness::Process` was host-qualified in round 3
+    and `Liveness::Worktree` was not — same enum, same boundary. A host session claims as
+    `session:<pid>:/Users/…`; in the container that path is absent, `try_exists` said `false`, and
+    `reclaim_dead` freed the claim of a session running on the host. The session id carries no
+    host, so the question is asked of the filesystem: **an absence is only proof where the place
+    it would be is visible** — the parent directory must exist. That is the archive sweep's
+    reachability rule, one level down, and it needs no change to an id format already in databases.
+  - *Which observation is the state.* `--status-file` recorded `status_of`'s answer from BEFORE
+    the linker ran, to preserve an alarm the repair clears — and that made a successful
+    FIRST-EVER link record `unlinked`, which `verify.sh` treats as fatal. Every new container
+    failed `postCreate` exactly once, on a feature working. `link_one` already returns `exposed`
+    for the case the pre-state existed to keep, so recording the OUTCOME loses nothing.
+  - *Which record governs.* Giving each disposal its own marker (round 4) opened a second way to
+    the regression `Plan` was added to prevent: `abandon --delete-branch`, change your mind,
+    `abandon` again — two pending records for one tree, and the older one still force-deletes the
+    branch the later run printed "kept" for. The newest pending record per worktree governs and
+    the rest are superseded; **archived** records are never superseded, because each names a
+    distinct archive that still has to be swept.
+- **The `ERR` trap added in round 4 was worse than the hole it closed, and only measurement showed
+  it.** `getent` exits 2 for a name with no A record, `pipefail` carries that out, and a BARE
+  assignment is a simple command in no conditional context — so `errexit` fired, `set -E` sent it
+  to `fail_closed`, and **one unresolvable domain took the whole raise to deny-all with no
+  allowlist**, blaming "an unexpected failure at line 173" while the two arms written for exactly
+  that state became unreachable. Measured which shapes trip it: a bare `x="$(cmd)"` does; `x="$(cmd)"
+  || x=""` and `if x="$(cmd)"` do not. The trap stays — it is what catches an abort no refusal
+  wrote — and the one bare assignment gained a fallback.
+- **A green harness is evidence about the paths it runs, not about a file.** After the container
+  harness went green I said the container files were no longer unexercised. The firewall defect
+  above lives on the DNS-failure path, which the harness does not drive: it covers the happy path
+  and the no-`NET_ADMIN` path. Generalising a run into a property of a file is the same shape as
+  every "unknown reported as a definite answer" this branch has been correcting.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

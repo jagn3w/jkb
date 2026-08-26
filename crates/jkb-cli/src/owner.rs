@@ -72,7 +72,6 @@ pub fn pid_alive(pid: u32) -> Fact {
     pid_exists(pid)
 }
 
-/// Best-effort local hostname (informational; single-host — the pid is what liveness keys on).
 /// This machine's name, for a test that must build an owner id this host will actually probe.
 #[cfg(test)]
 pub fn hostname_for_test() -> String {
@@ -126,7 +125,12 @@ pub fn is_alive(owner: &str) -> Fact {
         Liveness::Process { host, pid } if host == hostname() => pid_exists(pid),
         // `Path::exists` is itself lossy — it answers `false` for a permission error as well as
         // for a missing directory — so it is asked through `try_exists`, which separates them.
-        Liveness::Worktree(dir) => Fact::observed(dir.try_exists()),
+        // And an absence is only proof where the place it would be is visible; see `absent_here`.
+        Liveness::Worktree(dir) => match absent_here(&dir) {
+            Fact::No => Fact::Yes, // it is there
+            Fact::Yes => Fact::No, // it is gone, and this machine can see that it is gone
+            Fact::Unknown => Fact::Unknown,
+        },
         // An owner on another host and an external agent are the same answer for the same
         // reason: nothing here can establish it. Never "dead" — see the module docs.
         Liveness::Process { .. } | Liveness::External => Fact::Unknown,
@@ -148,6 +152,39 @@ pub fn is_alive(owner: &str) -> Fact {
 ///
 /// A pid that cannot be represented is [`Fact::No`], not `Unknown`: no process can carry an id
 /// outside `pid_t`, so its absence is established rather than merely unobserved.
+/// Whether `path` is **provably** absent from this machine.
+///
+/// AN ABSENCE IS ONLY PROOF WHERE YOU CAN SEE THE PLACE IT WOULD BE — the same rule the archive
+/// sweep applies to a record whose repo it cannot reach. `Liveness::Process` was host-qualified so
+/// a container's pid is not probed against this machine's process table; a filesystem path is no
+/// more portable across that boundary, and it was left un-qualified. A host session claims as
+/// `session:<pid>:/Users/…/.jkb/work/sess`; inside the container that path does not exist, so a
+/// bare `try_exists` answered `false`, `Fact::No`, and `reclaim_dead` freed the claim of a session
+/// running on the host — with `abandon` and `task work` then acting against it.
+///
+/// The session owner id carries no host, so the question is asked of the filesystem instead: the
+/// directory that would CONTAIN it must be visible. On the host `…/.jkb/work` exists and a missing
+/// `sess` is real; in the container it does not, so nothing is established. That is sound in both
+/// directions and needs no change to an id format already written into databases.
+///
+/// Deliberately conservative at the edge: if the parent is gone too — someone removed `.jkb/work`
+/// wholesale — this answers `Unknown` and the claim is reported rather than freed. Of the two ways
+/// to be wrong, the one that costs a command wins (D34.4).
+fn absent_here(path: &Path) -> Fact {
+    match path.try_exists() {
+        Ok(true) => Fact::No,
+        Err(_) => Fact::Unknown,
+        Ok(false) => match path.parent() {
+            // A path with no parent is `/`, whose absence is not a thing to reason about.
+            None => Fact::Unknown,
+            Some(parent) => match parent.try_exists() {
+                Ok(true) => Fact::Yes,
+                _ => Fact::Unknown,
+            },
+        },
+    }
+}
+
 fn pid_exists(pid: u32) -> Fact {
     let Ok(raw) = i32::try_from(pid) else {
         return Fact::No;
@@ -212,6 +249,39 @@ mod tests {
     /// that boundary — the dev container's pid 1 is not this machine's pid 1. Probing a foreign
     /// owner's pid locally answers about whichever process holds that number here: a live owner
     /// reported dead (and its claim freed), or a dead one reported alive.
+    /// The same rule as the pid one, for the shape it was not applied to.
+    ///
+    /// A session's claim is its checkout, and a checkout on another machine is not absent — it is
+    /// unobservable. Probing it as if it were local frees a live session's claim, which is what
+    /// `abandon` and `task work` then act on.
+    #[test]
+    fn a_session_worktree_this_machine_cannot_see_is_unknown_not_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join(".jkb/work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Alive: the checkout is there.
+        let live = work.join("live");
+        std::fs::create_dir(&live).unwrap();
+        assert_eq!(is_alive(&session_owner(&live)), Fact::Yes);
+
+        // Provably gone: this machine can see the directory it would be in.
+        let gone = work.join("gone");
+        assert_eq!(
+            is_alive(&session_owner(&gone)),
+            Fact::No,
+            "an absence IS proof where the place it would be is visible"
+        );
+
+        // Another machine's layout: neither the checkout nor the tree it lives in is here. This
+        // is the container looking at a host session, and it must not read as gone.
+        assert_eq!(
+            is_alive("session:1:/not-a-path-on-this-machine/repos/jkb/.jkb/work/sess"),
+            Fact::Unknown,
+            "a path from a filesystem this kernel does not have establishes nothing"
+        );
+    }
+
     #[test]
     fn an_owner_on_another_host_is_unknown_rather_than_probed_locally() {
         // pid 1 exists on every machine, so a local probe would answer `Yes` for this.

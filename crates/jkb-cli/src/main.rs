@@ -5235,7 +5235,7 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
             force,
             delete_branch,
         } => cmd_task_abandon(db, db_path, &uid, force, delete_branch, json),
-        TaskCmd::Sessions => cmd_task_sessions(db, json),
+        TaskCmd::Sessions => cmd_task_sessions(db, db_path, json),
         TaskCmd::Gate { cmd, clear } => cmd_task_gate(db, cmd.as_deref(), clear, json),
         _ => unreachable!("cmd_task_mutate routes only session subcommands here"),
     }
@@ -6225,9 +6225,18 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         interval_secs,
     } = flags;
     if break_lock {
-        match archive::break_lock(db_path)? {
-            Some(holder) => println!("broke the sweep lock held by {holder}"),
-            None => println!("no sweep lock was held"),
+        // `--dry-run` promises to change nothing, and this ran before that was consulted — so
+        // `--dry-run --break-lock` removed a live sweeper's lock while saying it would not.
+        if dry_run {
+            match archive::lock_holder(db_path)? {
+                Some(holder) => println!("would break the sweep lock held by {holder}"),
+                None => println!("no sweep lock is held"),
+            }
+        } else {
+            match archive::break_lock(db_path)? {
+                Some(holder) => println!("broke the sweep lock held by {holder}"),
+                None => println!("no sweep lock was held"),
+            }
         }
     }
     if !watch {
@@ -6244,12 +6253,20 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let _ = ctrlc::set_handler(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
     // Never zero: a sweep every 0 seconds is a busy loop that would keep a laptop awake.
     let interval = std::time::Duration::from_secs(interval_secs.max(60));
+    // What the last sweep could only observe, so an unchanged observation is not re-printed. A
+    // held cross-boundary record never changes, and a service that restates it every quarter hour
+    // is a log nobody reads the rest of; saying it once, and again when it changes, is the whole
+    // of the signal.
+    let mut last_observed = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         match archive::reap(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
             // log that says "nothing to do" 96 times a day is a log nobody reads the rest of.
-            Ok(r) if r.is_empty() => {}
-            Ok(r) => report_reap(&r, dry_run, json),
+            Ok(r) if r.is_empty() && r.observed() == last_observed => {}
+            Ok(r) => {
+                last_observed = r.observed();
+                report_reap(&r, dry_run, json);
+            }
             // A sweep that failed must not stop the service — the next one may well succeed, and
             // this is the process that finishes every deferred landing on the machine.
             Err(e) => eprintln!("reap: {e:#}"),
@@ -6723,6 +6740,14 @@ fn abandon_session(
     force: bool,
 ) -> Result<Option<String>> {
     let Some(sess) = sess else { return Ok(None) };
+    // ALREADY GONE is its own outcome, not a deferral. Without this arm `dispose` reported that
+    // the tree "could not be archived from in here" — true, but because there was nothing to
+    // archive — and handed `--delete-branch` to a sweep with nothing to do, so the branch was
+    // never deleted here and never deleted there. `land` has had this arm since D36.4.
+    if !sess.worktree.exists() {
+        let _ = gitrepo::prune_worktrees(&ctx.root);
+        return Ok(None);
+    }
     {
         if !force {
             anyhow::ensure!(
@@ -6836,10 +6861,23 @@ fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool)
 }
 
 /// `task sessions` — what is in flight in this repo.
-fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
+fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
     let ctx = repo::repo_ctx()?;
     let sessions = session::discover(&ctx.root)?;
     let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
+    // Which checkouts are finished and merely waiting to be moved. In the container EVERY landing
+    // produces one — a session cannot archive its own worktree — so without this the listing an
+    // operator reads to find live work is mostly finished work, in rows identical to it.
+    let awaiting: std::collections::BTreeSet<PathBuf> = archive::entries(db_path)
+        .map(|store| {
+            store
+                .records
+                .into_iter()
+                .filter(|(_, r)| r.archive.is_none())
+                .map(|(_, r)| r.worktree.clone())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut rows = Vec::new();
     for s in &sessions {
@@ -6873,6 +6911,7 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
             "status": task.map(|t| t.status.clone()),
             "dirty": gitrepo::is_dirty(&s.worktree)?,
             "commits": ahead,
+            "awaiting_archive": awaiting.iter().any(|w| session::same_path(w, &s.worktree)),
         }));
     }
 
@@ -6887,6 +6926,13 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
             } else {
                 ""
             };
+            // Said in the row, because it is the difference between work to pick up and work
+            // already done that nothing has moved yet.
+            let awaiting = if r["awaiting_archive"].as_bool().unwrap_or(false) {
+                " [awaiting archive]"
+            } else {
+                ""
+            };
             // Three states, not two: a count, a target that has been deleted, and a session that
             // never recorded one. Folding the last into the second sent people looking for a
             // branch nobody had removed.
@@ -6896,7 +6942,7 @@ fn cmd_task_sessions(db: &Db, json: bool) -> Result<()> {
                 (None, None) => "commits unknown (no land target recorded)".to_owned(),
             };
             println!(
-                "{:<28} {} → {}  {commits}{dirty}",
+                "{:<28} {} → {}  {commits}{dirty}{awaiting}",
                 r["session"].as_str().unwrap_or("?"),
                 r["branch"].as_str().unwrap_or("?"),
                 r["onto"].as_str().unwrap_or("?"),
@@ -6962,7 +7008,7 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
             return;
         }
     };
-    if store.records.is_empty() && store.unreadable.is_empty() {
+    if store.records.is_empty() && store.unreadable.is_empty() && store.rejected.is_empty() {
         println!("worktree removals: none pending");
         return;
     }
@@ -6985,15 +7031,31 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
         // What the safety net costs, said out loud. A landed session's checkout carries the
         // repo's build output, so this is the number that decides whether 30 days is the right
         // window here — and the alternative way to learn it is a full disk.
-        let bytes: u64 = archived
+        // Asked only of archives this machine can actually see. `dir_size` walks nothing for a
+        // path that is not there and returns 0, so a container-written archive read as "0 B held"
+        // on the host while occupying gigabytes of the same disk — a measurement that could not be
+        // taken, reported as a measurement of none.
+        let (seen, unseen): (Vec<_>, Vec<_>) = archived
             .iter()
             .filter_map(|(_, e)| e.archive.as_deref())
-            .map(archive::dir_size)
-            .sum();
+            .partition(|dir| dir.exists());
+        let bytes: u64 = seen.iter().copied().map(archive::dir_size).sum();
         println!("  {} held until they age out", human_bytes(bytes));
+        if !unseen.is_empty() {
+            println!(
+                "  and {} archive(s) whose size is unknown from here (their repo is not reachable)",
+                unseen.len()
+            );
+        }
     }
     for path in &store.unreadable {
         println!("  unreadable record {}", path.display());
+    }
+    // Refused records were invisible here while `reap` reported them held — so a store holding
+    // nothing BUT refused records read as "none pending", which is the one state a person needs
+    // to be told about.
+    for r in &store.rejected {
+        println!("  {} — REFUSED: {} ({})", r.uid, r.why, r.marker.display());
     }
     if fix {
         match archive::reap(db_path, archive::RETAIN_DAYS, false) {
