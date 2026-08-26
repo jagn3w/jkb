@@ -1625,8 +1625,9 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   not convenience: `scripts/auto-mode-posture.json` already grants `~/repos` in both `allowRead`
   and `allowWrite`, so a container holding only jkb was **tighter** than the boundary the same
   agent runs under on the host — a difference nothing had decided, which made a cross-repo task
-  impossible rather than deliberately refused. `workspaceFolder` still opens
-  `/home/vscode/repos/jkb`, so this assumes the checkout is `~/repos/jkb`.
+  impossible rather than deliberately refused. `workspaceFolder` FOLLOWS the folder you opened
+  (`${localWorkspaceFolderBasename}`), and `initializeCommand` refuses one the mount cannot
+  place — see the derived-folder note below.
 - **A nested bind must be NAMED, never inferred.** `verify.sh` compares exact mount points with no
   prefix logic (prefix filtering is what once let `$HOME` at `/host` through), so once the declared
   target is the parent, `mutate-verify.sh`'s own `-v $REPO:/home/vscode/repos/jkb` is undeclared —

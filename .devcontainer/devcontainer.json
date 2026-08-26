@@ -85,7 +85,14 @@
   // raises it as its first act; postStart raises it again because iptables rules live in the
   // container's network namespace and do not survive a restart.
   "postCreateCommand": "bash .devcontainer/setup.sh",
-  "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh",
+  //
+  // ...and the worktree reaper, because THE CONTAINER IS WHERE DEFERRAL IS NORMAL: a session
+  // cannot archive its own checkout, so every `jkb task land` in here records one for later — and
+  // the host's `com.jkb.reap` cannot finish it, since the record names `/home/vscode/...` paths
+  // the host cannot see (it holds them and says so). No init system in here to run a service, so
+  // every container start sweeps once. Best-effort by design: a reaper that could not run must
+  // never stop the firewall from being raised.
+  "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh && (jkb task reap || true)",
 
   "customizations": {
     "vscode": {

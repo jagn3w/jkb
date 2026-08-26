@@ -152,6 +152,17 @@ open(p, 'w').write(s.replace('"is not inside any host BIND"', '"a string verify.
 PYX
 run "a mutate-verify expectation goes stale" "expects text verify.sh never prints"
 
+# A refusal in the firewall that exits before installing any rule is not a refusal: iptables rules
+# do not survive a restart, so the container comes up with unfiltered egress and a message.
+seed; python3 - "$work/t/.devcontainer/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace('jq empty "$POSTURE" 2>/dev/null || fail_closed "$POSTURE is not valid JSON',
+              'jq empty "$POSTURE" 2>/dev/null || exit 1 # "$POSTURE is not valid JSON', 1)
+open(p, 'w').write(s)
+PYX
+run "a firewall refusal exits without installing a deny-all" "exits without installing a deny-all"
+
 seed; jq_dc '.mounts += ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"]'
 run "the docker socket is mounted in" "docker socket is root on the host"
 
@@ -207,8 +218,8 @@ open(p, 'w').write(s.replace('sudo -n /usr/local/bin/init-firewall.sh',
 PY
 run "a caller passes the workspace posture (shell-quoted)" "passes an argument to init-firewall.sh"
 
-seed; sub_dc '"postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh"' \
-             '"postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json"'
+seed; sub_dc 'init-firewall.sh && (jkb task reap || true)' \
+             'init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json'
 run "a caller passes the workspace posture (bare path)" "passes an argument to init-firewall.sh"
 
 seed; printf '{oops' > "$(DC)"
@@ -255,7 +266,7 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=27
+PINNED_BAD_SITES=28
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

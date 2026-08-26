@@ -94,7 +94,8 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 #   linked     the memory directory is a symlink into the store
 #   collision  a name exists on both sides; nothing was moved and no link was made
 #   foreign    something else already owns that path; left exactly as it was
-#   unsafe     the store holds something other than plain files (see below)
+#   unsafe     the store holds something other than plain files, and nothing points at it
+#   exposed    ...and a live link DID point at it, which this removed
 #   error      the state could not be established
 link_one() { # link_one <projects-dir> <store-dir> <repo-path>
     local projects="$1" store_dir="$2" path="${3%/}"
@@ -117,6 +118,19 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
     # ~/.claude, the one directory nothing here may share. Memory is prose in files; a link, a
     # socket or a device in there is not memory and is not something to quietly follow.
     if [ -L "$dest" ] || [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+        # AND BREAK THE LINK IF ONE IS LIVE. Refusing only to *create* one left the steady state
+        # untouched: link a repo normally, plant a symlink in the store afterwards, and the
+        # redirect — including back into ~/.claude, which nothing here may share — stays live on
+        # both sides while this prints a refusal and `verify.sh` reports an ok line. Removing a
+        # symlink destroys no memory (the files are in the store), and the repo simply stops being
+        # shared until a person cleans it, which is the safer side of that trade.
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$dest" ]; then
+            rm -f "$link"
+            warn "$key: $dest holds something that is not a plain file — REMOVED the live link into it"
+            warn "  memory for $key is no longer shared until you clean $dest and re-run"
+            echo exposed
+            return 0
+        fi
         warn "$key: $dest holds something that is not a plain file — refusing to link until it does"
         echo unsafe
         return 0
@@ -225,6 +239,9 @@ status_of() { # status_of <home> <store> <repo-path>
     # linked repo whose store had been poisoned reported `linked`, and `verify.sh` consults this
     # one. Two orderings of one rule is two rules.
     if [ -L "$dest" ] || [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+        # `exposed` while a link into it is LIVE — an active redirect, which verify.sh fails on —
+        # versus `unsafe`, an impure store nothing points at, which only wants a person.
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$dest" ]; then echo exposed; return 0; fi
         echo unsafe; return 0
     fi
     if [ -L "$link" ]; then
@@ -342,8 +359,15 @@ if [ "$self_test" -eq 1 ]; then
     mkdir -p "$t/.jkb/claude-memory/jkb" "$(dirname "$link")"
     ln -s "$t/.jkb/claude-memory/jkb" "$link"
     ln -s "$t/elsewhere/leak" "$t/.jkb/claude-memory/jkb/one.md"
-    check "a linked repo with a poisoned store reports unsafe, not linked" \
-        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
+    check "a linked repo with a poisoned store reports EXPOSED, not linked" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = exposed ] && echo yes || echo no)"
+    # ...and the linker BREAKS that link rather than only declining to make another. Refusing to
+    # create one left the live redirect — including back into ~/.claude — running untouched.
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "and the live redirect is removed, not merely reported" \
+        "$([ ! -e "$link" ] && echo yes || echo no)"
+    check "while the memory in the store is left for a person to clean" \
+        "$([ -L "$t/.jkb/claude-memory/jkb/one.md" ] && echo yes || echo no)"
     rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"
 
     # A symlink somebody else made is reported, never retargeted.

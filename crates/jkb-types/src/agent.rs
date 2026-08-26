@@ -88,8 +88,16 @@ pub enum AgentId {
 /// a string with an ad-hoc parser could not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Liveness {
-    /// A process with this pid exists.
-    Process(u32),
+    /// A process with this pid exists **on this host**.
+    ///
+    /// The host is carried because a pid means nothing without one: pid 812 in a dev container
+    /// is a different process from pid 812 on the machine hosting it, and jkb deliberately shares
+    /// `~/.jkb` across that boundary. Discarding it here made the probe answer about whichever
+    /// process happened to hold that number locally — reporting a live owner dead, or a dead one
+    /// alive, at exactly the boundary the claim model exists to be careful about. Only the caller
+    /// knows this host's name, so the comparison is theirs; this type's job is to refuse to hand
+    /// over a pid without the host it belongs to.
+    Process { host: String, pid: u32 },
     /// This directory exists.
     Worktree(PathBuf),
     /// Nothing on this machine can say. Not "dead" — *unestablished*.
@@ -199,7 +207,10 @@ impl AgentId {
     #[must_use]
     pub fn liveness(&self) -> Liveness {
         match self {
-            Self::Process { pid, .. } => Liveness::Process(*pid),
+            Self::Process { host, pid, .. } => Liveness::Process {
+                host: host.clone(),
+                pid: *pid,
+            },
             Self::Session { worktree, .. } => Liveness::Worktree(worktree.clone()),
             Self::Agent { .. } | Self::Unrecognized { .. } => Liveness::External,
         }
@@ -270,8 +281,11 @@ mod tests {
     fn each_shape_declares_what_would_prove_it() {
         assert_eq!(
             AgentId::parse("host:42").liveness(),
-            Liveness::Process(42),
-            "a process is proven by its pid"
+            Liveness::Process {
+                host: "host".into(),
+                pid: 42
+            },
+            "a process is proven by its pid ON ITS OWN HOST — a pid without one names nothing"
         );
         assert_eq!(
             AgentId::parse("session:1:/tmp/w").liveness(),
@@ -301,7 +315,13 @@ mod tests {
     fn a_reserved_host_name_cannot_impersonate_a_shape() {
         let id = AgentId::this_process("session", 5);
         assert_eq!(id.as_str(), "session-host:5");
-        assert_eq!(id.liveness(), Liveness::Process(5));
+        assert_eq!(
+            id.liveness(),
+            Liveness::Process {
+                host: "session-host".into(),
+                pid: 5
+            }
+        );
         let id = AgentId::this_process("node:1", 5);
         assert_eq!(
             id.as_str(),

@@ -274,6 +274,25 @@ for caller in "$here/setup.sh" "$here/devcontainer.json"; do
 done
 [ "$callers_ok" -eq 1 ] && ok "no caller passes an argument to the firewall"
 
+# NO REFUSAL IN THE FIREWALL MAY BYPASS `fail_closed`. iptables rules do not survive a container
+# restart, so a refusal that exits before installing any is not a refusal — it is unrestricted
+# egress with a message. Two guards had that shape (an unparseable snapshot, an unidentifiable
+# workspace posture), both in the file whose entire job is to be the layer that holds when the
+# nested sandbox does not. `exit 1` inside `fail_closed` itself is the one legitimate site.
+# Comments are stripped first and `exit 1` is matched ANYWHERE on the line, not just at its
+# start: the shape this is about is `... || exit 1`, which an anchored pattern walks straight
+# past — the guard's own first version did exactly that and reported the mutation as MISSED.
+stray_exits="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
+    /^fail_closed\(\) \{/ { infn = 1 }
+    infn && /^\}/           { infn = 0; next }
+    !infn && /(^|[^[:alnum:]_])exit[[:space:]]+1([^[:alnum:]_]|$)/ { print FNR }
+')"
+if [ -z "$stray_exits" ]; then
+    ok "every refusal in init-firewall.sh goes through fail_closed"
+else
+    bad "init-firewall.sh exits without installing a deny-all at line(s): $(tr '\n' ' ' <<<"$stray_exits")— a refusal that leaves no rules is unrestricted egress with a message"
+fi
+
 # EVERY EXPECT STRING mutate-verify.sh greps for must be one verify.sh can actually print.
 # That harness needs Docker, so it does not run in this gate — and a stale expect there is a
 # mutation that reports MISSED for ever, which is a guard nobody has seen fire dressed as a guard.

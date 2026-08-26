@@ -250,6 +250,17 @@ pub struct Store {
 /// # Errors
 /// Returns an error if the store cannot be read or the record cannot be removed.
 pub fn revoke(db: &Path, worktree: &Path) -> Result<bool> {
+    // UNDER THE SWEEP LOCK. Without it a sweep already in flight is working from a snapshot taken
+    // before this removal: it archives the checkout `task work` is at that moment handing back,
+    // and re-writes the record this deleted. Refusing is the honest outcome — the caller says so
+    // and the operator re-runs — because a cancellation that silently lost the race is worse than
+    // one that admits it.
+    let Some(_lock) = SweepLock::acquire(db)? else {
+        anyhow::bail!(
+            "a sweep is running, so the pending removal could not be cancelled — re-run this in \
+             a moment"
+        );
+    };
     let path = marker_path(db, worktree);
     match fs::read(&path) {
         Ok(body) => {
@@ -508,6 +519,45 @@ pub fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+/// Whether a record names paths this sweep may act on at all.
+///
+/// THE SWEEP DELETES DIRECTORIES AND THE RECORD STORE IS AGENT-WRITABLE. `~/.jkb` is bind-mounted
+/// into the dev container and granted in the posture's `allowWrite`, while the host's reaper runs
+/// as a launchd agent outside every sandbox — so a JSON file naming `"archive": "/Users/me/
+/// Documents"` with an old `archived_at` steered `remove_dir_all` at it, past a `removable()`
+/// probe that answers "permitted" for any ordinary directory. Corruption reaches the same place
+/// without an adversary.
+///
+/// So both paths are constrained to where this mechanism puts things: a worktree under
+/// `<repo>/.jkb/work`, an archive under `<repo>/.jkb/archive`. Checked ONCE, above the arms,
+/// because a rule each arm has to remember is the defect — the pending arm had
+/// `still_the_recorded_session` and the archived arm had nothing.
+///
+/// Lexical, deliberately: `Path::starts_with` compares components without touching the
+/// filesystem, so a record cannot be made to pass by creating a symlink, and a path that does not
+/// exist is judged the same as one that does.
+fn paths_are_ours(entry: &Entry) -> Result<(), String> {
+    let work = entry.repo_root.join(".jkb").join("work");
+    if !entry.worktree.starts_with(&work) || entry.worktree == work {
+        return Err(format!(
+            "{} is not a session worktree under {}",
+            entry.worktree.display(),
+            work.display()
+        ));
+    }
+    if let Some(dir) = &entry.archive {
+        let root = archive_root(&entry.repo_root);
+        if !dir.starts_with(&root) || *dir == root {
+            return Err(format!(
+                "its archive {} is not under {}",
+                dir.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether the tree at `entry.worktree` is still the session this record is about.
 ///
 /// Three questions, all of which must answer yes, and any of which failing HOLDS: git still
@@ -592,37 +642,26 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
     };
 
     for (marker, mut entry) in store.records {
+        // WHERE THIS RECORD POINTS, before either arm looks at it. Above the dispatch because the
+        // condition dominates both and each arm would otherwise need its own copy (D45.5).
+        if let Err(why) = paths_are_ours(&entry) {
+            report.held.push((
+                entry.uid.clone(),
+                format!("{why} — this record does not describe anything this sweep owns"),
+            ));
+            continue;
+        }
         // Already archived, so the only question left is whether it is old enough to delete.
         if let Some(dir) = entry.archive.clone() {
-            if !dir.exists() {
-                // Somebody removed it by hand. Nothing owed, so stop tracking it.
-                drop_marker(&marker, dry_run, &mut report, &entry.uid);
-                continue;
-            }
-            let age = now.saturating_sub(entry.archived_at.unwrap_or(now));
-            if age < retain_days.saturating_mul(SECS_PER_DAY) {
-                report.retained.push(dir);
-                continue;
-            }
-            if let Err(why) = removable(&dir) {
-                report.held.push((
-                    entry.uid.clone(),
-                    format!("{} cannot be deleted from here: {why}", dir.display()),
-                ));
-            } else if dry_run {
-                report.deleted.push(dir);
-            } else if let Err(e) = fs::remove_dir_all(&dir) {
-                // The probe proved the unlink permitted, but a walk can still fail — a file
-                // appearing mid-sweep, a device error. The record stays and the next sweep
-                // tries again.
-                report.held.push((
-                    entry.uid.clone(),
-                    format!("{} was not fully deleted: {e}", dir.display()),
-                ));
-            } else {
-                report.deleted.push(dir);
-                drop_marker(&marker, dry_run, &mut report, "");
-            }
+            sweep_archived(
+                &dir,
+                &entry,
+                &marker,
+                retain_days,
+                now,
+                dry_run,
+                &mut report,
+            );
             continue;
         }
 
@@ -700,6 +739,56 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
     }
 
     Ok(report)
+}
+
+/// The archived half of one record: keep it, or delete it once it is past the window.
+///
+/// Split from [`reap`] only for length; the containment check that makes acting on `dir` safe at
+/// all runs in the caller, above both arms.
+#[allow(clippy::too_many_arguments)]
+fn sweep_archived(
+    dir: &Path,
+    entry: &Entry,
+    marker: &Path,
+    retain_days: u64,
+    now: u64,
+    dry_run: bool,
+    report: &mut Report,
+) {
+    if !dir.exists() {
+        // Somebody removed it by hand. Nothing owed, so stop tracking it.
+        drop_marker(marker, dry_run, report, &entry.uid);
+        return;
+    }
+    let age = now.saturating_sub(entry.archived_at.unwrap_or(now));
+    if age < retain_days.saturating_mul(SECS_PER_DAY) {
+        report.retained.push(dir.to_path_buf());
+        return;
+    }
+    if dry_run {
+        // Reported without probing: `removable` works by attempting `remove_dir`, which
+        // succeeds on an empty directory — so asking the question during a dry run
+        // deleted the very thing it was about to say it *would* delete.
+        report.deleted.push(dir.to_path_buf());
+        return;
+    }
+    if let Err(why) = removable(dir) {
+        report.held.push((
+            entry.uid.clone(),
+            format!("{} cannot be deleted from here: {why}", dir.display()),
+        ));
+    } else if let Err(e) = fs::remove_dir_all(dir) {
+        // The probe proved the unlink permitted, but a walk can still fail — a file
+        // appearing mid-sweep, a device error. The record stays and the next sweep
+        // tries again.
+        report.held.push((
+            entry.uid.clone(),
+            format!("{} was not fully deleted: {e}", dir.display()),
+        ));
+    } else {
+        report.deleted.push(dir.to_path_buf());
+        drop_marker(marker, dry_run, report, "");
+    }
 }
 
 fn drop_marker(marker: &Path, dry_run: bool, report: &mut Report, uid: &str) {
@@ -1014,8 +1103,14 @@ mod tests {
         );
 
         // ...and a holder PROVEN gone is taken over, or one crashed sweep wedges the machine's
-        // reaper for ever. pid 2^22 is above every default pid_max, so it cannot be running.
-        fs::write(&lock, "nohost:4194304").expect("write");
+        // reaper for ever. THIS host — a pid on another one is `Unknown`, which is respected, so
+        // a foreign hostname here would assert the opposite of what this line says.
+        let dead_holder = format!("{}:4294967290", crate::owner::hostname_for_test());
+        assert!(
+            crate::owner::is_alive(&dead_holder).is_no(),
+            "the fixture's holder must be PROVEN gone, or this asserts nothing"
+        );
+        fs::write(&lock, &dead_holder).expect("write");
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
         assert!(!r.skipped, "a dead holder's lock is taken over");
     }
@@ -1150,6 +1245,80 @@ mod tests {
             "an archived record is not cancellable"
         );
         assert_eq!(entries(&db).expect("entries").records.len(), 1);
+    }
+
+    #[test]
+    fn a_record_pointing_outside_the_repo_deletes_nothing() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        fs::create_dir_all(&repo).expect("mk");
+        // Somebody's documents. The record store is inside the `~/.jkb` bind, which the container
+        // can write and the posture grants — and the host's reaper runs outside every sandbox.
+        let victim = t.path().join("Documents");
+        fs::create_dir_all(victim.join("taxes")).expect("mk");
+        fs::write(victim.join("taxes/2025.pdf"), b"important").expect("write");
+
+        let e = Entry {
+            archive: Some(victim.clone()),
+            // Old enough that the retention window is long past.
+            archived_at: Some(1),
+            head: Some("abc".into()),
+            ..entry(&repo.join(".jkb/work/s"), &repo)
+        };
+        record(&db, &e).expect("record");
+
+        let r = reap(&db, 0, false).expect("reap");
+        assert!(r.deleted.is_empty(), "nothing outside the repo is deleted");
+        assert_eq!(r.held.len(), 1, "it is held, with the reason: {:?}", r.held);
+        assert!(
+            victim.join("taxes/2025.pdf").exists(),
+            "and the directory it named is untouched"
+        );
+    }
+
+    #[test]
+    fn a_record_naming_a_worktree_outside_jkb_work_is_refused() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        fs::create_dir_all(&repo).expect("mk");
+        let elsewhere = t.path().join("not-a-session");
+        fs::create_dir_all(&elsewhere).expect("mk");
+        fs::write(elsewhere.join("f"), b"x").expect("write");
+
+        let e = Entry {
+            head: Some("abc".into()),
+            ..entry(&elsewhere, &repo)
+        };
+        record(&db, &e).expect("record");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(r.archived.is_empty(), "and nothing is moved either");
+        assert_eq!(r.held.len(), 1, "{:?}", r.held);
+        assert!(elsewhere.join("f").exists());
+    }
+
+    #[test]
+    fn a_dry_run_does_not_delete_an_empty_archive_through_its_own_probe() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        // `removable` works by ATTEMPTING `remove_dir`, which succeeds on an empty directory — so
+        // asking the question during a dry run deleted the thing it was about to say it *would*.
+        let dir = archive_root(&repo).join("s-19700101T000000Z");
+        fs::create_dir_all(&dir).expect("mk");
+        let e = Entry {
+            archive: Some(dir.clone()),
+            archived_at: Some(1),
+            head: Some("abc".into()),
+            ..entry(&repo.join(".jkb/work/s"), &repo)
+        };
+        record(&db, &e).expect("record");
+
+        let r = reap(&db, 0, true).expect("reap");
+        assert_eq!(r.deleted, vec![dir.clone()], "it says what it would delete");
+        assert!(dir.exists(), "and a dry run deleted nothing");
     }
 
     #[test]

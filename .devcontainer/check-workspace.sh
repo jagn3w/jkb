@@ -60,6 +60,10 @@ fi
 # the refusal's advice switched this guard off without moving the mount, and the container then
 # opened whatever sat at ~/repos/<name> instead. A remedy the machine does not accept is worse
 # than no remedy.
+# `pwd -P` resolves symlinks, which is why a symlinked checkout is refused rather than accepted:
+# the container binds ~/repos itself, so a link pointing out of it dangles in there. That is the
+# right answer, and the refusal below says so rather than advising a symlink — which it did, and
+# which this same resolution then rejected.
 resolve() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
 folder="$(resolve "$folder")"
 repos="$(resolve "$HOME/repos")"
@@ -82,7 +86,8 @@ different checkout than the one you are looking at, silently.
 
   • Working a jkb task session? Sessions are worked on the host, in their own VS Code window
     (\`jkb task work <uid>\`). The container is for the main checkout.
-  • Repo kept somewhere else? Move or symlink the checkout under ~/repos — that path is what
-    devcontainer.json binds, so it is the only place the container can see.
+  • Repo kept somewhere else? MOVE the checkout under ~/repos. A symlink there does not work
+    and is refused for the same reason: only ~/repos itself is bind-mounted, so the link would
+    dangle inside the container even though it resolves fine out here.
 EOF
 exit 1

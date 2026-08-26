@@ -73,11 +73,29 @@ pub fn pid_alive(pid: u32) -> Fact {
 }
 
 /// Best-effort local hostname (informational; single-host — the pid is what liveness keys on).
+/// This machine's name, for a test that must build an owner id this host will actually probe.
+#[cfg(test)]
+pub fn hostname_for_test() -> String {
+    hostname()
+}
+
+/// This machine's name — asked of the kernel when the environment does not say.
+///
+/// The environment comes first so a test (and an operator) can pin it. What matters is the
+/// fallback: it used to be the literal `"localhost"`, which both a host and the dev container
+/// running on it would answer, so `host:pid` owner ids from either side compared EQUAL and the
+/// container's pid namespace was probed as if it were this one. A rule whose two sides answer the
+/// same name is not a rule, so the last resort is `uname`, which names the machine.
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("HOST").ok())
         .filter(|h| !h.is_empty())
+        .or_else(|| {
+            let uts = rustix::system::uname();
+            let node = uts.nodename().to_string_lossy().into_owned();
+            (!node.is_empty()).then_some(node)
+        })
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
@@ -95,16 +113,23 @@ fn hostname() -> String {
 ///   — and that means "this work is in flight" — is the checkout. The pid is ignored rather
 ///   than consulted as a fallback, so a *recycled* pid cannot keep a removed session's claim
 ///   alive after `land`/`abandon` took its worktree away.
-/// * an **external** agent, and any id we cannot read, is [`Fact::Unknown`]: nothing here can
-///   say. That is not "dead" — see the module docs.
+/// * an **external** agent, an owner naming **another host**, and any id we cannot read are all
+///   [`Fact::Unknown`]: nothing here can say. That is not "dead" — see the module docs.
 #[must_use]
 pub fn is_alive(owner: &str) -> Fact {
     match AgentId::parse(owner).liveness() {
-        Liveness::Process(pid) => pid_exists(pid),
+        // A pid is only meaningful on the host that issued it. `~/.jkb` is bind-mounted into the
+        // dev container on purpose, so a claim — or a sweep lock — written in there names a pid in
+        // the container's namespace, and probing it here answers about whichever local process
+        // holds that number: a live owner reported dead, or a dead one alive. Unknown is the only
+        // honest answer for another host, and unknown never frees anything (D48.10).
+        Liveness::Process { host, pid } if host == hostname() => pid_exists(pid),
         // `Path::exists` is itself lossy — it answers `false` for a permission error as well as
         // for a missing directory — so it is asked through `try_exists`, which separates them.
         Liveness::Worktree(dir) => Fact::observed(dir.try_exists()),
-        Liveness::External => Fact::Unknown,
+        // An owner on another host and an external agent are the same answer for the same
+        // reason: nothing here can establish it. Never "dead" — see the module docs.
+        Liveness::Process { .. } | Liveness::External => Fact::Unknown,
     }
 }
 
@@ -151,7 +176,7 @@ fn liveness_from(probe: Result<(), Errno>) -> Fact {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_alive, self_owner, session_owner, session_worktree};
+    use super::{hostname, is_alive, self_owner, session_owner, session_worktree};
     use jkb_fsm::Fact;
     use jkb_types::AgentId;
 
@@ -178,9 +203,25 @@ mod tests {
     /// *unestablished*, which is a different answer and must not free the task.
     #[test]
     fn a_dead_pid_is_no_and_an_unreadable_owner_is_unknown() {
-        assert_eq!(is_alive("host:4294967290"), Fact::No);
+        assert_eq!(is_alive(&format!("{}:4294967290", hostname())), Fact::No);
         assert_eq!(is_alive("garbage"), Fact::Unknown);
         assert_eq!(is_alive("agent:01JBX7Q4"), Fact::Unknown);
+    }
+
+    /// A pid is only meaningful on the host that issued it, and `~/.jkb` is shared across exactly
+    /// that boundary — the dev container's pid 1 is not this machine's pid 1. Probing a foreign
+    /// owner's pid locally answers about whichever process holds that number here: a live owner
+    /// reported dead (and its claim freed), or a dead one reported alive.
+    #[test]
+    fn an_owner_on_another_host_is_unknown_rather_than_probed_locally() {
+        // pid 1 exists on every machine, so a local probe would answer `Yes` for this.
+        assert_eq!(
+            is_alive("some-other-machine:1"),
+            Fact::Unknown,
+            "another host's pid is not this host's to probe"
+        );
+        // ...and the same id on THIS host still answers from the kernel.
+        assert_eq!(is_alive(&format!("{}:1", hostname())), Fact::Yes);
     }
 
     /// A probe that **could not answer** is `Unknown`, never `No`.
@@ -230,7 +271,7 @@ mod tests {
             .wait()
             .expect("reap it, so it is gone rather than a zombie");
         assert_eq!(
-            is_alive(&format!("host:{pid}")),
+            is_alive(&format!("{}:{pid}", hostname())),
             Fact::No,
             "a reaped pid must reach the kernel and come back ESRCH"
         );
@@ -242,7 +283,7 @@ mod tests {
         // kernel answers `EPERM` — which is the whole point: the refusal is evidence the process
         // exists. This is the case the shell's `kill -0` gets wrong by reading its non-zero exit
         // as "gone", and the case `ps` was originally brought in to recover.
-        assert_eq!(is_alive("host:1"), Fact::Yes);
+        assert_eq!(is_alive(&format!("{}:1", hostname())), Fact::Yes);
     }
 
     /// The claim `jkb task work` takes must survive the process that took it — otherwise

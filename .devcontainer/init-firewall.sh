@@ -21,6 +21,36 @@ set -euo pipefail
 
 say() { printf '[firewall] %s\n' "$*"; }
 
+# EVERY REFUSAL MUST LEAVE MORE FILTERING THAN IT FOUND, NOT LESS. The refusals below used to
+# `exit 1` before any rule was installed — and iptables rules do NOT survive a container restart
+# (that is why postStart re-raises them), so a container that started offline kept UNFILTERED
+# egress while the script printed "Refusing". The refusal path was less safe than the success path,
+# which is the one direction this layer must never go.
+fail_closed() { # fail_closed <message...>
+    printf 'init-firewall: %s\n' "$*" >&2
+    # DNS and loopback stay open so the container can be diagnosed and can retry; everything else
+    # is denied. Deliberately does not depend on the `allowed` set having any contents.
+    iptables -F OUTPUT 2>/dev/null || true
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    if iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
+        echo "  egress is DENIED (fail-closed). Fix the cause and re-run to restore the allowlist." >&2
+    else
+        echo "  AND the deny-all chain could not be installed — egress may be unfiltered." >&2
+    fi
+    exit 1
+}
+
+# Defined FIRST, above every refusal in this file, because that is the only way the rule it
+# states can hold. It used to sit below two of them: the unparseable-snapshot guard and the
+# posture-discovery guard both `exit 1` before a single rule was installed, so a truncated
+# snapshot — the very state that guard's own comment describes as real — left the container
+# with an empty OUTPUT chain and unrestricted egress on every later start, permanently, since
+# the snapshot is root-owned and 0444. Two refusal styles in one security-critical script is
+# the defect, not either message.
+
 # THE ALLOWLIST THIS RUNS ON IS NOT THE ONE IN THE WORKSPACE. It used to be: the caller passed a
 # path, and the path passed was the repo's own copy — bind-mounted, under allowWrite, writable by
 # the agent this layer exists to bound. Appending a domain there and waiting for the next container
@@ -60,12 +90,11 @@ if [ ! -e "$SNAPSHOT" ]; then
     # FIRST RAISE ONLY. Refusing here fails container creation, which is the correct direction:
     # an egress allowlist that cannot be established must not be guessed at, and nothing has run
     # in the container yet.
-    workspace_posture="$(find_workspace_posture)" || {
-        echo "init-firewall: could not identify one workspace posture under /home/vscode/repos" >&2
-        echo "  (looked for */scripts/auto-mode-posture.json; found none, or more than one)." >&2
-        echo "  The egress allowlist is snapshotted from it once, at create, and must not be guessed." >&2
-        exit 1
-    }
+    workspace_posture="$(find_workspace_posture)" || fail_closed "could not identify one workspace
+  posture under /home/vscode/repos (looked for */scripts/auto-mode-posture.json; found
+  $(ls -d /home/vscode/repos/*/scripts/auto-mode-posture.json 2>/dev/null | wc -l | tr -d ' ')
+  matches, and exactly one is needed). The egress allowlist is snapshotted from it once, at
+  create, and must not be guessed."
     install -o root -g root -m 0444 "$workspace_posture" "$SNAPSHOT"
     say "snapshotted the egress allowlist from $workspace_posture (first run in this container)"
 # EVERY LATER RAISE reads only the snapshot, so the lookup below is for the drift NOTE alone and
@@ -88,33 +117,9 @@ POSTURE="$SNAPSHOT"
 # that exited 5 with no output at all, which in postCreate is an unexplained abort. A snapshot
 # that will not parse is a real state (a truncated write, a half-copied file), and the operator
 # needs to be told which file to look at.
-jq empty "$POSTURE" 2>/dev/null || {
-    echo "init-firewall: $POSTURE is not valid JSON — the egress allowlist cannot be read." >&2
-    echo "  Rebuild the container to re-snapshot it from the workspace posture." >&2
-    exit 1
-}
+jq empty "$POSTURE" 2>/dev/null || fail_closed "$POSTURE is not valid JSON — the egress
+  allowlist cannot be read. Rebuild the container to re-snapshot it from the workspace posture."
 
-# EVERY REFUSAL MUST LEAVE MORE FILTERING THAN IT FOUND, NOT LESS. The refusals below used to
-# `exit 1` before any rule was installed — and iptables rules do NOT survive a container restart
-# (that is why postStart re-raises them), so a container that started offline kept UNFILTERED
-# egress while the script printed "Refusing". The refusal path was less safe than the success path,
-# which is the one direction this layer must never go.
-fail_closed() { # fail_closed <message...>
-    printf 'init-firewall: %s\n' "$*" >&2
-    # DNS and loopback stay open so the container can be diagnosed and can retry; everything else
-    # is denied. Deliberately does not depend on the `allowed` set having any contents.
-    iptables -F OUTPUT 2>/dev/null || true
-    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    if iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
-        echo "  egress is DENIED (fail-closed). Fix the cause and re-run to restore the allowlist." >&2
-    else
-        echo "  AND the deny-all chain could not be installed — egress may be unfiltered." >&2
-    fi
-    exit 1
-}
 
 # Validated BEFORE any live state is touched. `|| declared=0`: a snapshot that is valid JSON but
 # not an object makes jq exit non-zero, and a bare assignment from a failing command substitution
@@ -198,8 +203,8 @@ iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
 
 # Fail loudly rather than leave a half-applied policy that reads as protection.
 if ! iptables -C OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
-    echo "init-firewall: default-REJECT rule is not in place — refusing to report success" >&2
-    exit 1
+    fail_closed "default-REJECT rule is not in place — refusing to report success on a
+  half-applied policy."
 fi
 if [ "$have_v6" -eq 1 ]; then
     say "egress default-deny is active (IPv4 allowlisted, IPv6 denied outright)"

@@ -6542,13 +6542,24 @@ fn cmd_task_abandon(
     // keyed by the name, so the next `jkb task work` cutting a **new** branch under the same
     // name cannot inherit anything from the old one — which is what the cut point this used to
     // have to forget was for.
-    if delete_branch && gitrepo::has_branch(&ctx.root, &branch)? {
+    // NOT while the worktree still holds it. When the disposal deferred, the checkout is still
+    // there with this branch checked out, and `git branch -D` refuses outright — which `?` turned
+    // into a bail BEFORE the claim was released, leaving the task `in_progress`, claimed by a
+    // session whose worktree still exists (so `is_alive` says Yes) and therefore reclaimable by
+    // nothing. Re-running failed identically. The decision is already in the record's `Plan`, and
+    // `delete_branch_if_any` applies it once the tree is out of the way.
+    if delete_branch && deferred.is_none() && gitrepo::has_branch(&ctx.root, &branch)? {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
     }
     // Read from git rather than from what this function did: `dispose` deletes the branch itself
     // when it archived the tree, so a flag set here would report `false` for a branch that is
     // gone. Asked once, after everything that could have removed it.
     let branch_deleted = delete_branch && !gitrepo::has_branch(&ctx.root, &branch)?;
+    // Said out loud, because "branch kept" would be wrong here — it is going, just not yet.
+    // `!json` because this is prose and the machine surface already carries `worktree_deferred`.
+    if !json && delete_branch && !branch_deleted && deferred.is_some() {
+        println!("  {branch} will be deleted when `jkb task reap` archives the checkout");
+    }
     // Release, and reopen unless the task is already finished.
     //
     // The land target is cleared **only** when the task is reopened, which is exactly when it

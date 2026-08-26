@@ -231,6 +231,11 @@ mem_state="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/d
 case "$mem_state" in
     linked)
         ok "auto-memory is shared with the host through ~/.jkb" ;;
+    exposed)
+        # A live redirect out of the store, which the linker has just broken. FATAL: the container
+        # is not in a state its own design permits, and saying so on the create that discovers it
+        # is the only moment anyone reads this.
+        bad "auto-memory was pointing into a store holding something that is not a plain file — the link has been removed; clean ~/.jkb/claude-memory and re-run scripts/link-claude-memory.sh" ;;
     collision|unsafe|foreign)
         # Not a FAIL: the container works, one repo's memory just is not shared until a person
         # settles it. Said plainly, because a state nobody is told about is one nobody fixes.

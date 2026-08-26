@@ -51,6 +51,10 @@ impl Fixture {
             .current_dir(&self.repo)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
+            // probed for liveness on the host that issued it, so an unpinned name makes every
+            // claim fixture `Unknown` and nothing is ever reclaimed.
+            .env("HOSTNAME", "host")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1061,7 +1065,10 @@ fn abandon_frees_a_dead_owners_claim() {
             "claim",
             &uid,
             "--owner",
-            "swarm:4294967290",
+            // `host:` is this test's own machine (pinned in `jkb()`), which is what makes the pid
+            // probeable at all: a crashed implementer on ANOTHER host is `Unknown`, and unknown
+            // keeps its claim rather than losing it to a pid that happens to be free here.
+            "host:4294967290",
         ])
         .assert()
         .success();
