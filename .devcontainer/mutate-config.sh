@@ -266,6 +266,18 @@ open(p, 'w').write(s.replace('dc_mount_sources() { # dc_mount_sources <devcontai
 PYX
 run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 
+# ...and the same fail-open shape one file over. The expectation check reads mutate-verify.sh's
+# `run "<label>" "<expect>"` lines with a sed; change that shape and the sed matches nothing,
+# `stale_expects` is empty, and the check printed `ok (0 checked)` — passing by having found
+# nothing to check, in the assertion whose whole job is finding guards that cannot fire.
+seed; python3 - "$work/t/.devcontainer/mutate-verify.sh" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+# Rename the helper, exactly as an ordinary refactor would.
+open(p, 'w').write(re.sub(r'^run "', 'drive "', s, flags=re.M))
+PYX
+run "mutate-verify's run-line shape changes" "this check just certified nothing"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -278,7 +290,7 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=29
+PINNED_BAD_SITES=30
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

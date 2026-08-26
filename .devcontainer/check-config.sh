@@ -323,12 +323,20 @@ fi
 # It went stale the moment a refusal was reworded, and nothing said so. Checked here, statically,
 # because the strings are just text in two files.
 stale_expects=()
+expects=()
 while IFS= read -r want; do
     [ -n "$want" ] || continue
+    expects+=("$want")
     grep -qF -e "$want" "$here/verify.sh" || stale_expects+=("$want")
 done < <(sed -n 's/^run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
-if [ ${#stale_expects[@]} -eq 0 ]; then
-    ok "every mutate-verify expectation is a string verify.sh prints ($(sed -n 's/^run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh" | grep -c .) checked)"
+# PINNED AGAINST AN EMPTY EXTRACTION, like the three other derived lists above. Without it this
+# check passes by finding nothing to check: reword mutate-verify.sh's `run` line and the sed
+# stops matching, `stale_expects` is empty, and it prints `ok (0 checked)` — the exact
+# vacuous-pass shape it was written to stop existing elsewhere.
+if [ ${#expects[@]} -eq 0 ]; then
+    bad "no expectations could be read out of mutate-verify.sh — this check just certified nothing; has the 'run \"<label>\" \"<expect>\"' shape changed?"
+elif [ ${#stale_expects[@]} -eq 0 ]; then
+    ok "every mutate-verify expectation is a string verify.sh prints (${#expects[@]} checked)"
 else
     bad "mutate-verify.sh expects text verify.sh never prints: ${stale_expects[*]} — those mutations can only ever report MISSED"
 fi

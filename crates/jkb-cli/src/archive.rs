@@ -489,8 +489,27 @@ pub fn dispose(
     uid: &str,
     plan: Plan,
 ) -> Result<Disposed> {
+    // `rev` answers `Ok(None)` for "git ran and could not tell me", and storing THAT as `head:
+    // None` collided with the value the field reserves for a record written before it existed —
+    // after which every sweep took `still_the_recorded_session`'s "no HEAD was recorded" arm,
+    // which names no action, and the directory sat there for ever. Reachable: a part-way `git
+    // worktree remove` (the incident this module replaces, still reachable from a stale binary or
+    // a hand-run command) can unlink `<worktree>/.git` before it stops, leaving a directory whose
+    // `exists()` check passes and whose HEAD cannot be read.
+    //
+    // Refused HERE, where the caller can still print it and the operator still has the tree.
     let head = gitrepo::rev(worktree, "HEAD")
         .with_context(|| format!("reading HEAD in {}", worktree.display()))?;
+    if head.is_none() {
+        anyhow::bail!(
+            "cannot read HEAD in {} — the session's identity is what the sweep checks before it \
+             touches the path, so it will not be recorded without one. If the directory has been \
+             partly removed, delete it by hand; if it is intact, `git -C {} status` will say what \
+             git thinks of it.",
+            worktree.display(),
+            worktree.display()
+        );
+    }
     let mut entry = Entry {
         worktree: worktree.to_path_buf(),
         repo_root: repo_root.to_path_buf(),
@@ -572,6 +591,23 @@ fn removable(path: &Path) -> Result<(), String> {
 /// breaking a live sweep's lock on an unestablished answer is what the lock exists to prevent.
 struct SweepLock {
     path: PathBuf,
+    /// THE FILE THIS ACQUISITION CREATED, by `(dev, ino)`. `Drop` unlinks only while the path
+    /// still names it, for the reason `acquire` states about the stale-lock path: releasing a
+    /// lock that is no longer yours takes its current holder's with it.
+    ///
+    /// Identity is the inode and not the owner id written inside, because the owner id cannot
+    /// tell an acquisition from its successor — `host:pid` is the same string for both when one
+    /// process reacquires, which is exactly what the test for this does. The inode changes on
+    /// any unlink-and-recreate, which is what `break_lock` and a stale-lock takeover both are.
+    /// `None` if the file could not be stat'd, which disables the release rather than guessing.
+    id: Option<(u64, u64)>,
+}
+
+/// `(dev, ino)` — the file, as distinct from the path naming it.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
 }
 
 impl SweepLock {
@@ -588,7 +624,9 @@ impl SweepLock {
                 Ok(mut f) => {
                     use std::io::Write;
                     let _ = write!(f, "{}", crate::owner::self_owner());
-                    return Ok(Ok(Self { path }));
+                    drop(f);
+                    let id = file_id(&path);
+                    return Ok(Ok(Self { path, id }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     let holder = fs::read_to_string(&path).unwrap_or_default();
@@ -649,8 +687,22 @@ impl SweepLock {
 }
 
 impl Drop for SweepLock {
+    /// Release, but only what is still ours.
+    ///
+    /// An unconditional unlink here undid the rule `acquire` states above it, and `--break-lock`
+    /// is what makes that reachable rather than theoretical: across the host/container bind a
+    /// foreign holder is `Unknown` by construction, so breaking the lock is the ORDINARY remedy
+    /// there, not an escape from a wedge. Break a live sweeper's lock, acquire a fresh one, and
+    /// the displaced sweeper's `Drop` removes the successor's — after which two sweeps run
+    /// concurrently, which is the whole thing this type exists to prevent.
+    ///
+    /// Re-reading is not atomic with the unlink and does not need to be: it converts a race both
+    /// parties win into one a party can only lose by being displaced in the instant between, and
+    /// the displacing party is a person running `--break-lock`.
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if self.id.is_some() && file_id(&self.path) == self.id {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1427,6 +1479,42 @@ mod tests {
     }
 
     #[test]
+    fn releasing_the_lock_never_removes_a_successors() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let path = store_dir(&db).join(".sweep.lock");
+
+        let Ok(displaced) = SweepLock::acquire(&db).expect("acquire") else {
+            panic!("the lock is free to begin with")
+        };
+
+        // What `--break-lock` does. NOT an exotic path across the host/container bind: a foreign
+        // holder is `Unknown` there by construction, so `jkb task reap` advises breaking it and
+        // the operator is invited to do exactly this against a live sweeper.
+        break_lock(&db).expect("break").expect("there was a holder");
+        let Ok(successor) = SweepLock::acquire(&db).expect("acquire") else {
+            panic!("the lock is free again once it has been broken")
+        };
+
+        // The displaced sweeper finishes and releases. `Drop` used to unlink unconditionally,
+        // taking the successor's lock with it — after which two sweeps run at once, which is the
+        // one thing this type exists to prevent.
+        drop(displaced);
+        assert!(
+            path.exists(),
+            "the successor still holds the lock after the displaced sweeper released"
+        );
+        assert_eq!(
+            lock_holder(&db).expect("holder").as_deref(),
+            Some(crate::owner::self_owner().as_str()),
+            "and it is still the successor's"
+        );
+
+        drop(successor);
+        assert!(!path.exists(), "the holder's own release does remove it");
+    }
+
+    #[test]
     fn a_sweep_that_could_not_take_the_lock_says_so_rather_than_reporting_nothing_to_do() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
@@ -1855,9 +1943,26 @@ mod tests {
         };
         record(&db, &e).expect("record");
 
+        // REFUSED BY `Record::parse`, and the assertion says so — this used to check only that
+        // exactly one record was held, which `still_the_recorded_session` satisfies on its own
+        // (a path outside `.jkb/work` is no registered worktree either), so the one test pinning
+        // the bound on what `stow`'s `fs::rename` may pick up passed with the containment half of
+        // the parser deleted. The refusal has its own wording; ask for it.
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
         assert!(r.archived.is_empty(), "and nothing is moved either");
         assert_eq!(r.held.len(), 1, "{:?}", r.held);
+        assert!(
+            r.held[0]
+                .1
+                .contains("does not describe anything this sweep owns"),
+            "held for containment, not for some other reason: {:?}",
+            r.held[0]
+        );
+        assert_eq!(
+            entries(&db).expect("entries").rejected.len(),
+            1,
+            "and it never becomes a Record at all"
+        );
         assert!(elsewhere.join("f").exists());
     }
 

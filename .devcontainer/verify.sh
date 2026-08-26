@@ -287,16 +287,22 @@ mem_key="$(basename "$mem_repo")"
 mem_status_file=/home/vscode/.claude-state/memory-status
 mem_live="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
 mem_recorded="$(awk -v k="$mem_key" '$1 == k { print $2 }' "$mem_status_file" 2>/dev/null | tail -1)"
-if [ "$mem_recorded" = exposed ]; then
-    mem_state=exposed
-    # Consumed: the alarm describes one create, and leaving it makes the remedy unable to clear it.
-    if [ -w "$mem_status_file" ]; then
-        awk -v k="$mem_key" '$1 != k' "$mem_status_file" > "$mem_status_file.new" 2>/dev/null \
-            && mv "$mem_status_file.new" "$mem_status_file" 2>/dev/null || true
-    fi
-else
-    mem_state="$mem_live"
-fi
+# The two states ONLY THE RUN can know, so only the record can carry them. `exposed` because the
+# repair clears its own alarm; `error` because it means the run stopped part-way — a migration that
+# moved some files and then failed leaves a directory the live observer reads as an ordinary
+# `unlinked`, and this check then blamed "the linker did not run", the one cause it is not. The
+# `error)` arm below was unreachable until now: `status_of` never emits that word.
+case "$mem_recorded" in
+    exposed|error)
+        mem_state="$mem_recorded"
+        # Consumed: the alarm describes one create, and leaving it makes the remedy — a hand
+        # re-run, which writes no status file — unable to clear it.
+        if [ -w "$mem_status_file" ]; then
+            awk -v k="$mem_key" '$1 != k' "$mem_status_file" > "$mem_status_file.new" 2>/dev/null \
+                && mv "$mem_status_file.new" "$mem_status_file" 2>/dev/null || true
+        fi ;;
+    *)  mem_state="$mem_live" ;;
+esac
 case "$mem_state" in
     linked)
         ok "auto-memory is shared with the host through ~/.jkb" ;;
@@ -310,16 +316,26 @@ case "$mem_state" in
         # settles it. Said plainly, because a state nobody is told about is one nobody fixes.
         ok "auto-memory is not shared for $(basename "$mem_repo") ($mem_state) — run scripts/link-claude-memory.sh to see what it wants"
         ;;
+    broken)
+        # The link is live and points at a store directory that is GONE, so every memory write
+        # into it fails. Not one of the declining states: nothing here wants a decision, the
+        # linker recreates the directory. FATAL because until it is re-run, memory is silently
+        # not being recorded — the failure mode with no symptom.
+        bad "auto-memory points at a store directory that no longer exists — re-run scripts/link-claude-memory.sh" ;;
     error)
-        # The linker ran and could not finish for this repo. Distinct from `unlinked`, which is
-        # "no link and no reason", and from the declining states above, which want a person.
+        # The linker ran and could not finish for this repo — from the RECORD, since a live
+        # observation cannot see a run that stopped part-way. Distinct from `unlinked`, which is
+        # "no link and nothing recorded", and from the declining states above, which want a person.
         bad "auto-memory could not be linked (state: error) — see scripts/link-claude-memory.sh's output in the create log" ;;
     unlinked|"")
         # FATAL, and setup.sh's comment now says the same. `unlinked` is not the linker declining
         # — a collision and a poisoned store have their own words above and pass — it means the
         # linker did not run or could not answer, and the README promises this works. The two
         # files used to state opposite rules about the same state.
-        bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — the linker did not run or could not answer; memory written in here would be invisible on the host" ;;
+        # Says what was OBSERVED, not why. The previous wording asserted "the linker did not run",
+        # which this cannot establish: a hand re-run that fails part-way writes no status file and
+        # lands here too.
+        bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — memory written in here would be invisible on the host; run scripts/link-claude-memory.sh and read what it says" ;;
     *)
         bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
 esac
@@ -349,7 +365,18 @@ while IFS= read -r m; do
     case "$mem_repo" in "$m"|"$m"/?*) ws_mounted=yes; break ;; *) ;; esac
 done <<<"$actual"
 assert "$mem_repo is inside a declared mount point" "$ws_mounted"
-assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || echo no)"
+# ASKED OF THE KERNEL TOO, with the table already in hand. `[ -d /home/vscode/.jkb ]` was a test
+# that `jkb` itself satisfies: `create_dir_all` runs on the parent of JKB_DB at three sites in
+# main.rs, so any verb materialises the directory and this printed `ok` in a container where the
+# bind was simply absent — a container-local database, a container-local memory store the linker
+# happily reports `linked` for, and every write lost on the next rebuild. The boundary check above
+# cannot cover it either: `comm -23 actual EXPECTED` reports mounts that are EXTRA, never a
+# declared one that is missing.
+kb_mounted=no
+while IFS= read -r m; do
+    [ "$m" = /home/vscode/.jkb ] && { kb_mounted=yes; break; }
+done <<<"$actual"
+assert "knowledge base is mounted" "$kb_mounted"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.

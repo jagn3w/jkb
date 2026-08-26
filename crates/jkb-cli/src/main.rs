@@ -6168,7 +6168,30 @@ fn settle_landing(
         );
     }
 
-    report_landing(&landed, sess, &disposal, kept_status.as_ref(), json);
+    // ASKED OF GIT, once, after everything that could have removed it — the same rule
+    // `cmd_task_abandon` already applies, and folded into the same one value so no two lines can
+    // disagree. `land` always plans the deletion (its branch is a duplicate of commits now in the
+    // target), and this used to be derived from WHICH DISPOSAL ARM RAN: `Archived` asserted
+    // `branch_deleted: true` even though `dispose` only `eprintln!`s when `git branch -D` fails,
+    // and `Deferred` — every landing in the container, where a session cannot archive its own
+    // checkout — reported a live branch with no mention of the reaper that will delete it. The
+    // operator then reaches for `git branch -D` and git refuses, because the deferred worktree
+    // still holds it.
+    let branch_fate = match gitrepo::has_branch(&ctx.root, landed.branch) {
+        Ok(true) if matches!(disposal, Disposal::Deferred(_)) => BranchFate::OwedToTheReaper,
+        // `Err` joins `Ok(true)`: unestablished is not "gone", and reporting a deletion we could
+        // not observe is the one direction that costs something — it stops the operator looking.
+        Ok(true) | Err(_) => BranchFate::Kept,
+        Ok(false) => BranchFate::Deleted,
+    };
+    report_landing(
+        &landed,
+        sess,
+        &disposal,
+        branch_fate,
+        kept_status.as_ref(),
+        json,
+    );
     Ok(())
 }
 
@@ -6180,6 +6203,7 @@ fn report_landing(
     landed: &Landed<'_>,
     sess: &session::Session,
     disposal: &Disposal,
+    branch_fate: BranchFate,
     kept_status: Option<&(jkb_types::TaskStatus, String)>,
     json: bool,
 ) {
@@ -6195,7 +6219,8 @@ fn report_landing(
                 "uid": landed.uid, "landed": true, "branch": landed.branch, "onto": landed.onto,
                 "commits": landed.ahead, "gate": landed.gate, "gate_source": landed.gate_source,
                 "session_removed": disposal.session_gone(), "status": status,
-                "branch_deleted": matches!(disposal, Disposal::Archived(_)),
+                "branch_deleted": branch_fate == BranchFate::Deleted,
+                "branch_owed_to_reaper": branch_fate == BranchFate::OwedToTheReaper,
                 "session_archived": match &disposal {
                     Disposal::Archived(dest) => Some(dest.display().to_string()),
                     _ => None,
@@ -6217,7 +6242,7 @@ fn report_landing(
             }
             Disposal::Archived(dest) => {
                 println!(
-                    "  archived session {} to {} (deleted after {} days); removed its branch",
+                    "  archived session {} to {} (deleted after {} days)",
                     sess.name,
                     dest.display(),
                     archive::RETAIN_DAYS
@@ -6235,6 +6260,18 @@ fn report_landing(
                 );
             }
             Disposal::Kept => println!("  kept session {} and its branch", sess.name),
+        }
+        // The branch, said separately and from what git reports — the disposal arms above say
+        // what happened to the DIRECTORY, which is a different question.
+        match branch_fate {
+            BranchFate::Deleted => println!("  removed its branch {}", landed.branch),
+            BranchFate::OwedToTheReaper => println!(
+                "  its branch {} is still checked out by the deferred session; `jkb task reap` \
+                 deletes it once the tree is archived",
+                landed.branch
+            ),
+            BranchFate::Kept => println!("  branch {} is still there", landed.branch),
+            BranchFate::Absent => {}
         }
     }
 }
@@ -6844,7 +6881,9 @@ struct AbandonOutcome<'a> {
     branch: BranchFate,
 }
 
-/// What happened to an abandoned session's branch.
+/// What happened to a disposed session's branch. Shared by `land` and `abandon`, which asked the
+/// same question two different ways until one of them started answering it from which code path
+/// had run rather than from git.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BranchFate {
     /// Deletion was not asked for; it is still there.

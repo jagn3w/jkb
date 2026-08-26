@@ -117,11 +117,25 @@ if [ ! -e "$SNAPSHOT" ]; then
     # FIRST RAISE ONLY. Refusing here fails container creation, which is the correct direction:
     # an egress allowlist that cannot be established must not be guessed at, and nothing has run
     # in the container yet.
-    workspace_posture="$(find_workspace_posture)" || fail_closed "could not identify one workspace
-  posture under /home/vscode/repos (looked for */scripts/auto-mode-posture.json; found
-  $(ls -d /home/vscode/repos/*/scripts/auto-mode-posture.json 2>/dev/null | wc -l | tr -d ' ')
-  matches, and exactly one is needed). The egress allowlist is snapshotted from it once, at
-  create, and must not be guessed."
+    #
+    # NAMES WHAT TO DO, and lists the candidates. Mounting all of ~/repos made "two checkouts
+    # carrying a posture" the ordinary case rather than an exotic one — a second clone, a fork, a
+    # colleague's copy — and this used to abort container creation with a count and no action,
+    # which for the person who has just hit it is indistinguishable from a broken image.
+    workspace_posture="$(find_workspace_posture)" || fail_closed "could not identify ONE workspace
+  posture under /home/vscode/repos, and the egress allowlist is snapshotted from it once, at
+  create. It must not be guessed, and this script cannot be told which to use: the sudoers grant
+  forbids arguments (a grant naming no argument accepts every argument) and an environment
+  variable would be agent-settable.
+
+  Candidates found ($(ls -d /home/vscode/repos/*/scripts/auto-mode-posture.json 2>/dev/null | wc -l | tr -d ' ')):
+$(ls -d /home/vscode/repos/*/scripts/auto-mode-posture.json 2>/dev/null | sed 's/^/    /' || true)
+
+  To fix it, on the HOST, then rebuild the container:
+    * none listed  — the checkout you opened has no scripts/auto-mode-posture.json. Open a repo
+                     that has one, or restore it.
+    * two or more  — move all but one out of ~/repos (they are mounted because ~/repos is mounted
+                     whole). A checkout kept elsewhere is not seen by the container at all."
     install -o root -g root -m 0444 "$workspace_posture" "$SNAPSHOT"
     say "snapshotted the egress allowlist from $workspace_posture (first run in this container)"
 # EVERY LATER RAISE reads only the snapshot, so the lookup below is for the drift NOTE alone and

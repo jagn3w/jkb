@@ -166,6 +166,7 @@ judge() { # judge <label> <expect> <output> <rc>
   # some ERE metacharacters and silently mis-matched "host bind source(s) parsed"; `-e`, because an
   # expect may start with a dash, which grep would otherwise read as an option.
   if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
+    caught=$((caught+1))
     printf '  CAUGHT   %s\n' "$label"
   else
     fails=$((fails+1))
@@ -175,6 +176,7 @@ judge() { # judge <label> <expect> <output> <rc>
 }
 fails=0
 build_failures=0
+caught=0
 echo "=== mutations of the container's own guarantees (each must be CAUGHT) ==="
 run "an undeclared host mount is added" "UNDECLARED mounts" \
     "${HEALTHY[@]}" \
@@ -294,4 +296,18 @@ echo
 [ "$build_failures" -eq 0 ] || printf '\033[33m%d mutation(s) could not be built — nothing was verified for them\033[0m\n' "$build_failures"
 [ "$fails" -eq 0 ] || { printf '\033[31m%d guard(s) did not fire\033[0m\n' "$fails"; exit 1; }
 [ "$build_failures" -eq 0 ] || exit 1
-printf '\033[32mevery guard fired, and the matcher was shown to discriminate\033[0m\n'
+
+# WHAT WAS DRIVEN, NOT "EVERY GUARD". This printed "every guard fired" while driving the mutations
+# listed above and nothing else — so an assertion added to verify.sh tomorrow, with no mutation for
+# it, was covered by that sentence without ever being watched failing. That is the same claim-more-
+# than-was-established shape every guard in this directory exists to stop, in the summary line of
+# the harness that judges them. No silent cap: say the number and say which are uncovered.
+verify_paths="$(grep -cE '^[[:space:]]*bad "' "$REPO/.devcontainer/verify.sh" 2>/dev/null || true)"
+verify_paths="${verify_paths:-0}"
+printf '\033[32m%d mutation(s) caught, and the matcher was shown to discriminate\033[0m\n' "$caught"
+if [ "$verify_paths" -gt "$caught" ]; then
+    printf '  verify.sh has %d failure paths; %d were driven here. The rest are NOT covered by this\n' \
+        "$verify_paths" "$caught"
+    printf '  run — several need a broken machine (an unreadable mount table, a failed link) rather\n'
+    printf '  than a docker flag, which is why this is reported and not a gate.\n'
+fi
