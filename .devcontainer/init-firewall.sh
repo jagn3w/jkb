@@ -35,13 +35,32 @@ fail_closed() { # fail_closed <message...>
     iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
     iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
     iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    if iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
-        echo "  egress is DENIED (fail-closed). Fix the cause and re-run to restore the allowlist." >&2
+    local v4=no v6=no
+    iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null && v4=yes
+    # IPv6 TOO, or the verdict below is false on a first raise: the success path denies v6
+    # outright further down, so a refusal that rebuilt only the v4 chain left v6 egress entirely
+    # unfiltered while printing "egress is DENIED". Best-effort like the rest of this function —
+    # a kernel without ip6tables is a normal state, and it is reported rather than assumed.
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -F OUTPUT 2>/dev/null || true
+        ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+        ip6tables -A OUTPUT -j REJECT 2>/dev/null && v6=yes
     else
-        echo "  AND the deny-all chain could not be installed — egress may be unfiltered." >&2
+        v6=absent
     fi
+    # NAMES WHAT IT ACTUALLY COVERED. "DENIED" unconditionally is the one sentence an operator
+    # would act on, and it was asserting a state this function had not established.
+    echo "  egress: IPv4 denied=$v4, IPv6 denied=$v6. Fix the cause and re-run to restore the allowlist." >&2
+    [ "$v4" = yes ] || echo "  WARNING: the IPv4 deny-all chain could not be installed — egress may be unfiltered." >&2
     exit 1
 }
+
+# EVERY abort routes through it, not just the ones written as refusals. `set -e` aborts do not go
+# near `fail_closed`, and one of them fires with the OUTPUT chain already flushed and empty —
+# which is unrestricted egress reached by a path no refusal message describes. The static check in
+# check-config.sh stays as second-line defence: it can see a stray `exit 1` and cannot see this.
+set -E
+trap 'fail_closed "an unexpected failure at line $LINENO — refusing to leave the chain as it is."' ERR
 
 # Defined FIRST, above every refusal in this file, because that is the only way the rule it
 # states can hold. It used to sit below two of them: the unparseable-snapshot guard and the

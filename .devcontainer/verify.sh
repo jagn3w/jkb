@@ -227,7 +227,13 @@ done
 #     refuses to resolve, and a store holding a symlink is one it refuses to follow — so reading
 #     "no link" as "the mechanism is broken" made a state its own design calls normal fail this
 #     check, and with it postCreate, and with that the container. One rule, stated in one place.
-mem_state="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+# THE STATE setup.sh FOUND, not the one it left. `link_one` repairs — it removes a live link into
+# a poisoned store — so asking now would see the harmless `unsafe` rather than the `exposed` this
+# must fail on, and the repair would have silently downgraded its own alarm. Falls back to asking
+# directly when no record exists (a hand-run verify, or a container built before this).
+mem_key="$(basename "$mem_repo")"
+mem_state="$(awk -v k="$mem_key" '$1 == k { print $2 }' /home/vscode/.claude-state/memory-status 2>/dev/null | tail -1)"
+[ -n "$mem_state" ] || mem_state="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
 case "$mem_state" in
     linked)
         ok "auto-memory is shared with the host through ~/.jkb" ;;

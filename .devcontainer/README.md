@@ -145,11 +145,22 @@ The linker leaves the link absent in states it recognises — a collision, an un
 reading "no link" as "broken" failed `postCreate` for a state the design calls normal. Those
 states report and pass; only an unexplained absence fails.
 
-Stated plainly, because it is a hole in "the boundary is what you did not mount": memory is
-agent-**writable** prose that is injected into context, so a shared store is a channel from
-container sessions into the less-confined host ones. Same person's agents at both ends, prose
-rather than code, and it travels through a directory that was already shared — but it is a
-channel, and it is opt-in on the host for that reason.
+Stated plainly, because it is a hole in "the boundary is what you did not mount" — and there are
+**two** channels here, not the one this was designed around.
+
+The first is container → host: memory is agent-**writable** prose injected into context, so a
+shared store carries text from container sessions into the less-confined host ones. Same person's
+agents at both ends, prose rather than code, through a directory that was already shared.
+
+The second was measured rather than predicted. `~/.claude/projects` sits under the posture's
+blanket `denyRead` of `~` and in no allow list, so **sandboxed Bash cannot touch auto-memory at
+all**; `~/.jkb` is in both `allowRead` and `allowWrite`, because jkb's database lives there. So
+linking moves memory from a place sandboxed Bash cannot reach into one where a single
+auto-approved command can rewrite it — for this repo and, through the same grant, for every other
+repo's store. The posture has no write-deny to carve `claude-memory` back out with, so this is
+**accepted, not mitigated**, and it is why the host side is opt-in (`setup.sh --link-memory`) and
+never created by a `git pull`. If the trade is not wanted, the store belongs at a path the posture
+does not grant, with its own declared bind into the container.
 
 ## Root is not reachable from inside
 

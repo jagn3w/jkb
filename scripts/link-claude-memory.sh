@@ -29,12 +29,27 @@
 # Run it on the host once and in the container on every create; both sides derive the repo list by
 # enumerating ~/repos, so a repo added later is picked up by re-running.
 #
-# STATED PLAINLY, because it is a hole in "the boundary is what you did not mount": memory is
-# agent-WRITABLE prose that is injected into context, so a shared store is a channel from
-# container sessions into the less-confined host ones. It is the same person's agents at both
-# ends and it is prose rather than code, and it travels through a directory that was already
-# shared — but it is a channel, and it is opt-in on the host for that reason (`setup.sh
-# --link-memory`), never created by a `git pull`.
+# STATED PLAINLY, because it is a hole in "the boundary is what you did not mount", and it is
+# WIDER than the container question it was designed around. Two channels, not one:
+#
+#  1. container -> host. Memory is agent-writable prose injected into context, so a shared store
+#     carries text from container sessions into the less-confined host ones. Same person's agents
+#     at both ends, prose rather than code, through a directory that was already shared.
+#
+#  2. sandboxed Bash -> every future session, ON THE HOST. This one was measured, not predicted,
+#     and it is the reason to read the paragraph twice. `~/.claude/projects` is under the
+#     posture's blanket `denyRead` of `~` and in no allow list, so sandboxed Bash cannot read or
+#     write auto-memory at all. `~/.jkb` is in BOTH `allowRead` and `allowWrite`, because jkb's
+#     database lives there. Linking therefore moves memory from a place sandboxed Bash cannot
+#     touch into one where a single auto-approved command can rewrite it — for this repo and, via
+#     the same grant, for every other repo's store. Prose written there is injected into every
+#     later session for that repo.
+#
+# The posture has no write-deny to carve `claude-memory` back out with (`filesystem` offers
+# `denyRead`, `allowRead`, `allowWrite` and nothing else), so this is ACCEPTED rather than
+# mitigated, and it is why the linking is opt-in on the host (`setup.sh --link-memory`) and never
+# created by a `git pull`. If that trade is not wanted, the store belongs at a path the posture
+# does not grant, with its own declared bind into the container.
 #
 # NOTHING HERE OVERWRITES. An existing memory directory is migrated into the store file by file
 # and the directory is then removed; a name that exists on both sides is left alone and reported,
@@ -56,6 +71,7 @@ store=""
 dry=0
 self_test=0
 status_repo=""
+status_file=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -67,6 +83,11 @@ while [ "$#" -gt 0 ]; do
         # to have two of.
         --print-slug) shift; slugify "${1:-}"; printf '\n'; exit 0 ;;
         --status)     shift; status_repo="${1:-}" ;;
+        # Where to record the state each repo was in BEFORE this run repaired anything. The
+        # repair downgrades its own alarm — removing a live link into a poisoned store turns
+        # `exposed` into `unsafe` — so a check that runs afterwards must read what was found,
+        # not what was left.
+        --status-file) shift; status_file="${1:-}" ;;
         --home)      shift; home="${1:-}" ;;
         --repos)     shift; repos="${1:-}" ;;
         --store)     shift; store="${1:-}" ;;
@@ -172,7 +193,13 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
         # what is already there left the one route that can plant a redirecting symlink
         # unguarded. Checked in the same all-or-nothing pass as the collisions.
         for entry in "$link"/*; do
-            if [ -L "$entry" ] || { [ ! -f "$entry" ] && [ ! -d "$entry" ]; }; then
+            # THE SAME RECURSIVE QUESTION the store check asks. Inspecting only the top level let
+            # a DIRECTORY containing a symlink migrate in, after which the link was created and
+            # the run reported `linked` — two spellings of "plain files only" disagreeing about
+            # what the store may hold, and the permissive one on the path that fills it.
+            if [ -L "$entry" ] \
+               || { [ ! -f "$entry" ] && [ ! -d "$entry" ]; } \
+               || [ -n "$(find "$entry" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
                 shopt -u dotglob nullglob
                 warn "$key: $(basename "$entry") is not a plain file — nothing moved, nothing linked"
                 echo unsafe
@@ -212,7 +239,7 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
 # Every repo, and the state each was left in. Returns non-zero when any repo needs a person —
 # a caller that cannot tell a clean run from one that linked nothing has no reason to check.
 run() { # run <home> <repos> <store>
-    local h="$1" r="$2" s="$3" d state rc=0
+    local h="$1" r="$2" s="$3" d state found rc=0
     local projects="$h/.claude/projects"
     if [ ! -d "$r" ]; then
         warn "no repos directory at $r — nothing to link"
@@ -220,7 +247,10 @@ run() { # run <home> <repos> <store>
     fi
     for d in "$r"/*/; do
         [ -d "$d" ] || continue
+        # Asked BEFORE `link_one` runs, because `link_one` repairs — see `--status-file`.
+        found="$(status_of "$h" "$s" "$d")"
         state="$(link_one "$projects" "$s" "$d")"
+        [ -z "$status_file" ] || printf '%s %s\n' "$(basename "${d%/}")" "$found" >> "$status_file"
         [ "$state" = linked ] || rc=1
     done
     return "$rc"
@@ -390,5 +420,6 @@ if [ -n "$status_repo" ]; then
     status_of "$home" "$store" "$status_repo"
     exit 0
 fi
+[ -z "$status_file" ] || : > "$status_file"
 echo "==> shared claude memory ($store)"
 run "$home" "$repos" "$store"

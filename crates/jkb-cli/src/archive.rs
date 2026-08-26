@@ -129,12 +129,13 @@ pub struct Report {
     /// Marker files that could not be read. Reported rather than removed: a file we cannot parse
     /// may be a torn write, and deleting it would discard the only record of a live worktree.
     pub unreadable: Vec<PathBuf>,
-    /// Another sweep held the lock, so this one looked at nothing.
+    /// Another sweep held the lock, so this one looked at nothing — and WHO holds it, because
+    /// that is the only thing an operator can act on.
     ///
     /// Distinct from an empty sweep for the reason every other unestablished answer here is:
     /// "there was nothing to do" and "I did not look" are different facts, and printing the
     /// first for the second is what this module keeps being corrected for.
-    pub skipped: bool,
+    pub skipped: Option<Held>,
 }
 
 impl Report {
@@ -149,6 +150,30 @@ impl Report {
             && self.cleared.is_empty()
             && self.unreadable.is_empty()
     }
+}
+
+/// A sweep lock somebody else holds.
+///
+/// Named in full because there is no automatic way out of one: an owner on another host is
+/// `Fact::Unknown` and unknown never frees anything, so a lock left by a container that has since
+/// been rebuilt — its hostname gone with it — is respected by every later sweep, on both sides,
+/// permanently. That is the right default (breaking a live sweeper's lock is what the lock exists
+/// to prevent) but it needs an escape a person can take, and an escape needs the file and the
+/// holder printed.
+#[derive(Debug, Clone)]
+pub struct Held {
+    /// The lock file, so `--break-lock` and an operator's `rm` have something to name.
+    pub path: PathBuf,
+    /// Its holder, verbatim. Empty when the lock could not be read.
+    pub holder: String,
+}
+
+/// Remove the sweep lock, whoever holds it. Returns the holder it displaced, if any.
+///
+/// # Errors
+/// Returns an error if the lock exists and cannot be removed.
+pub fn break_lock(db: &Path) -> Result<Option<String>> {
+    SweepLock::break_held(db)
 }
 
 /// Seconds since the Unix epoch. A clock that cannot be read reads as 0, which makes everything
@@ -186,14 +211,34 @@ pub fn archive_root(repo_root: &Path) -> PathBuf {
 /// the same name, and the second record would then overwrite the first — silently leaving one
 /// landed worktree that nothing ever archives. The hash is what makes the name unique; the slug
 /// is there so a person can tell the files apart.
-fn marker_path(db: &Path, worktree: &Path) -> PathBuf {
+fn marker_stem(db: &Path, worktree: &Path) -> PathBuf {
     let raw = worktree.to_string_lossy();
     let slug: String = raw
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let digest = jkb_core::blob::hash_bytes(raw.as_bytes());
-    store_dir(db).join(format!("{slug}-{}.json", &digest[..8]))
+    store_dir(db).join(format!("{slug}-{}", &digest[..8]))
+}
+
+/// A marker file no existing record occupies.
+///
+/// ONE DISPOSAL, ONE RECORD. The name used to be a pure function of the worktree path — and a
+/// session name is reused: abandon a session (archived to `sess-<stamp>`, recorded), reopen the
+/// task, `jkb task work` mints the same name at the same path, and the next disposal wrote its
+/// record over the first. The first archive was then referenced by nothing: no sweep saw it, no
+/// `doctor` listed it, and a checkout with its build output sat there permanently — defeating the
+/// retention window whose whole job is keeping the disk from filling. `Entry.head` exists because
+/// a path and a branch are both reusable names; the record's own identity was still the path.
+fn fresh_marker(db: &Path, worktree: &Path) -> PathBuf {
+    let stem = marker_stem(db, worktree);
+    let mut path = stem.with_extension("json");
+    let mut n = 2;
+    while path.exists() {
+        path = PathBuf::from(format!("{}-{n}.json", stem.display()));
+        n += 1;
+    }
+    path
 }
 
 /// Write (or replace) the record for one worktree.
@@ -201,7 +246,11 @@ fn marker_path(db: &Path, worktree: &Path) -> PathBuf {
 /// # Errors
 /// Returns an error if the store cannot be created or the record cannot be written.
 pub fn record(db: &Path, entry: &Entry) -> Result<()> {
-    record_at(&marker_path(db, &entry.worktree), entry)
+    // A FRESH file every time. This is only ever called to record a NEW disposal; the sweep
+    // updates an existing record through `record_at`, with the marker it read.
+    fs::create_dir_all(store_dir(db))
+        .with_context(|| format!("creating {}", store_dir(db).display()))?;
+    record_at(&fresh_marker(db, &entry.worktree), entry)
 }
 
 /// Write one record to a marker file **already chosen**.
@@ -230,9 +279,15 @@ pub fn record_at(path: &Path, entry: &Entry) -> Result<()> {
 #[derive(Default, Debug)]
 pub struct Store {
     /// `(marker file, record)`, ordered by marker path so a sweep is deterministic.
-    pub records: Vec<(PathBuf, Entry)>,
-    /// Marker files that could not be read or parsed.
+    ///
+    /// Only records that [`Record::parse`] accepted. The sweep receives no others, which is why
+    /// no arm of it can forget to ask.
+    pub records: Vec<(PathBuf, Record)>,
+    /// Marker files that could not be read or parsed as JSON at all.
     pub unreadable: Vec<PathBuf>,
+    /// `(marker file, why)` for records that parsed but describe paths this mechanism does not
+    /// own. Reported and kept, never deleted: a refusal is not a licence to act on the file.
+    pub rejected: Vec<(PathBuf, String)>,
 }
 
 /// Cancel the pending removal of `worktree`, if one is recorded.
@@ -255,24 +310,28 @@ pub fn revoke(db: &Path, worktree: &Path) -> Result<bool> {
     // and re-writes the record this deleted. Refusing is the honest outcome — the caller says so
     // and the operator re-runs — because a cancellation that silently lost the race is worse than
     // one that admits it.
-    let Some(_lock) = SweepLock::acquire(db)? else {
-        anyhow::bail!(
-            "a sweep is running, so the pending removal could not be cancelled — re-run this in \
-             a moment"
-        );
-    };
-    let path = marker_path(db, worktree);
-    match fs::read(&path) {
-        Ok(body) => {
-            if serde_json::from_slice::<Entry>(&body).is_ok_and(|e| e.archive.is_some()) {
-                return Ok(false);
+    let _lock = SweepLock::acquire(db)?.map_err(|held| {
+        anyhow::anyhow!(
+            "a sweep is running ({}), so the pending removal could not be cancelled — re-run \
+             this in a moment, or clear a stale lock with `jkb task reap --break-lock`",
+            if held.holder.is_empty() {
+                "holder unknown"
+            } else {
+                &held.holder
             }
+        )
+    })?;
+    // Found by ASKING the store rather than by computing a filename: one worktree can have
+    // several records now (one per disposal), and only the pending ones are cancellable.
+    let mut cancelled = false;
+    for (path, record) in entries(db)?.records {
+        if record.archive.is_some() || record.worktree != worktree {
+            continue;
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        cancelled = true;
     }
-    fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-    Ok(true)
+    Ok(cancelled)
 }
 
 /// Every record currently in the store, with the marker file each came from.
@@ -299,7 +358,10 @@ pub fn entries(db: &Path) -> Result<Store> {
             .map_err(|e| e.to_string())
             .and_then(|b| serde_json::from_slice::<Entry>(&b).map_err(|e| e.to_string()))
         {
-            Ok(entry) => store.records.push((path, entry)),
+            Ok(entry) => match Record::parse(entry) {
+                Ok(record) => store.records.push((path, record)),
+                Err(why) => store.rejected.push((path, why)),
+            },
             Err(_) => store.unreadable.push(path),
         }
     }
@@ -450,7 +512,7 @@ struct SweepLock {
 }
 
 impl SweepLock {
-    fn acquire(db: &Path) -> Result<Option<Self>> {
+    fn acquire(db: &Path) -> Result<Result<Self, Held>> {
         let dir = store_dir(db);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(".sweep.lock");
@@ -463,7 +525,7 @@ impl SweepLock {
                 Ok(mut f) => {
                     use std::io::Write;
                     let _ = write!(f, "{}", crate::owner::self_owner());
-                    return Ok(Some(Self { path }));
+                    return Ok(Ok(Self { path }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     let holder = fs::read_to_string(&path).unwrap_or_default();
@@ -477,7 +539,10 @@ impl SweepLock {
                     if !dead {
                         // Not an error: the other sweep is doing this sweep's work. A service
                         // tick that says "someone else is on it" must not read as a failure.
-                        return Ok(None);
+                        return Ok(Err(Held {
+                            path,
+                            holder: holder.trim().to_owned(),
+                        }));
                     }
                     // RE-READ BEFORE UNLINKING, which is the half of `LandLock`'s shape this
                     // dropped: two sweeps that both judge one stale lock would otherwise both
@@ -491,7 +556,32 @@ impl SweepLock {
                 Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
             }
         }
-        Ok(None)
+        Ok(Err(Held {
+            path,
+            holder: String::new(),
+        }))
+    }
+
+    /// Remove a lock whoever holds it — the operator's escape.
+    ///
+    /// There is no automatic one and there should not be: a holder on another host is `Unknown`,
+    /// and breaking a live sweeper's lock on an unestablished answer is exactly what the lock
+    /// prevents. But a container that was killed mid-sweep and then rebuilt leaves a holder whose
+    /// hostname no longer exists anywhere, and without this every sweep on both sides no-ops for
+    /// ever with nothing to do about it.
+    ///
+    /// # Errors
+    /// Returns an error if the lock file exists and cannot be removed.
+    fn break_held(db: &Path) -> Result<Option<String>> {
+        let path = store_dir(db).join(".sweep.lock");
+        match fs::read_to_string(&path) {
+            Ok(holder) => {
+                fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+                Ok(Some(holder.trim().to_owned()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
 }
 
@@ -519,43 +609,95 @@ pub fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-/// Whether a record names paths this sweep may act on at all.
+/// A record the sweep is allowed to act on: read from the store and **proven** to describe paths
+/// this mechanism owns.
 ///
-/// THE SWEEP DELETES DIRECTORIES AND THE RECORD STORE IS AGENT-WRITABLE. `~/.jkb` is bind-mounted
-/// into the dev container and granted in the posture's `allowWrite`, while the host's reaper runs
-/// as a launchd agent outside every sandbox — so a JSON file naming `"archive": "/Users/me/
-/// Documents"` with an old `archived_at` steered `remove_dir_all` at it, past a `removable()`
-/// probe that answers "permitted" for any ordinary directory. Corruption reaches the same place
-/// without an adversary.
+/// THE STORE IS UNTRUSTED INPUT, so it gets a parser rather than a checklist. It is a directory of
+/// JSON files inside `~/.jkb` — bind-mounted into the dev container, granted in the posture's
+/// `allowWrite`, and read by a launchd agent that runs outside every sandbox — and what the sweep
+/// does with a path in it is `remove_dir_all`. The first attempt at this was a `paths_are_ours`
+/// function the sweep called before dispatching, and it was defeated by `..`: `Path::starts_with`
+/// compares components without interpreting them, so `<repo>/.jkb/archive/../../../Documents`
+/// "starts with" the archive root while naming something else entirely. A check the caller
+/// remembers to run, over paths nobody normalized, is two mistakes; this is one type.
 ///
-/// So both paths are constrained to where this mechanism puts things: a worktree under
-/// `<repo>/.jkb/work`, an archive under `<repo>/.jkb/archive`. Checked ONCE, above the arms,
-/// because a rule each arm has to remember is the defect — the pending arm had
-/// `still_the_recorded_session` and the archived arm had nothing.
-///
-/// Lexical, deliberately: `Path::starts_with` compares components without touching the
-/// filesystem, so a record cannot be made to pass by creating a symlink, and a path that does not
-/// exist is judged the same as one that does.
-fn paths_are_ours(entry: &Entry) -> Result<(), String> {
-    let work = entry.repo_root.join(".jkb").join("work");
-    if !entry.worktree.starts_with(&work) || entry.worktree == work {
-        return Err(format!(
-            "{} is not a session worktree under {}",
-            entry.worktree.display(),
-            work.display()
-        ));
+/// [`Entry`] remains the wire form and is trusted for nothing. The only way to obtain a `Record`
+/// is [`Record::parse`], so a value of this type IS the evidence, and no sweep arm can be written
+/// that skips it.
+#[derive(Debug, Clone)]
+pub struct Record(Entry);
+
+impl std::ops::Deref for Record {
+    type Target = Entry;
+    fn deref(&self) -> &Entry {
+        &self.0
     }
-    if let Some(dir) = &entry.archive {
-        let root = archive_root(&entry.repo_root);
-        if !dir.starts_with(&root) || *dir == root {
+}
+
+/// A path this mechanism could have written: absolute, and naming only ordinary components.
+///
+/// `..` is REFUSED rather than resolved. Resolving would be sound too, but nothing here ever
+/// writes one, so a record containing one is either corrupt or hostile and neither deserves a
+/// best-effort interpretation. `.` goes with it for the same reason. Purely lexical, so a symlink
+/// planted afterwards cannot change the answer, and a path that does not exist is judged the same
+/// as one that does.
+fn plain_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+}
+
+impl Record {
+    /// The wire record inside, for a sweep that needs to update and re-write it.
+    #[must_use]
+    pub fn clone_entry(&self) -> Entry {
+        self.0.clone()
+    }
+
+    /// Read one wire record, or say why it cannot be acted on.
+    ///
+    /// # Errors
+    /// Returns the reason the record is refused: a path that is not plain and absolute, or one
+    /// that names something outside `<repo_root>/.jkb/{work,archive}`.
+    pub fn parse(entry: Entry) -> Result<Self, String> {
+        for (what, path) in [
+            ("repo_root", entry.repo_root.as_path()),
+            ("worktree", entry.worktree.as_path()),
+        ]
+        .into_iter()
+        .chain(entry.archive.as_deref().map(|a| ("archive", a)))
+        {
+            if !plain_absolute(path) {
+                return Err(format!(
+                    "its {what} ({}) is not an absolute path of ordinary components",
+                    path.display()
+                ));
+            }
+        }
+        let work = entry.repo_root.join(".jkb").join("work");
+        if !entry.worktree.starts_with(&work) || entry.worktree == work {
             return Err(format!(
-                "its archive {} is not under {}",
-                dir.display(),
-                root.display()
+                "{} is not a session worktree under {}",
+                entry.worktree.display(),
+                work.display()
             ));
         }
+        if let Some(dir) = &entry.archive {
+            let root = archive_root(&entry.repo_root);
+            if !dir.starts_with(&root) || *dir == root {
+                return Err(format!(
+                    "its archive {} is not under {}",
+                    dir.display(),
+                    root.display()
+                ));
+            }
+        }
+        Ok(Self(entry))
     }
-    Ok(())
 }
 
 /// Whether the tree at `entry.worktree` is still the session this record is about.
@@ -628,11 +770,14 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
     // DECISION as much as the write, because two sweeps that both read one pending record both
     // act on it. A sweep that finds the lock held reports nothing and returns — the other process
     // is doing this one's work, which is not a failure.
-    let Some(_lock) = SweepLock::acquire(db)? else {
-        return Ok(Report {
-            skipped: true,
-            ..Report::default()
-        });
+    let _lock = match SweepLock::acquire(db)? {
+        Ok(lock) => lock,
+        Err(held) => {
+            return Ok(Report {
+                skipped: Some(held),
+                ..Report::default()
+            })
+        }
     };
     let now = now_secs();
     let store = entries(db)?;
@@ -640,14 +785,30 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         unreadable: store.unreadable,
         ..Report::default()
     };
+    for (marker, why) in store.rejected {
+        report.held.push((
+            marker.display().to_string(),
+            format!("{why} — refused; this record does not describe anything this sweep owns"),
+        ));
+    }
 
-    for (marker, mut entry) in store.records {
-        // WHERE THIS RECORD POINTS, before either arm looks at it. Above the dispatch because the
-        // condition dominates both and each arm would otherwise need its own copy (D45.5).
-        if let Err(why) = paths_are_ours(&entry) {
+    for (marker, record) in store.records {
+        let mut entry = record.clone_entry();
+        // CAN THIS PROCESS SEE THE REPO AT ALL, before either arm looks at the record. Above the
+        // dispatch because the condition dominates both — the pending arm had it and the archived
+        // arm did not, so each side of the container bind destroyed the other's archived records:
+        // `/Users/...` is not reachable in the container, the archived arm read that as "somebody
+        // removed it by hand" and dropped the record, and the multi-gigabyte checkout it named was
+        // then referenced by nothing and never deleted. An absent directory is evidence of removal
+        // only when the repo it lives under is reachable in the first place (D45.5).
+        if !entry.repo_root.exists() {
             report.held.push((
                 entry.uid.clone(),
-                format!("{why} — this record does not describe anything this sweep owns"),
+                format!(
+                    "{} is not reachable from here, so whether anything is owed cannot be \
+                     established — the record is kept",
+                    entry.repo_root.display()
+                ),
             ));
             continue;
         }
@@ -665,26 +826,8 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             continue;
         }
 
-        // Not archived yet: this is the deferred half of a landing.
-        //
-        // A REPO WE CANNOT SEE IS UNKNOWN, NOT SETTLED. This used to clear the record, and the
-        // case is ordinary rather than exotic: `~/.jkb` is bind-mounted into the dev container, so
-        // both sides share one store while the same repo is `/home/vscode/repos/jkb` there and
-        // `~/repos/jkb` here. A container-recorded landing swept on the host would have had its
-        // record deleted while the worktree sat untouched — never archived, never reported, and
-        // listed as in flight for ever. Same for a repo on a drive that is not mounted today.
-        // Holding costs a line of output; clearing costs the only record of a live worktree.
-        if !entry.repo_root.exists() {
-            report.held.push((
-                entry.uid.clone(),
-                format!(
-                    "{} is not reachable from here, so whether anything is owed cannot be \
-                     established — the record is kept",
-                    entry.repo_root.display()
-                ),
-            ));
-            continue;
-        }
+        // Not archived yet: this is the deferred half of a landing. The repo is reachable by the
+        // time we get here, so an absent worktree really is one somebody removed.
         if !entry.worktree.exists() {
             // Gone already. Tidy git's registration and the branch, then stop tracking.
             if !dry_run {
@@ -1097,9 +1240,13 @@ mod tests {
         );
 
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
-        assert!(
-            r.skipped,
-            "it did not look, and that is not the same as finding nothing"
+        let held = r
+            .skipped
+            .expect("it did not look, and that is not finding nothing");
+        assert_eq!(
+            held.holder,
+            crate::owner::self_owner(),
+            "and it names the holder, which is the only thing an operator can act on"
         );
 
         // ...and a holder PROVEN gone is taken over, or one crashed sweep wedges the machine's
@@ -1112,7 +1259,7 @@ mod tests {
         );
         fs::write(&lock, &dead_holder).expect("write");
         let r = reap(&db, RETAIN_DAYS, false).expect("reap");
-        assert!(!r.skipped, "a dead holder's lock is taken over");
+        assert!(r.skipped.is_none(), "a dead holder's lock is taken over");
     }
 
     #[test]
@@ -1245,6 +1392,122 @@ mod tests {
             "an archived record is not cancellable"
         );
         assert_eq!(entries(&db).expect("entries").records.len(), 1);
+    }
+
+    #[test]
+    fn a_traversal_out_of_the_archive_root_is_refused_not_followed() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        fs::create_dir_all(&repo).expect("mk");
+        let victim = t.path().join("Documents");
+        fs::create_dir_all(victim.join("taxes")).expect("mk");
+        fs::write(victim.join("taxes/2025.pdf"), b"important").expect("write");
+
+        // `Path::starts_with` compares components WITHOUT interpreting them, so this "starts
+        // with" the archive root while naming somewhere else entirely. The first version of the
+        // containment guard accepted it.
+        let traversal = archive_root(&repo)
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("Documents");
+        let e = Entry {
+            archive: Some(traversal),
+            archived_at: Some(1),
+            head: Some("abc".into()),
+            ..entry(&repo.join(".jkb/work/s"), &repo)
+        };
+        fs::create_dir_all(store_dir(&db)).expect("mk");
+        fs::write(
+            store_dir(&db).join("hostile.json"),
+            serde_json::to_vec(&e).expect("json"),
+        )
+        .expect("write");
+
+        let store = entries(&db).expect("entries");
+        assert!(
+            store.records.is_empty(),
+            "the sweep is never handed a record it has not proven"
+        );
+        assert_eq!(store.rejected.len(), 1, "it is refused, with the reason");
+
+        let r = reap(&db, 0, false).expect("reap");
+        assert!(r.deleted.is_empty());
+        assert!(
+            victim.join("taxes/2025.pdf").exists(),
+            "and the directory it aimed at is untouched"
+        );
+        assert_eq!(
+            entries(&db).expect("entries").rejected.len(),
+            1,
+            "a refusal is not a licence to delete the file either"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_repo_holds_an_archived_record_too() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        // The container writes `/home/vscode/...`; the host sweeps the same shared store. The
+        // archived arm used to read "not visible from here" as "somebody removed it by hand" and
+        // drop the record — so each side destroyed the other's, and the checkout it named was
+        // then referenced by nothing and never deleted.
+        let repo = Path::new("/home/vscode/repos/jkb");
+        let e = Entry {
+            archive: Some(repo.join(".jkb/archive/s-19700101T000000Z")),
+            archived_at: Some(1),
+            head: Some("abc".into()),
+            ..entry(&repo.join(".jkb/work/s"), repo)
+        };
+        record(&db, &e).expect("record");
+
+        let r = reap(&db, 0, false).expect("reap");
+        assert!(r.cleared.is_empty(), "an unreachable repo settles nothing");
+        assert_eq!(r.held.len(), 1, "{:?}", r.held);
+        assert_eq!(
+            entries(&db).expect("entries").records.len(),
+            1,
+            "the record survives for whichever side can see the repo"
+        );
+    }
+
+    #[test]
+    fn a_second_disposal_of_one_session_does_not_overwrite_the_first_record() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let wt = repo.join(".jkb/work/sess");
+        // A session name is REUSED: abandon, reopen the task, `task work` mints the same name at
+        // the same path. Keyed on that path, the second disposal's record landed on the first's
+        // and the first archive became unreferenced — never swept, never reported, permanent.
+        let first = Entry {
+            archive: Some(archive_root(&repo).join("sess-19700101T000000Z")),
+            archived_at: Some(1),
+            head: Some("aaa".into()),
+            ..entry(&wt, &repo)
+        };
+        let second = Entry {
+            archive: Some(archive_root(&repo).join("sess-19700101T000001Z")),
+            archived_at: Some(2),
+            head: Some("bbb".into()),
+            ..entry(&wt, &repo)
+        };
+        record(&db, &first).expect("first");
+        record(&db, &second).expect("second");
+
+        let kept = entries(&db).expect("entries").records;
+        assert_eq!(kept.len(), 2, "both disposals are tracked");
+        let mut archives: Vec<String> = kept
+            .iter()
+            .filter_map(|(_, r)| r.archive.as_ref().map(|a| a.display().to_string()))
+            .collect();
+        archives.sort();
+        assert!(
+            archives[0].ends_with("sess-19700101T000000Z")
+                && archives[1].ends_with("sess-19700101T000001Z"),
+            "neither archive is orphaned: {archives:?}"
+        );
     }
 
     #[test]

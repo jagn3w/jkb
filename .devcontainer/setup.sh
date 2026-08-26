@@ -33,7 +33,12 @@ dc_link_state /home/vscode
 # at all, which `verify.sh` fails on, so this must not hide a non-zero exit behind a comment
 # claiming the opposite. It reports and continues; verify.sh decides.
 say "shared claude memory"
-"$repo/scripts/link-claude-memory.sh" || echo "  (some repos need attention — see above)" >&2
+# The state it FOUND is recorded before it repairs anything, because the repair downgrades its own
+# alarm: `link_one` removes a live link into a poisoned store, so `verify.sh` — which runs 25 lines
+# later — would ask afterwards and see the harmless `unsafe` rather than the `exposed` it must fail
+# on. Written where verify.sh reads it, and only ever appended to by this line.
+"$repo/scripts/link-claude-memory.sh" --status-file /home/vscode/.claude-state/memory-status \
+    || echo "  (some repos need attention — see above)" >&2
 
 say "auto-mode posture"
 # The same posture file the host uses. It ends by running `check`, so a merge that did not take

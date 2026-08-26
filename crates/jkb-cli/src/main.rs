@@ -909,6 +909,13 @@ enum TaskCmd {
         /// Report what would happen and change nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Remove a sweep lock whose holder is gone for good.
+        ///
+        /// There is no automatic escape and there should not be: a holder on another host
+        /// cannot be probed, and breaking a live sweeper's lock is what the lock prevents. A
+        /// container killed mid-sweep and then rebuilt leaves one nothing can ever clear.
+        #[arg(long)]
+        break_lock: bool,
         /// Keep sweeping, for the installed service. Ctrl-C stops it.
         #[arg(long)]
         watch: bool,
@@ -4229,9 +4236,20 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> 
         TaskCmd::Reap {
             retain_days,
             dry_run,
+            break_lock,
             watch,
             interval_secs,
-        } => cmd_task_reap(db_path, retain_days, dry_run, watch, interval_secs, json)?,
+        } => cmd_task_reap(
+            db_path,
+            ReapFlags {
+                retain_days,
+                dry_run,
+                break_lock,
+                watch,
+                interval_secs,
+            },
+            json,
+        )?,
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
@@ -5838,9 +5856,13 @@ fn land_preflight(
         // part-way removal. Said as an extra sentence rather than by changing `land_blocker`,
         // which is the one shared rule the In Flight row renders too — the verdict is identical,
         // only the remedy differs, and only when the difference is observable.
+        // Only onto the refusal it explains. `land_blocker` returns ONE reason, and appending a
+        // `git restore .` remedy to "it has no commits" or "its review left a must-fix open" is
+        // advice about a different problem — the tree being deletions-only is a fact about the
+        // dirt, and the dirt is only what was refused when the reason says so.
         let hint = match sess
             .as_ref()
-            .filter(|_| dirty)
+            .filter(|_| dirty && reason.contains("uncommitted changes"))
             .map(|s| gitrepo::deletions_only(&s.worktree))
         {
             Some(Ok(Some(n))) => format!(
@@ -6185,14 +6207,29 @@ fn report_landing(
 /// Takes the database **path** rather than a handle: it touches no rows. The records live beside
 /// the database precisely so this needs no repo context and one service sweeps every repo on the
 /// machine.
-fn cmd_task_reap(
-    db_path: &Path,
+#[derive(Clone, Copy)]
+struct ReapFlags {
     retain_days: u64,
     dry_run: bool,
+    break_lock: bool,
     watch: bool,
     interval_secs: u64,
-    json: bool,
-) -> Result<()> {
+}
+
+fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
+    let ReapFlags {
+        retain_days,
+        dry_run,
+        break_lock,
+        watch,
+        interval_secs,
+    } = flags;
+    if break_lock {
+        match archive::break_lock(db_path)? {
+            Some(holder) => println!("broke the sweep lock held by {holder}"),
+            None => println!("no sweep lock was held"),
+        }
+    }
     if !watch {
         report_reap(
             &archive::reap(db_path, retain_days, dry_run)?,
@@ -6242,7 +6279,10 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
                     .collect::<Vec<_>>(),
                 "deleted": r.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "cleared": r.cleared,
-                "skipped": r.skipped,
+                                "skipped": r.skipped.as_ref().map(|h| serde_json::json!({
+                    "lock": h.path.display().to_string(),
+                    "holder": h.holder,
+                })),
                 "retained": r.retained.len(),
                 "retained_bytes": r.retained.iter().map(|p| archive::dir_size(p)).sum::<u64>(),
                 "unreadable": r.unreadable.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
@@ -6277,8 +6317,20 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
     for path in &r.unreadable {
         println!("unreadable record {} (left alone)", path.display());
     }
-    if r.skipped {
-        println!("another sweep is already running here; this one looked at nothing");
+    if let Some(held) = &r.skipped {
+        // Named in full: an owner on another host is Unknown and unknown frees nothing, so a lock
+        // left by a container that has since been rebuilt is respected for ever by every sweep on
+        // both sides. `--break-lock` is the way out, and it needs something to point at.
+        println!(
+            "another sweep holds {} ({}); this one looked at nothing",
+            held.path.display(),
+            if held.holder.is_empty() {
+                "holder unknown"
+            } else {
+                &held.holder
+            }
+        );
+        println!("  if that holder is gone for good: jkb task reap --break-lock");
     } else if r.is_empty() && r.retained.is_empty() {
         println!("nothing to reap");
     } else if !r.retained.is_empty() {
@@ -6554,12 +6606,16 @@ fn cmd_task_abandon(
     // Read from git rather than from what this function did: `dispose` deletes the branch itself
     // when it archived the tree, so a flag set here would report `false` for a branch that is
     // gone. Asked once, after everything that could have removed it.
-    let branch_deleted = delete_branch && !gitrepo::has_branch(&ctx.root, &branch)?;
-    // Said out loud, because "branch kept" would be wrong here — it is going, just not yet.
-    // `!json` because this is prose and the machine surface already carries `worktree_deferred`.
-    if !json && delete_branch && !branch_deleted && deferred.is_some() {
-        println!("  {branch} will be deleted when `jkb task reap` archives the checkout");
-    }
+    // Read from git rather than from what this function did — `dispose` deletes the branch itself
+    // when it archived the tree — and folded into ONE value, so no two lines can disagree.
+    let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
+    let branch_fate = match (delete_branch, still_there) {
+        (_, false) if delete_branch => BranchFate::Deleted,
+        (true, true) => BranchFate::OwedToTheReaper,
+        (false, _) => BranchFate::Kept,
+        (true, false) => BranchFate::Deleted,
+    };
+
     // Release, and reopen unless the task is already finished.
     //
     // The land target is cleared **only** when the task is reopened, which is exactly when it
@@ -6638,18 +6694,18 @@ fn cmd_task_abandon(
     let _: Vec<()> = shared;
 
     report_abandon(
-        &ctx,
         uid,
         &branch,
         &AbandonOutcome {
             reopened,
             final_status: &final_status,
             worktree_removed: sess.is_some() && deferred.is_none(),
-            branch_deleted,
             deferred: deferred.as_deref(),
+            branch: branch_fate,
         },
         json,
-    )
+    );
+    Ok(())
 }
 
 /// Dispose of an abandoned session, if there is one, and say why not when it could not be moved.
@@ -6714,18 +6770,28 @@ struct AbandonOutcome<'a> {
     final_status: &'a str,
     /// The checkout is no longer where it was — archived, or there was none.
     worktree_removed: bool,
-    branch_deleted: bool,
     /// Why the checkout could not be archived from here, if it could not.
     deferred: Option<&'a str>,
+    /// What became of the branch. One value rather than "was it asked for" beside "did it
+    /// happen", because the report printed both "branch kept — delete it with `git branch -D`"
+    /// and the deferred-deletion sentence from those two, which contradict — and the first's
+    /// remedy cannot work anyway while the deferred worktree still holds the branch.
+    branch: BranchFate,
 }
 
-fn report_abandon(
-    ctx: &repo::RepoCtx,
-    uid: &str,
-    branch: &str,
-    out: &AbandonOutcome<'_>,
-    json: bool,
-) -> Result<()> {
+/// What happened to an abandoned session's branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BranchFate {
+    /// Deletion was not asked for; it is still there.
+    Kept,
+    /// Gone.
+    Deleted,
+    /// Asked for, and owed: the deferred worktree still has it checked out, so `git branch -D`
+    /// would refuse. `jkb task reap` deletes it once the tree is archived.
+    OwedToTheReaper,
+}
+
+fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool) {
     if json {
         println!(
             "{}",
@@ -6735,7 +6801,8 @@ fn report_abandon(
                 // What happened, not what was asked for: `--delete-branch` on a branch that was
                 // already gone deletes nothing.
                 "worktree_removed": out.worktree_removed,
-                "branch_deleted": out.branch_deleted,
+                "branch_deleted": out.branch == BranchFate::Deleted,
+                "branch_owed_to_reaper": out.branch == BranchFate::OwedToTheReaper,
                 "worktree_deferred": out.deferred,
             })
         );
@@ -6754,13 +6821,17 @@ fn report_abandon(
                  `jkb task reap`, which the watcher service runs"
             );
         }
-        // Asked of git, not of the flag: `--delete-branch` on a branch that could not be
-        // deleted used to print nothing at all, which reads as "it is gone".
-        if !out.branch_deleted && gitrepo::has_branch(&ctx.root, branch)? {
-            println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
+        // ONE line about the branch, from one value.
+        match out.branch {
+            BranchFate::Deleted => {}
+            BranchFate::OwedToTheReaper => println!(
+                "  branch {branch} will be deleted when `jkb task reap` archives the checkout"
+            ),
+            BranchFate::Kept => {
+                println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
+            }
         }
     }
-    Ok(())
 }
 
 /// `task sessions` — what is in flight in this repo.

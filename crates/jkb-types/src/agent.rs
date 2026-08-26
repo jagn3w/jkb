@@ -36,7 +36,13 @@ pub enum AgentId {
     /// A process on this machine: `host:pid`, or `host:pid:run` for a coordinator that wants to
     /// distinguish its runs. Subagents share their coordinator's pid, so the pid is the signal.
     Process {
-        /// Informational; single-host, so the pid is what liveness keys on.
+        /// WHICH MACHINE the pid belongs to, and therefore whether it may be probed at all.
+        ///
+        /// Not informational — it decides. `~/.jkb` is bind-mounted into the dev container on
+        /// purpose, so pid 812 written in there is a different process from pid 812 out here;
+        /// probing one against the other reports a live owner dead (and frees its claim) or a
+        /// dead one alive. `Liveness::Process` carries it, and the caller — which is the only
+        /// party that knows this host's name — compares.
         host: String,
         /// The process to probe.
         pid: u32,

@@ -1764,6 +1764,36 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   code is 0 and `judge` reports CAUGHT only on non-zero, so `MATCHER IS BROKEN` was unreachable —
   in the file whose whole job is finding guards that cannot fire. It asks the discriminating half
   instead: the label must appear in a healthy container and must not be on a `FAIL` line.
+- **The record store is untrusted input, so it gets a parser.** The containment guard that closed
+  round 3's arbitrary-delete finding did not hold: `Path::starts_with` compares components without
+  interpreting them, so `<repo>/.jkb/archive/../../../Documents` "starts with" the archive root
+  while naming something else. A check the sweep remembers to call, over paths nobody normalized,
+  is two mistakes. `Entry` is now the wire form and is trusted for nothing; `archive::Record` is
+  what the sweep sees; `Record::parse` is the only way between them, so no arm can be written that
+  skips it. `..` and `.` are **refused** rather than resolved — nothing here writes one, so a
+  record containing one is corrupt or hostile and neither deserves a best-effort reading.
+- **Reachability belongs above the dispatch, like containment.** The pending arm held an
+  unreachable `repo_root`; the archived arm read "not visible from here" as "somebody removed it
+  by hand" and dropped the record — so each side of the container bind destroyed the other's
+  archived records, and the multi-gigabyte checkout each named became unreferenced and permanent.
+  An absent directory is evidence of removal only when the repo it lives under is reachable.
+- **One disposal, one record.** The marker's name was a pure function of the worktree path, and a
+  session name is reused: abandon, reopen, `task work` mints the same name at the same path, and
+  the next disposal wrote over the first record. `Entry.head` exists because a path and a branch
+  are reusable names; the record's own identity was still the path.
+- **A lock that nothing can break is a wedge.** Making a foreign host `Unknown` was right, and it
+  made the sweep lock permanent for a container killed mid-sweep and then rebuilt — its hostname
+  gone with it, so every sweep on both sides no-ops for ever. The default stays (breaking a live
+  sweeper's lock is what the lock prevents); what was missing is an escape a person can take, so
+  the refusal names the lock file and its holder and `jkb task reap --break-lock` exists.
+- **Sharing memory through `~/.jkb` opened a channel nobody had priced.** `~/.claude/projects` is
+  under the posture's blanket `denyRead` and in no allow list, so sandboxed Bash cannot touch
+  auto-memory; `~/.jkb` is in `allowRead` **and** `allowWrite`, because the database lives there.
+  Linking therefore moves memory from a place sandboxed Bash cannot reach into one where a single
+  auto-approved command rewrites it, for every repo. The posture has no write-deny to carve it
+  back out with, so it is **accepted and stated** rather than mitigated — and the round-1
+  comparison that chose `~/.jkb` over a dedicated bind was made without this, so it is worth
+  re-deciding rather than inheriting.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
