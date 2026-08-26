@@ -188,11 +188,10 @@ run "blanket passwordless root is restored" "may run more than the firewall as r
 # is matching something that is present when nothing is wrong — which is precisely the defect
 # this file exists to detect in verify.sh, and it had it too.
 echo
-echo "=== self-test: an unmutated container must be reported MISSED ==="
-before="$fails"
-# Run the base container directly first: the control below is satisfied by a MISSED, and a
-# container that never started is ALSO a MISSED. Without this, a host with no docker — or a broken
-# image — reported "a healthy container does not trip the matcher" having observed nothing at all.
+echo "=== self-test: the matcher must stay quiet about a HEALTHY container ==="
+# Run the base container directly first, and require it to be healthy: a container that never
+# started produces output the matcher is also quiet about, so without this the harness reported
+# "shown to discriminate" having observed nothing at all.
 # ONE execution, judged twice: health first, then the matcher over the same captured output.
 control_out="$(docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT" 2>&1)"
 control_rc=$?
@@ -203,14 +202,28 @@ if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_o
     exit 1
 fi
 
-judge "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" \
-      "$control_out" "$control_rc"
-if [ "$fails" -gt "$before" ]; then
-  self_ok=1; fails="$before"      # a MISSED here is the expected result, not a failure
-  echo "  (correct: a healthy container does not trip the matcher)"
-else
+# THE HALF THAT CAN ACTUALLY BE WRONG. Routing the control through `judge` proved nothing: the
+# health check above has already established `control_rc` is 0, and `judge` reports CAUGHT only
+# when rc is non-zero — so the MISSED branch was taken by construction and the `MATCHER IS BROKEN`
+# arm was unreachable. A negative control that cannot fail is exactly the defect this file exists
+# to find in verify.sh.
+#
+# What the matcher really claims is the FAIL filter: `assert()` prints the SAME label on its ok and
+# its fail paths, so matching a label alone once reported two deleted guards as CAUGHT. Ask that
+# directly, against a container known healthy — the label must be present (or the test is matching
+# nothing) and must NOT be on a FAIL line.
+self_ok=1
+control_label="runs as a non-root user"
+if ! grep -qF -e "$control_label" <<<"$control_out"; then
   self_ok=0
-  echo "  MATCHER IS BROKEN: a healthy container was reported CAUGHT"
+  echo "  MATCHER PROVES NOTHING: a healthy container's output never mentions \"$control_label\","
+  echo "  so every CAUGHT above matched a string this harness cannot show discriminates."
+elif grep -F -e "$control_label" <<<"$control_out" | grep -q "FAIL"; then
+  self_ok=0
+  echo "  MATCHER IS BROKEN: that label is on a FAIL line in a HEALTHY container, so a CAUGHT"
+  echo "  above means nothing — the matcher fires when nothing is wrong."
+else
+  echo "  (correct: the label appears in a healthy container and never on a FAIL line)"
 fi
 
 echo

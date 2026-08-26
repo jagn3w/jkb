@@ -252,18 +252,30 @@ case "$mem_state" in
 esac
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.
-# THE MOUNT, asked of the kernel. A hard-coded /home/vscode/repos/jkb asserted something about a
-# different checkout once ~/repos is mounted whole; deriving it from where this script lives went
-# too far the other way and asserted that the directory containing the running script contains a
-# Cargo.toml — true by construction on every path that can execute this, so the property was
-# asserted nowhere. What must hold is that the declared workspace target is really a mount point
-# and this checkout is inside it.
-ws_target="$(dc_mount_targets "$DC" | grep -x '/home/vscode/repos' || true)"
+# THE MOUNT, asked of the kernel — and asked about THIS checkout rather than about a path.
+#
+# Three versions of this, and the middle two are why the wording matters. A hard-coded
+# /home/vscode/repos/jkb asserted something about whichever checkout sat there once ~/repos is
+# mounted whole. Deriving it from where this script lives went too far the other way and asserted
+# that the directory containing the running script contains a Cargo.toml — true by construction on
+# every path that can execute this. Then requiring the DECLARED target to itself appear in
+# mountinfo failed the harness outright: mutate-verify.sh mounts the repo AT
+# /home/vscode/repos/jkb (it cannot mount the parent — in a `jkb task work` session $REPO's parent
+# is `.jkb/work`), so /home/vscode/repos is never a mount point there. Measured: every mutation
+# reported CAUGHT and then the control failed, so the harness judged nothing.
+#
+# What actually has to hold is that this checkout sits inside a mount point that is BOTH really
+# mounted and declared. Both halves carry weight: mounted, so a repo baked into the image layer
+# with the bind dropped fails rather than passing as "confined"; declared, so it is a mount the
+# boundary knows about. `EXPECTED` is used deliberately — it has `--declare` folded in by now,
+# which is the one mechanism that exists to name exactly this nested case.
 ws_mounted=no
-if [ -n "$ws_target" ] && printf '%s\n' "$actual" | grep -qx "$ws_target"; then
-    case "$mem_repo" in "$ws_target"/?*) ws_mounted=yes ;; *) ;; esac
-fi
-assert "the workspace bind is mounted and $mem_repo is inside it" "$ws_mounted"
+while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    printf '%s\n' "$EXPECTED" | grep -qx "$m" || continue
+    case "$mem_repo" in "$m"|"$m"/?*) ws_mounted=yes; break ;; *) ;; esac
+done <<<"$actual"
+assert "$mem_repo is inside a declared mount point" "$ws_mounted"
 assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || echo no)"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
