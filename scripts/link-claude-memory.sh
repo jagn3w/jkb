@@ -46,10 +46,15 @@
 #     later session for that repo.
 #
 # The posture has no write-deny to carve `claude-memory` back out with (`filesystem` offers
-# `denyRead`, `allowRead`, `allowWrite` and nothing else), so this is ACCEPTED rather than
-# mitigated, and it is why the linking is opt-in on the host (`setup.sh --link-memory`) and never
-# created by a `git pull`. If that trade is not wanted, the store belongs at a path the posture
-# does not grant, with its own declared bind into the container.
+# `denyRead`, `allowRead`, `allowWrite` and nothing else). Weighed against a dedicated store with
+# its own declared bind, and `~/.jkb` was CHOSEN: both ends are the same person's agents, it is
+# prose rather than code, and the host side is opt-in (`setup.sh --link-memory`), never created by
+# a `git pull`.
+#
+# If you revisit it, start from this measured fact: file tools and Bash are bounded by different
+# mechanisms — the sandbox's `filesystem` block governs Bash, the `permissions` rules govern
+# Read/Edit/Write — so an agent writes memory through the Write tool wherever the store lives.
+# Moving it out of `~/.jkb` would close the Bash channel and would NOT stop agents writing memory.
 #
 # NOTHING HERE OVERWRITES. An existing memory directory is migrated into the store file by file
 # and the directory is then removed; a name that exists on both sides is left alone and reported,

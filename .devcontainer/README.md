@@ -157,10 +157,16 @@ blanket `denyRead` of `~` and in no allow list, so **sandboxed Bash cannot touch
 all**; `~/.jkb` is in both `allowRead` and `allowWrite`, because jkb's database lives there. So
 linking moves memory from a place sandboxed Bash cannot reach into one where a single
 auto-approved command can rewrite it — for this repo and, through the same grant, for every other
-repo's store. The posture has no write-deny to carve `claude-memory` back out with, so this is
-**accepted, not mitigated**, and it is why the host side is opt-in (`setup.sh --link-memory`) and
-never created by a `git pull`. If the trade is not wanted, the store belongs at a path the posture
-does not grant, with its own declared bind into the container.
+repo's store. The posture has no write-deny to carve `claude-memory` back out with, so this was
+**weighed and chosen**, not overlooked: both ends are the same person's agents, it is prose rather
+than code, and the host side is opt-in (`setup.sh --link-memory`), never created by a `git pull`.
+
+If you revisit it, start from the fact that decides what the alternatives buy — **file tools and
+Bash are bounded by different mechanisms.** The sandbox's `filesystem` block governs Bash; the
+`permissions` rules govern `Read`/`Edit`/`Write`. Measured: `Read` opens a memory file that Bash
+cannot even `ls`. So an agent writes memory through the Write tool wherever the store lives, and
+moving it to a path the posture does not grant would close the Bash channel **without** stopping
+agents writing memory.
 
 ## Root is not reachable from inside
 

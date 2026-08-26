@@ -1786,14 +1786,23 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   gone with it, so every sweep on both sides no-ops for ever. The default stays (breaking a live
   sweeper's lock is what the lock prevents); what was missing is an escape a person can take, so
   the refusal names the lock file and its holder and `jkb task reap --break-lock` exists.
-- **Sharing memory through `~/.jkb` opened a channel nobody had priced.** `~/.claude/projects` is
-  under the posture's blanket `denyRead` and in no allow list, so sandboxed Bash cannot touch
-  auto-memory; `~/.jkb` is in `allowRead` **and** `allowWrite`, because the database lives there.
-  Linking therefore moves memory from a place sandboxed Bash cannot reach into one where a single
-  auto-approved command rewrites it, for every repo. The posture has no write-deny to carve it
-  back out with, so it is **accepted and stated** rather than mitigated — and the round-1
-  comparison that chose `~/.jkb` over a dedicated bind was made without this, so it is worth
-  re-deciding rather than inheriting.
+- **Sharing memory through `~/.jkb` widens what sandboxed Bash can reach, and that is a decision,
+  not an oversight.** `~/.claude/projects` is under the posture's blanket `denyRead` and in no
+  allow list; `~/.jkb` is in `allowRead` **and** `allowWrite`, because the database lives there.
+  Linking therefore moves auto-memory from a place sandboxed Bash cannot touch into one where a
+  single auto-approved command rewrites it — for this repo and, through the same grant, for every
+  other repo's store. Memory is prose re-injected into every later session, so the channel turns a
+  one-shot injection into a durable one. The posture has no write-deny to carve `claude-memory`
+  back out with (`filesystem` offers `denyRead`/`allowRead`/`allowWrite` and nothing else).
+  **Weighed against a dedicated store with its own declared bind, and `~/.jkb` was chosen**: both
+  ends are the same person's agents, it is prose rather than code, and the host side is opt-in
+  (`setup.sh --link-memory`), never created by a `git pull`.
+- **The load-bearing fact underneath it, measured rather than assumed:** file tools and Bash are
+  bounded by *different* mechanisms. The sandbox's `filesystem` block governs Bash; the
+  `permissions` rules govern `Read`/`Edit`/`Write`. So an agent writes memory through the Write
+  tool wherever the store lives — moving it somewhere the posture does not grant would not have
+  stopped agents writing memory, only sandboxed Bash. Anyone revisiting this should start there,
+  because it is the fact that decides what the alternatives actually buy.
 - **`verify.sh` refuses to run outside the container, and never passes on a table it could not
   read.** Run on the macOS host it printed fourteen confident FAILs about a machine that was never
   the subject — and two `ok` lines, because `/proc/self/mountinfo` does not exist there, so the
