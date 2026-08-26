@@ -82,11 +82,6 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run)   dry=1 ;;
         --self-test) self_test=1 ;;
-        # So verify.sh can find the link it asserts without keeping a second copy of the slug
-        # rule. Two spellings of one derivation is the duplication .devcontainer/lib.sh exists
-        # to remove, and this one is a guess about another program's encoding — the worst kind
-        # to have two of.
-        --print-slug) shift; slugify "${1:-}"; printf '\n'; exit 0 ;;
         --status)     shift; status_repo="${1:-}" ;;
         # Where to record the state each repo was in BEFORE this run repaired anything. The
         # repair downgrades its own alarm — removing a live link into a poisoned store turns

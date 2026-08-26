@@ -285,9 +285,9 @@ pub struct Store {
     pub records: Vec<(PathBuf, Record)>,
     /// Marker files that could not be read or parsed as JSON at all.
     pub unreadable: Vec<PathBuf>,
-    /// `(marker file, why)` for records that parsed but describe paths this mechanism does not
-    /// own. Reported and kept, never deleted: a refusal is not a licence to act on the file.
-    pub rejected: Vec<(PathBuf, String)>,
+    /// Records that parsed as JSON but describe paths this mechanism does not own. Reported and
+    /// kept, never deleted: a refusal is not a licence to act on the file.
+    pub rejected: Vec<Rejected>,
 }
 
 /// Cancel the pending removal of `worktree`, if one is recorded.
@@ -358,10 +358,17 @@ pub fn entries(db: &Path) -> Result<Store> {
             .map_err(|e| e.to_string())
             .and_then(|b| serde_json::from_slice::<Entry>(&b).map_err(|e| e.to_string()))
         {
-            Ok(entry) => match Record::parse(entry) {
-                Ok(record) => store.records.push((path, record)),
-                Err(why) => store.rejected.push((path, why)),
-            },
+            Ok(entry) => {
+                let uid = entry.uid.clone();
+                match Record::parse(entry) {
+                    Ok(record) => store.records.push((path, record)),
+                    Err(why) => store.rejected.push(Rejected {
+                        marker: path,
+                        uid,
+                        why,
+                    }),
+                }
+            }
             Err(_) => store.unreadable.push(path),
         }
     }
@@ -634,6 +641,22 @@ impl std::ops::Deref for Record {
     }
 }
 
+/// A record that parsed but was refused, with enough to report it.
+///
+/// The uid is carried even though nothing trusts it, because it is what a person recognises. It
+/// used to be dropped and the marker path put in the `uid` field of the report instead — a field
+/// holding something other than what its name says, which is the shape this branch has spent four
+/// rounds removing from everywhere else.
+#[derive(Debug, Clone)]
+pub struct Rejected {
+    /// The marker file, so it can be found and looked at.
+    pub marker: PathBuf,
+    /// The uid the record claims. A label, never authority.
+    pub uid: String,
+    /// Why it was refused.
+    pub why: String,
+}
+
 /// A path this mechanism could have written: absolute, and naming only ordinary components.
 ///
 /// `..` is REFUSED rather than resolved. Resolving would be sound too, but nothing here ever
@@ -785,10 +808,14 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         unreadable: store.unreadable,
         ..Report::default()
     };
-    for (marker, why) in store.rejected {
+    for r in store.rejected {
         report.held.push((
-            marker.display().to_string(),
-            format!("{why} — refused; this record does not describe anything this sweep owns"),
+            r.uid,
+            format!(
+                "{} — refused; this record does not describe anything this sweep owns ({})",
+                r.why,
+                r.marker.display()
+            ),
         ));
     }
 

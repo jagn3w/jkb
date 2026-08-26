@@ -388,6 +388,47 @@ fn landing_a_session_with_no_commits_says_so() {
         ));
 }
 
+/// A disposal that could not move the tree must not take the task down with it.
+///
+/// From inside a sandboxed session `archive::stow` is refused, so `abandon` defers. It used to
+/// then run `git branch -D` on a branch the surviving worktree still had checked out; git refuses,
+/// `?` bailed before the claim was released, and the task was left `in_progress` claimed by a
+/// session whose worktree still exists — so `is_alive` said Yes and neither `doctor --fix` nor
+/// `task reclaim` could free it. Re-running failed identically.
+///
+/// The refusal is provoked without a sandbox: a regular file where `.jkb/archive` must be created
+/// makes `stow` fail for the same reason it fails there — nothing can be moved.
+#[test]
+fn a_deferred_abandon_still_reopens_the_task_and_keeps_the_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("deferred abandon task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(&wt, "d.txt", "work\n", "add d");
+
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").expect("block the archive");
+
+    f.jkb()
+        .args(["task", "abandon", &uid, "--delete-branch"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        f.status_of(&uid),
+        "open",
+        "the task is back on the frontier"
+    );
+    assert!(wt.exists(), "the tree it could not move is still there");
+    assert!(
+        !git(&f.repo, &["rev-parse", "--verify", &branch]).is_empty(),
+        "and its branch survives — `git branch -D` cannot run while that worktree holds it"
+    );
+
+    // ...and the claim really is free, which is what the wedge cost: the task must be workable.
+    f.jkb().args(["task", "work", &uid]).assert().success();
+}
+
 /// Abandoning returns the task to the frontier and takes the checkout with it — but keeps
 /// the branch, because the commits on it are real work.
 #[test]

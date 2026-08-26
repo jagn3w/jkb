@@ -6610,9 +6610,10 @@ fn cmd_task_abandon(
     // when it archived the tree — and folded into ONE value, so no two lines can disagree.
     let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
     let branch_fate = match (delete_branch, still_there) {
-        (_, false) if delete_branch => BranchFate::Deleted,
-        (true, true) => BranchFate::OwedToTheReaper,
         (false, _) => BranchFate::Kept,
+        // Asked for and still there: the deferred worktree has it checked out, so `git branch -D`
+        // would refuse. The record's `Plan` carries the decision and the reaper applies it.
+        (true, true) => BranchFate::OwedToTheReaper,
         (true, false) => BranchFate::Deleted,
     };
 
