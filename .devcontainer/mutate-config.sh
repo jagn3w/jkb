@@ -163,6 +163,18 @@ open(p, 'w').write(s)
 PYX
 run "a firewall refusal exits without installing a deny-all" "exits without installing a deny-all"
 
+# The shape the Docker harness cannot reach: a bare command-substitution assignment, which under
+# `set -eE` and the ERR trap takes the whole raise to deny-all the first time any one of the
+# fifteen posture domains fails to resolve.
+seed; python3 - "$work/t/.devcontainer/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace(
+    's/sort -u)" || ips=""', 's/sort -u)"', 1) if False else s.replace(
+    'sort -u)" || ips=""', 'sort -u)"', 1))
+PYX
+run "a firewall command substitution loses its fallback" "aborts the whole raise into fail_closed"
+
 seed; jq_dc '.mounts += ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"]'
 run "the docker socket is mounted in" "docker socket is root on the host"
 
@@ -266,7 +278,7 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=28
+PINNED_BAD_SITES=29
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

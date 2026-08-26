@@ -214,6 +214,20 @@ run "a --declare outside every declared target" "is not inside any host BIND" \
 run "auto-memory is not linked into the shared store" "auto-memory is not linked" \
     -e JKB_SKIP_MEMORY_LINK=1 "${HEALTHY[@]}"
 
+# THE FIREWALL'S OWN REFUSAL PATH, which nothing else here drives. Every other case exercises the
+# raise succeeding or never starting; this one makes it run and decide it cannot establish an
+# allowlist, which is the only route through `fail_closed` — the deny-all it installs, its IPv6
+# block, and its verdict line had never executed in a container.
+#
+# `--dns 127.0.0.1` rather than an unroutable address: nothing listens on the container's loopback
+# port 53, so every lookup is refused immediately instead of timing out fifteen times over. With no
+# domain resolvable the `resolved -eq 0` arm fires, `fail_closed` denies everything, and the
+# container is then too tight to work in — which is exactly what verify.sh must say. A container
+# that cannot reach its own allowlist is a real state (a laptop offline at container start), and
+# the honest report is "the firewall is too tight", not silence.
+run "the firewall cannot resolve any allowlisted domain" "too tight to work in" \
+    --dns 127.0.0.1 "${HEALTHY[@]}"
+
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
 # Dockerfile removes it; this puts it back and requires verify.sh to notice.

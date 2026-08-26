@@ -295,6 +295,28 @@ else
     bad "init-firewall.sh exits without installing a deny-all at line(s): $(tr '\n' ' ' <<<"$stray_exits")— a refusal that leaves no rules is unrestricted egress with a message"
 fi
 
+# UNDER `set -eE` PLUS THE ERR TRAP, A BARE COMMAND-SUBSTITUTION ASSIGNMENT ABORTS THE SCRIPT —
+# and in this file an abort means `fail_closed`, which is deny-all with no allowlist. That is not
+# hypothetical: `getent` exits 2 for a name with no A record, `pipefail` carries it out, and one
+# unresolvable domain among the fifteen took the whole raise down, blaming "an unexpected failure
+# at line 173" while the two arms written for exactly that state were unreachable.
+#
+# Measured which shapes trip it: a bare `x="$(cmd)"` does; `x="$(cmd)" || fallback` and
+# `if x="$(cmd)"` do not. So every such assignment must carry a fallback or sit in a conditional.
+# Checked here because the Docker harness cannot reach the DNS-failure path, and because the next
+# substitution added to this file has the same trap waiting for it.
+bare_subst="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
+    # An assignment whose value is a command substitution, at statement level.
+    /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="?\$\(/ {
+        if ($0 !~ /\|\|/) print FNR ": " $0
+    }
+')"
+if [ -z "$bare_subst" ]; then
+    ok "every command substitution in init-firewall.sh can fail without aborting the raise"
+else
+    bad "init-firewall.sh has a command-substitution assignment with no fallback, which aborts the whole raise into fail_closed under the ERR trap: $(tr '\n' ' ' <<<"$bare_subst")"
+fi
+
 # EVERY EXPECT STRING mutate-verify.sh greps for must be one verify.sh can actually print.
 # That harness needs Docker, so it does not run in this gate — and a stale expect there is a
 # mutation that reports MISSED for ever, which is a guard nobody has seen fire dressed as a guard.
