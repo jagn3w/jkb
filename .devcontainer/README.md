@@ -140,7 +140,12 @@ retargeted, and a store holding anything but plain files is refused rather than 
 written by agents on both sides of the boundary, and a symlink planted in it would redirect the
 other side's reads and writes wherever it points.
 
-`verify.sh` **asks the linker** (`--status`) rather than inferring breakage from a missing link.
+`verify.sh` **asks the linker live** (`--status`) rather than inferring breakage from a missing
+link — and reads setup.sh's create-time record as an *additional* alarm, never a substitute. Both
+matter: the linker repairs (it removes a live link into a poisoned store), so a live question
+asked afterwards sees the harmless `unsafe` rather than the `exposed` that was true at create;
+but a record consulted *instead* of asking made the store guard unfirable after create, so a
+redirect planted the next day reported `ok`.
 The linker leaves the link absent in states it recognises — a collision, an unsafe store — so
 reading "no link" as "broken" failed `postCreate` for a state the design calls normal. Those
 states report and pass; only an unexplained absence fails.

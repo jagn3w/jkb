@@ -33,10 +33,12 @@ dc_link_state /home/vscode
 # at all, which `verify.sh` fails on, so this must not hide a non-zero exit behind a comment
 # claiming the opposite. It reports and continues; verify.sh decides.
 say "shared claude memory"
-# The state it FOUND is recorded before it repairs anything, because the repair downgrades its own
-# alarm: `link_one` removes a live link into a poisoned store, so `verify.sh` — which runs 25 lines
-# later — would ask afterwards and see the harmless `unsafe` rather than the `exposed` it must fail
-# on. Written where verify.sh reads it, and only ever appended to by this line.
+# The state each repo was LEFT in is recorded here, and `verify.sh` reads it as an extra alarm
+# beside the live answer it asks for itself. The record earns its place because `link_one` repairs:
+# it removes a live link into a poisoned store, so a live question asked afterwards sees the
+# harmless `unsafe` and not the `exposed` that was true at create. It is not a substitute for
+# asking — that made the store guard unfirable after create — and verify.sh consumes an `exposed`
+# record once it has reported it, so the remedy it prints can clear it.
 "$repo/scripts/link-claude-memory.sh" --status-file /home/vscode/.claude-state/memory-status \
     || echo "  (some repos need attention — see above)" >&2
 

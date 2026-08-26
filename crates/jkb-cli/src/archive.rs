@@ -157,6 +157,15 @@ impl Report {
             .iter()
             .map(|(uid, why)| format!("h {uid} {why}"))
             .chain(self.unreadable.iter().map(|p| format!("u {}", p.display())))
+            // A lock nothing can break is an observation too, and the one this type was added to
+            // make visible: `Held`'s own doc says the escape "needs the file and the holder
+            // printed". Omitted here, the watcher went permanently silent about exactly it —
+            // every deferred landing on the machine stopped completing with no log line anywhere.
+            .chain(
+                self.skipped
+                    .iter()
+                    .map(|h| format!("l {} {}", h.path.display(), h.holder)),
+            )
             .collect();
         lines.sort();
         lines.join("\n")
@@ -272,13 +281,20 @@ fn marker_stem(db: &Path, worktree: &Path) -> PathBuf {
 /// a path and a branch are both reusable names; the record's own identity was still the path.
 fn fresh_marker(db: &Path, worktree: &Path) -> PathBuf {
     let stem = marker_stem(db, worktree);
-    let mut path = stem.with_extension("json");
-    let mut n = 2;
-    while path.exists() {
-        path = PathBuf::from(format!("{}-{n}.json", stem.display()));
+    // EVERY file carries the counter, zero-padded, so lexical order IS creation order. The first
+    // version left the first file bare and suffixed the rest — and `slug-hash-2.json` sorts BELOW
+    // `slug-hash.json`, because `-` precedes `.`. `governing_pending` breaks a `recorded_at` tie
+    // on the marker, so two disposals in the same second gave the older, withdrawn plan the vote:
+    // the inverse of the rule that function exists for. Making the name order the truth costs one
+    // format string; reasoning about `-` versus `.` at the comparison site does not survive.
+    let mut n = 1;
+    loop {
+        let path = PathBuf::from(format!("{}-{n:04}.json", stem.display()));
+        if !path.exists() {
+            return path;
+        }
         n += 1;
     }
-    path
 }
 
 /// Write (or replace) the record for one worktree.
@@ -811,11 +827,19 @@ fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
     }
     match gitrepo::is_dirty(&entry.worktree) {
         Ok(false) => Ok(()),
-        Ok(true) => Err(
-            "it has uncommitted changes — commit them, or drop the session with \
-             `jkb task abandon <uid> --force`, which records that you accept them"
+        Ok(true) => Err(match gitrepo::deletions_only(&entry.worktree) {
+            // The third site of this rule, and the one that was still telling an operator to
+            // commit 62,000 deleted lines. A tree that is only MISSING files is a part-way
+            // removal, not work, and the two want opposite advice.
+            Ok(Some(n)) => format!(
+                "its {n} change(s) are deletions of tracked files and nothing else — a part-way \
+                 removal, not work. `git -C {} restore .` puts them all back",
+                entry.worktree.display()
+            ),
+            _ => "it has uncommitted changes — commit them, or drop the session with \
+                  `jkb task abandon <uid> --force`, which records that you accept them"
                 .to_owned(),
-        ),
+        }),
         Err(e) => Err(format!("git could not check it for changes: {e}")),
     }
 }
@@ -837,6 +861,8 @@ fn governing_pending(records: &[(PathBuf, Record)]) -> BTreeMap<PathBuf, PathBuf
         if record.archive.is_some() {
             continue;
         }
+        // Marker names sort in creation order (see `fresh_marker`), so the larger pair is the
+        // later disposal even when the timestamps tie.
         let candidate = (record.recorded_at, marker.clone());
         match best.get(&record.worktree) {
             Some(current) if *current >= candidate => {}
@@ -1170,6 +1196,17 @@ mod tests {
         (wt, branch, head)
     }
 
+    /// A repo root that cannot exist anywhere, for the cross-boundary cases.
+    ///
+    /// These used to name `/home/vscode/repos/jkb` — "a path the host cannot see" — which is
+    /// exactly the bind target this change adds, so inside the container it EXISTS: the tests took
+    /// the opposite arm, the gate was red in the environment the change exists to introduce, and
+    /// two of them ran `git worktree prune` against the developer's real checkout. Unreachability
+    /// has to be a property of the fixture, not an assumption about the machine.
+    fn unreachable_repo(t: &tempfile::TempDir) -> PathBuf {
+        t.path().join("never-created")
+    }
+
     fn session_entry(repo: &Path, wt: &Path, branch: &str, head: &str) -> Entry {
         Entry {
             head: Some(head.to_owned()),
@@ -1358,12 +1395,10 @@ mod tests {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
         // A container-written record: this machine cannot reach the repo, so it is held for ever.
+        let repo = unreachable_repo(&t);
         let e = Entry {
             head: Some("abc".into()),
-            ..entry(
-                Path::new("/home/vscode/repos/jkb/.jkb/work/s"),
-                Path::new("/home/vscode/repos/jkb"),
-            )
+            ..entry(&repo.join(".jkb/work/s"), &repo)
         };
         record(&db, &e).expect("record");
 
@@ -1617,16 +1652,16 @@ mod tests {
     fn an_unreachable_repo_holds_an_archived_record_too() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
-        // The container writes `/home/vscode/...`; the host sweeps the same shared store. The
-        // archived arm used to read "not visible from here" as "somebody removed it by hand" and
-        // drop the record — so each side destroyed the other's, and the checkout it named was
-        // then referenced by nothing and never deleted.
-        let repo = Path::new("/home/vscode/repos/jkb");
+        // One side writes a record the other cannot reach — the container's `/home/vscode/…` swept
+        // on the host, or the reverse. The archived arm used to read "not visible from here" as
+        // "somebody removed it by hand" and drop the record, so each side destroyed the other's and
+        // the checkout it named was referenced by nothing and never deleted.
+        let repo = unreachable_repo(&t);
         let e = Entry {
             archive: Some(repo.join(".jkb/archive/s-19700101T000000Z")),
             archived_at: Some(1),
             head: Some("abc".into()),
-            ..entry(&repo.join(".jkb/work/s"), repo)
+            ..entry(&repo.join(".jkb/work/s"), &repo)
         };
         record(&db, &e).expect("record");
 
@@ -1637,6 +1672,37 @@ mod tests {
             entries(&db).expect("entries").records.len(),
             1,
             "the record survives for whichever side can see the repo"
+        );
+    }
+
+    /// The tie the first version got backwards: two disposals in the SAME second.
+    ///
+    /// `governing_pending` breaks a `recorded_at` tie on the marker, and the first naming scheme
+    /// left the first file bare while suffixing the rest — so `slug-hash-2.json` sorted below
+    /// `slug-hash.json` and the older, withdrawn plan won the vote. Marker names now sort in
+    /// creation order, which is what makes the comparison mean what it says.
+    #[test]
+    fn a_same_second_redisposal_is_still_governed_by_the_later_one() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+
+        let stamp = now_secs();
+        let mut first = session_entry(&repo, &wt, &branch, &head);
+        first.plan.delete_branch = true;
+        first.recorded_at = stamp;
+        record(&db, &first).expect("first");
+        let mut second = session_entry(&repo, &wt, &branch, &head);
+        second.plan.delete_branch = false;
+        second.recorded_at = stamp; // the same second, so only the marker order can decide
+        record(&db, &second).expect("second");
+
+        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(r.superseded.len(), 1, "one of them is withdrawn: {r:?}");
+        assert!(
+            gitrepo::rev(&repo, &branch).expect("rev").is_some(),
+            "and it is the FIRST — the later disposal said it kept the branch"
         );
     }
 
@@ -1911,14 +1977,12 @@ mod tests {
     fn a_repo_this_process_cannot_see_holds_its_record_instead_of_clearing_it() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
-        // The ordinary cross-boundary case: a landing recorded inside the dev container names
-        // /home/vscode/repos/jkb, and the host sweeps the same shared store.
+        // The ordinary cross-boundary case: a landing recorded on one side of the container bind,
+        // swept from the other, where the repo it names is not reachable.
+        let repo = unreachable_repo(&t);
         let e = Entry {
             head: Some("deadbeef".into()),
-            ..entry(
-                Path::new("/home/vscode/repos/jkb/.jkb/work/s"),
-                Path::new("/home/vscode/repos/jkb"),
-            )
+            ..entry(&repo.join(".jkb/work/s"), &repo)
         };
         record(&db, &e).expect("record");
 

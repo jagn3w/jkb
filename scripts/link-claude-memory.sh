@@ -209,7 +209,11 @@ link_one() { # link_one <projects-dir> <store-dir> <repo-path>
         done
         for entry in "$link"/*; do
             base="$(basename "$entry")"
-            if mv "$entry" "$dest/$base" 2>/dev/null; then
+            # `-n`, because the scan above and this move are separated by two more globs and the
+            # store is written from BOTH sides by design — so a name that appeared in between
+            # would be clobbered by a plain `mv`, and "NOTHING HERE OVERWRITES" is the promise
+            # this whole function is built on. `-n` makes the check and the act the same step.
+            if mv -n "$entry" "$dest/$base" 2>/dev/null && [ ! -e "$entry" ]; then
                 moved=$((moved+1))
             else
                 shopt -u dotglob nullglob
@@ -287,6 +291,16 @@ status_of() { # status_of <home> <store> <repo-path>
         local entry
         shopt -s dotglob nullglob
         for entry in "$link"/*; do
+            # THE SAME QUESTION `link_one` ASKS, in the same order. Without it one on-disk state
+            # answered `unsafe` from there (which verify.sh passes) and `unlinked` from here (which
+            # verify.sh fails, failing the container create) — two functions describing one
+            # directory differently, and verify.sh consulting whichever it happened to call.
+            if [ -L "$entry" ] \
+               || { [ ! -f "$entry" ] && [ ! -d "$entry" ]; } \
+               || [ -n "$(find "$entry" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+                shopt -u dotglob nullglob
+                echo unsafe; return 0
+            fi
             if [ -e "$dest/$(basename "$entry")" ]; then
                 shopt -u dotglob nullglob
                 echo collision; return 0

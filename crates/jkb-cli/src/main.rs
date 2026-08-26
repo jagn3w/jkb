@@ -1106,6 +1106,38 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
+    // THE SWEEP TOUCHES NO ROWS, so it must not be stopped by a schema it never reads. `open_db`
+    // runs the migrations, which refuse outright when the shared `~/.jkb/jkb.db` carries one this
+    // binary does not know — routine across branches here. The host's `com.jkb.reap` unit is
+    // whichever binary `setup.sh` last installed, so that divergence turned the one process that
+    // finishes every deferred landing into a launchd restart-loop, with the only symptom in
+    // reap.log. It works from the record store beside the database, and needs nothing else.
+    if let Command::Task {
+        cmd: cmd @ TaskCmd::Reap { .. },
+    } = cli.command
+    {
+        let TaskCmd::Reap {
+            retain_days,
+            dry_run,
+            break_lock,
+            watch,
+            interval_secs,
+        } = cmd
+        else {
+            unreachable!("matched above")
+        };
+        return cmd_task_reap(
+            &db_path,
+            ReapFlags {
+                retain_days,
+                dry_run,
+                break_lock,
+                watch,
+                interval_secs,
+            },
+            cli.json,
+        );
+    }
     let db = open_db(&db_path)?;
     let json = cli.json;
     let global = cli.global;
@@ -5325,28 +5357,34 @@ fn cmd_task_work(db: &Db, db_path: &Path, uid: &str, onto: Option<&str>, json: b
         },
     )?;
 
+    // CANCELLED FIRST, and a refusal stops the verb.
+    //
+    // `revoke` takes the sweep lock, so a refusal means a sweep is in flight working from a
+    // snapshot that still lists this worktree — and its checks all pass, because the tree is
+    // registered, on the recorded HEAD and clean. Printing a note and handing the session back
+    // anyway licensed that sweep to archive the checkout the operator was just told to work in
+    // and force-delete its branch. `revoke`'s own doc already said the honest outcome is to
+    // refuse and have the operator re-run; this makes the caller obey it.
+    //
+    // Before `open_worktree`, so a sweep sees either no worktree or no record — never a live
+    // checkout it still holds a licence for.
+    archive::revoke(db_path, &worktree)
+        .map(|cancelled| {
+            if cancelled {
+                println!("cancelled the pending removal of {}", worktree.display());
+            }
+        })
+        .with_context(|| {
+            format!(
+                "cannot open the session for {uid}: its pending removal could not be cancelled, \
+                 and opening it anyway would let that sweep archive the checkout you were about \
+                 to work in"
+            )
+        })?;
+
     let resumed = sessions.iter().any(|s| s.branch == branch);
     if !resumed {
         open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?;
-    }
-
-    // THIS SESSION IS ALIVE, so cancel any pending removal of it. `jkb task abandon` from inside
-    // a session cannot dispose of its own worktree, so it defers and reopens the task — and
-    // without this the operator returning to that task gets the same directory handed back with
-    // a reaper still holding a record for it. The sweep then either archives the checkout they
-    // are sitting in and force-deletes its branch, or, once they commit, refuses for ever on the
-    // grounds that it is a different session reusing the name. A record has to be cancellable by
-    // the thing that makes it wrong, not only by something destructive happening.
-    //
-    // Unconditional, not gated on `resumed`: a fresh session at a path some older record names
-    // is the same hazard, and cancelling a record for a worktree that is being handed out right
-    // now is correct in both cases.
-    match archive::revoke(db_path, &worktree) {
-        Ok(true) => println!("cancelled the pending removal of {}", worktree.display()),
-        Ok(false) => {}
-        // Reported, never fatal: the session is open and usable, and the worst case is a sweep
-        // that holds on it and says so.
-        Err(e) => eprintln!("note: could not cancel the pending removal of this session: {e:#}"),
     }
 
     // Record where the work is happening, exactly as `task start` does (D34.1), plus the
@@ -6627,7 +6665,8 @@ fn cmd_task_abandon(
     // when it archived the tree — and folded into ONE value, so no two lines can disagree.
     let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
     let branch_fate = match (delete_branch, still_there) {
-        (false, _) => BranchFate::Kept,
+        (false, true) => BranchFate::Kept,
+        (false, false) => BranchFate::Absent,
         // Asked for and still there: the deferred worktree has it checked out, so `git branch -D`
         // would refuse. The record's `Plan` carries the decision and the reaper applies it.
         (true, true) => BranchFate::OwedToTheReaper,
@@ -6810,6 +6849,10 @@ struct AbandonOutcome<'a> {
 enum BranchFate {
     /// Deletion was not asked for; it is still there.
     Kept,
+    /// Deletion was not asked for and there is nothing there anyway — somebody removed it, or
+    /// `dispose` did. Distinct from `Kept`, whose remedy (`git branch -D`) would error with
+    /// "branch not found" on a branch that is already gone.
+    Absent,
     /// Gone.
     Deleted,
     /// Asked for, and owed: the deferred worktree still has it checked out, so `git branch -D`
@@ -6849,7 +6892,7 @@ fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool)
         }
         // ONE line about the branch, from one value.
         match out.branch {
-            BranchFate::Deleted => {}
+            BranchFate::Deleted | BranchFate::Absent => {}
             BranchFate::OwedToTheReaper => println!(
                 "  branch {branch} will be deleted when `jkb task reap` archives the checkout"
             ),

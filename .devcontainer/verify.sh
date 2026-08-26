@@ -109,7 +109,11 @@ mem_repo="$(cd "$here_dc/.." && pwd)"
 EXPECTED="$(dc_mount_targets "$DC")"
 # What every container has regardless of configuration. Anything outside this and EXPECTED is
 # something a human added to devcontainer.json and must be looked at.
-RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets'
+# Anchored at a component boundary — `(/|$)` — not as bare prefixes. `^/dev` also matched
+# `/devtools`, `^/proc` matched `/procdata` and `^/sys` matched `/sysroot`, so a host mount at any
+# of those was silently dropped from the set this check calls exhaustive. A list of exclusions
+# that quietly grows is the shape this assertion exists to avoid having.
+RUNTIME_OWNED='^/$|^/proc(/|$)|^/sys(/|$)|^/dev(/|$)|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets(/|$)'
 # The READ is kept separate from the result, because "there were no mounts" and "the table could
 # not be read" are different facts and the second must never be spelled like the first. `EXPECTED`
 # has been guarded that way since it was derived; `actual` was not, so an unreadable table made
@@ -169,7 +173,10 @@ fi
 #    the host at all — not even the credential file, which is why you log in inside the container.
 #    Matched as a PREFIX, not for equality: a bind at ~/.claude/settings.json is the posture file
 #    itself and an equality test waves it through, which is the one mount that matters most here.
-claude_mounts="$(awk '$5 == "/home/vscode/.claude" || index($5, "/home/vscode/.claude/") == 1 {print $5}' /proc/self/mountinfo)"
+# From the table read ONCE and guarded above, not a second open: re-reading it here meant an
+# unreadable mountinfo printed `ok  nothing under ~/.claude is a host mount` having compared
+# nothing — the same defect fixed one assertion over, still live in its neighbour.
+claude_mounts="$(awk '$5 == "/home/vscode/.claude" || index($5, "/home/vscode/.claude/") == 1 {print $5}' <<<"$mountinfo")"
 assert "nothing under ~/.claude is a host mount${claude_mounts:+ (found: $(tr '\n' ' ' <<<"$claude_mounts"))}" \
     "$([ -z "$claude_mounts" ] && echo yes || echo no)"
 
@@ -263,13 +270,33 @@ done
 #     refuses to resolve, and a store holding a symlink is one it refuses to follow — so reading
 #     "no link" as "the mechanism is broken" made a state its own design calls normal fail this
 #     check, and with it postCreate, and with that the container. One rule, stated in one place.
-# THE STATE setup.sh FOUND, not the one it left. `link_one` repairs — it removes a live link into
-# a poisoned store — so asking now would see the harmless `unsafe` rather than the `exposed` this
-# must fail on, and the repair would have silently downgraded its own alarm. Falls back to asking
-# directly when no record exists (a hand-run verify, or a container built before this).
+# ASKED LIVE, EVERY TIME — and the create-time record is an ADDITIONAL alarm, never a substitute.
+#
+# It used to be the other way round, and that made the store guard unfirable after `postCreate`:
+# the record says `linked`, so a redirect planted in the store the next day — the only time that
+# state can arise, and exactly the sequence `link_one`'s comment describes — reported `ok`. The
+# mirror case was a false FAIL that could not be cleared: after an `exposed` create, the printed
+# remedy is a hand re-run of the linker, which writes no status file, so verify.sh kept reading
+# `exposed` until a full rebuild.
+#
+# The record still earns its place: `link_one` REPAIRS, removing a live link into a poisoned store,
+# so a live question asked afterwards sees the harmless `unsafe` and not the `exposed` that was
+# true at create. So both are consulted, the worse one decides, and an `exposed` record is
+# consumed once reported — which is what makes the documented remedy actually clear it.
 mem_key="$(basename "$mem_repo")"
-mem_state="$(awk -v k="$mem_key" '$1 == k { print $2 }' /home/vscode/.claude-state/memory-status 2>/dev/null | tail -1)"
-[ -n "$mem_state" ] || mem_state="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+mem_status_file=/home/vscode/.claude-state/memory-status
+mem_live="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+mem_recorded="$(awk -v k="$mem_key" '$1 == k { print $2 }' "$mem_status_file" 2>/dev/null | tail -1)"
+if [ "$mem_recorded" = exposed ]; then
+    mem_state=exposed
+    # Consumed: the alarm describes one create, and leaving it makes the remedy unable to clear it.
+    if [ -w "$mem_status_file" ]; then
+        awk -v k="$mem_key" '$1 != k' "$mem_status_file" > "$mem_status_file.new" 2>/dev/null \
+            && mv "$mem_status_file.new" "$mem_status_file" 2>/dev/null || true
+    fi
+else
+    mem_state="$mem_live"
+fi
 case "$mem_state" in
     linked)
         ok "auto-memory is shared with the host through ~/.jkb" ;;
@@ -326,6 +353,15 @@ assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || e
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.
+# WHAT THE FIREWALL DID, not what egress happens to do. The two probes below both resolve a name,
+# so a dead resolver produces the same answers as a deny-all — which meant the harness case for
+# `fail_closed` passed without ever establishing that it installed anything. The marker is written
+# by `fail_closed` and cleared only by a successful raise, so it says which of the two happened.
+if [ -e /run/jkb-egress-failed ]; then
+    bad "the firewall failed closed and left no allowlist: $(head -1 /run/jkb-egress-failed 2>/dev/null)"
+else
+    ok "the firewall raised an allowlist (it did not fail closed)"
+fi
 if curl -sS -m 6 -o /dev/null https://example.com 2>/dev/null; then
     bad "egress to a NON-allowlisted host was permitted (example.com)"
 else

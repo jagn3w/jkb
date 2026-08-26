@@ -1858,6 +1858,34 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   above lives on the DNS-failure path, which the harness does not drive: it covers the happy path
   and the no-`NET_ADMIN` path. Generalising a run into a property of a file is the same shape as
   every "unknown reported as a definite answer" this branch has been correcting.
+- **A test fixture must not assume anything about the machine it runs on.** Three sweep tests
+  named `/home/vscode/repos/jkb` as "a repo this machine cannot reach" — which is precisely the
+  bind target this change adds, so inside the container the path EXISTS: the tests took the
+  opposite arm, **the gate was red in the environment the change exists to introduce**, and two of
+  them ran `git worktree prune` against the real checkout. Unreachability is a property of the
+  fixture now (a tempdir path never created), not a claim about the world.
+- **A record consulted INSTEAD of asking makes a guard unfirable.** `verify.sh` read setup.sh's
+  create-time memory record in place of asking the linker, so the store guard could never fire
+  after `postCreate` — a redirect planted the next day reported `ok` — and an `exposed` record
+  could not be cleared by the remedy the failure printed. It asks live every time, and the record
+  is an additional alarm, consumed once reported. The record still earns its place: the linker
+  *repairs*, so a live question asked afterwards sees the harmless state and not the one that was
+  true at create.
+- **A caller that downgrades a refusal to a note undoes it.** `revoke` refuses when a sweep holds
+  the lock, and its doc says the honest outcome is for the operator to re-run — but `task work`
+  printed a note and handed the session back, licensing that sweep to archive the checkout it had
+  just told the operator to work in. The cancellation now happens **before** the worktree is
+  handed over, and a refusal stops the verb.
+- **A mutation can pass on the symptom rather than the behaviour.** The `--dns 127.0.0.1` case
+  reported CAUGHT whether or not `fail_closed` installed anything, because both egress probes
+  resolve a name and a dead resolver breaks them by itself. `fail_closed` now writes
+  `/run/jkb-egress-failed`, cleared only by a successful raise, so `verify.sh` — which runs as
+  `vscode` and cannot ask iptables anything — observes what the firewall DID rather than what
+  egress happens to do.
+- **`jkb task reap` no longer opens the database.** It touches no rows, but ran through the
+  dispatch that migrates first — so the shared-`jkb.db` divergence this project documents as
+  routine turned the one process that finishes every deferred landing into a launchd restart-loop,
+  with the only symptom in `reap.log`.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

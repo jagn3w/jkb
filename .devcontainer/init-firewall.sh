@@ -26,8 +26,16 @@ say() { printf '[firewall] %s\n' "$*"; }
 # (that is why postStart re-raises them), so a container that started offline kept UNFILTERED
 # egress while the script printed "Refusing". The refusal path was less safe than the success path,
 # which is the one direction this layer must never go.
+readonly FAILED_MARKER=/run/jkb-egress-failed
+
 fail_closed() { # fail_closed <message...>
     printf 'init-firewall: %s\n' "$*" >&2
+    # A DURABLE SIGNAL, because the only other one is this script's stderr — which postCreate
+    # swallows and which nothing later can read. `verify.sh` runs as `vscode` and cannot ask
+    # iptables anything, so without a marker it can only observe the SYMPTOM (egress fails), and a
+    # broken resolver produces that symptom just as well: the harness case written for this path
+    # passed whether or not a deny-all was ever installed.
+    printf '%s\n' "$*" > "$FAILED_MARKER" 2>/dev/null || true
     # DNS and loopback stay open so the container can be diagnosed and can retry; everything else
     # is denied. Deliberately does not depend on the `allowed` set having any contents.
     iptables -F OUTPUT 2>/dev/null || true
@@ -190,16 +198,26 @@ done <<<"$(jq -r '.require.sandbox.network.allowedDomains[]?' "$POSTURE")"
 
 # Resolving nothing yields an empty set, and the rules below would still install and still print
 # "default-deny is active" — technically true and useless: the container can reach nothing, and the
-# reason is a dead resolver rather than a policy anyone chose. Refuse, fail closed, and leave the
-# previous allowlist in place so a re-run at a better moment restores it.
+# reason is a dead resolver rather than a policy anyone chose. So refuse.
+#
+# What that COSTS changed when refusals were routed through `fail_closed`, and the message here
+# had not caught up: it still promised "the previous allowlist is left untouched", which was true
+# when a refusal exited without touching iptables and is false now that every refusal installs
+# deny-all. Both are defensible — an unestablished allowlist should not leave egress open — but
+# the operator has to be told which one happened, because "left untouched" and "you can reach
+# nothing until this succeeds" call for different next moves.
 if [ "$resolved" -eq 0 ]; then
     ipset destroy allowed-new 2>/dev/null || true
     fail_closed "$declared domain(s) declared but NONE resolved to an address — DNS is unavailable
-  or every entry is a wildcard. The previous allowlist, if any, is left untouched."
+  or every entry is a wildcard. Egress is now DENIED rather than left as it was: an allowlist that
+  could not be established must not leave the container reachable. Fix DNS and re-run this, or
+  restart the container, to restore it."
 fi
-# Swap the freshly built set into place. Until this line the LIVE allowlist is untouched, so a
-# refusal above cannot black-hole a running container — which the script's own advice to re-run it
-# would otherwise do at exactly the moment resolution is flaky.
+# Swap the freshly built set into place. Until this line the live allowlist is untouched, but a
+# refusal above still installs deny-all through `fail_closed`, so a running container IS cut off
+# until the raise succeeds — deliberately, and said in the refusal. It used to be that a refusal
+# changed nothing; that read better but left egress open on the one path where the allowlist could
+# not be established, which is the opposite of what this layer is for.
 ipset swap allowed-new allowed
 ipset destroy allowed-new 2>/dev/null || true
 say "allowed $resolved addresses from $declared domains"
@@ -236,6 +254,9 @@ if ! iptables -C OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/nul
     fail_closed "default-REJECT rule is not in place — refusing to report success on a
   half-applied policy."
 fi
+# Cleared only HERE, on the one path that installed a real allowlist — so the marker means
+# exactly "the last raise could not establish one", and nothing else has to be kept in agreement.
+rm -f "$FAILED_MARKER" 2>/dev/null || true
 if [ "$have_v6" -eq 1 ]; then
     say "egress default-deny is active (IPv4 allowlisted, IPv6 denied outright)"
 else

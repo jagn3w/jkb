@@ -225,7 +225,7 @@ run "auto-memory is not linked into the shared store" "auto-memory is not linked
 # container is then too tight to work in — which is exactly what verify.sh must say. A container
 # that cannot reach its own allowlist is a real state (a laptop offline at container start), and
 # the honest report is "the firewall is too tight", not silence.
-run "the firewall cannot resolve any allowlisted domain" "too tight to work in" \
+run "the firewall cannot resolve any allowlisted domain" "failed closed and left no allowlist" \
     --dns 127.0.0.1 "${HEALTHY[@]}"
 
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
