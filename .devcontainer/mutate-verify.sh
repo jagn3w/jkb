@@ -40,6 +40,27 @@ fi
 CONTROL_ONLY=0
 if [ "${1:-}" = --control ]; then CONTROL_ONLY=1; shift; fi
 IMAGE="${1:-jkb-dev}"
+
+# THE SUBJECT HAS TO EXIST, and be named on purpose. Same reason the docker checks above exist:
+# without this, an image that is not there produces nine MISSED lines and three BUILD-FAILED
+# blocks before the control finally reports them all unattributable — thirteen alarming lines for
+# a fact about the command. It happened with a stray em dash pasted as the image name, copied out
+# of prose where one followed the command; `docker run … — bash -c …` exits 125 ("could not start
+# the container"), which `judge` reads as a non-zero verify.sh and reports as a guard that did
+# not fire.
+if [ "$#" -gt 1 ]; then
+    echo "=== container guards ==="
+    echo "   usage: $(basename "$0") [--control] [image]" >&2
+    echo "   got $# arguments: $*" >&2
+    echo "   (a command copied with trailing prose attached is the usual cause)" >&2
+    exit 2
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "=== container guards ==="
+    echo "   no image named '$IMAGE'. Nothing was verified — this is NOT a passing result." >&2
+    echo "   Build it first:  docker build -t jkb-dev .devcontainer" >&2
+    exit 2
+fi
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 printf '{}' > "$scratch/home/settings.json"

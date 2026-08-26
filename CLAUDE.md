@@ -1817,6 +1817,14 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   command. `mutate-verify.sh --control` reuses the exact flags and preamble every mutation runs
   against, so "is my container ok" and "did that guard fire" cannot be answered about two
   different containers.
+- **A harness must refuse a subject it cannot find, before it reports on one.** A stray em dash
+  pasted as the image name — copied out of prose where one followed the command — made every
+  `docker run` exit 125 ("could not start the container"), which `judge` reads as a non-zero
+  `verify.sh` and reports as a guard that did not fire: nine MISSED lines and three BUILD-FAILED
+  blocks before the control finally called them unattributable. Thirteen alarming lines for a fact
+  about the command. The control did its job, and doing its job that late is the defect; the image
+  and the argument count are checked up front now, the same shape as the docker-on-PATH and
+  daemon-reachable checks already there for exactly this reason.
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
