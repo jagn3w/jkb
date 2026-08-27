@@ -1,19 +1,44 @@
 # jkb
 
-A local-first, agent-native knowledge base. Everything is an item in a virtual
-filesystem of logical **namespaces**, with **typed tags** and a **typed graph**;
-vector and keyword search are pluggable **indexes** derived from that filesystem.
-The same substrate powers a DAG **task manager** (with git-backed work sessions and
-review-gated landing), bidirectional **file sync**, and long-running **investigations** —
-and an **MCP server** lets agents (e.g. Claude) query and update the KB.
+Welcome to John's Knowledge Base (jkb). This is a flexible knowledge base that I'm
+writing to serve several different use cases. jkb is based on an opinionated virtual
+file system built on top of sqlite. Everything inside of jkb is a node in a tree, with
+typed edges between nodes, but jkb is opinionated about what namespaces exist, how nodes
+relate to each other, what kind of tags each node has, and how nodes are discoverable
+(e.g. indices, vector search).
 
-> **Status:** actively developed, and used to run its own development — jkb's tasks,
-> code-review findings, and design notes live in jkb. The v1 substrate (namespaces,
-> items, typed edges and tags, the query engine, the derived vector/FTS indexes, the task
-> DAG, file sync, the CLI, the MCP server) is complete and covered by the test suite.
-> The newer surface — task sessions and staging branches, typed namespaces,
-> investigations, the VS Code explorer — is younger and still moving. There are no
-> released binaries and no cross-version stability promise yet; you build from source.
+## What can jkb do?
+
+- Right now, jkb's most advanced usage is in driving agents in a DAG task manager with
+  git-backed work sessions and review-gated landing. This is currently the focus of
+  active development. The agent lifecycle is already a formal state machine, and a
+  container sandbox ships in `.devcontainer/`; next up is RBAC on jkb commands, so that
+  agents can coordinate and implement tasks as independently as possible. jkb has a
+  VS Code extension to facilitate coordinating agents.
+- jkb also has a searchable document store that embeds documents and provides an API to
+  search your documents, completely offline. This document store can hold the documents
+  in jkb, or it can do bidirectional file sync, so these documents can live separately
+  on disk.
+- jkb provides the scaffolding for long-running agent investigations, storing facts,
+  hypotheses and connections.
+- jkb provides an MCP server and CLI to let agents query and update the KB.
+- In the future, I'll provide several different release targets, with jkb as a basis
+  for different applications running on top of a local virtual filesystem (e.g. a
+  release target for a local app to hold interview transcripts).
+
+**A note on privacy.** jkb does not log any data remotely on its own — embeddings are
+computed locally by ollama, so document content never leaves the machine. The caveat
+worth reading twice: **any agent you run on top of jkb has access to the whole store.**
+And `jkb ingest <url>` fetches the page you point it at, so the sites you ingest may be
+tracked by their owners.
+
+> **Status:** jkb is used to run its own development — jkb's tasks, code-review
+> findings, and design notes live in jkb. The v1 substrate (the virtual filesystem, the
+> query engine and derived indexes, the task DAG, file sync, the CLI and the MCP server)
+> is complete and covered by the test suite; the newer surface — task sessions and
+> staging branches, typed namespaces, investigations, the VS Code explorer — is younger
+> and still moving. There are no released binaries and no cross-version stability
+> promise yet; you build from source.
 >
 > jkb is **single-machine-local**: one SQLite file, not safe to open concurrently from two
 > machines over a cloud-sync folder (`jkb doctor` warns if it detects one). See
