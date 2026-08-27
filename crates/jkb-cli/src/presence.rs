@@ -27,11 +27,10 @@ use jkb_fsm::Fact;
 /// Is `path` there, judged against an `anchor` whose presence is what makes an absence mean
 /// anything?
 ///
-/// - [`Fact::Yes`] — it is there.
-/// - [`Fact::No`] — it is not there **and** the anchor is, so the absence is established.
-/// - [`Fact::Unknown`] — either stat failed, or the anchor is not visible either, in which case
-///   nothing has been established about `path`: you may simply be looking at the wrong
-///   filesystem.
+/// - [`Presence::Here`] — it is there.
+/// - [`Presence::Gone`] — it is not there **and** the anchor is, so the absence is established.
+/// - [`Presence::Unreadable`] / [`Presence::AnchorInvisible`] — nothing has been established about
+///   `path`, and the two are kept apart because they have opposite remedies.
 ///
 /// **The anchor is re-stat'd here, not taken on trust**, and that is the load-bearing part. A
 /// caller that forgets its own reachability precheck degrades to `Unknown` and holds — it cannot
@@ -53,38 +52,92 @@ use jkb_fsm::Fact;
 /// Polarity is presence, never absence: the first version of this returned "is it gone" and every
 /// arm was flipped at the call site, which is one edit away from reading backwards in the probe
 /// that decides whether a claim may be freed.
-pub fn present_under(path: &Path, anchor: &Path) -> Fact {
+pub fn present_under(path: &Path, anchor: &Path) -> Presence {
     match path.try_exists() {
-        Ok(true) => Fact::Yes,
+        Ok(true) => Presence::Here,
         // The stat never came back. Nothing about `path` is established, whatever the anchor says.
-        Err(_) => Fact::Unknown,
+        Err(_) => Presence::Unreadable,
         Ok(false) => match anchor.try_exists() {
             // The place it would be is visible, so it really is gone.
-            Ok(true) => Fact::No,
-            _ => Fact::Unknown,
+            Ok(true) => Presence::Gone,
+            _ => Presence::AnchorInvisible,
         },
+    }
+}
+
+/// The answer, **with the cause of an unestablished one**.
+///
+/// [`Fact`] is the right shape for a caller that only has to decide whether to act. It is the
+/// wrong shape for a caller that has to say *what to do about it*, because the two ways of failing
+/// to establish presence have opposite remedies: an unreadable path is a permissions problem on
+/// this machine, an invisible anchor means you are looking at the wrong filesystem and nothing
+/// here can help. Collapsed to one `Unknown`, the disposal sweep printed "run it where that repo
+/// is checked out" for a repo checked out right here — advice the operator could follow for ever
+/// without the observation changing.
+///
+/// That is the same defect as `Fact` itself exists to prevent, one level up: not a value spelled
+/// `false`, but two **causes** spelled as one value. A caller that genuinely only needs the
+/// three-valued answer says so, with [`Presence::fact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// It is there.
+    Here,
+    /// It is not there, and the anchor is — so the absence is established.
+    Gone,
+    /// The stat of the path itself failed: EACCES on a parent component, ELOOP, ENAMETOOLONG.
+    /// Nothing is established, and the fix is on this machine.
+    Unreadable,
+    /// The path is absent and so is the anchor. Nothing is established, and the likeliest reason
+    /// is that this is not the filesystem the path was written on — the container bind.
+    AnchorInvisible,
+}
+
+impl Presence {
+    /// Collapse to the three-valued answer, for a caller that only decides whether to act.
+    ///
+    /// Both unestablished causes are [`Fact::Unknown`] — never `No`. A caller reaching for this
+    /// is saying "I do not report a remedy", which is true of the git probes and of the owner-id
+    /// liveness check, and false of anything that prints advice.
+    #[must_use]
+    pub fn fact(self) -> Fact {
+        match self {
+            Self::Here => Fact::Yes,
+            Self::Gone => Fact::No,
+            Self::Unreadable | Self::AnchorInvisible => Fact::Unknown,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::present_under;
+    use super::{present_under, Presence};
     use jkb_fsm::Fact;
+
+    /// Neither way of failing to establish presence may ever collapse to a proven absence — the
+    /// one property every caller of [`Presence::fact`] is relying on.
+    #[test]
+    fn an_unestablished_presence_is_never_proven_gone() {
+        for cause in [Presence::Unreadable, Presence::AnchorInvisible] {
+            assert_eq!(cause.fact(), Fact::Unknown, "{cause:?}");
+        }
+        assert_eq!(Presence::Here.fact(), Fact::Yes);
+        assert_eq!(Presence::Gone.fact(), Fact::No);
+    }
 
     #[test]
     fn an_absence_is_proven_only_when_the_anchor_is_visible() {
         let t = tempfile::tempdir().expect("tempdir");
         let anchor = t.path();
         let gone = anchor.join("gone");
-        assert_eq!(present_under(anchor, anchor), Fact::Yes);
+        assert_eq!(present_under(anchor, anchor), Presence::Here);
         assert_eq!(
             present_under(&gone, anchor),
-            Fact::No,
+            Presence::Gone,
             "absent, and we can see the place it would be"
         );
         assert_eq!(
             present_under(&gone, &anchor.join("no-such-anchor")),
-            Fact::Unknown,
+            Presence::AnchorInvisible,
             "absent, but so is the anchor — this may simply be the wrong filesystem"
         );
     }
@@ -97,7 +150,7 @@ mod tests {
         let unreachable = t.path().join("not-mounted-here");
         assert_eq!(
             present_under(&unreachable.join("sess"), &unreachable),
-            Fact::Unknown
+            Presence::AnchorInvisible
         );
     }
 
@@ -124,7 +177,7 @@ mod tests {
         );
         assert_eq!(
             answer,
-            Fact::Unknown,
+            Presence::Unreadable,
             "a visible anchor licenses reading an ENOENT, never a stat error"
         );
     }

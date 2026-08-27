@@ -5610,7 +5610,10 @@ fn batch_onto(db: &Db, ctx: &repo::RepoCtx) -> Result<Option<String>> {
 /// The branch checked out in `.jkb/base`, if that worktree exists.
 fn base_branch(ctx: &repo::RepoCtx) -> Result<Option<String>> {
     let base = session::base_worktree(&ctx.root);
+    // "no branch recorded for `.jkb/base`" either way, which is what a caller does with an
+    // unregistered base anyway.
     Ok(gitrepo::worktrees(&ctx.root)?
+        .unwrap_or_default()
         .into_iter()
         .find(|w| session::same_path(&w.path, &base))
         .and_then(|w| w.branch))
@@ -5866,7 +5869,7 @@ fn land_preflight(
         (Some(work), Some(target)) => gitrepo::ahead_count(&ctx.root, target, work)?,
         _ => 0,
     };
-    let worktrees = gitrepo::worktrees(&ctx.root)?;
+    let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
         staging::target_dirty_reason(&worktrees, &ctx.root, &onto, &mut dirty_cache)?;
@@ -5907,7 +5910,7 @@ fn land_preflight(
             .filter(|_| dirty.is_yes() && reason.contains("uncommitted changes"))
             .map(|s| gitrepo::deletions_only(&s.worktree))
         {
-            Some(Ok(Some(n))) => format!(
+            Some(Ok(gitrepo::Deletions::Only(n))) => format!(
                 " Those {n} change(s) are deletions of tracked files and nothing else — a \
                  part-way removal, not work. `git -C {} restore .` puts them all back.",
                 sess.as_ref()
@@ -6089,7 +6092,9 @@ fn settle_landing(
     // a checkout that was still there ended up orphaned — on disk with no record naming it.
     // `Unknown` leaves `disposed_already` false, and the guard below then keeps the session and
     // says so, which is what it already does for a tree it cannot read.
-    let disposed_already = presence::present_under(&sess.worktree, &ctx.root).is_no();
+    let disposed_already = presence::present_under(&sess.worktree, &ctx.root)
+        .fact()
+        .is_no();
 
     // The session was verified clean in `land_preflight`, but that was before a graft and a
     // gate build that can run for minutes — long enough for the agent sitting in the session
@@ -6599,7 +6604,10 @@ fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
     // know it" bail below and refused every landing, while `staging::land_dir_in` matched the
     // same directory by path and reported the task landable. `switch_to` attaches it either
     // way, so a detached base is an ordinary reusable cache.
+    // Collapsing to "not registered" is the safe direction: the arm it selects only refuses,
+    // with git's own message, rather than reusing a checkout on an unverified premise.
     let base_registered = gitrepo::worktrees(&ctx.root)?
+        .unwrap_or_default()
         .iter()
         .any(|w| session::same_path(&w.path, &base));
     if base_registered {
@@ -6875,7 +6883,10 @@ fn abandon_session(
     // the comment below says), so that pair is: commits deleted, checkout orphaned, nothing
     // tracking it. `Unknown` falls through instead, where the dirty check refuses with something
     // the operator can act on, and `--force` reaches `dispose`, which records rather than bails.
-    if presence::present_under(&sess.worktree, &ctx.root).is_no() {
+    if presence::present_under(&sess.worktree, &ctx.root)
+        .fact()
+        .is_no()
+    {
         let _ = gitrepo::prune_worktrees(&ctx.root);
         return Ok(None);
     }
@@ -7055,13 +7066,26 @@ fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
     // Which checkouts are finished and merely waiting to be moved. In the container EVERY landing
     // produces one — a session cannot archive its own worktree — so without this the listing an
     // operator reads to find live work is mostly finished work, in rows identical to it.
-    let awaiting: std::collections::BTreeSet<PathBuf> = archive::entries(db_path)
-        .map(|store| {
-            store
-                .records
-                .into_iter()
-                .filter(|(_, r)| r.archive.is_none())
-                .map(|(_, r)| r.worktree.clone())
+    // FROM THE VERDICT, not from the existence of a record. `[awaiting archive]` means "work
+    // already done that nothing has moved yet"; a record the sweep is going to HOLD means the
+    // opposite, and rendering the two the same is the hand-written "a sweep will finish this"
+    // claim the verdict seam exists to stop. `pending_outlook` also applies supersession, so a
+    // withdrawn record does not put a badge on a live session.
+    let awaiting: std::collections::BTreeSet<PathBuf> = archive::pending_outlook(db_path)
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|(_, v)| !matches!(v, archive::Verdict::Hold(_)))
+                .map(|(e, _)| e.worktree)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Held records, so the listing can say a checkout needs attention rather than silently
+    // omitting it — an absent badge reads as "nothing outstanding".
+    let stuck: std::collections::BTreeSet<PathBuf> = archive::pending_outlook(db_path)
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|(_, v)| matches!(v, archive::Verdict::Hold(_)))
+                .map(|(e, _)| e.worktree)
                 .collect()
         })
         .unwrap_or_default();
@@ -7102,6 +7126,10 @@ fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
             "dirty": gitrepo::is_dirty(&s.worktree, &ctx.root)?.as_str(),
             "commits": ahead,
             "awaiting_archive": awaiting.iter().any(|w| session::same_path(w, &s.worktree)),
+            // Distinct from the above rather than folded into it: "nothing will move this until
+            // you act" is a different fact from "something will", and a consumer that saw only
+            // one flag could not tell either from "there is no record at all".
+            "archive_blocked": stuck.iter().any(|w| session::same_path(w, &s.worktree)),
         }));
     }
 
@@ -7121,7 +7149,9 @@ fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
             };
             // Said in the row, because it is the difference between work to pick up and work
             // already done that nothing has moved yet.
-            let awaiting = if r["awaiting_archive"].as_bool().unwrap_or(false) {
+            let awaiting = if r["archive_blocked"].as_bool().unwrap_or(false) {
+                " [archive blocked — see `jkb doctor`]"
+            } else if r["awaiting_archive"].as_bool().unwrap_or(false) {
                 " [awaiting archive]"
             } else {
                 ""
@@ -7205,8 +7235,17 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
         println!("worktree removals: none pending");
         return;
     }
-    let (archived, pending): (Vec<_>, Vec<_>) =
-        store.records.iter().partition(|(_, e)| e.archive.is_some());
+    let archived: Vec<_> = store
+        .records
+        .iter()
+        .filter(|(_, e)| e.archive.is_some())
+        .collect();
+    // THE GOVERNING records, and their verdicts, from the one read the sweep itself uses. Asking
+    // `pending_verdict` per record was two-thirds of the rule: the sweep drops a record a later
+    // disposal replaced BEFORE it evaluates anything, so a withdrawn record was getting a vote
+    // here and re-printing advice the operator had already taken — and the count above it said
+    // "2 awaiting archive" for one worktree.
+    let pending = archive::pending_outlook(db_path).unwrap_or_default();
     println!(
         "worktree removals: {} awaiting archive, {} archived",
         pending.len(),
@@ -7217,8 +7256,8 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
     // can act on — and the two rendered identically, so the operator ran the fix repeatedly
     // against a record it would report the same way for ever.
     let mut blocked = 0usize;
-    for (_, e) in &pending {
-        match archive::pending_verdict(e) {
+    for (e, verdict) in &pending {
+        match verdict {
             archive::Verdict::Hold(b) => {
                 blocked += 1;
                 println!(
@@ -7228,6 +7267,15 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
                     b.reason,
                     b.remedy.advice()
                 );
+                // SAID OUT LOUD when the way out destroys something. Every other remedy here is
+                // recoverable — commit, restore, re-record, fix a permission — and exactly one
+                // is not, so a reader skimming a list of holds must not have to recognise which
+                // by its wording. jkb never takes this step itself; it is the operator's, and
+                // the reason it is offered at all is that the tree could not be shown to be ours
+                // (D34.4: where the reversible act is available, it wins).
+                if b.remedy.is_destructive() {
+                    println!("      this one is not reversible — jkb will not do it for you");
+                }
             }
             _ => println!("  {} — {} not yet moved", e.uid, e.worktree.display()),
         }

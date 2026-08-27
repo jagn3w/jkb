@@ -182,7 +182,8 @@ fn present_here(path: &Path) -> Fact {
     match path.parent() {
         // A path with no parent is `/`, whose absence is not a thing to reason about.
         None => Fact::Unknown,
-        Some(parent) => present_under(path, parent),
+        // `.fact()`: a claim probe decides whether to free, and prints no remedy.
+        Some(parent) => present_under(path, parent).fact(),
     }
 }
 

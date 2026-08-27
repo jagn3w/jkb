@@ -213,9 +213,13 @@ pub struct Worktree {
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed.
-pub fn worktrees(dir: &Path) -> Result<Vec<Worktree>> {
+pub fn worktrees(dir: &Path) -> Result<Option<Vec<Worktree>>> {
     let Some(text) = git(dir, &["worktree", "list", "--porcelain"])? else {
-        return Ok(Vec::new());
+        // `None`, NOT an empty list. A repo always has at least its own main worktree, so "none"
+        // is never a truthful reading of a non-zero exit — and the empty vec was read as *this
+        // path is not registered*, which is the value that selects a destructive remedy in the
+        // disposal sweep. Callers that only want a list collapse this deliberately.
+        return Ok(None);
     };
     let mut out = Vec::new();
     let mut path: Option<PathBuf> = None;
@@ -238,7 +242,7 @@ pub fn worktrees(dir: &Path) -> Result<Vec<Worktree>> {
     if let Some(p) = path {
         out.push(Worktree { path: p, branch });
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// The worktree in which `branch` is currently checked out, if any. `git` refuses to check
@@ -249,7 +253,12 @@ pub fn worktrees(dir: &Path) -> Result<Vec<Worktree>> {
 /// Returns an error if `git` cannot be executed.
 pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
     valid_ref(branch)?;
+    // A DELIBERATE collapse, and the safe direction here: this decides whether a land may borrow
+    // an existing checkout, and "no" means it cuts its own — which git then refuses outright if
+    // the branch really is checked out somewhere. A wrong `None` costs a refusal with git's own
+    // message; it cannot make a land graft into a checkout it does not own.
     Ok(worktrees(dir)?
+        .unwrap_or_default()
         .into_iter()
         .find(|w| w.branch.as_deref() == Some(branch))
         .map(|w| w.path))
@@ -546,7 +555,9 @@ pub fn worktree_identity(dir: &Path, anchor: &Path) -> Result<WorktreeIdentity> 
     // `Unknown`, and `land_blocker` then refuses for ever, printing a `git -C <worktree> status`
     // remedy about a directory that is not there. The repo root is the anchor no ordinary
     // operation removes.
-    match crate::presence::present_under(dir, anchor) {
+    // `.fact()` — a deliberate collapse: this function reports an identity, never a remedy, so
+    // the two ways of failing to establish presence are one answer to it.
+    match crate::presence::present_under(dir, anchor).fact() {
         Fact::No => return Ok(WorktreeIdentity::Absent),
         // Not established that it is there, and not established that it is gone. Nothing this
         // function could ask git afterwards would be about `dir` either.
@@ -610,7 +621,7 @@ pub fn worktree_head(dir: &Path, anchor: &Path) -> Result<Option<String>> {
 ///
 /// # Errors
 /// Returns an error if `git status` cannot be run here.
-pub fn deletions_only(dir: &Path) -> Result<Option<usize>> {
+pub fn deletions_only(dir: &Path) -> Result<Deletions> {
     // Asked as four questions with no whitespace in the answers, rather than by parsing
     // `status --porcelain` — whose leading status column is exactly what a trimmed capture eats,
     // so the first entry of every listing would read as the wrong code.
@@ -625,14 +636,35 @@ pub fn deletions_only(dir: &Path) -> Result<Option<usize>> {
         lines(&["diff", "--name-only"])?,
         lines(&["diff", "--name-only", "--diff-filter=D"])?,
     ) else {
-        return Ok(None);
+        // `Unknown`, and it used to be the same `None` as "this is real work". The comment here
+        // said `None` was *no advice* — but at the one call site that reads it, `None` picks the
+        // advice "commit them", which is exactly what must never be said about a part-way
+        // removal. An unanswered question is not a negative answer.
+        return Ok(Deletions::Unknown);
     };
     // A staged change of any kind is deliberate — staging a deletion included — and an untracked
     // file is work `git restore .` would not bring back and must not be advised over.
-    if staged > 0 || untracked > 0 || unstaged != deleted {
-        return Ok(None);
+    if staged > 0 || untracked > 0 || unstaged != deleted || deleted == 0 {
+        return Ok(Deletions::NotOnly);
     }
-    Ok((deleted > 0).then_some(deleted))
+    Ok(Deletions::Only(deleted))
+}
+
+/// What the dirt in a worktree is made of — asked only of a tree already known to be dirty.
+///
+/// Three values because the two ways of not being a pure deletion set want opposite advice, and
+/// the previous `Option<usize>` gave them one: a probe git could not answer read as "real work",
+/// so a part-way removal was met with *commit them* — the 62,421-deleted-lines advice this
+/// question exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deletions {
+    /// Every change is a deletion of a tracked file, and there are this many. A part-way removal,
+    /// recoverable in full with `git restore .`.
+    Only(usize),
+    /// Established to be something else: staged work, untracked files, or edits alongside.
+    NotOnly,
+    /// `git` did not answer, so nothing is established about what the dirt is.
+    Unknown,
 }
 
 /// How many commits `branch` has that `onto` does not. Both must be refs this repository can
@@ -1066,7 +1098,7 @@ mod tests {
         fixture(dir);
         assert_eq!(
             deletions_only(dir).unwrap(),
-            None,
+            super::Deletions::NotOnly,
             "a clean tree owes no advice"
         );
 
@@ -1074,15 +1106,31 @@ mod tests {
         std::fs::remove_file(dir.join("base.txt")).unwrap();
         assert_eq!(
             deletions_only(dir).unwrap(),
-            Some(1),
+            super::Deletions::Only(1),
             "deletions alone are recoverable with `git restore .`"
+        );
+
+        // A PROBE THAT DID NOT RUN is not a report of real work. This used to be the same
+        // `None` as the case below, so a part-way removal whose probe failed was met with
+        // "commit them" — the 62,421-deleted-lines advice this question exists to prevent.
+        // A SEPARATE tempdir, not a subdirectory of the fixture: git's discovery walks up, so a
+        // directory inside the repo is answered *by the repo* — the first version of this asserted
+        // `Unknown` and got `Only(1)` from the enclosing tree, which is the same trap
+        // `worktree_identity` exists for.
+        let outside = tempfile::tempdir().unwrap();
+        let not_a_repo = outside.path().join("elsewhere");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        assert_eq!(
+            deletions_only(&not_a_repo).unwrap(),
+            super::Deletions::Unknown,
+            "git declined to answer, and that is its own value"
         );
 
         // One real edit beside them and it is work again — the advice must flip back.
         std::fs::write(dir.join("new.txt"), "mine").unwrap();
         assert_eq!(
             deletions_only(dir).unwrap(),
-            None,
+            super::Deletions::NotOnly,
             "an untracked file beside the deletions is work, and must not be restored over"
         );
     }

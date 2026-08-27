@@ -218,7 +218,9 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     // landing the command performed — the row-versus-command divergence this single read exists to
     // prevent, in the exact case remote-inclusive existence was added to support.
     let existing = gitrepo::branch_refs(&ctx.root)?;
-    let worktrees = gitrepo::worktrees(&ctx.root)?;
+    // A listing degrades to "no checkouts", which reads as no live sessions — the same
+    // direction the row already takes for a branch it cannot resolve.
+    let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
     let mut cache = Cache::default();
 
     let mut out = Vec::new();
