@@ -117,12 +117,26 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 #
 # Walks up to but not including `$home`, so `~/.jkb` itself is covered: it is the bind mount the
 # container shares, and a link there redirects the database as well as the memory.
+#
+# BOUNDED BY `$home`, NOT BY `/`. The walk had no lower bound, so a store outside home — which
+# `--store <dir>` makes reachable by an ordinary flag — carried on up through the system, and on
+# macOS `/var` and `/tmp` are THEMSELVES symlinks. Every such store therefore reported `unsafe`,
+# refusing to link and telling the operator it "holds something other than plain files", which is
+# both false and unactionable. Above home the ancestors are not ours to judge: the store root
+# itself is always checked, and its ancestry only where it is ours.
 store_impure() { # store_impure <home> <store-root> <dest>
-    local h="${1%/}" p="$2" dest="$3"
-    while [ -n "$p" ] && [ "$p" != "/" ] && [ "$p" != "$h" ]; do
-        [ -L "$p" ] && return 0
-        p="$(dirname "$p")"
-    done
+    local h="${1%/}" p="${2%/}" dest="$3"
+    # The store root itself, wherever it lives.
+    [ -L "$p" ] && return 0
+    case "$p" in
+        "$h"/*)
+            p="$(dirname "$p")"
+            while [ -n "$p" ] && [ "$p" != "/" ] && [ "$p" != "$h" ]; do
+                [ -L "$p" ] && return 0
+                p="$(dirname "$p")"
+            done
+            ;;
+    esac
     [ -L "$dest" ] && return 0
     [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ] && return 0
     return 1
@@ -498,6 +512,23 @@ if [ "$self_test" -eq 1 ]; then
     check "the observer says so too, since verify.sh consults only that" \
         "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
     rm -rf "$t/.jkb" "$t/decoy"; mkdir -p "$t/.jkb/claude-memory"
+
+    # A STORE OUTSIDE $home IS NOT IMPURE BY VIRTUE OF WHERE IT SITS. `--store <dir>` makes that
+    # reachable with an ordinary flag, and the walk had no lower bound — so it climbed through the
+    # system, where on macOS `/var` and `/tmp` are themselves symlinks. Every such store reported
+    # `unsafe`: a refusal to link, explained as "the store holds something other than plain files",
+    # which is false and leaves the operator nothing to do about it.
+    # $home is "$t/home" here, NOT "$t" — the store has to be genuinely outside it or the walk
+    # stops at $home regardless and the case is not exercised. Written the other way first, and
+    # it passed with the fix reverted: `$t/outside` is under `$t`, so nothing climbed past it.
+    mkdir -p "$t/home" "$t/outside/store/jkb"
+    check "a plain store outside \$home is not called impure" \
+        "$(store_impure "$t/home" "$t/outside/store" "$t/outside/store/jkb" && echo no || echo yes)"
+    # ...and the check that matters is still made: the root itself, wherever it lives.
+    ln -s "$t/decoy" "$t/outside/store-link"
+    check "while a symlinked store root outside \$home still is" \
+        "$(store_impure "$t/home" "$t/outside/store-link" "$t/outside/store-link/jkb" && echo yes || echo no)"
+    rm -rf "$t/outside" "$t/home"
 
     # A live link whose store directory is GONE. It answered `linked`, so verify.sh reported
     # memory as shared while every write into it failed — the failure mode with no symptom.
