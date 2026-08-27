@@ -349,7 +349,17 @@ uncovered="$(printf '%s\n' "$all_paths" | grep -v '^$' \
     | grep -vxF -f <(printf '%s\n' "$covered" | grep -v '^$') || true)"
 n_cov=$(( n_all - $(printf '%s' "$uncovered" | grep -c '^' || true) ))
 printf '\033[32m%d mutation(s) caught, and the matcher was shown to discriminate\033[0m\n' "$caught"
-if [ -n "$uncovered" ]; then
+if [ "$n_all" -eq 0 ]; then
+    # NOT the same as full coverage, though it renders identically without this arm: an empty
+    # enumeration makes `uncovered` empty too, so the else branch below certified "all 0 failure
+    # paths were driven" — the claim-more-than-was-established shape this whole block was
+    # rewritten to remove, in the line that reports it. Reachable without any adversary: verify.sh
+    # renamed or moved, `$REPO` pointing somewhere else, or the `bad "`/`assert ` shape refactored.
+    # check-config.sh already refuses its own version of this ten lines from here, and unlike that
+    # one nothing catches a regression here, because this harness needs Docker and is in no gate.
+    printf '\033[31m  could not enumerate any failure paths in %s — this coverage report has\n' "$V"
+    printf '  certified NOTHING. Check the path and the `bad "` / `assert ` shapes it looks for.\033[0m\n'
+elif [ -n "$uncovered" ]; then
     printf '  %d of %d failure paths in verify.sh were driven here. NOT covered by this run:\n' \
         "$n_cov" "$n_all"
     while IFS= read -r n; do

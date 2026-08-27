@@ -169,7 +169,12 @@ pub fn is_alive(owner: &str) -> Fact {
 /// Answers the question the caller asks, rather than its inverse: the first version returned
 /// "is it absent" and every arm was then flipped at the call site, which is one edit away from
 /// reading backwards in the probe that decides whether a claim may be freed.
-fn present_here(path: &Path) -> Fact {
+/// Also [`crate::gitrepo::worktree_identity`]'s absence test, which is the same question about
+/// the same kind of path — a session worktree. It had a second answer there (`Path::exists()`,
+/// which reports `false` for any stat error, so an unreadable path became a PROVEN absence and
+/// then `Fact::No` from `is_dirty`, i.e. "proven clean"). Two answers to one question, with the
+/// newer and weaker one feeding every guard in the landing path.
+pub(crate) fn present_here(path: &Path) -> Fact {
     match path.try_exists() {
         Ok(true) => Fact::Yes,
         Err(_) => Fact::Unknown,

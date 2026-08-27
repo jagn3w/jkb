@@ -530,8 +530,22 @@ pub fn is_dirty(dir: &Path) -> Result<Fact> {
 pub fn worktree_identity(dir: &Path) -> Result<WorktreeIdentity> {
     // Absence is established without asking git, and must be: git answers for the enclosing repo
     // when handed a path that is not there, which would make a removed worktree read as `Own`.
-    if !dir.exists() {
-        return Ok(WorktreeIdentity::Absent);
+    //
+    // Asked through `owner::present_here` rather than `Path::exists()`, which was the second
+    // answer this crate carried to one question. `exists()` reports `false` for ANY stat error —
+    // an untraversable parent (EACCES), ELOOP, ENAMETOOLONG — so an unreadable path became
+    // `Absent`, and `Absent` is `Fact::No`, which is "proven clean": the exact spelling this
+    // module exists to forbid, feeding `land`'s post-gate check, `abandon_session`'s ensure,
+    // `land_dir_for`'s pre-`switch` check and the sweep's identity guard. `present_here` is
+    // three-valued and additionally requires the containing directory to be VISIBLE before it
+    // calls an absence proven — written after a bare `try_exists` false freed a live session's
+    // claim across the container bind, which is the same path this function is handed.
+    match crate::owner::present_here(dir) {
+        Fact::No => return Ok(WorktreeIdentity::Absent),
+        // Not established that it is there, and not established that it is gone. Nothing this
+        // function could ask git afterwards would be about `dir` either.
+        Fact::Unknown => return Ok(WorktreeIdentity::Foreign),
+        Fact::Yes => {}
     }
     let Some(top) = git(dir, &["rev-parse", "--show-toplevel"])?.filter(|s| !s.is_empty()) else {
         return Ok(WorktreeIdentity::Foreign);
@@ -1184,6 +1198,50 @@ mod tests {
             super::is_dirty(&gone).expect("is_dirty"),
             Fact::No,
             "nothing there holds no uncommitted work"
+        );
+    }
+
+    /// A path that cannot be stat'd is not a PROVEN absence.
+    ///
+    /// `Path::exists()` answers `false` for any stat error, so an untraversable parent made
+    /// `worktree_identity` say `Absent`, which `is_dirty` spells `Fact::No` — "proven clean", the
+    /// one answer this module exists to stop manufacturing. It then feeds `land`'s post-gate
+    /// check, `abandon_session`'s ensure, `land_dir_for`'s pre-`switch` check and the sweep's
+    /// identity guard, none of which can tell it from a real observation.
+    #[test]
+    fn a_path_that_cannot_be_stat_ed_is_not_a_proven_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().expect("tempdir");
+        let parent = t.path().join("locked");
+        let wt = parent.join("wt");
+        std::fs::create_dir_all(&wt).expect("mkdir");
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        // Everything is measured while the parent is untraversable, then it is restored so the
+        // tempdir can be cleaned up whatever the assertions do.
+        let stat = std::fs::metadata(&wt).err().map(|e| e.kind());
+        let identity = super::worktree_identity(&wt);
+        let dirty = super::is_dirty(&wt);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("restore");
+
+        // Asserted, not assumed: as root the chmod does not bite, and without this the test would
+        // pass having observed an ordinary readable directory.
+        assert_eq!(
+            stat,
+            Some(std::io::ErrorKind::PermissionDenied),
+            "the premise — stat must actually fail, or this test is about nothing"
+        );
+        assert_ne!(
+            identity.expect("identity"),
+            super::WorktreeIdentity::Absent,
+            "nobody established that it is gone; the stat never came back"
+        );
+        assert_eq!(
+            dirty.expect("is_dirty"),
+            Fact::Unknown,
+            "and an unreadable path must never read as PROVEN clean"
         );
     }
 

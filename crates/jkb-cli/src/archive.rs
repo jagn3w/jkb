@@ -548,24 +548,27 @@ pub fn dispose(
         // live worktrees). The rename changed nothing, so the caller's work is simply completed
         // and the tree is handed to `jkb task reap`.
         Err(e) => {
-            // HERE is where the identity is load-bearing: the sweep will come back to a tree
-            // nobody moved, and `still_the_recorded_session` checks this commit before it touches
-            // the path. Without it every sweep takes the "no HEAD was recorded" arm — which names
-            // no action — and the directory sits there for ever. The tree is untouched at this
-            // point (the rename changed nothing), so refusing costs the caller nothing it has not
-            // already done, and the operator still has the directory in front of them.
-            if entry.head.is_none() {
-                anyhow::bail!(
-                    "{} could not be archived from here ({e}), and its HEAD cannot be read from \
-                     the worktree itself — so there is nothing to identify it by when the sweep \
-                     comes back, and it would be held for ever. `git -C {} status` will say what \
-                     git makes of the directory; if it has been partly removed, \
-                     `git -C {} restore .` puts it back.",
-                    worktree.display(),
-                    worktree.display(),
-                    worktree.display()
-                );
-            }
+            // A MISSING IDENTITY IS RECORDED, NOT REFUSED — and the reasoning that made this a
+            // refusal for one round was right about the cost and wrong about who pays it.
+            //
+            // It is true that a record with no head cannot be re-identified, so the sweep will
+            // hold it. But refusing does not avoid that: it leaves the same unarchivable tree on
+            // disk with no record at all, AND takes the caller's plan down with it. `abandon`
+            // calls this through `?`, so the bail returned before the `write_txn` that releases
+            // the claim — leaving the task `in_progress`, held by a session whose worktree still
+            // exists, so `owner::is_alive` says Yes and `doctor --fix` will not reclaim it, and
+            // every re-run of the printed remedy hit the same bail. That is the exact wedge the
+            // comment above says the requirement was moved out of the preamble to avoid; moving
+            // it here fixed the archived path and left it on the deferred one, which in the
+            // container is the ORDINARY path (D49: a session cannot archive its own checkout).
+            //
+            // Recording is strictly better in every direction: the tree is remembered rather than
+            // forgotten, the task is freed, and the state terminates — `still_the_recorded_session`
+            // names the one action that resolves it, and once the operator removes the directory
+            // the sweep's absent-worktree arm prunes git's registration, applies `plan`'s branch
+            // deletion and drops the record. A refusal must leave something worth preserving, and
+            // here there is nothing: the checkout can no longer answer git for itself, and the
+            // operator has already said `--force`.
             if let Err(rec) = record(db, &entry) {
                 eprintln!(
                     "note: {} could not be archived from here ({e}) and the removal record could \
@@ -759,7 +762,14 @@ impl SweepLock {
         match fs::read_to_string(&path) {
             Ok(holder) => {
                 fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-                Ok(Some(holder.trim().to_owned()))
+                // THE THIRD READER, and it was the one not routed through the parser. `holder_of`
+                // says "ONE parser, because there are two readers and they must not disagree";
+                // there were three. `--dry-run --break-lock` goes through `lock_holder` and
+                // prints a clean owner id, while `--break-lock` came through here and printed the
+                // same identity with the nonce glued on — two spellings of one id in adjacent
+                // lines of one command, and the second is not something
+                // `jkb task release --owner` will match.
+                Ok(Some(holder_of(&holder).to_owned()))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -922,12 +932,21 @@ impl Record {
 /// nobody has committed is not something to move out from under whoever is writing it.
 fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
     let Some(want) = entry.head.as_deref() else {
-        return Err(
-            "no HEAD was recorded for it — an older record, or a checkout whose HEAD did not \
-                    resolve when it was written — so it cannot be shown to be the tree the record \
-                    describes"
-                .to_owned(),
-        );
+        // NAMES THE ACTION, because there is one and it terminates. This arm is reachable by
+        // design now: `dispose` records a deferred tree whose HEAD it could not read rather than
+        // refusing (see there for why). Such a record can never become identifiable — nothing
+        // later fills the field in — so "hold and say nothing" would be a permanent hold, which
+        // is what made recording look worse than refusing. Removing the directory by hand is the
+        // resolution: the sweep's absent-worktree arm then prunes git's registration, applies the
+        // record's branch plan and drops the record, so the operator's one step finishes the
+        // disposal rather than merely silencing it.
+        return Err(format!(
+            "no HEAD was recorded for it — an older record, or a checkout that could no longer \
+             answer git for itself when the record was written — so it cannot be shown to be the \
+             tree the record describes, and nothing later can establish that. Remove {} by hand; \
+             the next sweep will then finish the disposal it is owed",
+            entry.worktree.display()
+        ));
     };
     let registered = gitrepo::worktrees(&entry.repo_root)
         .map_err(|e| format!("git could not list this repo's worktrees: {e}"))?
@@ -942,7 +961,16 @@ fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
             entry.worktree.display()
         ));
     }
-    match gitrepo::rev(&entry.worktree, "HEAD") {
+    // `worktree_head`, THE SAME FUNCTION `dispose` WRITES THIS FIELD WITH. `rev(dir, "HEAD")` was
+    // the reader, and git's discovery walks up: once a session's `.git` file is unlinked — the
+    // incident this module exists for — `rev` resolves against the MAIN checkout while the record
+    // holds the session's own tip. Both outcomes are wrong and one is silent. Differing, the sweep
+    // reported "this is a different session reusing the name" about the enclosing repository's
+    // HEAD and held the record for ever on a false diagnosis. EQUAL — ordinary, since the main
+    // checkout commonly sits on the branch the land just fast-forwarded — the identity check
+    // passed on a borrowed value and the sweep went on to move a tree it had never identified.
+    // A field's reader and its writer must be answering about the same tree.
+    match gitrepo::worktree_head(&entry.worktree) {
         Ok(Some(head)) if head == want => {}
         Ok(Some(head)) => {
             return Err(format!(
@@ -951,7 +979,18 @@ fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
             &head[..head.len().min(8)]
         ))
         }
-        Ok(None) => return Err("its HEAD does not resolve".to_owned()),
+        // Now covers "it no longer answers git for itself" as well as an unresolvable HEAD —
+        // `worktree_head` returns `None` for both, deliberately, since neither yields an identity
+        // that is about THIS tree. Same remedy either way.
+        Ok(None) => {
+            return Err(format!(
+                "it does not answer git for itself any more, so its HEAD cannot be compared with \
+                 the one the landing recorded — `git -C {} status` will say what git makes of the \
+                 directory; if it has been partly removed, remove it by hand and the next sweep \
+                 will finish the disposal it is owed",
+                entry.worktree.display()
+            ))
+        }
         Err(e) => return Err(format!("git could not read its HEAD: {e}")),
     }
     if entry.plan.accept_dirty {
@@ -1518,6 +1557,123 @@ mod tests {
         assert!(!wt.exists(), "and is no longer where it was");
     }
 
+    /// A deferred tree whose HEAD cannot be read is RECORDED, not refused — and the state it
+    /// leaves terminates.
+    ///
+    /// Refusing here was the wedge, not the cure. `abandon` calls `dispose` through `?`, so the
+    /// bail returned before the `write_txn` that releases the claim: the task stayed
+    /// `in_progress` under a session owner `is_alive` still says Yes to, `doctor --fix` would not
+    /// reclaim it because the worktree still exists, and re-running hit the same bail. In the
+    /// container this is the ORDINARY path, since a session cannot archive its own checkout.
+    ///
+    /// Recording costs nothing that refusing saved: the same unarchivable tree is on disk either
+    /// way, and only one of the two remembers it.
+    #[test]
+    fn a_deferred_disposal_whose_head_cannot_be_read_is_recorded_rather_than_refused() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, _) = session(&repo, "sess");
+
+        // Nothing can be moved...
+        fs::write(repo.join(".jkb/archive"), b"in the way").expect("write");
+        // ...and the tree can no longer say what it is on. A part-way `git worktree remove`.
+        fs::remove_file(wt.join(".git")).expect("unlink .git");
+        assert_eq!(
+            gitrepo::worktree_head(&wt).expect("head"),
+            None,
+            "the premise: no identity is obtainable from the tree itself"
+        );
+
+        let out = dispose(
+            &db,
+            &repo,
+            &wt,
+            &branch,
+            "task:t",
+            Plan {
+                delete_branch: true,
+                accept_dirty: true,
+            },
+        )
+        .expect("recorded, not refused — the caller's claim release is behind this `?`");
+        assert!(matches!(out, Disposed::Deferred(_)));
+
+        let records = entries(&db).expect("entries").records;
+        assert_eq!(records.len(), 1, "the tree is remembered, not forgotten");
+        assert!(
+            records[0].1.head.is_none(),
+            "and honestly: no identity was obtainable, so none is claimed"
+        );
+
+        // The sweep cannot identify it — correctly — but it must not merely fall silent, because
+        // nothing later fills that field in. It names the one step that ends the state, and the
+        // sweep's absent-worktree arm then prunes git, applies the branch plan and drops the
+        // record. Without this the record is a permanent hold, which is what made refusing look
+        // like the better option.
+        let why =
+            still_the_recorded_session(&records[0].1).expect_err("it cannot be shown to be itself");
+        assert!(
+            why.contains(&wt.display().to_string()) && why.contains("by hand"),
+            "a hold with no action is where this class of record went to die: {why}"
+        );
+    }
+
+    /// The sweep must not identify a worktree by its PARENT's HEAD.
+    ///
+    /// `still_the_recorded_session` asked `rev(&entry.worktree, "HEAD")` while `dispose` wrote
+    /// the field with `worktree_head` — and git's discovery walks up, so once the session's
+    /// `.git` file is unlinked `rev` answers from the main checkout. The dangerous half is the
+    /// SILENT one, built here: when the main checkout happens to sit on the same commit — the
+    /// ordinary state right after a land fast-forwards it — the identity check passed on a
+    /// borrowed value and the sweep went on to move a tree it had never identified.
+    #[test]
+    fn the_sweep_does_not_identify_a_worktree_by_its_parents_head() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, _) = session(&repo, "sess");
+
+        fs::write(repo.join(".jkb/archive"), b"in the way").expect("write");
+        let out = dispose(
+            &db,
+            &repo,
+            &wt,
+            &branch,
+            "task:t",
+            Plan {
+                delete_branch: false,
+                accept_dirty: true,
+            },
+        )
+        .expect("dispose");
+        assert!(matches!(out, Disposed::Deferred(_)));
+        let entry = entries(&db).expect("entries").records.remove(0).1;
+        let want = entry
+            .head
+            .clone()
+            .expect("the session's own tip was recorded");
+
+        // The main checkout is moved onto the very commit the record names — what a land leaves
+        // behind — and then the session's link is broken.
+        git(&repo, &["reset", "--hard", &want]);
+        fs::remove_file(wt.join(".git")).expect("unlink .git");
+        assert_eq!(
+            gitrepo::rev(&wt, "HEAD").expect("rev").as_deref(),
+            Some(want.as_str()),
+            "the premise: the OLD reader would now be handed the recorded commit, from the wrong \
+             tree, and would call the identity established"
+        );
+
+        let why = still_the_recorded_session(&entry)
+            .expect_err("an identity borrowed from the enclosing repo is not this tree's");
+        assert!(
+            !why.contains("different session reusing the name"),
+            "nor is it the other wrong answer — the tree is not a stranger, it is unreadable: \
+             {why}"
+        );
+    }
+
     #[test]
     fn a_deferred_disposal_records_the_head_the_worktree_is_actually_on() {
         let t = tempfile::tempdir().expect("tempdir");
@@ -1625,7 +1781,16 @@ mod tests {
         // What `--break-lock` does. NOT an exotic path across the host/container bind: a foreign
         // holder is `Unknown` there by construction, so `jkb task reap` advises breaking it and
         // the operator is invited to do exactly this against a live sweeper.
-        break_lock(&db).expect("break").expect("there was a holder");
+        // ITS RETURN VALUE, not merely that there was one. `break_held` read the file directly
+        // instead of going through `holder_of`, so `--break-lock` printed the owner id with the
+        // release nonce glued on while `--dry-run --break-lock`, which goes through
+        // `lock_holder`, printed it clean — one identity rendered two ways by adjacent lines of
+        // one command, and the noisy one is not something `jkb task release --owner` matches.
+        assert_eq!(
+            break_lock(&db).expect("break").as_deref(),
+            Some(crate::owner::self_owner().as_str()),
+            "every reader of the lock file goes through the one parser"
+        );
         let Ok(successor) = SweepLock::acquire(&db).expect("acquire") else {
             panic!("the lock is free again once it has been broken")
         };
