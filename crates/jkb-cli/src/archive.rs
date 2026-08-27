@@ -1035,9 +1035,22 @@ pub enum Remedy {
     /// The record cannot be checked against the tree. Disposing again writes a fresh record with
     /// an identity that can be, and `governing_pending` makes the newer one authoritative — so
     /// this supersedes rather than accumulating.
+    ///
+    /// **Only offered for a tree git still registers.** `abandon` reaches a session through
+    /// [`crate::session::discover`], which walks `git worktree list` — so for an unregistered
+    /// directory it finds nothing, writes no record, and this advice changes nothing at all. That
+    /// is [`RemoveByHand`](Self::RemoveByHand)'s case.
     Redispose { uid: String },
     /// A part-way removal, recoverable in full.
     RestoreTree { worktree: PathBuf },
+    /// The tree cannot be identified AND git no longer registers it, so no jkb verb can reach it:
+    /// `abandon` discovers sessions from `git worktree list` and would find nothing to re-record.
+    /// The operator's own look at the directory is the only thing that ends this.
+    ///
+    /// Advising removal is the thing D34.4 warns against, and it is right only here — where the
+    /// tree cannot be shown to be ours, so the reversible alternative (`stow`) is not on offer.
+    /// Everywhere it is on offer, it wins.
+    RemoveByHand { worktree: PathBuf },
     /// Nothing on this machine can act: the repo is not reachable from here.
     NoActionFromHere,
 }
@@ -1051,13 +1064,20 @@ impl Remedy {
                 "`jkb task reap` from a terminal outside the session will finish it".to_owned()
             }
             Self::CommitOrForce { uid } => format!(
-                "commit them in the session, or run `jkb task abandon {uid} --force`, which                  records that you accept them"
+                "commit them in the session, or run `jkb task abandon {uid} --force`, which \
+                 records that you accept them"
             ),
             Self::Redispose { uid } => format!(
-                "run `jkb task abandon {uid} --force` — that records the tree afresh, with an                  identity the sweep can check, and supersedes this record"
+                "run `jkb task abandon {uid} --force` — that records the tree afresh, with an \
+                 identity the sweep can check, and supersedes this record"
             ),
             Self::RestoreTree { worktree } => format!(
                 "`git -C {} restore .` puts them all back",
+                worktree.display()
+            ),
+            Self::RemoveByHand { worktree } => format!(
+                "git no longer registers it, so no jkb verb can reach it — look at {} and remove \
+                 it yourself; the next sweep then finishes the disposal it is owed",
                 worktree.display()
             ),
             Self::NoActionFromHere => {
@@ -1153,17 +1173,16 @@ fn verdict_pending(entry: &Entry, obs: &Observed) -> Verdict {
         }
         Fact::Yes => {}
     }
-    if !obs.registered {
-        return Verdict::Hold(Blocked {
-            reason: format!(
-                "{} is no longer a registered worktree of this repo",
-                entry.worktree.display()
-            ),
-            remedy: Remedy::Redispose {
-                uid: entry.uid.clone(),
-            },
-        });
-    }
+    // REGISTRATION IS NOT EVIDENCE ABOUT IDENTITY, and vetoing on it here was a dead end. A
+    // commit is not reused, so a tree sitting on the commit the record names is the recorded
+    // session whatever `git worktree list` currently says — and `git worktree prune` unregisters
+    // exactly the broken trees these records are written for, so requiring registration required
+    // the absence of a routine cleanup. Worse, the remedy offered was `Redispose`, which cannot
+    // be carried out for an unregistered tree at all (see [`Remedy::Redispose`]): the hold was
+    // permanent and its advice was a sentence.
+    //
+    // What registration really governs is which REMEDY is followable, so it is read below, in the
+    // arms that have one to offer.
     match obs.identity {
         IdentityMatch::Matches => {}
         // THE WRECK IS STOWABLE, and this is the finding that produced this whole seam. A tree
@@ -1179,9 +1198,7 @@ fn verdict_pending(entry: &Entry, obs: &Observed) -> Verdict {
                     "{} is not the tree the record describes",
                     entry.worktree.display()
                 ),
-                remedy: Remedy::Redispose {
-                    uid: entry.uid.clone(),
-                },
+                remedy: unidentified_remedy(entry, obs),
             })
         }
         IdentityMatch::Unestablished => {
@@ -1190,9 +1207,7 @@ fn verdict_pending(entry: &Entry, obs: &Observed) -> Verdict {
                     "{} could not be shown to be the tree the record describes",
                     entry.worktree.display()
                 ),
-                remedy: Remedy::Redispose {
-                    uid: entry.uid.clone(),
-                },
+                remedy: unidentified_remedy(entry, obs),
             })
         }
     }
@@ -1239,6 +1254,26 @@ fn verdict_pending(entry: &Entry, obs: &Observed) -> Verdict {
                 uid: entry.uid.clone(),
             },
         }),
+    }
+}
+
+/// The way out of a hold where the tree in front of us is not the one the record describes.
+///
+/// Both such arms ask this rather than each naming a remedy, because the choice turns on one fact
+/// neither of them is about: **can any jkb verb still reach this tree?** `abandon` — the verb that
+/// would write a fresh, checkable record — discovers sessions from `git worktree list`, so for a
+/// directory git no longer registers it finds nothing and does nothing. Offering `Redispose`
+/// there is offering advice that cannot be followed, which is the whole failure this closed set
+/// exists to make impossible.
+fn unidentified_remedy(entry: &Entry, obs: &Observed) -> Remedy {
+    if obs.registered {
+        Remedy::Redispose {
+            uid: entry.uid.clone(),
+        }
+    } else {
+        Remedy::RemoveByHand {
+            worktree: entry.worktree.clone(),
+        }
     }
 }
 
@@ -1857,6 +1892,98 @@ mod tests {
         );
     }
 
+    /// Git's registration decides which remedy is followable — never whether the tree is ours.
+    ///
+    /// Two halves of one correction, and they pull in opposite directions, so both are asserted.
+    /// A commit id is never reused, so a tree sitting on the recorded commit IS the recorded
+    /// session and registration adds nothing — while `git worktree prune` unregisters precisely
+    /// the broken trees these records get written for, so vetoing on it required the absence of a
+    /// routine cleanup. And where the tree genuinely cannot be identified, registration is what
+    /// decides whether `abandon` can even see it: [`crate::session::discover`] walks
+    /// `git worktree list`, so on an unregistered directory it writes no record and `Redispose`
+    /// is advice that cannot be followed.
+    #[test]
+    fn registration_gates_the_remedy_not_the_identity() {
+        let entry = entry(Path::new("/repo/.jkb/work/s"), Path::new("/repo"));
+        let unregistered = Observed {
+            present: Fact::Yes,
+            registered: false,
+            identity: IdentityMatch::Matches,
+            dirty: Fact::No,
+            deletions_only: None,
+        };
+        assert_eq!(
+            verdict_pending(&entry, &unregistered),
+            Verdict::Stow,
+            "the commit matches, so `git worktree list` has nothing to add — and a prune of a \
+             broken tree must not freeze its own record"
+        );
+
+        let stranger = Observed {
+            identity: IdentityMatch::DifferentSession,
+            ..unregistered.clone()
+        };
+        let Verdict::Hold(blocked) = verdict_pending(&entry, &stranger) else {
+            panic!("a tree that is not ours is never moved")
+        };
+        assert!(
+            matches!(blocked.remedy, Remedy::RemoveByHand { .. }),
+            "and the way out cannot be `jkb task abandon`, which discovers sessions from git's \
+             registration and would find nothing here: {blocked:?}"
+        );
+
+        let stranger_registered = Observed {
+            registered: true,
+            ..stranger
+        };
+        let Verdict::Hold(blocked) = verdict_pending(&entry, &stranger_registered) else {
+            panic!("still not ours")
+        };
+        assert!(
+            matches!(blocked.remedy, Remedy::Redispose { .. }),
+            "but with the tree still registered, re-recording it is reachable: {blocked:?}"
+        );
+    }
+
+    /// Every remedy is a sentence somebody can read — checked over the CLOSED set, so a variant
+    /// added later cannot skip it.
+    ///
+    /// The self-review found two of these rendering `which` + eighteen spaces + `records`: a
+    /// `\`-continued literal whose continuation had been lost, leaving the run of indentation
+    /// inside the string. Nothing caught it, and the reason is the shape this repo keeps meeting —
+    /// [`a_deferral_promises_a_sweep_only_when_one_will_happen`] asserts
+    /// `outlook.contains("jkb task abandon")`, which sits BEFORE the damage, so the assertion was
+    /// satisfied by a mangled string exactly as by a good one. Assert on something the defect
+    /// changes.
+    #[test]
+    fn every_remedy_reads_as_a_sentence() {
+        let all = [
+            Remedy::RunReap,
+            Remedy::CommitOrForce {
+                uid: "task:t".to_owned(),
+            },
+            Remedy::Redispose {
+                uid: "task:t".to_owned(),
+            },
+            Remedy::RestoreTree {
+                worktree: PathBuf::from("/repo/.jkb/work/s"),
+            },
+            Remedy::NoActionFromHere,
+        ];
+        for remedy in all {
+            let advice = remedy.advice();
+            assert!(!advice.trim().is_empty(), "{remedy:?} says nothing");
+            assert!(
+                !advice.contains("  "),
+                "{remedy:?} renders a run of whitespace, so a line continuation was lost: {advice:?}"
+            );
+            assert!(
+                !advice.contains('\n'),
+                "{remedy:?} spans lines, which the one-line hold reports cannot show: {advice:?}"
+            );
+        }
+    }
+
     /// EVERY HOLD HAS AN EXIT — the property that makes a closed `Remedy` worth having.
     ///
     /// This is `Machine::audit`'s `UnreachableRemedy`/`DeadEnd` check, hand-rolled for one
@@ -1933,9 +2060,21 @@ mod tests {
         match remedy {
             // Disposing again writes a fresh record whose identity was just measured, and
             // `governing_pending` makes the newer one authoritative.
-            Remedy::Redispose { .. } => Observed {
+            //
+            // ONLY WHERE GIT STILL REGISTERS THE TREE, and getting this wrong is what let a dead
+            // end through. The first version also set `registered: true` — modelling `abandon` as
+            // able to re-register a worktree, which it cannot do and never claimed to. Under that
+            // model every `Redispose` moved the verdict, so the audit certified an unregistered
+            // tree's hold as escapable when running the advice would have printed "no session"
+            // and changed nothing. A model that grants a remedy an effect it does not have proves
+            // the property about the model.
+            Remedy::Redispose { .. } if obs.registered => Observed {
                 identity: IdentityMatch::Matches,
-                registered: true,
+                ..obs.clone()
+            },
+            // The operator looked and removed it, which is all this one asks.
+            Remedy::RemoveByHand { .. } => Observed {
+                present: Fact::No,
                 ..obs.clone()
             },
             // Both leave the tree with nothing uncommitted in it — one by committing (or by
@@ -1952,9 +2091,15 @@ mod tests {
                 present: Fact::Yes,
                 ..obs.clone()
             },
-            // Not reachable from `verdict_pending` — it is the executor's, for a rename this
-            // process may not perform — so it has no modelled effect here.
-            Remedy::RunReap => obs.clone(),
+            // NOTHING CHANGES, for two different reasons — and the audit reads a remedy with no
+            // modelled effect as a dead end, which is what each of these deserves.
+            //
+            // `RunReap` is not reachable from `verdict_pending` at all: it is the executor's, for
+            // a rename this process may not perform. A `Redispose` that got here is one offered
+            // for an UNREGISTERED tree, which `unidentified_remedy` will not do — `abandon`
+            // discovers sessions from `git worktree list` and would find nothing to re-record, so
+            // running the advice changes nothing and the model must say so.
+            Remedy::RunReap | Remedy::Redispose { .. } => obs.clone(),
         }
     }
 
