@@ -6776,6 +6776,15 @@ fn cmd_task_abandon(
         // being removed, the arm above has already returned; past that point the machine's plan
         // releases the claim with the status, as one value.
         let facts = lifecycle::TaskFacts {
+            // Stated by the caller, and it is entitled to state it: reaching this line means
+            // either the guard above proved the checkout clean (`is_dirty(...).is_no()`, which
+            // an unreadable checkout now fails) or the operator passed `--force`, which is them
+            // supplying the fact — the same decision `Plan::accept_dirty` records for the sweep.
+            //
+            // So `abandon_guard`'s own dirty denial is unreachable from here by construction.
+            // That is deliberate rather than an oversight: the CLI refuses earlier, with a
+            // remedy naming this worktree and the `--force` that overrides it, and `--force`
+            // must not then be vetoed by a second copy of the rule it just answered.
             work_dirty: Fact::No,
             ..task::observe(conn, id)?
         };
