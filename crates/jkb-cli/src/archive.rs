@@ -621,9 +621,17 @@ struct SweepLock {
     ///   the displaced sweeper's `Drop` would delete the successor's lock. APFS hands out
     ///   monotonic inode numbers, which is the only reason the test passed on this machine.
     ///
-    /// So a per-acquisition **nonce** goes in the file beside the owner id. `content` is the whole
-    /// line; `None` if it could not be read back, which disables the release rather than guessing.
-    content: Option<String>,
+    /// So a per-acquisition **nonce** goes in the file beside the owner id, and `content` is the
+    /// whole line as it was read back off disk.
+    ///
+    /// NOT an `Option`. It was one — `None` when the read-back failed — and that spelled "this
+    /// lock has no release identity", which `Drop` could only honour by leaving the file behind
+    /// at the end of a sweep that had run perfectly. The next acquisition then reads an owner id
+    /// of `""`, which `owner::is_alive` cannot recognise and so answers `Fact::Unknown`, which is
+    /// never `is_no()` — so the lock is held for ever by nobody and every later sweep no-ops,
+    /// breakable only by a person running `--break-lock`. A lock that cannot say what it wrote is
+    /// not a lock, so `acquire` removes the file and refuses instead of returning one.
+    content: String,
 }
 
 /// The owner id out of a lock file's `<owner> <nonce>` contents.
@@ -676,6 +684,21 @@ impl SweepLock {
                         fs::read_to_string(&path).ok().filter(|c| c.trim() == line)
                     } else {
                         None
+                    };
+                    let Some(content) = content else {
+                        // Removing it is safe for the reason that makes this arm reachable at
+                        // all: `create_new` succeeded, so this acquisition is the only party
+                        // that can be holding this file, and the identity never landed, so
+                        // nothing else could recognise it either. Leaving it is the one option
+                        // that costs something — see the field's doc.
+                        let _ = fs::remove_file(&path);
+                        anyhow::bail!(
+                            "could not establish a sweep lock at {} — it was created, but what \
+                             was written to it could not be read back, so releasing it later \
+                             could not be told from releasing whoever holds it by then. The file \
+                             has been removed and nothing was swept; try again.",
+                            path.display()
+                        );
                     };
                     return Ok(Ok(Self { path, content }));
                 }
@@ -758,9 +781,7 @@ impl Drop for SweepLock {
     /// parties win into one a party can only lose by being displaced in the instant between, and
     /// the displacing party is a person running `--break-lock`.
     fn drop(&mut self) {
-        let Some(mine) = self.content.as_deref() else {
-            return;
-        };
+        let mine = self.content.as_str();
         if fs::read_to_string(&self.path).is_ok_and(|c| c.trim() == mine) {
             let _ = fs::remove_file(&self.path);
         }
@@ -1644,15 +1665,12 @@ mod tests {
         let Ok(first) = SweepLock::acquire(&db).expect("acquire") else {
             panic!("free to begin with")
         };
-        let one = first
-            .content
-            .clone()
-            .expect("the lock records what it wrote");
+        let one = first.content.clone();
         break_lock(&db).expect("break").expect("there was a holder");
         let Ok(second) = SweepLock::acquire(&db).expect("acquire") else {
             panic!("free again once broken")
         };
-        let two = second.content.clone().expect("and so does its successor");
+        let two = second.content.clone();
 
         assert_ne!(
             one, two,

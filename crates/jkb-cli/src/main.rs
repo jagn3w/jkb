@@ -6186,14 +6186,15 @@ fn settle_landing(
     // `has_branch` answers a `Fact`, and only a PROVEN absence is a deletion. It used to collapse
     // any non-zero git exit to `false`, so an unreadable `packed-refs` printed "removed its
     // branch" — the one direction that costs something, because it stops the operator looking.
-    // Now `Unknown` and `Err` land together on `Kept`, which is what the comment always claimed.
-    let branch_fate = match gitrepo::has_branch(&ctx.root, landed.branch) {
-        Ok(f) if f.is_yes() && matches!(disposal, Disposal::Deferred(_)) => {
-            BranchFate::OwedToTheReaper
-        }
-        Ok(f) if f.is_no() => BranchFate::Deleted,
-        Ok(_) | Err(_) => BranchFate::Kept,
-    };
+    // `Err` — git not executable at all — is the same unestablished answer, so it is spelled as
+    // one rather than as a fourth arm that has to be kept in step with the other three.
+    let branch_fate = branch_fate(
+        // `land` always plans the deletion: its branch is a duplicate of commits now in the
+        // target. `archive::Plan { delete_branch: true }`, a few lines above.
+        true,
+        gitrepo::has_branch(&ctx.root, landed.branch).unwrap_or(Fact::Unknown),
+        matches!(disposal, Disposal::Deferred(_)),
+    );
     report_landing(
         &landed,
         sess,
@@ -6715,15 +6716,11 @@ fn cmd_task_abandon(
     // when it archived the tree — and folded into ONE value, so no two lines can disagree.
     // Three-valued, and an unestablished answer is reported as still there rather than as gone:
     // saying a branch was deleted when git could not say is what stops somebody looking for it.
+    // `deferred.is_some()` is passed because "the reaper will delete it" is a claim about the
+    // RECORD, not about the branch: with the tree archived (or already gone) there is no record,
+    // so nothing will ever apply the plan and the operator has to do it themselves.
     let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
-    let branch_fate = match (delete_branch, still_there.is_no()) {
-        (false, false) => BranchFate::Kept,
-        (false, true) => BranchFate::Absent,
-        // Asked for and still there: the deferred worktree has it checked out, so `git branch -D`
-        // would refuse. The record's `Plan` carries the decision and the reaper applies it.
-        (true, false) => BranchFate::OwedToTheReaper,
-        (true, true) => BranchFate::Deleted,
-    };
+    let branch_fate = branch_fate(delete_branch, still_there, deferred.is_some());
 
     // Release, and reopen unless the task is already finished.
     //
@@ -6925,6 +6922,42 @@ enum BranchFate {
     /// Asked for, and owed: the deferred worktree still has it checked out, so `git branch -D`
     /// would refuse. `jkb task reap` deletes it once the tree is archived.
     OwedToTheReaper,
+}
+
+/// The one rule, applied by both callers — which is what the enum above says it is for, and what
+/// the two of them had stopped doing again.
+///
+/// `present` is three-valued and only a **proven** absence is a deletion. The arm that was wrong
+/// is the other one: "asked to delete and not proven absent" was read as `OwedToTheReaper`
+/// without asking whether anything had been deferred. In `abandon` nothing has been, in the only
+/// case that reaches it — the branch is deleted right here when it is proven there, so arriving
+/// undeleted with no record means the answer was `Unknown` — and the line it prints then promises
+/// a deletion `jkb task reap` will never perform, because there is no record for it to act on.
+///
+/// **The reaper is owed something only when a record exists.** That is the fact the message is
+/// about, so it is the fact the fate is derived from.
+///
+/// The two `bool`s are deliberately not adjacent: with `present` between them a transposition is
+/// a type error rather than a silently wrong answer, which is the one thing a three-argument
+/// signature of mostly-`bool` can do about its own worst failure mode.
+fn branch_fate(asked_to_delete: bool, present: Fact, deferred: bool) -> BranchFate {
+    if present.is_no() {
+        // Nothing there. Which of the two got it there is not a distinction with a remedy, and
+        // neither fate prints one; they differ only in what the JSON reports.
+        return if asked_to_delete {
+            BranchFate::Deleted
+        } else {
+            BranchFate::Absent
+        };
+    }
+    if asked_to_delete && deferred {
+        BranchFate::OwedToTheReaper
+    } else {
+        // `Unknown` lands here rather than on `Deleted`: reporting a deletion nobody observed is
+        // the one direction that costs something, because it stops the operator looking. The
+        // remedy this prints (`git branch -D`) merely errors on a branch that is already gone.
+        BranchFate::Kept
+    }
 }
 
 fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool) {
@@ -8248,6 +8281,45 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::GUIDE;
     use jkb_types::TaskStatus;
+
+    /// The reaper is owed a branch only when there is a RECORD for it to act on.
+    ///
+    /// Round 8 made `has_branch` three-valued, correctly, and then derived the fate from
+    /// `(asked_to_delete, present.is_no())` alone — so an `Unknown` with nothing deferred printed
+    /// "branch X will be deleted when `jkb task reap` archives the checkout" about a checkout
+    /// that had already been archived. Nothing would ever delete it, and the operator was told
+    /// not to.
+    ///
+    /// Reachable exactly where the three-valued answer is: `cmd_task_abandon` deletes the branch
+    /// itself when it is proven present, so the only way to reach the fate undeleted with no
+    /// record is git failing to answer — an unreadable `packed-refs`, the state the round-8 test
+    /// builds.
+    #[test]
+    fn a_branch_is_owed_to_the_reaper_only_when_a_record_will_reach_it() {
+        use super::{branch_fate, BranchFate};
+        use jkb_fsm::Fact;
+
+        for present in [Fact::Yes, Fact::Unknown] {
+            assert!(
+                branch_fate(true, present, true) == BranchFate::OwedToTheReaper,
+                "a deferred tree still holds the branch, and its record carries the plan"
+            );
+            assert!(
+                branch_fate(true, present, false) == BranchFate::Kept,
+                "with no record nothing will ever apply the plan, so promising the reaper will \
+                 is telling the operator not to do the one thing left to do"
+            );
+            assert!(
+                branch_fate(false, present, true) == BranchFate::Kept,
+                "a deletion nobody asked for is not owed to anyone"
+            );
+        }
+        // A proven absence is the only deletion, whatever else is true.
+        for deferred in [true, false] {
+            assert!(branch_fate(true, Fact::No, deferred) == BranchFate::Deleted);
+            assert!(branch_fate(false, Fact::No, deferred) == BranchFate::Absent);
+        }
+    }
 
     /// Both `--status` enumerations name every status the CLI accepts.
     ///

@@ -488,6 +488,11 @@ pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
 /// So callers must state their polarity: a guard says `is_no()` (refuse when unreadable), a
 /// report says `is_yes()` or renders all three.
 ///
+/// `dir` must be a **worktree root** — every caller here passes a session checkout, `.jkb/base`
+/// or a repo root. Handed a subdirectory this answers [`Fact::Unknown`] rather than reporting on
+/// the enclosing repository, which is [`worktree_identity`]'s whole subject: a question asked
+/// about one tree must not be answered by another.
+///
 /// # Errors
 /// Returns an error if `git` cannot be executed at all. A `git` that ran and failed is
 /// [`Fact::Unknown`], not an error and emphatically not `No`.

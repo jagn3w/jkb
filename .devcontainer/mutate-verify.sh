@@ -334,7 +334,19 @@ if [ "${#caught_expects[@]}" -gt 0 ]; then
 fi
 all_paths="$(grep -nE '^[[:space:]]*(bad "|assert )' "$V" 2>/dev/null | cut -d: -f1 | sort -un)"
 n_all="$(printf '%s' "$all_paths" | grep -c '^' || true)"
-uncovered="$(comm -13 <(printf '%s\n' "$covered" | grep -v '^$') <(printf '%s\n' "$all_paths" | grep -v '^$'))"
+# NOT `comm`, which requires both inputs in ITS collating order — bytes — while these are line
+# numbers sorted NUMERICALLY. The two orders disagree the moment the file passes 99 lines: `100`
+# sorts after `12` here and before it there. Measured against this very verify.sh, with ten of
+# its twenty-five paths marked covered: every one of the twenty-five came back uncovered and the
+# summary read `0 of 25`. It errs towards claiming LESS than was established, which is the safe
+# direction and is why it survived a round — but a coverage report that always says none is one
+# nobody reads, and it buries the paths that genuinely have never been driven.
+#
+# `grep -vxF -f` asks set membership instead, which needs no ordering from either side. An empty
+# `covered` leaves an empty pattern file, which matches nothing, so `-v` yields every path: the
+# right answer for a run that caught nothing, and the reason this needs no special case.
+uncovered="$(printf '%s\n' "$all_paths" | grep -v '^$' \
+    | grep -vxF -f <(printf '%s\n' "$covered" | grep -v '^$') || true)"
 n_cov=$(( n_all - $(printf '%s' "$uncovered" | grep -c '^' || true) ))
 printf '\033[32m%d mutation(s) caught, and the matcher was shown to discriminate\033[0m\n' "$caught"
 if [ -n "$uncovered" ]; then
