@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use jkb_fsm::Fact;
+
+use crate::presence::present_under;
 use jkb_types::{AgentId, Liveness};
 use rustix::io::Errno;
 use rustix::process::{self, Pid};
@@ -123,9 +125,8 @@ pub fn is_alive(owner: &str) -> Fact {
         // holds that number: a live owner reported dead, or a dead one alive. Unknown is the only
         // honest answer for another host, and unknown never frees anything (D48.10).
         Liveness::Process { host, pid } if host == hostname() => pid_exists(pid),
-        // `Path::exists` is itself lossy — it answers `false` for a permission error as well as
-        // for a missing directory — so it is asked through `try_exists`, which separates them.
-        // And an absence is only proof where the place it would be is visible; see `absent_here`.
+        // An absence is only proof where the place it would be is visible, and for an owner id
+        // the only anchor available is the path's own parent — see [`present_here`].
         Liveness::Worktree(dir) => present_here(&dir),
         // An owner on another host and an external agent are the same answer for the same
         // reason: nothing here can establish it. Never "dead" — see the module docs.
@@ -148,48 +149,6 @@ pub fn is_alive(owner: &str) -> Fact {
 ///
 /// A pid that cannot be represented is [`Fact::No`], not `Unknown`: no process can carry an id
 /// outside `pid_t`, so its absence is established rather than merely unobserved.
-/// Whether `path` is there, as far as this machine can establish.
-///
-/// AN ABSENCE IS ONLY PROOF WHERE YOU CAN SEE THE PLACE IT WOULD BE — the same rule the archive
-/// sweep applies to a record whose repo it cannot reach. `Liveness::Process` was host-qualified so
-/// a container's pid is not probed against this machine's process table; a filesystem path is no
-/// more portable across that boundary, and it was left un-qualified. A host session claims as
-/// `session:<pid>:/Users/…/.jkb/work/sess`; inside the container that path does not exist, so a
-/// bare `try_exists` answered `false`, `Fact::No`, and `reclaim_dead` freed the claim of a session
-/// running on the host — with `abandon` and `task work` then acting against it.
-///
-/// The session owner id carries no host, so the question is asked of the filesystem instead: the
-/// directory that would CONTAIN it must be visible. On the host `…/.jkb/work` exists and a missing
-/// `sess` is real; in the container it does not, so nothing is established. That is sound in both
-/// directions and needs no change to an id format already written into databases.
-///
-/// Deliberately conservative at the edge: if the parent is gone too — someone removed `.jkb/work`
-/// wholesale — this answers `Unknown` and the claim is reported rather than freed. Of the two ways
-/// to be wrong, the one that costs a command wins (D34.4).
-/// Answers the question the caller asks, rather than its inverse: the first version returned
-/// "is it absent" and every arm was then flipped at the call site, which is one edit away from
-/// reading backwards in the probe that decides whether a claim may be freed.
-/// Also [`crate::gitrepo::worktree_identity`]'s absence test, which is the same question about
-/// the same kind of path — a session worktree. It had a second answer there (`Path::exists()`,
-/// which reports `false` for any stat error, so an unreadable path became a PROVEN absence and
-/// then `Fact::No` from `is_dirty`, i.e. "proven clean"). Two answers to one question, with the
-/// newer and weaker one feeding every guard in the landing path.
-pub(crate) fn present_here(path: &Path) -> Fact {
-    match path.try_exists() {
-        Ok(true) => Fact::Yes,
-        Err(_) => Fact::Unknown,
-        Ok(false) => match path.parent() {
-            // A path with no parent is `/`, whose absence is not a thing to reason about.
-            None => Fact::Unknown,
-            // The place it would be is visible, so it really is gone.
-            Some(parent) => match parent.try_exists() {
-                Ok(true) => Fact::No,
-                _ => Fact::Unknown,
-            },
-        },
-    }
-}
-
 fn pid_exists(pid: u32) -> Fact {
     let Ok(raw) = i32::try_from(pid) else {
         return Fact::No;
@@ -198,6 +157,33 @@ fn pid_exists(pid: u32) -> Fact {
         return Fact::No;
     };
     liveness_from(process::test_kill_process(pid))
+}
+
+/// Whether a session worktree named by an OWNER ID is there — the one caller with no anchor
+/// available but the path's own parent.
+///
+/// `Liveness::Process` was host-qualified so a container's pid is not probed against this
+/// machine's process table; a filesystem path is no more portable across that boundary, and it
+/// was left un-qualified. A host session claims as `session:<pid>:/Users/…/.jkb/work/sess`;
+/// inside the container that path does not exist, so a bare `try_exists` answered `false`,
+/// `Fact::No`, and `reclaim_dead` freed the claim of a session running on the host.
+///
+/// An owner id is a bare string: unlike every other caller of [`present_under`], nothing here
+/// holds a repo root to anchor on, so the containing directory is the best evidence available.
+/// On the host `…/.jkb/work` exists and a missing `sess` is real; in the container it does not,
+/// so nothing is established.
+///
+/// That the parent is a WEAK anchor is the price, and it is paid in the right direction: someone
+/// who removes `.jkb/work` wholesale gets `Unknown` here, and a claim reported rather than freed.
+/// The same weakness is a defect on the landing path — where it wedged `jkb task land` after a
+/// `git clean -xdf` — which is why that path anchors on the repo root instead. See
+/// [`present_under`] for choosing one.
+fn present_here(path: &Path) -> Fact {
+    match path.parent() {
+        // A path with no parent is `/`, whose absence is not a thing to reason about.
+        None => Fact::Unknown,
+        Some(parent) => present_under(path, parent),
+    }
 }
 
 /// The result-to-fact mapping, kept pure so every arm is reachable from a test — including errnos

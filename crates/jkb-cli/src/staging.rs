@@ -392,7 +392,7 @@ fn stage_task(
     // lost" warning and the command then refused without `--force`. The cost the skip was
     // for is the commit count (`git rev-list` per row), not `git status`.
     let dirty = match sess {
-        Some(s) => gitrepo::is_dirty(&s.worktree)?,
+        Some(s) => gitrepo::is_dirty(&s.worktree, &ctx.root)?,
         // No checkout to be dirty. `Fact::No` and not `Unknown`: this is established — there is
         // nothing there — rather than unobserved, and `land_blocker` refuses a session-less task
         // on its own arm above this one anyway.
@@ -500,7 +500,7 @@ pub(crate) fn target_dirty_reason(
     let is_dirty = if let Some(known) = dirty.get(&dir) {
         *known
     } else {
-        let answer = gitrepo::is_dirty(&dir)?;
+        let answer = gitrepo::is_dirty(&dir, root)?;
         dirty.insert(dir.clone(), answer);
         answer
     };

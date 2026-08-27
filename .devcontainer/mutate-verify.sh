@@ -359,6 +359,13 @@ if [ "$n_all" -eq 0 ]; then
     # one nothing catches a regression here, because this harness needs Docker and is in no gate.
     printf '\033[31m  could not enumerate any failure paths in %s — this coverage report has\n' "$V"
     printf '  certified NOTHING. Check the path and the `bad "` / `assert ` shapes it looks for.\033[0m\n'
+    # AND THE VERDICT, not only the rendering. This block is the last statement in the file, so
+    # printing alone left `$?` at 0 and a harness that certified nothing reported success —
+    # `check-config.sh` exits non-zero for its version of this. Deliberately NOT extended to the
+    # partial-coverage arm below: that one is a READING of a working meter, and the file already
+    # says why it is reported and not gated (several paths need a broken machine, not a docker
+    # flag). This arm is a BROKEN meter, which is a different claim and must not pass.
+    exit 1
 elif [ -n "$uncovered" ]; then
     printf '  %d of %d failure paths in verify.sh were driven here. NOT covered by this run:\n' \
         "$n_cov" "$n_all"

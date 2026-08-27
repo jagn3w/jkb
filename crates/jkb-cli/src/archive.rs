@@ -37,6 +37,7 @@ use jkb_fsm::Fact;
 use serde::{Deserialize, Serialize};
 
 use crate::gitrepo;
+use crate::presence;
 
 /// How long an archived worktree is kept before the sweep deletes it.
 pub const RETAIN_DAYS: u64 = 30;
@@ -462,6 +463,42 @@ pub fn stow(repo_root: &Path, worktree: &Path, at: u64) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// A disposal nobody could carry out here, and what will become of the record it left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferral {
+    /// Why this process could not move the tree.
+    pub why: String,
+    /// What a later sweep will do with the record — the SAME answer `jkb task reap` executes.
+    pub verdict: Verdict,
+}
+
+impl Deferral {
+    /// The sentence to print after "it could not be archived from here": either the promise that
+    /// something else will finish it, or the reason nothing will and what to do instead.
+    #[must_use]
+    pub fn outlook(&self) -> String {
+        match &self.verdict {
+            Verdict::Stow => {
+                "it is recorded for `jkb task reap`, which the watcher service runs".to_owned()
+            }
+            Verdict::DropRecord => "the checkout is already gone, so nothing is owed".to_owned(),
+            // NEVER a promise here. This is the case the reports used to describe as work in
+            // hand, while the sweep could not touch it.
+            Verdict::Hold(b) => format!(
+                "it is recorded, but `jkb task reap` will not be able to finish it: {} — {}",
+                b.reason,
+                b.remedy.advice()
+            ),
+        }
+    }
+
+    /// Whether a later sweep will actually act on the record — what a promise may be made about.
+    #[must_use]
+    pub fn will_be_swept(&self) -> bool {
+        matches!(self.verdict, Verdict::Stow | Verdict::DropRecord)
+    }
+}
+
 /// What became of a worktree this process tried to dispose of.
 pub enum Disposed {
     /// Moved into the repo's archive.
@@ -469,7 +506,7 @@ pub enum Disposed {
     /// Nothing moved — this process may not unlink the tree — and a record was left for the
     /// reaper. Carries the refusal, because "it did not work" without the reason is what makes an
     /// operator go looking in the wrong place.
-    Deferred(String),
+    Deferred(Deferral),
 }
 
 /// Dispose of one session worktree, and leave a record either way.
@@ -507,7 +544,7 @@ pub fn dispose(
     // this function's caller documents having already fixed once. `head` is read by the sweep
     // only to re-identify a DEFERRED tree; an archived record names its archive and needs no
     // identity at all, so the requirement belongs in that arm and nowhere else.
-    let head = gitrepo::worktree_head(worktree)
+    let head = gitrepo::worktree_head(worktree, repo_root)
         .with_context(|| format!("reading HEAD in {}", worktree.display()))?;
     let mut entry = Entry {
         worktree: worktree.to_path_buf(),
@@ -577,7 +614,16 @@ pub fn dispose(
                     worktree.display()
                 );
             }
-            Ok(Disposed::Deferred(e.to_string()))
+            // THE VERDICT ON THE RECORD JUST WRITTEN, so the caller's report is derived rather
+            // than assumed. Every verb used to print that `jkb task reap` would finish this —
+            // and for a tree that could not answer git for itself, no sweep could. A promise
+            // about another process's future behaviour has to come from the thing that decides
+            // it.
+            let verdict = pending_verdict(&entry);
+            Ok(Disposed::Deferred(Deferral {
+                why: e.to_string(),
+                verdict,
+            }))
         }
     }
 }
@@ -924,108 +970,282 @@ impl Record {
     }
 }
 
-/// Whether the tree at `entry.worktree` is still the session this record is about.
+/// How the tree at `entry.worktree` compares with the identity the record carries.
 ///
-/// Three questions, all of which must answer yes, and any of which failing HOLDS: git still
-/// registers that path as a worktree of this repo, it is still sitting on the commit the landing
-/// recorded, and it has nothing uncommitted. The first two establish identity — a path and a
-/// branch name are reusable, a commit is not — and the third is the ordinary safety rule: work
-/// nobody has committed is not something to move out from under whoever is writing it.
-fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
-    let Some(want) = entry.head.as_deref() else {
-        // NAMES THE ACTION, because there is one and it terminates. This arm is reachable by
-        // design now: `dispose` records a deferred tree whose HEAD it could not read rather than
-        // refusing (see there for why). Such a record can never become identifiable — nothing
-        // later fills the field in — so "hold and say nothing" would be a permanent hold, which
-        // is what made recording look worse than refusing. Removing the directory by hand is the
-        // resolution: the sweep's absent-worktree arm then prunes git's registration, applies the
-        // record's branch plan and drops the record, so the operator's one step finishes the
-        // disposal rather than merely silencing it.
-        return Err(format!(
-            "no HEAD was recorded for it — an older record, or a checkout that could no longer \
-             answer git for itself when the record was written — so it cannot be shown to be the \
-             tree the record describes, and nothing later can establish that. Remove {} by hand; \
-             the next sweep will then finish the disposal it is owed",
-            entry.worktree.display()
-        ));
-    };
-    let registered = gitrepo::worktrees(&entry.repo_root)
-        .map_err(|e| format!("git could not list this repo's worktrees: {e}"))?
-        .into_iter()
-        // Canonical comparison: git reports `/private/var/...` where the record holds
-        // `/var/...` on macOS, and a raw equality answers "not registered" for the very
-        // directory you are standing in.
-        .any(|w| crate::session::same_path(&w.path, &entry.worktree));
-    if !registered {
-        return Err(format!(
-            "{} is no longer a registered worktree of this repo",
-            entry.worktree.display()
-        ));
+/// A path and a branch are reusable names; establishing that the tree is the one the record
+/// describes is what makes acting on it safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityMatch {
+    /// The tree answers for itself and is on the commit the record names.
+    Matches,
+    /// The record says this tree could not answer git for itself, AND IT STILL CANNOT — so the
+    /// observation the record made is still true of the thing in front of us.
+    ///
+    /// `head: None` is not a missing field, and reading it as one is what made these records
+    /// unfinishable. It is an observation: *when I saw this tree it could not say what it was
+    /// on*. That is verifiable later, and this is the verification.
+    StillTheWreck,
+    /// The tree answers, and says something else — a different session reusing the name, or a
+    /// wreck somebody repaired.
+    DifferentSession,
+    /// Nothing could be established either way.
+    Unestablished,
+}
+
+/// What the sweep will do with one PENDING record — the one answer, executed by the sweep and
+/// rendered by every verb that promises something about it.
+///
+/// The choke point exists because the promises and the behaviour diverged: `report_landing`,
+/// `report_abandon`, `BranchFate::OwedToTheReaper` and `jkb doctor` each hand-wrote a claim that
+/// `jkb task reap` would finish the job, while the sweep bailed before it could. That is the
+/// disease `staging::land_blocker` was written to cure one area over — "**THE** rule, in one
+/// place, so the command and the row cannot describe different rules". Same cure here.
+///
+/// Deliberately only about a pending record. An archived one is a different and much simpler
+/// question — containment plus age — and no verb makes a promise about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Move it into the archive: a lossless rename, reversible for the retention window.
+    Stow,
+    /// Nothing is owed. Prune git's registration, apply the branch plan, stop tracking it.
+    DropRecord,
+    /// Held, with the reason and the action that changes it.
+    Hold(Blocked),
+}
+
+/// Why a record is held, and the one thing that unblocks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// What was observed, in a sentence.
+    pub reason: String,
+    /// What to do about it. A CLOSED set, so a hold cannot be reported with advice nobody
+    /// checked — the failure D48 records as "a printed remedy whose obvious argument froze the
+    /// task permanently", found twice, one message apart.
+    pub remedy: Remedy,
+}
+
+/// The actions that resolve a hold. Rendered in exactly one place, [`Remedy::advice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remedy {
+    /// Another process finishes it: the watcher service, or `jkb task reap` run from a terminal
+    /// outside the session that made the record.
+    RunReap,
+    /// The tree holds work nobody has committed.
+    CommitOrForce { uid: String },
+    /// The record cannot be checked against the tree. Disposing again writes a fresh record with
+    /// an identity that can be, and `governing_pending` makes the newer one authoritative — so
+    /// this supersedes rather than accumulating.
+    Redispose { uid: String },
+    /// A part-way removal, recoverable in full.
+    RestoreTree { worktree: PathBuf },
+    /// Nothing on this machine can act: the repo is not reachable from here.
+    NoActionFromHere,
+}
+
+impl Remedy {
+    /// The advice, in one place, so two verbs cannot word one action differently.
+    #[must_use]
+    pub fn advice(&self) -> String {
+        match self {
+            Self::RunReap => {
+                "`jkb task reap` from a terminal outside the session will finish it".to_owned()
+            }
+            Self::CommitOrForce { uid } => format!(
+                "commit them in the session, or run `jkb task abandon {uid} --force`, which                  records that you accept them"
+            ),
+            Self::Redispose { uid } => format!(
+                "run `jkb task abandon {uid} --force` — that records the tree afresh, with an                  identity the sweep can check, and supersedes this record"
+            ),
+            Self::RestoreTree { worktree } => format!(
+                "`git -C {} restore .` puts them all back",
+                worktree.display()
+            ),
+            Self::NoActionFromHere => {
+                "nothing here can act on it; run it where that repo is checked out".to_owned()
+            }
+        }
     }
-    // `worktree_head`, THE SAME FUNCTION `dispose` WRITES THIS FIELD WITH. `rev(dir, "HEAD")` was
-    // the reader, and git's discovery walks up: once a session's `.git` file is unlinked — the
-    // incident this module exists for — `rev` resolves against the MAIN checkout while the record
-    // holds the session's own tip. Both outcomes are wrong and one is silent. Differing, the sweep
-    // reported "this is a different session reusing the name" about the enclosing repository's
-    // HEAD and held the record for ever on a false diagnosis. EQUAL — ordinary, since the main
-    // checkout commonly sits on the branch the land just fast-forwarded — the identity check
-    // passed on a borrowed value and the sweep went on to move a tree it had never identified.
-    // A field's reader and its writer must be answering about the same tree.
-    match gitrepo::worktree_head(&entry.worktree) {
-        Ok(Some(head)) if head == want => {}
-        Ok(Some(head)) => {
-            return Err(format!(
-            "it is on {} now, not the {want} the landing recorded — this is a different session \
-                 reusing the name",
-            &head[..head.len().min(8)]
-        ))
+}
+
+/// Everything the verdict is decided from — gathered once, so the decision is a pure function of
+/// what was seen and can be exercised over its whole product in a test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    /// Is the worktree there, anchored on the repo root (see [`crate::presence`])?
+    pub present: Fact,
+    /// Does git still register that path as a worktree of this repo?
+    pub registered: bool,
+    /// How the tree compares with the recorded identity.
+    pub identity: IdentityMatch,
+    /// Uncommitted work in the tree.
+    pub dirty: Fact,
+    /// When the dirt is nothing but deletions of tracked files: how many. A part-way removal
+    /// wants the opposite advice from real work (the 62,421-deleted-lines incident).
+    pub deletions_only: Option<usize>,
+}
+
+/// Look at the tree a pending record names.
+fn observe_pending(entry: &Entry) -> Observed {
+    let present = presence::present_under(&entry.worktree, &entry.repo_root);
+    let registered = gitrepo::worktrees(&entry.repo_root).is_ok_and(|ws| {
+        ws.into_iter()
+            // Canonical comparison: git reports `/private/var/...` where the record holds
+            // `/var/...` on macOS, and a raw equality answers "not registered" for the very
+            // directory you are standing in.
+            .any(|w| crate::session::same_path(&w.path, &entry.worktree))
+    });
+    // `worktree_head`/`worktree_identity`, THE SAME FUNCTIONS `dispose` WRITES THE FIELD WITH.
+    // `rev(dir, "HEAD")` was once the reader, and git's discovery walks up: with a session's
+    // `.git` file unlinked it resolves against the MAIN checkout while the record holds the
+    // session's own tip. A field's reader and its writer must answer about the same tree.
+    let identity = match entry.head.as_deref() {
+        Some(want) => match gitrepo::worktree_head(&entry.worktree, &entry.repo_root) {
+            Ok(Some(head)) if head == want => IdentityMatch::Matches,
+            Ok(Some(_)) => IdentityMatch::DifferentSession,
+            Ok(None) | Err(_) => IdentityMatch::Unestablished,
+        },
+        // The record made an observation rather than leaving a field blank; check it still holds.
+        None => match gitrepo::worktree_identity(&entry.worktree, &entry.repo_root) {
+            Ok(gitrepo::WorktreeIdentity::Foreign) => IdentityMatch::StillTheWreck,
+            // It answers for itself now, so it is not the thing the record described — either a
+            // repaired tree or a different session at the same path. Either way the record's
+            // observation is stale and a fresh one is the way out.
+            Ok(gitrepo::WorktreeIdentity::Own) => IdentityMatch::DifferentSession,
+            Ok(gitrepo::WorktreeIdentity::Absent) | Err(_) => IdentityMatch::Unestablished,
+        },
+    };
+    let dirty = gitrepo::is_dirty(&entry.worktree, &entry.repo_root).unwrap_or(Fact::Unknown);
+    let deletions_only = if dirty.is_yes() {
+        gitrepo::deletions_only(&entry.worktree).ok().flatten()
+    } else {
+        None
+    };
+    Observed {
+        present,
+        registered,
+        identity,
+        dirty,
+        deletions_only,
+    }
+}
+
+/// What to do with a pending record, from observations alone.
+///
+/// **The identity bar scales with how destructive the act is**, which is the rule that unwedged
+/// this. `stow` is an atomic rename into `.jkb/archive` that preserves every byte and stays
+/// reversible for the retention window, so it needs only that the tree is still plausibly the
+/// one the record describes. Nothing here licenses an irreversible act on a weaker identity —
+/// and the previous behaviour, holding for ever while advising the operator to delete the
+/// directory by hand, had it exactly backwards: it refused the reversible action and recommended
+/// the irreversible one (D34.4).
+fn verdict_pending(entry: &Entry, obs: &Observed) -> Verdict {
+    match obs.present {
+        // Gone already. Whoever removed it did the sweep's work; the branch plan still applies.
+        Fact::No => return Verdict::DropRecord,
+        Fact::Unknown => {
+            return Verdict::Hold(Blocked {
+                reason: format!(
+                    "{} could not be read, so whether it is still there is unestablished",
+                    entry.worktree.display()
+                ),
+                remedy: Remedy::NoActionFromHere,
+            })
         }
-        // Now covers "it no longer answers git for itself" as well as an unresolvable HEAD —
-        // `worktree_head` returns `None` for both, deliberately, since neither yields an identity
-        // that is about THIS tree. Same remedy either way.
-        Ok(None) => {
-            return Err(format!(
-                "it does not answer git for itself any more, so its HEAD cannot be compared with \
-                 the one the landing recorded — `git -C {} status` will say what git makes of the \
-                 directory; if it has been partly removed, remove it by hand and the next sweep \
-                 will finish the disposal it is owed",
+        Fact::Yes => {}
+    }
+    if !obs.registered {
+        return Verdict::Hold(Blocked {
+            reason: format!(
+                "{} is no longer a registered worktree of this repo",
                 entry.worktree.display()
-            ))
+            ),
+            remedy: Remedy::Redispose {
+                uid: entry.uid.clone(),
+            },
+        });
+    }
+    match obs.identity {
+        IdentityMatch::Matches => {}
+        // THE WRECK IS STOWABLE, and this is the finding that produced this whole seam. A tree
+        // that cannot answer git for itself cannot answer `is_dirty` either, so requiring it
+        // clean would rebuild the wedge one column over. The dirty check is waived HERE, for a
+        // reason written down rather than by omission: the question is unanswerable in principle
+        // for a wreck, and `stow` loses nothing — where the alternative on offer was telling the
+        // operator to delete the directory.
+        IdentityMatch::StillTheWreck => return Verdict::Stow,
+        IdentityMatch::DifferentSession => {
+            return Verdict::Hold(Blocked {
+                reason: format!(
+                    "{} is not the tree the record describes",
+                    entry.worktree.display()
+                ),
+                remedy: Remedy::Redispose {
+                    uid: entry.uid.clone(),
+                },
+            })
         }
-        Err(e) => return Err(format!("git could not read its HEAD: {e}")),
+        IdentityMatch::Unestablished => {
+            return Verdict::Hold(Blocked {
+                reason: format!(
+                    "{} could not be shown to be the tree the record describes",
+                    entry.worktree.display()
+                ),
+                remedy: Remedy::Redispose {
+                    uid: entry.uid.clone(),
+                },
+            })
+        }
     }
     if entry.plan.accept_dirty {
         // The operator passed `--force`: they have already decided about whatever is in there,
         // and asking again would hold this record for ever over the very thing they answered.
-        return Ok(());
+        return Verdict::Stow;
     }
-    match gitrepo::is_dirty(&entry.worktree) {
+    match obs.dirty {
         // Proven clean, and nothing weaker. `is_dirty` used to spell "git ran and failed" as
-        // `false`, so a worktree whose `.git` had been unlinked part-way — the very incident
-        // this module exists to make unrepresentable — read as clean and was archived on the
-        // strength of it. The arm below already refused when git could not be *executed*; this
-        // is the same refusal for a git that executed and could not answer.
-        Ok(f) if f.is_no() => Ok(()),
-        Ok(f) if f.is_unknown() => Err(format!(
-            "git could not say whether it has uncommitted changes — `git -C {} status` will \
-             say what it makes of the directory",
-            entry.worktree.display()
-        )),
-        Ok(_) => Err(match gitrepo::deletions_only(&entry.worktree) {
-            // The third site of this rule, and the one that was still telling an operator to
-            // commit 62,000 deleted lines. A tree that is only MISSING files is a part-way
-            // removal, not work, and the two want opposite advice.
-            Ok(Some(n)) => format!(
-                "its {n} change(s) are deletions of tracked files and nothing else — a part-way \
-                 removal, not work. `git -C {} restore .` puts them all back",
+        // `false`, so a worktree whose `.git` had been unlinked part-way read as clean and was
+        // archived on the strength of it.
+        f if f.is_no() => Verdict::Stow,
+        f if f.is_yes() => Verdict::Hold(match obs.deletions_only {
+            // A tree that is only MISSING files is a part-way removal, not work, and the two
+            // want opposite advice — the third site of this rule, and the one that was still
+            // telling an operator to commit 62,000 deleted lines.
+            Some(n) => Blocked {
+                reason: format!(
+                    "its {n} change(s) are deletions of tracked files and nothing else — a \
+                     part-way removal, not work"
+                ),
+                remedy: Remedy::RestoreTree {
+                    worktree: entry.worktree.clone(),
+                },
+            },
+            None => Blocked {
+                reason: "it has uncommitted changes".to_owned(),
+                remedy: Remedy::CommitOrForce {
+                    uid: entry.uid.clone(),
+                },
+            },
+        }),
+        // NOT `Redispose`, which the audit below caught: the tree is identified — a fresh
+        // record would carry the same identity and the same unreadable status, so the advice
+        // led straight back here. What resolves it is making the tree readable, or saying the
+        // dirt is accepted, which is what this remedy offers.
+        _ => Verdict::Hold(Blocked {
+            reason: format!(
+                "git could not say whether {} has uncommitted changes",
                 entry.worktree.display()
             ),
-            _ => "it has uncommitted changes — commit them, or drop the session with \
-                  `jkb task abandon <uid> --force`, which records that you accept them"
-                .to_owned(),
+            remedy: Remedy::CommitOrForce {
+                uid: entry.uid.clone(),
+            },
         }),
-        Err(e) => Err(format!("git could not check it for changes: {e}")),
     }
+}
+
+/// The verdict for a pending record, observations and all — the one entry point.
+#[must_use]
+pub fn pending_verdict(entry: &Entry) -> Verdict {
+    verdict_pending(entry, &observe_pending(entry))
 }
 
 /// Which pending record governs each worktree: the newest, by `recorded_at`, ties broken by
@@ -1135,7 +1355,11 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         // removed it by hand" and dropped the record, and the multi-gigabyte checkout it named was
         // then referenced by nothing and never deleted. An absent directory is evidence of removal
         // only when the repo it lives under is reachable in the first place (D45.5).
-        if !entry.repo_root.exists() {
+        // THE ANCHOR ITSELF, asked the same way as everything it licenses. It was a bare
+        // `exists()` — safe, because both `No` and `Unknown` land in this held arm, but a third
+        // spelling of the question in the very function that states the rule, and it is what
+        // every absence below hangs from.
+        if !matches!(entry.repo_root.try_exists(), Ok(true)) {
             report.held.push((
                 entry.uid.clone(),
                 format!(
@@ -1172,11 +1396,12 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
 /// Sibling of [`sweep_archived`], and split out for the same reason — the reachability check that
 /// licenses reading an absence at all runs in the caller, above both.
 fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, report: &mut Report) {
-    // The repo is reachable by the time we get here, so an absent worktree really is one somebody
-    // removed.
-    match still_there(&entry.worktree) {
-        // Gone already. Tidy git's registration and the branch, then stop tracking.
-        Fact::No => {
+    // ONE decision, and it is not made here. The sweep EXECUTES the verdict that
+    // `report_landing`, `report_abandon` and `jkb doctor` all render, so a verb can no longer
+    // promise something the sweep will not do — which it did, for every record whose tree could
+    // not answer git for itself.
+    match pending_verdict(entry) {
+        Verdict::DropRecord => {
             if !dry_run {
                 let _ = gitrepo::prune_worktrees(&entry.repo_root);
                 delete_branch_if_any(entry);
@@ -1184,31 +1409,14 @@ fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, repo
             drop_marker(marker, dry_run, report, &entry.uid);
             return;
         }
-        // The stat never came back, so nobody has established this session was removed — and
-        // the two things the arm above does are the destructive pair (`delete_branch` is
-        // forced, and an abandoned branch is the only copy of its commits).
-        Fact::Unknown => {
+        Verdict::Hold(blocked) => {
             report.held.push((
                 entry.uid.clone(),
-                format!(
-                    "{} could not be read, so whether it is still there is unestablished — \
-                     the record is kept and nothing was removed",
-                    entry.worktree.display()
-                ),
+                format!("{} — {}", blocked.reason, blocked.remedy.advice()),
             ));
             return;
         }
-        Fact::Yes => {}
-    }
-    // Identity, before anything destructive. A record names a path and a branch, and both are
-    // reusable names; establishing that the tree is still the one it describes is what makes
-    // acting on them safe.
-    if let Err(why) = still_the_recorded_session(entry) {
-        report.held.push((
-            entry.uid.clone(),
-            format!("{}: {why}", entry.worktree.display()),
-        ));
-        return;
+        Verdict::Stow => {}
     }
     if dry_run {
         report
@@ -1237,9 +1445,16 @@ fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, repo
             delete_branch_if_any(entry);
             report.archived.push((entry.uid.clone(), dest));
         }
+        // The verdict said stow and the rename refused — which is ORDINARY rather than an error:
+        // a session cannot unlink its own checkout, so a sweep run from inside one lands here for
+        // its own tree while every other process moves it freely.
         Err(e) => report.held.push((
             entry.uid.clone(),
-            format!("{} could not be moved: {e}", entry.worktree.display()),
+            format!(
+                "{} could not be moved: {e} — {}",
+                entry.worktree.display(),
+                Remedy::RunReap.advice()
+            ),
         )),
     }
 }
@@ -1258,7 +1473,7 @@ fn sweep_archived(
     dry_run: bool,
     report: &mut Report,
 ) {
-    match still_there(dir) {
+    match presence::present_under(dir, &entry.repo_root) {
         // Somebody removed it by hand. Nothing owed, so stop tracking it.
         Fact::No => {
             drop_marker(marker, dry_run, report, &entry.uid);
@@ -1323,35 +1538,6 @@ fn drop_marker(marker: &Path, dry_run: bool, report: &mut Report, uid: &str) {
 /// Deleting the branch is tidiness, not correctness: its commits are in the target by the time
 /// anything here runs. A branch somebody checked out elsewhere, or already deleted, is not an
 /// error worth stopping an unattended sweep for.
-/// Is a session worktree (or its archive) still there — asked wherever an absence licenses
-/// something destructive, which is every disposal site in this crate.
-///
-/// Four of them, and each had its own `Path::exists()`: the sweep's two arms below, and
-/// `abandon_session`'s and `land`'s "already gone" shortcuts. `Path::exists()` answers `false`
-/// for ANY stat error. An untraversable
-/// `.jkb/work` therefore read as *the operator removed this session*: git's registration pruned,
-/// the record's branch **force-deleted** — and after `abandon --delete-branch` that branch holds
-/// the only copy of the commits — and the record dropped, leaving the checkout on disk with
-/// nothing tracking it. The archived arm answered the same way about a whole archive directory.
-/// It is the defect [`crate::gitrepo::worktree_identity`] had, at the sites the fix for that one
-/// did not reach; a rule each call site has to remember is the defect, so it is stated here and
-/// the callers ask it rather than each spelling an absence for themselves.
-///
-/// Deliberately NOT [`crate::owner::present_here`], which is the same question asked where the
-/// filesystem itself may be the wrong one: it reports an absent path with an absent PARENT as
-/// `Unknown`, because that is the signature of looking across the container bind rather than of a
-/// removal. Here the repo root is established reachable first — above both sweep arms (D45.5),
-/// and by holding a `RepoCtx` in the two verbs — which is precisely that hypothesis excluded.
-/// Inheriting the parent rule would also hold every record under a hand-removed `.jkb/archive`
-/// for ever, with no action left that could clear them, and a permanent hold is the failure this
-/// module has already been burned by once.
-///
-/// `Fact::No` is the only answer that licenses acting: `Unknown` means the stat never came back,
-/// which is not evidence of anything.
-pub(crate) fn still_there(path: &Path) -> Fact {
-    Fact::maybe(path.try_exists().ok())
-}
-
 fn delete_branch_if_any(entry: &Entry) {
     if entry.plan.delete_branch && !entry.branch.is_empty() {
         let _ = gitrepo::delete_branch(&entry.repo_root, &entry.branch, true);
@@ -1606,7 +1792,7 @@ mod tests {
         // A part-way `git worktree remove`: the directory is intact, its `.git` link is not.
         fs::remove_file(wt.join(".git")).expect("unlink .git");
         assert_eq!(
-            gitrepo::worktree_head(&wt).expect("head"),
+            gitrepo::worktree_head(&wt, &repo).expect("head"),
             None,
             "and the tree can no longer say what it is on"
         );
@@ -1628,6 +1814,148 @@ mod tests {
         };
         assert!(dest.exists(), "the tree really moved");
         assert!(!wt.exists(), "and is no longer where it was");
+    }
+
+    /// A record the sweep will hold is never reported as work in hand.
+    ///
+    /// The second half of the must-fix, and the reason `Deferral` carries a verdict at all.
+    /// `report_landing`, `report_abandon`, `branch_fate` and `jkb doctor` each hand-wrote "`jkb
+    /// task reap` will finish this" from the mere fact that a record had been written — so an
+    /// operator was sent, repeatedly, to run a command that would report the same hold for ever.
+    #[test]
+    fn a_deferral_promises_a_sweep_only_when_one_will_happen() {
+        let held = Deferral {
+            why: "permission denied".to_owned(),
+            verdict: Verdict::Hold(Blocked {
+                reason: "it is not the tree the record describes".to_owned(),
+                remedy: Remedy::Redispose {
+                    uid: "task:t".to_owned(),
+                },
+            }),
+        };
+        assert!(!held.will_be_swept(), "nothing will act on it");
+        let outlook = held.outlook();
+        assert!(
+            !outlook.contains("which the watcher service runs"),
+            "and it must not say something will: {outlook}"
+        );
+        assert!(
+            outlook.contains("will not be able to finish it")
+                && outlook.contains("jkb task abandon"),
+            "it says so, and what to do instead: {outlook}"
+        );
+
+        let owed = Deferral {
+            why: "permission denied".to_owned(),
+            verdict: Verdict::Stow,
+        };
+        assert!(owed.will_be_swept(), "this one really is in hand");
+        assert!(
+            owed.outlook().contains("jkb task reap"),
+            "so it may say so: {}",
+            owed.outlook()
+        );
+    }
+
+    /// EVERY HOLD HAS AN EXIT — the property that makes a closed `Remedy` worth having.
+    ///
+    /// This is `Machine::audit`'s `UnreachableRemedy`/`DeadEnd` check, hand-rolled for one
+    /// function because the disposal record does not (yet) earn a lifecycle table. D48 records
+    /// the failure it prevents: "passes 31 and 32 are the same finding one message apart — a
+    /// printed remedy whose obvious argument froze the task permanently". The whole of round
+    /// 10's must-fix is one instance — a hold whose advice was "remove it by hand", printed for
+    /// a tree that might hold uncommitted work.
+    ///
+    /// So: walk the product of what can be observed, and for every `Hold`, apply what the remedy
+    /// says and require the verdict to move. A remedy that leaves the verdict where it was is a
+    /// sentence, not a way out.
+    #[test]
+    fn every_hold_names_a_remedy_that_actually_leads_out() {
+        let facts = [Fact::Yes, Fact::No, Fact::Unknown];
+        let identities = [
+            IdentityMatch::Matches,
+            IdentityMatch::StillTheWreck,
+            IdentityMatch::DifferentSession,
+            IdentityMatch::Unestablished,
+        ];
+        let mut holds = 0;
+        for present in facts {
+            for registered in [true, false] {
+                for identity in identities {
+                    for dirty in facts {
+                        for deletions_only in [None, Some(3)] {
+                            for accept_dirty in [true, false] {
+                                let entry = Entry {
+                                    plan: Plan {
+                                        delete_branch: false,
+                                        accept_dirty,
+                                    },
+                                    ..entry(Path::new("/repo/.jkb/work/s"), Path::new("/repo"))
+                                };
+                                let obs = Observed {
+                                    present,
+                                    registered,
+                                    identity,
+                                    dirty,
+                                    deletions_only,
+                                };
+                                let Verdict::Hold(blocked) = verdict_pending(&entry, &obs) else {
+                                    continue;
+                                };
+                                holds += 1;
+                                let after =
+                                    verdict_pending(&entry, &applied(&blocked.remedy, &obs));
+                                assert_ne!(
+                                    Verdict::Hold(blocked.clone()),
+                                    after,
+                                    "doing what it says changes nothing, so this hold is \
+                                     permanent: {obs:?} -> {blocked:?}"
+                                );
+                                assert!(
+                                    !blocked.remedy.advice().is_empty(),
+                                    "and it must actually say something"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(holds > 0, "the walk must actually reach some holds");
+    }
+
+    /// What the world looks like once the operator has done what the remedy says.
+    ///
+    /// Deliberately a MODEL of the remedy rather than a re-run of the code: the point is to state
+    /// what each piece of advice is supposed to achieve, so a remedy whose advice does not
+    /// achieve it fails above.
+    fn applied(remedy: &Remedy, obs: &Observed) -> Observed {
+        match remedy {
+            // Disposing again writes a fresh record whose identity was just measured, and
+            // `governing_pending` makes the newer one authoritative.
+            Remedy::Redispose { .. } => Observed {
+                identity: IdentityMatch::Matches,
+                registered: true,
+                ..obs.clone()
+            },
+            // Both leave the tree with nothing uncommitted in it — one by committing (or by
+            // `--force`, which records that the dirt is accepted, honoured through
+            // `plan.accept_dirty`), the other by putting a part-way removal back. Same observable
+            // state, reached two ways.
+            Remedy::CommitOrForce { .. } | Remedy::RestoreTree { .. } => Observed {
+                dirty: Fact::No,
+                deletions_only: None,
+                ..obs.clone()
+            },
+            // Run where the repo is reachable: the stat that could not be taken is taken.
+            Remedy::NoActionFromHere => Observed {
+                present: Fact::Yes,
+                ..obs.clone()
+            },
+            // Not reachable from `verdict_pending` — it is the executor's, for a rename this
+            // process may not perform — so it has no modelled effect here.
+            Remedy::RunReap => obs.clone(),
+        }
     }
 
     /// A deferred tree whose HEAD cannot be read is RECORDED, not refused — and the state it
@@ -1653,7 +1981,7 @@ mod tests {
         // ...and the tree can no longer say what it is on. A part-way `git worktree remove`.
         fs::remove_file(wt.join(".git")).expect("unlink .git");
         assert_eq!(
-            gitrepo::worktree_head(&wt).expect("head"),
+            gitrepo::worktree_head(&wt, &repo).expect("head"),
             None,
             "the premise: no identity is obtainable from the tree itself"
         );
@@ -1679,16 +2007,17 @@ mod tests {
             "and honestly: no identity was obtainable, so none is claimed"
         );
 
-        // The sweep cannot identify it — correctly — but it must not merely fall silent, because
-        // nothing later fills that field in. It names the one step that ends the state, and the
-        // sweep's absent-worktree arm then prunes git, applies the branch plan and drops the
-        // record. Without this the record is a permanent hold, which is what made refusing look
-        // like the better option.
-        let why =
-            still_the_recorded_session(&records[0].1).expect_err("it cannot be shown to be itself");
-        assert!(
-            why.contains(&wt.display().to_string()) && why.contains("by hand"),
-            "a hold with no action is where this class of record went to die: {why}"
+        // AND THE SWEEP CAN FINISH IT. `head: None` is the observation "this tree could not say
+        // what it was on", not a blank field, and the tree is still exactly that — so the record
+        // is verifiable and `stow`, which loses nothing, is what happens. Read as a missing
+        // field it bailed before every later check, so no sweep could ever act while `land`,
+        // `abandon`, `branch_fate` and `doctor` all promised one would; the remedy it printed
+        // was to delete the directory by hand, which is strictly more destructive than the
+        // rename it was refusing (D34.4, inverted).
+        assert_eq!(
+            pending_verdict(&records[0].1),
+            Verdict::Stow,
+            "a wreck the record describes as a wreck is still identifiable"
         );
     }
 
@@ -1738,19 +2067,21 @@ mod tests {
              tree, and would call the identity established"
         );
 
-        let why = still_the_recorded_session(&entry)
-            .expect_err("an identity borrowed from the enclosing repo is not this tree's");
-        assert!(
-            !why.contains("different session reusing the name"),
-            "nor is it the other wrong answer — the tree is not a stranger, it is unreadable: \
-             {why}"
+        let verdict = pending_verdict(&entry);
+        assert_ne!(
+            verdict,
+            Verdict::Stow,
+            "an identity borrowed from the enclosing repo is not this tree's, so nothing is moved"
         );
-        // POSITIVELY, not only by excluding one wrong answer: an assertion that merely rules out
-        // a single wording is satisfied by every other wording too, including ones that name no
-        // action. This arm has a remedy and must say it.
+        // POSITIVELY, not only by excluding the wrong answer: a hold whose remedy is unstated is
+        // where this class of record went to die. The record names a head the tree can no longer
+        // be compared against, and disposing again is what replaces it with one that can.
+        let Verdict::Hold(blocked) = verdict else {
+            panic!("held, not acted on: {verdict:?}")
+        };
         assert!(
-            why.contains("does not answer git for itself") && why.contains("remove it by hand"),
-            "and it says what state the tree is in and what ends it: {why}"
+            matches!(blocked.remedy, Remedy::Redispose { .. }),
+            "and the way out is a fresh record, which supersedes this one: {blocked:?}"
         );
     }
 

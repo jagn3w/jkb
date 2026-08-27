@@ -496,8 +496,8 @@ pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
 /// # Errors
 /// Returns an error if `git` cannot be executed at all. A `git` that ran and failed is
 /// [`Fact::Unknown`], not an error and emphatically not `No`.
-pub fn is_dirty(dir: &Path) -> Result<Fact> {
-    match worktree_identity(dir)? {
+pub fn is_dirty(dir: &Path, anchor: &Path) -> Result<Fact> {
+    match worktree_identity(dir, anchor)? {
         // Nothing there IS an answer: an absent directory holds no uncommitted work. Spelling it
         // `Unknown` refused, for ever, a landing that used to complete — git keeps listing a
         // worktree whose directory was removed (`prunable`), so `session::discover` still returns
@@ -527,20 +527,26 @@ pub fn is_dirty(dir: &Path) -> Result<Fact> {
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
-pub fn worktree_identity(dir: &Path) -> Result<WorktreeIdentity> {
+pub fn worktree_identity(dir: &Path, anchor: &Path) -> Result<WorktreeIdentity> {
     // Absence is established without asking git, and must be: git answers for the enclosing repo
     // when handed a path that is not there, which would make a removed worktree read as `Own`.
     //
-    // Asked through `owner::present_here` rather than `Path::exists()`, which was the second
-    // answer this crate carried to one question. `exists()` reports `false` for ANY stat error —
-    // an untraversable parent (EACCES), ELOOP, ENAMETOOLONG — so an unreadable path became
-    // `Absent`, and `Absent` is `Fact::No`, which is "proven clean": the exact spelling this
-    // module exists to forbid, feeding `land`'s post-gate check, `abandon_session`'s ensure,
-    // `land_dir_for`'s pre-`switch` check and the sweep's identity guard. `present_here` is
-    // three-valued and additionally requires the containing directory to be VISIBLE before it
-    // calls an absence proven — written after a bare `try_exists` false freed a live session's
-    // claim across the container bind, which is the same path this function is handed.
-    match crate::owner::present_here(dir) {
+    // Asked through `presence::present_under` rather than `Path::exists()`, which answers `false`
+    // for ANY stat error — an untraversable parent (EACCES), ELOOP, ENAMETOOLONG — so an
+    // unreadable path became `Absent`, and `Absent` is `Fact::No`, which is "proven clean": the
+    // spelling this module exists to forbid, feeding `land`'s post-gate check,
+    // `abandon_session`'s ensure, `land_dir_for`'s pre-`switch` check and the sweep's identity
+    // guard.
+    //
+    // THE ANCHOR IS THE REPO ROOT, and it is the caller's to supply because only the caller knows
+    // it. Anchoring on the path's own parent — which is what the owner-id probe does, having
+    // nothing better — is wrong here and was a must-fix: `.jkb/` is in `.git/info/exclude`, so
+    // `git clean -xdf` removes `.jkb/work` and every checkout under it while git goes on listing
+    // them as prunable. Parent gone plus worktree gone reads as `Unknown`, `is_dirty` says
+    // `Unknown`, and `land_blocker` then refuses for ever, printing a `git -C <worktree> status`
+    // remedy about a directory that is not there. The repo root is the anchor no ordinary
+    // operation removes.
+    match crate::presence::present_under(dir, anchor) {
         Fact::No => return Ok(WorktreeIdentity::Absent),
         // Not established that it is there, and not established that it is gone. Nothing this
         // function could ask git afterwards would be about `dir` either.
@@ -581,8 +587,8 @@ pub enum WorktreeIdentity {
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
-pub fn worktree_head(dir: &Path) -> Result<Option<String>> {
-    if worktree_identity(dir)? == WorktreeIdentity::Own {
+pub fn worktree_head(dir: &Path, anchor: &Path) -> Result<Option<String>> {
+    if worktree_identity(dir, anchor)? == WorktreeIdentity::Own {
         rev(dir, "HEAD")
     } else {
         Ok(None)
@@ -1105,7 +1111,7 @@ mod tests {
         let t = tempfile::tempdir().expect("tempdir");
 
         // Not a git repository at all, which is what an unlinked `.git` leaves behind.
-        let answer = is_dirty(t.path()).expect("git is executable");
+        let answer = is_dirty(t.path(), t.path()).expect("git is executable");
         assert_eq!(
             answer,
             Fact::Unknown,
@@ -1115,6 +1121,45 @@ mod tests {
             !answer.is_no(),
             "and every guard asks `is_no()`, which must therefore be false here — this is the \
              assertion that fails if `is_dirty` ever collapses back to a bool"
+        );
+    }
+
+    /// `git clean -xdf` takes `.jkb/work` with it, and a landing must still complete.
+    ///
+    /// THE ANCHOR IS WHY THIS PASSES. `.jkb/` is in `.git/info/exclude`, so git treats the whole
+    /// directory as junk and removes it — while still listing the worktrees under it as
+    /// prunable, so `session::discover` returns them and `jkb task land` asks about a checkout
+    /// whose parent is gone too. Anchored on the worktree's own PARENT — which is what an owner
+    /// id must do, having nothing better — that reads `Unknown`, `is_dirty` reads `Unknown`, and
+    /// `land_blocker` refuses for ever while printing a `git -C <worktree> status` remedy about a
+    /// directory that is not there. Anchored on the repo root, which no ordinary operation
+    /// removes, the absence is established and the landing completes through
+    /// `Disposal::AlreadyGone` — the behaviour `a_worktree_directory_that_is_gone_...` above
+    /// records as already fixed once.
+    #[test]
+    fn a_session_whose_whole_work_directory_was_cleaned_is_absent_not_unknown() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let root = t.path();
+        fixture(root);
+        let wt = root.join(".jkb/work/x");
+        std::fs::create_dir_all(&wt).expect("mkdir");
+
+        // What `git clean -xdf` leaves: the excluded directory and everything under it, gone.
+        std::fs::remove_dir_all(root.join(".jkb")).expect("clean");
+        assert!(
+            !wt.parent().expect("parent").exists(),
+            "the premise — the PARENT is gone too, which is the whole difficulty"
+        );
+
+        assert_eq!(
+            super::worktree_identity(&wt, root).expect("identity"),
+            super::WorktreeIdentity::Absent,
+            "the repo root is visible, so the absence is established"
+        );
+        assert_eq!(
+            super::is_dirty(&wt, root).expect("is_dirty"),
+            Fact::No,
+            "and nothing there holds uncommitted work, so the landing is not refused"
         );
     }
 
@@ -1146,11 +1191,11 @@ mod tests {
         assert!(add.status.success(), "{add:?}");
 
         assert_eq!(
-            super::worktree_identity(&wt).expect("identity"),
+            super::worktree_identity(&wt, root).expect("identity"),
             super::WorktreeIdentity::Own,
             "the intact worktree answers for itself"
         );
-        let own_head = super::worktree_head(&wt).expect("head");
+        let own_head = super::worktree_head(&wt, root).expect("head");
         assert!(own_head.is_some(), "and has a HEAD of its own");
 
         std::fs::remove_file(wt.join(".git")).expect("unlink .git");
@@ -1164,17 +1209,17 @@ mod tests {
         );
 
         assert_eq!(
-            super::worktree_identity(&wt).expect("identity"),
+            super::worktree_identity(&wt, root).expect("identity"),
             super::WorktreeIdentity::Foreign,
             "an answer sourced from the enclosing repo is not about this tree"
         );
         assert_eq!(
-            super::is_dirty(&wt).expect("is_dirty"),
+            super::is_dirty(&wt, root).expect("is_dirty"),
             Fact::Unknown,
             "so dirtiness is unestablished, not the parent's cleanliness"
         );
         assert_eq!(
-            super::worktree_head(&wt).expect("head"),
+            super::worktree_head(&wt, root).expect("head"),
             None,
             "and a session never borrows its parent's HEAD as its own identity"
         );
@@ -1191,11 +1236,11 @@ mod tests {
         let t = tempfile::tempdir().expect("tempdir");
         let gone = t.path().join("removed");
         assert_eq!(
-            super::worktree_identity(&gone).expect("identity"),
+            super::worktree_identity(&gone, t.path()).expect("identity"),
             super::WorktreeIdentity::Absent
         );
         assert_eq!(
-            super::is_dirty(&gone).expect("is_dirty"),
+            super::is_dirty(&gone, t.path()).expect("is_dirty"),
             Fact::No,
             "nothing there holds no uncommitted work"
         );
@@ -1222,8 +1267,10 @@ mod tests {
         // Everything is measured while the parent is untraversable, then it is restored so the
         // tempdir can be cleaned up whatever the assertions do.
         let stat = std::fs::metadata(&wt).err().map(|e| e.kind());
-        let identity = super::worktree_identity(&wt);
-        let dirty = super::is_dirty(&wt);
+        // Anchored on the tempdir root, which is plainly VISIBLE — so the only thing that
+        // fails is the stat of `wt` itself, and the answer must still not be a proven absence.
+        let identity = super::worktree_identity(&wt, t.path());
+        let dirty = super::is_dirty(&wt, t.path());
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("restore");
 
         // Asserted, not assumed: as root the chmod does not bite, and without this the test would
