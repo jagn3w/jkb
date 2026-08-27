@@ -1213,10 +1213,16 @@ fn finish_observation(
     identity: IdentityMatch,
 ) -> Observed {
     let dirty = gitrepo::is_dirty(&entry.worktree, &entry.repo_root).unwrap_or(Fact::Unknown);
+    // `Unknown` — NOT `NotOnly` — when the question was never asked. Nothing reads this outside
+    // the `dirty.is_yes()` arm today, so the difference is inert; it is written the honest way
+    // anyway because `NotOnly` claims something was ESTABLISHED, and the whole defect this
+    // observation seam keeps producing is an unasked question wearing an answer's spelling. An
+    // arm added later that reads `deletions` without checking `dirty` first would be told a clean
+    // tree holds real work.
     let deletions = if dirty.is_yes() {
         gitrepo::deletions_only(&entry.worktree).unwrap_or(gitrepo::Deletions::Unknown)
     } else {
-        gitrepo::Deletions::NotOnly
+        gitrepo::Deletions::Unknown
     };
     Observed {
         present,

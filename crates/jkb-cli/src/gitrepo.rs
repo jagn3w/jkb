@@ -661,7 +661,11 @@ pub enum Deletions {
     /// Every change is a deletion of a tracked file, and there are this many. A part-way removal,
     /// recoverable in full with `git restore .`.
     Only(usize),
-    /// Established to be something else: staged work, untracked files, or edits alongside.
+    /// Established to be something else: staged work, untracked files, edits alongside — or
+    /// nothing at all. A clean tree lands here rather than in `Only(0)`, which would read as a
+    /// part-way removal of no files and license `git restore .` advice about nothing; the
+    /// function is contracted to be asked only of a dirty tree, and this is what it says if it
+    /// is not.
     NotOnly,
     /// `git` did not answer, so nothing is established about what the dirt is.
     Unknown,

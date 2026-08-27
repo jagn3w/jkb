@@ -5869,6 +5869,13 @@ fn land_preflight(
         (Some(work), Some(target)) => gitrepo::ahead_count(&ctx.root, target, work)?,
         _ => 0,
     };
+    // The last of the four deliberate collapses, and the only one worth a word about safety: an
+    // empty list makes `target_dirty_reason` find no checkout for `onto` and report it clean, so
+    // in principle a land could graft into a dirty target on the strength of a question git did
+    // not answer. It cannot get that far — `land_dir_for` asks the same broken git a moment later
+    // and refuses (an existing `.jkb/base` it cannot see registered) or fails outright (a
+    // `worktree add` that needs the same git) — so the preflight's optimism is bounded by the
+    // graft's own pessimism rather than by anything here.
     let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
@@ -7071,24 +7078,28 @@ fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
     // opposite, and rendering the two the same is the hand-written "a sweep will finish this"
     // claim the verdict seam exists to stop. `pending_outlook` also applies supersession, so a
     // withdrawn record does not put a badge on a live session.
-    let awaiting: std::collections::BTreeSet<PathBuf> = archive::pending_outlook(db_path)
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|(_, v)| !matches!(v, archive::Verdict::Hold(_)))
-                .map(|(e, _)| e.worktree)
-                .collect()
-        })
-        .unwrap_or_default();
-    // Held records, so the listing can say a checkout needs attention rather than silently
-    // omitting it — an absent badge reads as "nothing outstanding".
-    let stuck: std::collections::BTreeSet<PathBuf> = archive::pending_outlook(db_path)
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|(_, v)| matches!(v, archive::Verdict::Hold(_)))
-                .map(|(e, _)| e.worktree)
-                .collect()
-        })
-        .unwrap_or_default();
+    //
+    // ONE read, partitioned — not two filtered reads of the same thing. Each `pending_outlook`
+    // re-observes every record, which means a `git worktree list` and a `git status` per pending
+    // checkout; asked twice they can disagree, and a worktree that changed underneath between the
+    // two calls would land in BOTH sets or in NEITHER. Two answers to one question, which is the
+    // shape `pending_outlook` was just introduced to remove from these two surfaces.
+    //
+    // Held records get their own set rather than being folded into the one above, so the listing
+    // can say a checkout needs attention rather than silently omitting it — an absent badge reads
+    // as "nothing outstanding".
+    let (stuck, awaiting): (std::collections::BTreeSet<PathBuf>, _) =
+        archive::pending_outlook(db_path)
+            .map(|rows| {
+                let (held, moving): (Vec<_>, Vec<_>) = rows
+                    .into_iter()
+                    .partition(|(_, v)| matches!(v, archive::Verdict::Hold(_)));
+                let paths = |rs: Vec<(archive::Entry, archive::Verdict)>| {
+                    rs.into_iter().map(|(e, _)| e.worktree).collect()
+                };
+                (paths(held), paths(moving))
+            })
+            .unwrap_or_default();
 
     let mut rows = Vec::new();
     for s in &sessions {

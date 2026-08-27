@@ -429,6 +429,83 @@ fn a_deferred_abandon_still_reopens_the_task_and_keeps_the_branch() {
     f.jkb().args(["task", "work", &uid]).assert().success();
 }
 
+/// A deferred disposal is badged by **what the sweep will do with it**, not by the existence of
+/// a record.
+///
+/// `[awaiting archive]` is a promise that something is going to finish this. A record the sweep
+/// will HOLD is the opposite claim, and rendering the two the same is the hand-written
+/// "a sweep will finish this" the verdict seam exists to stop — an operator reading the listing
+/// to find live work would wait for a move that nothing was ever going to make.
+///
+/// The two states are provoked from ONE record, so what changes between the assertions is only
+/// what the sweep can do about it. A test that made two records could pass while the badge merely
+/// tracked which command wrote them.
+#[test]
+fn a_deferred_session_is_badged_by_what_the_sweep_will_do_with_it() {
+    let f = Fixture::new();
+    let uid = f.add_task("badged session task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "g.txt", "work\n", "add g");
+
+    // The same provocation the deferral test above uses: nothing can be moved into a regular file.
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").expect("block the archive");
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert!(
+        wt.exists(),
+        "the premise: the tree it could not move is still there"
+    );
+
+    let row = |f: &Fixture| -> serde_json::Value {
+        let out = f
+            .jkb()
+            .args(["task", "sessions", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "task sessions: {out:?}");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+        rows.iter()
+            .find(|r| r["worktree"].as_str() == wt.to_str())
+            .unwrap_or_else(|| panic!("the deferred checkout is listed: {rows:?}"))
+            .clone()
+    };
+
+    let clean = row(&f);
+    assert_eq!(
+        clean["awaiting_archive"],
+        serde_json::json!(true),
+        "a clean, identified tree is one the next sweep moves: {clean}"
+    );
+    assert_eq!(
+        clean["archive_blocked"],
+        serde_json::json!(false),
+        "and nothing is blocking it: {clean}"
+    );
+
+    // Now put something in it that no sweep may throw away. The record has not changed; what the
+    // sweep can do about it has.
+    std::fs::write(wt.join("untracked.txt"), "mine\n").expect("dirty the tree");
+    let dirty = row(&f);
+    assert_eq!(
+        dirty["archive_blocked"],
+        serde_json::json!(true),
+        "uncommitted work holds the disposal, and the listing must say so: {dirty}"
+    );
+    assert_eq!(
+        dirty["awaiting_archive"],
+        serde_json::json!(false),
+        "the two are never both true — that would promise a move and refuse it at once: {dirty}"
+    );
+
+    // And `doctor` agrees, from the same read: it is the surface the badge sends you to.
+    f.jkb()
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is HELD"))
+        .stdout(predicate::str::contains("1 awaiting archive"));
+}
+
 /// Abandoning returns the task to the frontier and takes the checkout with it — but keeps
 /// the branch, because the commits on it are real work.
 #[test]
