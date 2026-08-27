@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use jkb_fsm::Fact;
 
 /// Branch names tried, in order, when a repo does not say which branch is its trunk.
 const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
@@ -459,10 +460,30 @@ pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
 /// untracked). Untracked files count: a session's new module is untracked until it is
 /// added, and landing without it would land a branch that does not build.
 ///
+/// **Three-valued, and that is the whole point.** This returned `Result<bool>` and mapped a
+/// `git status` that exited non-zero — an unlinked `.git`, a corrupt index, a worktree whose
+/// administrative directory has been pruned — to `false`, i.e. *clean*. Every one of the eight
+/// callers is a guard standing in front of something destructive (`reset --hard`, an archiving
+/// rename, `git switch` across branches, the graft itself), so "git could not answer" was read
+/// as "safe to proceed" at all of them.
+///
+/// That is the defect [`Fact`] exists to prevent, named in its own module docs — *is that
+/// checkout clean* is the example given — and `CLAUDE.md` already states the rule this now
+/// satisfies: **landing needs `work_dirty.is_no()`; an unreadable checkout refuses.** The
+/// machine's [`jkb_core::lifecycle::TaskFacts::work_dirty`] was three-valued all along and its
+/// guard asks `is_no()` correctly; the CLI simply never had an `Unknown` to give it, because the
+/// collapse happened here, at the boundary, before the type could carry it.
+///
+/// So callers must state their polarity: a guard says `is_no()` (refuse when unreadable), a
+/// report says `is_yes()` or renders all three.
+///
 /// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn is_dirty(dir: &Path) -> Result<bool> {
-    Ok(git(dir, &["status", "--porcelain"])?.is_some_and(|s| !s.is_empty()))
+/// Returns an error if `git` cannot be executed at all. A `git` that ran and failed is
+/// [`Fact::Unknown`], not an error and emphatically not `No`.
+pub fn is_dirty(dir: &Path) -> Result<Fact> {
+    Ok(Fact::maybe(
+        git(dir, &["status", "--porcelain"])?.map(|s| !s.is_empty()),
+    ))
 }
 
 /// How many tracked files are deleted in the working tree, when that is **all** that is wrong.
@@ -739,7 +760,8 @@ pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_branch, deletions_only, key, trunk};
+    use super::{current_branch, deletions_only, is_dirty, key, trunk};
+    use jkb_fsm::Fact;
     use std::path::Path;
     use std::process::Command;
 
@@ -963,5 +985,31 @@ mod tests {
         // No remote here, so trunk falls through to the local `main`.
         assert_eq!(trunk(dir).unwrap().as_deref(), Some("main"));
         assert!(key(dir).unwrap().is_some());
+    }
+
+    /// A `git status` that ran and FAILED is `Unknown`, never `No`.
+    ///
+    /// This is the whole reason `is_dirty` is three-valued. It returned `Result<bool>` and
+    /// mapped a non-zero exit to `false` — *clean* — and all eight callers are guards standing
+    /// in front of something destructive: `reset --hard`, the archiving rename, `git switch`
+    /// across branches, and the land graft itself. A worktree whose `.git` has been unlinked
+    /// part-way (the incident `deletions_only` documents, still reachable from a stale binary
+    /// or a hand-run `git worktree remove`) answered "clean" to every one of them.
+    #[test]
+    fn a_git_status_that_could_not_run_is_unknown_not_clean() {
+        let t = tempfile::tempdir().expect("tempdir");
+
+        // Not a git repository at all, which is what an unlinked `.git` leaves behind.
+        let answer = is_dirty(t.path()).expect("git is executable");
+        assert_eq!(
+            answer,
+            Fact::Unknown,
+            "a directory git cannot read is not a clean checkout"
+        );
+        assert!(
+            !answer.is_no(),
+            "and every guard asks `is_no()`, which must therefore be false here — this is the \
+             assertion that fails if `is_dirty` ever collapses back to a bool"
+        );
     }
 }

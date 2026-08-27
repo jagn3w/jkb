@@ -5869,9 +5869,12 @@ fn land_preflight(
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
         staging::target_dirty_reason(&worktrees, &ctx.root, &onto, &mut dirty_cache)?;
+    // Three-valued: `land_blocker` requires it PROVEN clean, so a session checkout git cannot
+    // read refuses here — before the graft — instead of at `archive::dispose`, which runs after
+    // it and leaves the task frozen over work already in the target.
     let dirty = match &sess {
         Some(s) => gitrepo::is_dirty(&s.worktree)?,
-        None => false,
+        None => Fact::No,
     };
     // The same question the machine's `land` guard asks, asked **before** the graft. Both read
     // `containment`, which is where the answer lives (D35), so the row, the command and the
@@ -5900,7 +5903,7 @@ fn land_preflight(
         // dirt, and the dirt is only what was refused when the reason says so.
         let hint = match sess
             .as_ref()
-            .filter(|_| dirty && reason.contains("uncommitted changes"))
+            .filter(|_| dirty.is_yes() && reason.contains("uncommitted changes"))
             .map(|s| gitrepo::deletions_only(&s.worktree))
         {
             Some(Ok(Some(n))) => format!(
@@ -6088,8 +6091,11 @@ fn settle_landing(
     // remove`), so the check is taken **again**, here, against the state we are about to
     // discard. The landing itself already happened and is not undone by this; the session is
     // simply kept, with its work, for the person to deal with.
+    // `is_no()`, not `!is_yes()`: a checkout git cannot read is not a clean one, and every
+    // disposal below this line is destructive. The session is kept instead, which is exactly
+    // what this guard does for a genuinely dirty tree.
     anyhow::ensure!(
-        disposed_already || !gitrepo::is_dirty(&sess.worktree)?,
+        disposed_already || gitrepo::is_dirty(&sess.worktree)?.is_no(),
         "{branch} landed on {onto} — the commits are there — but {} has uncommitted changes \
          written since the landing began, so the session is kept exactly as it is rather than \
          reset over them. Deal with them, then close the task with \
@@ -6581,9 +6587,10 @@ fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
         // over, or refuses outright with a message about neither jkb nor the task. Hence its own
         // remedy, which is about this scratch checkout rather than about landing.
         anyhow::ensure!(
-            !gitrepo::is_dirty(&base)?,
-            "{} has uncommitted changes — it is jkb's own scratch checkout, so commit or \
-             discard them, or remove it with `git worktree remove --force`",
+            gitrepo::is_dirty(&base)?.is_no(),
+            "{} could not be established as clean — it is jkb's own scratch checkout, so commit \
+             or discard any changes, or remove it with `git worktree remove --force` and let \
+             jkb recreate it",
             base.display()
         );
         gitrepo::switch_to(&base, onto)?;
@@ -6826,9 +6833,13 @@ fn abandon_session(
     }
     {
         if !force {
+            // `--force` is the answer to both a dirty tree and an unreadable one: it records
+            // that the operator accepts whatever is in there (`Plan::accept_dirty`), which is
+            // the same decision either way.
             anyhow::ensure!(
-                !gitrepo::is_dirty(&sess.worktree)?,
-                "{} has uncommitted changes — commit them, or pass --force to discard them",
+                gitrepo::is_dirty(&sess.worktree)?.is_no(),
+                "{} could not be established as having no uncommitted changes — commit them, \
+                 or pass --force to discard whatever is there",
                 sess.worktree.display()
             );
         }
@@ -6991,7 +7002,10 @@ fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
             "onto": onto,
             "uid": task.map(|t| t.uid.clone()),
             "status": task.map(|t| t.status.clone()),
-            "dirty": gitrepo::is_dirty(&s.worktree)?,
+            // Three-valued, like every other reader of this: `"unknown"` is a checkout git
+            // could not read, which `jkb task land` refuses and which a listing must not
+            // render as the clean, landable `false`.
+            "dirty": gitrepo::is_dirty(&s.worktree)?.as_str(),
             "commits": ahead,
             "awaiting_archive": awaiting.iter().any(|w| session::same_path(w, &s.worktree)),
         }));
@@ -7003,10 +7017,13 @@ fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
         println!("(no sessions in {})", ctx.key);
     } else {
         for r in &rows {
-            let dirty = if r["dirty"].as_bool().unwrap_or(false) {
-                " [uncommitted]"
-            } else {
-                ""
+            // Three-valued, like the field it reads. `as_bool` here would have quietly dropped
+            // the badge the moment `dirty` became a string, and an unreadable checkout must not
+            // render as the clean, landable case — it is the one `jkb task land` refuses.
+            let dirty = match r["dirty"].as_str() {
+                Some("yes") => " [uncommitted]",
+                Some("unknown") => " [unreadable]",
+                _ => "",
             };
             // Said in the row, because it is the difference between work to pick up and work
             // already done that nothing has moved yet.
@@ -7993,7 +8010,7 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
                         "state": t.state.as_str(),
                         "branch": t.branch,
                         "worktree": t.worktree,
-                        "dirty": t.dirty,
+                        "dirty": t.dirty.as_str(),
                         "commits": t.commits,
                         "reviewed": t.reviewed,
                         "review_nss": t.review_nss,
@@ -8027,8 +8044,12 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
             if t.commits > 0 {
                 notes.push(format!("{} commit(s)", t.commits));
             }
-            if t.dirty {
-                notes.push("uncommitted".to_owned());
+            // Three-valued: an unreadable checkout is not the clean case, and saying nothing
+            // about it would leave the row looking landable while `land_blocked` refuses it.
+            match t.dirty {
+                Fact::Yes => notes.push("uncommitted".to_owned()),
+                Fact::Unknown => notes.push("unreadable checkout".to_owned()),
+                Fact::No => {}
             }
             if t.open_must_fix > 0 {
                 notes.push(format!("{} must-fix open", t.open_must_fix));

@@ -145,5 +145,10 @@ function stateIcon(t: StagedTask): string {
   if (t.state === "landed") return "check";
   if (t.state === "dropped") return "circle-slash";
   if (t.state === "review") return "eye";
-  return t.dirty ? "circle-outline" : "circle-filled";
+  // `=== "yes"`, not truthiness: `dirty` is a three-valued string, so every value is truthy
+  // and the plain test would mark every session dirty. `"unknown"` is a checkout git could not
+  // read, which is not the settled state `circle-filled` claims.
+  return t.dirty === "yes" || t.dirty === "unknown"
+    ? "circle-outline"
+    : "circle-filled";
 }

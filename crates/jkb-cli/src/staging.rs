@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use jkb_core::Db;
+use jkb_fsm::Fact;
 
 use crate::repo::{facet_one, facet_values, RepoCtx, RepoTask, FACET_BRANCH};
 use crate::{gitrepo, review, session};
@@ -102,7 +103,11 @@ pub(crate) struct StagedTask {
     /// The session branch (`task/<session>`), when one is recorded.
     pub(crate) branch: Option<String>,
     pub(crate) worktree: Option<std::path::PathBuf>,
-    pub(crate) dirty: bool,
+    /// Whether the session checkout has uncommitted changes — **three-valued**, because a
+    /// checkout git cannot read is not a clean one and the land gate refuses it. Rendered as
+    /// `"yes"`/`"no"`/`"unknown"`, never as a boolean that would make the third case look
+    /// like the landable one.
+    pub(crate) dirty: Fact,
     /// Commits the session branch has that the staging branch does not.
     pub(crate) commits: usize,
     /// The branch HEAD a review ran against (`reviewed=`), if any.
@@ -294,7 +299,7 @@ struct Cache {
     /// The findings of a set of review namespaces, keyed by that set.
     findings: BTreeMap<Vec<String>, std::rc::Rc<review::Findings>>,
     /// Whether a checkout has uncommitted changes, keyed by directory.
-    target_dirty: BTreeMap<std::path::PathBuf, bool>,
+    target_dirty: BTreeMap<std::path::PathBuf, Fact>,
 }
 
 impl Cache {
@@ -388,7 +393,10 @@ fn stage_task(
     // for is the commit count (`git rev-list` per row), not `git status`.
     let dirty = match sess {
         Some(s) => gitrepo::is_dirty(&s.worktree)?,
-        None => false,
+        // No checkout to be dirty. `Fact::No` and not `Unknown`: this is established — there is
+        // nothing there — rather than unobserved, and `land_blocker` refuses a session-less task
+        // on its own arm above this one anyway.
+        None => Fact::No,
     };
     // Both operands are refs that resolve here, never bare names: `ahead_count` now refuses an
     // unresolvable one rather than reporting the count as zero, and zero is what tells the row
@@ -480,7 +488,7 @@ pub(crate) fn target_dirty_reason(
     worktrees: &[gitrepo::Worktree],
     root: &std::path::Path,
     onto: &str,
-    dirty: &mut BTreeMap<std::path::PathBuf, bool>,
+    dirty: &mut BTreeMap<std::path::PathBuf, Fact>,
 ) -> Result<Option<String>> {
     let Some(dir) = land_dir_in(worktrees, root, onto) else {
         return Ok(None);
@@ -496,8 +504,19 @@ pub(crate) fn target_dirty_reason(
         dirty.insert(dir.clone(), answer);
         answer
     };
-    if !is_dirty {
+    // Proven clean, or the landing is refused. A checkout git could not read is not one to
+    // graft into and roll back on a red gate.
+    if is_dirty.is_no() {
         return Ok(None);
+    }
+    if is_dirty.is_unknown() {
+        return Ok(Some(format!(
+            "{} (the checkout a land onto {onto} would graft in) could not be read by git, so \
+             it cannot be established as safe to graft into. `git -C {} status` will say what \
+             it makes of the directory.",
+            dir.display(),
+            dir.display()
+        )));
     }
     Ok(Some(format!(
         "{} (the checkout a land onto {onto} would graft in) has uncommitted changes — \
@@ -520,7 +539,9 @@ pub(crate) struct LandFacts<'a> {
     /// three lines below a comment saying a refusal must not have moved a branch first.
     pub(crate) open_subtasks: bool,
     pub(crate) worktree: Option<&'a std::path::Path>,
-    pub(crate) dirty: bool,
+    /// Whether the session checkout has uncommitted changes. `land_blocker` requires it
+    /// **proven** clean (`is_no`), so an unreadable checkout refuses rather than landing.
+    pub(crate) dirty: Fact,
     /// Commits the work branch has that the staging branch does not.
     pub(crate) commits: usize,
     /// Whether the task's recorded work branch exists in git. Distinguishes a swarm task
@@ -582,8 +603,20 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
                 .to_owned()
         });
     }
-    if facts.dirty {
-        return Some("It has uncommitted changes — commit them in the session first.".to_owned());
+    // PROVEN CLEAN, or it does not land. `is_dirty` used to collapse a failed `git status` into
+    // `false`, so a session whose `.git` had been unlinked part-way passed every check here,
+    // was grafted, and only then hit `archive::dispose`'s refusal to record a session with no
+    // readable HEAD — which is after the graft, so the work was in the target, the task was not
+    // `done`, and the second run was refused by the `commits == 0` arm below. Frozen, holding a
+    // live session, with the branch pointing at what had already landed.
+    if !facts.dirty.is_no() {
+        return Some(if facts.dirty.is_unknown() {
+            "Git could not read its session checkout, so it cannot be established as clean. \
+             `git -C <worktree> status` will say what git makes of the directory."
+                .to_owned()
+        } else {
+            "It has uncommitted changes — commit them in the session first.".to_owned()
+        });
     }
     if facts.commits == 0 {
         return Some("It has no commits that the staging branch does not.".to_owned());
@@ -599,4 +632,55 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
         return Some(reason.to_owned());
     }
     facts.verdict.and_then(review::GateVerdict::short)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{land_blocker, LandFacts, State};
+    use jkb_fsm::Fact;
+    use std::path::Path;
+
+    /// Everything else about the task is landable, so only `dirty` decides.
+    fn facts(dirty: Fact) -> LandFacts<'static> {
+        LandFacts {
+            state: State::Implementing,
+            open_subtasks: false,
+            worktree: Some(Path::new("/tmp/session")),
+            dirty,
+            commits: 3,
+            branch_exists: true,
+            target_dirty: None,
+            verdict: None,
+        }
+    }
+
+    /// A session checkout git could not read does NOT land.
+    ///
+    /// The chain this closes, which round 7 opened: `is_dirty` mapped a failed `git status` to
+    /// `false`, so a worktree whose `.git` had been unlinked part-way read as clean here, was
+    /// grafted, and only then met `archive::dispose`'s refusal to record a session with no
+    /// readable HEAD. That refusal is correct and it is far too late — `dispose` runs after the
+    /// graft, so the work was already in the target while the task stayed non-terminal, and the
+    /// second run was refused by the `commits == 0` arm because the branch now added nothing.
+    /// Frozen, holding a live session, with no verb that moves it.
+    #[test]
+    fn a_session_checkout_git_cannot_read_does_not_land() {
+        let blocked = land_blocker(&facts(Fact::Unknown));
+        let reason = blocked.expect("an unreadable checkout is not landable");
+        assert!(
+            reason.contains("could not read"),
+            "refused for being unreadable, not for some other reason: {reason}"
+        );
+
+        // The polarity, stated as the assertion: `is_no()` and not `!is_yes()`. This is what
+        // fails if the guard is ever written as `if facts.dirty.is_yes()`.
+        assert!(
+            land_blocker(&facts(Fact::Yes)).is_some(),
+            "a dirty checkout still does not land"
+        );
+        assert!(
+            land_blocker(&facts(Fact::No)).is_none(),
+            "and a checkout PROVEN clean still does — the guard must not refuse everything"
+        );
+    }
 }

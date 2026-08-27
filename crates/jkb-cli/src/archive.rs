@@ -878,8 +878,18 @@ fn still_the_recorded_session(entry: &Entry) -> Result<(), String> {
         return Ok(());
     }
     match gitrepo::is_dirty(&entry.worktree) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(match gitrepo::deletions_only(&entry.worktree) {
+        // Proven clean, and nothing weaker. `is_dirty` used to spell "git ran and failed" as
+        // `false`, so a worktree whose `.git` had been unlinked part-way — the very incident
+        // this module exists to make unrepresentable — read as clean and was archived on the
+        // strength of it. The arm below already refused when git could not be *executed*; this
+        // is the same refusal for a git that executed and could not answer.
+        Ok(f) if f.is_no() => Ok(()),
+        Ok(f) if f.is_unknown() => Err(format!(
+            "git could not say whether it has uncommitted changes — `git -C {} status` will \
+             say what it makes of the directory",
+            entry.worktree.display()
+        )),
+        Ok(_) => Err(match gitrepo::deletions_only(&entry.worktree) {
             // The third site of this rule, and the one that was still telling an operator to
             // commit 62,000 deleted lines. A tree that is only MISSING files is a part-way
             // removal, not work, and the two want opposite advice.
