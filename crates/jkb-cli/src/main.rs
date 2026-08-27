@@ -6083,7 +6083,12 @@ fn settle_landing(
     // "clean" for a vanished worktree and the disposal below then fails on it. A concurrent
     // `jkb task abandon` removes exactly this directory, so the case is real, and "gone" is
     // the one state where disposal has nothing left to do.
-    let disposed_already = !sess.worktree.exists();
+    // `is_no()`, for the reason every absence in the disposal path is asked that way: a stat
+    // error is not a removal. Read as one, this skipped both the guard below and the disposal, so
+    // a checkout that was still there ended up orphaned — on disk with no record naming it.
+    // `Unknown` leaves `disposed_already` false, and the guard below then keeps the session and
+    // says so, which is what it already does for a tree it cannot read.
+    let disposed_already = archive::still_there(&sess.worktree).is_no();
 
     // The session was verified clean in `land_preflight`, but that was before a graft and a
     // gate build that can run for minutes — long enough for the agent sitting in the session
@@ -6841,7 +6846,14 @@ fn abandon_session(
     // the tree "could not be archived from in here" — true, but because there was nothing to
     // archive — and handed `--delete-branch` to a sweep with nothing to do, so the branch was
     // never deleted here and never deleted there. `land` has had this arm since D36.4.
-    if !sess.worktree.exists() {
+    // PROVEN gone, not merely un-stat-able. `Path::exists()` reports `false` for any stat error,
+    // so an untraversable `.jkb/work` took this shortcut for a session that was still there —
+    // skipping `dispose`, so no record was written, and returning to a caller that then deletes
+    // the branch on `--delete-branch`. An abandoned branch holds the only copy of its commits (as
+    // the comment below says), so that pair is: commits deleted, checkout orphaned, nothing
+    // tracking it. `Unknown` falls through instead, where the dirty check refuses with something
+    // the operator can act on, and `--force` reaches `dispose`, which records rather than bails.
+    if archive::still_there(&sess.worktree).is_no() {
         let _ = gitrepo::prune_worktrees(&ctx.root);
         return Ok(None);
     }

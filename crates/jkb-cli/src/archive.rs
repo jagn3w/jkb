@@ -33,6 +33,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use jkb_fsm::Fact;
 use serde::{Deserialize, Serialize};
 
 use crate::gitrepo;
@@ -1159,62 +1160,88 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             continue;
         }
 
-        // Not archived yet: this is the deferred half of a landing. The repo is reachable by the
-        // time we get here, so an absent worktree really is one somebody removed.
-        if !entry.worktree.exists() {
-            // Gone already. Tidy git's registration and the branch, then stop tracking.
-            if !dry_run {
-                let _ = gitrepo::prune_worktrees(&entry.repo_root);
-                delete_branch_if_any(&entry);
-            }
-            drop_marker(&marker, dry_run, &mut report, &entry.uid);
-            continue;
-        }
-        // Identity, before anything destructive. A record names a path and a branch, and both are
-        // reusable names; establishing that the tree is still the one it describes is what makes
-        // acting on them safe.
-        if let Err(why) = still_the_recorded_session(&entry) {
-            report.held.push((
-                entry.uid.clone(),
-                format!("{}: {why}", entry.worktree.display()),
-            ));
-            continue;
-        }
-        if dry_run {
-            report
-                .archived
-                .push((entry.uid.clone(), archive_root(&entry.repo_root)));
-            continue;
-        }
-        match stow(&entry.repo_root, &entry.worktree, now) {
-            Ok(dest) => {
-                entry.archive = Some(dest.clone());
-                entry.archived_at = Some(now);
-                // THE RECORD IS WRITTEN FIRST, before the two git commands below, because those
-                // can fail and this is the only thing that says where the tree went. Written back
-                // to the SAME file it was read from, so no second copy can appear.
-                if let Err(e) = record_at(&marker, &entry) {
-                    report.held.push((
-                        entry.uid.clone(),
-                        format!(
-                            "archived to {} but the record could not be updated: {e}",
-                            dest.display()
-                        ),
-                    ));
-                    continue;
-                }
-                let _ = gitrepo::prune_worktrees(&entry.repo_root);
-                delete_branch_if_any(&entry);
-                report.archived.push((entry.uid.clone(), dest));
-            }
-            Err(e) => report.held.push((
-                entry.uid.clone(),
-                format!("{} could not be moved: {e}", entry.worktree.display()),
-            )),
-        }
+        // Not archived yet: this is the deferred half of a landing.
+        sweep_pending(&mut entry, &marker, now, dry_run, &mut report);
     }
 
     Ok(report)
+}
+
+/// The pending half of one record: the landing this process could not finish, finished here.
+///
+/// Sibling of [`sweep_archived`], and split out for the same reason — the reachability check that
+/// licenses reading an absence at all runs in the caller, above both.
+fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, report: &mut Report) {
+    // The repo is reachable by the time we get here, so an absent worktree really is one somebody
+    // removed.
+    match still_there(&entry.worktree) {
+        // Gone already. Tidy git's registration and the branch, then stop tracking.
+        Fact::No => {
+            if !dry_run {
+                let _ = gitrepo::prune_worktrees(&entry.repo_root);
+                delete_branch_if_any(entry);
+            }
+            drop_marker(marker, dry_run, report, &entry.uid);
+            return;
+        }
+        // The stat never came back, so nobody has established this session was removed — and
+        // the two things the arm above does are the destructive pair (`delete_branch` is
+        // forced, and an abandoned branch is the only copy of its commits).
+        Fact::Unknown => {
+            report.held.push((
+                entry.uid.clone(),
+                format!(
+                    "{} could not be read, so whether it is still there is unestablished — \
+                     the record is kept and nothing was removed",
+                    entry.worktree.display()
+                ),
+            ));
+            return;
+        }
+        Fact::Yes => {}
+    }
+    // Identity, before anything destructive. A record names a path and a branch, and both are
+    // reusable names; establishing that the tree is still the one it describes is what makes
+    // acting on them safe.
+    if let Err(why) = still_the_recorded_session(entry) {
+        report.held.push((
+            entry.uid.clone(),
+            format!("{}: {why}", entry.worktree.display()),
+        ));
+        return;
+    }
+    if dry_run {
+        report
+            .archived
+            .push((entry.uid.clone(), archive_root(&entry.repo_root)));
+        return;
+    }
+    match stow(&entry.repo_root, &entry.worktree, now) {
+        Ok(dest) => {
+            entry.archive = Some(dest.clone());
+            entry.archived_at = Some(now);
+            // THE RECORD IS WRITTEN FIRST, before the two git commands below, because those
+            // can fail and this is the only thing that says where the tree went. Written back
+            // to the SAME file it was read from, so no second copy can appear.
+            if let Err(e) = record_at(marker, entry) {
+                report.held.push((
+                    entry.uid.clone(),
+                    format!(
+                        "archived to {} but the record could not be updated: {e}",
+                        dest.display()
+                    ),
+                ));
+                return;
+            }
+            let _ = gitrepo::prune_worktrees(&entry.repo_root);
+            delete_branch_if_any(entry);
+            report.archived.push((entry.uid.clone(), dest));
+        }
+        Err(e) => report.held.push((
+            entry.uid.clone(),
+            format!("{} could not be moved: {e}", entry.worktree.display()),
+        )),
+    }
 }
 
 /// The archived half of one record: keep it, or delete it once it is past the window.
@@ -1231,10 +1258,27 @@ fn sweep_archived(
     dry_run: bool,
     report: &mut Report,
 ) {
-    if !dir.exists() {
+    match still_there(dir) {
         // Somebody removed it by hand. Nothing owed, so stop tracking it.
-        drop_marker(marker, dry_run, report, &entry.uid);
-        return;
+        Fact::No => {
+            drop_marker(marker, dry_run, report, &entry.uid);
+            return;
+        }
+        // Dropping the record here is destructive in the quiet way: it is the only thing that
+        // names a multi-gigabyte archive, so a stat error that read as "removed by hand" left the
+        // directory referenced by nothing and never deleted.
+        Fact::Unknown => {
+            report.held.push((
+                entry.uid.clone(),
+                format!(
+                    "{} could not be read, so whether it is still there is unestablished — the \
+                     record is kept",
+                    dir.display()
+                ),
+            ));
+            return;
+        }
+        Fact::Yes => {}
     }
     let age = now.saturating_sub(entry.archived_at.unwrap_or(now));
     if age < retain_days.saturating_mul(SECS_PER_DAY) {
@@ -1279,6 +1323,35 @@ fn drop_marker(marker: &Path, dry_run: bool, report: &mut Report, uid: &str) {
 /// Deleting the branch is tidiness, not correctness: its commits are in the target by the time
 /// anything here runs. A branch somebody checked out elsewhere, or already deleted, is not an
 /// error worth stopping an unattended sweep for.
+/// Is a session worktree (or its archive) still there — asked wherever an absence licenses
+/// something destructive, which is every disposal site in this crate.
+///
+/// Four of them, and each had its own `Path::exists()`: the sweep's two arms below, and
+/// `abandon_session`'s and `land`'s "already gone" shortcuts. `Path::exists()` answers `false`
+/// for ANY stat error. An untraversable
+/// `.jkb/work` therefore read as *the operator removed this session*: git's registration pruned,
+/// the record's branch **force-deleted** — and after `abandon --delete-branch` that branch holds
+/// the only copy of the commits — and the record dropped, leaving the checkout on disk with
+/// nothing tracking it. The archived arm answered the same way about a whole archive directory.
+/// It is the defect [`crate::gitrepo::worktree_identity`] had, at the sites the fix for that one
+/// did not reach; a rule each call site has to remember is the defect, so it is stated here and
+/// the callers ask it rather than each spelling an absence for themselves.
+///
+/// Deliberately NOT [`crate::owner::present_here`], which is the same question asked where the
+/// filesystem itself may be the wrong one: it reports an absent path with an absent PARENT as
+/// `Unknown`, because that is the signature of looking across the container bind rather than of a
+/// removal. Here the repo root is established reachable first — above both sweep arms (D45.5),
+/// and by holding a `RepoCtx` in the two verbs — which is precisely that hypothesis excluded.
+/// Inheriting the parent rule would also hold every record under a hand-removed `.jkb/archive`
+/// for ever, with no action left that could clear them, and a permanent hold is the failure this
+/// module has already been burned by once.
+///
+/// `Fact::No` is the only answer that licenses acting: `Unknown` means the stat never came back,
+/// which is not evidence of anything.
+pub(crate) fn still_there(path: &Path) -> Fact {
+    Fact::maybe(path.try_exists().ok())
+}
+
 fn delete_branch_if_any(entry: &Entry) {
     if entry.plan.delete_branch && !entry.branch.is_empty() {
         let _ = gitrepo::delete_branch(&entry.repo_root, &entry.branch, true);
@@ -1672,6 +1745,122 @@ mod tests {
             "nor is it the other wrong answer — the tree is not a stranger, it is unreadable: \
              {why}"
         );
+        // POSITIVELY, not only by excluding one wrong answer: an assertion that merely rules out
+        // a single wording is satisfied by every other wording too, including ones that name no
+        // action. This arm has a remedy and must say it.
+        assert!(
+            why.contains("does not answer git for itself") && why.contains("remove it by hand"),
+            "and it says what state the tree is in and what ends it: {why}"
+        );
+    }
+
+    /// A session the sweep cannot STAT is not one somebody removed.
+    ///
+    /// The absence arm is the destructive pair: it prunes git's registration, applies the
+    /// record's branch deletion — forced, and after `abandon --delete-branch` that branch is the
+    /// only copy of the session's commits — and drops the record, so nothing tracks the checkout
+    /// afterwards. `Path::exists()` answers `false` for ANY stat error, so an untraversable
+    /// `.jkb/work` drove all three against a session that was still there. Same defect as
+    /// `worktree_identity`'s, at a site that fix did not reach.
+    #[test]
+    fn a_session_the_sweep_cannot_stat_is_not_one_somebody_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+
+        record(
+            &db,
+            &Entry {
+                head: Some(head),
+                branch: branch.clone(),
+                plan: Plan {
+                    delete_branch: true,
+                    accept_dirty: false,
+                },
+                ..entry(&wt, &repo)
+            },
+        )
+        .expect("record");
+
+        let work = repo.join(".jkb/work");
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let stat = fs::metadata(&wt).err().map(|e| e.kind());
+        let swept = reap(&db, 0, false);
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).expect("restore");
+
+        assert_eq!(
+            stat,
+            Some(io::ErrorKind::PermissionDenied),
+            "the premise — the stat must actually fail, or this test is about nothing"
+        );
+        let r = swept.expect("reap");
+        assert!(
+            r.cleared.is_empty(),
+            "nobody established the session was removed, so its record stands: {r:?}"
+        );
+        assert_eq!(
+            r.held.len(),
+            1,
+            "and it is held, with a reason: {:?}",
+            r.held
+        );
+        assert!(
+            !git(&repo, &["branch", "--list", &branch]).is_empty(),
+            "and the branch is still there"
+        );
+    }
+
+    /// Nor is an archive it cannot stat.
+    ///
+    /// Quieter and worse: the record is the only thing that names a multi-gigabyte archive, so
+    /// dropping it on an unproven absence leaves the directory referenced by nothing and never
+    /// deleted — the same harm the repo-root check above the dispatch exists to prevent, one
+    /// level down.
+    #[test]
+    fn an_archive_the_sweep_cannot_stat_is_not_one_somebody_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, _, head) = session(&repo, "sess");
+        let root = archive_root(&repo);
+        let archived = root.join("sess-20260101T000000Z");
+        fs::create_dir_all(&archived).expect("mk");
+        fs::write(archived.join("f"), b"x").expect("write");
+
+        record(
+            &db,
+            &Entry {
+                head: Some(head),
+                archive: Some(archived.clone()),
+                archived_at: Some(0),
+                ..entry(&wt, &repo)
+            },
+        )
+        .expect("record");
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let stat = fs::metadata(&archived).err().map(|e| e.kind());
+        // Retention 0, so a sweep that got past the guard would go on to delete it.
+        let swept = reap(&db, 0, false);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("restore");
+
+        assert_eq!(
+            stat,
+            Some(io::ErrorKind::PermissionDenied),
+            "the premise — the stat must actually fail, or this test is about nothing"
+        );
+        let r = swept.expect("reap");
+        assert!(
+            r.cleared.is_empty(),
+            "the only thing that names the archive is not thrown away on a stat error: {r:?}"
+        );
+        assert_eq!(r.held.len(), 1, "it is held, with a reason: {:?}", r.held);
+        assert!(archived.exists(), "and the archive is untouched");
     }
 
     #[test]
