@@ -211,7 +211,12 @@ pub struct Held {
 pub fn lock_holder(db: &Path) -> Result<Option<String>> {
     let path = store_dir(db).join(".sweep.lock");
     match fs::read_to_string(&path) {
-        Ok(holder) => Ok(Some(holder.trim().to_owned())),
+        // The file is `<owner> <nonce>` — the nonce is `SweepLock`'s release identity and is no
+        // part of who holds it. Taking the first field keeps every consumer unchanged: this is
+        // what `jkb task reap`'s refusal prints and what `owner::is_alive` is asked about, and a
+        // nonce appended to the id would make the liveness probe unable to parse it, so every
+        // holder would read `Unrecognized` -> `Unknown` and no stale lock could ever be broken.
+        Ok(holder) => Ok(Some(holder_of(&holder).to_owned())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -489,27 +494,20 @@ pub fn dispose(
     uid: &str,
     plan: Plan,
 ) -> Result<Disposed> {
-    // `rev` answers `Ok(None)` for "git ran and could not tell me", and storing THAT as `head:
-    // None` collided with the value the field reserves for a record written before it existed —
-    // after which every sweep took `still_the_recorded_session`'s "no HEAD was recorded" arm,
-    // which names no action, and the directory sat there for ever. Reachable: a part-way `git
-    // worktree remove` (the incident this module replaces, still reachable from a stale binary or
-    // a hand-run command) can unlink `<worktree>/.git` before it stops, leaving a directory whose
-    // `exists()` check passes and whose HEAD cannot be read.
+    // The worktree's OWN head — `gitrepo::rev(dir, "HEAD")` is not that. Git's discovery walks
+    // up, so a session whose `.git` file has been removed returns the *enclosing repository's*
+    // HEAD, and recording that as this session's identity is worse than recording none: the
+    // sweep compares it against the tree and concludes a different session is reusing the name.
     //
-    // Refused HERE, where the caller can still print it and the operator still has the tree.
-    let head = gitrepo::rev(worktree, "HEAD")
+    // NOT a precondition of disposal. Requiring it before `stow` refused a disposal that would
+    // have succeeded outright — and in `abandon` the `?` returned before the claim was released,
+    // leaving the task `in_progress` held by a session whose worktree still exists, so
+    // `owner::is_alive` says Yes and `doctor --fix` will not reclaim it. That is the exact wedge
+    // this function's caller documents having already fixed once. `head` is read by the sweep
+    // only to re-identify a DEFERRED tree; an archived record names its archive and needs no
+    // identity at all, so the requirement belongs in that arm and nowhere else.
+    let head = gitrepo::worktree_head(worktree)
         .with_context(|| format!("reading HEAD in {}", worktree.display()))?;
-    if head.is_none() {
-        anyhow::bail!(
-            "cannot read HEAD in {} — the session's identity is what the sweep checks before it \
-             touches the path, so it will not be recorded without one. If the directory has been \
-             partly removed, delete it by hand; if it is intact, `git -C {} status` will say what \
-             git thinks of it.",
-            worktree.display(),
-            worktree.display()
-        );
-    }
     let mut entry = Entry {
         worktree: worktree.to_path_buf(),
         repo_root: repo_root.to_path_buf(),
@@ -550,6 +548,24 @@ pub fn dispose(
         // live worktrees). The rename changed nothing, so the caller's work is simply completed
         // and the tree is handed to `jkb task reap`.
         Err(e) => {
+            // HERE is where the identity is load-bearing: the sweep will come back to a tree
+            // nobody moved, and `still_the_recorded_session` checks this commit before it touches
+            // the path. Without it every sweep takes the "no HEAD was recorded" arm — which names
+            // no action — and the directory sits there for ever. The tree is untouched at this
+            // point (the rename changed nothing), so refusing costs the caller nothing it has not
+            // already done, and the operator still has the directory in front of them.
+            if entry.head.is_none() {
+                anyhow::bail!(
+                    "{} could not be archived from here ({e}), and its HEAD cannot be read from \
+                     the worktree itself — so there is nothing to identify it by when the sweep \
+                     comes back, and it would be held for ever. `git -C {} status` will say what \
+                     git makes of the directory; if it has been partly removed, \
+                     `git -C {} restore .` puts it back.",
+                    worktree.display(),
+                    worktree.display(),
+                    worktree.display()
+                );
+            }
             if let Err(rec) = record(db, &entry) {
                 eprintln!(
                     "note: {} could not be archived from here ({e}) and the removal record could \
@@ -591,23 +607,48 @@ fn removable(path: &Path) -> Result<(), String> {
 /// breaking a live sweep's lock on an unestablished answer is what the lock exists to prevent.
 struct SweepLock {
     path: PathBuf,
-    /// THE FILE THIS ACQUISITION CREATED, by `(dev, ino)`. `Drop` unlinks only while the path
-    /// still names it, for the reason `acquire` states about the stale-lock path: releasing a
-    /// lock that is no longer yours takes its current holder's with it.
+    /// EXACTLY WHAT THIS ACQUISITION WROTE. `Drop` unlinks only while the file still contains
+    /// it, for the reason `acquire` states about the stale-lock path: releasing a lock that is no
+    /// longer yours takes its current holder's with it.
     ///
-    /// Identity is the inode and not the owner id written inside, because the owner id cannot
-    /// tell an acquisition from its successor — `host:pid` is the same string for both when one
-    /// process reacquires, which is exactly what the test for this does. The inode changes on
-    /// any unlink-and-recreate, which is what `break_lock` and a stale-lock takeover both are.
-    /// `None` if the file could not be stat'd, which disables the release rather than guessing.
-    id: Option<(u64, u64)>,
+    /// The identity has to be something neither the owner id nor the filesystem can hand back:
+    ///
+    /// * the **owner id alone** cannot tell an acquisition from its successor — `host:pid` is the
+    ///   same string for both when one process reacquires, which is what the test for this does;
+    /// * the **inode** was the first fix and is not safe either. `break_lock` unlinks the file,
+    ///   freeing its inode, and the successor creates a new one in the same directory an instant
+    ///   later — on ext4 the just-freed bit in the parent group's bitmap is a prime candidate, so
+    ///   the displaced sweeper's `Drop` would delete the successor's lock. APFS hands out
+    ///   monotonic inode numbers, which is the only reason the test passed on this machine.
+    ///
+    /// So a per-acquisition **nonce** goes in the file beside the owner id. `content` is the whole
+    /// line; `None` if it could not be read back, which disables the release rather than guessing.
+    content: Option<String>,
 }
 
-/// `(dev, ino)` — the file, as distinct from the path naming it.
-fn file_id(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let m = fs::metadata(path).ok()?;
-    Some((m.dev(), m.ino()))
+/// The owner id out of a lock file's `<owner> <nonce>` contents.
+///
+/// ONE parser, because there are two readers and they must not disagree: `lock_holder` renders
+/// this to the operator, and `SweepLock::acquire` hands it to `owner::is_alive`. Left as the raw
+/// contents, the appended nonce would make every id `Unrecognized` — hence `Fact::Unknown`, hence
+/// never `is_no()` — and no stale lock could ever be broken again.
+fn holder_of(contents: &str) -> &str {
+    // No `.trim()`: `split_whitespace` already skips leading whitespace, and clippy is right
+    // that chaining them is redundant.
+    contents.split_whitespace().next().unwrap_or_default()
+}
+
+/// A value no other acquisition of this lock will write. Not security, just distinctness: pid and
+/// a monotonic-ish clock reading, which cannot repeat within one process and cannot collide
+/// across processes.
+fn lock_nonce() -> String {
+    format!(
+        "{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    )
 }
 
 impl SweepLock {
@@ -623,26 +664,37 @@ impl SweepLock {
             {
                 Ok(mut f) => {
                     use std::io::Write;
-                    let _ = write!(f, "{}", crate::owner::self_owner());
+                    // `<owner> <nonce>`. `lock_holder` reports the first field, so what an
+                    // operator is shown is unchanged.
+                    let line = format!("{} {}", crate::owner::self_owner(), lock_nonce());
+                    let wrote = write!(f, "{line}").is_ok();
                     drop(f);
-                    let id = file_id(&path);
-                    return Ok(Ok(Self { path, id }));
+                    // Read back rather than assumed: `Drop` compares against what is ON DISK, so
+                    // an identity that never reached it would make the release a silent no-op and
+                    // wedge the lock for every later sweep.
+                    let content = if wrote {
+                        fs::read_to_string(&path).ok().filter(|c| c.trim() == line)
+                    } else {
+                        None
+                    };
+                    return Ok(Ok(Self { path, content }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let holder = fs::read_to_string(&path).unwrap_or_default();
+                    let contents = fs::read_to_string(&path).unwrap_or_default();
+                    let holder = holder_of(&contents);
                     // `host:pid`, judged by `owner::is_alive`, which answers `Fact`. A BARE pid
                     // was wrong here in a way it is not for `LandLock`: this store is shared
                     // across the host/container bind on purpose, and pid 812 in the container is
                     // a different process from pid 812 on the host — so the lock excluded nothing
                     // at exactly the boundary where two sweepers meet, and could declare a live
                     // one dead. An owner on another host is `Unknown`, and unknown respects.
-                    let dead = crate::owner::is_alive(holder.trim()).is_no();
+                    let dead = crate::owner::is_alive(holder).is_no();
                     if !dead {
                         // Not an error: the other sweep is doing this sweep's work. A service
                         // tick that says "someone else is on it" must not read as a failure.
                         return Ok(Err(Held {
                             path,
-                            holder: holder.trim().to_owned(),
+                            holder: holder.to_owned(),
                         }));
                     }
                     // RE-READ BEFORE UNLINKING, which is the half of `LandLock`'s shape this
@@ -650,7 +702,13 @@ impl SweepLock {
                     // remove it, and the second's remove would take the first's fresh lock with
                     // it. Removing only while the content is still what was judged makes that a
                     // race one of them loses instead of one they both win.
-                    if fs::read_to_string(&path).unwrap_or_default() == holder {
+                    // Against the WHOLE contents, not the owner id parsed out of it: the file is
+                    // `<owner> <nonce>`, so comparing the first field alone would match a
+                    // successor written by the same host and pid, and comparing to the parsed id
+                    // would never match at all — which would leave the stale lock in place and
+                    // fail every later acquisition.
+                    let still = fs::read_to_string(&path).unwrap_or_default();
+                    if still.trim() == contents.trim() {
                         let _ = fs::remove_file(&path);
                     }
                 }
@@ -700,7 +758,10 @@ impl Drop for SweepLock {
     /// parties win into one a party can only lose by being displaced in the instant between, and
     /// the displacing party is a person running `--break-lock`.
     fn drop(&mut self) {
-        if self.id.is_some() && file_id(&self.path) == self.id {
+        let Some(mine) = self.content.as_deref() else {
+            return;
+        };
+        if fs::read_to_string(&self.path).is_ok_and(|c| c.trim() == mine) {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -1394,6 +1455,48 @@ mod tests {
         assert!(left[0].1.archive.is_some(), "carrying where the tree went");
     }
 
+    /// A session that CAN be archived is archived, even when its HEAD cannot be read.
+    ///
+    /// The HEAD requirement was a precondition of the whole function, checked before `stow` was
+    /// even attempted — so a disposal that would have succeeded outright was refused instead, and
+    /// `jkb task abandon --force`'s `?` returned before the claim was released. That left the
+    /// task `in_progress`, held by a session whose worktree still exists — so `owner::is_alive`
+    /// says Yes, `doctor --fix` will not reclaim it, and re-running fails identically. `head` is
+    /// read only to re-identify a DEFERRED tree; an archived record names its archive.
+    #[test]
+    fn a_session_whose_head_cannot_be_read_is_still_archived() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let repo = t.path().join("repo");
+        let (wt, branch, _) = session(&repo, "sess");
+
+        // A part-way `git worktree remove`: the directory is intact, its `.git` link is not.
+        fs::remove_file(wt.join(".git")).expect("unlink .git");
+        assert_eq!(
+            gitrepo::worktree_head(&wt).expect("head"),
+            None,
+            "and the tree can no longer say what it is on"
+        );
+
+        let out = dispose(
+            &db,
+            &repo,
+            &wt,
+            &branch,
+            "task:t",
+            Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+        )
+        .expect("an archivable session is archived, not refused");
+        let Disposed::Archived(dest) = out else {
+            panic!("stow can succeed here, so it must have")
+        };
+        assert!(dest.exists(), "the tree really moved");
+        assert!(!wt.exists(), "and is no longer where it was");
+    }
+
     #[test]
     fn a_deferred_disposal_records_the_head_the_worktree_is_actually_on() {
         let t = tempfile::tempdir().expect("tempdir");
@@ -1522,6 +1625,53 @@ mod tests {
 
         drop(successor);
         assert!(!path.exists(), "the holder's own release does remove it");
+    }
+
+    /// Two acquisitions never share a release identity, whatever the filesystem does.
+    ///
+    /// The identity was the inode, and that is not safe: `break_lock` unlinks the file, freeing
+    /// its inode, and on ext4 the just-freed bit in the parent group's bitmap is a prime
+    /// candidate for the successor created an instant later — so the displaced sweeper's `Drop`
+    /// would delete the successor's lock and two sweeps would run at once. APFS hands out
+    /// monotonic inode numbers, which is the only reason the sibling test above passes here; a
+    /// test asserting a property the local filesystem happens to provide is not a test of the
+    /// code. The nonce is what makes it hold on both.
+    #[test]
+    fn two_acquisitions_never_share_a_release_identity() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+
+        let Ok(first) = SweepLock::acquire(&db).expect("acquire") else {
+            panic!("free to begin with")
+        };
+        let one = first
+            .content
+            .clone()
+            .expect("the lock records what it wrote");
+        break_lock(&db).expect("break").expect("there was a holder");
+        let Ok(second) = SweepLock::acquire(&db).expect("acquire") else {
+            panic!("free again once broken")
+        };
+        let two = second.content.clone().expect("and so does its successor");
+
+        assert_ne!(
+            one, two,
+            "same process, same host, same pid — so an identity built from the owner id alone \
+             cannot tell these apart, and one built from the inode cannot on a filesystem that \
+             reuses them"
+        );
+        // The owner id is still what an operator is shown, nonce and all kept out of it.
+        assert_eq!(
+            lock_holder(&db).expect("holder").as_deref(),
+            Some(crate::owner::self_owner().as_str()),
+            "the nonce is a release identity, not part of who holds the lock"
+        );
+        drop(first);
+        assert!(
+            store_dir(&db).join(".sweep.lock").exists(),
+            "and the displaced sweeper still does not take its successor's lock"
+        );
+        drop(second);
     }
 
     #[test]

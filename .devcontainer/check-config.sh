@@ -301,8 +301,24 @@ fi
 # unresolvable domain among the fifteen took the whole raise down, blaming "an unexpected failure
 # at line 173" while the two arms written for exactly that state were unreachable.
 #
-# Measured which shapes trip it: a bare `x="$(cmd)"` does; `x="$(cmd)" || fallback` and
-# `if x="$(cmd)"` do not. So every such assignment must carry a fallback or sit in a conditional.
+# Measured on bash 3.2, EVERY shape this file uses, because the regex below looks narrower than
+# the hazard and a later reader will otherwise widen it on suspicion:
+#
+#   x="$(cmd)"                     ABORTS — the trap fires and the raise becomes deny-all
+#   x="$(cmd)" || fallback         safe
+#   if x="$(cmd)"; then            safe
+#   elif x="$(cmd)"; then          safe
+#   printf ... "$(cmd)"            safe — errexit does not apply to an argument's expansion
+#   cmd "... $(cmd) ..." after ||  safe, twice over
+#   done <<<"$(cmd)"               safe
+#
+# So the bare assignment is the whole hazard, and matching it is the whole job. A review round
+# reported this check as vacuously passing over two live violations (the `$(ls …)` inside the
+# refusal message at init-firewall.sh:131, and the `elif` at :144); both were re-measured in the
+# exact shapes the file uses and neither aborts — 131 sits in an argument of a command that is
+# itself the right-hand side of `||`. Nothing was changed on the strength of that report, which
+# is why the measurement is written down here instead.
+#
 # Checked here because the Docker harness cannot reach the DNS-failure path, and because the next
 # substitution added to this file has the same trap waiting for it.
 bare_subst="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '

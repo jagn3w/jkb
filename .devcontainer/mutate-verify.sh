@@ -167,6 +167,10 @@ judge() { # judge <label> <expect> <output> <rc>
   # expect may start with a dash, which grep would otherwise read as an option.
   if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
     caught=$((caught+1))
+    # The EXPECT, not the count. Coverage is a property of which failure paths in verify.sh were
+    # driven, and several mutations legitimately share one — so counting mutations answers a
+    # different question from the one the summary asks.
+    caught_expects+=("$expect")
     printf '  CAUGHT   %s\n' "$label"
   else
     fails=$((fails+1))
@@ -177,6 +181,7 @@ judge() { # judge <label> <expect> <output> <rc>
 fails=0
 build_failures=0
 caught=0
+caught_expects=()
 echo "=== mutations of the container's own guarantees (each must be CAUGHT) ==="
 run "an undeclared host mount is added" "UNDECLARED mounts" \
     "${HEALTHY[@]}" \
@@ -186,6 +191,16 @@ run "an undeclared host mount is added" "UNDECLARED mounts" \
 run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/host
+# THE ONE SUBTRACTIVE CASE THAT WAS MISSING. `BASE` supplies the `~/.jkb` bind unconditionally
+# and every mutation reuses it, so no run ever reached `kb_mounted=no` — the assertion added
+# because the old `[ -d /home/vscode/.jkb ]` form passed in a container where the bind was ABSENT
+# had itself never been watched failing. It isolates cleanly: a missing declared mount is not an
+# extra one, so the boundary check still passes, and the memory linker reports `linked` against a
+# container-local store that dies with the container. Unlike the paths the coverage note below
+# excuses, this one needs a docker flag and nothing else.
+run "the knowledge base is NOT mounted" "knowledge base is mounted" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode \
+    -v "$REPO":/home/vscode/repos/jkb -w /home/vscode/repos/jkb
 run "the host's ~/.claude is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/home/vscode/.claude
@@ -302,12 +317,35 @@ echo
 # it, was covered by that sentence without ever being watched failing. That is the same claim-more-
 # than-was-established shape every guard in this directory exists to stop, in the summary line of
 # the harness that judges them. No silent cap: say the number and say which are uncovered.
-verify_paths="$(grep -cE '^[[:space:]]*bad "' "$REPO/.devcontainer/verify.sh" 2>/dev/null || true)"
-verify_paths="${verify_paths:-0}"
+#
+# COUNTED AS PATHS, NOT AS MUTATIONS, because those are two different quantities and the first
+# version printed one as the other: 13 mutations sharing 10 expect strings drive 8 distinct
+# failure paths, and "13 of 21" claimed half again as much coverage as existed. Worse, it was
+# self-erasing — add five mutations of already-covered properties and `caught` reaches the
+# denominator, at which point the whole "the rest are NOT covered" block disappears while a dozen
+# paths have still never been watched failing. `assert` call sites are in the denominator too;
+# they were not, so two paths that ARE driven were not even counted as existing.
+V="$REPO/.devcontainer/verify.sh"
+covered=""
+if [ "${#caught_expects[@]}" -gt 0 ]; then
+    covered="$(for want in "${caught_expects[@]}"; do
+        grep -nF -e "$want" "$V" 2>/dev/null | cut -d: -f1
+    done | sort -un)"
+fi
+all_paths="$(grep -nE '^[[:space:]]*(bad "|assert )' "$V" 2>/dev/null | cut -d: -f1 | sort -un)"
+n_all="$(printf '%s' "$all_paths" | grep -c '^' || true)"
+uncovered="$(comm -13 <(printf '%s\n' "$covered" | grep -v '^$') <(printf '%s\n' "$all_paths" | grep -v '^$'))"
+n_cov=$(( n_all - $(printf '%s' "$uncovered" | grep -c '^' || true) ))
 printf '\033[32m%d mutation(s) caught, and the matcher was shown to discriminate\033[0m\n' "$caught"
-if [ "$verify_paths" -gt "$caught" ]; then
-    printf '  verify.sh has %d failure paths; %d were driven here. The rest are NOT covered by this\n' \
-        "$verify_paths" "$caught"
-    printf '  run — several need a broken machine (an unreadable mount table, a failed link) rather\n'
-    printf '  than a docker flag, which is why this is reported and not a gate.\n'
+if [ -n "$uncovered" ]; then
+    printf '  %d of %d failure paths in verify.sh were driven here. NOT covered by this run:\n' \
+        "$n_cov" "$n_all"
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        printf '    verify.sh:%s  %s\n' "$n" "$(sed -n "${n}p" "$V" | sed 's/^[[:space:]]*//' | cut -c1-88)"
+    done <<<"$uncovered"
+    printf '  Several need a broken machine (an unreadable mount table, a failed link) rather than a\n'
+    printf '  docker flag, which is why this is reported and not a gate.\n'
+else
+    printf '  all %d failure paths in verify.sh were driven\n' "$n_all"
 fi

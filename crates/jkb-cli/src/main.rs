@@ -6183,12 +6183,16 @@ fn settle_landing(
     // checkout — reported a live branch with no mention of the reaper that will delete it. The
     // operator then reaches for `git branch -D` and git refuses, because the deferred worktree
     // still holds it.
+    // `has_branch` answers a `Fact`, and only a PROVEN absence is a deletion. It used to collapse
+    // any non-zero git exit to `false`, so an unreadable `packed-refs` printed "removed its
+    // branch" — the one direction that costs something, because it stops the operator looking.
+    // Now `Unknown` and `Err` land together on `Kept`, which is what the comment always claimed.
     let branch_fate = match gitrepo::has_branch(&ctx.root, landed.branch) {
-        Ok(true) if matches!(disposal, Disposal::Deferred(_)) => BranchFate::OwedToTheReaper,
-        // `Err` joins `Ok(true)`: unestablished is not "gone", and reporting a deletion we could
-        // not observe is the one direction that costs something — it stops the operator looking.
-        Ok(true) | Err(_) => BranchFate::Kept,
-        Ok(false) => BranchFate::Deleted,
+        Ok(f) if f.is_yes() && matches!(disposal, Disposal::Deferred(_)) => {
+            BranchFate::OwedToTheReaper
+        }
+        Ok(f) if f.is_no() => BranchFate::Deleted,
+        Ok(_) | Err(_) => BranchFate::Kept,
     };
     report_landing(
         &landed,
@@ -6699,7 +6703,9 @@ fn cmd_task_abandon(
     // session whose worktree still exists (so `is_alive` says Yes) and therefore reclaimable by
     // nothing. Re-running failed identically. The decision is already in the record's `Plan`, and
     // `delete_branch_if_any` applies it once the tree is out of the way.
-    if delete_branch && deferred.is_none() && gitrepo::has_branch(&ctx.root, &branch)? {
+    // `is_yes()`: delete only a branch proven to be there. An unestablished answer leaves it
+    // alone, which costs a `git branch -D` and never an unrecoverable one.
+    if delete_branch && deferred.is_none() && gitrepo::has_branch(&ctx.root, &branch)?.is_yes() {
         gitrepo::delete_branch(&ctx.root, &branch, true)?;
     }
     // Read from git rather than from what this function did: `dispose` deletes the branch itself
@@ -6707,14 +6713,16 @@ fn cmd_task_abandon(
     // gone. Asked once, after everything that could have removed it.
     // Read from git rather than from what this function did — `dispose` deletes the branch itself
     // when it archived the tree — and folded into ONE value, so no two lines can disagree.
+    // Three-valued, and an unestablished answer is reported as still there rather than as gone:
+    // saying a branch was deleted when git could not say is what stops somebody looking for it.
     let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
-    let branch_fate = match (delete_branch, still_there) {
-        (false, true) => BranchFate::Kept,
-        (false, false) => BranchFate::Absent,
+    let branch_fate = match (delete_branch, still_there.is_no()) {
+        (false, false) => BranchFate::Kept,
+        (false, true) => BranchFate::Absent,
         // Asked for and still there: the deferred worktree has it checked out, so `git branch -D`
         // would refuse. The record's `Plan` carries the decision and the reaper applies it.
-        (true, true) => BranchFate::OwedToTheReaper,
-        (true, false) => BranchFate::Deleted,
+        (true, false) => BranchFate::OwedToTheReaper,
+        (true, true) => BranchFate::Deleted,
     };
 
     // Release, and reopen unless the task is already finished.

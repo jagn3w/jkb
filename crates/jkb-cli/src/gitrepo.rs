@@ -6,6 +6,7 @@
 //! how the answer starts disagreeing with `git log`.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -312,22 +313,30 @@ pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether a local branch named `branch` exists.
+/// Whether a local branch named `branch` exists — **three-valued**.
+///
+/// Asked with `for-each-ref`, not `show-ref --verify --quiet`, and the difference is the whole
+/// point. `show-ref` exits non-zero both for *no such ref* and for *this repository cannot be
+/// read*, and [`git`] collapses every non-zero exit to `Ok(None)` — so a corrupt `packed-refs`
+/// was reported as a **deleted branch**, and `jkb task land` printed "removed its branch",
+/// which is the one direction that costs something: it stops the operator looking.
+///
+/// `for-each-ref` exits **zero with empty output** when nothing matches (measured, along with
+/// the 128 a broken repository gives), so a non-zero exit means only that git could not answer.
+///
+/// The match is exact. A `for-each-ref` pattern also matches deeper refs — `refs/heads/foo`
+/// matches `refs/heads/foo/bar`, likewise measured — so comparing on emptiness alone would
+/// report a branch that does not exist.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
+/// Returns an error if `git` cannot be executed at all.
+pub fn has_branch(dir: &Path, branch: &str) -> Result<Fact> {
     valid_ref(branch)?;
-    Ok(git(
-        dir,
-        &[
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )?
-    .is_some())
+    let want = format!("refs/heads/{branch}");
+    Ok(Fact::maybe(
+        git(dir, &["for-each-ref", "--format=%(refname)", &want])?
+            .map(|s| s.lines().any(|l| l == want)),
+    ))
 }
 
 /// Every branch that exists here, **counting a remote-tracking copy**, mapped to a ref that
@@ -439,7 +448,9 @@ pub fn branch_name(dir: &Path, name: &str) -> Result<BranchName> {
 pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
     valid_ref(branch)?;
     valid_ref(start)?;
-    if has_branch(dir, branch)? {
+    // Proven present, or attempt it: `git branch` refuses an existing branch on its own, so an
+    // unestablished answer costs a clear git error rather than a silent wrong turn.
+    if has_branch(dir, branch)?.is_yes() {
         return Ok(false);
     }
     git_must(dir, &["branch", branch, start])?;
@@ -481,9 +492,82 @@ pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
 /// Returns an error if `git` cannot be executed at all. A `git` that ran and failed is
 /// [`Fact::Unknown`], not an error and emphatically not `No`.
 pub fn is_dirty(dir: &Path) -> Result<Fact> {
-    Ok(Fact::maybe(
-        git(dir, &["status", "--porcelain"])?.map(|s| !s.is_empty()),
-    ))
+    match worktree_identity(dir)? {
+        // Nothing there IS an answer: an absent directory holds no uncommitted work. Spelling it
+        // `Unknown` refused, for ever, a landing that used to complete — git keeps listing a
+        // worktree whose directory was removed (`prunable`), so `session::discover` still returns
+        // it, `git -C <gone>` exits 128, and `land_blocker` then blocked on a checkout that the
+        // disposal step three functions later handles as `Disposal::AlreadyGone`. The remedy that
+        // refusal printed could not even be run.
+        WorktreeIdentity::Absent => Ok(Fact::No),
+        // Git answered, but about somewhere else. Nothing it said is about this tree.
+        WorktreeIdentity::Foreign => Ok(Fact::Unknown),
+        WorktreeIdentity::Own => Ok(Fact::maybe(
+            git(dir, &["status", "--porcelain"])?.map(|s| !s.is_empty()),
+        )),
+    }
+}
+
+/// Whether a per-worktree git question asked in `dir` is answered by `dir` itself.
+///
+/// **Git's discovery walks up**, and that quietly invalidates every question this module asks of
+/// a session worktree. With `<repo>/.jkb/work/x/.git` gone, `git -C <repo>/.jkb/work/x status`
+/// does not fail — it finds `<repo>/.git` and exits 0, reporting the MAIN checkout's status
+/// (empty, since `.jkb/` is in `.git/info/exclude`). So the very state this three-valued rewrite
+/// was written for — a worktree unlinked part-way — produced a confident `No` about a different
+/// tree, and `dispose` recorded the main repo's HEAD as that session's identity, which the sweep
+/// then reads as a different session reusing the name and holds for ever.
+///
+/// Asked here, once, so no call site has to remember that `-C` is not a fence.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed at all.
+pub fn worktree_identity(dir: &Path) -> Result<WorktreeIdentity> {
+    // Absence is established without asking git, and must be: git answers for the enclosing repo
+    // when handed a path that is not there, which would make a removed worktree read as `Own`.
+    if !dir.exists() {
+        return Ok(WorktreeIdentity::Absent);
+    }
+    let Some(top) = git(dir, &["rev-parse", "--show-toplevel"])?.filter(|s| !s.is_empty()) else {
+        return Ok(WorktreeIdentity::Foreign);
+    };
+    // Both sides resolved: `/tmp` and `/private/tmp` are the same directory on macOS, and
+    // comparing the strings would call every worktree under one of them foreign.
+    let (Ok(a), Ok(b)) = (fs::canonicalize(dir), fs::canonicalize(&top)) else {
+        return Ok(WorktreeIdentity::Foreign);
+    };
+    Ok(if a == b {
+        WorktreeIdentity::Own
+    } else {
+        WorktreeIdentity::Foreign
+    })
+}
+
+/// Whether a directory answers git's questions about **itself** — see [`worktree_identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeIdentity {
+    /// The directory is not there. An established observation, not an unobtainable answer.
+    Absent,
+    /// It is there and `rev-parse --show-toplevel` is the directory itself.
+    Own,
+    /// It is there, but git's answers come from an enclosing repository — or it could not say.
+    Foreign,
+}
+
+/// The commit `dir`'s **own** HEAD is on, or `None` if `dir` cannot answer for itself.
+///
+/// [`rev`] with `"HEAD"` is the wrong tool for a session worktree: git's discovery walks up, so a
+/// worktree whose `.git` file has been removed cheerfully returns the enclosing repository's
+/// HEAD. A session's identity is exactly what must not be borrowed from its parent.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed at all.
+pub fn worktree_head(dir: &Path) -> Result<Option<String>> {
+    if worktree_identity(dir)? == WorktreeIdentity::Own {
+        rev(dir, "HEAD")
+    } else {
+        Ok(None)
+    }
 }
 
 /// How many tracked files are deleted in the working tree, when that is **all** that is wrong.
@@ -748,7 +832,7 @@ pub fn ensure_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
 /// Returns an error if `git` cannot be executed or refuses to create the branch.
 pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
     valid_ref(branch)?;
-    if has_branch(dir, branch)? {
+    if has_branch(dir, branch)?.is_yes() {
         return Ok(true);
     }
     let Some(remote) = branch_ref(dir, branch, Prefer::Remote)? else {
@@ -790,6 +874,8 @@ mod tests {
         std::fs::write(dir.join("base.txt"), "base").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-qm", "base"]);
+        // `deep/er` exists so `has_branch("deep")` has a prefix to be wrongly matched by.
+        run(&["branch", "deep/er"]);
         for branch in ["mergecommit", "squash", "rebase", "unmerged"] {
             run(&["checkout", "-q", "-b", branch, "main"]);
             std::fs::write(dir.join(format!("{branch}.txt")), "one").unwrap();
@@ -1010,6 +1096,127 @@ mod tests {
             !answer.is_no(),
             "and every guard asks `is_no()`, which must therefore be false here — this is the \
              assertion that fails if `is_dirty` ever collapses back to a bool"
+        );
+    }
+
+    /// `git -C <dir>` is NOT a fence: git's discovery walks up.
+    ///
+    /// A session worktree whose `.git` file is gone is answered by the enclosing repository —
+    /// `status` exits 0 reporting the MAIN checkout — so the state the three-valued rewrite was
+    /// written for produced a confident answer about a different tree. `is_dirty` must call that
+    /// `Unknown`, and `worktree_head` must refuse to borrow the parent's HEAD as a session's
+    /// identity, or the sweep reads it as a different session reusing the name and holds it.
+    #[test]
+    fn a_worktree_whose_git_link_is_gone_does_not_answer_with_its_parents_state() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let root = t.path();
+        fixture(root);
+
+        // A linked worktree, then its `.git` file removed — a part-way `git worktree remove`.
+        let wt = root.join(".jkb/work/x");
+        std::fs::create_dir_all(wt.parent().expect("parent")).expect("mkdir");
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&wt)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git worktree add");
+        assert!(add.status.success(), "{add:?}");
+
+        assert_eq!(
+            super::worktree_identity(&wt).expect("identity"),
+            super::WorktreeIdentity::Own,
+            "the intact worktree answers for itself"
+        );
+        let own_head = super::worktree_head(&wt).expect("head");
+        assert!(own_head.is_some(), "and has a HEAD of its own");
+
+        std::fs::remove_file(wt.join(".git")).expect("unlink .git");
+
+        // The measured half: git still answers, from the enclosing repository.
+        let leaked = super::git(&wt, &["rev-parse", "--show-toplevel"]).expect("git");
+        assert!(
+            leaked.is_some(),
+            "git answers a gutted worktree from its parent — if this ever stops being true the \
+             guard below is testing nothing"
+        );
+
+        assert_eq!(
+            super::worktree_identity(&wt).expect("identity"),
+            super::WorktreeIdentity::Foreign,
+            "an answer sourced from the enclosing repo is not about this tree"
+        );
+        assert_eq!(
+            super::is_dirty(&wt).expect("is_dirty"),
+            Fact::Unknown,
+            "so dirtiness is unestablished, not the parent's cleanliness"
+        );
+        assert_eq!(
+            super::worktree_head(&wt).expect("head"),
+            None,
+            "and a session never borrows its parent's HEAD as its own identity"
+        );
+    }
+
+    /// An absent directory is an ESTABLISHED observation, not an unobtainable answer.
+    ///
+    /// Git keeps listing a worktree whose directory was removed (`prunable`), so `session::
+    /// discover` still returns it. Spelling that `Unknown` made `land_blocker` refuse for ever a
+    /// landing that used to complete through `Disposal::AlreadyGone` — and the remedy it printed
+    /// (`git -C <gone dir> status`) could not be run.
+    #[test]
+    fn a_worktree_directory_that_is_gone_is_not_dirty_rather_than_unknown() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let gone = t.path().join("removed");
+        assert_eq!(
+            super::worktree_identity(&gone).expect("identity"),
+            super::WorktreeIdentity::Absent
+        );
+        assert_eq!(
+            super::is_dirty(&gone).expect("is_dirty"),
+            Fact::No,
+            "nothing there holds no uncommitted work"
+        );
+    }
+
+    /// A branch question git could not answer is `Unknown`, never "no such branch".
+    ///
+    /// `show-ref --verify --quiet` exits non-zero for BOTH "no such ref" and "this repository
+    /// cannot be read", and `git` collapses every non-zero exit — so an unreadable repo reported
+    /// a deleted branch and `land` printed "removed its branch".
+    #[test]
+    fn an_unreadable_repo_does_not_report_a_branch_as_deleted() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let root = t.path();
+        fixture(root);
+
+        assert_eq!(
+            super::has_branch(root, "squash").expect("has_branch"),
+            Fact::Yes
+        );
+        assert_eq!(
+            super::has_branch(root, "no-such-branch").expect("has_branch"),
+            Fact::No,
+            "a branch that really is absent is PROVEN absent"
+        );
+        // A `for-each-ref` pattern also matches deeper refs, so an exact comparison is required.
+        assert_eq!(
+            super::has_branch(root, "deep").expect("has_branch"),
+            Fact::No,
+            "`refs/heads/deep` must not be reported present by `refs/heads/deep/er`"
+        );
+
+        // Now make the repository unreadable.
+        std::fs::write(root.join(".git/HEAD"), "not a ref\n").expect("corrupt HEAD");
+        std::fs::remove_dir_all(root.join(".git/refs")).expect("remove refs");
+        let _ = std::fs::remove_file(root.join(".git/packed-refs"));
+        assert_eq!(
+            super::has_branch(root, "squash").expect("has_branch"),
+            Fact::Unknown,
+            "git could not answer, which is not the same as the branch being gone"
         );
     }
 }
