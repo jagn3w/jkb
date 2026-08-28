@@ -79,14 +79,21 @@ background and notifies on completion.
 
 ## 3. Report
 
-The workflow returns `{findings, raw, refuted, reviewers, features, context, note}`. Print:
+The workflow returns `{findings, raw, refuted, reviewers, features, context, scopes, note}`.
+Print:
 
 - one line of provenance: range, effort, how many reviewers ran, which functional units were
   identified, and which context it found (conventions / design / patterns) — a review that
   found no conventions file reviewed a different, weaker thing, and the reader should know;
 - `raw → refuted → findings`, so the filtering is visible;
-- each finding: **severity** · `file:line` · the summary, then the scenario and the fix
-  direction, most severe first. Group by severity.
+- the **scope split** from `scopes`: how many findings are this change's to fix
+  (`introduced` + `aggravated`) and how many are `pre-existing`. Severity says how bad a
+  finding is; scope says whether this change is where it gets fixed, and the two are
+  independent — a pre-existing finding can be the most serious thing in the run.
+- each finding: **severity** · **scope** · `file:line` · the summary, then the scenario and the
+  fix direction, most severe first. Group by severity, not by scope: the order is about what is
+  worth reading next, and marking a finding pre-existing must never be a way of burying it.
+  Report every one of them, at the severity the reviewer gave it.
 - whether the run was **verified** (`verified: true`) or filed unverified. At `low` every
   finding carries `unverified: true` and that is expected — say once that nothing was
   skeptic-checked, rather than repeating it per finding. At `high`, flag the individual ones

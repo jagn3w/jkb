@@ -88,9 +88,19 @@ describe** — same resolution rules, same `scriptPath` lookup, same `args` obje
 is one workflow with two thin callers precisely so that "what counts as a finding" cannot differ
 between them (design D37.7).
 
-It returns `{findings, raw, refuted, reviewers, verified, features, context, note}`. Each finding
-carries `severity` (`must-fix` / `concern` / `nit`), `file`, `line`, `summary`, `scenario`,
-`fix`, `kind`, and possibly `unverified`.
+It returns `{findings, raw, refuted, reviewers, verified, features, context, scopes, note}`. Each
+finding carries `severity` (`must-fix` / `concern` / `nit`), `scope` (`introduced` /
+`aggravated` / `pre-existing`), `file`, `line`, `summary`, `scenario`, `fix`, `kind`, and
+possibly `unverified`.
+
+**`severity` and `scope` are independent, and step 3 files them differently.** Severity is how
+bad it is; scope is whether this change is where it gets fixed. A pre-existing defect can be the
+most serious thing in the run — it is reported at its real severity and it still is not this
+change's to fix. Never collapse the two by demoting a serious out-of-scope finding to a nit to
+get it out of the way: that hides real work, and the next reviewer finds it again.
+
+Treat a missing `scope` as `introduced` — the same default the reviewers are given. A field the
+model failed to fill must not be what excuses a defect.
 
 At the default `low` effort up to three reviewers split the change by feature area, each asking
 every lens question against one reading of its code, and nothing is skeptic-checked — findings
@@ -101,13 +111,39 @@ header line so a reader knows what they are looking at; do not annotate every ta
 
 ## 3. Log the findings as tasks
 
+**Split by `scope` first.** The two halves go to different places, and where a finding lands is
+what decides whether it holds the branch:
+
+- **`introduced` and `aggravated` → this review's `tasks.md`.** They are what this change has to
+  answer for, and `jkb task land` counts any open `!p1` among them.
+- **`pre-existing` → the backlog, as its own task**, at its real severity, tagged with this
+  review so the trail survives:
+
+  ```sh
+  jkb task add "<summary> — <file>:<line> !p<n>" +tasks/<repo>/.backlog
+  jkb task tag add <new-uid> review=<ns>
+  ```
+
+  Then record it in the review doc's prose (see `## Filed elsewhere` below) so the run's own
+  record is complete.
+
+**Why the split is by LOCATION and not by a section heading:** the land gate counts findings with
+`priority<=1` in the review namespace, whatever section they sit in. A pre-existing must-fix
+written into this doc would block the branch exactly as if the change had caused it, which is the
+thing the scope axis exists to stop. A section-based split would need a scope-aware change to the
+gate in `jkb-core`; until that exists, keeping them out of the namespace is what makes the
+distinction real rather than decorative.
+
+If a `pre-existing` finding is one you decide to fix here anyway, move it into `tasks.md` and say
+so — the categories inform the decision, they do not make it for you.
+
 Write `REVIEW_DIR/tasks.md` as a jkb **`tasks`-serializer** Markdown doc, so it can be mounted
 and managed as tasks:
 
 ```
 # Code review — <branch> @ <YYYY-MM-DD HH:MM>
 
-Base: <range> · HEAD: <short SHA> · Effort: <effort> · Reviewers: <n> · Findings: <N> (of <raw> raw, <refuted> refuted)
+Base: <range> · HEAD: <short SHA> · Effort: <effort> · Reviewers: <n> · Findings: <N> for this change (of <raw> raw, <refuted> refuted) · Pre-existing filed to the backlog: <P>
 
 ## Must-fix
 
@@ -126,6 +162,15 @@ Base: <range> · HEAD: <short SHA> · Effort: <effort> · Reviewers: <n> · Find
 - [ ] <summary> — <file>:<line> !p3
   <scenario>
   Fix: <fix>
+
+## Filed elsewhere
+
+Pre-existing, reported at their real severity and filed as their own work — this change is not
+where they get fixed. Prose, deliberately: they are the run's record, and as tasks here they
+would gate the branch.
+
+- must-fix — <file>:<line> — <summary> → <backlog uid>
+- concern — <file>:<line> — <summary> → <backlog uid>
 ```
 
 Rules for the doc — these are the serializer's, and getting them wrong corrupts the sync:
@@ -138,8 +183,11 @@ Rules for the doc — these are the serializer's, and getting them wrong corrupt
   read as task modifiers.
 - Scenario and fix go on **indented continuation lines** under the task.
 - Do not write `^id`s; jkb mints them on sync.
-- No findings → a single `## Summary` section with `- [x] No findings — clean review !p3`, and
-  say in the prose line whether nothing was found or everything was refuted.
+- No findings **for this change** → a single `## Summary` section with `- [x] No findings — clean
+  review !p3`, and say in the prose line whether nothing was found, everything was refuted, or
+  everything found was pre-existing and filed elsewhere. The third is a different result from the
+  first two and must not be reported as a clean review: the change is clean, the code is not.
+  Keep the `## Filed elsewhere` section in that case.
 
 ## 4. Mount the folder into the KB
 
@@ -200,13 +248,21 @@ keeps deciding not to fix, and quietly ceasing to report it would turn that deci
 invisible one.
 
 Then print the findings (severity · `file:line` · summary, most severe first) and a one-line
-summary: `N findings (H must-fix, M concern, L nit) from R raw, K refuted`. Say they are mounted
-at `repos/<repo>/codereviews/<folder>` (git-ignored on disk) and browsable under
+summary: `N findings for this change (H must-fix, M concern, L nit) from R raw, K refuted; P
+pre-existing filed to the backlog`. Say they are mounted at
+`repos/<repo>/codereviews/<folder>` (git-ignored on disk) and browsable under
 `tasks/<repo>/codereviews/…`.
 
-Finally, say whether the branch can now land. You already know — the reader should not have to
-discover it at `land` time:
+**Print the two sets apart, and print the pre-existing one too.** It is not noise and it is not
+overhead: it is the review's answer to "what else is wrong here", and dropping it from the report
+is how a scope category turns into a way of not mentioning things. Give each one its severity and
+its backlog uid. If any pre-existing finding is a must-fix, say so in a sentence — the branch can
+land over it, and somebody should still know it is there.
 
-- **no must-fix findings** → "this branch is landable (`jkb task land <uid>`)".
-- **must-fix findings** → name them, and say landing is blocked until each is `done` or
+Finally, say whether the branch can now land. You already know — the reader should not have to
+discover it at `land` time. **Judged on the in-scope set only**, which is what the gate counts:
+
+- **no in-scope must-fix findings** → "this branch is landable (`jkb task land <uid>`)", and if
+  there are pre-existing must-fixes, name them in the same breath as filed-not-blocking.
+- **in-scope must-fix findings** → name them, and say landing is blocked until each is `done` or
   `cancelled`. `jkb staging ls` shows the same count against the task.

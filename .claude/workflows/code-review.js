@@ -86,9 +86,13 @@ const FINDING = {
     scenario: { type: 'string' }, // concrete inputs/state -> wrong result
     fix: { type: 'string' }, // the direction, not a patch
     severity: { type: 'string', enum: ['must-fix', 'concern', 'nit'] },
+    // Orthogonal to severity: how bad it is, versus whether THIS change is where it gets fixed.
+    // A serious defect the change merely sits next to must not hold the change hostage, and
+    // must not be quietly demoted to a nit to get it out of the way either.
+    scope: { type: 'string', enum: ['introduced', 'aggravated', 'pre-existing'] },
     kind: { type: 'string', enum: ['defect', 'quality'] },
   },
-  required: ['file', 'line', 'summary', 'scenario', 'severity', 'kind'],
+  required: ['file', 'line', 'summary', 'scenario', 'severity', 'scope', 'kind'],
 }
 
 const FINDINGS = {
@@ -182,7 +186,7 @@ const RANKED = {
           kind: { type: 'string', enum: ['defect', 'quality'] },
           lenses: { type: 'string' }, // which reviewers found it (merged duplicates)
         },
-        required: ['file', 'line', 'summary', 'scenario', 'severity', 'kind'],
+        required: ['file', 'line', 'summary', 'scenario', 'severity', 'scope', 'kind'],
       },
     },
     note: { type: 'string' },
@@ -252,6 +256,27 @@ For each finding give:
                            it to make sure it gets read.
                Severity is earned by how concrete and inevitable the harm is, never by how
                strongly you hold the view.
+  scope        introduced · aggravated · pre-existing — a SEPARATE axis from severity, and the
+               two are independent: a pre-existing defect can be the worst thing in the review,
+               and something this change introduced can be a nit. Severity says how bad it is;
+               scope says whether THIS change is where it gets fixed.
+                 introduced    the change causes it. The code carrying the defect is in the
+                               diff, or the diff is what makes the path reachable.
+                 aggravated    it predates the change, and the change makes it worse, more
+                               likely, or newly reachable. Say in the scenario what the change
+                               did to it. Fixed here by default — the change is why it matters
+                               now.
+                 pre-existing  it predates the change and the change does not affect it. You
+                               are reviewing a range: to claim this you must be able to say
+                               that the code carrying the defect is UNCHANGED in that range.
+                               Say so in the scenario, in those words.
+               If you cannot establish which of the three it is, say \`introduced\`. Of the two
+               ways to be wrong, one costs a fix that was not needed and the other ships a
+               defect under a label that excuses it. \`pre-existing\` is the only value that can
+               remove a finding from a change's own must-fix set, so it is a claim about the
+               diff and it has to be checkable — never a way to reduce what the author has to
+               deal with, and never a reason to soften the severity. Report the real severity
+               and let the scope decide where it goes.
   kind         \`quality\` if the finding is about how the code is BUILT — its structure,
                factoring, naming or placement — and \`defect\` if it is about the code being
                WRONG. The ranking pass demotes an unevidenced quality finding to a nit, so it
@@ -824,17 +849,34 @@ ${JSON.stringify(findings, null, 2)}
    finding so that it gets read, and deflating one because the set already has enough of its
    tier.
 
-3. ORDER STRICTLY, most damaging first — a total order across the whole set, not just grouped by
-   tier. The reader works down this list and stops when they run out of time, so position 1 must
-   genuinely be the thing most worth their next hour.
+3. CHECK EACH \`scope\` AGAINST THE DIFF, which the finders each saw only part of. This axis
+   decides where a finding goes — \`introduced\` and \`aggravated\` are this change's to fix,
+   \`pre-existing\` is filed as its own work — so it is the one field a finder has an incentive
+   to get wrong, and the incentive runs one way: towards excusing the change.
+     - \`pre-existing\` REQUIRES that the code carrying the defect is unchanged in the reviewed
+       range. If the finding does not say so and you cannot see it in the diff, move it to
+       \`introduced\`. Unestablished is not pre-existing.
+     - Move a finding to \`pre-existing\` only on the same evidence — never because the set
+       already has enough for this change to fix, and never as a softer alternative to demoting
+       its severity.
+     - Scope and severity move INDEPENDENTLY. Do not lower a severity because the scope is
+       \`pre-existing\`; a serious old defect is reported at its real severity and filed as its
+       own work. Do not raise one because it was introduced.
 
-4. SHARPEN each summary to one line that states the DEFECT — what is wrong — rather than the
+4. ORDER STRICTLY, most damaging first — a total order across the whole set, not just grouped by
+   tier. The reader works down this list and stops when they run out of time, so position 1 must
+   genuinely be the thing most worth their next hour. Order by severity and damage, NOT by
+   scope: a pre-existing must-fix outranks an introduced nit, because the order is about what is
+   worth reading next and not about who owns it.
+
+5. SHARPEN each summary to one line that states the DEFECT — what is wrong — rather than the
    topic. "X is never removed, so a second Y wedges" beats "cleanup issue in X". Keep the
    scenario concrete. Do not lengthen anything.
 
 Return the consolidated, calibrated, ordered list, plus a \`note\` giving what you merged and —
-in one sentence — why the must-fix set is the size it is. If it is empty, say that plainly;
-a change with nothing worth holding the merge for is a normal and good outcome.`
+in one sentence each — why the must-fix set is the size it is, and how many findings you moved
+between scopes and on what evidence. If the must-fix set is empty, say that plainly; a change
+with nothing worth holding the merge for is a normal and good outcome.`
 }
 
 // ---------------------------------------------------------------------------
@@ -864,9 +906,18 @@ async function finish(survivors, rawCount, killed, reviewerCount, scout) {
     bySeverity(survivors, 'ranking pass failed; sorted by severity, not merged or recalibrated')
 
   const counts = ranked.findings.reduce((acc, f) => ({ ...acc, [f.severity]: (acc[f.severity] || 0) + 1 }), {})
+  // An absent `scope` reads as `introduced`, matching what the finders are told to do when they
+  // cannot establish it: the value that keeps the finding in this change's own set. A schema the
+  // model failed to fill must not be the thing that excuses a defect.
+  const scopeOf = (f) => f.scope || 'introduced'
+  const scopes = ranked.findings.reduce((acc, f) => ({ ...acc, [scopeOf(f)]: (acc[scopeOf(f)] || 0) + 1 }), {})
+  const mine = ranked.findings.filter((f) => scopeOf(f) !== 'pre-existing')
   log(
     `done · ${ranked.findings.length} finding(s): ` +
-      `${counts['must-fix'] || 0} must-fix, ${counts.concern || 0} concern, ${counts.nit || 0} nit`,
+      `${counts['must-fix'] || 0} must-fix, ${counts.concern || 0} concern, ${counts.nit || 0} nit · ` +
+      `${mine.length} for this change ` +
+      `(${scopes.introduced || 0} introduced, ${scopes.aggravated || 0} aggravated), ` +
+      `${scopes['pre-existing'] || 0} pre-existing`,
   )
   return {
     range: RANGE || 'working tree',
@@ -882,6 +933,15 @@ async function finish(survivors, rawCount, killed, reviewerCount, scout) {
     raw: rawCount,
     refuted: killed,
     findings: ranked.findings,
+    // The split, so a caller does not have to re-derive it and get the absent-`scope` default
+    // the other way round. `blocking` is what this change has to answer for; `preExisting` is
+    // real work that belongs somewhere else and is reported at its true severity.
+    scopes: {
+      blocking: mine.length,
+      introduced: scopes.introduced || 0,
+      aggravated: scopes.aggravated || 0,
+      preExisting: scopes['pre-existing'] || 0,
+    },
     note: ranked.note || '',
   }
 }
