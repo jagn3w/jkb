@@ -514,8 +514,10 @@ pub fn is_dirty(dir: &Path, anchor: &Path) -> Result<Fact> {
         // disposal step three functions later handles as `Disposal::AlreadyGone`. The remedy that
         // refusal printed could not even be run.
         WorktreeIdentity::Absent => Ok(Fact::No),
-        // Git answered, but about somewhere else. Nothing it said is about this tree.
-        WorktreeIdentity::Foreign => Ok(Fact::Unknown),
+        // Git answered, but about somewhere else — or would not answer at all. Either way nothing
+        // it said is about this tree, so the two collapse HERE, deliberately: dirtiness has one
+        // unestablished answer and no remedy of its own to keep them apart for.
+        WorktreeIdentity::Foreign | WorktreeIdentity::Unestablished => Ok(Fact::Unknown),
         WorktreeIdentity::Own => Ok(Fact::maybe(
             git(dir, &["status", "--porcelain"])?.map(|s| !s.is_empty()),
         )),
@@ -561,16 +563,20 @@ pub fn worktree_identity(dir: &Path, anchor: &Path) -> Result<WorktreeIdentity> 
         Fact::No => return Ok(WorktreeIdentity::Absent),
         // Not established that it is there, and not established that it is gone. Nothing this
         // function could ask git afterwards would be about `dir` either.
-        Fact::Unknown => return Ok(WorktreeIdentity::Foreign),
+        Fact::Unknown => return Ok(WorktreeIdentity::Unestablished),
         Fact::Yes => {}
     }
+    // `Unestablished`, NOT `Foreign`. `git()` maps every non-zero exit to `Ok(None)`, so this arm
+    // is "git would not answer here" — `fatal: detected dubious ownership` on a uid-mismatched
+    // bind, a corrupt object store, a `safe.directory` policy — and calling that a proven wreck is
+    // what let the sweep rename a checkout it had established nothing about.
     let Some(top) = git(dir, &["rev-parse", "--show-toplevel"])?.filter(|s| !s.is_empty()) else {
-        return Ok(WorktreeIdentity::Foreign);
+        return Ok(WorktreeIdentity::Unestablished);
     };
     // Both sides resolved: `/tmp` and `/private/tmp` are the same directory on macOS, and
     // comparing the strings would call every worktree under one of them foreign.
     let (Ok(a), Ok(b)) = (fs::canonicalize(dir), fs::canonicalize(&top)) else {
-        return Ok(WorktreeIdentity::Foreign);
+        return Ok(WorktreeIdentity::Unestablished);
     };
     Ok(if a == b {
         WorktreeIdentity::Own
@@ -586,8 +592,20 @@ pub enum WorktreeIdentity {
     Absent,
     /// It is there and `rev-parse --show-toplevel` is the directory itself.
     Own,
-    /// It is there, but git's answers come from an enclosing repository — or it could not say.
+    /// It is there, git ANSWERED, and the answer names an enclosing repository — the wreck: a
+    /// part-way `git worktree remove` that unlinked the `.git` file and stopped.
+    ///
+    /// **Established**, and that is the whole reason it is separate from [`Self::Unestablished`].
+    /// It used to cover "or it could not say" as well, and the disposal sweep keys its most
+    /// destructive outcome on it: a repo git declines to speak for at all — `fatal: detected
+    /// dubious ownership`, which a uid-mismatched container bind produces routinely — read as a
+    /// proven wreck, and every deferred checkout under it was renamed away with the dirty check
+    /// waived. Same defect as `worktrees`, `deletions_only` and `present_under`, in the last
+    /// probe of the family that still had it.
     Foreign,
+    /// It is there and nothing about what it is was established: `rev-parse --show-toplevel` did
+    /// not answer, `canonicalize` failed, or its presence itself is unproven.
+    Unestablished,
 }
 
 /// The commit `dir`'s **own** HEAD is on, or `None` if `dir` cannot answer for itself.
@@ -606,11 +624,11 @@ pub fn worktree_head(dir: &Path, anchor: &Path) -> Result<Option<String>> {
     }
 }
 
-/// How many tracked files are deleted in the working tree, when that is **all** that is wrong.
+/// What the dirt in `dir`'s working tree is made of — see [`Deletions`] for the three answers.
 ///
-/// `Some(n)` means: `n` tracked files are missing, nothing is staged, nothing is modified and
-/// nothing is untracked — a tree somebody (or something) part-way removed, recoverable in full
-/// with one `git restore .`. `None` means the dirt is real work.
+/// [`Deletions::Only`] means: `n` tracked files are missing, nothing is staged, nothing is
+/// modified and nothing is untracked — a tree somebody (or something) part-way removed,
+/// recoverable in full with one `git restore .`.
 ///
 /// This exists because of a real incident: a `git worktree remove` refused part-way through left
 /// 152 deletions, and the next landing refused with "it has uncommitted changes — commit them in
@@ -619,15 +637,28 @@ pub fn worktree_head(dir: &Path, anchor: &Path) -> Result<Option<String>> {
 /// — disposal is an atomic rename now — but nothing stops a stale binary, an interrupted `rm`, or
 /// a hand-run `git worktree remove` from doing so.
 ///
+/// **`anchor` is the repo root, and the identity fence is here** — the same shape as [`is_dirty`]
+/// and [`worktree_head`], for the same reason their docs give: `git -C <dir>` is not a fence, so
+/// for a tree whose `.git` file has been unlinked git's discovery walks up and these four
+/// questions are answered *by the enclosing checkout*. That is not a hypothetical: the test below
+/// asserted `Unknown` for a directory inside the fixture repo and got `Only(1)` from the repo
+/// around it. It was the only probe in this family that made "do not ask this of a tree that
+/// cannot answer for itself" a rule every call site had to remember, and both call sites were
+/// safe only by each independently gating on its own `is_dirty(..).is_yes()`.
+///
 /// # Errors
-/// Returns an error if `git status` cannot be run here.
-pub fn deletions_only(dir: &Path) -> Result<Deletions> {
+/// Returns an error if `git` cannot be executed at all.
+pub fn deletions_only(dir: &Path, anchor: &Path) -> Result<Deletions> {
+    // Nothing this function could ask afterwards would be about `dir`.
+    if worktree_identity(dir, anchor)? != WorktreeIdentity::Own {
+        return Ok(Deletions::Unknown);
+    }
     // Asked as four questions with no whitespace in the answers, rather than by parsing
     // `status --porcelain` — whose leading status column is exactly what a trimmed capture eats,
     // so the first entry of every listing would read as the wrong code.
     let lines = |args: &[&str]| -> Result<Option<usize>> {
-        // A `git` that exits non-zero here means the question was not answered. Unknown must not
-        // be spelled the same as none: it returns `None` from the caller, which is *no advice*.
+        // A `git` that exits non-zero here means the question was not answered, and the caller
+        // turns that into `Deletions::Unknown` — never into a negative answer.
         Ok(git(dir, args)?.map(|s| s.lines().filter(|l| !l.trim().is_empty()).count()))
     };
     let (Some(staged), Some(untracked), Some(unstaged), Some(deleted)) = (
@@ -636,10 +667,10 @@ pub fn deletions_only(dir: &Path) -> Result<Deletions> {
         lines(&["diff", "--name-only"])?,
         lines(&["diff", "--name-only", "--diff-filter=D"])?,
     ) else {
-        // `Unknown`, and it used to be the same `None` as "this is real work". The comment here
-        // said `None` was *no advice* — but at the one call site that reads it, `None` picks the
-        // advice "commit them", which is exactly what must never be said about a part-way
-        // removal. An unanswered question is not a negative answer.
+        // `Unknown`, and it used to be the same `None` as "this is real work" — defended by a
+        // comment claiming `None` meant *no advice*, when at the one call site that read it
+        // `None` selected the advice "commit them": exactly what must never be said about a
+        // part-way removal. An unanswered question is not a negative answer.
         return Ok(Deletions::Unknown);
     };
     // A staged change of any kind is deliberate — staging a deletion included — and an untracked
@@ -669,6 +700,37 @@ pub enum Deletions {
     NotOnly,
     /// `git` did not answer, so nothing is established about what the dirt is.
     Unknown,
+}
+
+impl Deletions {
+    /// What must be added to a bare *"it has uncommitted changes"* for that sentence to be true —
+    /// or `None` where it already is.
+    ///
+    /// **One wording, because there are two readers and they drifted.** `jkb task land` and the
+    /// disposal sweep explain the same observation to the same person, and the sweep was taught
+    /// this round to caveat an unanswered probe while the land path went on wording it exactly
+    /// like ordinary work — at the site of the 152-deletion incident, telling an operator to
+    /// commit what may be a part-way removal. Three-valued `Deletions` exists so those two cannot
+    /// read the same; a renderer per caller is how they came to.
+    ///
+    /// Deliberately carries no remedy and no path: the two callers offer different ones (`land`
+    /// suggests `git restore .` inline, the sweep has a [`crate::archive::Remedy`] of its own),
+    /// and folding a remedy in here would have one of them print it twice.
+    #[must_use]
+    pub fn caveat(self) -> Option<String> {
+        match self {
+            Self::Only(n) => Some(format!(
+                "those {n} change(s) are deletions of tracked files and nothing else — a \
+                 part-way removal, not work"
+            )),
+            Self::NotOnly => None,
+            Self::Unknown => Some(
+                "git could not say what they are made of, so whether this is a part-way removal \
+                 is unestablished"
+                    .to_owned(),
+            ),
+        }
+    }
 }
 
 /// How many commits `branch` has that `onto` does not. Both must be refs this repository can
@@ -1101,7 +1163,7 @@ mod tests {
         let dir = tmp.path();
         fixture(dir);
         assert_eq!(
-            deletions_only(dir).unwrap(),
+            deletions_only(dir, dir).unwrap(),
             super::Deletions::NotOnly,
             "a clean tree owes no advice"
         );
@@ -1109,7 +1171,7 @@ mod tests {
         // The incident's shape: tracked files missing, nothing staged, nothing untracked.
         std::fs::remove_file(dir.join("base.txt")).unwrap();
         assert_eq!(
-            deletions_only(dir).unwrap(),
+            deletions_only(dir, dir).unwrap(),
             super::Deletions::Only(1),
             "deletions alone are recoverable with `git restore .`"
         );
@@ -1125,15 +1187,30 @@ mod tests {
         let not_a_repo = outside.path().join("elsewhere");
         std::fs::create_dir_all(&not_a_repo).unwrap();
         assert_eq!(
-            deletions_only(&not_a_repo).unwrap(),
+            deletions_only(&not_a_repo, outside.path()).unwrap(),
             super::Deletions::Unknown,
             "git declined to answer, and that is its own value"
+        );
+
+        // THE TRAP THE FENCE EXISTS FOR, asked inside the repo where it actually bites: a
+        // directory that is not a worktree of its own is answered BY THE REPO AROUND IT, because
+        // `git -C <dir>` is not a fence and discovery walks up. Unfenced, this reported the
+        // enclosing checkout's one deletion as the subdirectory's own — which is precisely how a
+        // wrecked session tree would have had the main checkout's dirt read as its own, and why
+        // the case above had to be written in a separate tempdir to say anything at all.
+        let inside = dir.join("subdir");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(
+            deletions_only(&inside, dir).unwrap(),
+            super::Deletions::Unknown,
+            "a directory that does not answer git for itself must report nothing, not its \
+             parent's dirt"
         );
 
         // One real edit beside them and it is work again — the advice must flip back.
         std::fs::write(dir.join("new.txt"), "mine").unwrap();
         assert_eq!(
-            deletions_only(dir).unwrap(),
+            deletions_only(dir, dir).unwrap(),
             super::Deletions::NotOnly,
             "an untracked file beside the deletions is work, and must not be restored over"
         );

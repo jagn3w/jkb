@@ -5869,17 +5869,15 @@ fn land_preflight(
         (Some(work), Some(target)) => gitrepo::ahead_count(&ctx.root, target, work)?,
         _ => 0,
     };
-    // The last of the four deliberate collapses, and the only one worth a word about safety: an
-    // empty list makes `target_dirty_reason` find no checkout for `onto` and report it clean, so
-    // in principle a land could graft into a dirty target on the strength of a question git did
-    // not answer. It cannot get that far — `land_dir_for` asks the same broken git a moment later
-    // and refuses (an existing `.jkb/base` it cannot see registered) or fails outright (a
-    // `worktree add` that needs the same git) — so the preflight's optimism is bounded by the
-    // graft's own pessimism rather than by anything here.
-    let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
+    // NOT collapsed here any more. `target_dirty_reason` takes the `Option` and says what an
+    // unanswered `git worktree list` means for a landing — which is a refusal, because the
+    // checkout the graft would land in cannot even be identified. Collapsed to an empty list it
+    // reported the target CLEAN, and the bespoke argument written here for why that was safe was
+    // the second such argument in the tree for one value; one helper stating it once is the fix.
+    let worktrees = gitrepo::worktrees(&ctx.root)?;
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
-        staging::target_dirty_reason(&worktrees, &ctx.root, &onto, &mut dirty_cache)?;
+        staging::target_dirty_reason(worktrees.as_deref(), &ctx.root, &onto, &mut dirty_cache)?;
     // Three-valued: `land_blocker` requires it PROVEN clean, so a session checkout git cannot
     // read refuses here — before the graft — instead of at `archive::dispose`, which runs after
     // it and leaves the task frozen over work already in the target.
@@ -5912,17 +5910,31 @@ fn land_preflight(
         // `git restore .` remedy to "it has no commits" or "its review left a must-fix open" is
         // advice about a different problem — the tree being deletions-only is a fact about the
         // dirt, and the dirt is only what was refused when the reason says so.
+        // From `Deletions::caveat`, the ONE wording — not a second one written here. This arm used
+        // to match `Only(n)` and fall through everything else to silence, so an unanswered probe
+        // (`Deletions::Unknown`) read exactly like ordinary work and the operator was told to
+        // commit what may be a part-way removal: the collapse `archive::verdict_pending` had just
+        // been corrected for, still in place at the site of the incident that motivated it.
         let hint = match sess
             .as_ref()
             .filter(|_| dirty.is_yes() && reason.contains("uncommitted changes"))
-            .map(|s| gitrepo::deletions_only(&s.worktree))
+            .map(|s| gitrepo::deletions_only(&s.worktree, &ctx.root))
         {
-            Some(Ok(gitrepo::Deletions::Only(n))) => format!(
-                " Those {n} change(s) are deletions of tracked files and nothing else — a \
-                 part-way removal, not work. `git -C {} restore .` puts them all back.",
-                sess.as_ref()
-                    .map_or_else(String::new, |s| s.worktree.display().to_string())
-            ),
+            Some(Ok(d)) => match (d.caveat(), &sess) {
+                (None, _) | (_, None) => String::new(),
+                // The remedy is the land path's own, which is why `caveat` does not carry one: it
+                // belongs only to the arm where putting the files back is the answer.
+                (Some(c), Some(s)) => {
+                    let capped = format!("{}{}", c[..1].to_uppercase(), &c[1..]);
+                    match d {
+                        gitrepo::Deletions::Only(_) => format!(
+                            " {capped}. `git -C {} restore .` puts them all back.",
+                            s.worktree.display()
+                        ),
+                        _ => format!(" {capped}."),
+                    }
+                }
+            },
             _ => String::new(),
         };
         anyhow::bail!("{uid} cannot land. {reason}{hint}");
@@ -6415,6 +6427,9 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
                     .collect::<Vec<_>>(),
                 "deleted": r.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "cleared": r.cleared,
+                "kept_branches": r.kept_branches.iter()
+                    .map(|(uid, why)| serde_json::json!({ "uid": uid, "reason": why }))
+                    .collect::<Vec<_>>(),
                                 "skipped": r.skipped.as_ref().map(|h| serde_json::json!({
                     "lock": h.path.display().to_string(),
                     "holder": h.holder,
@@ -6444,6 +6459,11 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
     }
     for uid in &r.cleared {
         println!("cleared {uid} (nothing left to archive)");
+    }
+    // A plan the operator asked for that jkb declined to apply. Printed with the archive lines
+    // rather than with the holds: the tree DID move, and only the branch survives.
+    for (uid, why) in &r.kept_branches {
+        println!("kept branch for {uid}: {why}");
     }
     // Held is the normal state when this is run from the session that owns the worktree, so it
     // says what would move it rather than reading as a failure.
@@ -7256,21 +7276,34 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
     // disposal replaced BEFORE it evaluates anything, so a withdrawn record was getting a vote
     // here and re-printing advice the operator had already taken — and the count above it said
     // "2 awaiting archive" for one worktree.
-    let pending = archive::pending_outlook(db_path).unwrap_or_default();
+    //
+    // Asked of the `store` ALREADY READ, not of the path again. Two reads meant the archived count
+    // and the pending count came from two views of one file, so a record a concurrent sweep
+    // archived between them appeared in neither; and the second read's error was swallowed to an
+    // empty list, which printed "0 awaiting archive" over a store full of deferred checkouts and
+    // suppressed the `--fix` line with it.
+    let pending = archive::pending_outlook_in(&store);
+    // AWAITING AND HELD ARE COUNTED APART, and this is the surface `jkb task sessions` sends you
+    // to. That listing was changed this round to stop saying "awaiting archive" about a record
+    // nothing will ever move — `[awaiting archive]` is a promise that something is going to finish
+    // this — and then the header here went on making exactly that promise, for three checkouts at
+    // once, with the `--fix` line suppressed because every one of them was held.
+    let (held, awaiting): (Vec<_>, Vec<_>) = pending
+        .iter()
+        .partition(|(_, v)| matches!(v, archive::Verdict::Hold(_)));
     println!(
-        "worktree removals: {} awaiting archive, {} archived",
-        pending.len(),
+        "worktree removals: {} awaiting archive, {} held, {} archived",
+        awaiting.len(),
+        held.len(),
         archived.len()
     );
     // WHY it has not moved, from the verdict the sweep executes. "not yet moved" beside "run
     // `jkb doctor --fix`" was true of a record waiting for the service and false of one no sweep
     // can act on — and the two rendered identically, so the operator ran the fix repeatedly
     // against a record it would report the same way for ever.
-    let mut blocked = 0usize;
     for (e, verdict) in &pending {
         match verdict {
             archive::Verdict::Hold(b) => {
-                blocked += 1;
                 println!(
                     "  {} — {} is HELD: {} — {}",
                     e.uid,
@@ -7336,7 +7369,7 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
             Ok(r) => report_reap(&r, false, false),
             Err(e) => println!("  sweep failed: {e}"),
         }
-    } else if pending.len() > blocked {
+    } else if !awaiting.is_empty() {
         println!("  run `jkb doctor --fix` or `jkb task reap` (the watcher service runs it)");
     }
 }

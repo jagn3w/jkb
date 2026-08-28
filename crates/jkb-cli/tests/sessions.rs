@@ -497,13 +497,16 @@ fn a_deferred_session_is_badged_by_what_the_sweep_will_do_with_it() {
         "the two are never both true — that would promise a move and refuse it at once: {dirty}"
     );
 
-    // And `doctor` agrees, from the same read: it is the surface the badge sends you to.
+    // And `doctor` agrees, from the same read: it is the surface the badge sends you to. It must
+    // count this record as HELD and not as awaiting — the promise the badge above was changed to
+    // stop making. The first version of this assertion pinned "1 awaiting archive" for a record it
+    // had just made held, which is the lumped wording rather than the fix.
     f.jkb()
         .args(["doctor"])
         .assert()
         .success()
         .stdout(predicate::str::contains("is HELD"))
-        .stdout(predicate::str::contains("1 awaiting archive"));
+        .stdout(predicate::str::contains("0 awaiting archive, 1 held"));
 }
 
 /// Abandoning returns the task to the frontier and takes the checkout with it — but keeps

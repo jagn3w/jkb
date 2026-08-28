@@ -218,9 +218,10 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
     // landing the command performed — the row-versus-command divergence this single read exists to
     // prevent, in the exact case remote-inclusive existence was added to support.
     let existing = gitrepo::branch_refs(&ctx.root)?;
-    // A listing degrades to "no checkouts", which reads as no live sessions — the same
-    // direction the row already takes for a branch it cannot resolve.
-    let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
+    // NOT collapsed here. `target_dirty_reason` takes the `Option` and states what an unanswered
+    // listing means for a landing; `Staging::checkout` below takes the "no checkouts" reading,
+    // which is the direction the row already takes for a branch it cannot resolve.
+    let worktrees = gitrepo::worktrees(&ctx.root)?;
     let mut cache = Cache::default();
 
     let mut out = Vec::new();
@@ -253,8 +254,12 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
 
         // Per branch, not per task: whether the target checkout is dirty is a property of
         // the branch, and it is the one land precondition a row could not previously see.
-        let target_dirty =
-            target_dirty_reason(&worktrees, &ctx.root, &branch, &mut cache.target_dirty)?;
+        let target_dirty = target_dirty_reason(
+            worktrees.as_deref(),
+            &ctx.root,
+            &branch,
+            &mut cache.target_dirty,
+        )?;
         let branch_ctx = BranchCtx {
             onto_ref: &branch_ref,
             sessions: &sessions,
@@ -274,8 +279,11 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
             branch: branch.clone(),
             merged: spent,
             ahead,
+            // "no checkout" either way — the same direction the row already takes for a branch
+            // it cannot resolve, and unlike the dirty question there is no act gated on it.
             checkout: worktrees
                 .iter()
+                .flat_map(|ws| ws.iter())
                 .find(|w| w.branch.as_deref() == Some(branch.as_str()))
                 .map(|w| w.path.clone()),
             tasks: staged,
@@ -486,12 +494,30 @@ fn land_dir_in(
 /// A pure read, so the CLI's preflight and this view's rows ask the same question of the same
 /// `git worktree list` — `collect` fetches that list once per run, rather than re-spawning
 /// `git worktree list` per branch as the first version did.
+///
+/// **`worktrees` is `Option`, and the collapse lives here rather than at each caller.** Both
+/// callers used to `unwrap_or_default()` a `git worktree list` that had not answered, each with
+/// its own written argument for why that was safe, and for this consumer neither argument held:
+/// an empty list makes `land_dir_in` answer `None`, whose premise is *the graft will land in a
+/// `.jkb/base` that has to be created, which cannot be dirty because it does not exist yet* — and
+/// an existing, dirty `.jkb/base` falsifies exactly that. The row then read "Landable" for a task
+/// `jkb task land` refuses with a different message, which is the row-versus-command divergence
+/// [`land_blocker`](crate::repo) exists to prevent. A question git did not answer is not an
+/// answer, and one helper stating that once beats two call sites reasoning about it.
 pub(crate) fn target_dirty_reason(
-    worktrees: &[gitrepo::Worktree],
+    worktrees: Option<&[gitrepo::Worktree]>,
     root: &std::path::Path,
     onto: &str,
     dirty: &mut BTreeMap<std::path::PathBuf, Fact>,
 ) -> Result<Option<String>> {
+    let Some(worktrees) = worktrees else {
+        return Ok(Some(format!(
+            "git could not list this repository's worktrees, so the checkout a land onto {onto} \
+             would graft in cannot be identified, let alone established as clean. \
+             `git -C {} worktree list` will say what it makes of the repository.",
+            root.display()
+        )));
+    };
     let Some(dir) = land_dir_in(worktrees, root, onto) else {
         return Ok(None);
     };
