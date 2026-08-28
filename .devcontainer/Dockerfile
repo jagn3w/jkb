@@ -72,4 +72,17 @@ RUN mkdir -p /home/vscode/.cargo/target \
              /home/vscode/.claude-state \
              /home/vscode/.claude
 
+# --- VS Code extensions, fetched HERE rather than at connect time ----------------------------
+# A build has ordinary egress; the running container does not. Measured on a real "Reopen in
+# Container": VS Code starts installing extensions ~1s before setup.sh raises the egress firewall,
+# the downloads land just after it is up, and both failed with ECONNREFUSED — non-fatally, so the
+# container came up with neither installed and nothing gated on it. Fetching at build time needs
+# no widening of the posture's allowedDomains. setup.sh installs these from disk; verify.sh
+# asserts the result. See fetch-extensions.sh for why the CDN was not allowlisted instead.
+#
+# Deliberately the LAST thing in the file: it copies devcontainer.json, which changes often, and
+# nothing above it should be rebuilt when it does.
+COPY --chown=vscode:vscode lib.sh devcontainer.json fetch-extensions.sh /home/vscode/.devcontainer-build/
+RUN /home/vscode/.devcontainer-build/fetch-extensions.sh /home/vscode/.vsix
+
 WORKDIR /workspaces

@@ -75,4 +75,10 @@ echo "==> devcontainer config"
 # JSON) but never as working.
 "$(dirname "$0")/../.devcontainer/check-workspace.sh" --self-test
 
+# ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
+# a regex, and it is the one part of the mount boundary that widens by a typo instead of by an
+# edit somebody reviews — an over-broad exclusion drops a real mount from the set and the
+# assertion still prints `ok`. mutate-verify.sh covers it and needs Docker; this costs nothing.
+"$(dirname "$0")/../.devcontainer/verify.sh" --self-test
+
 echo "All checks passed."

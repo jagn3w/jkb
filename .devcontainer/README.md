@@ -61,6 +61,34 @@ docker build -t jkb-dev .devcontainer
 to `postStartCommand` would run the whole of create with open egress), then the posture, then
 `verify.sh`.
 
+## Extensions are fetched at build time, and pinned
+
+VS Code installs extensions when you **connect**, which is after `setup.sh` has raised the egress
+firewall. Measured: both declared extensions failed with `ECONNREFUSED` to `*.gallery.vsassets.io`
+and the container came up with neither installed — including the Claude Code extension, which is
+most of what this container is for — as a non-fatal log line nothing gated on. Reordering cannot
+fix it, because `postStartCommand` re-raises the firewall on every start.
+
+So `fetch-extensions.sh` downloads the `.vsix` files during `docker build`, where egress is
+ordinary because the firewall only exists inside the running container, and `setup.sh` installs
+them from disk. **This needs no widening of `allowedDomains`** — and the alternative is worse than
+it sounds: the firewall pins names to IPs at raise time and cannot pin a wildcard, so
+`*.vsassets.io` would not help and every extension *publisher* would need its own concrete host,
+pinned to CDN addresses that rotate.
+
+**Every entry must be version-pinned** (`publisher.name@version`); `check-config.sh` fails the
+gate on one that is not, because unpinned means VS Code resolves "latest" over the network and we
+are back to the download that cannot succeed. Adding or upgrading an extension is therefore an
+edit plus a **rebuild**, the same ceremony the allowlist already asks for.
+
+The list lives once, in `devcontainer.json`, and is read through `lib.sh`'s `dc_extensions` by all
+four users of it — the build fetch, the install, the pinning gate, and `verify.sh`'s assertion
+that they are actually present. `verify.sh` **skips** that last one where there is no VS Code
+server, since `devcontainer up`, a plain `docker run` and `mutate-verify.sh` all build a correct
+container with no VS Code in it; the skip is printed, and the judgement itself
+(`missing_extensions`) is a pure function exercised by `verify.sh --self-test`, so its failure arm
+is watched even though no container harness can reach it.
+
 ## The mount list is the security boundary
 
 Everything absent from `devcontainer.json`'s `mounts` does not exist inside the container. Add to
@@ -78,6 +106,23 @@ The expected set is **derived** from `devcontainer.json`, so adding a mount is a
 and cannot drift out of step with the verifier. It used to be transcribed into `verify.sh` as
 well, and the first time the mounts changed the copy went stale and a correctly-built container
 failed its own verifier.
+
+**`/vscode` is excluded, and it is the one exclusion the container runtime does not own.** The Dev
+Containers extension mounts a named volume there to hold the VS Code server, before `postCreate`
+runs. It is added by the launcher's own docker flags, so it can be declared neither in
+`devcontainer.json` — which would claim we create it, when under `devcontainer up` or a plain
+`docker run` it is simply absent — nor with `--declare`, which is refused for anything not nested
+inside a declared bind. Until it was excluded, **"Reopen in Container" failed `postCreate`
+outright** on `UNDECLARED mounts: /vscode`: the supported path was the one path no harness drove,
+because `mutate-verify.sh` spells its own docker flags and never mounts it. Anchored `^/vscode$`,
+so a bind at `/vscode/anything` still fails. The cost, stated: from inside the container a volume
+and a bind are indistinguishable, so this one path is a spot where a host bind would pass — which
+is not the threat this check is for, and a careless line in `devcontainer.json` still is.
+
+`verify.sh --self-test` exercises that exclusion list on a host with no Docker (it is in
+`./scripts/check.sh`), because every entry is an *exclusion*: one that matches more than it names
+drops a real mount from the set and the assertion still prints `ok`. That is this file's own
+history — `^/dev` once matched `/devtools`.
 
 All of **`~/repos`** is mounted, at `/home/vscode/repos`, and `workspaceFolder` follows the folder
 you opened — `/home/vscode/repos/${localWorkspaceFolderBasename}`. The argument

@@ -357,6 +357,29 @@ else
     bad "mutate-verify.sh expects text verify.sh never prints: ${stale_expects[*]} — those mutations can only ever report MISSED"
 fi
 
+# Every declared VS Code extension is VERSION-PINNED. Unpinned, VS Code resolves "latest" over
+# the network when you connect — which is after postCreate raised the egress firewall, so the
+# download is refused and the container comes up without the extension, non-fatally. The pin is
+# what makes the .vsix staged into the image at build time match what VS Code asks for.
+#
+# Pinned against an empty extraction for the same reason as the lists above: an empty list would
+# make this print `ok (0 checked)` while the Dockerfile fetched nothing and every downstream
+# assertion was vacuously satisfied.
+unpinned=()
+ext_count=0
+while read -r ext; do
+    [ -n "$ext" ] || continue
+    ext_count=$((ext_count+1))
+    dc_extension_split "$ext" >/dev/null || unpinned+=("$ext")
+done <<<"$(dc_extensions "$here/devcontainer.json")"
+if [ "$ext_count" -eq 0 ]; then
+    bad "no extensions could be read out of devcontainer.json — this check just certified nothing; has customizations.vscode.extensions moved?"
+elif [ ${#unpinned[@]} -eq 0 ]; then
+    ok "every declared VS Code extension is version-pinned ($ext_count checked)"
+else
+    bad "unpinned VS Code extension(s): ${unpinned[*]} — write publisher.name@version, or the connect-time download the firewall refuses is what installs them"
+fi
+
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi
 done

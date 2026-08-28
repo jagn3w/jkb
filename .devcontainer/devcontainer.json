@@ -94,9 +94,22 @@
   // never stop the firewall from being raised.
   "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh && (jkb task reap || true)",
 
+  // EVERY ENTRY IS VERSION-PINNED, and that is a requirement rather than a preference —
+  // check-config.sh fails the gate on an unpinned one.
+  //
+  // These are fetched as .vsix files at BUILD time (fetch-extensions.sh, run from the Dockerfile,
+  // where egress is unrestricted because the firewall only exists inside the running container)
+  // and installed from disk by setup.sh. Left to VS Code they are downloaded at CONNECT time,
+  // which is after setup.sh has raised the egress firewall: measured, both of these failed with
+  // ECONNREFUSED to *.gallery.vsassets.io and the container came up with NEITHER installed, as a
+  // non-fatal log line nothing gated on. Widening `allowedDomains` to Microsoft's CDN instead
+  // would mean a new entry per extension PUBLISHER, pinned to IPs that rotate.
+  //
+  // The pin is what makes the local .vsix match what VS Code asks for. Unpinned, it resolves
+  // "latest" over the network and we are back to the download that cannot succeed.
   "customizations": {
     "vscode": {
-      "extensions": ["rust-lang.rust-analyzer", "anthropic.claude-code"]
+      "extensions": ["rust-lang.rust-analyzer@0.3.3025", "anthropic.claude-code@2.1.250"]
     }
   }
 }

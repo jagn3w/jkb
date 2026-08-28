@@ -256,6 +256,18 @@ run "the Dockerfile stops pre-creating CARGO_TARGET_DIR" "does not pre-create"
 seed; printf '\nif then fi\n' >> "$work/t/.devcontainer/setup.sh"
 run "a devcontainer script gains a syntax error" "has a syntax error"
 
+# An extension loses its version pin — the state VS Code resolves over the network, at connect
+# time, against a raised egress firewall. It failed exactly this way on a real launch and said so
+# only in a log line nothing gated on.
+seed; jq_dc '.customizations.vscode.extensions |= map(split("@")[0])'
+run "a VS Code extension loses its version pin" "unpinned VS Code extension(s)"
+
+# ...and the same fail-open shape as the two below: the pinning check reads the list through
+# lib.sh's dc_extensions, and a list it cannot find is an empty list. Nothing to check reads as
+# nothing wrong — while the Dockerfile fetches no .vsix and setup.sh installs none.
+seed; jq_dc 'del(.customizations.vscode.extensions)'
+run "the extension list moves out from under dc_extensions" "this check just certified nothing"
+
 # The source half of the mount review depends on lib.sh producing anything at all. mutate-config
 # did not mutate lib.sh, so neither this nor the fail-open shape it protects was ever watched.
 seed; python3 - "$work/t/.devcontainer/lib.sh" <<'PYX'
@@ -290,7 +302,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=30
+PINNED_BAD_SITES=32
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

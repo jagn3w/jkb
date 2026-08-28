@@ -34,14 +34,126 @@ assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 # in the ok line below, because an override nobody can see is indistinguishable from a rule that
 # does not exist (D38).
 DECLARED_EXTRA=()
+SELF_TEST=no
 while [ $# -gt 0 ]; do
     case "$1" in
         --declare)   shift; [ $# -gt 0 ] || { echo "verify.sh: --declare needs a mount point" >&2; exit 2; }
                      DECLARED_EXTRA+=("$1"); shift ;;
         --declare=*) DECLARED_EXTRA+=("${1#--declare=}"); shift ;;
-        *)           echo "usage: verify.sh [--declare <mount-point>]..." >&2; exit 2 ;;
+        --self-test) SELF_TEST=yes; shift ;;
+        *)           echo "usage: verify.sh [--declare <mount-point>]... | --self-test" >&2; exit 2 ;;
     esac
 done
+
+# What every container has regardless of configuration. Anything outside this and EXPECTED is
+# something a human added to devcontainer.json and must be looked at.
+#
+# Anchored at a component boundary — `(/|$)` — not as bare prefixes. `^/dev` also matched
+# `/devtools`, `^/proc` matched `/procdata` and `^/sys` matched `/sysroot`, so a host mount at any
+# of those was silently dropped from the set this check calls exhaustive. A list of exclusions
+# that quietly grows is the shape this assertion exists to avoid having.
+#
+# `/vscode` is the one entry here the CONTAINER RUNTIME does not own: the VS Code Dev Containers
+# extension mounts a named volume there to hold the server, unpacks it, and symlinks
+# ~/.vscode-server/bin at it — all before postCreate runs. It is added by the launcher's own
+# docker flags, so it is expressible neither in devcontainer.json (which would be a false claim:
+# we do not create it, and under `devcontainer up` or a plain docker run it is simply absent) nor
+# as `--declare` (which is refused for anything not nested inside a declared bind). Without it
+# `Reopen in Container` failed postCreate outright on `UNDECLARED mounts: /vscode`, which is why
+# the supported path was the one path nothing had exercised.
+#
+# Anchored `^/vscode$`, deliberately not `(/|$)`: only the mount point itself is the launcher's.
+# A bind at /vscode/anything is somebody putting a host path inside it, and must still fail.
+# The cost, stated rather than hidden: from in here a volume and a bind are indistinguishable, so
+# this one path is a spot where a host bind would pass. Bounded to one path, and it is not the
+# threat this check is for — a careless line in devcontainer.json is, and that is still covered.
+RUNTIME_OWNED='^/$|^/proc(/|$)|^/sys(/|$)|^/dev(/|$)|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets(/|$)|^/vscode$'
+
+# Which declared extension ids are absent from a `code-server --list-extensions` listing.
+#
+# Pure, and separated from the call for one reason: in EVERY harness this repo has there is no VS
+# Code server — `devcontainer up`, a plain docker run and mutate-verify.sh all build a correct
+# container with no VS Code in it — so the only arm of assertion 7 that can run there is the skip.
+# Left inline, its FAIL arm would be unreachable code wearing the costume of a guard, in a change
+# whose entire subject is a check that could not fire.
+#
+# Case-insensitive: the marketplace treats extension ids that way, and `--list-extensions` prints
+# the publisher's own casing rather than the casing devcontainer.json happens to use.
+missing_extensions() { # missing_extensions <declared, one per line> <installed, one per line>
+    local declared="$1" installed="$2" ext id out=""
+    while read -r ext; do
+        [ -n "$ext" ] || continue
+        id="${ext%@*}"
+        printf '%s\n' "$installed" | grep -qiFx "$id" || out="$out $id"
+    done <<<"$declared"
+    printf '%s' "$out"
+}
+
+# --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
+#
+# It is the one part of the mount boundary that widens by a TYPO rather than by an edit anyone
+# reviews: every entry is an exclusion, so a pattern matching more than it names silently stops
+# the exhaustive check from being exhaustive, and the assertion still prints `ok`. That is not
+# hypothetical — the `^/dev` / `/devtools` class above is the same file's own history.
+# mutate-verify.sh would catch it, but mutate-verify.sh needs a Docker host and is not in the
+# gate. This is, and it costs nothing.
+if [ "$SELF_TEST" = yes ]; then
+    st_fail=0
+    st() { # st <mount point> <owned|checked>
+        if printf '%s' "$1" | grep -Eq "$RUNTIME_OWNED"; then got=owned; else got=checked; fi
+        if [ "$got" = "$2" ]; then printf '  \033[32mok\033[0m   %-24s %s\n' "$1" "$2"
+        else printf '  \033[31mFAIL\033[0m %-24s is %s, wanted %s\n' "$1" "$got" "$2"; st_fail=$((st_fail+1)); fi
+    }
+    echo "==> verify.sh self-test: RUNTIME_OWNED"
+    for p in / /proc /proc/sys /sys /sys/fs/cgroup /dev /dev/shm /dev/pts \
+             /etc/hosts /etc/hostname /etc/resolv.conf /run/.containerenv \
+             /var/run/secrets /var/run/secrets/kubernetes.io /vscode; do
+        st "$p" owned
+    done
+    # Every one of these is a real mount point somebody could add, and each is a near-miss for an
+    # entry above. A regex that swallows one of them is a hole with no symptom.
+    for p in /vscodex /vscode-evil /vscode/secrets /devtools /procdata /sysroot /etchosts \
+             /etc/hostnamex /etc/resolv.conf.bak /run/containerenv /var/run/secretsx \
+             /home/vscode/repos /home/vscode/.jkb /host; do
+        st "$p" checked
+    done
+
+    # Assertion 7's judgement, whose FAIL arm no container harness can reach (see
+    # missing_extensions). `st` compares strings, so these read as the mount cases do.
+    echo "==> verify.sh self-test: missing_extensions"
+    declared="$(printf 'rust-lang.rust-analyzer@0.3.3025\nanthropic.claude-code@2.1.250\n')"
+    st2() { # st2 <label> <got> <want>
+        if [ "$2" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+        else printf '  \033[31mFAIL\033[0m %s\n         got:  [%s]\n         want: [%s]\n' "$1" "$2" "$3"; st_fail=$((st_fail+1)); fi
+    }
+    st2 "both installed is nothing missing" \
+        "$(missing_extensions "$declared" "$(printf 'rust-lang.rust-analyzer\nanthropic.claude-code\n')")" ""
+    st2 "the one this container exists for, absent, is named" \
+        "$(missing_extensions "$declared" "rust-lang.rust-analyzer")" " anthropic.claude-code"
+    st2 "an empty listing names every declared one" \
+        "$(missing_extensions "$declared" "")" " rust-lang.rust-analyzer anthropic.claude-code"
+    # The version suffix is ours, not the listing's: `--list-extensions` prints bare ids, so
+    # comparing the pinned string would report every extension missing, always.
+    st2 "the @version pin is stripped before comparing" \
+        "$(missing_extensions "anthropic.claude-code@2.1.250" "anthropic.claude-code")" ""
+    st2 "publisher casing does not decide the answer" \
+        "$(missing_extensions "$declared" "$(printf 'rust-lang.rust-analyzer\nAnthropic.Claude-Code\n')")" ""
+    # A DIFFERENT extension whose id contains this one must not satisfy it. The direction matters
+    # and the first version of this case had it backwards — it asked whether a listing SHORTER
+    # than the id matched, which no grep would have said yes to, so it passed with the anchoring
+    # deleted. Caught by mutating the guard rather than by reading it.
+    st2 "a longer id containing this one is not a match" \
+        "$(missing_extensions "anthropic.claude-code@2.1.250" "anthropic.claude-code-preview")" " anthropic.claude-code"
+    # The dot in an extension id is a literal. Unfixed, `anthropic.claude-code` is a pattern whose
+    # `.` matches any character, so an unrelated id differing only there would read as installed.
+    st2 "the dot in an id is literal, not a wildcard" \
+        "$(missing_extensions "anthropic.claude-code@2.1.250" "anthropicXclaude-code")" " anthropic.claude-code"
+
+    echo
+    [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
+    printf '\033[32mverify.sh self-test passed\033[0m\n'
+    exit 0
+fi
 
 # INSIDE THE CONTAINER, OR NOT AT ALL. Every assertion below is about a Linux container's kernel
 # state, and run anywhere else they do not fail — they answer about a machine that was never the
@@ -107,13 +219,8 @@ mem_repo="$(cd "$here_dc/.." && pwd)"
 # shellcheck source=/dev/null
 . "$here_dc/lib.sh"
 EXPECTED="$(dc_mount_targets "$DC")"
-# What every container has regardless of configuration. Anything outside this and EXPECTED is
-# something a human added to devcontainer.json and must be looked at.
-# Anchored at a component boundary — `(/|$)` — not as bare prefixes. `^/dev` also matched
-# `/devtools`, `^/proc` matched `/procdata` and `^/sys` matched `/sysroot`, so a host mount at any
-# of those was silently dropped from the set this check calls exhaustive. A list of exclusions
-# that quietly grows is the shape this assertion exists to avoid having.
-RUNTIME_OWNED='^/$|^/proc(/|$)|^/sys(/|$)|^/dev(/|$)|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets(/|$)'
+# RUNTIME_OWNED — the exclusion list — is defined at the top of this file, above the
+# inside-the-container refusal, so `--self-test` can exercise it on a host with no Docker.
 # The READ is kept separate from the result, because "there were no mounts" and "the table could
 # not be read" are different facts and the second must never be spelled like the first. `EXPECTED`
 # has been guarded that way since it was derived; `actual` was not, so an unreadable table made
@@ -407,6 +514,32 @@ if "$mem_repo/scripts/auto-mode.sh" check >/dev/null 2>&1; then
     ok "Claude Code posture is intact"
 else
     bad "Claude Code posture is NOT intact (scripts/auto-mode.sh check)"
+fi
+
+# 7. The declared extensions are actually installed. This is the assertion the failure that
+#    prompted it did not have: VS Code's own install failed with ECONNREFUSED against the egress
+#    firewall, logged it, and carried on — so `postCreate` went green with neither extension
+#    present and the Claude Code extension, which is most of what this container is for, simply
+#    absent. A non-fatal log line is not a guard.
+#
+#    Asked of the server, not of a directory listing: `--list-extensions` is what VS Code itself
+#    considers installed, where a directory can be left behind by a failed install.
+#
+#    SKIPPED where there is no VS Code server — `devcontainer up`, a plain docker run and
+#    mutate-verify.sh all build a correct container with no VS Code in it. The skip is printed
+#    rather than silent, and it is the SAME condition setup.sh installs under, so the two cannot
+#    disagree about whether this ran.
+code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
+if [ -z "$code_server" ]; then
+    echo "  skip no VS Code server in this container — extensions not checked (not a VS Code launch)"
+else
+    installed="$("$code_server" --server-data-dir "$HOME/.vscode-server" --list-extensions 2>/dev/null || true)"
+    missing="$(missing_extensions "$(dc_extensions "$here_dc/devcontainer.json")" "$installed")"
+    if [ -n "$missing" ]; then
+        bad "declared extensions are not installed:$missing (setup.sh installs them from ~/.vsix; rebuild if that is empty)"
+    else
+        ok "every declared VS Code extension is installed ($(printf '%s\n' "$installed" | grep -c .) present)"
+    fi
 fi
 
 echo

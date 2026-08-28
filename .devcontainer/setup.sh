@@ -68,5 +68,40 @@ say "install jkb into the container"
 command -v jkb >/dev/null || { echo "jkb is not on PATH after install" >&2; exit 1; }
 jkb --version || true
 
+# The .vsix files were staged into the image by fetch-extensions.sh, because a connect-time
+# download is refused by the firewall this script raised in its first act. Installing from disk
+# needs no network at all.
+#
+# SKIPPED, not failed, when there is no VS Code server: `devcontainer up`, `docker run` and
+# mutate-verify.sh all produce a perfectly good container with no VS Code in it, and extensions
+# are meaningless there. Said out loud rather than passed over silently — verify.sh applies the
+# same condition to its own assertion, so the two cannot disagree about whether this ran.
+say "vs code extensions"
+code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
+if [ -z "$code_server" ]; then
+    echo "  no VS Code server in this container — skipping (nothing to install extensions into)"
+else
+    while read -r ext; do
+        [ -n "$ext" ] || continue
+        split="$(dc_extension_split "$ext")" || {
+            echo "  '$ext' is not version-pinned in devcontainer.json — see check-config.sh" >&2
+            exit 1
+        }
+        id="${split%%$'\t'*}"; version="${split##*$'\t'}"
+        vsix="$HOME/.vsix/$id-$version.vsix"
+        # A missing .vsix means the image predates this entry. Rebuild rather than reach for the
+        # network: the download is exactly what cannot work from in here.
+        [ -f "$vsix" ] || {
+            echo "  $id@$version was not staged into this image — rebuild the container" >&2
+            exit 1
+        }
+        # Same --server-data-dir VS Code itself passes, so this installs where the running server
+        # will look rather than into a second default location.
+        "$code_server" --server-data-dir "$HOME/.vscode-server" \
+                       --install-extension "$vsix" --force >/dev/null
+        echo "  installed $id@$version from disk"
+    done <<<"$(dc_extensions "$repo/.devcontainer/devcontainer.json")"
+fi
+
 say "verify the container is what it claims to be"
 "$repo/.devcontainer/verify.sh"

@@ -47,6 +47,29 @@ dc_type_for_target() { # dc_type_for_target <devcontainer.json> <target>
         2>/dev/null | head -1
 }
 
+# Every VS Code extension the container declares, one per line, exactly as written — normally
+# `publisher.name@version`.
+#
+# ONE list, read four times: the Dockerfile fetches these at build time, setup.sh installs them
+# from disk, check-config.sh asserts each is version-pinned, and verify.sh asserts each is
+# actually present. Restating it in any of those would be the two-lists-that-must-agree defect
+# that already went stale once in verify.sh's mount set.
+dc_extensions() { # dc_extensions <devcontainer.json>
+    dc_strip "$1" 2>/dev/null \
+      | jq -r '(.customizations.vscode.extensions // [])[]' 2>/dev/null
+}
+
+# `<publisher>.<name>` and `<version>` for one declared entry, tab-separated; empty if it carries
+# no `@version`. An unpinned entry is a hard error at every call site rather than a default,
+# because the fallback for "no matching local VSIX" is a marketplace download, and that download
+# is refused by the egress firewall — silently, as a non-fatal log line nothing gates on.
+dc_extension_split() { # dc_extension_split <publisher.name@version>
+    case "$1" in
+        *@*) printf '%s\t%s\n' "${1%@*}" "${1##*@}" ;;
+        *)   return 1 ;;
+    esac
+}
+
 # Link Claude Code's state out of ~/.claude into the .claude-state volume, so sessions, memory and
 # the login survive a rebuild without anything of the host's being mounted in.
 #
