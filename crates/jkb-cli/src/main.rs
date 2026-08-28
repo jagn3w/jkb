@@ -5875,6 +5875,14 @@ fn land_preflight(
     // reported the target CLEAN, and the bespoke argument written here for why that was safe was
     // the second such argument in the tree for one value; one helper stating it once is the fix.
     let worktrees = gitrepo::worktrees(&ctx.root)?;
+    // The SAME silence reaches `land_blocker` twice: through `target_dirty` below, and — four
+    // arms earlier — through `sess`, because `repo::work_for` -> `session::discover` collapses
+    // this failed listing to "no sessions". The second route answered first, so the refusal
+    // added beside `target_dirty` could not fire and the operator was told to run `jkb task
+    // work`, which cuts a second branch and detaches the task from its batch.
+    let listing_failed = worktrees
+        .is_none()
+        .then(|| staging::worktree_listing_refusal(&ctx.root));
     let mut dirty_cache = BTreeMap::new();
     let target_dirty =
         staging::target_dirty_reason(worktrees.as_deref(), &ctx.root, &onto, &mut dirty_cache)?;
@@ -5897,6 +5905,7 @@ fn land_preflight(
         commits: ahead,
         branch_exists: work_ref.is_some(),
         target_dirty: target_dirty.as_deref(),
+        listing_failed: listing_failed.as_deref(),
         // The review is enforced a moment later by `review::enforce`, which renders the same
         // verdict at length and is where `--no-review` records a waiver instead of refusing.
         verdict: None,

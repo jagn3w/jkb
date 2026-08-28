@@ -1118,8 +1118,9 @@ Remedy {
     /// Distinct from [`RemoveByHand`](Self::RemoveByHand) too — that one is licensed by the tree
     /// having ANSWERED and named itself a stranger. The way out here is `git worktree repair`,
     /// which is non-destructive and re-links a checkout whose administrative file was lost.
-    InspectByHand { worktree: PathBuf } = Remedy::InspectByHand {
+    InspectByHand { worktree: PathBuf, repo_root: PathBuf } = Remedy::InspectByHand {
         worktree: PathBuf::from("/repo/.jkb/work/s"),
+        repo_root: PathBuf::from("/repo"),
     },
     /// Nothing on this machine can act: the repo is not reachable from here.
     NoActionFromHere = Remedy::NoActionFromHere,
@@ -1162,13 +1163,23 @@ impl Remedy {
                 repo_root.display(),
                 repo_root.display()
             ),
-            Self::InspectByHand { worktree } => format!(
+            // RUN FROM THE REPO, NAMING THE TREE. `git -C <worktree> worktree repair` is the
+            // form that reads best and the one form that cannot work here: this remedy exists
+            // precisely because `git -C <worktree>` does not answer, so it exits 128 having
+            // done nothing. The repair has to be asked of a repository that still answers, and
+            // `git worktree repair <path>` is exactly the sub-command for a tree whose
+            // administrative file was lost.
+            Self::InspectByHand {
+                worktree,
+                repo_root,
+            } => format!(
                 "git lists no worktree at {} and the directory will not answer for itself, \
-                 so nothing here can say what it is — `git -C {} worktree repair` re-links \
+                 so nothing here can say what it is — `git -C {} worktree repair {}` re-links \
                  a checkout whose administrative file was lost; if it is not a checkout you \
                  want, move it out of `.jkb/work` yourself. The record is kept until it \
                  changes.",
                 worktree.display(),
+                repo_root.display(),
                 worktree.display()
             ),
             Self::NoActionFromHere => {
@@ -1471,6 +1482,7 @@ fn unidentified_remedy(entry: &Entry, obs: &Observed) -> Remedy {
         // moment `applied` stopped choosing which of git's two answers to model.
         f if f.is_no() => Remedy::InspectByHand {
             worktree: entry.worktree.clone(),
+            repo_root: entry.repo_root.clone(),
         },
         // Git could not answer at all. Nothing about the tree OR its registration is established,
         // and neither licenses destroying anything.
@@ -2901,6 +2913,21 @@ mod tests {
                 with(&|o| o.identity = IdentityMatch::Matches),
                 with(&|o| o.identity = IdentityMatch::Wreck),
                 with(&|o| o.identity = IdentityMatch::DifferentSession),
+                // REPAIR MAY NOT HELP — the cross-path container case (each side's `.git`
+                // naming the other's absolute path) is re-linked by nothing — and that outcome
+                // is deliberately NOT modelled here, which is a gap stated rather than hidden.
+                //
+                // Adding it fails `escapes`, and correctly: that helper is `.all()`, so a
+                // remedy passes only if EVERY outcome of following it moves the verdict. This
+                // remedy's advice is a disjunction — try the repair, and if it is not a checkout
+                // you want, move it out yourself — so its truthful model has an arm that changes
+                // nothing while the sentence as a whole still always leads out, via `Gone`
+                // below. Whether the property is "the advice cannot fail" (`.all`, which round
+                // 11 chose deliberately over optimistic modelling) or "some way of following it
+                // leads out" (`.any`) is a decision about what the audit claims, and flipping it
+                // here would revert that round's correction as a side effect of a message fix.
+                // Filed as its own work; `FixPermissions` and `RestoreTree` can fail the same
+                // way, so it is not a fact about this variant.
                 with(&|o| o.present = presence::Presence::Gone),
             ],
             Remedy::RunReap | Remedy::Redispose { .. } => vec![obs.clone()],
