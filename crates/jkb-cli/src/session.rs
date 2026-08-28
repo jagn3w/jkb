@@ -195,7 +195,12 @@ fn canonical(p: &Path) -> PathBuf {
 pub fn discover(repo_root: &Path) -> Result<Vec<Session>> {
     let work_root = canonical(&jkb_dir(repo_root).join(WORK_DIR));
     let mut out = Vec::new();
-    for wt in gitrepo::worktrees(repo_root)? {
+    // A DELIBERATE collapse, and the one place it is dangerous enough to name: when git cannot
+    // answer, this reports NO sessions, so `jkb task abandon` finds nothing to dispose and
+    // `jkb task work` may mint a second session at a path that already holds one. The honest
+    // alternative — erroring — would take every read command down with a repo git is unhappy
+    // about, including the ones that would tell you why. Reported rather than fixed.
+    for wt in gitrepo::worktrees(repo_root)?.unwrap_or_default() {
         let Some(branch) = wt.branch.clone() else {
             continue;
         };

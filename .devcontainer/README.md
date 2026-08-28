@@ -79,9 +79,99 @@ and cannot drift out of step with the verifier. It used to be transcribed into `
 well, and the first time the mounts changed the copy went stale and a correctly-built container
 failed its own verifier.
 
-By default only **this repo** is mounted, not all of `~/repos` — the tightest useful default. To
-work across repos, change `workspaceMount` to bind `${localEnv:HOME}/repos` at
-`/home/vscode/repos`, deliberately.
+All of **`~/repos`** is mounted, at `/home/vscode/repos`, and `workspaceFolder` follows the folder
+you opened — `/home/vscode/repos/${localWorkspaceFolderBasename}`. The argument
+for the width is consistency, not convenience: `scripts/auto-mode-posture.json` already grants
+`~/repos` in both `allowRead` and `allowWrite`, so a container holding only jkb was *tighter* than
+the boundary the same agent runs under on the host. That difference was nothing anyone had
+decided, and it made a cross-repo task impossible in here rather than deliberately refused.
+Everything the posture does not grant is still absent by the kernel: `~/.ssh`, `~/.aws`,
+`~/Documents`, the rest of `$HOME`.
+
+**Only a folder directly inside `~/repos` can be opened**, and `initializeCommand`
+(`check-workspace.sh`) refuses anything else before the container is created. A literal
+`workspaceFolder` would be worse than a refusal: a `jkb task work` session lives at
+`<repo>/.jkb/work/<session>`, which is inside the mount but is not `~/repos/<name>`, so the
+container would start the agent in the **main checkout** instead — silently, with every guard
+still passing, because the wrong repo is a perfectly good repo. Keeping those two apart is the
+entire point of a session (D36). Sessions are worked on the host; the container is for the main
+checkout.
+
+### A nested bind must be named
+
+`verify.sh` compares exact mount points, with no prefix logic — filtering by prefix is what once
+let `$HOME` at `/host` through. So a bind *inside* a declared target is undeclared, and
+`mutate-verify.sh` needs exactly one: it spells its own docker flags and must mount the repo at
+`/home/vscode/repos/jkb`, because in a `jkb task work` session the repo's parent directory is
+`.jkb/work` and mounting it would put the checkout at `/home/vscode/repos/<session>`.
+
+Nesting is **not** granted automatically. A mount point and a mount source are independent —
+`-v ~/.ssh:/home/vscode/repos/jkb/secrets` is inside the declared region and is still
+exfiltration — and the source cannot be checked from inside the container, because on Docker
+Desktop for macOS `/proc/self/mountinfo` reports the path inside the VM rather than the host path.
+So the exception is named instead: `verify.sh --declare <mount-point>` **adds** to the derived set
+(it can never switch a check off) and is **refused** unless the value is a strict descendant of a
+target `devcontainer.json` declares **as a bind**. Not a volume: a named volume reaches no host
+filesystem, which is exactly why `check-config.sh` reviews bind sources and waves volumes through
+— so a bind nested under `~/.cargo/target` would be a host mount somewhere nobody reviewed. `--declare /host`, `--declare /var/run/docker.sock`
+and `--declare /home/vscode/.claude/settings.json` are therefore all refused by `verify.sh`
+itself, and `mutate-verify.sh` watches that refusal fire. The count appears in the passing line,
+because an override nobody can see is indistinguishable from a rule that does not exist.
+
+### Auto-memory is shared through `~/.jkb`, not through a mount
+
+Claude Code keys auto-memory by the project's **absolute path** —
+`~/.claude/projects/<slug>/memory/`, where `<slug>` is that path with every character outside
+`[A-Za-z0-9-]` replaced by `-`. So one repo has two keys, `-Users-you-repos-jkb` on the host and
+`-home-vscode-repos-jkb` in here, and widening the workspace mount does not change that: the key
+comes from where the repo *is*, not from what is in it.
+
+The obvious fix — bind the host's memory directory in — is the one mount this design forbids, for
+the reason above. So the store lives at **`~/.jkb/claude-memory/<repo>/`** instead, inside the
+bind that already exists and is already reviewed, and each side symlinks its own slug's `memory`
+directory at it. `scripts/link-claude-memory.sh` does both sides; `setup.sh` runs it on every
+container create, and on the host it is opt-in (`./scripts/setup.sh --link-memory`) because it
+writes under `~/.claude` and the `post-merge` hook re-runs `setup.sh` after every pull. Nothing it
+does overwrites, and it decides **before it moves anything**: if any name exists on both sides,
+nothing is moved, no link is made, and the collision is reported. Migrating what it could and then
+declining the link left that side holding only the colliding file, with its `MEMORY.md` naming
+notes it could no longer read — worse than never having run. A symlink pointing elsewhere is never
+retargeted, and a store holding anything but plain files is refused rather than followed: it is
+written by agents on both sides of the boundary, and a symlink planted in it would redirect the
+other side's reads and writes wherever it points.
+
+`verify.sh` **asks the linker live** (`--status`) rather than inferring breakage from a missing
+link — and reads setup.sh's create-time record as an *additional* alarm, never a substitute. Both
+matter: the linker repairs (it removes a live link into a poisoned store), so a live question
+asked afterwards sees the harmless `unsafe` rather than the `exposed` that was true at create;
+but a record consulted *instead* of asking made the store guard unfirable after create, so a
+redirect planted the next day reported `ok`.
+The linker leaves the link absent in states it recognises — a collision, an unsafe store — so
+reading "no link" as "broken" failed `postCreate` for a state the design calls normal. Those
+states report and pass; only an unexplained absence fails.
+
+Stated plainly, because it is a hole in "the boundary is what you did not mount" — and there are
+**two** channels here, not the one this was designed around.
+
+The first is container → host: memory is agent-**writable** prose injected into context, so a
+shared store carries text from container sessions into the less-confined host ones. Same person's
+agents at both ends, prose rather than code, through a directory that was already shared.
+
+The second was measured rather than predicted. `~/.claude/projects` sits under the posture's
+blanket `denyRead` of `~` and in no allow list, so **sandboxed Bash cannot touch auto-memory at
+all**; `~/.jkb` is in both `allowRead` and `allowWrite`, because jkb's database lives there. So
+linking moves memory from a place sandboxed Bash cannot reach into one where a single
+auto-approved command can rewrite it — for this repo and, through the same grant, for every other
+repo's store. The posture has no write-deny to carve `claude-memory` back out with, so this was
+**weighed and chosen**, not overlooked: both ends are the same person's agents, it is prose rather
+than code, and the host side is opt-in (`setup.sh --link-memory`), never created by a `git pull`.
+
+If you revisit it, start from the fact that decides what the alternatives buy — **file tools and
+Bash are bounded by different mechanisms.** The sandbox's `filesystem` block governs Bash; the
+`permissions` rules govern `Read`/`Edit`/`Write`. Measured: `Read` opens a memory file that Bash
+cannot even `ls`. So an agent writes memory through the Write tool wherever the store lives, and
+moving it to a path the posture does not grant would close the Bash channel **without** stopping
+agents writing memory.
 
 ## Root is not reachable from inside
 
@@ -107,6 +197,13 @@ the Dockerfile and rebuild, or `docker exec -u root` from the host.
   Allowlisting it to make the harness runnable would trade the boundary for convenience.
 - `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
   fails naming it. A guard nobody has watched fail is not a guard.
+- `mutate-verify.sh --control` — **the one way to ask "is this container healthy" from outside**.
+  One healthy run, printed verbatim, using the same flags and the same preamble every mutation
+  runs against. Do not hand-roll the `docker run`: it needs the seccomp profile, `NET_ADMIN`, both
+  binds, and a preamble that raises the firewall, links the state and the memory store, and
+  installs the posture — and a command missing any of those prints a dozen FAILs that read as a
+  broken container rather than as a wrong invocation. (`verify.sh` itself is for use *inside* the
+  container, where the lifecycle has already done all of that; it refuses to run anywhere else.)
 - `check-config.sh` — host-side, no Docker, part of `./scripts/check.sh`. Its real job is the
   seccomp profile: it is **generated**, and a generator whose patch no-ops against a changed
   upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
@@ -170,3 +267,37 @@ it points at is not there.
 Costs, stated: on macOS this is a Linux VM, so bind-mount IO is slower and the toolchain is the
 container's, not your host's. `~/repos` mounted is still writable and push-able — the container's
 win is bounded to what you did **not** mount.
+
+## A session worktree is archived, not deleted
+
+`jkb task land` used to finish with `git worktree remove`, which unlinks the tree recursively
+and stops at the first refusal. Run from inside a sandboxed agent session that refusal comes at
+`<worktree>/.claude/settings.json` — Claude Code protects a project's policy files from the agent
+whose policy they are — by which point 152 files were gone. The verb reported an error about the
+*directory* and said nothing about the 62,421 lines it had already removed.
+
+Disposal is a **rename** now: the whole tree moves to `<repo>/.jkb/archive/<session>-<stamp>` in
+one atomic operation, so there is no partial state for a failure to leave behind, and a worktree
+disposed of by mistake is still there to move back. Deleting it is a separate, later decision —
+`jkb task reap` removes archives older than 30 days, and probes each with `remove_dir` first so it
+never begins a walk it cannot finish.
+
+The refusal is scoped to the session's **own** working directories: measured across five live
+worktrees, only the session's own tree answers `EPERM`, every other one answers `ENOTEMPTY`. So
+`land` never blocks on it — it grafts, applies its plan, records what it could not move, and any
+other process finishes the job. `jkb service install` installs that reaper beside the sync
+watcher (`com.jkb.reap`), as a second unit rather than another job for the watcher: a wedged file
+watcher must not also stop every deferred landing on the machine from completing. `jkb doctor`
+reports what is outstanding and `jkb doctor --fix` sweeps it.
+
+Three rules keep the sweep from being the destructive thing it replaced. It **holds** rather than
+acts whenever it cannot establish something: a repo root it cannot reach settles nothing (the
+ordinary case once host and container share `~/.jkb` at different paths), and a tree that is not
+still a registered worktree sitting on the commit the landing recorded is a different session
+reusing the name, not this record's business. One sweep runs at a time, because two both reading a
+pending record both act on it — the second finding the worktree gone and deleting the record the
+first had just written. And the **cost is reported**: a landed session's checkout carries the
+repo's build output, so `jkb doctor` and `jkb task reap` print what the archives occupy. It is
+deliberately not pruned — `git clean -X` deletes exactly the regenerable files and also deletes a
+gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
+`--retain-days` if size matters more than the safety net.

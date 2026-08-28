@@ -58,11 +58,15 @@ run — starts the same one.
   same session. `--onto` names the **staging branch** its work lands on; omit it and jkb
   joins the batch already in flight, or cuts one from trunk.
 - `jkb task land <uid>` — rebase the session onto its target branch, run the repo's gate, and
-  on green mark the task done and clean the session up. Landing is serial, so a red gate
-  means *your* branch broke the integrated result.
+  on green mark the task done and **archive** the session — moved to `.jkb/archive`, never
+  deleted here. Landing is serial, so a red gate means *your* branch broke the integrated
+  result. From inside a session it completes but leaves the worktree: a session may not unlink
+  its own `.claude` policy files, so `jkb task reap` finishes the disposal from anywhere else.
 - `jkb task abandon <uid>` — drop the session; the task reopens unless it already finished
   or another live worker holds its claim (the branch is kept).
 - `jkb task sessions` — what is in flight, with uncommitted work and commits ahead.
+- `jkb task reap` — archive the worktrees landings could not move, and delete archives older
+  than 30 days. The watcher service runs it; `jkb doctor` reports what is outstanding.
 - `jkb task gate ["<cmd>"]` — the command that verifies a landing here (remembered per repo).
 - `jkb staging ls [--all]` — the staging branches in this repo and what is landing on each:
   every task's state (`implementing` / `review` / `landed` / `dropped`), its commits, and

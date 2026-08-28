@@ -22,6 +22,26 @@ say "claude state"
 . "$repo/.devcontainer/lib.sh"
 dc_link_state /home/vscode
 
+# ...and auto-memory, which the volume alone does NOT solve. Claude Code keys memory by the
+# project's absolute path, so this container's `/home/vscode/repos/jkb` is a different key from the
+# host's `/Users/.../repos/jkb` and the two sides would never see each other's. The shared store is
+# `~/.jkb/claude-memory/<repo>/` — inside the bind mount that already exists, so no mount is added
+# and the `~/.claude` prohibition is untouched. See the script's header for why the obvious bind is
+# refused. A repo the linker DECLINES to link — a name that exists on both sides, a store holding
+# something that is not a plain file — is a state it recognises and reports, and `verify.sh` passes
+# on those: they want a person, not a rebuild. What is not tolerated is the linker failing to run
+# at all, which `verify.sh` fails on, so this must not hide a non-zero exit behind a comment
+# claiming the opposite. It reports and continues; verify.sh decides.
+say "shared claude memory"
+# The state each repo was LEFT in is recorded here, and `verify.sh` reads it as an extra alarm
+# beside the live answer it asks for itself. The record earns its place because `link_one` repairs:
+# it removes a live link into a poisoned store, so a live question asked afterwards sees the
+# harmless `unsafe` and not the `exposed` that was true at create. It is not a substitute for
+# asking — that made the store guard unfirable after create — and verify.sh consumes an `exposed`
+# record once it has reported it, so the remedy it prints can clear it.
+"$repo/scripts/link-claude-memory.sh" --status-file /home/vscode/.claude-state/memory-status \
+    || echo "  (some repos need attention — see above)" >&2
+
 say "auto-mode posture"
 # The same posture file the host uses. It ends by running `check`, so a merge that did not take
 # fails here rather than at the first unattended command.

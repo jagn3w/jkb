@@ -1615,6 +1615,283 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
   (see D48.7). Settle it in a live session with `./scripts/auto-mode.sh sandboxed`, **not** with
   `printenv CLAUDE_CODE_SANDBOXED` — see the measurement under D48 below.
 
+## The dev container mounts ~/repos, and a session worktree is archived (D49)
+
+The container follow-up bucket. Design in `.devcontainer/README.md`; the container harnesses are
+`check-config.sh` + `mutate-config.sh` (static, in the gate) and `verify.sh` + `mutate-verify.sh`
+(need Docker).
+
+- **`workspaceMount` binds all of `~/repos`**, not just this repo. The argument is *consistency*,
+  not convenience: `scripts/auto-mode-posture.json` already grants `~/repos` in both `allowRead`
+  and `allowWrite`, so a container holding only jkb was **tighter** than the boundary the same
+  agent runs under on the host — a difference nothing had decided, which made a cross-repo task
+  impossible rather than deliberately refused. `workspaceFolder` FOLLOWS the folder you opened
+  (`${localWorkspaceFolderBasename}`), and `initializeCommand` refuses one the mount cannot
+  place — see the derived-folder note below.
+- **A nested bind must be NAMED, never inferred.** `verify.sh` compares exact mount points with no
+  prefix logic (prefix filtering is what once let `$HOME` at `/host` through), so once the declared
+  target is the parent, `mutate-verify.sh`'s own `-v $REPO:/home/vscode/repos/jkb` is undeclared —
+  and it cannot mount the parent instead, because in a `jkb task work` session `$REPO`'s parent is
+  `.jkb/work`. The tempting rule — *nested is fine* — is wrong: a mount point and a mount SOURCE
+  are independent, `-v ~/.ssh:/home/vscode/repos/jkb/secrets` is inside the declared region and is
+  still exfiltration, and the source cannot be checked from inside (Docker Desktop for macOS
+  reports the path inside the VM, which is why `dc_mount_sources` is host-side only). So
+  `verify.sh --declare <target>` **adds** to the derived set and is **refused** unless the value is
+  a strict descendant of something already declared **as a bind** (not a volume, which reaches no
+  host filesystem, so nothing nested under one is reviewable this way) — `/host`, the docker socket and
+  `~/.claude/settings.json` are all refused by verify.sh itself, which is exactly the mutation set
+  the harness exists to catch. The count prints in the passing line (D38's `--no-review` lesson).
+  A blanket rule would have weakened the *shipped* container; this weakens only the harness, and
+  only where a path is written down in a diff.
+- **Auto-memory is shared through `~/.jkb`, with no new mount.** Claude Code keys memory by the
+  project's absolute path, so one repo has two keys (`-Users-…-repos-jkb` /
+  `-home-vscode-repos-jkb`) and widening the workspace mount does not change that. Binding the
+  host's memory dir is the one mount forbidden everywhere in this design (`~/.claude` holds
+  `settings.json`, which IS the posture), it collides with `dc_link_state`'s symlink, and the slug
+  is inexpressible in `devcontainer.json`. So `scripts/link-claude-memory.sh` symlinks each side's
+  `memory` dir at `~/.jkb/claude-memory/<repo>/` — inside the bind that already exists. It migrates
+  file by file and **never overwrites**: a name on both sides is left alone and reported. Opt-in on
+  the host (`setup.sh --link-memory`), because `post-merge` re-runs `setup.sh` and a `git pull`
+  must not rearrange somebody's `~/.claude`. Stated plainly: agent-writable prose flowing from a
+  bounded context to a less bounded one is a channel, argued for rather than added by reflex.
+- **A session worktree is ARCHIVED, never deleted** (`jkb-cli/src/archive.rs`). `git worktree
+  remove` unlinks recursively and stops at the first refusal; from inside a sandboxed session that
+  refusal is `<worktree>/.claude/settings.json` — Claude Code protects a project's policy files
+  from the agent whose policy they are — and 152 files were already gone, with the error naming the
+  *directory* and not the 62,421 lines. Disposal is now one atomic `fs::rename` into
+  `<repo>/.jkb/archive/<session>-<stamp>`: partial destruction stops being representable rather
+  than being guarded against. `jkb task reap` deletes an archive once it is 30 days old, probing
+  with `remove_dir` first (`EPERM` vs `ENOTEMPTY`) so it never begins a walk it cannot finish.
+- **The refusal is scoped to the session's OWN working directories, and that is what makes
+  deferral work.** Measured across five live worktrees: only the session's own tree answers
+  `EPERM`; every other one answers `ENOTEMPTY`. And the deny is **not** ours — `auto-mode-posture
+  .json` names only `~/.claude/*` — so there is no knob, and there should not be: a session that
+  could write its own `.claude/hooks/` could run anything. So `land` never blocks: it grafts,
+  records the worktree it could not move, applies its plan (D48's ordering intact), and any other
+  process finishes it. `jkb service install` now writes **two** units — `com.jkb.sync` and
+  `com.jkb.reap` — kept apart so a wedged file watcher does not also stop every deferred landing.
+  `jkb doctor` reports what is outstanding; `--fix` sweeps it.
+- **The reviewer found the second disposal route, and it is the shape this repo keeps meeting.**
+  `jkb task abandon` still called `git worktree remove` — the verb an operator reaches for to clear
+  the directory a deferred landing leaves behind was the one that gutted it. Both verbs now go
+  through `archive::dispose`, which is the callee that remembers the rule instead of two call sites
+  that must. Its `delete_branch` is the caller's, because a landing's branch is a duplicate of
+  commits already in the target while an abandoned branch holds the only copy.
+- **A record names a path and a branch, and both are reusable names**, so the sweep establishes
+  identity before acting: git still registers that path as a worktree, it is still on the commit
+  the landing recorded (`Entry.head`), and it is clean. Remove a deferred worktree by hand and
+  `jkb task work` recreates a session at the same path on the same branch; a sweep keyed on those
+  two would archive the live tree and force-delete its branch. A commit id is not reused.
+- **Unknown is not settled, and one sweep runs at a time.** A repo root the sweep cannot reach used
+  to clear the record — ordinary once host and container share `~/.jkb` at different paths, and it
+  deleted the only record of a live worktree. Two concurrent sweeps did lose each other's updates
+  (the second finds the worktree gone and drops the record the first just wrote), so a `SweepLock`
+  covers the reads as well as the writes, with `LandLock`'s rule that a lock is stale only when its
+  holder is **proven** gone.
+- **`workspaceFolder` follows the folder you opened, and `initializeCommand` refuses one the mount
+  cannot place.** A literal path under the target opens whichever repo sits there — for a session
+  worktree, the main checkout — silently, with every guard passing, because the wrong repo is a
+  perfectly good repo. `check-config.sh` asserts both halves and `mutate-config.sh` watches each
+  fail.
+- **The memory linker decides the whole migration before moving anything**, and refuses a store
+  holding anything but plain files (a symlink planted by either side redirects the other's reads
+  and writes, including back into `~/.claude`). `verify.sh` **asks** it for the state rather than
+  inferring breakage from a missing link — the linker leaves the link absent on purpose in states
+  it recognises, so the inference failed `postCreate` for a state the design calls normal.
+- **The record carries the decision that produced it (`archive::Plan`), and can be cancelled.**
+  Three findings in review 2 were one cause: `dispose` took `delete_branch` as an argument and
+  threw it away, so the reaper applied *land's* defaults to an `abandon` record and force-deleted
+  the branch the verb had just printed "kept" for; `--force`'s acceptance of a dirty tree was
+  likewise unrecorded, so the sweep's own dirty check held that record for ever; and nothing could
+  revoke a record, so `jkb task work` resuming a deferred session got the directory back with a
+  reaper still holding a claim on it — which then either archived the checkout the operator was
+  sitting in or, once they committed, refused for ever as "a different session reusing the name".
+  `Plan` is part of the `Entry`, `archive::revoke` is the cancel, and `task work` calls it.
+- **A guard whose expectation no longer matches its subject is a guard nobody has seen fire.**
+  Rewording verify.sh's `--declare` refusal left `mutate-verify.sh` grepping for text it never
+  prints — and that harness needs Docker, so the gate could not notice. `check-config.sh` now
+  checks statically that every expectation is a string verify.sh can print. Same round: an
+  assertion that the workspace is mounted had been rewritten to say the directory containing the
+  running script contains a `Cargo.toml`, true by construction (its third wording, below, is the
+  one the harness accepted); and a self-test assertion could
+  not fail because `note` wrote to the stdout `run` was capturing, so every clean link run exited
+  1 with its own report eaten.
+- **`init-firewall.sh` discovers its workspace instead of naming it.** The hard-coded
+  `~/repos/jkb` was a statement about whichever checkout sat there once the mount widened — it
+  would snapshot another checkout's egress allowlist as the root-owned list every later start
+  runs on. It cannot be told which (the sudoers grant forbids arguments, and an environment
+  variable is agent-settable), so one repo carrying `scripts/auto-mode-posture.json` is the
+  answer and two is a refusal — on the **first raise only**, because a later raise that exits
+  non-zero leaves the rules unapplied, and unapplied rules mean unrestricted egress.
+- **A remedy the machine does not accept is worse than no remedy.** `check-workspace.sh` advised
+  setting `JKB_REPOS_DIR`, read by nothing else in the tree: following the advice switched the
+  preflight off without moving the mount, producing the exact silent wrong-checkout open the file
+  exists to prevent. One statement of where repos live, and it is `devcontainer.json`'s.
+- **The sweep may only delete inside the tree it owns.** The worst defect on this branch, and it
+  survived two reviews: the retention arm passed whatever absolute path a record's `archive` field
+  named to `remove_dir_all`. The record store lives in `~/.jkb`, which is bind-mounted into the
+  container and granted in the posture's `allowWrite`, while the host's reaper is a launchd agent
+  outside every sandbox — so an agent-writable JSON file steered an unsandboxed recursive delete
+  at any directory, past a probe that answers "permitted" for any ordinary one. Corruption reaches
+  the same place with no adversary. Both paths are constrained to `<repo>/.jkb/{work,archive}`,
+  checked **once above both arms** (D45.5's rule: a condition that dominates every arm belongs
+  above the dispatch) — the pending arm had a guard and the archived arm had nothing.
+- **A refusal that installs no rule is not a refusal.** Two guards in `init-firewall.sh` exited
+  before any iptables rule was applied, and rules do not survive a container restart — so a
+  truncated snapshot, the state one of those guards' own comments calls real, left unrestricted
+  egress on every later start, permanently (the snapshot is root-owned and 0444). `fail_closed` is
+  defined above every refusal now and `check-config.sh` fails the gate on an `exit 1` in that file
+  outside it. That guard's own first version anchored its pattern to the start of a line and
+  walked past `|| exit 1` — the exact shape it existed for; the mutation caught it.
+- **A pid is meaningless without the host that issued it.** `Liveness::Process` carried only the
+  pid, so a claim (or a sweep lock) written inside the container was probed against this machine's
+  process table: a live owner reported dead and freed, or a dead one reported alive. It carries
+  the host, and a foreign one is `Unknown`, which frees nothing. `hostname()` also stopped falling
+  back to the literal `"localhost"` — which both sides of the boundary answered, so the rule's two
+  sides gave the same name and the rule was not one.
+- **The container is where deferral is normal, and it had no finisher.** A session cannot archive
+  its own checkout, so every `land` in there records one — and the host's reaper correctly holds
+  those records, because it cannot see `/home/vscode/...`. There is no init system in the
+  container to run a service, so `postStartCommand` sweeps once per start, best-effort behind the
+  firewall raise.
+- **The container harness settled two findings no amount of reading would have.** `verify.sh`'s
+  workspace assertion went through three wordings — a hard-coded path (describes whichever
+  checkout sits there), the script's own directory (true wherever it can run), and the declared
+  target in `mountinfo` (which the harness's own bind layout never produces, so every mutation
+  reported CAUGHT and then the control failed and the run judged nothing). It asks whether this
+  checkout is inside a mount point that is both mounted and declared, `--declare` folded in. And
+  the harness's negative control could not fail: the health check establishes the control's exit
+  code is 0 and `judge` reports CAUGHT only on non-zero, so `MATCHER IS BROKEN` was unreachable —
+  in the file whose whole job is finding guards that cannot fire. It asks the discriminating half
+  instead: the label must appear in a healthy container and must not be on a `FAIL` line.
+- **The record store is untrusted input, so it gets a parser.** The containment guard that closed
+  round 3's arbitrary-delete finding did not hold: `Path::starts_with` compares components without
+  interpreting them, so `<repo>/.jkb/archive/../../../Documents` "starts with" the archive root
+  while naming something else. A check the sweep remembers to call, over paths nobody normalized,
+  is two mistakes. `Entry` is now the wire form and is trusted for nothing; `archive::Record` is
+  what the sweep sees; `Record::parse` is the only way between them, so no arm can be written that
+  skips it. `..` and `.` are **refused** rather than resolved — nothing here writes one, so a
+  record containing one is corrupt or hostile and neither deserves a best-effort reading.
+- **Reachability belongs above the dispatch, like containment.** The pending arm held an
+  unreachable `repo_root`; the archived arm read "not visible from here" as "somebody removed it
+  by hand" and dropped the record — so each side of the container bind destroyed the other's
+  archived records, and the multi-gigabyte checkout each named became unreferenced and permanent.
+  An absent directory is evidence of removal only when the repo it lives under is reachable.
+- **One disposal, one record.** The marker's name was a pure function of the worktree path, and a
+  session name is reused: abandon, reopen, `task work` mints the same name at the same path, and
+  the next disposal wrote over the first record. `Entry.head` exists because a path and a branch
+  are reusable names; the record's own identity was still the path.
+- **A lock that nothing can break is a wedge.** Making a foreign host `Unknown` was right, and it
+  made the sweep lock permanent for a container killed mid-sweep and then rebuilt — its hostname
+  gone with it, so every sweep on both sides no-ops for ever. The default stays (breaking a live
+  sweeper's lock is what the lock prevents); what was missing is an escape a person can take, so
+  the refusal names the lock file and its holder and `jkb task reap --break-lock` exists.
+- **Sharing memory through `~/.jkb` widens what sandboxed Bash can reach, and that is a decision,
+  not an oversight.** `~/.claude/projects` is under the posture's blanket `denyRead` and in no
+  allow list; `~/.jkb` is in `allowRead` **and** `allowWrite`, because the database lives there.
+  Linking therefore moves auto-memory from a place sandboxed Bash cannot touch into one where a
+  single auto-approved command rewrites it — for this repo and, through the same grant, for every
+  other repo's store. Memory is prose re-injected into every later session, so the channel turns a
+  one-shot injection into a durable one. The posture has no write-deny to carve `claude-memory`
+  back out with (`filesystem` offers `denyRead`/`allowRead`/`allowWrite` and nothing else).
+  **Weighed against a dedicated store with its own declared bind, and `~/.jkb` was chosen**: both
+  ends are the same person's agents, it is prose rather than code, and the host side is opt-in
+  (`setup.sh --link-memory`), never created by a `git pull`.
+- **The load-bearing fact underneath it, measured rather than assumed:** file tools and Bash are
+  bounded by *different* mechanisms. The sandbox's `filesystem` block governs Bash; the
+  `permissions` rules govern `Read`/`Edit`/`Write`. So an agent writes memory through the Write
+  tool wherever the store lives — moving it somewhere the posture does not grant would not have
+  stopped agents writing memory, only sandboxed Bash. Anyone revisiting this should start there,
+  because it is the fact that decides what the alternatives actually buy.
+- **`verify.sh` refuses to run outside the container, and never passes on a table it could not
+  read.** Run on the macOS host it printed fourteen confident FAILs about a machine that was never
+  the subject — and two `ok` lines, because `/proc/self/mountinfo` does not exist there, so the
+  mount-boundary check compared an EMPTY set and passed. `EXPECTED` had been guarded against
+  emptiness since the day it was derived; `actual` never was, in the one assertion the file exists
+  for. The read is now kept separate from the result, and an unreadable table is a FAIL. Found by
+  running the script in the wrong place, which is the sort of thing no amount of reading finds.
+- **There is one way to ask whether the container is healthy, and it is not a `docker run` you
+  write yourself.** A hand-rolled one printed in a refusal message omitted the seccomp profile,
+  `NET_ADMIN`, the `~/.jkb` bind and the whole preamble that raises the firewall and installs the
+  posture — so it produced a dozen FAILs that read as a broken container instead of as a wrong
+  command. `mutate-verify.sh --control` reuses the exact flags and preamble every mutation runs
+  against, so "is my container ok" and "did that guard fire" cannot be answered about two
+  different containers.
+- **A harness must refuse a subject it cannot find, before it reports on one.** A stray em dash
+  pasted as the image name — copied out of prose where one followed the command — made every
+  `docker run` exit 125 ("could not start the container"), which `judge` reads as a non-zero
+  `verify.sh` and reports as a guard that did not fire: nine MISSED lines and three BUILD-FAILED
+  blocks before the control finally called them unattributable. Thirteen alarming lines for a fact
+  about the command. The control did its job, and doing its job that late is the defect; the image
+  and the argument count are checked up front now, the same shape as the docker-on-PATH and
+  daemon-reachable checks already there for exactly this reason.
+- **One idea closes three of round 5's findings: when several members of a set could answer, name
+  which one is authoritative instead of letting whichever is reached answer.**
+  - *Which variant carries the host question.* `Liveness::Process` was host-qualified in round 3
+    and `Liveness::Worktree` was not — same enum, same boundary. A host session claims as
+    `session:<pid>:/Users/…`; in the container that path is absent, `try_exists` said `false`, and
+    `reclaim_dead` freed the claim of a session running on the host. The session id carries no
+    host, so the question is asked of the filesystem: **an absence is only proof where the place
+    it would be is visible** — the parent directory must exist. That is the archive sweep's
+    reachability rule, one level down, and it needs no change to an id format already in databases.
+  - *Which observation is the state.* `--status-file` recorded `status_of`'s answer from BEFORE
+    the linker ran, to preserve an alarm the repair clears — and that made a successful
+    FIRST-EVER link record `unlinked`, which `verify.sh` treats as fatal. Every new container
+    failed `postCreate` exactly once, on a feature working. `link_one` already returns `exposed`
+    for the case the pre-state existed to keep, so recording the OUTCOME loses nothing.
+  - *Which record governs.* Giving each disposal its own marker (round 4) opened a second way to
+    the regression `Plan` was added to prevent: `abandon --delete-branch`, change your mind,
+    `abandon` again — two pending records for one tree, and the older one still force-deletes the
+    branch the later run printed "kept" for. The newest pending record per worktree governs and
+    the rest are superseded; **archived** records are never superseded, because each names a
+    distinct archive that still has to be swept.
+- **The `ERR` trap added in round 4 was worse than the hole it closed, and only measurement showed
+  it.** `getent` exits 2 for a name with no A record, `pipefail` carries that out, and a BARE
+  assignment is a simple command in no conditional context — so `errexit` fired, `set -E` sent it
+  to `fail_closed`, and **one unresolvable domain took the whole raise to deny-all with no
+  allowlist**, blaming "an unexpected failure at line 173" while the two arms written for exactly
+  that state became unreachable. Measured which shapes trip it: a bare `x="$(cmd)"` does; `x="$(cmd)"
+  || x=""` and `if x="$(cmd)"` do not. The trap stays — it is what catches an abort no refusal
+  wrote — and the one bare assignment gained a fallback.
+- **A green harness is evidence about the paths it runs, not about a file.** After the container
+  harness went green I said the container files were no longer unexercised. The firewall defect
+  above lives on the DNS-failure path, which the harness does not drive: it covers the happy path
+  and the no-`NET_ADMIN` path. Generalising a run into a property of a file is the same shape as
+  every "unknown reported as a definite answer" this branch has been correcting.
+- **A test fixture must not assume anything about the machine it runs on.** Three sweep tests
+  named `/home/vscode/repos/jkb` as "a repo this machine cannot reach" — which is precisely the
+  bind target this change adds, so inside the container the path EXISTS: the tests took the
+  opposite arm, **the gate was red in the environment the change exists to introduce**, and two of
+  them ran `git worktree prune` against the real checkout. Unreachability is a property of the
+  fixture now (a tempdir path never created), not a claim about the world.
+- **A record consulted INSTEAD of asking makes a guard unfirable.** `verify.sh` read setup.sh's
+  create-time memory record in place of asking the linker, so the store guard could never fire
+  after `postCreate` — a redirect planted the next day reported `ok` — and an `exposed` record
+  could not be cleared by the remedy the failure printed. It asks live every time, and the record
+  is an additional alarm, consumed once reported. The record still earns its place: the linker
+  *repairs*, so a live question asked afterwards sees the harmless state and not the one that was
+  true at create.
+- **A caller that downgrades a refusal to a note undoes it.** `revoke` refuses when a sweep holds
+  the lock, and its doc says the honest outcome is for the operator to re-run — but `task work`
+  printed a note and handed the session back, licensing that sweep to archive the checkout it had
+  just told the operator to work in. The cancellation now happens **before** the worktree is
+  handed over, and a refusal stops the verb.
+- **A mutation can pass on the symptom rather than the behaviour.** The `--dns 127.0.0.1` case
+  reported CAUGHT whether or not `fail_closed` installed anything, because both egress probes
+  resolve a name and a dead resolver breaks them by itself. `fail_closed` now writes
+  `/run/jkb-egress-failed`, cleared only by a successful raise, so `verify.sh` — which runs as
+  `vscode` and cannot ask iptables anything — observes what the firewall DID rather than what
+  egress happens to do.
+- **`jkb task reap` no longer opens the database.** It touches no rows, but ran through the
+  dispatch that migrates first — so the shared-`jkb.db` divergence this project documents as
+  routine turned the one process that finishes every deferred landing into a launchd restart-loop,
+  with the only symptom in `reap.log`.
+- **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
+  attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
+  over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
+  not by parsing `status --porcelain` — whose leading status column is exactly what the trimming
+  capture helper eats.
+
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
 `/review-log` used to wrap the host's `/code-review`, which reports to the user rather than

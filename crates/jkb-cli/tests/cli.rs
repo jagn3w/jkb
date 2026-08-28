@@ -16,6 +16,13 @@ use tempfile::TempDir;
 fn jkb(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("jkb").unwrap();
     cmd.arg("--db").arg(db);
+    // Pin the host these tests' owner ids are compared against. A `host:<pid>` owner is only
+    // probed for liveness on the host that issued it — a pid means nothing without one, and
+    // `~/.jkb` is shared across the container boundary on purpose — so `host:1234` has to name
+    // the machine the binary thinks it is running on, or every claim fixture below is `Unknown`
+    // and nothing is ever reclaimed. Pinned rather than read, so the tests do not depend on
+    // whatever the developer's machine is called.
+    cmd.env("HOSTNAME", "host");
     cmd
 }
 

@@ -12,6 +12,61 @@ ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 
+# `--declare <mount-point>`: a mount point the CALLER declares, for the one case devcontainer.json
+# cannot express — a bind NESTED inside a declared target. `mutate-verify.sh` is that case: it
+# spells its own docker flags, and it must mount the repo at /home/vscode/repos/jkb because in a
+# `jkb task work` session the repo's parent directory is `.jkb/work`, not a repos dir, so mounting
+# the parent would put the checkout at /home/vscode/repos/<session>.
+#
+# Nesting is NOT granted automatically, and that is the whole design decision here. A mount point
+# and a mount SOURCE are independent: `-v ~/.ssh:/home/vscode/repos/jkb/secrets` sits inside a
+# declared region and is still exfiltration. Nor can the source be checked from in here — on
+# Docker Desktop for macOS /proc/self/mountinfo reports the path inside the VM, not the host path,
+# which is why lib.sh's `dc_mount_sources` is used only by check-config.sh, on the host, where the
+# sources are literal strings in the JSON.
+#
+# So the exception is NAMED rather than inferred, and it is bounded two ways. It only ADDS to the
+# derived set, so it can never switch a check off; and it is refused unless the value is a strict
+# descendant of a target devcontainer.json declares AS A BIND — not a volume, which reaches no
+# host filesystem and is therefore a region nobody reviewed sources for — so `--declare /host`,
+# `--declare /var/run/docker.sock` and `--declare /home/vscode/.claude/settings.json` — the exact
+# mutations mutate-verify.sh exists to catch — cannot be waved through by it. The count is printed
+# in the ok line below, because an override nobody can see is indistinguishable from a rule that
+# does not exist (D38).
+DECLARED_EXTRA=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --declare)   shift; [ $# -gt 0 ] || { echo "verify.sh: --declare needs a mount point" >&2; exit 2; }
+                     DECLARED_EXTRA+=("$1"); shift ;;
+        --declare=*) DECLARED_EXTRA+=("${1#--declare=}"); shift ;;
+        *)           echo "usage: verify.sh [--declare <mount-point>]..." >&2; exit 2 ;;
+    esac
+done
+
+# INSIDE THE CONTAINER, OR NOT AT ALL. Every assertion below is about a Linux container's kernel
+# state, and run anywhere else they do not fail — they answer about a machine that was never the
+# subject. On the macOS host this printed fourteen confident FAILs (no `~/.claude` links, sudo
+# wants a password, the knowledge base "not mounted") and, worse, two `ok` lines: `/proc/self/
+# mountinfo` does not exist there, so the mount-boundary check compared an EMPTY set and passed.
+# A report an operator could act on, about nothing.
+#
+# The mount table is the load-bearing input rather than a proxy for the platform: if it cannot be
+# read, the one assertion this file exists for cannot mean anything, whatever else is true.
+if [ ! -r /proc/self/mountinfo ]; then
+    echo "verify.sh asserts what a running container is, and must run INSIDE one." >&2
+    echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
+    echo "  file exists for — could not be checked at all." >&2
+    echo >&2
+    echo "  In VS Code:  Reopen in Container, then ./.devcontainer/verify.sh" >&2
+    echo "  With Docker: ./.devcontainer/mutate-verify.sh --control   (one healthy run)" >&2
+    echo "               ./.devcontainer/mutate-verify.sh             (every guard, watched failing)" >&2
+    echo >&2
+    echo "  Do NOT hand-roll the docker run: it needs the seccomp profile, NET_ADMIN, both binds" >&2
+    echo "  and a preamble that raises the firewall and installs the posture. A command missing" >&2
+    echo "  any of those prints a dozen FAILs that read as a broken container." >&2
+    exit 2
+fi
+
 echo "==> container posture"
 
 # 1. Non-root. Load-bearing, not hygiene: root in a container cannot create a mount namespace
@@ -45,21 +100,67 @@ fi
 # the gate that reviews the boundary and the check that enforces it cannot read it differently.
 here_dc="$(cd "$(dirname "$0")" && pwd)"
 DC="$here_dc/devcontainer.json"
+# The checkout being verified: the one this script is in. Every assertion below that used to name
+# /home/vscode/repos/jkb reads this instead — with all of ~/repos mounted, that literal is a
+# statement about whichever repo happens to sit there, which is not necessarily this one.
+mem_repo="$(cd "$here_dc/.." && pwd)"
 # shellcheck source=/dev/null
 . "$here_dc/lib.sh"
 EXPECTED="$(dc_mount_targets "$DC")"
 # What every container has regardless of configuration. Anything outside this and EXPECTED is
 # something a human added to devcontainer.json and must be looked at.
-RUNTIME_OWNED='^/$|^/proc|^/sys|^/dev|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets'
-actual="$(awk '{print $5}' /proc/self/mountinfo | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
+# Anchored at a component boundary — `(/|$)` — not as bare prefixes. `^/dev` also matched
+# `/devtools`, `^/proc` matched `/procdata` and `^/sys` matched `/sysroot`, so a host mount at any
+# of those was silently dropped from the set this check calls exhaustive. A list of exclusions
+# that quietly grows is the shape this assertion exists to avoid having.
+RUNTIME_OWNED='^/$|^/proc(/|$)|^/sys(/|$)|^/dev(/|$)|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets(/|$)'
+# The READ is kept separate from the result, because "there were no mounts" and "the table could
+# not be read" are different facts and the second must never be spelled like the first. `EXPECTED`
+# has been guarded that way since it was derived; `actual` was not, so an unreadable table made
+# the boundary check pass having compared nothing.
+if mountinfo="$(cat /proc/self/mountinfo 2>/dev/null)" && [ -n "$mountinfo" ]; then
+    mounts_readable=yes
+    actual="$(awk '{print $5}' <<<"$mountinfo" | sort -u | grep -Ev "$RUNTIME_OWNED" || true)"
+else
+    mounts_readable=no
+    actual=""
+fi
 # A failed derivation would make every real mount look undeclared — a true failure, but reported
 # as the wrong thing. Say which it is, so the fix is not looked for in devcontainer.json's mounts.
-if [ -z "$EXPECTED" ]; then
+#
+# The caller's own declarations are folded in HERE, after the derivation and never instead of it,
+# and each is refused unless it is strictly inside something already derived. `$d/*` is a strict
+# descendant test on purpose: `--declare` cannot restate a declared target (which would be a
+# no-op) and cannot name one of its ancestors (which would widen the set upwards).
+extra=0
+for t in ${DECLARED_EXTRA[@]+"${DECLARED_EXTRA[@]}"}; do
+    nested=no
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        case "$t" in "$d"/?*) ;; *) continue ;; esac
+        # ...and only inside a BIND. A named volume is container-managed and reaches no host
+        # filesystem, which is exactly why check-config.sh reviews bind sources and waves volumes
+        # through — so "inside a declared region" cannot mean inside a volume: a bind nested under
+        # ~/.cargo/target would be a host mount at a place nobody reviewed. `dc_type_for_target`
+        # is lib.sh's own answer to that question, used here rather than derived a second way.
+        [ "$(dc_type_for_target "$DC" "$d")" = bind ] || continue
+        nested=yes; break
+    done <<<"$EXPECTED"
+    if [ "$nested" = yes ]; then
+        EXPECTED="$(printf '%s\n%s\n' "$EXPECTED" "$t" | sort -u)"
+        extra=$((extra+1))
+    else
+        bad "--declare $t is not inside any host BIND $DC declares — only a mount nested in a declared bind may be named here (a named volume reaches no host filesystem, so nothing under one is reviewable this way)"
+    fi
+done
+if [ "$mounts_readable" != yes ]; then
+    bad "could not read /proc/self/mountinfo — the mount boundary was not checked, which is not the same as finding it clean"
+elif [ -z "$EXPECTED" ]; then
     bad "could not derive the declared mounts from $DC — the check below cannot mean anything"
 else
     unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$EXPECTED"))"
     if [ -z "$unexpected" ]; then
-        ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked against $(printf '%s\n' "$EXPECTED" | grep -c . ) declared)"
+        ok "every mount point is declared or runtime-owned ($(printf '%s\n' "$actual" | grep -c . ) checked against $(printf '%s\n' "$EXPECTED" | grep -c . ) declared$([ "$extra" -gt 0 ] && printf ', %s of them nested and named with --declare' "$extra"))"
     else
         bad "UNDECLARED mounts: $(tr '\n' ' ' <<<"$unexpected")"
     fi
@@ -72,7 +173,10 @@ fi
 #    the host at all — not even the credential file, which is why you log in inside the container.
 #    Matched as a PREFIX, not for equality: a bind at ~/.claude/settings.json is the posture file
 #    itself and an equality test waves it through, which is the one mount that matters most here.
-claude_mounts="$(awk '$5 == "/home/vscode/.claude" || index($5, "/home/vscode/.claude/") == 1 {print $5}' /proc/self/mountinfo)"
+# From the table read ONCE and guarded above, not a second open: re-reading it here meant an
+# unreadable mountinfo printed `ok  nothing under ~/.claude is a host mount` having compared
+# nothing — the same defect fixed one assertion over, still live in its neighbour.
+claude_mounts="$(awk '$5 == "/home/vscode/.claude" || index($5, "/home/vscode/.claude/") == 1 {print $5}' <<<"$mountinfo")"
 assert "nothing under ~/.claude is a host mount${claude_mounts:+ (found: $(tr '\n' ' ' <<<"$claude_mounts"))}" \
     "$([ -z "$claude_mounts" ] && echo yes || echo no)"
 
@@ -153,12 +257,138 @@ for pair in "/home/vscode/.claude/.credentials.json:/home/vscode/.claude-state/.
 done
 [ "$links_ok" -eq 1 ] && ok "login state is linked into the persistent volume"
 
+# 3d. Auto-memory reaches the host, and the state volume does NOT give you this: Claude Code keys
+#     memory by the project's ABSOLUTE PATH, so this container's /home/vscode/repos/jkb is a
+#     different key from the host's, and widening the workspace mount does not change that. The
+#     shared store lives inside the ~/.jkb bind that already exists, so nothing under ~/.claude is
+#     mounted and the assertion above still holds. Asserted here for the reason 3c is: it is a
+#     promise the README makes, and a promise checked nowhere is how this one would rot.
+#     The slug comes from the linking script itself rather than being spelled again here — one
+#     guess about another program's private encoding is enough.
+#     ASKED OF THE LINKER, not inferred from the link's absence. The linker deliberately leaves
+#     the link absent in states it recognises — a name that exists on both sides is a collision it
+#     refuses to resolve, and a store holding a symlink is one it refuses to follow — so reading
+#     "no link" as "the mechanism is broken" made a state its own design calls normal fail this
+#     check, and with it postCreate, and with that the container. One rule, stated in one place.
+# ASKED LIVE, EVERY TIME — and the create-time record is an ADDITIONAL alarm, never a substitute.
+#
+# It used to be the other way round, and that made the store guard unfirable after `postCreate`:
+# the record says `linked`, so a redirect planted in the store the next day — the only time that
+# state can arise, and exactly the sequence `link_one`'s comment describes — reported `ok`. The
+# mirror case was a false FAIL that could not be cleared: after an `exposed` create, the printed
+# remedy is a hand re-run of the linker, which writes no status file, so verify.sh kept reading
+# `exposed` until a full rebuild.
+#
+# The record still earns its place: `link_one` REPAIRS, removing a live link into a poisoned store,
+# so a live question asked afterwards sees the harmless `unsafe` and not the `exposed` that was
+# true at create. So both are consulted, the worse one decides, and an `exposed` record is
+# consumed once reported — which is what makes the documented remedy actually clear it.
+mem_key="$(basename "$mem_repo")"
+mem_status_file=/home/vscode/.claude-state/memory-status
+mem_live="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+mem_recorded="$(awk -v k="$mem_key" '$1 == k { print $2 }' "$mem_status_file" 2>/dev/null | tail -1)"
+# The two states ONLY THE RUN can know, so only the record can carry them. `exposed` because the
+# repair clears its own alarm; `error` because it means the run stopped part-way — a migration that
+# moved some files and then failed leaves a directory the live observer reads as an ordinary
+# `unlinked`, and this check then blamed "the linker did not run", the one cause it is not. The
+# `error)` arm below was unreachable until now: `status_of` never emits that word.
+case "$mem_recorded" in
+    exposed|error)
+        mem_state="$mem_recorded"
+        # Consumed: the alarm describes one create, and leaving it makes the remedy — a hand
+        # re-run, which writes no status file — unable to clear it.
+        if [ -w "$mem_status_file" ]; then
+            awk -v k="$mem_key" '$1 != k' "$mem_status_file" > "$mem_status_file.new" 2>/dev/null \
+                && mv "$mem_status_file.new" "$mem_status_file" 2>/dev/null || true
+        fi ;;
+    *)  mem_state="$mem_live" ;;
+esac
+case "$mem_state" in
+    linked)
+        ok "auto-memory is shared with the host through ~/.jkb" ;;
+    exposed)
+        # A live redirect out of the store, which the linker has just broken. FATAL: the container
+        # is not in a state its own design permits, and saying so on the create that discovers it
+        # is the only moment anyone reads this.
+        bad "auto-memory was pointing into a store holding something that is not a plain file — the link has been removed; clean ~/.jkb/claude-memory and re-run scripts/link-claude-memory.sh" ;;
+    collision|unsafe|foreign)
+        # Not a FAIL: the container works, one repo's memory just is not shared until a person
+        # settles it. Said plainly, because a state nobody is told about is one nobody fixes.
+        ok "auto-memory is not shared for $(basename "$mem_repo") ($mem_state) — run scripts/link-claude-memory.sh to see what it wants"
+        ;;
+    broken)
+        # The link is live and points at a store directory that is GONE, so every memory write
+        # into it fails. Not one of the declining states: nothing here wants a decision, the
+        # linker recreates the directory. FATAL because until it is re-run, memory is silently
+        # not being recorded — the failure mode with no symptom.
+        bad "auto-memory points at a store directory that no longer exists — re-run scripts/link-claude-memory.sh" ;;
+    error)
+        # The linker ran and could not finish for this repo — from the RECORD, since a live
+        # observation cannot see a run that stopped part-way. Distinct from `unlinked`, which is
+        # "no link and nothing recorded", and from the declining states above, which want a person.
+        bad "auto-memory could not be linked (state: error) — see scripts/link-claude-memory.sh's output in the create log" ;;
+    unlinked|"")
+        # FATAL, and setup.sh's comment now says the same. `unlinked` is not the linker declining
+        # — a collision and a poisoned store have their own words above and pass — it means the
+        # linker did not run or could not answer, and the README promises this works. The two
+        # files used to state opposite rules about the same state.
+        # Says what was OBSERVED, not why. The previous wording asserted "the linker did not run",
+        # which this cannot establish: a hand re-run that fails part-way writes no status file and
+        # lands here too.
+        bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — memory written in here would be invisible on the host; run scripts/link-claude-memory.sh and read what it says" ;;
+    *)
+        bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
+esac
+
 # 4. ...and these must be present, or the container is merely empty rather than confined.
-assert "workspace is mounted"       "$([ -f /home/vscode/repos/jkb/Cargo.toml ] && echo yes || echo no)"
-assert "knowledge base is mounted"  "$([ -d /home/vscode/.jkb ] && echo yes || echo no)"
+# THE MOUNT, asked of the kernel — and asked about THIS checkout rather than about a path.
+#
+# Three versions of this, and the middle two are why the wording matters. A hard-coded
+# /home/vscode/repos/jkb asserted something about whichever checkout sat there once ~/repos is
+# mounted whole. Deriving it from where this script lives went too far the other way and asserted
+# that the directory containing the running script contains a Cargo.toml — true by construction on
+# every path that can execute this. Then requiring the DECLARED target to itself appear in
+# mountinfo failed the harness outright: mutate-verify.sh mounts the repo AT
+# /home/vscode/repos/jkb (it cannot mount the parent — in a `jkb task work` session $REPO's parent
+# is `.jkb/work`), so /home/vscode/repos is never a mount point there. Measured: every mutation
+# reported CAUGHT and then the control failed, so the harness judged nothing.
+#
+# What actually has to hold is that this checkout sits inside a mount point that is BOTH really
+# mounted and declared. Both halves carry weight: mounted, so a repo baked into the image layer
+# with the bind dropped fails rather than passing as "confined"; declared, so it is a mount the
+# boundary knows about. `EXPECTED` is used deliberately — it has `--declare` folded in by now,
+# which is the one mechanism that exists to name exactly this nested case.
+ws_mounted=no
+while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    printf '%s\n' "$EXPECTED" | grep -qx "$m" || continue
+    case "$mem_repo" in "$m"|"$m"/?*) ws_mounted=yes; break ;; *) ;; esac
+done <<<"$actual"
+assert "$mem_repo is inside a declared mount point" "$ws_mounted"
+# ASKED OF THE KERNEL TOO, with the table already in hand. `[ -d /home/vscode/.jkb ]` was a test
+# that `jkb` itself satisfies: `create_dir_all` runs on the parent of JKB_DB at three sites in
+# main.rs, so any verb materialises the directory and this printed `ok` in a container where the
+# bind was simply absent — a container-local database, a container-local memory store the linker
+# happily reports `linked` for, and every write lost on the next rebuild. The boundary check above
+# cannot cover it either: `comm -23 actual EXPECTED` reports mounts that are EXTRA, never a
+# declared one that is missing.
+kb_mounted=no
+while IFS= read -r m; do
+    [ "$m" = /home/vscode/.jkb ] && { kb_mounted=yes; break; }
+done <<<"$actual"
+assert "knowledge base is mounted" "$kb_mounted"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.
+# WHAT THE FIREWALL DID, not what egress happens to do. The two probes below both resolve a name,
+# so a dead resolver produces the same answers as a deny-all — which meant the harness case for
+# `fail_closed` passed without ever establishing that it installed anything. The marker is written
+# by `fail_closed` and cleared only by a successful raise, so it says which of the two happened.
+if [ -e /run/jkb-egress-failed ]; then
+    bad "the firewall failed closed and left no allowlist: $(head -1 /run/jkb-egress-failed 2>/dev/null)"
+else
+    ok "the firewall raised an allowlist (it did not fail closed)"
+fi
 if curl -sS -m 6 -o /dev/null https://example.com 2>/dev/null; then
     bad "egress to a NON-allowlisted host was permitted (example.com)"
 else
@@ -173,7 +403,7 @@ fi
 
 # 6. The inner posture. `check` is the drift rule from D48; here it also proves the posture
 #    survived being installed into a fresh container HOME.
-if /home/vscode/repos/jkb/scripts/auto-mode.sh check >/dev/null 2>&1; then
+if "$mem_repo/scripts/auto-mode.sh" check >/dev/null 2>&1; then
     ok "Claude Code posture is intact"
 else
     bad "Claude Code posture is NOT intact (scripts/auto-mode.sh check)"

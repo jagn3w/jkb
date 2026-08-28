@@ -5,11 +5,17 @@
 #   1. installs the `jkb` binary to ~/.cargo/bin (cargo install)
 #   2. scaffolds the standard KB namespace roots (repos/ tasks/ media/ references/ memory/)
 #   3. builds + installs the VS Code extension (pnpm; skipped if VS Code/pnpm absent)
-#   4. installs + activates the file-sync watcher as an OS service (launchd/systemd)
+#   4. installs + activates the background services (file-sync watcher and worktree
+#      reaper) as OS services (launchd/systemd)
 #   5. installs the repo's post-merge git hook into this repo's .git/hooks — and, when
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #
-# Flags: --no-extension, --no-service, --no-scaffold, --db <path>, -h/--help.
+# Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
+#
+# --link-memory is opt-in, and deliberately not the default: it writes symlinks under
+# ~/.claude/projects so the dev container and the host share one auto-memory store, and this
+# script is re-run by the post-merge hook. A `git pull` must not quietly rearrange somebody's
+# ~/.claude. See scripts/link-claude-memory.sh.
 # Everything is best-effort per step: a missing optional tool warns and continues.
 set -euo pipefail
 
@@ -17,6 +23,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 do_extension=1
 do_service=1
 do_scaffold=1
+link_memory=0
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -24,9 +31,12 @@ while [ "$#" -gt 0 ]; do
     --no-extension) do_extension=0 ;;
     --no-service) do_service=0 ;;
     --no-scaffold) do_scaffold=0 ;;
+    --link-memory) link_memory=1 ;;
     --db) shift; db="$1" ;;
     -h|--help)
-      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      # Derived, not a pinned line range: the header grows, and a stale `2,18p` silently
+      # truncates the help or prints a line of code as documentation. Both happened here.
+      sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -87,25 +97,32 @@ fi
 
 # --- 4. file-sync watcher service -------------------------------------------
 if [ "$do_service" -eq 1 ]; then
-  say "install + activate file-sync watcher"
+  say "install + activate background services (file sync, worktree reaper)"
   jkb --db "$db" service install
+  # BOTH units `service install` writes. The reaper is what finishes a landing whose session
+  # could not archive its own worktree, so a unit that is written and never loaded means those
+  # worktrees accumulate for ever — visible only as `jkb doctor` output nobody reads.
   case "$(uname -s)" in
     Darwin)
-      plist="$HOME/Library/LaunchAgents/com.jkb.sync.plist"
-      launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
-      if launchctl load "$plist"; then echo "watcher loaded (launchd)"; else
-        warn "could not load the launchd agent; activate manually: launchctl load $plist"
-      fi ;;
+      for label in com.jkb.sync com.jkb.reap; do
+        plist="$HOME/Library/LaunchAgents/$label.plist"
+        launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
+        if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
+          warn "could not load $label; activate manually: launchctl load $plist"
+        fi
+      done ;;
     Linux)
       if command -v systemctl >/dev/null 2>&1; then
         systemctl --user daemon-reload || true
-        if systemctl --user enable --now com.jkb.sync; then echo "watcher enabled (systemd)"; else
-          warn "could not enable the systemd unit; activate manually: systemctl --user enable --now com.jkb.sync"
-        fi
+        for label in com.jkb.sync com.jkb.reap; do
+          if systemctl --user enable --now "$label"; then echo "$label enabled (systemd)"; else
+            warn "could not enable $label; activate manually: systemctl --user enable --now $label"
+          fi
+        done
       else
-        warn "systemctl not found; activate the printed unit manually."
+        warn "systemctl not found; activate the printed units manually."
       fi ;;
-    *) warn "unsupported OS for auto-activation; the unit was written — activate it manually." ;;
+    *) warn "unsupported OS for auto-activation; the units were written — activate them manually." ;;
   esac
 else
   warn "skipping watcher service (--no-service)"
@@ -156,6 +173,13 @@ CHAIN
   else
     warn "not a git repo; skipping hook install"
   fi
+fi
+
+# --- shared claude memory (opt-in) -------------------------------------------
+# Only when asked. This writes under ~/.claude/projects, and setup.sh is what the post-merge hook
+# re-runs after a `git pull` — jkb does not rearrange other people's configuration behind them.
+if [ "$link_memory" -eq 1 ]; then
+  "$repo_root/scripts/link-claude-memory.sh" || warn "some repos could not be linked (see above)"
 fi
 
 say "setup complete"

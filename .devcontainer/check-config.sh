@@ -102,7 +102,7 @@ fi
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
 mount_targets="$(dc_mount_targets "$here/devcontainer.json")"
 missing_mounts=()
-for m in /home/vscode/repos/jkb /home/vscode/.jkb; do
+for m in /home/vscode/repos /home/vscode/.jkb; do
     grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
 done
 if [ ${#missing_mounts[@]} -eq 0 ]; then
@@ -110,6 +110,44 @@ if [ ${#missing_mounts[@]} -eq 0 ]; then
 else
     bad "the declared mount set is missing ${missing_mounts[*]} — verify.sh derives its boundary from this list"
 fi
+
+# The workspace folder must be INSIDE the workspace mount's target, and the folder that decides it
+# must be refused when it cannot be. These are one rule in two halves and both are needed: a
+# `workspaceFolder` that is a literal path under the target opens whatever repo happens to sit
+# there — for a `jkb task work` session, the main checkout instead of the session — and every
+# runtime guard still passes, because the wrong repo is a perfectly good repo. The `initializeCommand`
+# is what makes the derived form safe, so its absence is a failure of this rule, not a separate one.
+# Parsed through jq, handling BOTH the string and object forms of `workspaceMount` — the spec
+# allows either and they are interchangeable at any time. A `target=` regex understood only the
+# string form, and when it yielded nothing the case below degenerated to "does it start with a
+# slash", which every plausible value passes: a guard that fails open on a purely cosmetic edit.
+ws_target="$(jq -r 'if (.workspaceMount // "") | type == "string"
+                    then ((.workspaceMount // "") | capture("target=(?<t>[^,]+)").t)
+                    else (.workspaceMount.target // "") end' <<<"$dc" 2>/dev/null)"
+ws_folder="$(jq -r '.workspaceFolder // ""' <<<"$dc")"
+ws_ok=1
+if [ -z "$ws_target" ] || [ -z "$ws_folder" ]; then
+    bad "could not read workspaceMount's target and workspaceFolder from devcontainer.json — the checks below cannot mean anything"
+    ws_ok=0
+else
+case "$ws_folder" in
+    "$ws_target"/?*) ;;
+    *) bad "workspaceFolder ($ws_folder) is not inside the workspaceMount target ($ws_target) — the container would open a directory the mount does not place there"; ws_ok=0 ;;
+esac
+# ...and DERIVED, which is the property that actually matters. Inside the target is not enough:
+# a literal `/home/vscode/repos/jkb` is inside it and is exactly the harm the comment above
+# names — it opens whichever checkout sits there, so a session worktree starts the agent in the
+# main one. The folder has to follow the folder that was opened.
+case "$ws_folder" in
+    *'${localWorkspaceFolderBasename}'*) ;;
+    *) bad "workspaceFolder ($ws_folder) is a literal path, not derived from \${localWorkspaceFolderBasename} — it would open whichever checkout happens to sit there rather than the one you opened"; ws_ok=0 ;;
+esac
+fi
+if ! grep -qF 'check-workspace.sh' <<<"$(jq -r '.initializeCommand // ""' <<<"$dc")"; then
+    bad "devcontainer.json has no initializeCommand running check-workspace.sh — a folder that is not \$HOME/repos/<name> would open a DIFFERENT checkout than the one you clicked, silently"
+    ws_ok=0
+fi
+[ "$ws_ok" -eq 1 ] && ok "the workspace folder is inside the mount, and a folder that is not is refused before create"
 
 # DERIVING THE EXPECTED SET MADE THE BOUNDARY SELF-CERTIFYING, and this is the other half of it.
 # verify.sh can now only answer "does the running container match what it declares"; adding a
@@ -131,7 +169,7 @@ done <<<"$mount_targets"
 while IFS= read -r src; do
     [ -n "$src" ] || continue
     case "$src" in
-        '${localWorkspaceFolder}'|'${localEnv:HOME}/.jkb') ;;
+        '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb') ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
 done <<<"$(dc_mount_sources "$here/devcontainer.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
@@ -235,6 +273,89 @@ for caller in "$here/setup.sh" "$here/devcontainer.json"; do
     fi
 done
 [ "$callers_ok" -eq 1 ] && ok "no caller passes an argument to the firewall"
+
+# NO REFUSAL IN THE FIREWALL MAY BYPASS `fail_closed`. iptables rules do not survive a container
+# restart, so a refusal that exits before installing any is not a refusal — it is unrestricted
+# egress with a message. Two guards had that shape (an unparseable snapshot, an unidentifiable
+# workspace posture), both in the file whose entire job is to be the layer that holds when the
+# nested sandbox does not. `exit 1` inside `fail_closed` itself is the one legitimate site.
+# Comments are stripped first and any NONZERO exit is matched ANYWHERE on the line, not just at
+# its start. Two ways this was too narrow: an anchored pattern walked straight past `... || exit 1`
+# (its own first version, reported MISSED by the mutation), and matching the literal `1` walked
+# past the `exit 2` the argument refusal used — a refusal leaving no rules, which is the one thing
+# this checks for.
+stray_exits="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
+    /^fail_closed\(\) \{/ { infn = 1 }
+    infn && /^\}/           { infn = 0; next }
+    !infn && /(^|[^[:alnum:]_])exit[[:space:]]+[1-9]/ { print FNR }
+')"
+if [ -z "$stray_exits" ]; then
+    ok "every refusal in init-firewall.sh goes through fail_closed"
+else
+    bad "init-firewall.sh exits without installing a deny-all at line(s): $(tr '\n' ' ' <<<"$stray_exits")— a refusal that leaves no rules is unrestricted egress with a message"
+fi
+
+# UNDER `set -eE` PLUS THE ERR TRAP, A BARE COMMAND-SUBSTITUTION ASSIGNMENT ABORTS THE SCRIPT —
+# and in this file an abort means `fail_closed`, which is deny-all with no allowlist. That is not
+# hypothetical: `getent` exits 2 for a name with no A record, `pipefail` carries it out, and one
+# unresolvable domain among the fifteen took the whole raise down, blaming "an unexpected failure
+# at line 173" while the two arms written for exactly that state were unreachable.
+#
+# Measured on bash 3.2, EVERY shape this file uses, because the regex below looks narrower than
+# the hazard and a later reader will otherwise widen it on suspicion:
+#
+#   x="$(cmd)"                     ABORTS — the trap fires and the raise becomes deny-all
+#   x="$(cmd)" || fallback         safe
+#   if x="$(cmd)"; then            safe
+#   elif x="$(cmd)"; then          safe
+#   printf ... "$(cmd)"            safe — errexit does not apply to an argument's expansion
+#   cmd "... $(cmd) ..." after ||  safe, twice over
+#   done <<<"$(cmd)"               safe
+#
+# So the bare assignment is the whole hazard, and matching it is the whole job. A review round
+# reported this check as vacuously passing over two live violations (the `$(ls …)` inside the
+# refusal message at init-firewall.sh:131, and the `elif` at :144); both were re-measured in the
+# exact shapes the file uses and neither aborts — 131 sits in an argument of a command that is
+# itself the right-hand side of `||`. Nothing was changed on the strength of that report, which
+# is why the measurement is written down here instead.
+#
+# Checked here because the Docker harness cannot reach the DNS-failure path, and because the next
+# substitution added to this file has the same trap waiting for it.
+bare_subst="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
+    # An assignment whose value is a command substitution, at statement level.
+    /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="?\$\(/ {
+        if ($0 !~ /\|\|/) print FNR ": " $0
+    }
+')"
+if [ -z "$bare_subst" ]; then
+    ok "every command substitution in init-firewall.sh can fail without aborting the raise"
+else
+    bad "init-firewall.sh has a command-substitution assignment with no fallback, which aborts the whole raise into fail_closed under the ERR trap: $(tr '\n' ' ' <<<"$bare_subst")"
+fi
+
+# EVERY EXPECT STRING mutate-verify.sh greps for must be one verify.sh can actually print.
+# That harness needs Docker, so it does not run in this gate — and a stale expect there is a
+# mutation that reports MISSED for ever, which is a guard nobody has seen fire dressed as a guard.
+# It went stale the moment a refusal was reworded, and nothing said so. Checked here, statically,
+# because the strings are just text in two files.
+stale_expects=()
+expects=()
+while IFS= read -r want; do
+    [ -n "$want" ] || continue
+    expects+=("$want")
+    grep -qF -e "$want" "$here/verify.sh" || stale_expects+=("$want")
+done < <(sed -n 's/^run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
+# PINNED AGAINST AN EMPTY EXTRACTION, like the three other derived lists above. Without it this
+# check passes by finding nothing to check: reword mutate-verify.sh's `run` line and the sed
+# stops matching, `stale_expects` is empty, and it prints `ok (0 checked)` — the exact
+# vacuous-pass shape it was written to stop existing elsewhere.
+if [ ${#expects[@]} -eq 0 ]; then
+    bad "no expectations could be read out of mutate-verify.sh — this check just certified nothing; has the 'run \"<label>\" \"<expect>\"' shape changed?"
+elif [ ${#stale_expects[@]} -eq 0 ]; then
+    ok "every mutate-verify expectation is a string verify.sh prints (${#expects[@]} checked)"
+else
+    bad "mutate-verify.sh expects text verify.sh never prints: ${stale_expects[*]} — those mutations can only ever report MISSED"
+fi
 
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi

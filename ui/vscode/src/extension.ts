@@ -345,7 +345,14 @@ async function pickStagingBranch(
   const create = {
     label: "$(add) New staging branch…",
     description: "cut a fresh branch from trunk",
-    value: " new",
+    // A sentinel that cannot collide with a branch name: `git check-ref-format` forbids `:`
+    // in a ref, so no real branch can ever equal this.
+    //
+    // It used to be a NUL byte, which is equally uncollidable and made the whole file read as
+    // BINARY — so `grep -r` skipped it silently, and a repo-wide sweep for readers of
+    // `StagedTask.dirty` missed the two in this file, one of which passes `--force` to
+    // `jkb task abandon`. A sentinel is not worth a source file search tools cannot see.
+    value: ":new",
   };
   const existing = branches.map((b) => ({
     label: `$(git-branch) ${b.branch}`,
@@ -362,7 +369,7 @@ async function pickStagingBranch(
     placeHolder: "Where should this task's work land?",
   });
   if (!pick) return undefined;
-  if (pick.value !== " new") return pick.value;
+  if (pick.value !== ":new") return pick.value;
 
   const name = await vscode.window.showInputBox({
     prompt: "Name for the new staging branch (cut from trunk)",
@@ -452,7 +459,15 @@ async function abandonFromFlight(client: CliJkbClient, node?: FlightNode): Promi
     vscode.window.showWarningMessage(`jkb: ${t.title} has no session to abandon.`);
     return;
   }
-  const warn = t.dirty ? " It has uncommitted changes, which will be lost." : "";
+  // Three-valued (`"yes"` / `"no"` / `"unknown"`), so a truthiness test is wrong: every value
+  // is a non-empty string, and `if (t.dirty)` warned about uncommitted changes on every task
+  // — including the clean ones, which is how a modal warning becomes noise people click past.
+  const warn =
+    t.dirty === "yes"
+      ? " It has uncommitted changes, which will be lost."
+      : t.dirty === "unknown"
+        ? " Git could not read its checkout, so whether it holds uncommitted work is unknown."
+        : "";
   // A finished task keeps its status: abandoning disposes of the checkout, and putting
   // already-merged or deliberately-cancelled work back on the ready frontier is the one
   // thing it must not do. Say which is about to happen, because they are different acts.
@@ -472,7 +487,11 @@ async function abandonFromFlight(client: CliJkbClient, node?: FlightNode): Promi
   const terminal = vscode.window.createTerminal({ name: `jkb abandon`, cwd });
   terminal.show();
   const args = ["task", "abandon", t.uid];
-  if (t.dirty) args.push("--force");
+  // ONLY for a checkout proven dirty. `--force` discards the tree, and under the same
+  // truthiness bug above it was appended for every task. `"unknown"` deliberately does NOT
+  // force: the CLI refuses an unreadable checkout and says how to override, which costs one
+  // command — where forcing costs whatever git could not see (D34.4).
+  if (t.dirty === "yes") args.push("--force");
   terminal.sendText(client.terminalCommand(args));
 }
 

@@ -8,6 +8,12 @@
 export type StagedState = "implementing" | "review" | "landed" | "dropped";
 
 /** One task on a staging branch. */
+/**
+ * A three-valued answer about the world outside the program, mirroring the CLI's `Fact`
+ * (`crates/jkb-fsm/src/fact.rs`). `"unknown"` means *not established* — never *no*.
+ */
+export type Fact = "yes" | "no" | "unknown";
+
 export interface StagedTask {
   readonly uid: string;
   readonly title: string;
@@ -16,7 +22,16 @@ export interface StagedTask {
   /** The session branch (`task/<session>`), when one is recorded. */
   readonly branch: string | null;
   readonly worktree: string | null;
-  readonly dirty: boolean;
+  /**
+   * Whether the session checkout has uncommitted changes.
+   *
+   * THREE-VALUED, mirroring the CLI's `Fact`: `"unknown"` is a checkout git could not read,
+   * which `jkb task land` refuses. It was a boolean, which forced that third answer to be
+   * spelled as the clean, landable one — the defect the CLI-side type exists to prevent. A
+   * plain truthiness test is wrong on this: every one of the three values is a non-empty
+   * string, so `if (t.dirty)` reads `"no"` as dirty.
+   */
+  readonly dirty: Fact;
   /** Commits the session branch has that the staging branch does not. */
   readonly commits: number;
   /** The branch HEAD a review ran against. */
@@ -70,7 +85,8 @@ export function formatBranchSummary(b: StagingBranch): string {
 export function formatTaskSummary(t: StagedTask): string {
   const parts: string[] = [t.state];
   if (t.commits > 0) parts.push(plural(t.commits, "commit"));
-  if (t.dirty) parts.push("uncommitted");
+  if (t.dirty === "yes") parts.push("uncommitted");
+  else if (t.dirty === "unknown") parts.push("unreadable checkout");
   if (t.open_must_fix > 0) parts.push(`${t.open_must_fix} must-fix open`);
   // Keyed on the REVIEW verdict, not on `land_blocked`. A `reviewed=` sha whose findings never
   // reached the KB must not read as reviewed — but `land_blocked` also fires for uncommitted

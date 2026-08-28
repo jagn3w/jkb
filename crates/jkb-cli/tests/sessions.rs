@@ -51,6 +51,10 @@ impl Fixture {
             .current_dir(&self.repo)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
+            // probed for liveness on the host that issued it, so an unpinned name makes every
+            // claim fixture `Unknown` and nothing is ever reclaimed.
+            .env("HOSTNAME", "host")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
@@ -196,6 +200,31 @@ fn two_sessions_are_worked_in_parallel_and_land_in_sequence() {
         .success()
         .stdout(predicate::str::contains("no sessions"));
     assert!(!wa.exists() && !wb.exists());
+
+    // ...but the trees were ARCHIVED, not deleted (design D49). This is the promise the whole
+    // rename-instead-of-unlink change exists for, and the old code satisfied every assertion
+    // above while destroying the files — so the files themselves are what is asserted, not just
+    // that a directory appeared.
+    let archive = f.repo.join(".jkb/archive");
+    let archived: Vec<PathBuf> = std::fs::read_dir(&archive)
+        .expect("an archive directory exists")
+        .map(|e| e.expect("readable").path())
+        .collect();
+    assert_eq!(
+        archived.len(),
+        2,
+        "one archive per landed session: {archived:?}"
+    );
+    // Asked as "is this file recoverable from SOME archive", not counted: each session is
+    // archived at what it landed, so the second — cut from the batch after the first landed —
+    // legitimately carries both files.
+    for want in ["a.txt", "b.txt"] {
+        assert!(
+            archived.iter().any(|d| d.join(want).exists()),
+            "{want} is recoverable from {}",
+            archive.display()
+        );
+    }
 }
 
 /// A local trunk ahead of its remote is the ordinary case. Cutting the batch from
@@ -357,6 +386,127 @@ fn landing_a_session_with_no_commits_says_so() {
         .stderr(predicate::str::contains(
             "It has no commits that the staging branch does not",
         ));
+}
+
+/// A disposal that could not move the tree must not take the task down with it.
+///
+/// From inside a sandboxed session `archive::stow` is refused, so `abandon` defers. It used to
+/// then run `git branch -D` on a branch the surviving worktree still had checked out; git refuses,
+/// `?` bailed before the claim was released, and the task was left `in_progress` claimed by a
+/// session whose worktree still exists — so `is_alive` said Yes and neither `doctor --fix` nor
+/// `task reclaim` could free it. Re-running failed identically.
+///
+/// The refusal is provoked without a sandbox: a regular file where `.jkb/archive` must be created
+/// makes `stow` fail for the same reason it fails there — nothing can be moved.
+#[test]
+fn a_deferred_abandon_still_reopens_the_task_and_keeps_the_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("deferred abandon task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(&wt, "d.txt", "work\n", "add d");
+
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").expect("block the archive");
+
+    f.jkb()
+        .args(["task", "abandon", &uid, "--delete-branch"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        f.status_of(&uid),
+        "open",
+        "the task is back on the frontier"
+    );
+    assert!(wt.exists(), "the tree it could not move is still there");
+    assert!(
+        !git(&f.repo, &["rev-parse", "--verify", &branch]).is_empty(),
+        "and its branch survives — `git branch -D` cannot run while that worktree holds it"
+    );
+
+    // ...and the claim really is free, which is what the wedge cost: the task must be workable.
+    f.jkb().args(["task", "work", &uid]).assert().success();
+}
+
+/// A deferred disposal is badged by **what the sweep will do with it**, not by the existence of
+/// a record.
+///
+/// `[awaiting archive]` is a promise that something is going to finish this. A record the sweep
+/// will HOLD is the opposite claim, and rendering the two the same is the hand-written
+/// "a sweep will finish this" the verdict seam exists to stop — an operator reading the listing
+/// to find live work would wait for a move that nothing was ever going to make.
+///
+/// The two states are provoked from ONE record, so what changes between the assertions is only
+/// what the sweep can do about it. A test that made two records could pass while the badge merely
+/// tracked which command wrote them.
+#[test]
+fn a_deferred_session_is_badged_by_what_the_sweep_will_do_with_it() {
+    let f = Fixture::new();
+    let uid = f.add_task("badged session task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "g.txt", "work\n", "add g");
+
+    // The same provocation the deferral test above uses: nothing can be moved into a regular file.
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").expect("block the archive");
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert!(
+        wt.exists(),
+        "the premise: the tree it could not move is still there"
+    );
+
+    let row = |f: &Fixture| -> serde_json::Value {
+        let out = f
+            .jkb()
+            .args(["task", "sessions", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "task sessions: {out:?}");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+        rows.iter()
+            .find(|r| r["worktree"].as_str() == wt.to_str())
+            .unwrap_or_else(|| panic!("the deferred checkout is listed: {rows:?}"))
+            .clone()
+    };
+
+    let clean = row(&f);
+    assert_eq!(
+        clean["awaiting_archive"],
+        serde_json::json!(true),
+        "a clean, identified tree is one the next sweep moves: {clean}"
+    );
+    assert_eq!(
+        clean["archive_blocked"],
+        serde_json::json!(false),
+        "and nothing is blocking it: {clean}"
+    );
+
+    // Now put something in it that no sweep may throw away. The record has not changed; what the
+    // sweep can do about it has.
+    std::fs::write(wt.join("untracked.txt"), "mine\n").expect("dirty the tree");
+    let dirty = row(&f);
+    assert_eq!(
+        dirty["archive_blocked"],
+        serde_json::json!(true),
+        "uncommitted work holds the disposal, and the listing must say so: {dirty}"
+    );
+    assert_eq!(
+        dirty["awaiting_archive"],
+        serde_json::json!(false),
+        "the two are never both true — that would promise a move and refuse it at once: {dirty}"
+    );
+
+    // And `doctor` agrees, from the same read: it is the surface the badge sends you to. It must
+    // count this record as HELD and not as awaiting — the promise the badge above was changed to
+    // stop making. The first version of this assertion pinned "1 awaiting archive" for a record it
+    // had just made held, which is the lumped wording rather than the fix.
+    f.jkb()
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is HELD"))
+        .stdout(predicate::str::contains("0 awaiting archive, 1 held"));
 }
 
 /// Abandoning returns the task to the frontier and takes the checkout with it — but keeps
@@ -1036,7 +1186,10 @@ fn abandon_frees_a_dead_owners_claim() {
             "claim",
             &uid,
             "--owner",
-            "swarm:4294967290",
+            // `host:` is this test's own machine (pinned in `jkb()`), which is what makes the pid
+            // probeable at all: a crashed implementer on ANOTHER host is `Unknown`, and unknown
+            // keeps its claim rather than losing it to a pid that happens to be free here.
+            "host:4294967290",
         ])
         .assert()
         .success();

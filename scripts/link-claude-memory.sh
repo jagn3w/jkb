@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# Share Claude Code's per-repo auto-memory between the host and the dev container (design D49).
+#
+#   ./scripts/link-claude-memory.sh [--dry-run] [--home <dir>] [--repos <dir>] [--store <dir>]
+#   ./scripts/link-claude-memory.sh --self-test
+#
+# THE PROBLEM. Claude Code keeps auto-memory in `~/.claude/projects/<slug>/memory/`, one directory
+# per project, where <slug> is the absolute path of the git repo root with every character outside
+# [A-Za-z0-9-] replaced by `-`. That key is the ABSOLUTE PATH, so the same repo has two of them:
+#
+#     host       /Users/you/repos/jkb    ->  -Users-you-repos-jkb
+#     container  /home/vscode/repos/jkb  ->  -home-vscode-repos-jkb
+#
+# Mounting all of ~/repos does not change that — the slug is derived from where the repo is, not
+# from what is in it — so the two sides key to different directories and neither can see what the
+# other learned.
+#
+# WHY NOT MOUNT IT. The obvious fix is a bind from the host's memory directory to the container's,
+# and it is the one mount this whole design forbids: `~/.claude` also holds `settings.json`, which
+# IS the posture, and a process the posture bounds must not read the file deciding whether it is
+# bounded. check-config.sh refuses such a mount, verify.sh asserts against it, and
+# mutate-verify.sh watches both fire. It would also collide with `dc_link_state`, which replaces
+# ~/.claude/projects with a symlink into the state volume, and it would need `initializeCommand`
+# to resolve a slug that no devcontainer.json substitution can express.
+#
+# WHAT THIS DOES INSTEAD. `~/.jkb` is ALREADY bind-mounted into the container, already declared and
+# already reviewed, so it costs no boundary change at all: the shared store is
+# `~/.jkb/claude-memory/<repo>/`, and each side symlinks its own slug's `memory` directory at it.
+# Run it on the host once and in the container on every create; both sides derive the repo list by
+# enumerating ~/repos, so a repo added later is picked up by re-running.
+#
+# STATED PLAINLY, because it is a hole in "the boundary is what you did not mount", and it is
+# WIDER than the container question it was designed around. Two channels, not one:
+#
+#  1. container -> host. Memory is agent-writable prose injected into context, so a shared store
+#     carries text from container sessions into the less-confined host ones. Same person's agents
+#     at both ends, prose rather than code, through a directory that was already shared.
+#
+#  2. sandboxed Bash -> every future session, ON THE HOST. This one was measured, not predicted,
+#     and it is the reason to read the paragraph twice. `~/.claude/projects` is under the
+#     posture's blanket `denyRead` of `~` and in no allow list, so sandboxed Bash cannot read or
+#     write auto-memory at all. `~/.jkb` is in BOTH `allowRead` and `allowWrite`, because jkb's
+#     database lives there. Linking therefore moves memory from a place sandboxed Bash cannot
+#     touch into one where a single auto-approved command can rewrite it — for this repo and, via
+#     the same grant, for every other repo's store. Prose written there is injected into every
+#     later session for that repo.
+#
+# The posture has no write-deny to carve `claude-memory` back out with (`filesystem` offers
+# `denyRead`, `allowRead`, `allowWrite` and nothing else). Weighed against a dedicated store with
+# its own declared bind, and `~/.jkb` was CHOSEN: both ends are the same person's agents, it is
+# prose rather than code, and the host side is opt-in (`setup.sh --link-memory`), never created by
+# a `git pull`.
+#
+# If you revisit it, start from this measured fact: file tools and Bash are bounded by different
+# mechanisms — the sandbox's `filesystem` block governs Bash, the `permissions` rules govern
+# Read/Edit/Write — so an agent writes memory through the Write tool wherever the store lives.
+# Moving it out of `~/.jkb` would close the Bash channel and would NOT stop agents writing memory.
+#
+# NOTHING HERE OVERWRITES. An existing memory directory is migrated into the store file by file
+# and the directory is then removed; a name that exists on both sides is left alone and reported,
+# because picking a winner silently is how memory gets lost. A symlink already pointing somewhere
+# else is reported and skipped, never retargeted.
+set -uo pipefail
+
+# The slug Claude Code derives from a project's absolute path. INFERRED FROM OBSERVATION, not from
+# documentation: `/Users/jagnew/repos/jkb/.jkb/work/mount-all-of-repos-into-the-dev` is keyed
+# `-Users-jagnew-repos-jkb--jkb-work-mount-all-of-repos-into-the-dev`, which fixes `/` and `.`
+# and says nothing about the rest, so everything outside [A-Za-z0-9-] is mapped the same way.
+# Getting it wrong for some repo name fails in the harmless direction: the link is made at a path
+# Claude Code never reads, so that repo's memory is simply not shared and nothing is lost.
+slugify() { printf '%s' "${1//[!A-Za-z0-9-]/-}"; }
+
+home="$HOME"
+repos=""
+store=""
+dry=0
+self_test=0
+status_repo=""
+status_file=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run)   dry=1 ;;
+        --self-test) self_test=1 ;;
+        --status)     shift; status_repo="${1:-}" ;;
+        # Where to record the state each repo was left in. Read by `verify.sh`, which would
+        # otherwise have to re-derive it AFTER the repair — and the repair clears its own alarm:
+        # removing a live link into a poisoned store turns `exposed` into `unsafe`. The outcome
+        # `link_one` returns says `exposed` for exactly that case, so recording the outcome keeps
+        # the alarm without recording a snapshot taken before the work.
+        --status-file) shift; status_file="${1:-}" ;;
+        --home)      shift; home="${1:-}" ;;
+        --repos)     shift; repos="${1:-}" ;;
+        --store)     shift; store="${1:-}" ;;
+        -h|--help)   sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)           echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# Progress goes to STDERR. `link_one`'s stdout is its state word and nothing else: `run` captures
+# it, and with the notes mixed in the state never equalled `linked`, so every clean run exited 1
+# with its own report eaten — including the "migrated N file(s)" line, the only word a user gets
+# that their memory was moved.
+note() { printf '  %s\n' "$*" >&2; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
+
+
+# Is the store anything other than plain directories and plain files?
+#
+# THE ROOT AND THE PATH DOWN TO IT, not just this repo's directory inside it. The guard used to ask
+# only about `$dest`, and `link_one` runs `mkdir -p "$dest"` FIRST — so a symlink at the store root
+# is followed, `$dest` is then a real directory somewhere else entirely, `[ -L "$dest" ]` is false,
+# `find` sees an empty directory, and the whole store — every repo's memory, on both sides of the
+# boundary — is redirected wherever that link points, including back into `~/.claude`. The comment
+# below names exactly that harm and the check was one path component short of covering it.
+#
+# Walks up to but not including `$home`, so `~/.jkb` itself is covered: it is the bind mount the
+# container shares, and a link there redirects the database as well as the memory.
+#
+# BOUNDED BY `$home`, NOT BY `/`. The walk had no lower bound, so a store outside home — which
+# `--store <dir>` makes reachable by an ordinary flag — carried on up through the system, and on
+# macOS `/var` and `/tmp` are THEMSELVES symlinks. Every such store therefore reported `unsafe`,
+# refusing to link and telling the operator it "holds something other than plain files", which is
+# both false and unactionable. Above home the ancestors are not ours to judge: the store root
+# itself is always checked, and its ancestry only where it is ours.
+store_impure() { # store_impure <home> <store-root> <dest>
+    local h="${1%/}" p="${2%/}" dest="$3"
+    # The store root itself, wherever it lives.
+    [ -L "$p" ] && return 0
+    case "$p" in
+        "$h"/*)
+            p="$(dirname "$p")"
+            while [ -n "$p" ] && [ "$p" != "/" ] && [ "$p" != "$h" ]; do
+                [ -L "$p" ] && return 0
+                p="$(dirname "$p")"
+            done
+            ;;
+    esac
+    [ -L "$dest" ] && return 0
+    [ -n "$(find "$dest" ! -type d ! -type f -print -quit 2>/dev/null)" ] && return 0
+    return 1
+}
+
+# One repo. Kept separate from the loop so the self-test can drive it directly.
+#
+# Prints one word — the STATE it left that repo in — and exits 0 for every state it recognises,
+# because "the linker ran and correctly declined" is not a failure and must not read as one.
+# `verify.sh` consumes that word: it used to infer breakage from the link's absence, which is a
+# state this function produces on purpose, so a normal collision failed container creation.
+#
+#   linked     the memory directory is a symlink into the store
+#   collision  a name exists on both sides; nothing was moved and no link was made
+#   foreign    something else already owns that path; left exactly as it was
+#   unsafe     the store holds something other than plain files, and nothing points at it
+#   exposed    ...and a live link DID point at it, which this removed
+#   broken     the link points at a store directory that no longer exists (repairable)
+#   error      the state could not be established
+link_one() { # link_one <home> <projects-dir> <store-dir> <repo-path>
+    local h="$1" projects="$2" store_dir="$3" path="${4%/}"
+    local key slug link dest
+    key="$(basename "$path")"
+    slug="$(slugify "$path")"
+    link="$projects/$slug/memory"
+    dest="$store_dir/$key"
+
+    # DRY RUN REPORTS THE STATE IT WOULD FIND, and asks the observer to get it — it used to
+    # return here having inspected nothing, so it answered `linked` for every repo including the
+    # ones a real run refuses, and `linked` is the one word meaning "nothing here needs you".
+    if [ "$dry" -eq 1 ]; then
+        local would
+        would="$(state_of "$h" "$projects" "$store_dir" "$path")"
+        case "$would" in
+            unlinked) note "would link $link -> $dest" ;;
+            broken)   note "would recreate $dest, which $link already points at" ;;
+            linked)   note "$key: already linked" ;;
+            *)        note "$key: $would — would not link" ;;
+        esac
+        echo "$would"
+        return 0
+    fi
+
+    # THE STORE MUST HOLD PLAIN FILES. It is written by agents on both sides of a boundary the
+    # rest of this design spends its effort maintaining, and a symlink planted in it by either
+    # side redirects the other's reads and writes wherever it points — including back into
+    # ~/.claude, the one directory nothing here may share. Memory is prose in files; a link, a
+    # socket or a device in there is not memory and is not something to quietly follow.
+    #
+    # ASKED BEFORE `mkdir -p "$dest"`, which is what closes the store-root hole: creating the
+    # directory first is what let a symlinked root be followed and then reported clean.
+    if store_impure "$h" "$store_dir" "$dest"; then
+        # AND BREAK THE LINK IF ONE IS LIVE. Refusing only to *create* one left the steady state
+        # untouched: link a repo normally, plant a symlink in the store afterwards, and the
+        # redirect — including back into ~/.claude, which nothing here may share — stays live on
+        # both sides while this prints a refusal and `verify.sh` reports an ok line. Removing a
+        # symlink destroys no memory (the files are in the store), and the repo simply stops being
+        # shared until a person cleans it, which is the safer side of that trade.
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$dest" ]; then
+            rm -f "$link"
+            warn "$key: $dest holds something that is not a plain file — REMOVED the live link into it"
+            warn "  memory for $key is no longer shared until you clean $dest and re-run"
+            echo exposed
+            return 0
+        fi
+        warn "$key: $dest holds something that is not a plain file — refusing to link until it does"
+        echo unsafe
+        return 0
+    fi
+
+    # Only now, with the root and everything down to it proven to be plain directories, so this
+    # cannot follow a link out of the store.
+    mkdir -p "$dest" || { warn "$key: cannot create $dest"; echo error; return 0; }
+
+    if [ -L "$link" ]; then
+        local current
+        current="$(readlink "$link")"
+        if [ "$current" = "$dest" ]; then
+            note "$key: already linked"
+            echo linked
+            return 0
+        fi
+        warn "$key: $link already points at $current — left alone; remove it by hand to relink"
+        echo foreign
+        return 0
+    fi
+
+    # A real directory here is memory written before the store existed. DECIDED IN FULL BEFORE
+    # ANYTHING MOVES: a scan first, and if any name exists on both sides nothing is moved and no
+    # link is made. Migrating what it could and then refusing the link left that side holding only
+    # the colliding file, with its MEMORY.md index pointing at notes it could no longer read —
+    # which is worse than never having run, the one outcome this must not produce.
+    if [ -d "$link" ]; then
+        local collisions=() entry base moved=0
+        shopt -s dotglob nullglob
+        for entry in "$link"/*; do
+            base="$(basename "$entry")"
+            [ -e "$dest/$base" ] && collisions+=("$base")
+        done
+        if [ "${#collisions[@]}" -gt 0 ]; then
+            shopt -u dotglob nullglob
+            warn "$key: ${collisions[*]} exist(s) on both sides — nothing moved, nothing linked;"
+            warn "  merge by hand, then re-run. Store: $dest  Local: $link"
+            echo collision
+            return 0
+        fi
+        # The store must hold plain files, and THIS is the path that fills it — checking only
+        # what is already there left the one route that can plant a redirecting symlink
+        # unguarded. Checked in the same all-or-nothing pass as the collisions.
+        for entry in "$link"/*; do
+            # THE SAME RECURSIVE QUESTION the store check asks. Inspecting only the top level let
+            # a DIRECTORY containing a symlink migrate in, after which the link was created and
+            # the run reported `linked` — two spellings of "plain files only" disagreeing about
+            # what the store may hold, and the permissive one on the path that fills it.
+            if [ -L "$entry" ] \
+               || { [ ! -f "$entry" ] && [ ! -d "$entry" ]; } \
+               || [ -n "$(find "$entry" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+                shopt -u dotglob nullglob
+                warn "$key: $(basename "$entry") is not a plain file — nothing moved, nothing linked"
+                echo unsafe
+                return 0
+            fi
+        done
+        for entry in "$link"/*; do
+            base="$(basename "$entry")"
+            # `-n`, because the scan above and this move are separated by two more globs and the
+            # store is written from BOTH sides by design — so a name that appeared in between
+            # would be clobbered by a plain `mv`, and "NOTHING HERE OVERWRITES" is the promise
+            # this whole function is built on. `-n` makes the check and the act the same step.
+            if mv -n "$entry" "$dest/$base" 2>/dev/null && [ ! -e "$entry" ]; then
+                moved=$((moved+1))
+            else
+                shopt -u dotglob nullglob
+                warn "$key: could not move $base — stopping with the rest left in place"
+                echo error
+                return 0
+            fi
+        done
+        shopt -u dotglob nullglob
+        if ! rmdir "$link" 2>/dev/null; then
+            warn "$key: $link could not be replaced by a link — left as it is"
+            echo error
+            return 0
+        fi
+        [ "$moved" -eq 0 ] || note "$key: migrated $moved file(s) into the store"
+    elif [ -e "$link" ]; then
+        warn "$key: $link exists and is not a directory — left alone"
+        echo foreign
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$link")" || { warn "$key: cannot create $(dirname "$link")"; echo error; return 0; }
+    ln -s "$dest" "$link" || { warn "$key: could not create the link"; echo error; return 0; }
+    note "$key: linked $link -> $dest"
+    echo linked
+}
+
+# Every repo, and the state each was left in. Returns non-zero when any repo needs a person —
+# a caller that cannot tell a clean run from one that linked nothing has no reason to check.
+run() { # run <home> <repos> <store>
+    local h="$1" r="$2" s="$3" d state rc=0
+    local projects="$h/.claude/projects"
+    if [ ! -d "$r" ]; then
+        warn "no repos directory at $r — nothing to link"
+        return 0
+    fi
+    for d in "$r"/*/; do
+        [ -d "$d" ] || continue
+        # THE STATE THIS RUN PRODUCED, not one observed at a different moment. It used to record
+        # `status_of`'s answer from BEFORE `link_one` — meant to preserve the `exposed` alarm that
+        # the repair itself clears — and that made a successful FIRST-EVER link record `unlinked`,
+        # which `verify.sh` treats as fatal. So every new container failed `postCreate` once, on a
+        # feature working correctly. `link_one` already returns `exposed` when it breaks a live
+        # link, so the pre-state bought nothing the outcome does not already say.
+        state="$(link_one "$h" "$projects" "$s" "$d")"
+        [ -z "$status_file" ] || printf '%s %s\n' "$(basename "${d%/}")" "$state" >> "$status_file"
+        [ "$state" = linked ] || rc=1
+    done
+    return "$rc"
+}
+
+# The state of ONE repo, printed as a single word and nothing else. `verify.sh` asks this rather
+# than inferring breakage from a missing symlink, so the container check and this script state the
+# same rule instead of opposite ones.
+status_of() { # status_of <home> <store> <repo-path>
+    state_of "$1" "$1/.claude/projects" "$2" "$3"
+}
+
+# The observation itself, taking the projects directory rather than deriving it, so `link_one`'s
+# dry run can ask the same question about the same tree. Nothing here mutates.
+state_of() { # state_of <home> <projects> <store> <repo-path>
+    local h="$1" projects="$2" s="$3" path="${4%/}" key slug link dest
+    key="$(basename "$path")"
+    slug="$(slugify "$path")"
+    link="$projects/$slug/memory"
+    dest="$s/$key"
+    # THE STORE FIRST, in the same order `link_one` asks — this used to test the link first, so a
+    # linked repo whose store had been poisoned reported `linked`, and `verify.sh` consults this
+    # one. Two orderings of one rule is two rules; now it is one function, so it is one rule.
+    if store_impure "$h" "$s" "$dest"; then
+        # `exposed` while a link into it is LIVE — an active redirect, which verify.sh fails on —
+        # versus `unsafe`, an impure store nothing points at, which only wants a person.
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$dest" ]; then echo exposed; return 0; fi
+        echo unsafe; return 0
+    fi
+    if [ -L "$link" ]; then
+        if [ "$(readlink "$link")" = "$dest" ]; then
+            # A link pointing at a store directory that is GONE. It used to answer `linked`, so
+            # verify.sh reported memory as shared while Claude Code's next write into it failed
+            # and memory silently stopped being recorded. Repairable — the linker recreates the
+            # directory — so it is its own word and not one of the "wants a person" states.
+            [ -d "$dest" ] || { echo broken; return 0; }
+            echo linked; return 0
+        fi
+        echo foreign; return 0
+    fi
+    if [ -d "$link" ]; then
+        local entry
+        shopt -s dotglob nullglob
+        for entry in "$link"/*; do
+            # THE SAME QUESTION `link_one` ASKS, in the same order. Without it one on-disk state
+            # answered `unsafe` from there (which verify.sh passes) and `unlinked` from here (which
+            # verify.sh fails, failing the container create) — two functions describing one
+            # directory differently, and verify.sh consulting whichever it happened to call.
+            if [ -L "$entry" ] \
+               || { [ ! -f "$entry" ] && [ ! -d "$entry" ]; } \
+               || [ -n "$(find "$entry" ! -type d ! -type f -print -quit 2>/dev/null)" ]; then
+                shopt -u dotglob nullglob
+                echo unsafe; return 0
+            fi
+            if [ -e "$dest/$(basename "$entry")" ]; then
+                shopt -u dotglob nullglob
+                echo collision; return 0
+            fi
+        done
+        shopt -u dotglob nullglob
+        echo unlinked; return 0
+    fi
+    [ -e "$link" ] && { echo foreign; return 0; }
+    echo unlinked
+}
+
+# --- self-test ---------------------------------------------------------------
+# The slug rule is a guess about another program's private encoding and the migration is the only
+# step here that can lose something, so both are exercised against a scratch HOME rather than
+# argued for. Runs in ./scripts/check.sh: no container, no network, no Docker.
+if [ "$self_test" -eq 1 ]; then
+    t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
+    fails=0
+    check() { # check <label> <condition-result>
+        if [ "$2" = yes ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+        else printf '  \033[31mFAIL\033[0m %s\n' "$1"; fails=$((fails+1)); fi
+    }
+    echo "==> link-claude-memory self-test"
+
+    # The one observed slug, pinned. If Claude Code's encoding changes this is where it shows.
+    got="$(slugify /Users/jagnew/repos/jkb/.jkb/work/mount-all-of-repos-into-the-dev)"
+    want="-Users-jagnew-repos-jkb--jkb-work-mount-all-of-repos-into-the-dev"
+    check "the slug rule reproduces the observed key" "$([ "$got" = "$want" ] && echo yes || echo no)"
+    # The CONTAINER key, by value. Asserting merely that two different inputs give two different
+    # outputs cannot fail under a character-wise mapping — it was a test in the shape of a test.
+    # This is the literal `verify.sh` and the README both name, so a change to either shows here.
+    check "the container path keys to -home-vscode-repos-jkb" \
+        "$([ "$(slugify /home/vscode/repos/jkb)" = "-home-vscode-repos-jkb" ] && echo yes || echo no)"
+
+    mkdir -p "$t/repos/jkb" "$t/repos/other"
+    # Pre-existing memory, as an un-migrated host has.
+    old="$t/.claude/projects/$(slugify "$t/repos/jkb")/memory"
+    mkdir -p "$old"; echo hello > "$old/one.md"; echo idx > "$old/MEMORY.md"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+
+    link="$t/.claude/projects/$(slugify "$t/repos/jkb")/memory"
+    check "the repo's memory directory is now a symlink" "$([ -L "$link" ] && echo yes || echo no)"
+    check "it points into the shared store" \
+        "$([ "$(readlink "$link")" = "$t/.jkb/claude-memory/jkb" ] && echo yes || echo no)"
+    check "existing memory was migrated, not dropped" \
+        "$([ -f "$t/.jkb/claude-memory/jkb/one.md" ] && [ -f "$t/.jkb/claude-memory/jkb/MEMORY.md" ] && echo yes || echo no)"
+    check "the content survived the migration" \
+        "$([ "$(cat "$t/.jkb/claude-memory/jkb/one.md" 2>/dev/null)" = hello ] && echo yes || echo no)"
+    check "every repo under the repos dir is linked" \
+        "$([ -L "$t/.claude/projects/$(slugify "$t/repos/other")/memory" ] && echo yes || echo no)"
+    check "--status agrees with what was done" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = linked ] && echo yes || echo no)"
+    # The other half of run()'s contract, and the half that was missing: a clean run must SUCCEED.
+    # `note` used to write to stdout, which `run` captures, so the state never equalled `linked`
+    # and every clean run exited 1 — the "needs attention" assertion below passed unconditionally
+    # and could not have failed.
+    check "a clean run succeeds" \
+        "$(run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1 && echo yes || echo no)"
+
+    # Idempotent: the verb runs on every container create and on every host re-run.
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "re-running changes nothing and keeps the content" \
+        "$([ -L "$link" ] && [ "$(cat "$t/.jkb/claude-memory/jkb/one.md" 2>/dev/null)" = hello ] && echo yes || echo no)"
+
+    # A COLLISION MOVES NOTHING. Migrating what it could and then refusing the link left this
+    # side holding only the colliding file, with its index naming notes it could no longer read.
+    rm "$link"; mkdir -p "$link"
+    echo theirs > "$link/one.md"; echo new > "$link/two.md"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a colliding name is not overwritten in the store" \
+        "$([ "$(cat "$t/.jkb/claude-memory/jkb/one.md" 2>/dev/null)" = hello ] && echo yes || echo no)"
+    check "the colliding copy is left where it is" \
+        "$([ "$(cat "$link/one.md" 2>/dev/null)" = theirs ] && echo yes || echo no)"
+    check "and so is every file beside it — nothing moved at all" \
+        "$([ -f "$link/two.md" ] && [ ! -f "$t/.jkb/claude-memory/jkb/two.md" ] && echo yes || echo no)"
+    check "the state is reported as a collision, not as breakage" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = collision ] && echo yes || echo no)"
+    check "run() reports that a repo needs attention" \
+        "$(run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1 && echo no || echo yes)"
+
+    # A symlink in the store redirects the other side's reads and writes wherever it points.
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"
+    mkdir -p "$t/.jkb/claude-memory/jkb" "$t/elsewhere"
+    ln -s "$t/elsewhere/leak" "$t/.jkb/claude-memory/jkb/one.md"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a store holding a symlink is refused, not linked into" \
+        "$([ ! -L "$link" ] && echo yes || echo no)"
+    check "and says so" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
+
+    # The MIGRATION is the path that fills the store, so it must apply the same purity rule as
+    # the store check — otherwise the one route that can plant a redirecting symlink is unguarded.
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"; mkdir -p "$link" "$t/elsewhere"
+    # The target EXISTS, and both assertions ask about the link rather than through it. With a
+    # dangling target `-e` dereferenced to false and read as "not migrated"; and `-L "$link/one.md"`
+    # resolved through the newly created `$link -> $dest` to the migrated symlink and was true
+    # either way. Both stayed green with the guard deleted — measured — so the one guard on the
+    # route that can plant a redirect into the store was pinned by nothing.
+    : > "$t/elsewhere/leak"
+    ln -s "$t/elsewhere/leak" "$link/one.md"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a symlink is not migrated into the store" \
+        "$([ ! -L "$t/.jkb/claude-memory/jkb/one.md" ] && [ ! -e "$t/.jkb/claude-memory/jkb/one.md" ] && echo yes || echo no)"
+    check "and no link was made over the local copy" \
+        "$([ ! -L "$link" ] && [ -L "$link/one.md" ] && echo yes || echo no)"
+
+    # A poisoned store must not read as healthy just because the link happens to exist —
+    # `verify.sh` consults `status_of`, so the two must ask in the same order.
+    rm -rf "$link" "$t/.jkb/claude-memory/jkb"
+    mkdir -p "$t/.jkb/claude-memory/jkb" "$(dirname "$link")"
+    ln -s "$t/.jkb/claude-memory/jkb" "$link"
+    ln -s "$t/elsewhere/leak" "$t/.jkb/claude-memory/jkb/one.md"
+    check "a linked repo with a poisoned store reports EXPOSED, not linked" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = exposed ] && echo yes || echo no)"
+    # ...and the linker BREAKS that link rather than only declining to make another. Refusing to
+    # create one left the live redirect — including back into ~/.claude — running untouched.
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "and the live redirect is removed, not merely reported" \
+        "$([ ! -e "$link" ] && echo yes || echo no)"
+    check "while the memory in the store is left for a person to clean" \
+        "$([ -L "$t/.jkb/claude-memory/jkb/one.md" ] && echo yes || echo no)"
+    rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"
+
+    # A symlink somebody else made is reported, never retargeted.
+    rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"
+    rm -rf "$link"; ln -s "$t/elsewhere" "$link"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a foreign symlink is left pointing where it pointed" \
+        "$([ "$(readlink "$link")" = "$t/elsewhere" ] && echo yes || echo no)"
+
+    # THE STORE ROOT, not just this repo's directory inside it. The guard asked only about `$dest`
+    # while `mkdir -p "$dest"` ran first, so a symlink one component up was FOLLOWED: `$dest`
+    # became a real directory somewhere else, `[ -L "$dest" ]` was false, and the whole store —
+    # every repo's memory, both sides — was redirected there while this reported `linked`.
+    rm -rf "$t/.jkb" "$link" "$t/decoy"; mkdir -p "$t/decoy"
+    ln -s "$t/decoy" "$t/.jkb/claude-memory" 2>/dev/null || { mkdir -p "$t/.jkb"; ln -s "$t/decoy" "$t/.jkb/claude-memory"; }
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "a symlinked STORE ROOT is refused, not followed" \
+        "$([ ! -e "$link" ] && echo yes || echo no)"
+    check "and nothing was created through it" \
+        "$([ ! -e "$t/decoy/jkb" ] && echo yes || echo no)"
+    check "the observer says so too, since verify.sh consults only that" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = unsafe ] && echo yes || echo no)"
+    rm -rf "$t/.jkb" "$t/decoy"; mkdir -p "$t/.jkb/claude-memory"
+
+    # A STORE OUTSIDE $home IS NOT IMPURE BY VIRTUE OF WHERE IT SITS. `--store <dir>` makes that
+    # reachable with an ordinary flag, and the walk had no lower bound — so it climbed through the
+    # system, where on macOS `/var` and `/tmp` are themselves symlinks. Every such store reported
+    # `unsafe`: a refusal to link, explained as "the store holds something other than plain files",
+    # which is false and leaves the operator nothing to do about it.
+    # $home is "$t/home" here, NOT "$t" — the store has to be genuinely outside it or the walk
+    # stops at $home regardless and the case is not exercised. Written the other way first, and
+    # it passed with the fix reverted: `$t/outside` is under `$t`, so nothing climbed past it.
+    mkdir -p "$t/home" "$t/outside/store/jkb"
+    check "a plain store outside \$home is not called impure" \
+        "$(store_impure "$t/home" "$t/outside/store" "$t/outside/store/jkb" && echo no || echo yes)"
+    # ...and the check that matters is still made: the root itself, wherever it lives.
+    ln -s "$t/decoy" "$t/outside/store-link"
+    check "while a symlinked store root outside \$home still is" \
+        "$(store_impure "$t/home" "$t/outside/store-link" "$t/outside/store-link/jkb" && echo yes || echo no)"
+    rm -rf "$t/outside" "$t/home"
+
+    # A live link whose store directory is GONE. It answered `linked`, so verify.sh reported
+    # memory as shared while every write into it failed — the failure mode with no symptom.
+    rm -rf "$link"; mkdir -p "$(dirname "$link")"
+    ln -s "$t/.jkb/claude-memory/jkb" "$link"
+    check "a link pointing at a store directory that is gone reads as broken" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = broken ] && echo yes || echo no)"
+    run "$t" "$t/repos" "$t/.jkb/claude-memory" >/dev/null 2>&1
+    check "and the linker repairs it" \
+        "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = linked ] && echo yes || echo no)"
+
+    # `--dry-run` used to return before inspecting anything, so it answered `linked` for every
+    # repo — including the ones a real run refuses — and `linked` is the one word that means
+    # "nothing here needs you".
+    rm -rf "$t/.jkb/claude-memory/jkb"; mkdir -p "$t/.jkb/claude-memory/jkb"
+    ln -s "$t/elsewhere" "$t/.jkb/claude-memory/jkb/redirect"
+    dry=1
+    check "a dry run reports the state it would find, not a blanket 'linked'" \
+        "$([ "$(link_one "$t" "$t/.claude/projects" "$t/.jkb/claude-memory" "$t/repos/jkb" 2>/dev/null)" != linked ] && echo yes || echo no)"
+    check "and it changes nothing while saying so" \
+        "$([ -L "$t/.jkb/claude-memory/jkb/redirect" ] && echo yes || echo no)"
+    dry=0
+
+    echo
+    if [ "$fails" -ne 0 ]; then printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; fi
+    printf '\033[32mlink-claude-memory self-test passed\033[0m\n'
+    exit 0
+fi
+
+# --- the verb ----------------------------------------------------------------
+repos="${repos:-$home/repos}"
+store="${store:-$home/.jkb/claude-memory}"
+if [ -n "$status_repo" ]; then
+    status_of "$home" "$store" "$status_repo"
+    exit 0
+fi
+[ -z "$status_file" ] || : > "$status_file"
+echo "==> shared claude memory ($store)"
+run "$home" "$repos" "$store"

@@ -2,7 +2,15 @@
 # Each case breaks ONE property the container is supposed to have. verify.sh must fail, and must
 # fail naming that property — a guard nobody has watched fail is not a guard.
 #
-#   ./.devcontainer/mutate-verify.sh [image]
+#   ./.devcontainer/mutate-verify.sh [image]           every guard, each watched failing
+#   ./.devcontainer/mutate-verify.sh --control [image]  ONE healthy run, for "is this container ok"
+#
+# `--control` exists because assembling that `docker run` by hand goes wrong: it needs the seccomp
+# profile, NET_ADMIN, both binds, and a preamble that raises the firewall, links the state, links
+# the memory store and installs the posture — and a command missing any of those produces a dozen
+# FAILs that read as a broken container. That is the same "a container that cannot run looks
+# exactly like a guard that did not fire" this file already guards its own control against, so the
+# correct invocation is here, defined ONCE, rather than written out in prose somewhere.
 #
 # Needs a Docker host and the image built (`docker build -t jkb-dev .devcontainer`), so it is this
 # change's #[ignore] test and is never part of ./scripts/check.sh — the host-side static checks
@@ -29,7 +37,30 @@ elif ! docker info >/dev/null 2>&1; then
     echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
     exit 0
 fi
+CONTROL_ONLY=0
+if [ "${1:-}" = --control ]; then CONTROL_ONLY=1; shift; fi
 IMAGE="${1:-jkb-dev}"
+
+# THE SUBJECT HAS TO EXIST, and be named on purpose. Same reason the docker checks above exist:
+# without this, an image that is not there produces nine MISSED lines and three BUILD-FAILED
+# blocks before the control finally reports them all unattributable — thirteen alarming lines for
+# a fact about the command. It happened with a stray em dash pasted as the image name, copied out
+# of prose where one followed the command; `docker run … — bash -c …` exits 125 ("could not start
+# the container"), which `judge` reads as a non-zero verify.sh and reports as a guard that did
+# not fire.
+if [ "$#" -gt 1 ]; then
+    echo "=== container guards ==="
+    echo "   usage: $(basename "$0") [--control] [image]" >&2
+    echo "   got $# arguments: $*" >&2
+    echo "   (a command copied with trailing prose attached is the usual cause)" >&2
+    exit 2
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "=== container guards ==="
+    echo "   no image named '$IMAGE'. Nothing was verified — this is NOT a passing result." >&2
+    echo "   Build it first:  docker build -t jkb-dev .devcontainer" >&2
+    exit 2
+fi
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 printf '{}' > "$scratch/home/settings.json"
@@ -45,17 +76,43 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # duplicated between run() and the control's pre-run, which meant the control could certify a
 # configuration the mutations never used — a control that is not about the same thing is not a
 # control.
+# `--declare` is the nested-bind exception, and this harness is the reason it exists. BASE mounts
+# the repo AT /home/vscode/repos/jkb, which devcontainer.json now declares only the parent of —
+# and the parent cannot be mounted instead, because in a `jkb task work` session $REPO's parent is
+# `.jkb/work`, so the checkout would land at /home/vscode/repos/<session>. verify.sh accepts the
+# name only because it is strictly inside a declared target; see its comment for why nesting is
+# not granted automatically. Read from the environment so a mutation can supply a BAD declaration
+# and watch the refusal fire — one SUBJECT, as the comment above requires.
 SUBJECT='
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       . ./.devcontainer/lib.sh && dc_link_state /home/vscode
+      [ -n "${JKB_SKIP_MEMORY_LINK:-}" ] || ./scripts/link-claude-memory.sh >/dev/null 2>&1
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
-      ./.devcontainer/verify.sh'
+      ./.devcontainer/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
 # The baseline every ADDITIVE mutation runs in, and the control with it. The three subtractive
 # mutations below deliberately spell a reduced set instead — that is what they are testing — and
 # being the only sites that do so makes them visibly the odd ones. Before this, HEALTHY was used
 # by the control alone while ten sites wrote the flags by hand, so tightening the baseline at the
 # run sites would have left the control certifying a container the mutations never ran in.
 HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}")
+
+# One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
+# runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
+# containers.
+if [ "$CONTROL_ONLY" -eq 1 ]; then
+    echo "=== one healthy container (the same subject every mutation runs against) ==="
+    docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT"
+    rc=$?
+    echo
+    if [ "$rc" -eq 0 ]; then
+        echo "the container is what it claims to be (verify.sh exit 0)"
+    else
+        echo "verify.sh exited $rc — the FAIL lines above are real, and about THIS container." >&2
+        echo "  Note the knowledge base here is an empty scratch directory, not your ~/.jkb:" >&2
+        echo "  this checks the container, not your data." >&2
+    fi
+    exit "$rc"
+fi
 
 RUN_IMAGE=""
 MUTANT_FAILED=0
@@ -109,6 +166,11 @@ judge() { # judge <label> <expect> <output> <rc>
   # some ERE metacharacters and silently mis-matched "host bind source(s) parsed"; `-e`, because an
   # expect may start with a dash, which grep would otherwise read as an option.
   if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
+    caught=$((caught+1))
+    # The EXPECT, not the count. Coverage is a property of which failure paths in verify.sh were
+    # driven, and several mutations legitimately share one — so counting mutations answers a
+    # different question from the one the summary asks.
+    caught_expects+=("$expect")
     printf '  CAUGHT   %s\n' "$label"
   else
     fails=$((fails+1))
@@ -118,6 +180,8 @@ judge() { # judge <label> <expect> <output> <rc>
 }
 fails=0
 build_failures=0
+caught=0
+caught_expects=()
 echo "=== mutations of the container's own guarantees (each must be CAUGHT) ==="
 run "an undeclared host mount is added" "UNDECLARED mounts" \
     "${HEALTHY[@]}" \
@@ -127,6 +191,16 @@ run "an undeclared host mount is added" "UNDECLARED mounts" \
 run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/host
+# THE ONE SUBTRACTIVE CASE THAT WAS MISSING. `BASE` supplies the `~/.jkb` bind unconditionally
+# and every mutation reuses it, so no run ever reached `kb_mounted=no` — the assertion added
+# because the old `[ -d /home/vscode/.jkb ]` form passed in a container where the bind was ABSENT
+# had itself never been watched failing. It isolates cleanly: a missing declared mount is not an
+# extra one, so the boundary check still passes, and the memory linker reports `linked` against a
+# container-local store that dies with the container. Unlike the paths the coverage note below
+# excuses, this one needs a docker flag and nothing else.
+run "the knowledge base is NOT mounted" "knowledge base is mounted" \
+    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode \
+    -v "$REPO":/home/vscode/repos/jkb -w /home/vscode/repos/jkb
 run "the host's ~/.claude is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/home/vscode/.claude
@@ -142,6 +216,34 @@ run "no NET_ADMIN (firewall cannot come up)" "NON-allowlisted host was permitted
     --security-opt seccomp="$SEC" --user vscode "${BASE[@]}"
 run "runs as root" "runs as a non-root user" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user root "${BASE[@]}"
+
+# The nested-bind exception must not be usable as a general one. A `--declare` naming anything
+# OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the
+# docker.sock-shaped mount two cases above — so the refusal is watched here rather than argued for
+# in a comment. No extra `-v` is needed: what is under test is that verify.sh refuses to ACCEPT
+# the name, which it must do whether or not something is mounted there.
+run "a --declare outside every declared target" "is not inside any host BIND" \
+    -e JKB_VERIFY_DECLARE=/host "${HEALTHY[@]}"
+
+# Auto-memory sharing is a README promise whose entire mechanism is one symlink, which is exactly
+# the shape 3c exists for. Skip the linking step and the assertion must say so — otherwise the
+# container reports healthy while everything an agent learns in here dies with it.
+run "auto-memory is not linked into the shared store" "auto-memory is not linked" \
+    -e JKB_SKIP_MEMORY_LINK=1 "${HEALTHY[@]}"
+
+# THE FIREWALL'S OWN REFUSAL PATH, which nothing else here drives. Every other case exercises the
+# raise succeeding or never starting; this one makes it run and decide it cannot establish an
+# allowlist, which is the only route through `fail_closed` — the deny-all it installs, its IPv6
+# block, and its verdict line had never executed in a container.
+#
+# `--dns 127.0.0.1` rather than an unroutable address: nothing listens on the container's loopback
+# port 53, so every lookup is refused immediately instead of timing out fifteen times over. With no
+# domain resolvable the `resolved -eq 0` arm fires, `fail_closed` denies everything, and the
+# container is then too tight to work in — which is exactly what verify.sh must say. A container
+# that cannot reach its own allowlist is a real state (a laptop offline at container start), and
+# the honest report is "the firewall is too tight", not silence.
+run "the firewall cannot resolve any allowlisted domain" "failed closed and left no allowlist" \
+    --dns 127.0.0.1 "${HEALTHY[@]}"
 
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
@@ -166,11 +268,10 @@ run "blanket passwordless root is restored" "may run more than the firewall as r
 # is matching something that is present when nothing is wrong — which is precisely the defect
 # this file exists to detect in verify.sh, and it had it too.
 echo
-echo "=== self-test: an unmutated container must be reported MISSED ==="
-before="$fails"
-# Run the base container directly first: the control below is satisfied by a MISSED, and a
-# container that never started is ALSO a MISSED. Without this, a host with no docker — or a broken
-# image — reported "a healthy container does not trip the matcher" having observed nothing at all.
+echo "=== self-test: the matcher must stay quiet about a HEALTHY container ==="
+# Run the base container directly first, and require it to be healthy: a container that never
+# started produces output the matcher is also quiet about, so without this the harness reported
+# "shown to discriminate" having observed nothing at all.
 # ONE execution, judged twice: health first, then the matcher over the same captured output.
 control_out="$(docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT" 2>&1)"
 control_rc=$?
@@ -181,14 +282,28 @@ if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_o
     exit 1
 fi
 
-judge "control: nothing mutated (MISSED is correct here)" "runs as a non-root user" \
-      "$control_out" "$control_rc"
-if [ "$fails" -gt "$before" ]; then
-  self_ok=1; fails="$before"      # a MISSED here is the expected result, not a failure
-  echo "  (correct: a healthy container does not trip the matcher)"
-else
+# THE HALF THAT CAN ACTUALLY BE WRONG. Routing the control through `judge` proved nothing: the
+# health check above has already established `control_rc` is 0, and `judge` reports CAUGHT only
+# when rc is non-zero — so the MISSED branch was taken by construction and the `MATCHER IS BROKEN`
+# arm was unreachable. A negative control that cannot fail is exactly the defect this file exists
+# to find in verify.sh.
+#
+# What the matcher really claims is the FAIL filter: `assert()` prints the SAME label on its ok and
+# its fail paths, so matching a label alone once reported two deleted guards as CAUGHT. Ask that
+# directly, against a container known healthy — the label must be present (or the test is matching
+# nothing) and must NOT be on a FAIL line.
+self_ok=1
+control_label="runs as a non-root user"
+if ! grep -qF -e "$control_label" <<<"$control_out"; then
   self_ok=0
-  echo "  MATCHER IS BROKEN: a healthy container was reported CAUGHT"
+  echo "  MATCHER PROVES NOTHING: a healthy container's output never mentions \"$control_label\","
+  echo "  so every CAUGHT above matched a string this harness cannot show discriminates."
+elif grep -F -e "$control_label" <<<"$control_out" | grep -q "FAIL"; then
+  self_ok=0
+  echo "  MATCHER IS BROKEN: that label is on a FAIL line in a HEALTHY container, so a CAUGHT"
+  echo "  above means nothing — the matcher fires when nothing is wrong."
+else
+  echo "  (correct: the label appears in a healthy container and never on a FAIL line)"
 fi
 
 echo
@@ -196,4 +311,70 @@ echo
 [ "$build_failures" -eq 0 ] || printf '\033[33m%d mutation(s) could not be built — nothing was verified for them\033[0m\n' "$build_failures"
 [ "$fails" -eq 0 ] || { printf '\033[31m%d guard(s) did not fire\033[0m\n' "$fails"; exit 1; }
 [ "$build_failures" -eq 0 ] || exit 1
-printf '\033[32mevery guard fired, and the matcher was shown to discriminate\033[0m\n'
+
+# WHAT WAS DRIVEN, NOT "EVERY GUARD". This printed "every guard fired" while driving the mutations
+# listed above and nothing else — so an assertion added to verify.sh tomorrow, with no mutation for
+# it, was covered by that sentence without ever being watched failing. That is the same claim-more-
+# than-was-established shape every guard in this directory exists to stop, in the summary line of
+# the harness that judges them. No silent cap: say the number and say which are uncovered.
+#
+# COUNTED AS PATHS, NOT AS MUTATIONS, because those are two different quantities and the first
+# version printed one as the other: 13 mutations sharing 10 expect strings drive 8 distinct
+# failure paths, and "13 of 21" claimed half again as much coverage as existed. Worse, it was
+# self-erasing — add five mutations of already-covered properties and `caught` reaches the
+# denominator, at which point the whole "the rest are NOT covered" block disappears while a dozen
+# paths have still never been watched failing. `assert` call sites are in the denominator too;
+# they were not, so two paths that ARE driven were not even counted as existing.
+V="$REPO/.devcontainer/verify.sh"
+covered=""
+if [ "${#caught_expects[@]}" -gt 0 ]; then
+    covered="$(for want in "${caught_expects[@]}"; do
+        grep -nF -e "$want" "$V" 2>/dev/null | cut -d: -f1
+    done | sort -un)"
+fi
+all_paths="$(grep -nE '^[[:space:]]*(bad "|assert )' "$V" 2>/dev/null | cut -d: -f1 | sort -un)"
+n_all="$(printf '%s' "$all_paths" | grep -c '^' || true)"
+# NOT `comm`, which requires both inputs in ITS collating order — bytes — while these are line
+# numbers sorted NUMERICALLY. The two orders disagree the moment the file passes 99 lines: `100`
+# sorts after `12` here and before it there. Measured against this very verify.sh, with ten of
+# its twenty-five paths marked covered: every one of the twenty-five came back uncovered and the
+# summary read `0 of 25`. It errs towards claiming LESS than was established, which is the safe
+# direction and is why it survived a round — but a coverage report that always says none is one
+# nobody reads, and it buries the paths that genuinely have never been driven.
+#
+# `grep -vxF -f` asks set membership instead, which needs no ordering from either side. An empty
+# `covered` leaves an empty pattern file, which matches nothing, so `-v` yields every path: the
+# right answer for a run that caught nothing, and the reason this needs no special case.
+uncovered="$(printf '%s\n' "$all_paths" | grep -v '^$' \
+    | grep -vxF -f <(printf '%s\n' "$covered" | grep -v '^$') || true)"
+n_cov=$(( n_all - $(printf '%s' "$uncovered" | grep -c '^' || true) ))
+printf '\033[32m%d mutation(s) caught, and the matcher was shown to discriminate\033[0m\n' "$caught"
+if [ "$n_all" -eq 0 ]; then
+    # NOT the same as full coverage, though it renders identically without this arm: an empty
+    # enumeration makes `uncovered` empty too, so the else branch below certified "all 0 failure
+    # paths were driven" — the claim-more-than-was-established shape this whole block was
+    # rewritten to remove, in the line that reports it. Reachable without any adversary: verify.sh
+    # renamed or moved, `$REPO` pointing somewhere else, or the `bad "`/`assert ` shape refactored.
+    # check-config.sh already refuses its own version of this ten lines from here, and unlike that
+    # one nothing catches a regression here, because this harness needs Docker and is in no gate.
+    printf '\033[31m  could not enumerate any failure paths in %s — this coverage report has\n' "$V"
+    printf '  certified NOTHING. Check the path and the `bad "` / `assert ` shapes it looks for.\033[0m\n'
+    # AND THE VERDICT, not only the rendering. This block is the last statement in the file, so
+    # printing alone left `$?` at 0 and a harness that certified nothing reported success —
+    # `check-config.sh` exits non-zero for its version of this. Deliberately NOT extended to the
+    # partial-coverage arm below: that one is a READING of a working meter, and the file already
+    # says why it is reported and not gated (several paths need a broken machine, not a docker
+    # flag). This arm is a BROKEN meter, which is a different claim and must not pass.
+    exit 1
+elif [ -n "$uncovered" ]; then
+    printf '  %d of %d failure paths in verify.sh were driven here. NOT covered by this run:\n' \
+        "$n_cov" "$n_all"
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        printf '    verify.sh:%s  %s\n' "$n" "$(sed -n "${n}p" "$V" | sed 's/^[[:space:]]*//' | cut -c1-88)"
+    done <<<"$uncovered"
+    printf '  Several need a broken machine (an unreadable mount table, a failed link) rather than a\n'
+    printf '  docker flag, which is why this is reported and not a gate.\n'
+else
+    printf '  all %d failure paths in verify.sh were driven\n' "$n_all"
+fi

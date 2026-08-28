@@ -118,6 +118,63 @@ run "the generator's syscall list stops parsing" "no longer yields"
 seed; jq_dc 'del(.mounts[] | select(test("/home/vscode/.jkb")))'
 run "the knowledge-base mount is dropped" "declared mount set is missing"
 
+seed; sub_dc '"workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}"' \
+             '"workspaceFolder": "/home/vscode/elsewhere/jkb"'
+run "workspaceFolder leaves the workspace mount" "is not inside the workspaceMount target"
+
+# The other half of the same rule. A literal workspaceFolder is only safe because a folder that
+# cannot be placed under the mount is refused before the container is created; drop the refusal
+# and opening a session worktree silently starts the agent in the main checkout instead.
+seed; python3 - "$(DC)" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"initializeCommand"', '"initializeCommandTypo"', 1))
+PYX
+run "the workspace-folder preflight is dropped" "no initializeCommand running check-workspace.sh"
+
+# The harm the rule is really about: a literal path is INSIDE the mount target and still opens
+# whichever checkout sits there. "Inside the target" alone let this through.
+seed; sub_dc '"workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}"' \
+             '"workspaceFolder": "/home/vscode/repos/jkb"'
+run "workspaceFolder becomes a literal path again" "is a literal path, not derived"
+
+# ...and the parse the two checks above stand on. The object form is legal and interchangeable,
+# and a `target=` regex that understood only the string form failed OPEN on it.
+seed; jq_dc '.workspaceMount = {"source": "${localEnv:HOME}/repos", "target": "/home/vscode/repos", "type": "bind"} | .workspaceFolder = "/somewhere/else"'
+run "workspaceMount is written in its object form" "is not inside the workspaceMount target"
+
+# A mutation harness whose expectation no longer matches its subject reports MISSED for ever.
+# mutate-verify.sh needs Docker so this gate cannot run it; the strings are checkable statically.
+seed; python3 - "$work/t/.devcontainer/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"is not inside any host BIND"', '"a string verify.sh never prints"', 1))
+PYX
+run "a mutate-verify expectation goes stale" "expects text verify.sh never prints"
+
+# A refusal in the firewall that exits before installing any rule is not a refusal: iptables rules
+# do not survive a restart, so the container comes up with unfiltered egress and a message.
+seed; python3 - "$work/t/.devcontainer/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace('jq empty "$POSTURE" 2>/dev/null || fail_closed "$POSTURE is not valid JSON',
+              'jq empty "$POSTURE" 2>/dev/null || exit 1 # "$POSTURE is not valid JSON', 1)
+open(p, 'w').write(s)
+PYX
+run "a firewall refusal exits without installing a deny-all" "exits without installing a deny-all"
+
+# The shape the Docker harness cannot reach: a bare command-substitution assignment, which under
+# `set -eE` and the ERR trap takes the whole raise to deny-all the first time any one of the
+# fifteen posture domains fails to resolve.
+seed; python3 - "$work/t/.devcontainer/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace(
+    's/sort -u)" || ips=""', 's/sort -u)"', 1) if False else s.replace(
+    'sort -u)" || ips=""', 'sort -u)"', 1))
+PYX
+run "a firewall command substitution loses its fallback" "aborts the whole raise into fail_closed"
+
 seed; jq_dc '.mounts += ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"]'
 run "the docker socket is mounted in" "docker socket is root on the host"
 
@@ -173,8 +230,8 @@ open(p, 'w').write(s.replace('sudo -n /usr/local/bin/init-firewall.sh',
 PY
 run "a caller passes the workspace posture (shell-quoted)" "passes an argument to init-firewall.sh"
 
-seed; sub_dc '"postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh"' \
-             '"postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json"'
+seed; sub_dc 'init-firewall.sh && (jkb task reap || true)' \
+             'init-firewall.sh /home/vscode/repos/jkb/scripts/auto-mode-posture.json'
 run "a caller passes the workspace posture (bare path)" "passes an argument to init-firewall.sh"
 
 seed; printf '{oops' > "$(DC)"
@@ -209,6 +266,18 @@ open(p, 'w').write(s.replace('dc_mount_sources() { # dc_mount_sources <devcontai
 PYX
 run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 
+# ...and the same fail-open shape one file over. The expectation check reads mutate-verify.sh's
+# `run "<label>" "<expect>"` lines with a sed; change that shape and the sed matches nothing,
+# `stale_expects` is empty, and the check printed `ok (0 checked)` — passing by having found
+# nothing to check, in the assertion whose whole job is finding guards that cannot fire.
+seed; python3 - "$work/t/.devcontainer/mutate-verify.sh" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+# Rename the helper, exactly as an ordinary refactor would.
+open(p, 'w').write(re.sub(r'^run "', 'drive "', s, flags=re.M))
+PYX
+run "mutate-verify's run-line shape changes" "this check just certified nothing"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -221,7 +290,7 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=22
+PINNED_BAD_SITES=30
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

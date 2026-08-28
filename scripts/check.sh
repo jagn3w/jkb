@@ -65,4 +65,14 @@ echo "==> devcontainer config"
 # cannot fail. Needs no Docker either, so it belongs in the gate rather than beside mutate-verify.
 "$(dirname "$0")/../.devcontainer/mutate-config.sh"
 
+# The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
+# path encoding and its migration step is the only thing here that can lose a file, so both are
+# exercised against a scratch HOME. No container, no Docker, no network.
+"$(dirname "$0")/link-claude-memory.sh" --self-test
+
+# ...and the workspace preflight. It is the one guard between the widened container mount and a
+# silent wrong-checkout open, and until now it was certified as wired (check-config.sh reads the
+# JSON) but never as working.
+"$(dirname "$0")/../.devcontainer/check-workspace.sh" --self-test
+
 echo "All checks passed."
