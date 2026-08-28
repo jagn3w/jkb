@@ -1216,6 +1216,40 @@ mod tests {
         );
     }
 
+    /// **Only ordinary work is worth no caveat.** The two readers of this renderer — `jkb task
+    /// land` and the disposal sweep — both say "it has uncommitted changes" and then append what
+    /// this returns, so a `None` here IS the bare sentence. `Unknown` returning `None` would put
+    /// that sentence, unqualified, on a tree nobody established anything about, which is the
+    /// collapse three-valued [`Deletions`] exists to prevent and the one both callers had.
+    #[test]
+    fn only_real_work_is_worth_no_caveat() {
+        use super::Deletions;
+        assert_eq!(
+            Deletions::NotOnly.caveat(),
+            None,
+            "real work needs nothing added to `it has uncommitted changes`"
+        );
+        let only = Deletions::Only(2)
+            .caveat()
+            .expect("a part-way removal is caveated");
+        assert!(
+            only.contains('2') && only.contains("part-way removal"),
+            "it says how many and what they are: {only}"
+        );
+        let unknown = Deletions::Unknown
+            .caveat()
+            .expect("an unanswered probe is caveated — it must not read as work");
+        assert!(
+            unknown.contains("unestablished"),
+            "and it says the question went unanswered rather than describing the dirt: {unknown}"
+        );
+        // The property, rather than the wordings: the three do not share a rendering.
+        assert_ne!(
+            only, unknown,
+            "two different observations, two different sentences"
+        );
+    }
+
     #[test]
     fn repo_key_branch_and_trunk_are_discovered() {
         let tmp = tempfile::tempdir().unwrap();

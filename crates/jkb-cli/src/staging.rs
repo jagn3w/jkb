@@ -664,9 +664,36 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{land_blocker, LandFacts, State};
+    use super::{land_blocker, target_dirty_reason, LandFacts, State};
     use jkb_fsm::Fact;
+    use std::collections::BTreeMap;
     use std::path::Path;
+
+    /// A `git worktree list` that did not answer REFUSES, and says so about the listing.
+    ///
+    /// The arm has no other route into it — it needs git to fail in the repo — so it is asked of
+    /// the helper directly. It is worth pinning because the direction is the whole point of
+    /// taking an `Option` here: both callers used to `unwrap_or_default()`, and an empty list
+    /// makes `land_dir_in` answer `None`, which this function reads as *nothing to be dirty*.
+    /// Silence and cleanliness must not share a spelling in the one precondition a row renders
+    /// and the command enforces.
+    #[test]
+    fn a_worktree_listing_that_did_not_answer_is_not_a_clean_target() {
+        let mut cache = BTreeMap::new();
+        let reason = target_dirty_reason(None, Path::new("/repo"), "batch", &mut cache)
+            .expect("pure, so it cannot fail here")
+            .expect("an unanswered listing is not a clean target");
+        assert!(
+            reason.contains("could not list") && reason.contains("batch"),
+            "refused for the listing, and about the branch asked about: {reason}"
+        );
+        // And the control: a listing that answered, holding no checkout for the branch, is clean.
+        assert_eq!(
+            target_dirty_reason(Some(&[]), Path::new("/repo"), "batch", &mut cache).expect("pure"),
+            None,
+            "an empty ANSWER is a real answer — only the absent one refuses"
+        );
+    }
 
     /// Everything else about the task is landable, so only `dirty` decides.
     fn facts(dirty: Fact) -> LandFacts<'static> {

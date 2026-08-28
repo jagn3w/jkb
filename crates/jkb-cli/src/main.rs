@@ -5915,17 +5915,27 @@ fn land_preflight(
         // (`Deletions::Unknown`) read exactly like ordinary work and the operator was told to
         // commit what may be a part-way removal: the collapse `archive::verdict_pending` had just
         // been corrected for, still in place at the site of the incident that motivated it.
+        // The session is carried THROUGH the probe rather than re-matched after it. Written as
+        // `match (d.caveat(), &sess)` there was an arm for `sess` being `None`, which cannot
+        // happen — the probe only runs inside `sess.as_ref().map(..)` — so it was a branch no
+        // input reaches wearing the costume of a safeguard.
         let hint = match sess
             .as_ref()
             .filter(|_| dirty.is_yes() && reason.contains("uncommitted changes"))
-            .map(|s| gitrepo::deletions_only(&s.worktree, &ctx.root))
+            .map(|s| (s, gitrepo::deletions_only(&s.worktree, &ctx.root)))
         {
-            Some(Ok(d)) => match (d.caveat(), &sess) {
-                (None, _) | (_, None) => String::new(),
+            Some((s, Ok(d))) => match d.caveat() {
+                None => String::new(),
                 // The remedy is the land path's own, which is why `caveat` does not carry one: it
                 // belongs only to the arm where putting the files back is the answer.
-                (Some(c), Some(s)) => {
-                    let capped = format!("{}{}", c[..1].to_uppercase(), &c[1..]);
+                Some(c) => {
+                    // By characters, not by bytes. `c[..1]` panics on any caveat whose first
+                    // character is multi-byte, and the wordings live in `Deletions::caveat` where
+                    // nothing warns a future editor that a caller is slicing them.
+                    let mut ch = c.chars();
+                    let capped = ch.next().map_or_else(String::new, |f| {
+                        f.to_uppercase().collect::<String>() + ch.as_str()
+                    });
                     match d {
                         gitrepo::Deletions::Only(_) => format!(
                             " {capped}. `git -C {} restore .` puts them all back.",

@@ -1848,6 +1848,13 @@ fn drop_marker(marker: &Path, dry_run: bool, report: &mut Report, uid: &str) {
 /// `DropRecord` deletes branches too, and the next acting verdict would have to remember the rule
 /// as well. A rule every call site must remember is the defect (D40/D45).
 ///
+/// **Its domain is the DEFERRED application of a plan**, and that is why two sibling sites
+/// legitimately do not call it: [`dispose`]'s own delete, and `jkb task abandon`'s when nothing
+/// was deferred. There the operator asks and jkb acts in one moment, so there is no window in
+/// which the branch can move between the decision and the act — the premise cannot have stopped
+/// holding, and re-checking it would only add a way to refuse what was just requested. What makes
+/// this function's check necessary is elapsed time, not the verb.
+///
 /// The comparison is positive-only: a `rev` that answers nothing is git failing OR the branch
 /// being gone already, and neither licenses a delete, so anything but a proven match keeps it.
 /// A branch already gone is silently fine — there is nothing to keep and nothing to report.
@@ -1868,8 +1875,9 @@ fn delete_branch_if_any(entry: &Entry, report: &mut Report) {
             entry.uid.clone(),
             format!(
                 "{} was kept: the disposal planned to delete it at {}, and it is now at {} — \
-                 those commits are in no target, so `git branch -D` would be the only copy's \
-                 last reader. Delete it yourself once you have looked.",
+                 whether anything since reached a target is not something this can establish, \
+                 and a forced `git branch -D` on the wrong side of that is the only copy's last \
+                 reader. Delete it yourself once you have looked.",
                 entry.branch,
                 planned
                     .as_deref()
