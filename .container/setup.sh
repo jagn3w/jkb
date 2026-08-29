@@ -81,55 +81,12 @@ jkb --version || true
 # mutate-verify.sh all produce a perfectly good container with no VS Code in it, and extensions
 # are meaningless there. Said out loud rather than passed over silently — verify.sh applies the
 # same condition to its own assertion, so the two cannot disagree about whether this ran.
-say "vs code extensions"
-code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
-if [ -z "$code_server" ]; then
-    echo "  no VS Code server in this container — skipping (nothing to install extensions into)"
-else
-    while read -r ext; do
-        [ -n "$ext" ] || continue
-        split="$(dc_extension_split "$ext")" || {
-            echo "  '$ext' is not version-pinned in container.json — see check-config.sh" >&2
-            exit 1
-        }
-        id="${split%%$'\t'*}"; version="${split##*$'\t'}"
-        vsix="$HOME/.vsix/$id-$version.vsix"
-        # A missing .vsix means the image predates this entry. Rebuild rather than reach for the
-        # network: the download is exactly what cannot work from in here.
-        [ -f "$vsix" ] || {
-            echo "  $id@$version was not staged into this image — rebuild the container" >&2
-            exit 1
-        }
-        # Same --server-data-dir VS Code itself passes, so this installs where the running server
-        # will look rather than into a second default location.
-        "$code_server" --server-data-dir "$HOME/.vscode-server" \
-                       --install-extension "$vsix" --force >/dev/null
-        echo "  installed $id@$version from disk"
-    done <<<"$(dc_extensions "$repo/.container/container.json")"
-
-    # ...and the one this repo BUILDS. The jkb explorer is not on the marketplace, so it is not in
-    # the list above and fetch-extensions.sh cannot stage it — which is why the side panel was
-    # missing from every container until this line existed. Built from the workspace rather than
-    # baked into the image, so it matches the checkout you are actually working in. It needs
-    # registry.npmjs.org (pnpm, and vsce via `pnpm dlx`), which the posture allowlists, so it
-    # works behind the firewall this script raised in its first act.
-    #
-    # scripts/install-extension.sh is the HOST's installer, reused unchanged: one builder and one
-    # installer, or the container ships a different extension from the host for reasons nobody
-    # decided. It resolves code-server itself.
-    #
-    # Fatal, like the `jkb` install above and for the same reason — the binary and the panel are
-    # the two things that make this a jkb container rather than a generic one, and a swallowed
-    # failure is a container that looks ready and is not. verify.sh asserts the result.
-    if [ -f "$repo/ui/vscode/package.json" ]; then
-        say "jkb explorer extension (built from ui/vscode)"
-        # --build-in, because ui/node_modules is in the bind mount and is NOT portable: esbuild's
-        # native binary differs per platform and pnpm links only the current one, so building here
-        # would break the HOST's `./scripts/check.sh`, which runs `pnpm run build` with no install
-        # in front of it. See the flag's comment in that script.
-        "$repo/scripts/install-extension.sh" --build-in "$HOME/.jkb-ui-build"
-    fi
-fi
+# Extensions are installed by their own script, because VS Code puts its server in the container
+# when you ATTACH — which is AFTER this has run, since attaching is something you do to a container
+# that is already up. So on a fresh container this legitimately finds nothing and says so, and the
+# install happens when you run that script from an attached window. Under Dev Containers the order
+# was the reverse and this was never a separate step.
+"$repo/.container/install-extensions.sh"
 
 say "verify the container is what it claims to be"
 "$repo/.container/verify.sh"
