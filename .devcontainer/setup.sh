@@ -101,6 +101,29 @@ else
                        --install-extension "$vsix" --force >/dev/null
         echo "  installed $id@$version from disk"
     done <<<"$(dc_extensions "$repo/.devcontainer/devcontainer.json")"
+
+    # ...and the one this repo BUILDS. The jkb explorer is not on the marketplace, so it is not in
+    # the list above and fetch-extensions.sh cannot stage it — which is why the side panel was
+    # missing from every container until this line existed. Built from the workspace rather than
+    # baked into the image, so it matches the checkout you are actually working in. It needs
+    # registry.npmjs.org (pnpm, and vsce via `pnpm dlx`), which the posture allowlists, so it
+    # works behind the firewall this script raised in its first act.
+    #
+    # scripts/install-extension.sh is the HOST's installer, reused unchanged: one builder and one
+    # installer, or the container ships a different extension from the host for reasons nobody
+    # decided. It resolves code-server itself.
+    #
+    # Fatal, like the `jkb` install above and for the same reason — the binary and the panel are
+    # the two things that make this a jkb container rather than a generic one, and a swallowed
+    # failure is a container that looks ready and is not. verify.sh asserts the result.
+    if [ -f "$repo/ui/vscode/package.json" ]; then
+        say "jkb explorer extension (built from ui/vscode)"
+        # --build-in, because ui/node_modules is in the bind mount and is NOT portable: esbuild's
+        # native binary differs per platform and pnpm links only the current one, so building here
+        # would break the HOST's `./scripts/check.sh`, which runs `pnpm run build` with no install
+        # in front of it. See the flag's comment in that script.
+        "$repo/scripts/install-extension.sh" --build-in "$HOME/.jkb-ui-build"
+    fi
 fi
 
 say "verify the container is what it claims to be"

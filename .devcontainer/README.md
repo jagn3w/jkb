@@ -89,6 +89,48 @@ container with no VS Code in it; the skip is printed, and the judgement itself
 (`missing_extensions`) is a pure function exercised by `verify.sh --self-test`, so its failure arm
 is watched even though no container harness can reach it.
 
+**The pin binds the download, not the installed version.** Measured on a container *restart*: VS
+Code auto-updated `anthropic.claude-code` from the pinned 2.1.250 to 2.1.251 and fetched it
+successfully, apparently through `code-server --use-host-proxy`, which tunnels via the host and so
+does not meet the container's firewall at all. That path is not reliable — the same flag was
+present in the create that failed — so it changes nothing about staging the `.vsix` at build time.
+It does mean the assertion compares **ids, not versions**: an auto-update must not read as a
+missing extension.
+
+## One extension is built, not downloaded
+
+The jkb explorer (`ui/vscode`) is not on the marketplace, so it is not in `devcontainer.json`'s
+list and `fetch-extensions.sh` cannot stage it. Nothing installed it, nothing declared it, and
+therefore nothing could assert it either — so **every container ever built came up without the
+side panel**, silently. Two of this repo's recurring shapes at once: an absence nothing was
+checking, and a rule (`code` vs `code-server`) that the host installer knew and the container did
+not.
+
+`setup.sh` now builds and installs it from the workspace, by calling `scripts/install-extension.sh`
+— the **host's** installer, reused unchanged, so the container cannot ship a different build of the
+extension from the one you install on the host for reasons nobody decided. That script resolves
+`code-server` and its `--server-data-dir` itself when there is no `code` CLI, which is the dev
+container case. It builds from the checkout rather than from a snapshot baked into the image, so
+the panel matches the code you are working in, and it needs only `registry.npmjs.org`, which the
+posture already allowlists.
+
+It builds into `~/.jkb-ui-build`, **not** into the workspace, and that is not tidiness.
+`ui/node_modules` is inside the bind mount, so the container and the host share one copy — and it
+is not portable: esbuild ships a native binary per platform and pnpm links only the current one.
+A build in here would leave linux links there, and the host's `./scripts/check.sh` runs
+`pnpm run build` with **no `pnpm install`** in front of it, so the next host gate would fail with
+an esbuild platform error and nothing pointing at the container. One shared mutable directory,
+two writers with incompatible requirements; the copy removes the sharing rather than adding a rule
+both sides have to remember.
+
+It is **fatal** on failure, like the `jkb` install, and for the same reason: the binary and the
+panel are the two things that make this a jkb container rather than a generic one. `verify.sh`
+appends its id to the declared list and asserts it like any other; `check-config.sh` pins the
+derivation, because a rename dropping `publisher` from `ui/vscode/package.json` would otherwise
+make that assertion silently check one fewer extension — the invisible-again failure. Both steps
+are skipped where the repo builds no extension of its own, since this container is meant to serve
+any repo under `~/repos`.
+
 ## The mount list is the security boundary
 
 Everything absent from `devcontainer.json`'s `mounts` does not exist inside the container. Add to

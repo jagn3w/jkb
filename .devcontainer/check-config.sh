@@ -380,6 +380,20 @@ else
     bad "unpinned VS Code extension(s): ${unpinned[*]} — write publisher.name@version, or the connect-time download the firewall refuses is what installs them"
 fi
 
+# The extension this repo BUILDS is identified by ui/vscode/package.json, and verify.sh asks
+# dc_local_extension for its id in order to assert it is installed. A rename that drops `publisher`
+# or `name` fails nothing on its own: the helper returns nothing, verify.sh silently checks one
+# fewer extension, and the missing side panel becomes invisible again — which is the state this
+# whole path was added to end. Same vacuous-pass shape as the derived lists above, pinned the same
+# way. Skipped where the repo builds no extension, since the container is meant to serve any repo.
+if [ -f "$here/../ui/vscode/package.json" ]; then
+    if local_ext="$(dc_local_extension "$(cd "$here/.." && pwd)")"; then
+        ok "the locally-built extension has a derivable id ($local_ext)"
+    else
+        bad "ui/vscode/package.json no longer yields a publisher.name — verify.sh would silently stop checking that the jkb explorer is installed"
+    fi
+fi
+
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi
 done

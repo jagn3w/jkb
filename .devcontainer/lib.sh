@@ -70,6 +70,21 @@ dc_extension_split() { # dc_extension_split <publisher.name@version>
     esac
 }
 
+# The `publisher.name` of the extension this repo BUILDS ITSELF, or nothing when it has none.
+# It is deliberately NOT in devcontainer.json: that list is what VS Code downloads from the
+# marketplace, and this extension is not published there. Which is exactly why the jkb side panel
+# was absent from every container ever built — nothing installed it, nothing declared it, and so
+# nothing could assert it either. setup.sh builds and installs it; verify.sh asserts the result;
+# both ask HERE, so neither can drift from the package that defines the id.
+dc_local_extension() { # dc_local_extension <repo-root>
+    local pkg="$1/ui/vscode/package.json" publisher name
+    [ -f "$pkg" ] || return 1
+    publisher="$(jq -r '.publisher // empty' "$pkg" 2>/dev/null)"
+    name="$(jq -r '.name // empty' "$pkg" 2>/dev/null)"
+    [ -n "$publisher" ] && [ -n "$name" ] || return 1
+    printf '%s.%s\n' "$publisher" "$name"
+}
+
 # Link Claude Code's state out of ~/.claude into the .claude-state volume, so sessions, memory and
 # the login survive a rebuild without anything of the host's being mounted in.
 #

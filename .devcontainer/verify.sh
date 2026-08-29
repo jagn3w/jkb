@@ -534,9 +534,17 @@ if [ -z "$code_server" ]; then
     echo "  skip no VS Code server in this container — extensions not checked (not a VS Code launch)"
 else
     installed="$("$code_server" --server-data-dir "$HOME/.vscode-server" --list-extensions 2>/dev/null || true)"
-    missing="$(missing_extensions "$(dc_extensions "$here_dc/devcontainer.json")" "$installed")"
+    declared="$(dc_extensions "$here_dc/devcontainer.json")"
+    # ...plus the extension this repo builds itself, which is not in that list and cannot be: it is
+    # not on the marketplace. It was absent from every container ever built precisely because
+    # nothing declared it, so nothing checked it. Appended rather than checked separately so the
+    # one matcher the self-test exercises covers it too.
+    if local_ext="$(dc_local_extension "$(cd "$here_dc/.." && pwd)")"; then
+        declared="$declared"$'\n'"$local_ext"
+    fi
+    missing="$(missing_extensions "$declared" "$installed")"
     if [ -n "$missing" ]; then
-        bad "declared extensions are not installed:$missing (setup.sh installs them from ~/.vsix; rebuild if that is empty)"
+        bad "declared extensions are not installed:$missing (marketplace ones come from ~/.vsix, the jkb explorer from scripts/install-extension.sh; rebuild the container)"
     else
         ok "every declared VS Code extension is installed ($(printf '%s\n' "$installed" | grep -c .) present)"
     fi

@@ -33,6 +33,10 @@ seed() {
     rm -rf "$work/t"; mkdir -p "$work/t/scripts"
     cp -R "$repo/.devcontainer" "$work/t/.devcontainer"
     cp "$repo/scripts/auto-mode-posture.json" "$work/t/scripts/"
+    # check-config.sh derives the locally-built extension's id from here, and skips when the repo
+    # has none — so without this the mutation below could not be watched failing.
+    mkdir -p "$work/t/ui/vscode"
+    cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
 }
 
 DC() { printf '%s' "$work/t/.devcontainer/devcontainer.json"; }
@@ -184,6 +188,10 @@ run "the posture file itself is mounted in" "inside the posture's own directory"
 seed; jq_dc '.mounts += ["source=${localEnv:HOME},target=/home/vscode/elsewhere,type=bind"]'
 run "the whole host HOME is bound under a benign name" "not on the reviewed bind allowlist"
 
+seed; jq 'del(.publisher)' "$work/t/ui/vscode/package.json" > "$work/t/ui/vscode/pkg.new" \
+        && mv "$work/t/ui/vscode/pkg.new" "$work/t/ui/vscode/package.json"
+run "the locally-built extension loses its publisher" "no longer yields a publisher.name"
+
 seed; sub_dc '"CARGO_TARGET_DIR": "/home/vscode/.cargo/target"' '"CARGO_TARGET_DIR": "/home/vscode/.cargo-target"'
 run "CARGO_TARGET_DIR moves outside the allowlisted root" "is under no allowWrite root"
 
@@ -302,7 +310,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.devcontainer/check-config.sh")"
-PINNED_BAD_SITES=32
+PINNED_BAD_SITES=33
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
