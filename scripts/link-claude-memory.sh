@@ -21,7 +21,7 @@
 # bounded. check-config.sh refuses such a mount, verify.sh asserts against it, and
 # mutate-verify.sh watches both fire. It would also collide with `dc_link_state`, which replaces
 # ~/.claude/projects with a symlink into the state volume, and it would need `initializeCommand`
-# to resolve a slug that no devcontainer.json substitution can express.
+# to resolve a slug that no container.json substitution can express.
 #
 # WHAT THIS DOES INSTEAD. `~/.jkb` is ALREADY bind-mounted into the container, already declared and
 # already reviewed, so it costs no boundary change at all: the shared store is

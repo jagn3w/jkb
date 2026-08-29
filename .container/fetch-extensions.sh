@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Fetch the VS Code extensions devcontainer.json declares, as .vsix files, AT IMAGE BUILD TIME.
+# Fetch the VS Code extensions container.json declares, as .vsix files, AT IMAGE BUILD TIME.
 #
-#   .devcontainer/fetch-extensions.sh [dest-dir]
-#   .devcontainer/fetch-extensions.sh --self-test
+#   .container/fetch-extensions.sh [dest-dir]
+#   .container/fetch-extensions.sh --self-test
 #
 # WHY THIS EXISTS. Left to VS Code, extensions are downloaded when you connect — which is after
 # postCreate has raised the egress firewall. Measured on a real "Reopen in Container" run: both
 # declared extensions failed with ECONNREFUSED to *.gallery.vsassets.io, and the container came up
-# with neither installed. It is not a race we can win by reordering, either: postStartCommand
-# re-raises the firewall on every start, so a later install hits the same wall.
+# with neither installed. It is not a race we can win by reordering, either: the firewall is
+# re-raised on every container start, so a later install hits the same wall.
 #
 # A build runs BEFORE any of that. The firewall lives inside the running container, so `docker
 # build` has ordinary egress — which is why fetching here needs no change to the posture's
@@ -18,7 +18,7 @@
 # would need its own concrete host, pinned to CDN addresses that rotate.
 #
 # setup.sh installs what this fetches; verify.sh asserts the result. The list itself is read from
-# devcontainer.json through lib.sh, never restated here.
+# container.json through lib.sh, never restated here.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -78,7 +78,7 @@ if [ "${1:-}" = --self-test ]; then
     check "an UNPINNED entry is refused, never defaulted" \
         "$(dc_extension_split anthropic.claude-code || echo REFUSED)" REFUSED
 
-    # The list really is read out of devcontainer.json, and really is pinned. This is the half
+    # The list really is read out of container.json, and really is pinned. This is the half
     # that would go quiet if the jq path were wrong: an empty list downloads nothing, installs
     # nothing, and every assertion downstream is vacuously satisfied.
     n=0
@@ -86,8 +86,8 @@ if [ "${1:-}" = --self-test ]; then
         [ -n "$ext" ] || continue
         n=$((n+1))
         check "declared entry $ext is pinned" "$(dc_extension_split "$ext" >/dev/null && echo yes || echo no)" yes
-    done <<<"$(dc_extensions "$here/devcontainer.json")"
-    check "devcontainer.json declares at least one extension" "$([ "$n" -gt 0 ] && echo yes || echo no)" yes
+    done <<<"$(dc_extensions "$here/container.json")"
+    check "container.json declares at least one extension" "$([ "$n" -gt 0 ] && echo yes || echo no)" yes
 
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
@@ -111,7 +111,7 @@ while read -r ext; do
     [ -n "$ext" ] || continue
     split="$(dc_extension_split "$ext")" || {
         echo "fetch-extensions.sh: '$ext' is not version-pinned." >&2
-        echo "  Write it as publisher.name@version in devcontainer.json. Unpinned, VS Code" >&2
+        echo "  Write it as publisher.name@version in container.json. Unpinned, VS Code" >&2
         echo "  resolves 'latest' over the network at connect time, which the egress firewall" >&2
         echo "  refuses — and refuses non-fatally, so the container comes up without it." >&2
         exit 1
@@ -134,6 +134,6 @@ while read -r ext; do
         echo "  say nothing, which is the exact failure this script was written for." >&2
         exit 1
     fi
-done <<<"$(dc_extensions "$here/devcontainer.json")"
+done <<<"$(dc_extensions "$here/container.json")"
 
 echo "fetch-extensions.sh: $count extension(s) staged in $dest"

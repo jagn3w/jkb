@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# postCreate for the jkb dev container (design D49). Runs as `vscode`, once per container build.
+# First-run setup for the jkb container (design D49). Runs as `vscode`, once per container, from
+# run.sh — which is what starts the container now that this is not a Dev Containers config. It is
+# also safe to run by hand inside an attached window.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
-# FIRST, before anything else runs or reaches the network. The Dev Containers lifecycle is
-# postCreate -> postStart, so leaving this to postStartCommand alone would run the whole of this
-# script — including a toolchain download — with unrestricted egress. postStart raises it again
-# on every later start, because iptables rules do not survive a container restart.
+# FIRST, before anything else runs or reaches the network — otherwise the whole of this script,
+# including a toolchain download, runs with unrestricted egress. run.sh also raises it before
+# calling this, and again on every later start, because iptables rules live in the container's
+# network namespace and do not survive a restart. Raised here as well rather than relied upon:
+# this script is runnable by hand, and a firewall that is only raised by one caller is a boundary
+# that depends on which caller you used.
 say "egress firewall"
 sudo -n /usr/local/bin/init-firewall.sh
 
@@ -15,11 +19,11 @@ sudo -n /usr/local/bin/init-firewall.sh
 # volume so it survives a rebuild without putting anything on the host. NOTHING under ~/.claude is
 # mounted from the host — not even the credential file — which is why you authenticate inside the
 # container, and therefore why the credential and account-state files must be linked out here too.
-# Without them, devcontainer.json's promise that a login survives a rebuild is false: they would
+# Without them, container.json's promise that a login survives a rebuild is false: they would
 # sit in the container's writable layer and go with it.
 say "claude state"
 # shellcheck source=/dev/null
-. "$repo/.devcontainer/lib.sh"
+. "$repo/.container/lib.sh"
 dc_link_state /home/vscode
 
 # ...and auto-memory, which the volume alone does NOT solve. Claude Code keys memory by the
@@ -55,7 +59,7 @@ say "rust toolchain (pinned by rust-toolchain.toml)"
 # fine and the tooling fails at first use. Slow on first create; the cargo registry volume makes
 # a rebuild cheap. Deliberately fatal rather than `|| true` — a swallowed failure here is a
 # container that looks ready and is not.
-# CARGO_TARGET_DIR is set in devcontainer.json to a volume, off the bind-mounted workspace: a bind
+# CARGO_TARGET_DIR is set in container.json to a volume, off the bind-mounted workspace: a bind
 # mount carries the HOST's uids, so where the host uid is not 1000 the container user cannot
 # create target/ at all. Assert it rather than discover it three minutes into a build.
 [ -w "${CARGO_TARGET_DIR:-/home/vscode/.cargo/target}" ] || {
@@ -72,7 +76,8 @@ jkb --version || true
 # download is refused by the firewall this script raised in its first act. Installing from disk
 # needs no network at all.
 #
-# SKIPPED, not failed, when there is no VS Code server: `devcontainer up`, `docker run` and
+# SKIPPED, not failed, when there is no VS Code server: `run.sh` before anything attaches,
+# a plain `docker run` and
 # mutate-verify.sh all produce a perfectly good container with no VS Code in it, and extensions
 # are meaningless there. Said out loud rather than passed over silently — verify.sh applies the
 # same condition to its own assertion, so the two cannot disagree about whether this ran.
@@ -84,7 +89,7 @@ else
     while read -r ext; do
         [ -n "$ext" ] || continue
         split="$(dc_extension_split "$ext")" || {
-            echo "  '$ext' is not version-pinned in devcontainer.json — see check-config.sh" >&2
+            echo "  '$ext' is not version-pinned in container.json — see check-config.sh" >&2
             exit 1
         }
         id="${split%%$'\t'*}"; version="${split##*$'\t'}"
@@ -100,7 +105,7 @@ else
         "$code_server" --server-data-dir "$HOME/.vscode-server" \
                        --install-extension "$vsix" --force >/dev/null
         echo "  installed $id@$version from disk"
-    done <<<"$(dc_extensions "$repo/.devcontainer/devcontainer.json")"
+    done <<<"$(dc_extensions "$repo/.container/container.json")"
 
     # ...and the one this repo BUILDS. The jkb explorer is not on the marketplace, so it is not in
     # the list above and fetch-extensions.sh cannot stage it — which is why the side panel was
@@ -127,4 +132,4 @@ else
 fi
 
 say "verify the container is what it claims to be"
-"$repo/.devcontainer/verify.sh"
+"$repo/.container/verify.sh"

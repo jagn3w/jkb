@@ -4,7 +4,7 @@
 # that is not mounted does not exist in here, so Claude Code's in-process tools (Read/Glob/Grep/
 # Edit) are bounded by the mount namespace rather than by permission rules, which is the one
 # property the rule model cannot express. Claude Code's OWN sandbox then runs nested inside it,
-# giving per-command confinement and the egress allowlist. .devcontainer/README.md has the
+# giving per-command confinement and the egress allowlist. .container/README.md has the
 # measurements behind each choice.
 #
 # NON-ROOT IS LOAD-BEARING, not hygiene. Measured: a root process inside a container cannot create
@@ -80,9 +80,11 @@ RUN mkdir -p /home/vscode/.cargo/target \
 # no widening of the posture's allowedDomains. setup.sh installs these from disk; verify.sh
 # asserts the result. See fetch-extensions.sh for why the CDN was not allowlisted instead.
 #
-# Deliberately the LAST thing in the file: it copies devcontainer.json, which changes often, and
+# Deliberately the LAST thing in the file: it copies container.json, which changes often, and
 # nothing above it should be rebuilt when it does.
-COPY --chown=vscode:vscode lib.sh devcontainer.json fetch-extensions.sh /home/vscode/.devcontainer-build/
-RUN /home/vscode/.devcontainer-build/fetch-extensions.sh /home/vscode/.vsix
+COPY --chown=vscode:vscode lib.sh container.json fetch-extensions.sh /home/vscode/.container-build/
+RUN /home/vscode/.container-build/fetch-extensions.sh /home/vscode/.vsix
 
-WORKDIR /workspaces
+# Where an attached VS Code terminal lands by default. `/workspaces` was Dev Containers' own
+# convention and nothing puts anything there now.
+WORKDIR /home/vscode/repos

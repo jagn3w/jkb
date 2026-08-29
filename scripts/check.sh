@@ -54,31 +54,32 @@ else
 fi
 
 # The dev container's configuration (design D49). Static only — no Docker — so it belongs in the
-# gate; the parts that need a container are .devcontainer/verify.sh and mutate-verify.sh. It
+# gate; the parts that need a container are .container/verify.sh and mutate-verify.sh. It
 # mainly guards the GENERATED seccomp profile, whose patch silently no-opping against a changed
 # upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
-echo "==> devcontainer config"
-"$(dirname "$0")/../.devcontainer/check-config.sh"
+echo "==> container config"
+"$(dirname "$0")/../.container/check-config.sh"
 
 # ...and every assertion in it, watched failing. check-config.sh had no such harness while
 # verify.sh did, and three review rounds each found the same defect in it — an assertion that
 # cannot fail. Needs no Docker either, so it belongs in the gate rather than beside mutate-verify.
-"$(dirname "$0")/../.devcontainer/mutate-config.sh"
+"$(dirname "$0")/../.container/mutate-config.sh"
 
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are
 # exercised against a scratch HOME. No container, no Docker, no network.
 "$(dirname "$0")/link-claude-memory.sh" --self-test
 
-# ...and the workspace preflight. It is the one guard between the widened container mount and a
-# silent wrong-checkout open, and until now it was certified as wired (check-config.sh reads the
-# JSON) but never as working.
-"$(dirname "$0")/../.devcontainer/check-workspace.sh" --self-test
+# ...and the container's argument derivation. run.sh is the ONLY thing that applies
+# container.json now that VS Code does not read it, so a mistake in the derivation is a container
+# built to a different specification than the one every other check reads. The derivation is pure,
+# so it is exercised here; the parts needing Docker are verify.sh and mutate-verify.sh.
+"$(dirname "$0")/../.container/run.sh" --self-test
 
 # ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
 # a regex, and it is the one part of the mount boundary that widens by a typo instead of by an
 # edit somebody reviews — an over-broad exclusion drops a real mount from the set and the
 # assertion still prints `ok`. mutate-verify.sh covers it and needs Docker; this costs nothing.
-"$(dirname "$0")/../.devcontainer/verify.sh" --self-test
+"$(dirname "$0")/../.container/verify.sh" --self-test
 
 echo "All checks passed."

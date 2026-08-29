@@ -2,7 +2,7 @@
 # Assert the container is what it claims to be (design D49). Run inside the container.
 #
 # A configuration nobody checks is a configuration nobody knows the state of, and every property
-# here is one somebody could remove by editing a single line of devcontainer.json — a mount added,
+# here is one somebody could remove by editing a single line of container.json — a mount added,
 # `remoteUser` dropped, the seccomp profile path typo'd (Docker fails loudly on a missing profile,
 # but not on one that no longer contains what it should). Each assertion below fails for exactly
 # one such edit.
@@ -12,7 +12,7 @@ ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 
-# `--declare <mount-point>`: a mount point the CALLER declares, for the one case devcontainer.json
+# `--declare <mount-point>`: a mount point the CALLER declares, for the one case container.json
 # cannot express — a bind NESTED inside a declared target. `mutate-verify.sh` is that case: it
 # spells its own docker flags, and it must mount the repo at /home/vscode/repos/jkb because in a
 # `jkb task work` session the repo's parent directory is `.jkb/work`, not a repos dir, so mounting
@@ -27,7 +27,7 @@ assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 #
 # So the exception is NAMED rather than inferred, and it is bounded two ways. It only ADDS to the
 # derived set, so it can never switch a check off; and it is refused unless the value is a strict
-# descendant of a target devcontainer.json declares AS A BIND — not a volume, which reaches no
+# descendant of a target container.json declares AS A BIND — not a volume, which reaches no
 # host filesystem and is therefore a region nobody reviewed sources for — so `--declare /host`,
 # `--declare /var/run/docker.sock` and `--declare /home/vscode/.claude/settings.json` — the exact
 # mutations mutate-verify.sh exists to catch — cannot be waved through by it. The count is printed
@@ -46,39 +46,43 @@ while [ $# -gt 0 ]; do
 done
 
 # What every container has regardless of configuration. Anything outside this and EXPECTED is
-# something a human added to devcontainer.json and must be looked at.
+# something a human added to container.json and must be looked at.
 #
 # Anchored at a component boundary — `(/|$)` — not as bare prefixes. `^/dev` also matched
 # `/devtools`, `^/proc` matched `/procdata` and `^/sys` matched `/sysroot`, so a host mount at any
 # of those was silently dropped from the set this check calls exhaustive. A list of exclusions
 # that quietly grows is the shape this assertion exists to avoid having.
 #
-# `/vscode` is the one entry here the CONTAINER RUNTIME does not own: the VS Code Dev Containers
-# extension mounts a named volume there to hold the server, unpacks it, and symlinks
-# ~/.vscode-server/bin at it — all before postCreate runs. It is added by the launcher's own
-# docker flags, so it is expressible neither in devcontainer.json (which would be a false claim:
-# we do not create it, and under `devcontainer up` or a plain docker run it is simply absent) nor
-# as `--declare` (which is refused for anything not nested inside a declared bind). Without it
-# `Reopen in Container` failed postCreate outright on `UNDECLARED mounts: /vscode`, which is why
-# the supported path was the one path nothing had exercised.
+# `/vscode` is the one entry here the CONTAINER RUNTIME does not own: VS Code's remote launcher
+# mounts a named volume there to hold the server, unpacks it, and symlinks ~/.vscode-server/bin at
+# it. It comes from the launcher's own docker flags, so it is expressible neither in
+# container.json (which would be a false claim: we do not create it, and under `run.sh` or a plain
+# docker run it is simply absent) nor as `--declare` (refused for anything not nested inside a
+# declared bind). Without this entry the container failed outright on `UNDECLARED mounts:
+# /vscode`, which is why the supported path was the one path nothing had exercised.
+#
+# It is kept now that the container is started by `run.sh` and ATTACHED to rather than created by
+# Dev Containers, because whether a given VS Code version stages its server through that volume is
+# the launcher's business and not something this file should have an opinion about. An exclusion
+# for a mount that never appears costs nothing; its absence costs a container that cannot start.
 #
 # Anchored `^/vscode$`, deliberately not `(/|$)`: only the mount point itself is the launcher's.
 # A bind at /vscode/anything is somebody putting a host path inside it, and must still fail.
 # The cost, stated rather than hidden: from in here a volume and a bind are indistinguishable, so
 # this one path is a spot where a host bind would pass. Bounded to one path, and it is not the
-# threat this check is for — a careless line in devcontainer.json is, and that is still covered.
+# threat this check is for — a careless line in container.json is, and that is still covered.
 RUNTIME_OWNED='^/$|^/proc(/|$)|^/sys(/|$)|^/dev(/|$)|^/etc/hosts$|^/etc/hostname$|^/etc/resolv\.conf$|^/run/\.containerenv$|^/var/run/secrets(/|$)|^/vscode$'
 
 # Which declared extension ids are absent from a `code-server --list-extensions` listing.
 #
 # Pure, and separated from the call for one reason: in EVERY harness this repo has there is no VS
-# Code server — `devcontainer up`, a plain docker run and mutate-verify.sh all build a correct
+# Code server — `run.sh`, a plain docker run and mutate-verify.sh all build a correct
 # container with no VS Code in it — so the only arm of assertion 7 that can run there is the skip.
 # Left inline, its FAIL arm would be unreachable code wearing the costume of a guard, in a change
 # whose entire subject is a check that could not fire.
 #
 # Case-insensitive: the marketplace treats extension ids that way, and `--list-extensions` prints
-# the publisher's own casing rather than the casing devcontainer.json happens to use.
+# the publisher's own casing rather than the casing container.json happens to use.
 missing_extensions() { # missing_extensions <declared, one per line> <installed, one per line>
     local declared="$1" installed="$2" ext id out=""
     while read -r ext; do
@@ -169,9 +173,9 @@ if [ ! -r /proc/self/mountinfo ]; then
     echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
     echo "  file exists for — could not be checked at all." >&2
     echo >&2
-    echo "  In VS Code:  Reopen in Container, then ./.devcontainer/verify.sh" >&2
-    echo "  With Docker: ./.devcontainer/mutate-verify.sh --control   (one healthy run)" >&2
-    echo "               ./.devcontainer/mutate-verify.sh             (every guard, watched failing)" >&2
+    echo "  In VS Code:  ./.container/run.sh, attach to the container, then run this" >&2
+    echo "  With Docker: ./.container/mutate-verify.sh --control   (one healthy run)" >&2
+    echo "               ./.container/mutate-verify.sh             (every guard, watched failing)" >&2
     echo >&2
     echo "  Do NOT hand-roll the docker run: it needs the seccomp profile, NET_ADMIN, both binds" >&2
     echo "  and a preamble that raises the firewall and installs the posture. A command missing" >&2
@@ -196,22 +200,22 @@ fi
 #    that ought to be absent. A list of absences can never be complete — it is the same
 #    "enumerate the secrets" shape the host posture has to settle for because permission rules
 #    cannot express default-deny. Here the kernel can, so ask it: every host path mounted in shows
-#    up in /proc/self/mountinfo, and the set must be exactly what devcontainer.json declares.
+#    up in /proc/self/mountinfo, and the set must be exactly what container.json declares.
 #    A mount added in a hurry fails this line by name, including one nobody thought to forbid.
 # EVERY mount point the kernel reports, minus the runtime's own fixed set — NOT the ones that
 # happen to live under /home/vscode. Filtering by target prefix made this a list of absences with
 # two entries: mounting /var/run/docker.sock (root on the host) or $HOME at /host passed cleanly.
 #
-# The expected set is DERIVED from devcontainer.json rather than transcribed beside it. A
+# The expected set is DERIVED from container.json rather than transcribed beside it. A
 # hand-kept copy went stale the first time the mounts changed: renaming the cargo target volume
 # deleted the registry line with it, so a correctly-built container failed this very assertion
 # after a full toolchain build. Two lists that must agree is the defect; there is now one list.
 # Deriving does not weaken it — the question this asks is "does the running container match what
 # it declares", and editing the declaration changes nothing until a human rebuilds.
-# Derived through .devcontainer/lib.sh, the SAME function check-config.sh uses on the host, so
+# Derived through .container/lib.sh, the SAME function check-config.sh uses on the host, so
 # the gate that reviews the boundary and the check that enforces it cannot read it differently.
 here_dc="$(cd "$(dirname "$0")" && pwd)"
-DC="$here_dc/devcontainer.json"
+DC="$here_dc/container.json"
 # The checkout being verified: the one this script is in. Every assertion below that used to name
 # /home/vscode/repos/jkb reads this instead — with all of ~/repos mounted, that literal is a
 # statement about whichever repo happens to sit there, which is not necessarily this one.
@@ -233,7 +237,7 @@ else
     actual=""
 fi
 # A failed derivation would make every real mount look undeclared — a true failure, but reported
-# as the wrong thing. Say which it is, so the fix is not looked for in devcontainer.json's mounts.
+# as the wrong thing. Say which it is, so the fix is not looked for in container.json's mounts.
 #
 # The caller's own declarations are folded in HERE, after the derivation and never instead of it,
 # and each is refused unless it is strictly inside something already derived. `$d/*` is a strict
@@ -336,7 +340,7 @@ else
     bad "vscode may run more than the firewall as root: $(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries" | tr -s ' ' | tr '\n' ';')"
 fi
 
-# 3c. The login-state links. devcontainer.json and the README both promise a login survives a
+# 3c. The login-state links. container.json and the README both promise a login survives a
 #     rebuild, and that promise is entirely these two symlinks — without them the credentials sit
 #     in the writable layer and go with it. A promise made in two documents and checked nowhere is
 #     the shape this change keeps finding, so it is checked here.
@@ -525,7 +529,7 @@ fi
 #    Asked of the server, not of a directory listing: `--list-extensions` is what VS Code itself
 #    considers installed, where a directory can be left behind by a failed install.
 #
-#    SKIPPED where there is no VS Code server — `devcontainer up`, a plain docker run and
+#    SKIPPED where there is no VS Code server — `run.sh`, a plain docker run and
 #    mutate-verify.sh all build a correct container with no VS Code in it. The skip is printed
 #    rather than silent, and it is the SAME condition setup.sh installs under, so the two cannot
 #    disagree about whether this ran.
@@ -534,7 +538,7 @@ if [ -z "$code_server" ]; then
     echo "  skip no VS Code server in this container — extensions not checked (not a VS Code launch)"
 else
     installed="$("$code_server" --server-data-dir "$HOME/.vscode-server" --list-extensions 2>/dev/null || true)"
-    declared="$(dc_extensions "$here_dc/devcontainer.json")"
+    declared="$(dc_extensions "$here_dc/container.json")"
     # ...plus the extension this repo builds itself, which is not in that list and cannot be: it is
     # not on the marketplace. It was absent from every container ever built precisely because
     # nothing declared it, so nothing checked it. Appended rather than checked separately so the

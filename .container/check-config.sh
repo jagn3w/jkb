@@ -12,7 +12,7 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 
-echo "==> devcontainer config"
+echo "==> container config"
 command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0; }
 
 # Sourced HERE rather than 80 lines down, so this file has one copy of the comment-stripping rule
@@ -20,26 +20,26 @@ command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0
 # parsing the same input through two copies that can disagree.
 # shellcheck source=/dev/null
 . "$here/lib.sh"
-if dc_strip "$here/devcontainer.json" | jq empty 2>/dev/null; then ok "devcontainer.json parses"
-else bad "devcontainer.json does not parse"; fi
+if dc_strip "$here/container.json" | jq empty 2>/dev/null; then ok "container.json parses"
+else bad "container.json does not parse"; fi
 
-dc="$(dc_strip "$here/devcontainer.json")"
+dc="$(dc_strip "$here/container.json")"
 for want in '"remoteUser": "vscode"' '--cap-add=NET_ADMIN'; do
     if grep -qF -e "$want" <<<"$dc"; then ok "declares $want"
-    else bad "devcontainer.json no longer declares $want"; fi
+    else bad "container.json no longer declares $want"; fi
 done
 
 # The seccomp profile is asserted as a FLAG/VALUE PAIR in runArgs, not as a string present
 # somewhere in the file. Grepping for the value alone passed when the `--security-opt` flag was
 # deleted and the value left orphaned — Docker would then apply its default profile, bubblewrap
 # would fail, and the config still read as declaring a profile. Found by mutate-config.sh.
-if jq -e --arg v "seccomp=\${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json" \
+if jq -e --arg v "seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json" \
       '[.runArgs // [] | to_entries[] | select(.value == "--security-opt") | .key]
        | any(. as $i | ($ARGS.named.v) == ($in_args[$i+1] // ""))' \
       --argjson in_args "$(jq -c '.runArgs // []' <<<"$dc")" <<<"$dc" >/dev/null 2>&1; then
     ok "runArgs pairs --security-opt with the seccomp profile"
 else
-    bad "devcontainer.json does not pair --security-opt with seccomp=\${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json — Docker would apply its default profile and bubblewrap could not start"
+    bad "container.json does not pair --security-opt with seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json — Docker would apply its default profile and bubblewrap could not start"
 fi
 
 # Non-root is load-bearing (root cannot create a mount namespace in a container), so a
@@ -100,7 +100,7 @@ fi
 # mounts changed, dropping the cargo registry and failing a correctly-built container — so what is
 # checked here is that the DERIVATION still yields the mounts the container cannot work without.
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
-mount_targets="$(dc_mount_targets "$here/devcontainer.json")"
+mount_targets="$(dc_mount_targets "$here/container.json")"
 missing_mounts=()
 for m in /home/vscode/repos /home/vscode/.jkb; do
     grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
@@ -111,47 +111,38 @@ else
     bad "the declared mount set is missing ${missing_mounts[*]} — verify.sh derives its boundary from this list"
 fi
 
-# The workspace folder must be INSIDE the workspace mount's target, and the folder that decides it
-# must be refused when it cannot be. These are one rule in two halves and both are needed: a
-# `workspaceFolder` that is a literal path under the target opens whatever repo happens to sit
-# there — for a `jkb task work` session, the main checkout instead of the session — and every
-# runtime guard still passes, because the wrong repo is a perfectly good repo. The `initializeCommand`
-# is what makes the derived form safe, so its absence is a failure of this rule, not a separate one.
-# Parsed through jq, handling BOTH the string and object forms of `workspaceMount` — the spec
-# allows either and they are interchangeable at any time. A `target=` regex understood only the
-# string form, and when it yielded nothing the case below degenerated to "does it start with a
-# slash", which every plausible value passes: a guard that fails open on a purely cosmetic edit.
-ws_target="$(jq -r 'if (.workspaceMount // "") | type == "string"
-                    then ((.workspaceMount // "") | capture("target=(?<t>[^,]+)").t)
-                    else (.workspaceMount.target // "") end' <<<"$dc" 2>/dev/null)"
-ws_folder="$(jq -r '.workspaceFolder // ""' <<<"$dc")"
-ws_ok=1
-if [ -z "$ws_target" ] || [ -z "$ws_folder" ]; then
-    bad "could not read workspaceMount's target and workspaceFolder from devcontainer.json — the checks below cannot mean anything"
-    ws_ok=0
+# EVERY TOP-LEVEL KEY of container.json is applied by something. This replaces the whole
+# workspaceFolder/initializeCommand family of checks, which existed because Dev Containers decided
+# where the container opened and could only express a BASENAME — a limitation that is gone now that
+# you attach to the container and open any path inside it.
+#
+# What replaces it is the risk the rename introduces: this file is no longer read by VS Code, so
+# nothing applies it except our own run.sh. A key added here that run.sh does not read is a
+# declaration that does nothing while looking exactly like configuration — and the key most likely
+# to be added is another `mounts`-shaped one, which is the security boundary. run.sh names what it
+# reads (`--consumed-keys`) rather than this file guessing, so the two cannot disagree.
+declared_keys=(); unread_keys=()
+while IFS= read -r k; do [ -n "$k" ] && declared_keys+=("$k"); done < <(jq -r 'keys[]' <<<"$dc" 2>/dev/null)
+consumed="$("$here/run.sh" --consumed-keys 2>/dev/null)"
+for k in ${declared_keys[@]+"${declared_keys[@]}"}; do
+    grep -qxF -e "$k" <<<"$consumed" || unread_keys+=("$k")
+done
+# PINNED AGAINST AN EMPTY EXTRACTION on BOTH sides, like the derived lists above. Either one
+# yielding nothing makes the loop vacuous: no declared keys means nothing is checked, and no
+# consumed list would instead report every key as unread, which is a different lie.
+if [ ${#declared_keys[@]} -eq 0 ]; then
+    bad "no top-level keys could be read out of container.json — this check just certified nothing"
+elif [ -z "$consumed" ]; then
+    bad "run.sh --consumed-keys printed nothing — this check cannot tell an applied key from an ignored one"
+elif [ ${#unread_keys[@]} -eq 0 ]; then
+    ok "every key in container.json is applied by run.sh (${#declared_keys[@]} checked)"
 else
-case "$ws_folder" in
-    "$ws_target"/?*) ;;
-    *) bad "workspaceFolder ($ws_folder) is not inside the workspaceMount target ($ws_target) — the container would open a directory the mount does not place there"; ws_ok=0 ;;
-esac
-# ...and DERIVED, which is the property that actually matters. Inside the target is not enough:
-# a literal `/home/vscode/repos/jkb` is inside it and is exactly the harm the comment above
-# names — it opens whichever checkout sits there, so a session worktree starts the agent in the
-# main one. The folder has to follow the folder that was opened.
-case "$ws_folder" in
-    *'${localWorkspaceFolderBasename}'*) ;;
-    *) bad "workspaceFolder ($ws_folder) is a literal path, not derived from \${localWorkspaceFolderBasename} — it would open whichever checkout happens to sit there rather than the one you opened"; ws_ok=0 ;;
-esac
+    bad "container.json declares ${unread_keys[*]} which run.sh does not read — nothing applies it; add it to consumed_keys() and to docker_args(), or remove it"
 fi
-if ! grep -qF 'check-workspace.sh' <<<"$(jq -r '.initializeCommand // ""' <<<"$dc")"; then
-    bad "devcontainer.json has no initializeCommand running check-workspace.sh — a folder that is not \$HOME/repos/<name> would open a DIFFERENT checkout than the one you clicked, silently"
-    ws_ok=0
-fi
-[ "$ws_ok" -eq 1 ] && ok "the workspace folder is inside the mount, and a folder that is not is refused before create"
 
 # DERIVING THE EXPECTED SET MADE THE BOUNDARY SELF-CERTIFYING, and this is the other half of it.
 # verify.sh can now only answer "does the running container match what it declares"; adding a
-# mount to devcontainer.json makes it declared, so the runtime check would accept the two mounts
+# mount to container.json makes it declared, so the runtime check would accept the two mounts
 # verify.sh's own comment names as the reason it exists. What must still be answered is "is the
 # declaration acceptable", and that belongs here, in the gate a human reads in a diff.
 forbidden=()
@@ -172,19 +163,19 @@ while IFS= read -r src; do
         '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb') ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
-done <<<"$(dc_mount_sources "$here/devcontainer.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
+done <<<"$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
 # ...and certify the source derivation produced something, the way the target list is certified
 # above. An include-match on `|bind` skipped any other type spelling entirely, and an empty result
 # made "every declared mount is acceptable" pass with the host's ~/.ssh bound in — a guard that
 # fails OPEN. Excluding volumes instead means an unrecognised type is reviewed, not waved through.
-bind_sources="$(dc_mount_sources "$here/devcontainer.json" | sed -n '/|volume$/!s/|[^|]*$//p' | grep -c .)"
+bind_sources="$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p' | grep -c .)"
 if [ "$bind_sources" -lt 2 ]; then
     bad "only $bind_sources host bind source(s) parsed — the workspace and ~/.jkb are both binds, so the review below saw less than the config declares"
 fi
 if [ ${#forbidden[@]} -eq 0 ]; then
     ok "every declared mount is acceptable (no posture directory, no docker socket, binds from the reviewed set)"
 else
-    for f in "${forbidden[@]}"; do bad "devcontainer.json declares a mount that must not exist: $f"; done
+    for f in "${forbidden[@]}"; do bad "container.json declares a mount that must not exist: $f"; done
 fi
 
 # CARGO_TARGET_DIR is named in three files that cannot reference one another (JSON has no
@@ -198,7 +189,7 @@ user="$(jq -r '.remoteUser // "root"' <<<"$dc")"
 home="/home/$user"
 target="$(jq -r '.containerEnv.CARGO_TARGET_DIR // ""' <<<"$dc")"
 if [ -z "$target" ]; then
-    bad "devcontainer.json sets no containerEnv.CARGO_TARGET_DIR — cargo would write into the bind mount"
+    bad "container.json sets no containerEnv.CARGO_TARGET_DIR — cargo would write into the bind mount"
 else
     sites_ok=1
     # Declared AND a volume. Rewriting this to use the derived target list dropped the
@@ -206,7 +197,7 @@ else
     # plain bind satisfies — and a bind is the case that breaks: it carries the host's uids, so
     # where the host uid is not 1000 the build dies with EACCES minutes in.
     grep -qx "$target" <<<"$mount_targets" || { bad "nothing is mounted at CARGO_TARGET_DIR ($target) — a named volume whose path the image lacks is created root-owned"; sites_ok=0; }
-    [ "$(dc_type_for_target "$here/devcontainer.json" "$target")" = volume ] \
+    [ "$(dc_type_for_target "$here/container.json" "$target")" = volume ] \
         || { bad "CARGO_TARGET_DIR ($target) is not declared type=volume — a bind mount carries the host's uids and the build dies with EACCES"; sites_ok=0; }
     grep -qF "mkdir -p $target" "$here/Dockerfile" || { bad "Dockerfile does not pre-create $target — Docker seeds volume ownership from the image, so this is what stops EACCES"; sites_ok=0; }
     [ "$sites_ok" -eq 1 ] && ok "every site names the same CARGO_TARGET_DIR ($target)"
@@ -264,7 +255,7 @@ fi
 # `init-firewall.sh "$repo/scripts/..."` — so reverting setup.sh wholesale to the code this guard
 # exists to prevent still printed `ok`. It caught the JSON spelling and never the shell one.
 callers_ok=1
-for caller in "$here/setup.sh" "$here/devcontainer.json"; do
+for caller in "$here/setup.sh" "$here/run.sh"; do
     # Anything that STARTS a word after the command is an argument — including a quote, which is
     # how the old setup.sh spelled it. Only a redirect, pipe, separator or end of line is not.
     if grep -nE 'init-firewall\.sh[[:space:]]+[^;|&>#[:space:]]' "$caller" >/dev/null; then
@@ -371,9 +362,9 @@ while read -r ext; do
     [ -n "$ext" ] || continue
     ext_count=$((ext_count+1))
     dc_extension_split "$ext" >/dev/null || unpinned+=("$ext")
-done <<<"$(dc_extensions "$here/devcontainer.json")"
+done <<<"$(dc_extensions "$here/container.json")"
 if [ "$ext_count" -eq 0 ]; then
-    bad "no extensions could be read out of devcontainer.json — this check just certified nothing; has customizations.vscode.extensions moved?"
+    bad "no extensions could be read out of container.json — this check just certified nothing; has customizations.vscode.extensions moved?"
 elif [ ${#unpinned[@]} -eq 0 ]; then
     ok "every declared VS Code extension is version-pinned ($ext_count checked)"
 else
@@ -400,4 +391,4 @@ done
 
 echo
 if [ "$fail" -ne 0 ]; then printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"; exit 1; fi
-printf '\033[32mall %d devcontainer config checks passed\033[0m\n' "$pass"
+printf '\033[32mall %d container config checks passed\033[0m\n' "$pass"

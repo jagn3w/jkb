@@ -1260,7 +1260,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   `~/.docker/bin/docker` fails with `Operation not permitted` — the directory is under
   `denyRead: ["~"]` and in no `allowRead` entry. An unattended agent that can reach Docker can
   mount `/` into a container and is root on the host, so this is the boundary doing its job; the
-  cost is that `.devcontainer/verify.sh` and `mutate-verify.sh` become **human-run** steps, which
+  cost is that `.container/verify.sh` and `mutate-verify.sh` become **human-run** steps, which
   is now stated where they are documented rather than discovered when they stop working.
 - **Installing it for real found two things no amount of checking could.** `install` ran clean
   (preflight green, 45 pre-existing allow rules and the theme preserved, `/tmp`, `$TMPDIR` and
@@ -1459,7 +1459,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     `verify.sh`'s hand-written mount list where two were intended, dropping `.cargo/registry` — so
     a correctly-built container failed its own verifier, after the full toolchain build, because
     `setup.sh` ends by running it. Two lists that must agree **is** the defect: the list is now
-    **derived** from `devcontainer.json` (both the string and object mount spellings), so there is
+    **derived** from `container.json` (both the string and object mount spellings), so there is
     one. A `CARGO_TARGET_DIR` guard added an hour earlier pinned a single string in that very file
     and could not see the list beside it — a guard aimed at the instance, not the class.
   - **The third round found the same class again, so the fix stopped being a fix and became a
@@ -1468,7 +1468,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     could not cross a shell quote and so never caught the exact code it existed to prevent, and a
     rewrite that dropped the `type=volume` half of its own check while keeping the failure message
     about volumes. Hand-mutating after each round works until nobody does it.
-    `.devcontainer/mutate-config.sh` breaks each config property in turn (18 of them) and requires
+    `.container/mutate-config.sh` breaks each config property in turn (18 of them) and requires
     a FAIL naming it, with the same negative control — and it needs no Docker, so unlike
     `mutate-verify.sh` it runs in `check.sh` and CI. **It found a live one on its first run**: the
     seccomp assertion grepped for the `seccomp=…` value anywhere in the file, so deleting the
@@ -1499,7 +1499,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   - **Removing a mount left the plumbing shaped around it.** `setup.sh`'s symlink loop linked only
     the *directories* under `~/.claude`, because the credential file was the one thing bind-mounted
     and the loop had to go around it. With the mount gone, nothing linked it — so an in-container
-    login sat in the writable layer and died with the next rebuild, while `devcontainer.json`
+    login sat in the writable layer and died with the next rebuild, while `container.json`
     promised the opposite. `.credentials.json` and `~/.claude.json` are now linked into the volume
     too, dangling until first write. The residual is stated rather than designed away: a writer
     that replaces a file by temp-and-rename would drop the link, which costs one re-login at the
@@ -1517,7 +1517,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
 
 ## Both layers: the dev container with the sandbox nested inside (D49)
 
-`.devcontainer/` is the "both" configuration of D48 — a container **and** Claude Code's own
+`.container/` is the "both" configuration of D48 — a container **and** Claude Code's own
 sandbox running inside it. `scripts/auto-mode.sh` alone is host-only; this adds the one property
 the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7, D49).
 
@@ -1578,7 +1578,7 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
   directly.
 - **The mount list is the security boundary, and it is asserted exhaustively.** `verify.sh` reads
   `/proc/self/mountinfo` and fails if the mounted set is anything other than what
-  `devcontainer.json` declares — rather than listing paths that ought to be absent, which is the
+  `container.json` declares — rather than listing paths that ought to be absent, which is the
   "enumerate the secrets" shape the host posture is *forced* into and the container is not. Only
   `~/.claude/.credentials.json` is mounted, never `~/.claude`: that directory holds the posture,
   and a process the posture bounds must not read or write the file deciding whether it is bounded.
@@ -1604,7 +1604,7 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
 - **Where VS Code runs does not matter; where the `claude` process runs does.** Under Dev
   Containers the UI is on the host and the server, extension host and terminals are in the
   container. The Claude Code extension declares no `extensionKind` and has a Node `main`, so VS
-  Code runs it as a **workspace** extension — in the container — and `devcontainer.json` lists it
+  Code runs it as a **workspace** extension — in the container — and `container.json` lists it
   so the linux build is installed inside (a host copy is platform-specific and separate).
 - **Open the repo root, not a session worktree.** `jkb task work` puts worktrees at
   `<repo>/.jkb/work/<session>` and a linked worktree's `.git` is a *file* pointing into
@@ -1617,7 +1617,7 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
 
 ## The dev container mounts ~/repos, and a session worktree is archived (D49)
 
-The container follow-up bucket. Design in `.devcontainer/README.md`; the container harnesses are
+The container follow-up bucket. Design in `.container/README.md`; the container harnesses are
 `check-config.sh` + `mutate-config.sh` (static, in the gate) and `verify.sh` + `mutate-verify.sh`
 (need Docker).
 
@@ -1648,7 +1648,7 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   `-home-vscode-repos-jkb`) and widening the workspace mount does not change that. Binding the
   host's memory dir is the one mount forbidden everywhere in this design (`~/.claude` holds
   `settings.json`, which IS the posture), it collides with `dc_link_state`'s symlink, and the slug
-  is inexpressible in `devcontainer.json`. So `scripts/link-claude-memory.sh` symlinks each side's
+  is inexpressible in `container.json`. So `scripts/link-claude-memory.sh` symlinks each side's
   `memory` dir at `~/.jkb/claude-memory/<repo>/` — inside the bind that already exists. It migrates
   file by file and **never overwrites**: a name on both sides is left alone and reported. Opt-in on
   the host (`setup.sh --link-memory`), because `post-merge` re-runs `setup.sh` and a `git pull`
@@ -1726,7 +1726,7 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
 - **A remedy the machine does not accept is worse than no remedy.** `check-workspace.sh` advised
   setting `JKB_REPOS_DIR`, read by nothing else in the tree: following the advice switched the
   preflight off without moving the mount, producing the exact silent wrong-checkout open the file
-  exists to prevent. One statement of where repos live, and it is `devcontainer.json`'s.
+  exists to prevent. One statement of where repos live, and it is `container.json`'s.
 - **The sweep may only delete inside the tree it owns.** The worst defect on this branch, and it
   survived two reviews: the retention arm passed whatever absolute path a record's `archive` field
   named to `remove_dir_all`. The record store lives in `~/.jkb`, which is bind-mounted into the
@@ -1891,6 +1891,61 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
   not by parsing `status --porcelain` — whose leading status column is exactly what the trimming
   capture helper eats.
+
+## The container is started by a script and attached to, not opened by Dev Containers (D49)
+
+Everything above about mounts, seccomp, the firewall and the harnesses is unchanged. What changed
+is who starts the container, and it removes a limitation rather than working around one.
+
+- **Dev Containers could not open a folder nested inside the mount.** `workspaceFolder` can only be
+  built from `${localWorkspaceFolderBasename}` — there is no variable for a path *relative* to the
+  mount, and `initializeCommand` cannot supply one (a subprocess cannot set its parent's
+  environment, and substitution has already happened). So `~/repos/jkb/.jkb/work/sess` resolved to
+  `/home/vscode/repos/sess`, which does not exist, and the near-miss was worse than the miss: a
+  literal fallback opened a **different checkout** silently, with every guard passing, because the
+  wrong repo is a perfectly good repo. **This is what supersedes the `workspaceFolder`/
+  `initializeCommand`/`check-workspace.sh` bullets in the section above.**
+- **The cost was concrete: a change to the container could only be tested after landing it.** A
+  session worktree carries its own `.container/`, so opening one is exactly how you would exercise
+  an edit — and that was the one thing Dev Containers could not do. Two rebuilds in a row tested
+  `main` instead, and read as the container being broken.
+- **Attaching has no `workspaceFolder`.** `.container/run.sh` starts one long-lived container from
+  `container.json`; you attach ("Dev Containers: Attach to Running Container") and open any path
+  inside, at any depth, with `code <path>` from an attached terminal opening more windows on the
+  same container. So the limitation and the guard that policed it both stop existing — and **one**
+  container serves every repo under `~/repos` rather than one per opened folder, which is what the
+  widened mount was for in the first place.
+- **Three alternatives were worked out and rejected, each on a fact rather than a preference.** A
+  relative symlink `~/repos/<name>` → the worktree gives `find_workspace_posture` a second
+  directory carrying `scripts/auto-mode-posture.json`, and it `fail_closed`s on first raise — that
+  refusal is deliberate and must not learn an exception. A nested bind at
+  `/home/vscode/repos/<basename>` has the same effect for the same reason. A **constant** workspace
+  path (`workspaceMount` from `${localWorkspaceFolder}` to a fixed target) handles any depth and
+  breaks session identity instead: claims are `session:<pid>:<worktree>` and liveness is *does that
+  worktree exist*, so every container would record one shared path and no claim would ever be
+  reclaimable.
+- **The file is `container.json` and the folder is `.container/`, and the names are the point.**
+  VS Code detects `devcontainer.json` and offers *Reopen in Container*, which would be a second way
+  to get a container — one built by Dev Containers, one by `run.sh` — and two launch paths that
+  start identical drift, in the mount list, which is the security boundary. Detection is
+  file-based as far as is known, so renaming the folder is belt-and-braces; it is done anyway
+  because the name asserted something no longer true, which is the same argument that renamed the
+  file.
+- **What replaces the deleted guard is a smaller, checkable claim.** `run.sh` is now the only thing
+  that applies `container.json`, so a key nobody reads is possible and looks exactly like
+  configuration — and the key most likely to be added is another `mounts`-shaped one.
+  `run.sh --consumed-keys` names what it reads and `check-config.sh` fails on any declared key not
+  in that list, so adding one forces the decision at the moment it is added rather than at the
+  moment somebody notices it never applied. `run.sh --self-test` is in `./scripts/check.sh`.
+- **An unset `${localEnv:VAR}` is REFUSED, where Dev Containers substitutes the empty string.**
+  That default is how `source=${localEnv:HOME}/repos` quietly becomes `source=/repos` — a different
+  host directory, mounted, with nothing to notice. A boundary must not be able to move because a
+  variable was not set.
+- **The lifecycle rule survives its mechanism.** The firewall is raised **first**, on every start,
+  because iptables rules live in the container's network namespace and do not survive a restart and
+  because the rest of setup includes a toolchain download. It used to be spelled as
+  postCreate-before-postStart; it is now two lines in `run.sh`, and `setup.sh` raises it too rather
+  than trusting one caller — a boundary that depends on which caller you used is not one.
 
 ## Code review (D37) — our own reviewer, because the host's is not composable
 

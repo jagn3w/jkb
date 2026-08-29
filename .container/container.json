@@ -1,17 +1,45 @@
 {
+  // THE DECLARATION. Not a Dev Containers config, and deliberately not named `devcontainer.json`:
+  // VS Code detects that filename and offers "Reopen in Container", which would be a SECOND way to
+  // get a container — built by Dev Containers from this file, beside the one `run.sh` builds from
+  // it — and two launch paths that start identical drift, in the mount list, which is the security
+  // boundary here. One name, one reader, no drift.
+  //
+  // WHY NOT DEV CONTAINERS. Its `workspaceFolder` can only be built from
+  // `${localWorkspaceFolderBasename}`; there is no variable for a folder's path RELATIVE to the
+  // mount. So a folder nested inside the mount — a `jkb task work` session at
+  // `<repo>/.jkb/work/<session>` — resolved to `/home/vscode/repos/<session>`, which does not
+  // exist, and the near-miss was worse than the miss: opening one silently started the agent in a
+  // DIFFERENT checkout, with every guard passing, because the wrong repo is a perfectly good repo.
+  // A whole host-side preflight (`check-workspace.sh`) existed to refuse that case.
+  //
+  // `run.sh` starts one long-lived container from this file and you ATTACH VS Code to it
+  // ("Dev Containers: Attach to Running Container", or `.container/run.sh --open <path>`).
+  // Attaching has no `workspaceFolder`: you open any path inside the container, at any depth, and
+  // `code <path>` from a terminal in there opens further windows on the same container. So the
+  // limitation, and the guard that policed it, both stop existing — and one container serves every
+  // repo under ~/repos instead of one per opened folder.
+  //
+  // EVERY TOP-LEVEL KEY HERE MUST BE CONSUMED BY run.sh. `run.sh --consumed-keys` prints what it
+  // reads and check-config.sh fails on a key that is in neither that list nor its ignored set, so
+  // a key added here cannot be silently dropped by the one thing that applies it.
   "name": "jkb (sandboxed Claude)",
   "build": { "dockerfile": "Dockerfile" },
 
   // Non-root is load-bearing, not hygiene: measured, root in a container cannot create a
   // mount/net/pid namespace directly even with seccomp off, so bubblewrap — and therefore Claude
-  // Code's nested sandbox — works only as a normal user.
+  // Code's nested sandbox — works only as a normal user. `run.sh` passes this as `--user`, and
+  // attaching inherits the container's user, so the VS Code server and its terminals get it too.
   "remoteUser": "vscode",
 
   "runArgs": [
     // Docker's default profile plus the 14 namespace/mount syscalls bubblewrap needs. NOT
     // `seccomp=unconfined` and NOT `--privileged`: both were measured unnecessary, and each
     // discards far more than it buys. See generate-seccomp.sh.
-    "--security-opt", "seccomp=${localWorkspaceFolder}/.devcontainer/seccomp-bwrap.json",
+    //
+    // `${localWorkspaceFolder}` keeps its Dev Containers spelling on purpose — run.sh substitutes
+    // it with the checkout that provides this container, which is what it always meant here.
+    "--security-opt", "seccomp=${localWorkspaceFolder}/.container/seccomp-bwrap.json",
 
     // For init-firewall.sh. Scoped to this container's own network namespace, so it cannot touch
     // host networking.
@@ -28,25 +56,17 @@
   //
   // The paths are chosen so the SAME scripts/auto-mode-posture.json works here and on the host:
   // it is written `~`-relative, and ~/repos and ~/.jkb land where it expects them.
-  //
-  // ALL of ~/repos, not just this repo. That is a widening, and the argument for it is
-  // consistency rather than convenience: the posture already grants ~/repos in both `allowRead`
-  // and `allowWrite`, so a container holding only jkb was TIGHTER than the boundary the same
-  // agent runs under on the host — a difference nothing had decided, and one that made a
-  // cross-repo task simply impossible in here rather than deliberately refused. Everything the
-  // posture does NOT grant is still absent by the kernel: ~/.ssh, ~/Documents, ~/.aws, the rest
-  // of $HOME.
-  //
-  // `workspaceFolder` FOLLOWS the folder you opened, and `initializeCommand` refuses one this
-  // mount cannot represent. A literal `/home/vscode/repos/jkb` here would be a different thing
-  // from the mount's target for every folder except one: opening a `jkb task work` session (which
-  // lives at `<repo>/.jkb/work/<session>`, inside the mount but not at `~/repos/<name>`) would
-  // start the agent in the MAIN checkout instead, silently, with every guard still passing —
-  // keeping those two apart being the entire point of a session. See check-workspace.sh.
-  "initializeCommand": "bash .devcontainer/check-workspace.sh \"${localWorkspaceFolder}\"",
-  "workspaceMount": "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
-  "workspaceFolder": "/home/vscode/repos/${localWorkspaceFolderBasename}",
   "mounts": [
+    // ALL of ~/repos, not just this repo. That is a widening, and the argument for it is
+    // consistency rather than convenience: the posture already grants ~/repos in both `allowRead`
+    // and `allowWrite`, so a container holding only jkb was TIGHTER than the boundary the same
+    // agent runs under on the host — a difference nothing had decided, and one that made a
+    // cross-repo task simply impossible in here rather than deliberately refused. Everything the
+    // posture does NOT grant is still absent by the kernel: ~/.ssh, ~/Documents, ~/.aws, the rest
+    // of $HOME. It is also what makes one container enough for every repo: you attach once and
+    // open whichever checkout you want, including a `jkb task work` session inside one.
+    "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
+
     // The knowledge base. Shared with the host deliberately — it is the point of jkb — and every
     // write to it goes through the audited writer-actor, so damage here is undoable.
     "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
@@ -80,33 +100,20 @@
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target"
   },
 
-  // Order matters, and the lifecycle is postCreate BEFORE postStart — so the firewall cannot be
-  // left to postStart alone or the whole of postCreate runs with unrestricted egress. setup.sh
-  // raises it as its first act; postStart raises it again because iptables rules live in the
-  // container's network namespace and do not survive a restart.
-  "postCreateCommand": "bash .devcontainer/setup.sh",
-  //
-  // ...and the worktree reaper, because THE CONTAINER IS WHERE DEFERRAL IS NORMAL: a session
-  // cannot archive its own checkout, so every `jkb task land` in here records one for later — and
-  // the host's `com.jkb.reap` cannot finish it, since the record names `/home/vscode/...` paths
-  // the host cannot see (it holds them and says so). No init system in here to run a service, so
-  // every container start sweeps once. Best-effort by design: a reaper that could not run must
-  // never stop the firewall from being raised.
-  "postStartCommand": "sudo -n /usr/local/bin/init-firewall.sh && (jkb task reap || true)",
-
   // EVERY ENTRY IS VERSION-PINNED, and that is a requirement rather than a preference —
   // check-config.sh fails the gate on an unpinned one.
   //
   // These are fetched as .vsix files at BUILD time (fetch-extensions.sh, run from the Dockerfile,
   // where egress is unrestricted because the firewall only exists inside the running container)
-  // and installed from disk by setup.sh. Left to VS Code they are downloaded at CONNECT time,
-  // which is after setup.sh has raised the egress firewall: measured, both of these failed with
-  // ECONNREFUSED to *.gallery.vsassets.io and the container came up with NEITHER installed, as a
-  // non-fatal log line nothing gated on. Widening `allowedDomains` to Microsoft's CDN instead
-  // would mean a new entry per extension PUBLISHER, pinned to IPs that rotate.
+  // and installed from disk by setup.sh. Attaching does not apply this list at all — VS Code only
+  // reads `customizations` from a Dev Containers config — which costs nothing, because relying on
+  // VS Code to install them is exactly what did not work: measured, both failed with ECONNREFUSED
+  // to *.gallery.vsassets.io against the egress firewall and the container came up with NEITHER
+  // installed, as a non-fatal log line nothing gated on.
   //
-  // The pin is what makes the local .vsix match what VS Code asks for. Unpinned, it resolves
-  // "latest" over the network and we are back to the download that cannot succeed.
+  // The pin is what makes the local .vsix match what setup.sh installs. It does NOT bind the
+  // version that ends up installed: VS Code auto-updates an extension in the background, measured
+  // on a restart here (2.1.250 -> 2.1.251), which is why verify.sh compares ids and not versions.
   "customizations": {
     "vscode": {
       "extensions": ["rust-lang.rust-analyzer@0.3.3025", "anthropic.claude-code@2.1.250"]

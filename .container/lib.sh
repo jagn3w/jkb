@@ -7,17 +7,17 @@
 #
 # Sourced, never executed: no `set -e` here, so a caller's own shell options are left alone.
 
-# devcontainer.json permits // comments; strip them the way the spec's parsers do.
+# container.json permits // comments; strip them the way the spec's parsers do.
 dc_strip() { sed 's://.*$::' "$1"; }
 
 # Every mount point the container declares, one per line, sorted.
 #
 # The devcontainer spec allows a mount as either a comma-separated string or an object, and the
 # two are interchangeable at any time, so both are read — handling only strings would turn a
-# purely cosmetic edit of devcontainer.json into a container that cannot verify itself.
-dc_mount_targets() { # dc_mount_targets <devcontainer.json>
+# purely cosmetic edit of container.json into a container that cannot verify itself.
+dc_mount_targets() { # dc_mount_targets <container.json>
     dc_strip "$1" 2>/dev/null \
-      | jq -r '[(.workspaceMount // empty)] + (.mounts // [])
+      | jq -r '(.mounts // [])
                | .[]
                | if type == "string" then capture("target=(?<t>[^,]+)").t else .target end' \
         2>/dev/null | sort -u
@@ -25,9 +25,9 @@ dc_mount_targets() { # dc_mount_targets <devcontainer.json>
 
 # `<source>|<type>` for every declared mount, so a caller can tell a host bind (which reaches the
 # host filesystem and must be reviewed) from a named volume (which cannot).
-dc_mount_sources() { # dc_mount_sources <devcontainer.json>
+dc_mount_sources() { # dc_mount_sources <container.json>
     dc_strip "$1" 2>/dev/null \
-      | jq -r '[(.workspaceMount // empty)] + (.mounts // [])
+      | jq -r '(.mounts // [])
                | .[]
                | if type == "string"
                  then (capture("source=(?<s>[^,]+)").s + "|" + ((capture("type=(?<t>[^,]+)") // {t:"bind"}).t))
@@ -35,10 +35,25 @@ dc_mount_sources() { # dc_mount_sources <devcontainer.json>
         2>/dev/null
 }
 
-# The declared type for one target, or empty if it is not declared.
-dc_type_for_target() { # dc_type_for_target <devcontainer.json> <target>
+# Every declared mount as ONE docker `--mount` spec per line. The string form already IS that
+# syntax (comma-separated key=value), so it passes through; the object form is joined into it.
+#
+# It lives here beside the other three readers of `.mounts` rather than in run.sh, which is the
+# only caller: all four have to agree about the string-vs-object spelling the spec allows at any
+# time, and a fourth private copy of that rule is how the thing that APPLIES the mount list comes
+# to disagree with the thing that VERIFIES it.
+dc_mount_specs() { # dc_mount_specs <container.json>
     dc_strip "$1" 2>/dev/null \
-      | jq -r --arg want "$2" '[(.workspaceMount // empty)] + (.mounts // [])
+      | jq -r '(.mounts // [])[]
+               | if type == "string" then .
+                 else ([to_entries[] | "\(.key)=\(.value)"] | join(",")) end' \
+        2>/dev/null
+}
+
+# The declared type for one target, or empty if it is not declared.
+dc_type_for_target() { # dc_type_for_target <container.json> <target>
+    dc_strip "$1" 2>/dev/null \
+      | jq -r --arg want "$2" '(.mounts // [])
                | .[]
                | if type == "string"
                  then {t: capture("target=(?<t>[^,]+)").t, k: ((capture("type=(?<k>[^,]+)") // {k:"bind"}).k)}
@@ -54,7 +69,7 @@ dc_type_for_target() { # dc_type_for_target <devcontainer.json> <target>
 # from disk, check-config.sh asserts each is version-pinned, and verify.sh asserts each is
 # actually present. Restating it in any of those would be the two-lists-that-must-agree defect
 # that already went stale once in verify.sh's mount set.
-dc_extensions() { # dc_extensions <devcontainer.json>
+dc_extensions() { # dc_extensions <container.json>
     dc_strip "$1" 2>/dev/null \
       | jq -r '(.customizations.vscode.extensions // [])[]' 2>/dev/null
 }
@@ -71,7 +86,7 @@ dc_extension_split() { # dc_extension_split <publisher.name@version>
 }
 
 # The `publisher.name` of the extension this repo BUILDS ITSELF, or nothing when it has none.
-# It is deliberately NOT in devcontainer.json: that list is what VS Code downloads from the
+# It is deliberately NOT in container.json: that list is what VS Code downloads from the
 # marketplace, and this extension is not published there. Which is exactly why the jkb side panel
 # was absent from every container ever built — nothing installed it, nothing declared it, and so
 # nothing could assert it either. setup.sh builds and installs it; verify.sh asserts the result;

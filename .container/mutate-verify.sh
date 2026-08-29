@@ -2,8 +2,8 @@
 # Each case breaks ONE property the container is supposed to have. verify.sh must fail, and must
 # fail naming that property — a guard nobody has watched fail is not a guard.
 #
-#   ./.devcontainer/mutate-verify.sh [image]           every guard, each watched failing
-#   ./.devcontainer/mutate-verify.sh --control [image]  ONE healthy run, for "is this container ok"
+#   ./.container/mutate-verify.sh [image]           every guard, each watched failing
+#   ./.container/mutate-verify.sh --control [image]  ONE healthy run, for "is this container ok"
 #
 # `--control` exists because assembling that `docker run` by hand goes wrong: it needs the seccomp
 # profile, NET_ADMIN, both binds, and a preamble that raises the firewall, links the state, links
@@ -12,7 +12,7 @@
 # exactly like a guard that did not fire" this file already guards its own control against, so the
 # correct invocation is here, defined ONCE, rather than written out in prose somewhere.
 #
-# Needs a Docker host and the image built (`docker build -t jkb-dev .devcontainer`), so it is this
+# Needs a Docker host and the image built (`docker build -t jkb-dev .container`), so it is this
 # change's #[ignore] test and is never part of ./scripts/check.sh — the host-side static checks
 # live in check-config.sh.
 set -uo pipefail
@@ -58,13 +58,13 @@ fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "=== container guards ==="
     echo "   no image named '$IMAGE'. Nothing was verified — this is NOT a passing result." >&2
-    echo "   Build it first:  docker build -t jkb-dev .devcontainer" >&2
+    echo "   Build it first:  docker build -t jkb-dev .container" >&2
     exit 2
 fi
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 printf '{}' > "$scratch/home/settings.json"
-SEC="$REPO/.devcontainer/seccomp-bwrap.json"
+SEC="$REPO/.container/seccomp-bwrap.json"
 BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)
 # A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
 # useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
@@ -77,7 +77,7 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # configuration the mutations never used — a control that is not about the same thing is not a
 # control.
 # `--declare` is the nested-bind exception, and this harness is the reason it exists. BASE mounts
-# the repo AT /home/vscode/repos/jkb, which devcontainer.json now declares only the parent of —
+# the repo AT /home/vscode/repos/jkb, which container.json now declares only the parent of —
 # and the parent cannot be mounted instead, because in a `jkb task work` session $REPO's parent is
 # `.jkb/work`, so the checkout would land at /home/vscode/repos/<session>. verify.sh accepts the
 # name only because it is strictly inside a declared target; see its comment for why nesting is
@@ -85,10 +85,10 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # and watch the refusal fire — one SUBJECT, as the comment above requires.
 SUBJECT='
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
-      . ./.devcontainer/lib.sh && dc_link_state /home/vscode
+      . ./.container/lib.sh && dc_link_state /home/vscode
       [ -n "${JKB_SKIP_MEMORY_LINK:-}" ] || ./scripts/link-claude-memory.sh >/dev/null 2>&1
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1
-      ./.devcontainer/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
+      ./.container/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
 # The baseline every ADDITIVE mutation runs in, and the control with it. The three subtractive
 # mutations below deliberately spell a reduced set instead — that is what they are testing — and
 # being the only sites that do so makes them visibly the odd ones. Before this, HEALTHY was used
@@ -325,7 +325,7 @@ echo
 # denominator, at which point the whole "the rest are NOT covered" block disappears while a dozen
 # paths have still never been watched failing. `assert` call sites are in the denominator too;
 # they were not, so two paths that ARE driven were not even counted as existing.
-V="$REPO/.devcontainer/verify.sh"
+V="$REPO/.container/verify.sh"
 covered=""
 if [ "${#caught_expects[@]}" -gt 0 ]; then
     covered="$(for want in "${caught_expects[@]}"; do
