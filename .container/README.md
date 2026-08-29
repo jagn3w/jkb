@@ -62,6 +62,19 @@ opens another window on the same container. `run.sh --open [path]` does the atta
 Command Palette route is the documented one — the attached-container URI it builds is VS Code's
 spelling and nothing here can test it.
 
+On a **fresh** container, one more step: extensions are not installed yet. VS Code puts its server
+into the container when you *attach*, which is after `run.sh` has finished — so setup finds nothing
+to install into and says so. From a terminal in the attached window:
+
+```sh
+./.container/install-extensions.sh     # marketplace extensions from disk, then the jkb explorer
+```
+
+then *Developer: Reload Window*. `run.sh` cannot do it for you: it drives Docker from the host, and
+the container deliberately has none. Automating it means a `postAttachCommand` in VS Code's
+attached-container configuration (`imageConfigs/<image>.json` in its globalStorage), which is not
+wired up yet.
+
 `run.sh` raises the firewall **first** on every start, because iptables rules live in the
 container's network namespace and do not survive a restart, and because otherwise the rest of
 setup — including a toolchain download — runs with open egress. On a fresh container it then runs
