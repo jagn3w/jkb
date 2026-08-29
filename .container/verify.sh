@@ -422,6 +422,19 @@ case "$mem_state" in
         # is not in a state its own design permits, and saying so on the create that discovers it
         # is the only moment anyone reads this.
         bad "auto-memory was pointing into a store holding something that is not a plain file — the link has been removed; clean ~/.jkb/claude-memory and re-run scripts/link-claude-memory.sh" ;;
+    unmanaged)
+        # Not a FAIL, and distinct from `unlinked` on purpose: the linker walks `~/repos/*/`, so it
+        # never visited this path — it did not fail at anything, it was never asked. Reporting that
+        # as `unlinked` (which is fatal, and rightly) said the linker had broken.
+        #
+        # This became reachable when the container stopped being opened by Dev Containers: that
+        # could only open a top-level repo, so every workspace was managed by construction. Now a
+        # `jkb task work` session is an ordinary thing to open, and its memory really is its own —
+        # on the host too, because Claude Code keys memory by absolute path. Whether a worktree's
+        # memory should be merged into its repo's single store, where several sessions would then
+        # collide on MEMORY.md, is filed as a decision rather than guessed at here.
+        ok "auto-memory is not shared for $(basename "$mem_repo") (a session worktree, not a top-level repo under ~/repos) — memory written here stays in this workspace"
+        ;;
     collision|unsafe|foreign)
         # Not a FAIL: the container works, one repo's memory just is not shared until a person
         # settles it. Said plainly, because a state nobody is told about is one nobody fixes.
