@@ -76,11 +76,33 @@ if [ -n "$build_in" ]; then
 fi
 
 echo "==> pnpm install + build ($ui_dir)"
-(cd "$ui_dir" && pnpm install --silent && pnpm run build)
+(cd "$ui_dir" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm install --silent </dev/null && pnpm run build </dev/null)
 
 echo "==> package .vsix"
 vscode_dir="$ui_dir/vscode"
-(cd "$vscode_dir" && pnpm dlx @vscode/vsce package --no-dependencies --allow-missing-repository >/dev/null)
+# NOT `>/dev/null`, and NOT with a terminal on stdin. What hung a fresh container was pnpm 10+
+# refusing to run a dependency's postinstall without approval and asking for it with an
+# INTERACTIVE MULTI-SELECT (`@vscode/vsce-sign`, `keytar`) — while `>/dev/null` swallowed the
+# question. A machine that has answered once never sees it again, which is why this worked on the
+# host for months and blocked on the first container.
+#
+# `</dev/null` is the fix, and it is the fix on its own: MEASURED against a cold dlx cache and a
+# cold store, pnpm does not ask when stdin is not a terminal — it proceeds without building. The
+# visible output is what makes any future question diagnosable instead of a hang with no symptom.
+#
+# `--config.ignore-scripts=true` is not what stops the prompt, then, and is kept for a different
+# reason: those postinstalls FETCH — keytar's `prebuild-install` pulls a prebuilt binary — and this
+# runs behind an egress firewall that allows a named handful of hosts. Neither package is needed to
+# PACKAGE (keytar is credential storage for `vsce publish`, vsce-sign is signing), so not running
+# them is right on its own terms. `--ignore-scripts` is not a `dlx` option; `--config.` is the
+# escape hatch pnpm names itself, and both the spelling and a real `package` run through it were
+# checked against pnpm 11.17 rather than guessed.
+#
+# COREPACK_ENABLE_DOWNLOAD_PROMPT for the shape one level up: corepack asks before fetching pnpm on
+# a fresh machine, which is exactly what a container is. That one the user did see, and answered.
+(cd "$vscode_dir" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    pnpm --config.ignore-scripts=true dlx @vscode/vsce package \
+         --no-dependencies --allow-missing-repository </dev/null)
 vsix="$(ls -t "$vscode_dir"/*.vsix | head -1)"
 echo "    $vsix"
 
