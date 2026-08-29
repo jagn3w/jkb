@@ -98,11 +98,25 @@ vscode_dir="$ui_dir/vscode"
 # escape hatch pnpm names itself, and both the spelling and a real `package` run through it were
 # checked against pnpm 11.17 rather than guessed.
 #
+# THE VERSION PIN IS THE FIX, and which of the two it was had to be measured rather than assumed.
+# A fresh container downloaded the newest vsce, which PROMPTS when there is no LICENSE file; the
+# host's warm pnpm store reused 3.9.2, which only WARNS. Pinned and run on a cold cache and a cold
+# store, with and without the flag below: 3.9.2 packages either way. So the same command really did
+# behave differently on two machines because they were silently running different versions of the
+# build tool — the same class of defect the extension pins in container.json exist for, and it cost
+# an hour of looking for a difference that was never in the code.
+#
+# `--skip-license` is kept, and is honest rather than redundant: this repo has no LICENSE and no
+# `license` field in any manifest, and the answer is not to invent one — that would assert a licence
+# for a project that has not declared one. The extension is packaged to be installed locally, never
+# published, and the flag says exactly that. It is also what keeps a future version bump from
+# reintroducing the prompt.
+#
 # COREPACK_ENABLE_DOWNLOAD_PROMPT for the shape one level up: corepack asks before fetching pnpm on
 # a fresh machine, which is exactly what a container is. That one the user did see, and answered.
 (cd "$vscode_dir" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
-    pnpm --config.ignore-scripts=true dlx @vscode/vsce package \
-         --no-dependencies --allow-missing-repository </dev/null)
+    pnpm --config.ignore-scripts=true dlx @vscode/vsce@3.9.2 package \
+         --no-dependencies --allow-missing-repository --skip-license </dev/null)
 vsix="$(ls -t "$vscode_dir"/*.vsix | head -1)"
 echo "    $vsix"
 
