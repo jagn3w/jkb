@@ -100,6 +100,17 @@ args_hash() { # args_hash <arg>...
     printf '%s' "${sum%% *}"
 }
 
+# The fingerprint of a config, read the same way the live path reads it — one array element per
+# line. `args_hash $(docker_args …)` would word-split instead, so a value with whitespace in it
+# would be hashed as two arguments here and as one there, and the self-test would be checking a
+# function of something other than what gets run. No declared value contains whitespace today,
+# which is what makes this the cheap moment to fix it rather than the expensive one.
+config_hash() { # config_hash <config> <repo-root>
+    local a=() l
+    while IFS= read -r l; do a+=("$l"); done < <(docker_args "$1" "$2")
+    args_hash ${a[@]+"${a[@]}"}
+}
+
 docker_args() { # docker_args <config> <repo-root>  -> one argument per line
     local cfg="$1" root="$2" line stripped
     stripped="$(dc_strip "$cfg")"
@@ -196,9 +207,9 @@ if [ "${1:-}" = --self-test ]; then
     # it while every check here read the new declaration.
     tmpcfg="$(mktemp)"; trap 'rm -f "$tmpcfg"' EXIT
     dc_strip "$CONFIG" | jq '.mounts += ["source=/tmp/x,target=/tmp/x,type=bind"]' > "$tmpcfg"
-    same="$(args_hash $(docker_args "$CONFIG" "$repo"))"
-    again="$(args_hash $(docker_args "$CONFIG" "$repo"))"
-    other="$(args_hash $(docker_args "$tmpcfg" "$repo"))"
+    same="$(config_hash "$CONFIG" "$repo")"
+    again="$(config_hash "$CONFIG" "$repo")"
+    other="$(config_hash "$tmpcfg" "$repo")"
     eq "the fingerprint is stable across two derivations" "$same" "$again"
     eq "...and a new mount changes it" "$([ "$same" != "$other" ] && echo differs || echo same)" "differs"
 
