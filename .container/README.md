@@ -84,6 +84,27 @@ checked. A boundary that depends on which caller you used is not one. `run.sh` r
 synchronously as well, which is not a second rule — the raise is idempotent — but a way of knowing
 it has finished before the next `docker exec` lands.
 
+**The container boots on what the raise established, not on whether it succeeded** (D50). The
+raise records a verdict in `/run/jkb-egress-verdict` on every ending, and the entrypoint reads it:
+
+| verdict | means | the container |
+|---|---|---|
+| `allowlisted` | the allowlist is up and both IP families are bounded | starts |
+| `denied` | no allowlist, but egress is provably denied — DNS and loopback only | starts, loudly: this is the state you attach to in order to repair it |
+| `unfiltered` | denial could **not** be established on one or both families | **refuses to start** |
+| *(no verdict)* | the raise aborted before recording one | **refuses to start** |
+
+An unproven family counts as open — including the case where the success path allowlists IPv4 but
+the kernel has no `ip6tables`, which previously reported success while leaving every allowlist rule
+bypassable over AAAA. A container with no IPv6 at all is a different thing and is fine: there is no
+path to deny, and that is measured rather than assumed.
+
+If your host genuinely cannot be given the guarantee, `JKB_EGRESS_ACCEPT_UNFILTERED` in
+`container.json` boots it anyway — and `verify.sh` then reports a failure on every single run for
+as long as it is set. It lives in `containerEnv` rather than as a `run.sh` flag so that
+`docker start` honours the same decision and a session inside the container cannot grant it to
+itself. Turning it on is a reviewable edit plus a recreate.
+
 `run.sh` then runs `setup.sh` (posture, toolchain, `jkb`, extensions, `verify.sh`) if setup has
 not completed in this container, and `verify.sh` alone if it has. That is decided by a marker
 `setup.sh` writes as its last act, **not** by whether this invocation created the container: an

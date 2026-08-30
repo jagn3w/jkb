@@ -508,11 +508,25 @@ assert "knowledge base is mounted" "$kb_mounted"
 # so a dead resolver produces the same answers as a deny-all — which meant the harness case for
 # `fail_closed` passed without ever establishing that it installed anything. The marker is written
 # by `fail_closed` and cleared only by a successful raise, so it says which of the two happened.
-if [ -e /run/jkb-egress-failed ]; then
-    bad "the firewall failed closed and left no allowlist: $(head -1 /run/jkb-egress-failed 2>/dev/null)"
-else
-    ok "the firewall raised an allowlist (it did not fail closed)"
-fi
+egress_verdict=/run/jkb-egress-verdict
+eg_state="$(sed -n 's/^state=//p' "$egress_verdict" 2>/dev/null | head -1)"
+eg_reason="$(sed -n 's/^reason=//p' "$egress_verdict" 2>/dev/null | head -1)"
+eg_v6="$(sed -n 's/^v6=//p' "$egress_verdict" 2>/dev/null | head -1)"
+case "$eg_state" in
+    allowlisted) ok "the firewall raised an allowlist (IPv4 allowlisted, IPv6 $eg_v6)" ;;
+    denied)      bad "the firewall failed closed and left no allowlist: $eg_reason" ;;
+    # Reachable only via JKB_EGRESS_ACCEPT_UNFILTERED — the entrypoint refuses this state
+    # otherwise — so seeing it means the override is set. It is a failure every run for as long
+    # as it is: an override nobody can see is indistinguishable from a rule that does not exist.
+    unfiltered)  bad "egress is UNFILTERED and the container was started anyway
+       (JKB_EGRESS_ACCEPT_UNFILTERED). $eg_reason" ;;
+    # No file, or a state nothing here knows. Not evidence of anything, and never read as denied:
+    # this is also what a container started with --entrypoint bash looks like, which is exactly
+    # when you most want to be told the firewall's state is unestablished.
+    *)           bad "the firewall left no verdict this understands (state=${eg_state:-<none>}) —
+       it records one on every ending, so it aborted before reaching any of them, or this
+       container was started bypassing the entrypoint" ;;
+esac
 if curl -sS -m 6 -o /dev/null https://example.com 2>/dev/null; then
     bad "egress to a NON-allowlisted host was permitted (example.com)"
 else

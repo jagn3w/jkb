@@ -87,6 +87,21 @@ jobs:
       - name: container config guards fire
         run: ./.container/mutate-config.sh
 
+      # The pure derivations behind the container, each exercised without Docker. They were in
+      # scripts/check.sh only — behind a jq guard whose skip text says "CI runs this gate", which
+      # was not true: on a machine without jq they ran NOWHERE. A skip is only honest if the thing
+      # it defers to actually happens.
+      #   run.sh          the docker argument derivation and the staleness fingerprint
+      #   entrypoint.sh   the boot decision, against a stubbed firewall raise (D50.3)
+      #   fetch-ext...    the marketplace URL and platform mapping
+      #   verify.sh       the mount-exclusion regex
+      - name: container derivations
+        run: |
+          ./.container/run.sh --self-test
+          ./.container/entrypoint.sh --self-test
+          ./.container/fetch-extensions.sh --self-test
+          ./.container/verify.sh --self-test
+
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny

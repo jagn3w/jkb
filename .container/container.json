@@ -97,7 +97,17 @@
     // Keep the posture's own paths meaningful inside the container.
     "JKB_DB": "/home/vscode/.jkb/jkb.db",
     // See the target/ volume above: keeps cargo's output off the bind mount.
-    "CARGO_TARGET_DIR": "/home/vscode/.cargo/target"
+    "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",
+    // THE ONE ESCAPE FROM THE EGRESS BOOT GATE (D50.6), off by default and declared here on
+    // purpose. entrypoint.sh refuses to start a container whose firewall could not establish that
+    // egress is bounded — right for an unattended agent, and it means a host with real IPv6 and
+    // no ip6tables cannot start this at all. Setting this to "1" boots it anyway; verify.sh then
+    // reports a FAILURE on every run for as long as it is set, because an override nobody can see
+    // is indistinguishable from a rule that does not exist. It lives in containerEnv rather than
+    // as a run.sh flag for two reasons: `docker start` must honour the same decision and run.sh is
+    // not in that path, and an environment fixed at create is something a session inside the
+    // container cannot grant itself.
+    "JKB_EGRESS_ACCEPT_UNFILTERED": "0"
   },
 
   // EVERY ENTRY IS VERSION-PINNED, and that is a requirement rather than a preference —

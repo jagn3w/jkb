@@ -409,8 +409,33 @@ esac
 # so without this the exec below could race the entrypoint and do its work on a half-built chain.
 # Running it synchronously is the cheapest way to know a raise has completed, and it keeps this
 # script's behaviour identical to the version that was actually exercised.
+# THE ENTRYPOINT CAN REFUSE TO START THE CONTAINER (D50.3), and `docker run --detach` still
+# returns 0 when it does — the refusal is in the container's logs, not in docker's exit code. So
+# the next `docker exec` failed with a bare "Container ... is not running" and `set -e` killed this
+# script, leaving the actual explanation somewhere nothing pointed at.
+if ! docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true; then
+    printf '\033[31merror:\033[0m %s exited immediately after starting.\n' "$NAME" >&2
+    printf 'The entrypoint refuses to run a container whose firewall could not establish that\n' >&2
+    printf 'egress is bounded. Its reason is the last thing in the log:\n\n' >&2
+    docker logs --tail 20 "$NAME" 2>&1 | sed 's/^/  /' >&2
+    exit 1
+fi
+
+# Already raised by the entrypoint, on this start and on every other. Re-raising here is not a
+# second rule — the raise is idempotent by design — it is a SYNCHRONISATION POINT: `docker run`
+# returns as soon as the container is started, so without this the execs below could race the
+# entrypoint and do their work against a half-built chain.
+#
+# Its failure is RECORDED, not fatal. The entrypoint has already made the boot decision on the
+# verdict; if the cause persists the re-raise fails the same way, and letting `set -e` kill this
+# script here would skip the reap, skip verify.sh, and so skip the very reporting the design makes
+# verify responsible for — for the one caller that runs it.
 say "egress firewall"
-docker exec "$NAME" sudo -n /usr/local/bin/init-firewall.sh
+raise_rc=0
+docker exec "$NAME" sudo -n /usr/local/bin/init-firewall.sh || raise_rc=$?
+if [ "$raise_rc" -ne 0 ]; then
+    say "the raise reported a failure (exit $raise_rc) — verify.sh below reports what state it left"
+fi
 
 # WHICH ARM, and it is asked of whether SETUP FINISHED — not of whether this invocation created the
 # container. `fresh=1` meant "docker run just succeeded", which is true a full minute before setup
@@ -461,7 +486,15 @@ cat <<EOF
   container. There is no workspaceFolder here, so any depth works.
 EOF
 
-if [ "$OPEN" -eq 1 ]; then
+if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
+    # OPENING A WINDOW IS AN ACTION, NOT A NOTE. Carrying verify's result so the attach
+    # instructions still print is right; going on to launch an attached VS Code window into a
+    # container whose verifier just reported UNDECLARED mounts, permitted egress to a
+    # non-allowlisted host, or a broken posture is not. Before the result was carried, `set -e`
+    # made this unreachable on a red verify; carrying it is what made it reachable.
+    printf '\n\033[31mnot opening a window:\033[0m verify.sh reported problems (exit %s).\n' "$verify_rc" >&2
+    printf 'Fix them, or attach by hand with the Command Palette route above if you know why.\n' >&2
+elif [ "$OPEN" -eq 1 ]; then
     [ -n "$open_path" ] || open_path="$ctr_repo"
     # A HOST PATH IS THE NATURAL THING TO TYPE — you are standing in one — and appending it to the
     # container URI verbatim opened a window on a folder that does not exist in there, with no

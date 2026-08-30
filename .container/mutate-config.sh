@@ -194,6 +194,39 @@ open(p, 'w').write(s + '\n"$repo/.container/verify.sh"\n')
 PYX
 run "setup.sh verifies as well as run.sh" "a second verifier there"
 
+# ...and the half that guard's passing line CLAIMS but never checked: that run.sh still verifies.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("verify.sh", "nothing.sh"))
+PYX
+run "run.sh stops verifying at all" "nothing verifies the container"
+
+# THE ENTRYPOINT LINE. One line in the Dockerfile is the whole of "the firewall is raised on every
+# start"; deleting it leaves both config harnesses green because run.sh raises it too, and breaks
+# only `docker start`, Docker Desktop and a daemon restart — where nothing else looks.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]
+open(p, 'w').write("".join(l for l in open(p) if not l.startswith("ENTRYPOINT")))
+PYX
+run "the image stops running entrypoint.sh" "does not set ENTRYPOINT"
+
+# The egress verdict path: one writer, two readers, three processes that cannot share a variable.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("/run/jkb-egress-verdict", "/run/jkb-egress-result"))
+PYX
+run "a reader drifts off the verdict path" "spelled 2 different ways"
+
+seed; python3 - "$work/t/.container/entrypoint.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("/run/jkb-egress-verdict", "$SOMETHING_ELSE"))
+PYX
+run "a reader stops naming the verdict at all" "is not named by:"
+
 seed; jq_dc '{}'
 run "the declaration is emptied" "this check just certified nothing"
 
@@ -364,7 +397,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=37
+PINNED_BAD_SITES=41
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

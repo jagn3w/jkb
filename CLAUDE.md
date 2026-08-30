@@ -1945,7 +1945,67 @@ is who starts the container, and it removes a limitation rather than working aro
   because iptables rules live in the container's network namespace and do not survive a restart and
   because the rest of setup includes a toolchain download.
 
-### What the review found: replacing a lifecycle moves its guarantees onto whoever replaces it
+### The raise records a verdict, and the container boots on it (D50)
+
+Design: `openspec/changes/jkb-egress-verdict/`. Two review rounds produced a must-fix in this one
+subsystem, **the second caused by the first's fix**, which is the signal to model rather than
+patch again.
+
+- **`init-firewall.sh` computed whether egress was denied, printed it, and threw it away.** What it
+  recorded was a *cause string*, written by `fail_closed` **before** any `iptables` call with every
+  one of those calls `|| true` — so the marker meant *"`fail_closed` ran"*, which is a different
+  fact from *"egress is denied"*. Its four endings collapsed into two distinguishable ones, and the
+  two that mattered most — deny-all installed, and deny-all **failed** — wrote the identical thing.
+  `entrypoint.sh` read presence as proof of denial, printed `egress is DENIED`, and booted. On the
+  second one that sentence is false and an unattended agent gets an open network, on precisely the
+  `docker start` routes the entrypoint was added to cover.
+- **It is the house defect — an unestablished answer spelled as a definite one** — reproduced while
+  fixing a finding about a boundary that depended on its caller. `Fact::Unknown` collapsed to
+  `false`, `ahead_count` returning `0`, `has_own_commits` answering *no* when `rev-list` failed.
+- **The raise records a verdict** (`/run/jkb-egress-verdict`, root-owned, written on every ending):
+  `state=allowlisted|denied|unfiltered` plus the per-family detail and the reason. **Absence is its
+  own answer** — dying before the record leaves `unknown`, never `denied` — which is what makes
+  writing it *late* safe, where writing the old marker early was what made it uninformative.
+- **Denial must be ESTABLISHED, on both families.** A family that is not provably closed is open.
+  That rule now reaches the **success** path too: it used to allowlist IPv4, print *"IPv6 is
+  UNFILTERED"*, and report success anyway, its own comment conceding this was *"safe only because
+  the container has no IPv6 route, which is not checked here."*
+- **`unfiltered` refuses to boot.** The asymmetry decides it: refusing costs a debugging session and
+  prints its own escape (`docker run --entrypoint bash`); booting costs the guarantee, silently, on
+  the paths nothing else watches. A container in that state is nearly useless anyway — no allowlist
+  means no npm, no crates.io, no `api.anthropic.com` — so staying up buys diagnosability, not work.
+  `denied` still boots, loudly: it is safe, and it is the state you need to attach to in order to
+  repair it.
+- **…but absence of the path establishes denial too.** No `/proc/net/if_inet6`, or no non-loopback
+  v6 address, means no source address and no route: `v6=absent` satisfies the rule rather than
+  weakening it. Without that clause the container refuses to boot on any kernel lacking `ip6tables`
+  *even where IPv6 is not in play at all*. It is a measurement, and an unobtainable measurement is
+  `open` — which is also, exactly, what the existing `set -E`/ERR-trap guard demanded of the
+  assignment. **That guard caught this change as it was written**: a bare `v6="$(v6_state)"` would
+  have aborted the whole raise into `fail_closed`.
+- **The one escape is recorded.** `JKB_EGRESS_ACCEPT_UNFILTERED=1` in `containerEnv` — fixed at
+  create, so a session inside cannot grant it to itself, and `docker start` honours the same
+  decision, which a `run.sh` flag could not. `verify.sh` reports it as a **failure** every run for
+  as long as it is set: an override nobody can see is indistinguishable from a rule that does not
+  exist. Without it, a host with real IPv6 and no `ip6tables` could not start the container at all.
+- **`run.sh` learned that the entrypoint can refuse.** `docker run --detach` still returns 0, so
+  the next `docker exec` failed with a bare *"Container … is not running"* and `set -e` killed the
+  script, leaving the explanation in `docker logs` which nothing pointed at. And the synchronous
+  re-raise's failure is now recorded rather than fatal — under `set -e` it skipped the reap and
+  `verify.sh`, i.e. the very reporting the design assigns to verify.
+- **`--open` is an action, not a note.** Carrying verify's exit code so the attach instructions
+  still print is right; going on to launch a window into a container whose verifier just reported
+  undeclared mounts is not. Before the result was carried, `set -e` made that unreachable.
+- **Four guards, because a guard that cannot fire is this directory's recurring defect.** Nothing
+  asserted the Dockerfile still wires the `ENTRYPOINT` — delete one line and every check stays
+  green while `docker start` comes up unfiltered. The round-1 "one verifier" guard checked only
+  that `setup.sh` does *not* verify while its passing line claimed `run.sh` does. The verdict path
+  is spelled by one writer and two readers in three processes that cannot share a variable, so
+  their agreement is asserted like the setup marker's. **And the mutation harness caught the
+  drift-detection guard being unable to fire**: grepping for the literal path it already knew could
+  only ever find one distinct value, so it now extracts each file's own spelling and compares those.
+
+### What review round 1 found: replacing a lifecycle moves its guarantees onto whoever replaces it
 
 Fifteen findings, four must-fix, **every one `introduced`** — and three of the four are one
 sentence: `postCreateCommand`/`postStartCommand` were not just *steps*, they were the statements

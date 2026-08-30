@@ -290,6 +290,55 @@ else
     ok "setup.sh does not verify; run.sh does, once, after either arm"
 fi
 
+# ...AND THE OTHER HALF, which the line above claims and did not check. Asserting only that
+# setup.sh does NOT verify, while the passing message says run.sh does, means deleting run.sh's
+# call leaves every harness green and nothing verifying anything.
+if dc_strip_comments "$here/run.sh" | grep -qE 'verify\.sh'; then
+    ok "run.sh runs verify.sh"
+else
+    bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
+fi
+
+# THE ENTRYPOINT LINE ITSELF. `ENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]` appears exactly once
+# and was referenced by no check: delete it in a rebase or a base-image bump and the build
+# succeeds, both config harnesses stay green, and run.sh raises the firewall itself so its path
+# looks identical — while `docker start`, Docker Desktop's start button and a daemon restart, the
+# three routes the entrypoint exists for, come back with unrestricted egress.
+if grep -qE '^ENTRYPOINT.*entrypoint\.sh' "$here/Dockerfile"; then
+    ok "the image runs entrypoint.sh as its ENTRYPOINT"
+else
+    bad "the Dockerfile does not set ENTRYPOINT to entrypoint.sh — docker start would come up with no firewall"
+fi
+
+# THE VERDICT PATH, spelled in one writer and two readers that are three different processes and
+# cannot share a variable — the same constraint as the setup marker above, so the same guard.
+# Drift means a reader silently sees `unknown` for ever: under D50.3 a container that never boots,
+# or in verify.sh a permanent false alarm.
+#
+# EACH FILE'S OWN SPELLING, not a search for the literal we expect. Grepping for the path this
+# check already knows can only ever find one distinct value, so the drift branch was unreachable —
+# the exact defect this directory keeps producing, in the guard written to prevent a different one.
+# The mutation caught it. So: pull the path out of each file's own `*verdict*=…/run/…` assignment,
+# which is how all three name it, and compare those. verify.sh mentions several other /run/ paths,
+# which is why this is anchored on the assignment rather than on /run/.
+verdict_missing=""
+verdict_paths=""
+for vf in init-firewall.sh entrypoint.sh verify.sh; do
+    vp="$(grep -ioE '[a-z_]*verdict[a-z_]*=[^[:space:]]*/run/[A-Za-z0-9._-]+' "$here/$vf" 2>/dev/null \
+          | grep -oE '/run/[A-Za-z0-9._-]+' | sort -u | head -1)"
+    if [ -z "$vp" ]; then verdict_missing="$verdict_missing $vf"
+    else verdict_paths="$verdict_paths$vp
+"; fi
+done
+verdict_distinct="$(printf '%s' "$verdict_paths" | sort -u | grep -c . || true)"
+if [ -n "$verdict_missing" ]; then
+    bad "the egress verdict path is not named by:$verdict_missing — init-firewall.sh writes it, entrypoint.sh and verify.sh read it, and a reader that lost it sees 'unknown' for ever"
+elif [ "$verdict_distinct" -ne 1 ]; then
+    bad "the egress verdict path is spelled $verdict_distinct different ways — a reader would see 'unknown' for ever"
+else
+    ok "the writer and both readers agree on the egress verdict path ($(printf '%s' "$verdict_paths" | head -1))"
+fi
+
 callers_ok=1
 callers=()
 for f in "$here"/*.sh; do
