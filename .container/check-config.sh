@@ -279,6 +279,17 @@ else
     ok "run.sh and setup.sh agree on the setup-complete marker ($setup_marker_run)"
 fi
 
+# ONE VERIFIER. verify.sh used to be setup.sh's last line as well as a run.sh step, and the split
+# is what let "a failing assertion must not suppress the attach instructions" get fixed on one path
+# and stay broken on the other. It also made a verify failure read as "setup did not complete", so
+# the next run redid the toolchain because an extension was missing. Putting it back would restore
+# both, silently and slowly, which is the kind of regression nobody goes looking for.
+if dc_strip_comments "$here/setup.sh" | grep -qE '(^|[^-[:alnum:]])verify\.sh'; then
+    bad "setup.sh runs verify.sh again — run.sh verifies after both arms, and a second verifier there is what made a failed check re-run the whole of setup"
+else
+    ok "setup.sh does not verify; run.sh does, once, after either arm"
+fi
+
 callers_ok=1
 callers=()
 for f in "$here"/*.sh; do

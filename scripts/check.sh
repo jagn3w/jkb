@@ -86,6 +86,12 @@ else
 # as a 404 in somebody's `docker build`.
 "$(dirname "$0")/../.container/fetch-extensions.sh" --self-test
 
+# ...and what the container does when the firewall raise fails. It has three outcomes and getting
+# the two failing ones the wrong way round yields either a container that will not boot or one
+# running unprotected — decided by the first thing that executes in there, which nothing had run.
+# Exercised against a stubbed sudo, so it needs no Docker and no privileges.
+"$(dirname "$0")/../.container/entrypoint.sh" --self-test
+
 # ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
 # a regex, and it is the one part of the mount boundary that widens by a typo instead of by an
 # edit somebody reviews — an over-broad exclusion drops a real mount from the set and the

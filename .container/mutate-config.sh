@@ -185,6 +185,15 @@ open(p, 'w').write(s.replace("touch /home/vscode/.jkb-container-setup-complete",
 PYX
 run "setup.sh stops writing the marker at all" "stopped naming it"
 
+# ...and the second verifier put back, which is how the fix for "a fatal verify hides the attach
+# instructions" comes to hold on one path and not the other again.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s + '\n"$repo/.container/verify.sh"\n')
+PYX
+run "setup.sh verifies as well as run.sh" "a second verifier there"
+
 seed; jq_dc '{}'
 run "the declaration is emptied" "this check just certified nothing"
 
@@ -355,7 +364,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=36
+PINNED_BAD_SITES=37
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

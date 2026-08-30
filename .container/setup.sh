@@ -88,14 +88,21 @@ jkb --version || true
 # was the reverse and this was never a separate step.
 "$repo/.container/install-extensions.sh"
 
-say "verify the container is what it claims to be"
-"$repo/.container/verify.sh"
-
 # LAST, and only on success — `set -e` means an earlier failure never reaches this line. run.sh
-# chooses between "run setup" and "just verify" on this marker, so it has to mean setup FINISHED.
-# Choosing on "did this invocation create the container" instead left an interrupted first run
-# permanently in the verify arm, with no way back to setup short of recreating the container.
+# chooses between "run setup" and "skip to verify" on this marker, so it has to mean setup
+# FINISHED. Choosing on "did this invocation create the container" instead left an interrupted
+# first run permanently in the verify arm, with no way back to setup short of recreating it.
 #
 # In the writable layer deliberately, not a volume: `run.sh --rm` must genuinely redo setup, and a
 # volume would carry the marker across into a container that had never been set up.
 touch /home/vscode/.jkb-container-setup-complete
+
+# VERIFYING IS NOT A SETUP STEP, and it used to be the last line of this file. Two things followed
+# from that and both were wrong. A failing assertion aborted run.sh under `set -e` before it could
+# print how to attach — the defect the review found in the OTHER arm, still here in this one,
+# because a fix applied at the site rather than to the rule reaches one caller. And it made a
+# verify failure mean "setup did not complete", so the next run redid the whole toolchain install
+# because an extension was missing. run.sh runs verify after both arms now and carries its exit
+# code, so there is one verifier, one place that decides what a failure costs, and the marker
+# means exactly what it says.
+say "setup complete — run.sh verifies next"

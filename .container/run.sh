@@ -429,23 +429,24 @@ if [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
     docker exec -w "$ctr_repo" "$NAME" bash .container/setup.sh
-    verify_rc=0
-else
-    # THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was below, and verify.sh exits 1
-    # on any failing assertion under `set -e` — so one assertion about something else disabled the
-    # only reaper that can finish container-side archive records, whose /home/vscode/... paths the
-    # host's `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted
-    # postStartCommand ran it unconditionally and this is that shape back.
-    docker exec -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
-
-    # setup.sh ends by running verify.sh, so this is the arm that would otherwise never check. Its
-    # result is CARRIED rather than fatal: a failed assertion must still leave you able to read how
-    # to attach — several of them name a remedy you run from inside an attached window, and dying
-    # here printed the problem and withheld the way to fix it.
-    say "verify"
-    verify_rc=0
-    docker exec -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
 fi
+
+# THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was after, and verify.sh exits 1 on
+# any failing assertion under `set -e` — so one assertion about something else disabled the only
+# reaper that can finish container-side archive records, whose /home/vscode/... paths the host's
+# `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted postStartCommand
+# ran it unconditionally and this is that shape back.
+docker exec -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
+
+# ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
+# separate call here on the restart path — so the review's "a fatal verify suppresses everything
+# after it" was fixed in one arm and left in the other, which is what fixing at a site rather than
+# at the rule buys you. Its result is CARRIED rather than fatal: several assertions name a remedy
+# you run from inside an attached window, and dying here printed the problem while withholding the
+# way to fix it. The exit code is still verify's, at the very end.
+say "verify"
+verify_rc=0
+docker exec -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
 
 say "attached VS Code windows"
 cat <<EOF
