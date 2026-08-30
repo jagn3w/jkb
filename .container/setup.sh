@@ -90,3 +90,12 @@ jkb --version || true
 
 say "verify the container is what it claims to be"
 "$repo/.container/verify.sh"
+
+# LAST, and only on success — `set -e` means an earlier failure never reaches this line. run.sh
+# chooses between "run setup" and "just verify" on this marker, so it has to mean setup FINISHED.
+# Choosing on "did this invocation create the container" instead left an interrupted first run
+# permanently in the verify arm, with no way back to setup short of recreating the container.
+#
+# In the writable layer deliberately, not a volume: `run.sh --rm` must genuinely redo setup, and a
+# volume would carry the marker across into a container that had never been set up.
+touch /home/vscode/.jkb-container-setup-complete

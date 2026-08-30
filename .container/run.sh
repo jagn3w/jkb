@@ -29,7 +29,11 @@ IMAGE="${JKB_CONTAINER_IMAGE:-jkb-dev}"
 NAME="${JKB_CONTAINER_NAME:-jkb-dev}"
 # Where the mount puts things. One statement of it, used by both the path mapping and the refusal.
 HOST_REPOS="$HOME/repos"
+HOST_REPOS_REAL="$(cd "$HOST_REPOS" 2>/dev/null && pwd -P || printf '%s' "$HOST_REPOS")"
 CTR_REPOS="/home/vscode/repos"
+# Written by setup.sh as its LAST act, so its presence means "setup finished", not "setup started".
+# One statement of the path, shared with setup.sh via this being the only place it is spelled here.
+SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -77,13 +81,25 @@ dc_subst() { # dc_subst <string> <repo-root>
 # preflight, and it is a much smaller claim: not "which folder may you open" (attaching answers
 # that — any of them) but "the checkout that PROVIDES this container has to be inside the mount",
 # because run.sh has to hand the container a path to its own setup.sh.
+# SYMLINKS ARE RESOLVED ON BOTH SIDES, which the deleted check-workspace.sh did deliberately and
+# this dropped. `~/repos` being a symlink is ordinary — an external volume, a tidier home — and then
+# the two spellings never match textually: `$repo` comes from `cd && pwd`, so it can be either form
+# depending on how the script was invoked. Refusing there is the bad direction twice over, since the
+# remedy printed ("move the checkout under ~/repos") is already satisfied. Both spellings of both
+# operands are tried, so either form is accepted and the mount still decides what is reachable.
 container_path() { # container_path <host-path>
-    local p="$1"
-    case "$p" in
-        "$HOST_REPOS"/*) printf '%s%s' "$CTR_REPOS" "${p#"$HOST_REPOS"}" ;;
-        "$HOST_REPOS")   printf '%s' "$CTR_REPOS" ;;
-        *) return 1 ;;
-    esac
+    local p="$1" p_real root
+    p_real="$(cd "$p" 2>/dev/null && pwd -P || printf '%s' "$p")"
+    for p in "$1" "$p_real"; do
+        for root in "$HOST_REPOS" "$HOST_REPOS_REAL"; do
+            [ -n "$root" ] || continue
+            case "$p" in
+                "$root"/*) printf '%s%s' "$CTR_REPOS" "${p#"$root"}"; return 0 ;;
+                "$root")   printf '%s' "$CTR_REPOS"; return 0 ;;
+            esac
+        done
+    done
+    return 1
 }
 
 # A fingerprint of the DERIVED arguments — not of the file, so a comment edit does not force a
@@ -100,6 +116,37 @@ args_hash() { # args_hash <arg>...
     printf '%s' "${sum%% *}"
 }
 
+file_sha() { # file_sha <path>
+    local sum
+    if command -v shasum >/dev/null 2>&1; then sum="$(shasum -a 256 "$1")"
+    else sum="$(sha256sum "$1")"; fi
+    printf '%s' "${sum%% *}"
+}
+
+# WHAT REACHES THE CONTAINER, not the checkout that produced it — and that distinction is the whole
+# point of this function. `runArgs` carries `--security-opt seccomp=${localWorkspaceFolder}/…`, so
+# the derived argument list is a function of WHERE the checkout lives. Hashing it raw meant a
+# `jkb task work` session — the case this whole change exists to make possible — computed a
+# different fingerprint from the main checkout, was told `jkb-dev was created from a different
+# container.json` (naming a file that had not changed), and was advised `--rm && run.sh`, which
+# destroys the shared container along with ~/.vscode-server, its extensions and ~/.jkb-ui-build,
+# none of which are in a volume. The main checkout then refused identically. Two checkouts
+# ping-ponging, from a declaration they agreed on completely.
+#
+# So the workspace root is normalised out, and the seccomp profile's CONTENT is folded in to
+# replace the path just removed: a profile that really differs must still force a recreate, or
+# normalising would have opened a hole where the check used to be.
+fingerprint() { # fingerprint <repo-root> <arg>...
+    local root="$1"; shift
+    local a profile="" norm=()
+    for a in "$@"; do
+        norm+=("${a//$root/\$\{WORKSPACE\}}")
+        case "$a" in *seccomp=*) profile="${a#*seccomp=}" ;; esac
+    done
+    [ -n "$profile" ] && [ -f "$profile" ] && norm+=("seccomp-content=$(file_sha "$profile")")
+    args_hash ${norm[@]+"${norm[@]}"}
+}
+
 # The fingerprint of a config, read the same way the live path reads it — one array element per
 # line. `args_hash $(docker_args …)` would word-split instead, so a value with whitespace in it
 # would be hashed as two arguments here and as one there, and the self-test would be checking a
@@ -108,7 +155,7 @@ args_hash() { # args_hash <arg>...
 config_hash() { # config_hash <config> <repo-root>
     local a=() l
     while IFS= read -r l; do a+=("$l"); done < <(docker_args "$1" "$2")
-    args_hash ${a[@]+"${a[@]}"}
+    fingerprint "$2" ${a[@]+"${a[@]}"}
 }
 
 docker_args() { # docker_args <config> <repo-root>  -> one argument per line
@@ -180,7 +227,23 @@ if [ "${1:-}" = --self-test ]; then
     # the string `/h/repos` and is a different directory; mapping it would hand the container a
     # path that resolves to something else entirely.
     eq "a sibling with a shared prefix is refused" "$(rc_of container_path /h/repos-backup/jkb)" "1"
+
+    # A SYMLINKED ~/repos, which is ordinary and which the textual comparison refused. Both
+    # spellings have to map, because which one you get depends on how the script was invoked: the
+    # link name from `$HOME/repos`, the physical path from anything that resolved it on the way.
+    lnk="$(mktemp -d)"; trap 'rm -rf "$lnk"' EXIT
+    mkdir -p "$lnk/real/jkb"
+    ln -s "$lnk/real" "$lnk/link"
+    HOST_REPOS="$lnk/link"
+    HOST_REPOS_REAL="$(cd "$HOST_REPOS" && pwd -P)"
+    eq "a symlinked ~/repos, named through the link" \
+       "$(container_path "$lnk/link/jkb")" "/c/repos/jkb"
+    eq "...and named through what it resolves to" \
+       "$(container_path "$HOST_REPOS_REAL/jkb")" "/c/repos/jkb"
+    eq "...while something outside it is still refused" "$(rc_of container_path "$lnk/other")" "1"
+
     HOST_REPOS="$HOME/repos" CTR_REPOS=/home/vscode/repos
+    HOST_REPOS_REAL="$(cd "$HOST_REPOS" 2>/dev/null && pwd -P || printf '%s' "$HOST_REPOS")"
 
     echo "==> run.sh self-test: derivation from the real container.json"
     args="$(docker_args "$CONFIG" "$repo")"
@@ -212,6 +275,22 @@ if [ "${1:-}" = --self-test ]; then
     other="$(config_hash "$tmpcfg" "$repo")"
     eq "the fingerprint is stable across two derivations" "$same" "$again"
     eq "...and a new mount changes it" "$([ "$same" != "$other" ] && echo differs || echo same)" "differs"
+
+    # THE PROPERTY THE PING-PONG DEFECT NEEDED. `runArgs` names the seccomp profile by
+    # ${localWorkspaceFolder}, so the raw argument list differs between two checkouts of the same
+    # declaration — a session worktree and its main copy — and each then refused the other's
+    # container and advised destroying it. Two roots, same content, must fingerprint the same.
+    twin="$(mktemp -d)"; trap 'rm -f "$tmpcfg"; rm -rf "$twin"' EXIT
+    mkdir -p "$twin/.container"
+    cp "$CONFIG" "$twin/.container/container.json"
+    cp "$here/seccomp-bwrap.json" "$twin/.container/seccomp-bwrap.json"
+    eq "two checkouts of the same declaration agree" \
+       "$(config_hash "$twin/.container/container.json" "$twin")" "$same"
+    # ...and normalising the path away must not have taken the profile's CONTENT with it, or the
+    # check would be blind to the one file it exists to pin.
+    printf '{"tampered":true}\n' > "$twin/.container/seccomp-bwrap.json"
+    eq "...but a different seccomp profile does not" \
+       "$([ "$(config_hash "$twin/.container/container.json" "$twin")" != "$same" ] && echo differs || echo same)" "differs"
 
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
@@ -252,7 +331,7 @@ ARGS=()
 while IFS= read -r line; do ARGS+=("$line"); done < <(docker_args "$CONFIG" "$repo")
 
 # Hashed BEFORE the label is appended, or the value would have to contain itself.
-want_hash="$(args_hash "${ARGS[@]}")"
+want_hash="$(fingerprint "$repo" "${ARGS[@]}")"
 ARGS+=(--label "jkb.args-hash=$want_hash")
 
 if [ "$DRY" -eq 1 ]; then
@@ -266,8 +345,12 @@ command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
 
 if [ "$BUILD" -eq 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    say "build $IMAGE"
-    docker build -t "$IMAGE" "$here"
+    # `name` and `build.dockerfile` are READ here. They were listed as consumed keys while nothing
+    # looked at either, so check-config.sh printed "every key in container.json is applied by
+    # run.sh" about two declarations that did nothing — and the fix for the next inert key would
+    # have been to add it to the list, which silences the check rather than satisfying it.
+    say "build $IMAGE — $(dc_name "$CONFIG")"
+    docker build -t "$IMAGE" -f "$here/$(dc_dockerfile "$CONFIG")" "$here"
 fi
 
 state="$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true)"
@@ -282,13 +365,29 @@ case "$state" in
         if [ "$have" != "$want_hash" ]; then
             case "$have" in
                 ""|"<no value>") reason="$NAME carries no record of what it was created from" ;;
-                *)               reason="$NAME was created from a different container.json" ;;
+                *)               reason="$NAME was created from a different container.json or seccomp profile" ;;
             esac
             die "$reason.
   \`docker start\` reuses the configuration a container was BUILT with, so starting it would give
   you the old mounts and flags while every check here read the new declaration.
 
   Recreate it (the image and the volumes — cargo cache, Claude state — all survive):
+      $0 --rm && $0"
+        fi
+        # ...AND THE IMAGE, by the staleness check's own argument. It says `docker start` reuses
+        # the configuration a container was BUILT with; that is just as true of the image, and the
+        # fingerprint covers only the argument list. So `run.sh --build` — which README.md
+        # documents as exactly what you do after changing the Dockerfile or the pinned extension
+        # list — built a new image, left the container on the old one, and install-extensions.sh
+        # then failed with "was not staged into this image — rebuild the container", advice the
+        # user had just followed.
+        want_image="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+        have_image="$(docker inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)"
+        if [ -n "$want_image" ] && [ -n "$have_image" ] && [ "$have_image" != "$want_image" ]; then
+            die "$NAME is running an older build of $IMAGE than the one on disk.
+  A container keeps the image it was created from, so the new one does not reach it by starting.
+
+  Recreate it (the volumes — cargo cache, Claude state — survive):
       $0 --rm && $0"
         fi
         if [ "$state" = running ]; then say "container $NAME is already running"
@@ -303,27 +402,50 @@ case "$state" in
         ;;
 esac
 
-# ORDER, and it is the same rule Dev Containers' lifecycle comment used to state: the firewall
-# FIRST, before anything else runs or reaches the network — otherwise setup.sh's toolchain
-# download happens with unrestricted egress. It is raised on every start, not just at create,
-# because iptables rules live in the container's network namespace and do not survive a restart.
+# The firewall is the IMAGE'S entrypoint now, so it is already up: it is raised on `docker run`
+# and on `docker start`, by whoever issues them, which is what makes it a property of the container
+# rather than of this caller. Re-raising here is not a second rule — the raise is idempotent by
+# design — it is a SYNCHRONISATION POINT. `docker run` returns as soon as the container is started,
+# so without this the exec below could race the entrypoint and do its work on a half-built chain.
+# Running it synchronously is the cheapest way to know a raise has completed, and it keeps this
+# script's behaviour identical to the version that was actually exercised.
 say "egress firewall"
 docker exec "$NAME" sudo -n /usr/local/bin/init-firewall.sh
 
-if [ "$fresh" -eq 1 ]; then
-    say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
-    docker exec -w "$ctr_repo" "$NAME" bash .container/setup.sh
+# WHICH ARM, and it is asked of whether SETUP FINISHED — not of whether this invocation created the
+# container. `fresh=1` meant "docker run just succeeded", which is true a full minute before setup
+# is done: interrupt the toolchain download, or let any step fail, and the container is left with
+# no posture, no toolchain and no jkb, while every later run takes the verify arm instead — so
+# setup.sh becomes unreachable for the life of the container and only `--rm` escapes. Dev
+# Containers recorded postCreate completion and re-ran it after a failure; this is that. The marker
+# is in the writable layer, not a volume, so recreating the container correctly redoes setup.
+if docker exec "$NAME" test -e "$SETUP_MARKER" 2>/dev/null; then
+    setup_done=1
 else
-    # setup.sh ends by running verify.sh, so this is the arm that would otherwise never check.
-    say "verify"
-    docker exec -w "$ctr_repo" "$NAME" bash .container/verify.sh
+    setup_done=0
 fi
 
-# THE CONTAINER IS WHERE DEFERRAL IS NORMAL: a session cannot archive its own checkout, so every
-# `jkb task land` in here records one for later, and the host's `com.jkb.reap` cannot finish it
-# (the record names /home/vscode/... paths the host cannot see). Best-effort: a reaper that could
-# not run must never stop the firewall from having been raised.
-docker exec -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
+if [ "$setup_done" -eq 0 ]; then
+    [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
+    say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
+    docker exec -w "$ctr_repo" "$NAME" bash .container/setup.sh
+    verify_rc=0
+else
+    # THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was below, and verify.sh exits 1
+    # on any failing assertion under `set -e` — so one assertion about something else disabled the
+    # only reaper that can finish container-side archive records, whose /home/vscode/... paths the
+    # host's `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted
+    # postStartCommand ran it unconditionally and this is that shape back.
+    docker exec -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
+
+    # setup.sh ends by running verify.sh, so this is the arm that would otherwise never check. Its
+    # result is CARRIED rather than fatal: a failed assertion must still leave you able to read how
+    # to attach — several of them name a remedy you run from inside an attached window, and dying
+    # here printed the problem and withheld the way to fix it.
+    say "verify"
+    verify_rc=0
+    docker exec -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
+fi
 
 say "attached VS Code windows"
 cat <<EOF
@@ -340,6 +462,16 @@ EOF
 
 if [ "$OPEN" -eq 1 ]; then
     [ -n "$open_path" ] || open_path="$ctr_repo"
+    # A HOST PATH IS THE NATURAL THING TO TYPE — you are standing in one — and appending it to the
+    # container URI verbatim opened a window on a folder that does not exist in there, with no
+    # error, because VS Code will happily attach to a path it then cannot list. Translate anything
+    # under ~/repos; leave everything else alone, since a path already in container form (or
+    # anywhere else inside the container) is equally legitimate and this cannot tell them apart
+    # except by the mount, which is exactly the question container_path answers.
+    if translated="$(container_path "$open_path" 2>/dev/null)"; then
+        [ "$translated" = "$open_path" ] || say "opening the container's $translated (you named the host path)"
+        open_path="$translated"
+    fi
     command -v code >/dev/null 2>&1 || die "the 'code' CLI is not on PATH (VS Code: 'Shell Command: Install code in PATH')"
     # Attached containers are addressed by a hex-encoded JSON authority. This spelling is VS Code's
     # and is not something this repo can verify from a test, so it is a convenience on top of the
@@ -348,4 +480,13 @@ if [ "$OPEN" -eq 1 ]; then
     hex="$(printf '{"containerName":"/%s"}' "$NAME" | od -A n -t x1 | tr -d ' \n')"
     say "opening $open_path"
     code --folder-uri "vscode-remote://attached-container+$hex$open_path"
+fi
+
+# Carried from the verify above rather than exiting at it: the container IS up and attachable, and
+# several assertions name a remedy you run from inside it, so the instructions had to be printed
+# first. The exit code is still verify's, so a caller or CI cannot read a failed check as a pass.
+if [ "${verify_rc:-0}" -ne 0 ]; then
+    printf '\n\033[31mverify.sh reported problems (exit %s)\033[0m — the container is running and\n' "$verify_rc" >&2
+    printf 'attachable, but it is not what it claims to be. The failing lines above say what to do.\n' >&2
+    exit "$verify_rc"
 fi

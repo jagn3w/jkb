@@ -30,7 +30,11 @@ RUN apt-get update -qq \
 # path. It must never be run from the mounted workspace: a script the agent can edit, that the
 # agent can also sudo, is a root shell with extra steps.
 COPY --chown=root:root init-firewall.sh /usr/local/bin/init-firewall.sh
+# The entrypoint is root-owned for the same reason and by the same argument: it is what raises the
+# firewall on every start, so an agent able to rewrite it could simply not raise it.
+COPY --chown=root:root entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/init-firewall.sh \
+                    /usr/local/bin/entrypoint.sh \
     # Owned explicitly, not inherited. Everything here rests on `vscode` being unable to replace
     # the script sudo runs as root, or the allowlist snapshot beside it — and unlink/replace is
     # governed by the DIRECTORY, not the file mode. Debian-derived images have historically
@@ -38,7 +42,7 @@ RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/in
     # add the user to a group at any time. Same shape as the blanket-sudo grant: an inherited
     # property nothing in this repo stated. verify.sh asserts the result at runtime.
     && chmod 0755 /usr/local /usr/local/bin /usr/local/share \
-    && chmod 0755 /usr/local/bin/init-firewall.sh \
+    && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
     && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh ""\n' > /etc/sudoers.d/init-firewall \
     && chmod 0440 /etc/sudoers.d/init-firewall \
     # ...and the grant above means nothing while THIS file exists. The devcontainers base image
@@ -88,3 +92,8 @@ RUN /home/vscode/.container-build/fetch-extensions.sh /home/vscode/.vsix
 # Where an attached VS Code terminal lands by default. `/workspaces` was Dev Containers' own
 # convention and nothing puts anything there now.
 WORKDIR /home/vscode/repos
+
+# The egress firewall is raised HERE, by the container itself, so that `docker start` and Docker
+# Desktop's start button get it too — not only `run.sh`. See entrypoint.sh for why the two failure
+# modes are answered differently.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

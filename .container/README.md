@@ -75,13 +75,22 @@ the container deliberately has none. Automating it means a `postAttachCommand` i
 attached-container configuration (`imageConfigs/<image>.json` in its globalStorage), which is not
 wired up yet.
 
-`run.sh` raises the firewall **first** on every start, because iptables rules live in the
-container's network namespace and do not survive a restart, and because otherwise the rest of
-setup — including a toolchain download — runs with open egress. On a fresh container it then runs
-`setup.sh` (posture, toolchain, `jkb`, extensions, `verify.sh`); on a restart it runs `verify.sh`
-directly. Either way it ends by sweeping deferred worktree archives, which is the container's job
-because a session cannot archive its own checkout and the host's reaper cannot see
-`/home/vscode/...` paths.
+The firewall is raised by the image's **entrypoint**, so it comes up on `docker run` *and* on
+`docker start` — including Docker Desktop's start button and a daemon restart — rather than only
+when `run.sh` is the one starting it. That matters because iptables rules live in the container's
+network namespace and do not survive a stop: when the raise belonged to `run.sh` alone, every
+other way of starting the container gave an unattended agent unrestricted egress, and nothing
+checked. A boundary that depends on which caller you used is not one. `run.sh` re-raises it
+synchronously as well, which is not a second rule — the raise is idempotent — but a way of knowing
+it has finished before the next `docker exec` lands.
+
+`run.sh` then runs `setup.sh` (posture, toolchain, `jkb`, extensions, `verify.sh`) if setup has
+not completed in this container, and `verify.sh` alone if it has. That is decided by a marker
+`setup.sh` writes as its last act, **not** by whether this invocation created the container: an
+interrupted first run used to leave setup unreachable for the container's whole life. It also
+sweeps deferred worktree archives — the container's job, because a session cannot archive its own
+checkout and the host's reaper cannot see `/home/vscode/...` paths — and it does that *before*
+verifying, so a failing assertion about something else cannot disable it.
 
 ```sh
 ./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
@@ -164,9 +173,14 @@ side panel**, silently. Two of this repo's recurring shapes at once: an absence 
 checking, and a rule (`code` vs `code-server`) that the host installer knew and the container did
 not.
 
-`setup.sh` now builds and installs it from the workspace, by calling `scripts/install-extension.sh`
-— the **host's** installer, reused unchanged, so the container cannot ship a different build of the
-extension from the one you install on the host for reasons nobody decided. That script resolves
+`install-extensions.sh` builds and installs it from the workspace, by calling
+`scripts/install-extension.sh` — the **host's** installer, reused unchanged, so the container cannot
+ship a different build of the extension from the one you install on the host for reasons nobody
+decided. `setup.sh` calls that script too, but on a fresh container it finds no VS Code server and
+correctly does nothing: the server arrives when you **attach**, which is after setup has run. So on
+a new container this is the one step you run by hand, from a terminal in the attached window — see
+*Using it* above. (Under Dev Containers the order was the reverse, which is why it was never a
+separate step.) That script resolves
 `code-server` and its `--server-data-dir` itself when there is no `code` CLI, which is the dev
 container case. It builds from the checkout rather than from a snapshot baked into the image, so
 the panel matches the code you are working in, and it needs only `registry.npmjs.org`, which the

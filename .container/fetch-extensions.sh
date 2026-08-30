@@ -136,4 +136,18 @@ while read -r ext; do
     fi
 done <<<"$(dc_extensions "$here/container.json")"
 
+# A BUILD THAT STAGES NOTHING MUST FAIL, and this is the same argument as the download refusal
+# above one level up. Empty the `extensions` array, or rename the `customizations.vscode` path the
+# jq expression walks, and the loop body never ran: the image shipped an empty ~/.vsix,
+# install-extensions.sh installed nothing, and both said so with exit 0. `run.sh --build` does not
+# invoke check-config.sh, so nothing else was watching at that moment. The self-test at the top of
+# this file already asserts this refusal; the fetch path did not implement it.
+if [ "$count" -eq 0 ]; then
+    echo "fetch-extensions.sh: container.json declared NO extensions to stage." >&2
+    echo "  That is almost certainly a broken customizations.vscode.extensions path rather than a" >&2
+    echo "  deliberate empty list — and a container with no extensions is what this script exists" >&2
+    echo "  to prevent. Refusing the build." >&2
+    exit 1
+fi
+
 echo "fetch-extensions.sh: $count extension(s) staged in $dest"

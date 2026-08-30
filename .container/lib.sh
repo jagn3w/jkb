@@ -42,6 +42,21 @@ dc_mount_sources() { # dc_mount_sources <container.json>
 # only caller: all four have to agree about the string-vs-object spelling the spec allows at any
 # time, and a fourth private copy of that rule is how the thing that APPLIES the mount list comes
 # to disagree with the thing that VERIFIES it.
+# The declaration's human name, and the Dockerfile it names. Both exist so that `name` and `build`
+# are keys something actually READS — they were listed as consumed while nothing looked at either,
+# which made "every key in container.json is applied by run.sh" a true sentence about two inert
+# declarations. Each falls back to what run.sh used to hard-code, so a file omitting them behaves
+# exactly as before rather than breaking.
+dc_name() { # dc_name <container.json>
+    local n; n="$(dc_strip "$1" 2>/dev/null | jq -r '.name // empty' 2>/dev/null)"
+    printf '%s' "${n:-jkb dev container}"
+}
+
+dc_dockerfile() { # dc_dockerfile <container.json>
+    local f; f="$(dc_strip "$1" 2>/dev/null | jq -r '.build.dockerfile // empty' 2>/dev/null)"
+    printf '%s' "${f:-Dockerfile}"
+}
+
 dc_mount_specs() { # dc_mount_specs <container.json>
     dc_strip "$1" 2>/dev/null \
       | jq -r '(.mounts // [])[]

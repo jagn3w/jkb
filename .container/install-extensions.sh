@@ -34,7 +34,12 @@ if [ -z "$code_server" ]; then
     echo "  That is expected during first-run setup: VS Code installs its server when you ATTACH."
     echo "  Attach (Command Palette -> 'Dev Containers: Attach to Running Container' -> jkb-dev),"
     echo "  then run this again from a terminal in that window."
-    exit "${JKB_EXT_SKIP_RC:-0}"
+    # Plain 0. There was a JKB_EXT_SKIP_RC knob here so a caller could make this state fatal, and
+    # nothing anywhere set it — so the by-hand-versus-setup.sh distinction the text above describes
+    # existed only in the text, while every caller got the same exit code regardless. A knob with no
+    # user is not a seam, it is a claim the code does not honour; the two cases differ in what they
+    # PRINT, which is where the difference actually is.
+    exit 0
 fi
 
 while read -r ext; do

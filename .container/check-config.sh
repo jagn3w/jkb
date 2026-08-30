@@ -254,11 +254,58 @@ fi
 # `auto-mode-posture.json` on the same line, which cannot cross the double quote in setup.sh's own
 # `init-firewall.sh "$repo/scripts/..."` — so reverting setup.sh wholesale to the code this guard
 # exists to prevent still printed `ok`. It caught the JSON spelling and never the shell one.
+#
+# DERIVED, not enumerated. The hand-written list was `setup.sh run.sh`, in a directory this change
+# gave a third caller — a rule every new call site has to be remembered into is the defect, and the
+# guard that misses the newest caller is the one nobody notices. So: every script here that names
+# the firewall, minus the ones that only QUOTE it. That exclusion is three files that exist today
+# and is asserted non-empty and complete below, where adding a caller needs no edit at all.
+# Shell comments, removed. Two guards below need it and had one copy between them; a second
+# spelling of "what is a comment" is a second answer to the question they both ask.
+dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
+
+# THE SETUP MARKER IS SPELLED IN TWO FILES AND THEY CANNOT SHARE A VARIABLE: setup.sh runs inside
+# the container, run.sh on the host. So the agreement is asserted instead. If they drift, run.sh
+# looks for a marker setup.sh never writes — and then EVERY run re-runs the whole of setup, slowly,
+# for ever, while reporting success. That reads as working, which is why it needs a guard rather
+# than a comment.
+setup_marker_run="$(grep -oE 'SETUP_MARKER="[^"]+"' "$here/run.sh" | head -1 | sed 's/.*="//; s/"$//')"
+setup_marker_setup="$(dc_strip_comments "$here/setup.sh" | grep -oE 'touch[[:space:]]+/home/vscode/[^[:space:]]+' | head -1 | awk '{print $2}')"
+if [ -z "$setup_marker_run" ] || [ -z "$setup_marker_setup" ]; then
+    bad "could not find the setup-complete marker in both run.sh and setup.sh — one of them stopped naming it"
+elif [ "$setup_marker_run" != "$setup_marker_setup" ]; then
+    bad "run.sh looks for the setup marker at $setup_marker_run but setup.sh writes $setup_marker_setup — setup would re-run for ever"
+else
+    ok "run.sh and setup.sh agree on the setup-complete marker ($setup_marker_run)"
+fi
+
 callers_ok=1
-for caller in "$here/setup.sh" "$here/run.sh"; do
+callers=()
+for f in "$here"/*.sh; do
+    case "$(basename "$f")" in
+        init-firewall.sh|check-config.sh|mutate-config.sh) continue ;;  # the script itself, and the two harnesses that quote it
+    esac
+    grep -qF 'init-firewall.sh' "$f" && callers+=("$f")
+done
+[ "${#callers[@]}" -gt 0 ] || bad "no script here calls init-firewall.sh — the derivation below is checking nothing"
+for want in setup.sh run.sh entrypoint.sh; do
+    printf '%s\n' "${callers[@]##*/}" | grep -qxF "$want" \
+        || bad "$want no longer reaches the firewall-argument guard (did it stop calling init-firewall.sh?)"
+done
+for caller in ${callers[@]+"${callers[@]}"}; do
     # Anything that STARTS a word after the command is an argument — including a quote, which is
     # how the old setup.sh spelled it. Only a redirect, pipe, separator or end of line is not.
-    if grep -nE 'init-firewall\.sh[[:space:]]+[^;|&>#[:space:]]' "$caller" >/dev/null; then
+    #
+    # AN INVOCATION, NOT A MENTION, and deriving the caller list is what forced that distinction:
+    # scanning only setup.sh and run.sh, every occurrence happened to be a call, so the bare name
+    # was a good enough proxy. Over the whole directory it is not — the file name appears in a
+    # comment, in an error message and in a list of paths to chmod, and all three read as calls
+    # passing an argument. So the match is anchored on `sudo`, which is how it is invoked and the
+    # only way it CAN be (it needs root, and sudoers grants `vscode` exactly this one path);
+    # comments are stripped first, because a comment can mention sudoers too. A caller running it
+    # as root without sudo would slip past, and that is deliberate: nothing here is root, and the
+    # rule this guard enforces is a property of the sudoers grant.
+    if dc_strip_comments "$caller" | grep -nE 'sudo[^#]*init-firewall\.sh[[:space:]]+[^;|&>#[:space:]]' >/dev/null; then
         bad "$(basename "$caller") passes an argument to init-firewall.sh — sudoers permits none, and the allowlist is the root-owned snapshot"
         callers_ok=0
     fi
@@ -275,7 +322,7 @@ done
 # (its own first version, reported MISSED by the mutation), and matching the literal `1` walked
 # past the `exit 2` the argument refusal used — a refusal leaving no rules, which is the one thing
 # this checks for.
-stray_exits="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
+stray_exits="$(dc_strip_comments "$here/init-firewall.sh" | awk '
     /^fail_closed\(\) \{/ { infn = 1 }
     infn && /^\}/           { infn = 0; next }
     !infn && /(^|[^[:alnum:]_])exit[[:space:]]+[1-9]/ { print FNR }

@@ -1943,9 +1943,69 @@ is who starts the container, and it removes a limitation rather than working aro
   variable was not set.
 - **The lifecycle rule survives its mechanism.** The firewall is raised **first**, on every start,
   because iptables rules live in the container's network namespace and do not survive a restart and
-  because the rest of setup includes a toolchain download. It used to be spelled as
-  postCreate-before-postStart; it is now two lines in `run.sh`, and `setup.sh` raises it too rather
-  than trusting one caller — a boundary that depends on which caller you used is not one.
+  because the rest of setup includes a toolchain download.
+
+### What the review found: replacing a lifecycle moves its guarantees onto whoever replaces it
+
+Fifteen findings, four must-fix, **every one `introduced`** — and three of the four are one
+sentence: `postCreateCommand`/`postStartCommand` were not just *steps*, they were the statements
+*this happens on every start* and *this happens until it succeeds*. Deleting the lifecycle deleted
+the guarantees while the steps survived, and each defect is one guarantee that then had no owner.
+
+- **The firewall belongs to the CONTAINER, not to `run.sh`.** As one caller's step, `docker start
+  jkb-dev`, Docker Desktop's start button and a daemon restart all brought the container up with no
+  allowlist, and nothing checked, because attaching runs nothing. It is the image's **ENTRYPOINT**
+  now, so every route raises it. `run.sh` re-raises it synchronously — not a second rule, the raise
+  is idempotent, but `docker run` returns before the entrypoint finishes and the next `docker exec`
+  would race it. Two failure modes, answered differently: `init-firewall.sh`'s own `fail_closed`
+  has already installed deny-all and recorded why, so the container stays **up** (egress denied,
+  `verify.sh` reports the marker, a person can repair it); a failure that left no marker installed
+  no rules and **refuses to run**.
+- **"Did this invocation create the container" is not "did setup finish".** `fresh=1` is true a
+  minute before setup completes, so an interrupted first run left `setup.sh` permanently
+  unreachable — every later run took the verify arm, and only `--rm` escaped. The arm is chosen on
+  a marker `setup.sh` writes as its **last** act. It is spelled in two files that cannot share a
+  variable (one runs on the host, one in the container), so `check-config.sh` asserts they agree:
+  drift there re-runs the whole of setup for ever while reporting success, which reads as slowness
+  rather than as a bug.
+- **A fingerprint of the derived arguments included the host checkout path.** `runArgs` names the
+  seccomp profile by `${localWorkspaceFolder}`, so a session worktree — *the case this change
+  exists to enable* — computed a different hash from its main checkout, was told `created from a
+  different container.json` about a file that had not changed, and was advised `--rm`, destroying
+  the shared container plus `~/.vscode-server`, its extensions and `~/.jkb-ui-build`, none of which
+  are in a volume. Then the main checkout refused identically: two checkouts ping-ponging over a
+  declaration they agreed on. The workspace root is normalised out and the profile's **content** is
+  folded in, so a profile that really differs still forces a recreate.
+- **An assertion whose two conditions used to be one.** `verify.sh` checked the declared extensions
+  under the same condition `setup.sh` installs them under — true under Dev Containers, where the
+  server was unpacked before `postCreate`. Now the server arrives when you **attach**, so setup
+  installs nothing and the next `run.sh` finds a server with nothing in it: fatal, under `set -e`,
+  with the remedy "rebuild the container" — which reproduces that exact state. The never-installed
+  case reports and names `install-extensions.sh`; a server that has extensions but is missing a
+  declared one is still a failure, because that is the original bug.
+- **A verify that aborts is a verify that suppresses everything after it.** The deferred-archive
+  reap was unconditional in `postStartCommand` and ended up downstream of a fatal `verify.sh`, so
+  one unrelated assertion disabled the only reaper that can finish container-side archive records.
+  It runs **before** the verify now, and the verify's result is *carried* rather than exiting at
+  the point of failure — several assertions name a remedy you run from inside an attached window,
+  and dying printed the problem while withholding the way to fix it. The exit code is still
+  verify's.
+- **Two guards could not fire and one was inert.** `fetch-extensions.sh --self-test` was called by
+  nothing, so the marketplace URL derivation was exercised by no automated run; a zero-length
+  extension list staged nothing and exited 0; and `consumed_keys()` listed `name` and `build` while
+  `run.sh` read neither — so "every key is applied" was a true sentence about two inert
+  declarations, and the fix for the *next* inert key would have been to add it to the list, which
+  silences the check rather than satisfying it. Both keys are read now.
+- **Deriving a list forces a distinction that enumerating one hides.** The firewall-argument guard
+  named `setup.sh` and `run.sh` by hand, in a directory this change gave a third caller. Derived
+  over the directory, it immediately produced three false positives — the file name in a comment,
+  in an error message, and in a list of paths to `chmod` — because "mentions it" was only ever a
+  good enough proxy for "calls it" across two hand-picked files. It is anchored on `sudo` now,
+  which is the only way it *can* be invoked.
+- **`--build` rebuilt the image and left the container on the old one**, so a newly staged `.vsix`
+  never arrived while `install-extensions.sh` said "rebuild the container" — advice just followed.
+  The staleness check's own argument (`docker start` reuses what the container was built with)
+  applies to the image and was applied only to the arguments.
 
 ## Code review (D37) — our own reviewer, because the host's is not composable
 

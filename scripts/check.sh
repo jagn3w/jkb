@@ -57,7 +57,16 @@ fi
 # gate; the parts that need a container are .container/verify.sh and mutate-verify.sh. It
 # mainly guards the GENERATED seccomp profile, whose patch silently no-opping against a changed
 # upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
+#
+# ONE jq GUARD FOR THE WHOLE GROUP, not one per script. Every check below reads container.json
+# through lib.sh's `dc_*` helpers, so they stand or fall together — and they did not: check-config.sh
+# announced its own skip while run.sh --self-test went on to die red on the same missing tool, so a
+# fact about the machine read as a broken container derivation. A skip decided per-assertion is not
+# a skip; it is three different answers to one question.
 echo "==> container config"
+if ! command -v jq >/dev/null 2>&1; then
+    echo "   (skipped: jq not installed — 'brew install jq'; CI runs these gates)"
+else
 "$(dirname "$0")/../.container/check-config.sh"
 
 # ...and every assertion in it, watched failing. check-config.sh had no such harness while
@@ -65,21 +74,29 @@ echo "==> container config"
 # cannot fail. Needs no Docker either, so it belongs in the gate rather than beside mutate-verify.
 "$(dirname "$0")/../.container/mutate-config.sh"
 
-# The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
-# path encoding and its migration step is the only thing here that can lose a file, so both are
-# exercised against a scratch HOME. No container, no Docker, no network.
-"$(dirname "$0")/link-claude-memory.sh" --self-test
-
 # ...and the container's argument derivation. run.sh is the ONLY thing that applies
 # container.json now that VS Code does not read it, so a mistake in the derivation is a container
 # built to a different specification than the one every other check reads. The derivation is pure,
 # so it is exercised here; the parts needing Docker are verify.sh and mutate-verify.sh.
 "$(dirname "$0")/../.container/run.sh" --self-test
 
+# ...and the marketplace URL derivation. It was the one --self-test in .container/ that no caller
+# ran: the publisher/name split, the arm64/amd64 platform mapping and the refusal of an unknown
+# architecture were exercised by nothing, so breaking any of them kept the gate green and surfaced
+# as a 404 in somebody's `docker build`.
+"$(dirname "$0")/../.container/fetch-extensions.sh" --self-test
+
 # ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
 # a regex, and it is the one part of the mount boundary that widens by a typo instead of by an
 # edit somebody reviews — an over-broad exclusion drops a real mount from the set and the
 # assertion still prints `ok`. mutate-verify.sh covers it and needs Docker; this costs nothing.
 "$(dirname "$0")/../.container/verify.sh" --self-test
+fi
+
+# The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
+# path encoding and its migration step is the only thing here that can lose a file, so both are
+# exercised against a scratch HOME. No container, no Docker, no network — and deliberately OUTSIDE
+# the jq group above: it reads no container.json, so a missing jq is no reason to skip it.
+"$(dirname "$0")/link-claude-memory.sh" --self-test
 
 echo "All checks passed."

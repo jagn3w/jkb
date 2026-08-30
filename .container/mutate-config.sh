@@ -138,6 +138,53 @@ open(p, 'w').write(s.replace("consumed_keys() {\n    cat <<'KEYS'", "consumed_ke
 PYX
 run "run.sh stops naming the keys it applies" "cannot tell an applied key from an ignored one"
 
+# The firewall-argument guard now DERIVES its callers instead of naming setup.sh and run.sh, so it
+# covers a caller added later — the entrypoint being the first one that would have been missed.
+# Both halves of that derivation get watched failing, because a derived list that silently comes
+# back empty is a guard reporting `ok` about nothing, which is the failure the hand-written list at
+# least could not have.
+seed; for f in "$work"/t/.container/*.sh; do
+    case "$(basename "$f")" in
+        init-firewall.sh|check-config.sh|mutate-config.sh) continue ;;
+    esac
+    # Every mention removed, so nothing looks like a caller any more.
+    python3 - "$f" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh"))
+PYX
+done
+run "no script reaches the firewall-argument guard" "the derivation below is checking nothing"
+
+# ...and the completeness half: a caller that stops calling it must be reported, not quietly
+# dropped from a list that then still prints `ok`.
+seed; python3 - "$work/t/.container/entrypoint.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh"))
+PYX
+run "the entrypoint stops raising the firewall" "no longer reaches the firewall-argument guard"
+
+# The setup-complete marker, spelled in two files that cannot share a variable. Drift there makes
+# every run redo the whole of setup while reporting success — the kind of breakage that looks like
+# slowness rather than like a bug, so nobody goes looking.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("/home/vscode/.jkb-container-setup-complete",
+                             "/home/vscode/.jkb-setup-done"))
+PYX
+run "the two spellings of the setup marker drift apart" "setup would re-run for ever"
+
+# ...and the half that pins the extraction itself: a guard that cannot find either value must say
+# so rather than compare two empty strings and call them equal.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("touch /home/vscode/.jkb-container-setup-complete", ":"))
+PYX
+run "setup.sh stops writing the marker at all" "stopped naming it"
+
 seed; jq_dc '{}'
 run "the declaration is emptied" "this check just certified nothing"
 
@@ -308,7 +355,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=32
+PINNED_BAD_SITES=36
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

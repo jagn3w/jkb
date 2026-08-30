@@ -544,8 +544,17 @@ fi
 #
 #    SKIPPED where there is no VS Code server — `run.sh`, a plain docker run and
 #    mutate-verify.sh all build a correct container with no VS Code in it. The skip is printed
-#    rather than silent, and it is the SAME condition setup.sh installs under, so the two cannot
-#    disagree about whether this ran.
+#    rather than silent.
+#
+#    THE TWO CONDITIONS ARE NOT THE SAME ONE, and the comment here used to claim they were. That
+#    was true under Dev Containers, where the server was unpacked BEFORE postCreate. Now VS Code
+#    installs its server when you ATTACH, which is after setup.sh has run — so setup.sh legitimately
+#    finds no server and installs nothing, and by the time this runs on a later `run.sh` the server
+#    exists and has nothing in it. They evaluate at different times and routinely disagree, which is
+#    the ordinary state of every container between attaching and running install-extensions.sh.
+#    Failing there aborted `run.sh` under `set -e` and printed "rebuild the container" — advice that
+#    returns you to exactly that state. So the never-installed case REPORTS; a server that has
+#    extensions but is missing a declared one is still a failure, because that is the original bug.
 code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
 if [ -z "$code_server" ]; then
     echo "  skip no VS Code server in this container — extensions not checked (not a VS Code launch)"
@@ -560,10 +569,18 @@ else
         declared="$declared"$'\n'"$local_ext"
     fi
     missing="$(missing_extensions "$declared" "$installed")"
-    if [ -n "$missing" ]; then
-        bad "declared extensions are not installed:$missing (marketplace ones come from ~/.vsix, the jkb explorer from scripts/install-extension.sh; rebuild the container)"
+    present="$(printf '%s\n' "$installed" | grep -c . || true)"
+    if [ -z "$missing" ]; then
+        ok "every declared VS Code extension is installed ($present present)"
+    elif [ "$present" -eq 0 ]; then
+        # Nothing at all has been installed into this server, which is what attaching leaves behind
+        # — not a broken install. The remedy is a command, and it is the command that exists for it.
+        echo "  note this VS Code server has no extensions yet — attaching does not install them."
+        echo "       Run  ./.container/install-extensions.sh  from a terminal in the attached window."
     else
-        ok "every declared VS Code extension is installed ($(printf '%s\n' "$installed" | grep -c .) present)"
+        bad "declared extensions are not installed:$missing — $present other(s) are, so this is not the
+       never-installed state. Run ./.container/install-extensions.sh from an attached terminal; if it
+       reports one was not staged into the image, rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
     fi
 fi
 
