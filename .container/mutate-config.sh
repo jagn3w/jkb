@@ -47,9 +47,40 @@ seed() {
 DC() { printf '%s' "$work/t/.container/container.json"; }
 
 EXPECTS=()
+# EVERY MUTATION MUST ACTUALLY HAVE MUTATED SOMETHING. Most of these edit the seeded copy with a
+# literal `s.replace(...)` against a whitespace-exact target -- ten leading spaces of YAML, an exact
+# path expression -- and a bare replace that matches NOTHING is silent. Reindent a CI step or move
+# a path into a variable and the unmutated tree is handed to check-config.sh, which passes, and the
+# harness prints MISSED: a red shared gate blaming a guard that is perfectly fine, pointing at the
+# wrong file. `sub_dc` and a couple of the blocks assert their target is present for exactly this
+# reason; nineteen others did not.
+#
+# Asked ONCE here rather than added to each block, so a mutation written next year cannot omit it.
+# Comparing the whole seeded tree against the pristine one also catches a mutation that edits the
+# wrong file, which a per-block assertion would not.
+# DERIVED FROM THE SEEDED TREE, not from a list of the files seed() copies. The first version
+# named three paths and immediately called two perfectly good mutations no-ops, because they edit
+# ui/vscode/package.json and scripts/auto-mode-posture.json -- a second list that has to be kept in
+# step with seed(), which is the defect this file keeps finding elsewhere. Walking what was
+# actually seeded needs no list and covers a file added to seed() tomorrow.
+mutated() { # mutated -> 0 if anything in the seeded tree differs from the repo
+    local f
+    while IFS= read -r f; do
+        cmp -s "$f" "$repo/${f#"$work/t/"}" || return 0
+    done < <(find "$work/t" -type f)
+    return 1
+}
+
 run() { # run <label> <expect-substring>
     local label="$1" expect="$2" out rc
     EXPECTS+=("$expect")
+    if ! mutated; then
+        fails=$((fails+1))
+        printf '  \033[31mNO-OP\033[0m    %s\n' "$label"
+        printf '           the mutation changed nothing — its target has moved, so this tests the\n'
+        printf '           UNMUTATED tree and would report MISSED about a guard that is fine.\n'
+        return
+    fi
     out="$(cd "$work/t" && ./.container/check-config.sh 2>&1)"; rc=$?
     judge "$label" "$expect" "$out" "$rc"
 }
@@ -239,6 +270,18 @@ open(p, 'w').write(s.replace('iptables -w 5 -C OUTPUT $RULE_ALLOWLIST',
                              'iptables -w 5 -C OUTPUT -m set --match-set allowed-new dst -j ACCEPT', 1))
 PYX
 run "the probe spells the allowlist rule itself" "egress-lib.sh spells an OUTPUT rule inline"
+
+# ...and the emptiness half. Routing the calls through a wrapper, or a line continuation, yields no
+# lines for the loop at all -- so it examines nothing and prints its ok, which is the vacuous pass
+# every other derived list in check-config.sh is pinned against.
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'\b(ip6tables|iptables) -w 5 -C OUTPUT', 'IPT -C CHAIN', s)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the shared-rule check can find no rules to check" "just certified nothing"
 
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
@@ -506,7 +549,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=48
+PINNED_BAD_SITES=49
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

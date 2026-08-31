@@ -264,6 +264,20 @@ open    denied absent yes unfiltered
 open    open   open   no  unfiltered
 TABLE
 
+    # `in_vocab` MUST BE ABLE TO REJECT SOMETHING. Every row above hands it a value `eq` has
+    # already compared against a `want` that is itself one of the three states, so a value outside
+    # the vocabulary implies the row already failed -- the assertion ran on every row and could
+    # never be the one to fire. Its stated purpose is the branch it cannot reach from a table:
+    # `verdict_state` echoing back whatever bounded-word a caller passes.
+    #
+    # Exercised here on a value no row produces, in a subshell so the real tally is untouched, and
+    # BOTH ways round -- an assertion that only ever rejects is as useless as one that only ever
+    # accepts.
+    n="$( fails=0; in_vocab demo wibble >/dev/null; printf '%s' "$fails" )"
+    eq "in_vocab rejects a state outside the vocabulary" "$n" "1"
+    n="$( fails=0; in_vocab demo denied  >/dev/null; printf '%s' "$fails" )"
+    eq "...and accepts one inside it"                    "$n" "0"
+
     t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
     : > "$t/no-route"
     printf '00000000000000000000000000000001 01 80 10 80       lo\n' > "$t/lo"

@@ -372,10 +372,13 @@ fi
 # second copy of the thing being checked); it requires that no site spells one out inline.
 rules_ok=1
 for f in init-firewall.sh egress-lib.sh; do
+    seen=0
     # Every OUTPUT-chain install or probe must expand a $RULE_* constant rather than name a match
     # or a target itself. `-F`/`-P` and the DNS/loopback/conntrack openings are not rules the probe
     # reads back, so they are not in scope: this is only about the specs that BOTH sides state.
     while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        seen=$((seen+1))
         case "$line" in
             *'$RULE_'*) ;;
             *'-j REJECT'*|*'--match-set'*)
@@ -383,8 +386,24 @@ for f in init-firewall.sh egress-lib.sh; do
                 rules_ok=0 ;;
         esac
     done <<EOF
-$(dc_strip_comments "$here/$f" | grep -E '(iptables|ip6tables) .* -(A|C) OUTPUT ')
+$(dc_strip_comments "$here/$f" | grep -E '(iptables|ip6tables)[[:space:]].*[[:space:]]OUTPUT([[:space:]]|$)')
 EOF
+    # MATCHED ON THE CHAIN OPERAND, not on one spelling of the flag. This selected `-A OUTPUT ` and
+    # `-C OUTPUT ` literally, so writing the probe as `iptables --check OUTPUT ...` -- iptables'
+    # own long form for the same thing -- meant the line was never extracted and therefore never
+    # examined, and the guard printed ok having looked at nothing. The shipped defect this exists
+    # for was re-introducible one flag spelling along.
+    #
+    # Broadening is safe: lines that touch OUTPUT without stating a shared spec (-F, -P, the DNS
+    # and loopback openings) carry neither REJECT nor --match-set and fall through the case arms.
+    #
+    # PINNED AGAINST AN EMPTY EXTRACTION, like every other derived list here. Routing the calls
+    # through a wrapper variable, or a line continuation, yields no lines at all -- the loop never
+    # runs and the same ok prints.
+    if [ "$seen" -eq 0 ]; then
+        bad "no OUTPUT-chain rule lines could be read out of $f — the check that the raise and the probe state one spec just certified nothing"
+        rules_ok=0
+    fi
 done
 [ "$rules_ok" -eq 1 ] && ok "the raise installs and the probe reads back one shared rule spec"
 
@@ -394,8 +413,16 @@ done
 # one from check.sh and CI exercises a script nobody runs locally. Derived from both files and
 # compared, which is the rule this file already applies to the setup marker, the verdict path and
 # run.sh's consumed keys.
+# COMMENTS STRIPPED FIRST, because a commented-out self-test is not a self-test that runs. Both
+# files are read raw before this, so commenting out `./.container/verify.sh --self-test` in ci.yml
+# and the egress-status one in check.sh -- which is exactly how a step gets temporarily disabled --
+# still had the two lists agreeing and both guards printing ok, while two self-tests ran nowhere.
+# YAML and shell share `#`, so one stripper serves both. It is the same anchoring rule this file
+# already applies a hundred lines above to the run.sh/verify.sh invocation guard, whose comment
+# says that matching a MENTION rather than an INVOCATION is this directory's most-repeated defect.
 selftests_of() { # selftests_of <file>  -> the .container scripts it runs --self-test on, sorted
-    grep -oE '[A-Za-z0-9_.-]+\.sh" --self-test|[A-Za-z0-9_.-]+\.sh --self-test' "$1" 2>/dev/null \
+    dc_strip_comments "$1" 2>/dev/null \
+        | grep -oE '[A-Za-z0-9_.-]+\.sh" --self-test|[A-Za-z0-9_.-]+\.sh --self-test' \
         | sed 's/"* --self-test$//' | sed 's#.*/##' | sort -u
 }
 gate_selftests="$(selftests_of "$here/../scripts/check.sh")"
@@ -417,8 +444,8 @@ for f in "$here"/*.sh; do
     case "$b" in check-config.sh|mutate-config.sh|mutate-verify.sh) continue ;; esac
     grep -qE '^\s*(if )?\[ "\$\{?1' "$f" 2>/dev/null || true
     if grep -qF -- '--self-test' "$f" 2>/dev/null; then
-        grep -qF -- "$b\" --self-test" <<<"$(cat "$here/../scripts/check.sh")" \
-            || grep -qF -- "$b --self-test" <<<"$(cat "$here/../scripts/check.sh")" \
+        grep -qF -- "$b\" --self-test" <<<"$(dc_strip_comments "$here/../scripts/check.sh")" \
+            || grep -qF -- "$b --self-test" <<<"$(dc_strip_comments "$here/../scripts/check.sh")" \
             || ungated+=("$b")
     fi
 done
