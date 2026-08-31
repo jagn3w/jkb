@@ -34,7 +34,33 @@ say() { printf '[firewall] %s\n' "$*"; }
 # ABSENCE IS ITS OWN ANSWER. Dying before this is written leaves no file, which readers treat as
 # `unknown` and therefore refuse — so writing it late is safe in the one direction that matters,
 # where writing the old marker early was what made it uninformative.
-readonly VERDICT=/run/jkb-egress-verdict
+# Overridable ONLY so --self-test can point it somewhere writable, exactly as entrypoint.sh's
+# reader is. It cannot weaken anything: sudo runs with env_reset, so the sudoers-granted path
+# never sees a caller's value, and a non-root run that supplies one cannot write the real file
+# anyway (it is root-owned). The value only selects which file is written.
+VERDICT="${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}"
+
+# THE VOCABULARY, named once. A state a reader does not have an arm for falls into its `*` case and
+# is treated as unknown — which under D50.3 is a container that refuses to boot, for ever, over a
+# word. So check-config.sh requires every state here to be handled by entrypoint.sh and verify.sh,
+# and the self-test below requires verdict_state to return nothing outside it. Neither half is
+# decorative: adding a state without teaching the readers fails the gate, and inventing one in
+# verdict_state fails the self-test.
+readonly VERDICT_STATES="allowlisted denied unfiltered"
+
+# WHAT THE RAISE ESTABLISHED, from each family's measured state — the ONE statement of it (D50.2/
+# D50.4). Two callers reach it, the fail-closed path and the success path, differing only in what
+# "bounded" is called there: a blanket deny is `denied`, a raised allowlist is `allowlisted`.
+# Spelling the rule at each site instead is precisely how the success path came to allowlist IPv4,
+# print "IPv6 is UNFILTERED", and report success anyway — one site was fixed and the other kept its
+# own wording. A third caller cannot now invent a third reading.
+#
+# A family counts as closed when it is `denied`, or `absent` (no address and no route — denial by a
+# second means, D50.4). Everything else, INCLUDING a measurement that could not be taken, is open.
+verdict_state() { # verdict_state <v4> <v6> <state-if-bounded> -> <state-if-bounded>|unfiltered
+    case "$1" in denied|allowlisted) ;; *) printf 'unfiltered'; return ;; esac
+    case "$2" in denied|absent) printf '%s' "$3" ;; *) printf 'unfiltered' ;; esac
+}
 
 record_verdict() { # record_verdict <state> <v4> <v6> <reason...>
     local state="$1" v4="$2" v6="$3"; shift 3
@@ -57,9 +83,13 @@ v6_state() {
         printf 'denied'; return
     fi
     # No v6 interface addresses beyond loopback (::1/128) means nothing can leave over v6. Read
-    # from /proc rather than from `ip`, which the image is not guaranteed to carry.
-    if [ ! -e /proc/net/if_inet6 ]; then printf 'absent'; return; fi
-    if ! grep -qvE '^0{31}1 ' /proc/net/if_inet6 2>/dev/null; then printf 'absent'; return; fi
+    # from /proc rather than from `ip`, which the image is not guaranteed to carry. The path is
+    # overridable only so --self-test can exercise this parse: the host it is developed on has no
+    # /proc at all, so on the real path this would answer `absent` for the wrong reason and the
+    # fiddly part — the 31-zeros-then-1 loopback pattern — would never run.
+    local inet6="${JKB_INET6_PATH:-/proc/net/if_inet6}"
+    if [ ! -e "$inet6" ]; then printf 'absent'; return; fi
+    if ! grep -qvE '^0{31}1 ' "$inet6" 2>/dev/null; then printf 'absent'; return; fi
     printf 'open'
 }
 
@@ -95,11 +125,7 @@ fail_closed() { # fail_closed <message...>
     # THE STATE IT LEAVES BEHIND, not the fact that it ran (D50.2). Both families must be provably
     # closed to call this denied; anything else is unfiltered, and under D50.3 the entrypoint
     # refuses to boot on it rather than printing that egress is denied and running anyway.
-    if [ "$v4" = denied ] && { [ "$v6" = denied ] || [ "$v6" = absent ]; }; then
-        record_verdict denied "$v4" "$v6" "$*"
-    else
-        record_verdict unfiltered "$v4" "$v6" "$*"
-    fi
+    record_verdict "$(verdict_state "$v4" "$v6" denied)" "$v4" "$v6" "$*"
 
     # NAMES WHAT IT ACTUALLY COVERED. "DENIED" unconditionally is the one sentence an operator
     # would act on, and it was asserting a state this function had not established.
@@ -112,6 +138,91 @@ fail_closed() { # fail_closed <message...>
     fi
     exit 1
 }
+
+# --- self-test --------------------------------------------------------------------------------
+# What this script RECORDS is now what decides whether the container boots (D50.3), and until this
+# existed that half had no executable coverage at all while its reader had fourteen assertions.
+# Everything below is pure or path-injected, so it needs no container, no root and no iptables.
+# Placed above `set -E`/the ERR trap deliberately: a failing assertion should report itself, not
+# route into fail_closed. Only when it is the sole argument — the real invocation takes none.
+if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then
+    fails=0
+    eq() { # eq <label> <got> <want>
+        if [ "$2" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+        else fails=$((fails+1)); printf '  \033[31mFAIL\033[0m %s (got %s, wanted %s)\n' "$1" "$2" "$3"; fi
+    }
+    echo "==> firewall self-test: what the raise records"
+
+    # THE RULE, as a literal table rather than a re-derivation. Writing the expectation as a second
+    # copy of the condition would pass for any condition, including the wrong one this replaced.
+    # Columns: v4  v6  what-bounded-is-called-here  expected-verdict
+    while read -r v4 v6 bounded want; do
+        [ -n "${v4:-}" ] || continue
+        got="$(verdict_state "$v4" "$v6" "$bounded")"
+        eq "verdict_state $v4 $v6 -> $want" "$got" "$want"
+        # ...and it never invents a state the readers have no arm for. Checked on every row rather
+        # than once, because the value is what a caller passes in on one of the two branches.
+        case " $VERDICT_STATES " in *" $got "*) ;;
+            *) fails=$((fails+1)); printf '  \033[31mFAIL\033[0m verdict_state returned %s, which is not in VERDICT_STATES\n' "$got" ;;
+        esac
+    done <<'TABLE'
+denied      denied denied      denied
+denied      absent denied      denied
+denied      open   denied      unfiltered
+denied      wat    denied      unfiltered
+open        denied denied      unfiltered
+open        absent denied      unfiltered
+open        open   denied      unfiltered
+wat         denied denied      unfiltered
+allowlisted denied allowlisted allowlisted
+allowlisted absent allowlisted allowlisted
+allowlisted open   allowlisted unfiltered
+allowlisted wat    allowlisted unfiltered
+TABLE
+
+    t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
+
+    # THE MEASUREMENT. The loopback pattern is 31 zeros then a 1 then a space, matched against the
+    # kernel's own column format; getting it wrong reads a real address as loopback and reports
+    # `absent`, which is a verdict of "provably closed" over an open network.
+    printf '00000000000000000000000000000001 01 80 10 80       lo\n' > "$t/lo-only"
+    printf '00000000000000000000000000000001 01 80 10 80       lo\nfe80000000000000042aff0fe4c0a01 02 40 20 80     eth0\n' > "$t/has-addr"
+    : > "$t/empty"
+    eq "loopback only is absent"        "$(JKB_INET6_PATH="$t/lo-only"  v6_state)" "absent"
+    eq "a real v6 address is open"      "$(JKB_INET6_PATH="$t/has-addr" v6_state)" "open"
+    eq "an empty table is absent"       "$(JKB_INET6_PATH="$t/empty"    v6_state)" "absent"
+    eq "no table at all is absent"      "$(JKB_INET6_PATH="$t/nope"     v6_state)" "absent"
+
+    # THE FORMAT, against the REAL reader. This contract spans two files — record_verdict writes
+    # it, entrypoint.sh's verdict_field parses it — and nothing checked that they agree, which is
+    # the one thing a static check cannot reach. A stub `sudo` that writes nothing stands in for
+    # the raise, so what the entrypoint reads is exactly what was written here.
+    ep="$(dirname "$0")/entrypoint.sh"
+    if [ ! -r "$ep" ]; then
+        fails=$((fails+1)); printf '  \033[31mFAIL\033[0m entrypoint.sh is not beside this script — the round-trip below checked nothing\n'
+    else
+        mkdir -p "$t/bin"
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$t/bin/sudo"; chmod +x "$t/bin/sudo"
+        read_back() { # read_back <state> <v6> <reason> -> what the entrypoint did
+            VERDICT="$t/verdict" record_verdict "$1" denied "$2" "$3"
+            JKB_EGRESS_VERDICT="$t/verdict" PATH="$t/bin:$PATH" \
+                bash "$ep" echo BOOTED 2>"$t/err" || true
+        }
+        eq "a recorded allowlisted verdict boots" "$(read_back allowlisted denied ok)"        "BOOTED"
+        eq "a recorded denied verdict boots"      "$(read_back denied absent 'chain rebuilt')" "BOOTED"
+        eq "a recorded unfiltered verdict does not" "$(read_back unfiltered open 'no ip6tables')" ""
+        # A reason with spaces must survive as one field; the entrypoint prints it back.
+        read_back denied absent 'the snapshot was unreadable' >/dev/null
+        eq "the reason reaches the reader intact" \
+           "$(grep -c 'the snapshot was unreadable' "$t/err")" "1"
+    fi
+
+    echo
+    [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
+    printf '\033[32mfirewall self-test passed\033[0m\n'
+    exit 0
+fi
+# ------------------------------------------------------------------------------------------------
 
 # EVERY abort routes through it, not just the ones written as refusals. `set -e` aborts do not go
 # near `fail_closed`, and one of them fires with the OUTPUT chain already flushed and empty —
@@ -326,7 +437,9 @@ fi
 # See fail_closed: an unobtainable measurement is `open` (D50.4), and a bare assignment
 # would abort into fail_closed under the ERR trap.
 v6="$(v6_state)" || v6=open
-if [ "$v6" = denied ] || [ "$v6" = absent ]; then
+# The check above established IPv4: the default-REJECT rule is in place behind the allowlist, so
+# `allowlisted` here is measured, not assumed. Same rule as fail_closed's, same function.
+if [ "$(verdict_state allowlisted "$v6" allowlisted)" = allowlisted ]; then
     record_verdict allowlisted allowlisted "$v6" "allowlist raised for $resolved addresses from $declared domains"
     if [ "$v6" = denied ]; then
         say "egress default-deny is active (IPv4 allowlisted, IPv6 denied outright)"

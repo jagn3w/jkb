@@ -506,8 +506,11 @@ assert "knowledge base is mounted" "$kb_mounted"
 #    one-sided test while having broken the container.
 # WHAT THE FIREWALL DID, not what egress happens to do. The two probes below both resolve a name,
 # so a dead resolver produces the same answers as a deny-all — which meant the harness case for
-# `fail_closed` passed without ever establishing that it installed anything. The marker is written
-# by `fail_closed` and cleared only by a successful raise, so it says which of the two happened.
+# `fail_closed` passed without ever establishing that it installed anything. The raise records what
+# it ESTABLISHED on every ending it reaches (D50.2), so this reads that rather than probing.
+# Deliberately NOT the exit code and no longer a bare marker: the marker this replaced was written
+# before any iptables call, so it meant "fail_closed ran" — true both when a deny-all went in and
+# when installing it failed and egress was left wide open.
 egress_verdict=/run/jkb-egress-verdict
 eg_state="$(sed -n 's/^state=//p' "$egress_verdict" 2>/dev/null | head -1)"
 eg_reason="$(sed -n 's/^reason=//p' "$egress_verdict" 2>/dev/null | head -1)"

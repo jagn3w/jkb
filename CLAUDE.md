@@ -1983,6 +1983,29 @@ patch again.
   `open` — which is also, exactly, what the existing `set -E`/ERR-trap guard demanded of the
   assignment. **That guard caught this change as it was written**: a bare `v6="$(v6_state)"` would
   have aborted the whole raise into `fail_closed`.
+- **The rule is stated once (`verdict_state`), because it was already spelled twice.** The
+  fail-closed path and the success path each decided "both families provably closed" in their own
+  wording, and that is *how* the success path came to report success on unfiltered IPv6: one site
+  was fixed and the other kept its own reading. They differ only in what bounded is called there —
+  a blanket deny is `denied`, a raised allowlist is `allowlisted` — which is an argument, not a
+  second rule. Found by this file's own question, *who else implements this rule*.
+- **The writer's half now has a self-test, and it was the half that had none.** The reader had
+  fourteen assertions and the measurement behind its verdict had zero — the wrong way round, since a
+  verdict is only as good as what established it. `init-firewall.sh --self-test` is pure and
+  path-injected (`JKB_INET6_PATH`, `JKB_EGRESS_VERDICT`): no iptables, no root, no `/proc`. It pins
+  the rule as a **literal table** rather than a re-derivation — writing the expectation as a second
+  copy of the condition passes for any condition, including the wrong one this replaced — and it
+  round-trips `record_verdict` through the **real** `entrypoint.sh`, which is the one contract
+  spanning two files that no static check can reach. All three groups were watched failing.
+- **The vocabulary is single-sourced too** (`VERDICT_STATES`). A reader with no arm for a state the
+  writer records drops it into `*`, and unknown means a container that refuses to boot **for ever**,
+  over a word. `check-config.sh` requires both readers to carry an arm for every declared state;
+  the self-test requires `verdict_state` to return nothing outside it. Neither half is decorative.
+- **Two existing guards fired on this change, and exempting them needed a guard of its own.** The
+  self-test block sits above `set -E`, so the stray-exit and bare-substitution rules do not apply to
+  it — but that is only true while it *exits* before the trap is installed. So the exemption is
+  paired with a check that the block ends in an exit: a refactor that let it fall through would run
+  during a real raise while still exempt from the two rules that make one survivable.
 - **The one escape is recorded.** `JKB_EGRESS_ACCEPT_UNFILTERED=1` in `containerEnv` — fixed at
   create, so a session inside cannot grant it to itself, and `docker start` honours the same
   decision, which a `run.sh` flag could not. `verify.sh` reports it as a **failure** every run for

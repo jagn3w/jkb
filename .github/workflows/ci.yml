@@ -93,12 +93,14 @@ jobs:
       # it defers to actually happens.
       #   run.sh          the docker argument derivation and the staleness fingerprint
       #   entrypoint.sh   the boot decision, against a stubbed firewall raise (D50.3)
+      #   init-firew...   what the raise records, and the format the reader parses (D50.2/D50.4)
       #   fetch-ext...    the marketplace URL and platform mapping
       #   verify.sh       the mount-exclusion regex
       - name: container derivations
         run: |
           ./.container/run.sh --self-test
           ./.container/entrypoint.sh --self-test
+          ./.container/init-firewall.sh --self-test
           ./.container/fetch-extensions.sh --self-test
           ./.container/verify.sh --self-test
 

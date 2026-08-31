@@ -339,6 +339,29 @@ else
     ok "the writer and both readers agree on the egress verdict path ($(printf '%s' "$verdict_paths" | head -1))"
 fi
 
+# ...and on the STATES that path carries. The path agreeing is not enough: a reader with no arm for
+# a state the writer records drops it into `*`, which both readers treat as unknown — and unknown
+# under D50.3 is a container that refuses to boot, permanently, over a word nobody taught them.
+# Single-sourced from init-firewall.sh's VERDICT_STATES so this is not a fourth list to keep in
+# step; the writer's own self-test is what stops verdict_state returning something absent from it.
+verdict_states="$(grep -oE '^readonly VERDICT_STATES="[^"]*"' "$here/init-firewall.sh" 2>/dev/null \
+                  | head -1 | sed 's/.*="//; s/"$//')"
+if [ -z "$verdict_states" ]; then
+    bad "init-firewall.sh no longer declares VERDICT_STATES — the check that both readers handle every verdict is now checking nothing"
+else
+    states_ok=1
+    for st in $verdict_states; do
+        for rf in entrypoint.sh verify.sh; do
+            # A case arm for the state, i.e. the bare word followed by `)` — not a mention of it
+            # in a comment or a message, which is how a reader can look like it handles a state
+            # it only talks about.
+            grep -qE "^[[:space:]]*(\*\|)?$st\)" "$here/$rf" 2>/dev/null \
+                || { bad "$rf has no case arm for the '$st' verdict — it would read that state as unknown and refuse"; states_ok=0; }
+        done
+    done
+    [ "$states_ok" -eq 1 ] && ok "both readers handle every verdict state ($verdict_states)"
+fi
+
 callers_ok=1
 callers=()
 for f in "$here"/*.sh; do
@@ -383,9 +406,11 @@ done
 # past the `exit 2` the argument refusal used — a refusal leaving no rules, which is the one thing
 # this checks for.
 stray_exits="$(dc_strip_comments "$here/init-firewall.sh" | awk '
+    /^if \[ "\$#" -eq 1 \]/ { inself = 1 }
+    inself && /^fi$/        { inself = 0; next }
     /^fail_closed\(\) \{/ { infn = 1 }
     infn && /^\}/           { infn = 0; next }
-    !infn && /(^|[^[:alnum:]_])exit[[:space:]]+[1-9]/ { print FNR }
+    !infn && !inself && /(^|[^[:alnum:]_])exit[[:space:]]+[1-9]/ { print FNR }
 ')"
 if [ -z "$stray_exits" ]; then
     ok "every refusal in init-firewall.sh goes through fail_closed"
@@ -420,11 +445,35 @@ fi
 # Checked here because the Docker harness cannot reach the DNS-failure path, and because the next
 # substitution added to this file has the same trap waiting for it.
 bare_subst="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$here/init-firewall.sh" | awk '
+    # The --self-test block is out of scope for BOTH this and the stray-exit rule above: it runs
+    # above `set -E`, exits unconditionally before the ERR trap is ever installed, and is never
+    # reached during a raise (the sudoers entry pins the script to no arguments). The exemption is
+    # not taken on trust — the check below requires the block to end in an exit, so it cannot grow
+    # a fall-through into the operational body and quietly take the exemption with it.
+    /^if \[ "\$#" -eq 1 \]/ { inself = 1 }
+    inself && /^fi$/        { inself = 0; next }
+    inself                  { next }
     # An assignment whose value is a command substitution, at statement level.
     /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="?\$\(/ {
         if ($0 !~ /\|\|/) print FNR ": " $0
     }
 ')"
+# WHAT MAKES THAT EXEMPTION SAFE. Both rules above skip the --self-test block because it exits
+# before `set -E` installs the ERR trap. If it ever stopped exiting — an early `return`, a removed
+# `exit 0`, a refactor that lets it fall through — its code would run during a real raise while
+# still being exempt from the two rules that make a raise survivable. So: the last statement in
+# the block must be an exit.
+selftest_tail="$(dc_strip_comments "$here/init-firewall.sh" | awk '
+    /^if \[ "\$#" -eq 1 \]/ { inself = 1; next }
+    inself && /^fi$/        { print last; inself = 0 }
+    inself && /[^[:space:]]/ { last = $0 }
+')"
+case "$selftest_tail" in
+    *exit*) ok "init-firewall.sh's self-test block exits rather than falling into the raise" ;;
+    "")     bad "init-firewall.sh has no --self-test block, but check.sh and CI run it — the writer's verdict logic is unexercised" ;;
+    *)      bad "init-firewall.sh's --self-test block does not end in an exit (last statement: $selftest_tail) — it could fall through into a real raise while exempt from the two rules that make one survivable" ;;
+esac
+
 if [ -z "$bare_subst" ]; then
     ok "every command substitution in init-firewall.sh can fail without aborting the raise"
 else

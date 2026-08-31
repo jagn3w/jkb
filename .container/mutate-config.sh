@@ -230,6 +230,40 @@ run "a reader stops naming the verdict at all" "is not named by:"
 seed; jq_dc '{}'
 run "the declaration is emptied" "this check just certified nothing"
 
+# The verdict VOCABULARY. The path agreeing is not enough: a reader with no arm for a state the
+# writer records reads it as unknown, and unknown is a container that refuses to boot for ever.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("    denied)      bad ", "    refused)     bad ", 1))
+PYX
+run "a reader loses the arm for a verdict state" "has no case arm for the 'denied' verdict"
+
+seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('readonly VERDICT_STATES="', 'readonly NOT_THE_STATES="', 1))
+PYX
+run "the writer stops declaring its states" "no longer declares VERDICT_STATES"
+
+# ...and what makes the two ERR-trap rules safe to exempt the self-test from: that it exits.
+seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+# Drop the final `exit 0`, so the block would fall through into a real raise.
+open(p, 'w').write(s.replace("    printf '\\033[32mfirewall self-test passed\\033[0m\\n'\n    exit 0\n",
+                             "    printf '\\033[32mfirewall self-test passed\\033[0m\\n'\n", 1))
+PYX
+run "the self-test can fall through into a real raise" "does not end in an exit"
+
+seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index('if [ "$#" -eq 1 ]'); j = s.index('\nfi\n', i)
+open(p, 'w').write(s[:i] + s[j+4:])
+PYX
+run "the writer's self-test is deleted outright" "the writer's verdict logic is unexercised"
+
 # A mutation harness whose expectation no longer matches its subject reports MISSED for ever.
 # mutate-verify.sh needs Docker so this gate cannot run it; the strings are checkable statically.
 seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
@@ -397,7 +431,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=41
+PINNED_BAD_SITES=45
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
