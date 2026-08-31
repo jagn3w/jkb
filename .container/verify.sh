@@ -315,8 +315,21 @@ unwritable_ok=1
 # two directories, and every path below would still test unwritable while the sudoers entry ran the
 # agent's script as root. Debian ships /usr/local as root:staff drwxrwsr-x, so this is one group
 # membership away on a floating base tag.
-for path in /usr/local /usr/local/bin /usr/local/bin/init-firewall.sh /usr/local/share \
-            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d; do
+# The FILES come from the Dockerfile's own root-owned COPY lines, so a script added there is
+# covered without being remembered into this list -- which is how entrypoint.sh, egress-status.sh
+# and egress-lib.sh came to have no ownership check while the Dockerfile claimed they did. The
+# DIRECTORIES stay explicit below: they are not COPY targets, and they are what governs replacing
+# the files inside them.
+root_installed="$(dc_root_installed "$here_dc/Dockerfile")"
+# PINNED AGAINST AN EMPTY DERIVATION, like every other derived list here. A grep that silently
+# matched nothing would leave this loop checking only the directories and still print its ok --
+# a guard reporting success having examined none of the files it exists for.
+if [ -z "$root_installed" ]; then
+    bad "no root-owned COPY targets could be derived from the Dockerfile — the check that the agent cannot replace the scripts sudo runs as root is examining nothing"
+    unwritable_ok=0
+fi
+for path in /usr/local /usr/local/bin /usr/local/share \
+            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d $root_installed; do
     # A path that does not exist yet (the snapshot, before the first raise) cannot be replaced
     # either, so absence is fine; what must never be true is that it exists AND is writable.
     if [ -e "$path" ] && [ -w "$path" ]; then

@@ -163,3 +163,18 @@ dc_link_state() { # dc_link_state [home]
 # In the writable layer deliberately, not a volume: `run.sh --rm` must genuinely redo setup, and a
 # volume would carry the marker into a container that had never been set up.
 JKB_SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
+
+# EVERY PATH THE DOCKERFILE INSTALLS AS ROOT, derived from its own COPY lines (D52.5).
+#
+# verify.sh asserts at runtime that these cannot be replaced by the agent -- the sudoers grant runs
+# one of them as root, so a writable copy of it is a root shell. That list was hand-written and
+# named only init-firewall.sh, so the three scripts added since (entrypoint.sh, egress-status.sh
+# and egress-lib.sh -- the last of which init-firewall.sh SOURCES as root) had no ownership check
+# at all, while the Dockerfile's own comment claimed "verify.sh asserts the result at runtime".
+#
+# A list every new COPY has to be remembered into is the defect. Derived, a fourth installed script
+# is covered by existing.
+dc_root_installed() { # dc_root_installed <Dockerfile> -> one absolute container path per line
+    grep -E '^COPY[[:space:]]+--chown=root:root[[:space:]]' "$1" 2>/dev/null \
+        | awk '{print $NF}' | grep '^/' | sort -u
+}
