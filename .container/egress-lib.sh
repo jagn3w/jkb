@@ -70,6 +70,16 @@ probe_state() { # probe_state <v4chain> <v6chain> <v6path> <allowlist> -> allowl
 # GREP'S EXIT CODE IS THREE-VALUED AND ONLY TWO OF THEM ARE MEASUREMENTS: 0 found, 1 read it and
 # found nothing, >=2 could not read it. The old code hid the third behind `2>/dev/null` and let it
 # fall through as "found nothing", which here means "provably closed" — the whole finding.
+#
+# `|| rc=$?` RATHER THAN `; rc=$?`, AND IT IS LOAD-BEARING. This library is sourced into
+# init-firewall.sh, which runs `set -euo pipefail` with `set -E` and an ERR trap into `fail_closed`.
+# A bare `grep; rc=$?` is a simple command in no conditional context, so BOTH non-zero answers this
+# function exists to tell apart — 1 and 2 — abort it. `set -E` carries the trap into command
+# substitutions, so the abort ran `fail_closed` INSIDE the caller's measurement: a successful
+# allowlist raise on a kernel without ip6tables flushed itself to deny-all and recorded the reason
+# "an unexpected failure at line 80", which made the whole `v6=absent` success branch unreachable.
+# The `||` puts the grep in a conditional context, where errexit does not apply. The self-test at
+# the bottom runs every measurement under exactly that trap so the next one cannot regress it.
 v6_path_state() { # v6_path_state [if_inet6] [ipv6_route] -> absent|open
     local inet6="${1:-${JKB_INET6_PATH:-/proc/net/if_inet6}}"
     local route="${2:-${JKB_IPV6_ROUTE_PATH:-/proc/net/ipv6_route}}"
@@ -77,7 +87,7 @@ v6_path_state() { # v6_path_state [if_inet6] [ipv6_route] -> absent|open
 
     # 1. A default route is a way out on its own, whatever the addresses say. Destination ::/0 is
     #    32 zero hex digits then a zero prefix length, in the first two columns.
-    grep -qE '^0{32} 00 ' "$route" >/dev/null 2>&1; rc=$?
+    rc=0; grep -qE '^0{32} 00 ' "$route" >/dev/null 2>&1 || rc=$?
     case $rc in
         0) printf 'open'; return ;;   # there is a default route
         1) : ;;                       # positively read: there is none
@@ -88,7 +98,7 @@ v6_path_state() { # v6_path_state [if_inet6] [ipv6_route] -> absent|open
 
     # 2. No way out by route. Is there an address that can source off-link traffic — anything that
     #    is neither loopback (::1) nor link-local (fe80::/10)? Column 1 is 32 hex digits.
-    grep -qivE '^(0{31}1|fe[89ab])' "$inet6" >/dev/null 2>&1; rc=$?
+    rc=0; grep -qivE '^(0{31}1|fe[89ab])' "$inet6" >/dev/null 2>&1 || rc=$?
     case $rc in
         0) printf 'open' ;;                                        # an off-link address exists
         1) printf 'absent' ;;                                      # read it: only ::1 / fe80::, or empty
@@ -211,6 +221,50 @@ TABLE
     else
         printf '  \033[33mskip\033[0m the unreadable-file rows (running as root, which can read them)\n'
     fi
+
+    # NO MEASUREMENT MAY TRIP THE CALLER'S ERR TRAP (D51.3). This library is sourced into
+    # init-firewall.sh, which runs `set -euo pipefail` + `set -E` with an ERR trap into
+    # `fail_closed`; `set -E` carries that trap into command substitutions, so a measurement
+    # containing one bare failing command turns a successful raise into a self-inflicted deny-all
+    # from inside `v6="$(v6_state)"` — and the `|| v6=open` at the call site does NOT prevent it,
+    # because the trap fires in the subshell before the `||` is reached.
+    #
+    # Asserted against the REAL settings rather than by reading the code, and over every
+    # measurement rather than the one that regressed, because the hazard is the shape and not the
+    # function. The `absent` rows matter most: those are the paths where grep returns non-zero,
+    # which is every ordinary container (no default route, and usually no /proc/net/ipv6_route).
+    trapped="$t/trap-fired"
+    under_trap() { # under_trap <fn> <args...> -> the value, or `TRAP` if the ERR trap fired
+        rm -f "$trapped"
+        env -u JKB_INET6_PATH -u JKB_IPV6_ROUTE_PATH \
+            LIB="${BASH_SOURCE[0]}" TRAPPED="$trapped" bash -c '
+                set -euo pipefail
+                . "$LIB"
+                set -E
+                trap "echo fired > \"$TRAPPED\"; exit 97" ERR
+                v6_state() { if [ "$(v6_chain_state)" = denied ]; then printf denied; return; fi
+                             printf "%s" "$(v6_path_state)"; }
+                out="$("$@")" || out=CALL_FAILED
+                printf "%s" "$out"
+            ' _ "$@" 2>/dev/null
+        [ -e "$trapped" ] && printf 'TRAP'
+    }
+    eq "v6_path_state under the caller's ERR trap: no route"  "$(under_trap v6_path_state "$t/lo" "$t/no-route")"       "absent"
+    eq "v6_path_state under the caller's ERR trap: no table"  "$(under_trap v6_path_state "$t/nope" "$t/nope")"         "absent"
+    eq "v6_path_state under the caller's ERR trap: a route"   "$(under_trap v6_path_state "$t/lo" "$t/default-route")"  "open"
+    # The remaining measurements take no arguments, so what they answer depends on this machine.
+    # The ASSERTION is therefore the property, not the value: none of them may trip the trap,
+    # whatever they find. `v6_state` is the composition init-firewall.sh actually calls and is
+    # where the regression landed — it reaches v6_path_state only when the v6 chain is not denied,
+    # which is the no-ip6tables case, so on a machine with ip6tables this row passes trivially and
+    # the injected-path rows above are what cover it.
+    for fn in v6_state v4_chain_state v6_chain_state allowlist_state; do
+        got="$(under_trap "$fn")"
+        case "$got" in *TRAP*) fails=$((fails+1))
+                printf '  \033[31mFAIL\033[0m %s tripped the caller'"'"'s ERR trap\n' "$fn" ;;
+            *) printf '  \033[32mok\033[0m   %s under the caller'"'"'s ERR trap (%s)\n' "$fn" "$got" ;;
+        esac
+    done
 
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
