@@ -363,6 +363,26 @@ ctr_repo="$(container_path "$repo")" || die "this checkout ($repo) is not under 
 ARGS=()
 while IFS= read -r line; do ARGS+=("$line"); done < <(docker_args "$CONFIG" "$repo")
 
+# THE APPARMOR PROFILE IS A HOST FACT, so it is decided here rather than declared in
+# container.json: whether AppArmor mediates containers at all depends on the machine, and passing
+# `--security-opt apparmor=...` where it is unavailable is an error rather than a no-op. macOS
+# adds nothing; Docker Desktop's VM does not run AppArmor.
+#
+# WHY A PROFILE AT ALL. Docker's docker-default denies `mount`, so bubblewrap -- which Claude
+# Code's Linux sandbox shells out to -- creates its namespaces and then fails at its first mount.
+# The nested sandbox therefore never started on any AppArmor host, which is most Linux machines.
+# `.container/apparmor-jkb-dev` is docker-default with that one rule allowed and every other
+# restriction kept; see its header for why `apparmor=unconfined` was not the answer.
+#
+# INSIDE THE FINGERPRINT, deliberately: a container created without the profile is genuinely not
+# the same container as one created with it, and should be reported stale rather than reused.
+AA_PROFILE="$(dc_apparmor_profile "$here/apparmor-jkb-dev")"
+aa_enabled() { # -> 0 if AppArmor mediates on this host
+    [ -r /sys/module/apparmor/parameters/enabled ] \
+        && grep -qi '^Y' /sys/module/apparmor/parameters/enabled
+}
+if aa_enabled; then ARGS+=(--security-opt "apparmor=$AA_PROFILE"); fi
+
 # Hashed BEFORE the label is appended, or the value would have to contain itself.
 want_hash="$(fingerprint "$repo" "${ARGS[@]}")"
 ARGS+=(--label "jkb.args-hash=$want_hash")
@@ -430,6 +450,20 @@ case "$state" in
         say "create $NAME"
         # `sleep infinity` because nothing else keeps it alive: the image's job is to be a place to
         # attach to, not to run a program.
+        # REFUSED, NEVER FALLEN BACK. Without the profile loaded Docker will not start the
+        # container at all, which is the right failure -- but the message it gives is about a
+        # missing AppArmor profile and says nothing about what to do. Silently dropping the
+        # security-opt instead would start a container whose nested sandbox does not work and
+        # whose verifier reports docker-default, which is the state this whole change ends.
+        if aa_enabled && ! docker run --rm --security-opt "apparmor=$AA_PROFILE" "$IMAGE" true >/dev/null 2>&1; then
+            die "the AppArmor profile '$AA_PROFILE' is not loaded on this host, so the container's
+  nested sandbox could not start. Load it (it needs root, and a container cannot do it for itself):
+
+      sudo apparmor_parser -r -W $here/apparmor-jkb-dev
+
+  It is Docker's own docker-default profile with \`mount\` allowed, which bubblewrap needs; see
+  $here/apparmor-jkb-dev for why the whole profile is not simply switched off."
+        fi
         docker run "${ARGS[@]}" "$IMAGE" sleep infinity >/dev/null
         fresh=1
         ;;

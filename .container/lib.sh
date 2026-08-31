@@ -178,3 +178,12 @@ dc_root_installed() { # dc_root_installed <Dockerfile> -> one absolute container
     grep -E '^COPY[[:space:]]+--chown=root:root[[:space:]]' "$1" 2>/dev/null \
         | awk '{print $NF}' | grep '^/' | sort -u
 }
+
+# THE APPARMOR PROFILE'S NAME, read out of the profile itself (D52.5). run.sh passes it to docker,
+# mutate-verify.sh passes the same, verify.sh checks the profile in force against it, and ci.yml
+# names it in its probe -- five spellings of one fact, and a mismatch means a container silently
+# started under docker-default, which is precisely the state that made bubblewrap fail. The file
+# that DECLARES the profile is the one place it cannot be wrong.
+dc_apparmor_profile() { # dc_apparmor_profile <profile file> -> the declared profile name
+    sed -n 's/^profile[[:space:]]\{1,\}\([A-Za-z0-9_.-]\{1,\}\)[[:space:]].*/\1/p' "$1" 2>/dev/null | head -1
+}

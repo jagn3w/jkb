@@ -249,6 +249,42 @@ else
     printf '       three-way probe that separates seccomp from AppArmor.\n'
 fi
 
+# 2b. WHICH AppArmor PROFILE IS IN FORCE, and that relaxing one rule did not relax the rest.
+#
+# docker-default denies `mount`, which is why bubblewrap could not start; the answer was a profile
+# that is docker-default with that ONE rule allowed, rather than `apparmor=unconfined`. That choice
+# is worth nothing unless it is checked, and it fails silently in the direction that matters: a
+# container started without the security-opt gets docker-default and simply cannot run the nested
+# sandbox, while one started with `unconfined` runs it with no profile at all.
+#
+# So this asserts the profile by NAME, and then asserts that a restriction the relaxed profile is
+# supposed to have KEPT still bites. Reading the name alone would pass for a profile called
+# jkb-dev that had been edited into permitting everything -- the name is a label, not the policy.
+aa_profile="$(cat /proc/self/attr/current 2>/dev/null | sed 's/ (.*//')"
+# Derived from the profile file in the checkout, never a literal here: this comparison is the
+# whole assertion, and a name that drifted from the file would make it check the wrong thing.
+. "$(dirname "$0")/lib.sh" 2>/dev/null || true
+aa_want="$(dc_apparmor_profile "$(dirname "$0")/apparmor-jkb-dev" 2>/dev/null)"
+[ -n "$aa_want" ] || aa_want=jkb-dev
+case "$aa_profile" in
+    "")            note "AppArmor is not mediating this container (no profile) — expected on a host without AppArmor, e.g. Docker Desktop for macOS" ;;
+    unconfined)    bad "AppArmor is not confining this container (unconfined) — the container ships a profile that keeps every docker-default restriction except \`mount\`; running unconfined discards all of them" ;;
+    docker-default)
+                   bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile: sudo apparmor_parser -r -W .container/apparmor-jkb-dev" ;;
+    "$aa_want")
+        # THE POLICY, NOT THE LABEL. sysrq-trigger is denied `rwklx` by docker-default and this
+        # profile keeps that line verbatim, so a write that SUCCEEDS means the profile in force is
+        # not the one in the repo. Deliberately a path the container has no reason to touch, and
+        # one whose denial comes from AppArmor rather than from file permissions: it is
+        # root-writable, and this container is not root, so the check also states what it proves.
+        if printf '' > /proc/sysrq-trigger 2>/dev/null; then
+            bad "the AppArmor profile $aa_want is in force but a docker-default restriction it is supposed to keep (deny /proc/sysrq-trigger) did not apply — the loaded profile is not the one in this repo"
+        else
+            ok "AppArmor is applying the container's own profile ($aa_want), and the restrictions it keeps still apply"
+        fi ;;
+    *)             bad "an unexpected AppArmor profile is in force ($aa_profile) — this container declares $aa_want" ;;
+esac
+
 # 3. THE MOUNT BOUNDARY IS THE POINT, so assert it EXHAUSTIVELY rather than by listing paths
 #    that ought to be absent. A list of absences can never be complete — it is the same
 #    "enumerate the secrets" shape the host posture has to settle for because permission rules

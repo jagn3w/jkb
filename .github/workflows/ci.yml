@@ -138,17 +138,11 @@ jobs:
   # has been observed green.
   container:
     runs-on: ubuntu-latest
-    env:
-      # BUBBLEWRAP IS A KNOWN FAILURE ON THIS HOST CLASS, declared by name rather than skipped.
-      # verify.sh still reports it at full volume every run, with bwrap's own error and the host
-      # settings; what this changes is the exit code, so the other ~24 assertions and every
-      # mutation stay readable instead of being blocked behind one open investigation.
-      #
-      # It is NOT a workaround for a CI quirk. The container fails the same way on any stock-Docker
-      # AppArmor host, which is most Linux machines, so this is a real limitation of D49's "both
-      # layers" claim -- tracked as its own change, not papered over here. Remove this line the day
-      # that is fixed, and the stock-seccomp mutation becomes meaningful again with it.
-      JKB_ACCEPT_NO_BWRAP: '1'
+    # JKB_ACCEPT_NO_BWRAP IS DELIBERATELY NOT SET ANY MORE. It parked the bubblewrap failure while
+    # the cause was unknown; the cause is now established (docker-default denies `mount`) and the
+    # container ships a profile that fixes it, so a bubblewrap failure is once again a real failure
+    # and must fail the build. Keeping the acceptance would mean the remedy could silently not work.
+    # The stock-seccomp mutation becomes meaningful again with it.
 
     # The build is minutes and the harness starts ~13 containers; a wedged docker pull would
     # otherwise sit for the runner's six-hour default. Generous enough that a slow-but-working
@@ -162,6 +156,25 @@ jobs:
       # first pass: a cache that silently serves a stale image would make this job report on
       # something other than the committed Dockerfile, which is the failure mode the job exists to
       # remove. Revisit once it has a track record.
+      # THE CONTAINER'S APPARMOR PROFILE, loaded before anything starts a container. Docker's
+      # docker-default denies `mount`, so bubblewrap creates its namespaces and then fails at its
+      # first mount -- which is how the nested sandbox came to have never started on any AppArmor
+      # host. The profile is docker-default with that one rule allowed and every other restriction
+      # kept, so this is a narrower change than `apparmor=unconfined` and is asserted at runtime by
+      # verify.sh, which checks the profile by name AND that a restriction it keeps still bites.
+      #
+      # Loading needs root and a container cannot do it for itself, which is why run.sh refuses
+      # with this command rather than silently falling back to docker-default.
+      - name: Load the container's AppArmor profile
+        run: |
+          if [ -r /sys/module/apparmor/parameters/enabled ] \
+             && grep -qi '^Y' /sys/module/apparmor/parameters/enabled; then
+            sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+            echo "loaded jkb-dev"
+          else
+            echo "AppArmor is not enabled on this runner — nothing to load, and run.sh adds no profile"
+          fi
+
       - name: Build the image
         run: docker build -t jkb-dev .container
 
@@ -219,8 +232,11 @@ jobs:
           }
           probe "[1] stock docker"        --user vscode
           probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
-          probe "[3] + apparmor=unconfined" --user vscode --security-opt seccomp=$SEC \
-                                            --security-opt apparmor=unconfined
+          # The SHIPPED remedy, not `unconfined`: that is what run.sh passes and what has to work.
+          # Arm [2] is the broken state (docker-default), so [2] FAILED with [3] OK is the fix
+          # demonstrated rather than argued.
+          probe "[3] + apparmor=jkb-dev" --user vscode --security-opt seccomp=$SEC \
+                                         --security-opt apparmor=jkb-dev
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
       # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run

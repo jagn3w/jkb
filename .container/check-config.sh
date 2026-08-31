@@ -407,6 +407,48 @@ EOF
 done
 [ "$rules_ok" -eq 1 ] && ok "the raise installs and the probe reads back one shared rule spec"
 
+# THE APPARMOR PROFILE IS docker-default WITH ONE RULE CHANGED, and the point is the "one".
+# Switching AppArmor off entirely would also have let bubblewrap start; what was chosen instead was
+# a profile keeping every other docker-default restriction. That choice is worth nothing unless the
+# file still reflects it, and it degrades silently: a profile edited into permissiveness has the
+# same name, loads fine, and verify.sh's name check would still pass. (verify.sh also probes one
+# restriction at runtime; this is the static half, and it can see the whole file.)
+aa_file="$here/apparmor-jkb-dev"
+aa_name="$(dc_apparmor_profile "$aa_file")"
+if [ -z "$aa_name" ]; then
+    bad "$aa_file declares no profile — run.sh, mutate-verify.sh and verify.sh all derive the profile name from it, so they would pass an empty one to docker"
+else
+    aa_ok=1
+    # The one deliberate difference. An explicit `deny` cannot be overridden later in AppArmor, so
+    # the deny must be ABSENT rather than merely followed by an allow.
+    grep -qE '^[[:space:]]*mount,' "$aa_file" || { bad "$aa_file does not allow \`mount\` — bubblewrap cannot start under it, which is the whole reason it exists"; aa_ok=0; }
+    grep -qE '^[[:space:]]*deny[[:space:]]+mount,' "$aa_file" && { bad "$aa_file still denies \`mount\` — an explicit deny wins over any later allow in AppArmor, so bubblewrap would still fail"; aa_ok=0; }
+    # ...and the restrictions it is supposed to KEEP. Named members, not a count, for the reason
+    # the seccomp check gives: a threshold passes while silently losing the entries under it.
+    # ANCHORED ON THE RULE, not on a mention of it, and with NO HAND-ROLLED REGEX ESCAPING --
+    # both halves were defects the mutation caught. Grepping the whole file matched these words in
+    # the profile's own header, where it explains what `apparmor=unconfined` would discard. The fix
+    # for that then built a pattern with `sed 's/[]\/[.*^$]/\\&/g'`, which BSD sed REJECTS as
+    # unbalanced brackets: the substitution produced nothing, the pattern collapsed to
+    # `^[[:space:]]*deny[[:space:]].*`, and the guard matched any deny line at all -- passing with
+    # every restriction below deleted. Selecting the deny rules and then matching FIXED-string
+    # needs no escaping and cannot collapse. The first version grepped the whole file, and
+    # every one of these words appears in the profile's own header where it explains what
+    # `apparmor=unconfined` would have discarded -- so deleting the actual `deny` line left the
+    # guard green. Caught by its mutation on the first run, which is the shape this directory
+    # produces most often.
+    for r in 'sysrq-trigger' 'kcore' '/sys/firmware' '/sys/kernel/security'; do
+        grep -E '^[[:space:]]*deny[[:space:]]' "$aa_file" | grep -qF -e "$r" \
+            || { bad "$aa_file no longer denies $r — it is supposed to be docker-default with ONE rule relaxed, not a permissive profile wearing its name"; aa_ok=0; }
+    done
+    # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
+    if ! grep -qF -e "apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
+        bad "ci.yml does not name the profile the file declares ($aa_name) — its bubblewrap probe would test a profile nothing loads"
+        aa_ok=0
+    fi
+    [ "$aa_ok" -eq 1 ] && ok "the AppArmor profile is docker-default with only \`mount\` relaxed ($aa_name)"
+fi
+
 # THE TWO SELF-TEST LISTS AGREE (D51.9). scripts/check.sh and .github/workflows/ci.yml each
 # enumerate the `.container/*.sh --self-test` invocations, because CI re-implements each gate step
 # rather than running check.sh. Add a self-test to check.sh alone and it runs nowhere in CI; drop

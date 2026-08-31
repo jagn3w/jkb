@@ -143,7 +143,15 @@ SUBJECT="$PREAMBLE"'
 # an operator's statement about a host, and a harness that quietly assumed it would hide the very
 # failure it exists to detect everywhere else.
 ACCEPT_ENV=(); [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && ACCEPT_ENV=(-e JKB_ACCEPT_NO_BWRAP=1)
-HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${ACCEPT_ENV[@]}" "${BASE[@]}")
+# The same host-conditional AppArmor decision run.sh makes, for the same reason: docker-default
+# denies `mount`, so without this the healthy container fails bubblewrap and every mutation verdict
+# is judged against a container that is not the one run.sh produces.
+AA_ARGS=()
+if [ -r /sys/module/apparmor/parameters/enabled ] \
+   && grep -qi '^Y' /sys/module/apparmor/parameters/enabled; then
+    AA_ARGS=(--security-opt "apparmor=$(. "$REPO/.container/lib.sh"; dc_apparmor_profile "$REPO/.container/apparmor-jkb-dev")")
+fi
+HEALTHY=(--security-opt seccomp="$SEC" "${AA_ARGS[@]}" --cap-add=NET_ADMIN --user vscode "${ACCEPT_ENV[@]}" "${BASE[@]}")
 
 # One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
 # runs in, so "is my container ok" and "did this guard fire" cannot be answered about different

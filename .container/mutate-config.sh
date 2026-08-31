@@ -283,6 +283,45 @@ open(p, 'w').write(out)
 PYX
 run "the shared-rule check can find no rules to check" "just certified nothing"
 
+# THE APPARMOR PROFILE, mutated four ways -- one per thing it promises. A profile that keeps its
+# name while being gutted is the failure mode here: it loads, verify.sh's name check passes, and
+# every docker-default restriction is gone.
+seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+out = s.replace("\n  mount,\n", "\n  deny mount,\n", 1)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the profile denies mount again" "still denies"
+
+seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^\s*deny @\{PROC\}/sysrq-trigger.*$', '', s, count=1, flags=re.M)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the profile drops a docker-default restriction" "no longer denies sysrq-trigger"
+
+seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^profile ', '# profile ', s, count=1, flags=re.M)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the profile declares no name" "declares no profile"
+
+seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+out = s.replace("apparmor=jkb-dev", "apparmor=jkb-container")
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "CI probes a profile nothing loads" "does not name the profile the file declares"
+
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
 # never established which occurrence the guard reads, and the guard was in fact reading those
@@ -549,7 +588,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=49
+PINNED_BAD_SITES=54
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

@@ -1,0 +1,79 @@
+# AppArmor profile for the jkb dev container (design D49/D52).
+#
+# THIS IS DOCKER'S OWN `docker-default` PROFILE WITH EXACTLY ONE LINE CHANGED: `deny mount,`
+# becomes `mount,`. Everything else is reproduced verbatim from moby's template
+# (moby/moby profiles/apparmor/template.go), and the point of writing it out rather than turning
+# AppArmor off is that every OTHER restriction docker-default imposes is kept.
+#
+# WHY THE CHANGE IS NEEDED. Claude Code's Linux sandbox shells out to bubblewrap, which creates a
+# user namespace and then re-mounts the root inside it. docker-default denies `mount` outright, so
+# bwrap fails at its first mount with `Failed to make / slave: Permission denied` -- namespaces
+# created, mounts refused. Measured, not assumed: a container reports
+# `apparmor profile in force: docker-default (enforce)` and fails exactly there while the seccomp
+# profile demonstrably allows the mount syscalls.
+#
+# WHY IT IS NOT A NEW CONCESSION. `.container/seccomp-bwrap.json` already re-allows `mount`,
+# `umount2`, `pivot_root` and the rest for precisely this purpose, and states the reason: those
+# calls are only reachable inside the user namespace bubblewrap creates, where the process holds no
+# privilege over the host. AppArmor was silently overriding a decision this design had already
+# taken and reviewed -- which is why the nested sandbox had never actually started on Linux.
+#
+# WHY NOT `apparmor=unconfined`. That would drop the whole profile: the /proc write denials,
+# sysrq-trigger, kcore, the /sys restrictions and the ptrace confinement, none of which bubblewrap
+# needs. This gives up one rule instead of all of them.
+#
+# AN EXPLICIT `deny` CANNOT BE OVERRIDDEN LATER IN APPARMOR -- deny always wins over allow,
+# whatever the order -- so the rule genuinely has to be replaced rather than followed by an allow.
+# That is why this is a whole profile and not an include-plus-override.
+#
+# NARROWING, stated rather than pretended: `mount,` permits every mount operation, not only the
+# ones bwrap performs. AppArmor can qualify by fstype and mount point, but bwrap's sequence spans
+# several (tmpfs, proc, sysfs, bind, MS_SLAVE propagation changes) and a too-narrow rule fails at
+# run time in a way that reads exactly like this bug. Left broad deliberately, bounded by the fact
+# that it is reachable only inside the user namespace, and noted as the next tightening.
+#
+# LOADING IT IS A HOST ACTION and needs root, so a container cannot do it for itself:
+#     sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+# run.sh checks it is loaded and refuses with that command rather than falling back to
+# docker-default, which would start a container whose nested sandbox silently does not work --
+# the state this whole change exists to end.
+
+#include <tunables/global>
+
+profile jkb-dev flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  # THE ONE DELIBERATE DIFFERENCE FROM docker-default, which has `deny mount,` here.
+  mount,
+
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # dockerd may send signals to container processes (for kill).
+  signal (receive) peer=unconfined,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer=jkb-dev,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^1-9],[^1-9][^1-9][^1-9],[^1-9][^1-9][^1-9][^1-9]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'docker ps' or using 'ps' inside a container
+  ptrace (trace,read,tracedby,readby) peer=jkb-dev,
+}
