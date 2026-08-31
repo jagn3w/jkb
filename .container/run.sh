@@ -186,6 +186,17 @@ docker_args() { # docker_args <config> <repo-root>  -> one argument per line
 # ---------------------------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------------------------
+# WHAT ONE OBSERVATION OF THE CONTAINER MEANS. Pure, so every outcome is a self-test row rather
+# than something only a Docker host can reach (D52.4). The entrypoint execs the command, so once
+# PID 1 is no longer the entrypoint the boot decision has been made.
+settle_step() { # settle_step <running:true|other> <ps output> -> gone|unreadable|waiting|settled
+    [ "$1" = true ] || { printf 'gone'; return; }
+    # Empty is NOT "the entrypoint has finished". It is `ps` missing from the image, or an exec
+    # that failed while the container was still up -- neither of which is an observation of PID 1.
+    [ -n "$2" ] || { printf 'unreadable'; return; }
+    case "$2" in *entrypoint.sh*) printf 'waiting' ;; *) printf 'settled' ;; esac
+}
+
 if [ "${1:-}" = --self-test ]; then
     # shellcheck source=/dev/null
     . "$here/lib.sh"
@@ -291,6 +302,28 @@ if [ "${1:-}" = --self-test ]; then
     printf '{"tampered":true}\n' > "$twin/.container/seccomp-bwrap.json"
     eq "...but a different seccomp profile does not" \
        "$([ "$(config_hash "$twin/.container/container.json" "$twin")" != "$same" ] && echo differs || echo same)" "differs"
+
+    # THE LIFECYCLE LAYER, which had no harness at all -- and all three of review round 4's
+    # must-fixes lived in it (the 125 sentinel consumed as an answer, the dead exit-3 branch, and
+    # this function spelling three different unestablished outcomes `settled`). The decision is
+    # pure and takes its observations as arguments, so every outcome is a row here rather than
+    # something only a Docker host can reach (D52.4).
+    #
+    # A literal table, not a re-derivation: writing the expectation as a second copy of the
+    # condition passes for any condition, including the one this replaced.
+    while read -r running psout want; do
+        [ -n "${running:-}" ] || continue
+        [ "$psout" = "-" ] && psout=""
+        got="$(settle_step "$running" "$psout")"
+        eq "settle_step $running '$psout' -> $want" "$got" "$want"
+    done <<'TABLE'
+false   -                     gone
+<none>  -                     gone
+true    -                     unreadable
+true    /usr/local/bin/entrypoint.sh  waiting
+true    /bin/bash             settled
+true    sleep\x20infinity      settled
+TABLE
 
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
@@ -421,17 +454,27 @@ esac
 # ten-minute rebuild, `verify_rc` took the daemon's exit 1 for verify's verdict, and the run ended
 # by printing "the container is running and attachable" about a container that was not, from a
 # verifier that never ran.
-settle() { # settle -> 0 once PID 1 is past the entrypoint, 1 if the container is gone
-    local i
+# EVERY UNESTABLISHED OUTCOME USED TO BE SPELLED `settled`. The loop fell out of `done` and
+# `return 0` when the budget ran out, and the ps probe's `|| return 0` read "no output at all" the
+# same way -- so a black-holed resolver (which keeps the raise inside ~15 getent calls at 5s x2 per
+# name, well past this budget) and an image without `ps` both reported the entrypoint as finished,
+# which is exactly the state this function was added to stop run.sh proceeding through.
+settle() { # settle -> 0 settled | 1 container gone | 2 could not read PID 1 | 3 budget exhausted
+    local i state
     for i in $(seq 1 120); do
-        docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true || return 1
-        # The entrypoint execs the command, so once PID 1 is no longer the entrypoint the decision
-        # has been made. Falls back to a plain running check where ps is unavailable.
-        docker exec "$NAME" sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null \
-            | grep -q 'entrypoint.sh' || return 0
+        state="$(settle_step \
+            "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" \
+            "$(docker exec "$NAME" sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null)")"
+        case "$state" in
+            gone)       return 1 ;;
+            settled)    return 0 ;;
+            # Not retried: `ps` absent is a property of the image, not a transient, and waiting
+            # two minutes to say "could not tell" helps nobody. The caller decides what to do.
+            unreadable) return 2 ;;
+        esac
         sleep 1
     done
-    return 0
+    return 3
 }
 
 # "Is the container alive, and if not why" DOMINATES every exec below, so it is asked in one place
@@ -439,30 +482,59 @@ settle() { # settle -> 0 once PID 1 is past the entrypoint, 1 if the container i
 # up front, in a form that could not distinguish a dead container from a false probe.
 container_died() { # container_died <what was being attempted>
     printf '\n\033[31merror:\033[0m %s is not running (while: %s).\n' "$NAME" "$1" >&2
-    printf 'The entrypoint refuses to start a container whose firewall could not establish that\n' >&2
-    printf 'egress is bounded. Its reason is the last thing in the log:\n\n' >&2
+    # OFFERED AS A LIKELY CAUSE, NOT STATED AS THE CAUSE. A container can be gone for reasons that
+    # have nothing to do with egress -- an OOM kill, `docker stop`, a crash in something the
+    # entrypoint exec'd -- and asserting the firewall refused sends the reader to audit a boundary
+    # that is fine. The log below is the evidence; this line only says where to look first.
+    printf 'The most likely cause is the entrypoint refusing to start a container whose firewall\n' >&2
+    printf 'could not establish that egress is bounded. The log is the evidence:\n\n' >&2
     docker logs --tail 20 "$NAME" 2>&1 | sed 's/^/  /' >&2
 }
 
 # Runs a command in the container and tells a TRANSPORT failure from the command's own answer. They
 # shared exit 1, so "the container is gone" and "the thing I asked about is false" were the same
-# value. Returns the command's status; on a dead container it reports and returns 125, which no
-# probe here uses as an answer.
+# value.
+#
+# IT NO LONGER RETURNS A SENTINEL, and that is the fix. It used to report and return 125 with a
+# comment saying no probe uses that as an answer -- but the two capturing call sites did exactly
+# that: `verify_rc=$?` and `raise_rc=$?` took 125 as the command's own result, so a container that
+# died during verify printed "verify.sh reported problems (exit 125) -- the container is running
+# and attachable ... the failing lines above say what to do", with no failing lines, about a
+# container that was gone and a verifier that never ran.
+#
+# A value every caller has to remember to check is the defect, not the callers. There is no call
+# site here that could sensibly continue once the container is gone, so this reports and STOPS.
+#
+# The one caller that reads output through a command substitution is unaffected by design: `exit`
+# there ends the subshell, the substitution yields nothing, and that site already treats "neither
+# word came back" as its own condition rather than as an answer.
 in_container() { # in_container <args...>
     local rc=0
     docker exec "$@" || rc=$?
     if [ "$rc" -ne 0 ] \
        && ! docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true; then
         container_died "docker exec $*"
-        return 125
+        exit 1
     fi
     return "$rc"
 }
 
-if ! settle; then
-    container_died "waiting for the entrypoint to settle"
-    exit 1
-fi
+settle_rc=0; settle || settle_rc=$?
+case "$settle_rc" in
+    0) ;;
+    1) container_died "waiting for the entrypoint to settle"; exit 1 ;;
+    2) # Reported, not continued through. Proceeding here is what the old code did for every one
+       # of these, and it is what let the execs below race a half-built chain.
+       printf '\n\033[31merror:\033[0m could not read PID 1 in %s, so this script cannot tell\n' "$NAME" >&2
+       printf 'whether the entrypoint has finished deciding. `ps` may be missing from the image.\n' >&2
+       printf 'Everything below would be racing a firewall that may still be coming up.\n' >&2
+       exit 1 ;;
+    3) printf '\n\033[31merror:\033[0m %s is still running its entrypoint after 120s.\n' "$NAME" >&2
+       printf 'The firewall raise resolves the allowlist by DNS, so a black-holed resolver holds it\n' >&2
+       printf 'here. The container log says where it is:\n\n' >&2
+       docker logs --tail 20 "$NAME" 2>&1 | sed 's/^/  /' >&2
+       exit 1 ;;
+esac
 
 # Already raised by the entrypoint, on this start and on every other. Re-raising here is not a
 # second rule — the raise is idempotent by design — it is a SYNCHRONISATION POINT: `docker run`
@@ -496,9 +568,18 @@ setup_probe="$(in_container "$NAME" sh -c "test -e '$JKB_SETUP_MARKER' && echo d
 case "$setup_probe" in
     done)    setup_done=1 ;;
     missing) setup_done=0 ;;
-    *)       # Neither word came back: the exec failed. Never read as "setup did not complete".
-             printf '\033[31merror:\033[0m could not ask %s whether setup completed.\n' "$NAME" >&2
-             container_died "probing the setup marker"
+    *)       # Neither word came back: the exec failed. Never read as "setup did not complete" --
+             # that answer would start a ten-minute toolchain rebuild on a container that had
+             # already been set up.
+             #
+             # It does NOT call container_died here any more. `in_container` reports and exits when
+             # the container is gone, so reaching this point means the exec failed while the
+             # container was still running -- a transient daemon error, a paused container -- and
+             # announcing "not running" about a running container is the misattribution this whole
+             # seam exists to remove.
+             printf '\n\033[31merror:\033[0m could not ask %s whether setup completed, but it is\n' "$NAME" >&2
+             printf 'still running — so the exec failed for a reason this script has not established.\n' >&2
+             printf 'Try again; if it persists, attach by hand and look at the container.\n' >&2
              exit 1 ;;
 esac
 
