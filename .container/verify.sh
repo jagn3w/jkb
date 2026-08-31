@@ -198,10 +198,32 @@ echo "==> container posture"
 assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo yes || echo no)"
 
 # 2. The nested sandbox's mechanism. This is the exact shape Claude Code invokes.
-if bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true 2>/dev/null; then
-    ok "bubblewrap can create its namespaces (nested sandbox can start)"; pass=$pass
+#
+# THE ERROR IS CAPTURED AND REPORTED, NOT DISCARDED. This used to send stderr to /dev/null and then
+# advise "check the seccomp profile is applied" — naming one cause among several, and naming the
+# wrong one wherever the profile demonstrably IS applied, which docker guarantees by failing
+# outright on a missing profile file. A remedy that does not fit the failure is worse than no
+# remedy (D48): it sends the reader to audit a file that is fine, and it made this failure need a
+# separate probe to say anything at all. What decides it is bwrap's own message, so print that, and
+# print the two host settings that produce this — read through /proc, which a container can
+# usually see even though it cannot set them.
+if bwrap_err="$(bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true 2>&1)"; then
+    ok "bubblewrap can create its namespaces (nested sandbox can start)"
 else
-    bad "bubblewrap cannot create namespaces — check the seccomp profile is applied"
+    bad "bubblewrap cannot create namespaces — the nested sandbox cannot start"
+    [ -n "$bwrap_err" ] && printf '       bwrap said: %s\n' \
+        "$(printf '%s' "$bwrap_err" | head -2 | tr '\n' ' ')"
+    # Reported as facts, with no cause asserted. `apparmor_restrict_unprivileged_userns=1` is the
+    # Ubuntu 24.04+ default and restricts exactly this; `max_user_namespaces=0` disables it
+    # outright. Either explains the failure, and neither is fixable from inside the container —
+    # they are the host's, so an operator needs to see them rather than be sent to the profile.
+    for f in kernel/apparmor_restrict_unprivileged_userns user/max_user_namespaces; do
+        v="$(cat "/proc/sys/$f" 2>/dev/null)" \
+            && printf '       host %s = %s\n' "$(basename "$f")" "$v"
+    done
+    printf '       the seccomp profile is applied by the run flags, so it is not usually the cause;\n'
+    printf '       see .github/workflows/ci.yml "Why bubblewrap can or cannot start" for the\n'
+    printf '       three-way probe that separates seccomp from AppArmor.\n'
 fi
 
 # 3. THE MOUNT BOUNDARY IS THE POINT, so assert it EXHAUSTIVELY rather than by listing paths
