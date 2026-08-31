@@ -162,11 +162,62 @@ jobs:
       - name: The container is what it claims to be
         run: ./.container/mutate-verify.sh --control
 
+      # WHY BUBBLEWRAP CAN OR CANNOT START. The first real run answered D52 task 1.3 with a FAIL:
+      # `bubblewrap cannot create namespaces`. That is the nested sandbox's mechanism, so it needs
+      # a cause and not a skip — the seccomp profile IS applied by the flags above (docker errors
+      # on a missing profile file), so something else is refusing.
+      #
+      # This step DELIBERATELY assembles its own docker flags, which the diagnostic below does not:
+      # varying the flags IS the experiment. [2] is exactly what the container ships, so if [3]
+      # succeeds where [2] fails the cause is AppArmor — Ubuntu 24.04 (which ubuntu-latest is)
+      # restricts unprivileged user namespaces by default, and the design's own measurement was
+      # taken on 26.04. Reported, never acted on automatically: `apparmor=unconfined` is a real
+      # weakening of the container and is a decision, not a fix to apply because a probe suggested it.
+      - name: Why bubblewrap can or cannot start (settles task 1.3)
+        if: always()
+        run: |
+          echo "--- runner facts ---"; uname -a
+          for s in kernel.unprivileged_userns_clone user.max_user_namespaces \
+                   kernel.apparmor_restrict_unprivileged_userns; do
+            printf '%s = %s\n' "$s" "$(sysctl -n $s 2>&1 || true)"
+          done
+          probe='bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
+                   && echo BWRAP-OK || echo BWRAP-FAILED'
+          SEC=.container/seccomp-bwrap.json
+          echo "--- [1] stock docker (expected to fail) ---"
+          docker run --rm --user vscode jkb-dev bash -c "$probe" 2>&1 | tail -2
+          echo "--- [2] + the seccomp profile the container ships ---"
+          docker run --rm --user vscode --security-opt seccomp=$SEC jkb-dev bash -c "$probe" 2>&1 | tail -2
+          echo "--- [3] + apparmor unconfined ---"
+          docker run --rm --user vscode --security-opt seccomp=$SEC --security-opt apparmor=unconfined \
+            jkb-dev bash -c "$probe" 2>&1 | tail -2
+
+      # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
+      # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run
+      # reported the state without the reason. Re-running it verbosely in the SAME container the
+      # control uses is the whole diagnostic — and it goes through `--shell` rather than a
+      # hand-assembled `docker run` precisely because this one is not an experiment about flags.
+      - name: What the memory linker actually says
+        if: always()
+        run: |
+          ./.container/mutate-verify.sh --shell '
+            echo "--- linker, verbose (the preamble already ran it quietly) ---"
+            ./scripts/link-claude-memory.sh; echo "linker exit=$?"
+            echo "--- what it reports for this repo ---"
+            ./scripts/link-claude-memory.sh --status /home/vscode/repos/jkb
+            echo "--- the paths it works over ---"
+            ls -ld /home/vscode/.claude /home/vscode/.claude/projects /home/vscode/.jkb 2>&1
+            ls -la /home/vscode/.jkb 2>&1 | head -5'
+
       # ...and every one of those assertions watched failing. This harness has NEVER executed:
       # each of its mutations breaks one property (an undeclared mount, the host ~/.claude mounted,
       # stock seccomp, no NET_ADMIN, running as root, the sudoers grant restored) and requires
       # verify.sh to fail naming it, with a negative control proving the matcher discriminates.
+      #
+      # `if: always()` so a failing control does not hide whether the guards themselves work —
+      # those are different questions, and the first real run needs both answered in one go.
       - name: Every container guard, watched failing
+        if: always()
         run: ./.container/mutate-verify.sh
 
   # The `ui/` pnpm workspace, gated separately: it needs neither the Rust toolchain nor the

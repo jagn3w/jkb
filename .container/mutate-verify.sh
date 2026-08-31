@@ -38,7 +38,18 @@ elif ! docker info >/dev/null 2>&1; then
     exit 0
 fi
 CONTROL_ONLY=0
+SHELL_CMD=""
 if [ "${1:-}" = --control ]; then CONTROL_ONLY=1; shift; fi
+# `--shell <command>`: run one command in a healthy container, after the same preamble every
+# mutation and the control run. It exists so a DIAGNOSTIC never has to hand-roll the docker flags
+# -- the failure this file's header already records, where an assembled-by-hand `docker run`
+# omitted the seccomp profile, NET_ADMIN, the binds and the preamble, and produced a dozen FAILs
+# that read as a broken container instead of as a wrong command. It runs no assertions and its
+# exit code is the command's.
+if [ "${1:-}" = --shell ]; then
+    shift; [ $# -gt 0 ] || { echo "mutate-verify.sh: --shell needs a command" >&2; exit 2; }
+    SHELL_CMD="$1"; shift
+fi
 IMAGE="${1:-jkb-dev}"
 
 # THE SUBJECT HAS TO EXIST, and be named on purpose. Same reason the docker checks above exist:
@@ -83,11 +94,14 @@ BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /
 # name only because it is strictly inside a declared target; see its comment for why nesting is
 # not granted automatically. Read from the environment so a mutation can supply a BAD declaration
 # and watch the refusal fire — one SUBJECT, as the comment above requires.
-SUBJECT='
+# Split so `--shell` can reuse the setup half verbatim rather than restating it: two spellings of
+# what a healthy container has been through is two answers to the question the control asks.
+PREAMBLE='
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       . ./.container/lib.sh && dc_link_state /home/vscode
       [ -n "${JKB_SKIP_MEMORY_LINK:-}" ] || ./scripts/link-claude-memory.sh >/dev/null 2>&1
-      ./scripts/auto-mode.sh install --force >/dev/null 2>&1
+      ./scripts/auto-mode.sh install --force >/dev/null 2>&1'
+SUBJECT="$PREAMBLE"'
       ./.container/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
 # The baseline every ADDITIVE mutation runs in, and the control with it. The three subtractive
 # mutations below deliberately spell a reduced set instead — that is what they are testing — and
@@ -99,6 +113,13 @@ HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE
 # One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
 # runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
 # containers.
+if [ -n "$SHELL_CMD" ]; then
+    echo "=== a healthy container, running your command after the standard preamble ==="
+    docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$PREAMBLE
+      $SHELL_CMD"
+    exit $?
+fi
+
 if [ "$CONTROL_ONLY" -eq 1 ]; then
     echo "=== one healthy container (the same subject every mutation runs against) ==="
     docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT"
