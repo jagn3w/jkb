@@ -233,7 +233,19 @@ run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
     -v "$scratch/home/settings.json":/home/vscode/.claude/settings.json
 run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
     --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
-run "no NET_ADMIN (firewall cannot come up)" "NON-allowlisted host was permitted" \
+# NO NET_ADMIN, WITH THE OVERRIDE ARMED -- and the override is what makes this mutation
+# judgeable at all. Without it the entrypoint (correctly) refuses to boot an unbounded container,
+# so $SUBJECT never runs, verify.sh never runs, and the assertion this mutation names is
+# unreachable: the harness printed MISSED for ever, which is a tooling outcome dressed as a guard
+# that did not fire. Predicted by a reviewer, then confirmed by the first real run of this file.
+#
+# So the container is allowed to boot, and what is tested is what the label says: that verify.sh
+# NOTICES the firewall never came up. The entrypoint's own refusal on this same configuration is a
+# separate property and is covered by entrypoint.sh --self-test; it cannot be judged here, because
+# `judge` requires the expectation and the word FAIL on one line and the refusal is not a verify.sh
+# FAIL line.
+run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
+    -e JKB_EGRESS_ACCEPT_UNFILTERED=1 \
     --security-opt seccomp="$SEC" --user vscode "${BASE[@]}"
 run "runs as root" "runs as a non-root user" \
     --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user root "${BASE[@]}"
