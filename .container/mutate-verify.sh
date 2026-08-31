@@ -72,7 +72,24 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "   Build it first:  docker build -t jkb-dev .container" >&2
     exit 2
 fi
-scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
+# CLEANUP HAS THE SAME UID PROBLEM AS THE MOUNT, one level along. The container writes into the
+# scratch knowledge base as uid 1000, creating directories it owns; removing a file needs write
+# permission on its CONTAINING directory, so on a host whose user is not 1000 the plain `rm -rf`
+# fails partway with "Permission denied" and leaves the tree behind. Pre-creating a level does not
+# help -- the tree is arbitrarily deep -- so the only user who can remove it is root, in a
+# container, which is what the fallback does using the image already built. Every step is
+# best-effort and the last resort is SAYING SO: a leaked temp directory is a known annoyance in
+# this repo, and a confusing "Permission denied" at the end of a passing run is worse, because it
+# trains people to read past the last lines of output.
+scratch="$(mktemp -d)"
+cleanup() {
+    rm -rf "$scratch" 2>/dev/null && return 0
+    docker run --rm --user root -v "$scratch":/s "$IMAGE" rm -rf /s/jkb /s/home >/dev/null 2>&1 || true
+    rm -rf "$scratch" 2>/dev/null \
+        || echo "note: $scratch holds files owned by the container's user and could not be removed" >&2
+    return 0
+}
+trap cleanup EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 # THE KNOWLEDGE-BASE BIND MUST BE WRITABLE BY THE CONTAINER'S USER, WHOEVER THAT IS ON THIS HOST.
 # This directory is created here, on the host, and bind-mounted at /home/vscode/.jkb -- so it
