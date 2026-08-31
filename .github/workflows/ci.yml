@@ -116,6 +116,59 @@ jobs:
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  # The dev container, BUILT AND RUN (design D52). Everything above this job is a statement about
+  # the TEXT of the container scripts; this is the only job that executes them.
+  #
+  # WHY IT DID NOT EXIST UNTIL NOW, which is the whole point of D52. `.container/verify.sh` and
+  # `mutate-verify.sh` need a Docker daemon, and the D48 auto-mode posture blankets `~` under
+  # `denyRead`, so `~/.docker/bin/docker` is unreachable on the machine this repo is developed on.
+  # They were therefore documented as human-run steps — and nobody ran them, for four review rounds
+  # and 53 findings. That state is STABLE precisely because it is unrepeatable, which is why the
+  # static layer kept growing: it was the only thing the gate could reach.
+  #
+  # A runner is not under that posture and ships a working rootful daemon. `--cap-add NET_ADMIN`
+  # and `--security-opt seccomp=<file>` are ordinary docker-CLI flags here, and the bwrap-nesting
+  # measurement this container is built around was taken on Ubuntu/Docker, which is what this is.
+  #
+  # OPEN QUESTION THIS JOB EXISTS TO SETTLE (D52.2, tasks 1.3): whether bubblewrap can create its
+  # namespaces under a runner's kernel — verify.sh asserts it directly. If it cannot, the honest
+  # response is to skip THAT assertion by name and say so, not to weaken the job; everything else
+  # here (the firewall raise, ~24 verify.sh assertions, every mutation) is exercised regardless.
+  # Nothing has been deleted from the static layer against this job, and nothing will be until it
+  # has been observed green.
+  container:
+    runs-on: ubuntu-latest
+    # The build is minutes and the harness starts ~13 containers; a wedged docker pull would
+    # otherwise sit for the runner's six-hour default. Generous enough that a slow-but-working
+    # run is not reported as a broken one.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image carries a Rust toolchain, the Claude CLI and the pinned VS Code extensions, so
+      # it is a genuinely large build (~4 GB, several minutes). Deliberately NOT cached on the
+      # first pass: a cache that silently serves a stale image would make this job report on
+      # something other than the committed Dockerfile, which is the failure mode the job exists to
+      # remove. Revisit once it has a track record.
+      - name: Build the image
+        run: docker build -t jkb-dev .container
+
+      # ONE HEALTHY CONTAINER, with the real flags and the real preamble. Deliberately reuses
+      # mutate-verify.sh's own --control rather than spelling a `docker run` here: a hand-rolled
+      # one omitted the seccomp profile, NET_ADMIN, the binds and the firewall-raising preamble,
+      # and produced a dozen FAILs that read as a broken container instead of as a wrong command.
+      # "Is the container healthy" and "did that guard fire" must not be answerable about two
+      # different containers.
+      - name: The container is what it claims to be
+        run: ./.container/mutate-verify.sh --control
+
+      # ...and every one of those assertions watched failing. This harness has NEVER executed:
+      # each of its mutations breaks one property (an undeclared mount, the host ~/.claude mounted,
+      # stock seccomp, no NET_ADMIN, running as root, the sudoers grant restored) and requires
+      # verify.sh to fail naming it, with a negative control proving the matcher discriminates.
+      - name: Every container guard, watched failing
+        run: ./.container/mutate-verify.sh
+
   # The `ui/` pnpm workspace, gated separately: it needs neither the Rust toolchain nor the
   # disk cleanup above, so it runs in parallel and fails fast on its own.
   #
