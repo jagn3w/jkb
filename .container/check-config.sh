@@ -277,20 +277,12 @@ fi
 # spelling of "what is a comment" is a second answer to the question they both ask.
 dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
-# THE SETUP MARKER IS SPELLED IN TWO FILES AND THEY CANNOT SHARE A VARIABLE: setup.sh runs inside
-# the container, run.sh on the host. So the agreement is asserted instead. If they drift, run.sh
-# looks for a marker setup.sh never writes — and then EVERY run re-runs the whole of setup, slowly,
-# for ever, while reporting success. That reads as working, which is why it needs a guard rather
-# than a comment.
-setup_marker_run="$(grep -oE 'SETUP_MARKER="[^"]+"' "$here/run.sh" | head -1 | sed 's/.*="//; s/"$//')"
-setup_marker_setup="$(dc_strip_comments "$here/setup.sh" | grep -oE 'touch[[:space:]]+/home/vscode/[^[:space:]]+' | head -1 | awk '{print $2}')"
-if [ -z "$setup_marker_run" ] || [ -z "$setup_marker_setup" ]; then
-    bad "could not find the setup-complete marker in both run.sh and setup.sh — one of them stopped naming it"
-elif [ "$setup_marker_run" != "$setup_marker_setup" ]; then
-    bad "run.sh looks for the setup marker at $setup_marker_run but setup.sh writes $setup_marker_setup — setup would re-run for ever"
-else
-    ok "run.sh and setup.sh agree on the setup-complete marker ($setup_marker_run)"
-fi
+# THE SETUP MARKER IS NO LONGER GUARDED HERE, because it is no longer spelled twice (D52.5). This
+# compared run.sh's and setup.sh's spellings of the marker path, justified by a comment reading
+# "setup.sh runs inside the container, run.sh on the host [so] they cannot share a variable". They
+# can: run.sh sources lib.sh on the host, setup.sh sources the same file inside the container from
+# the same bind-mounted checkout, and the path is JKB_SETUP_MARKER there. One spelling, nothing to
+# compare -- the guard is deleted with the duplication rather than kept as a second model of it.
 
 # ONE VERIFIER. verify.sh used to be setup.sh's last line as well as a run.sh step, and the split
 # is what let "a failing assertion must not suppress the attach instructions" get fixed on one path

@@ -170,25 +170,11 @@ open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh"))
 PYX
 run "the entrypoint stops raising the firewall" "no longer reaches the firewall-argument guard"
 
-# The setup-complete marker, spelled in two files that cannot share a variable. Drift there makes
-# every run redo the whole of setup while reporting success — the kind of breakage that looks like
-# slowness rather than like a bug, so nobody goes looking.
-seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("/home/vscode/.jkb-container-setup-complete",
-                             "/home/vscode/.jkb-setup-done"))
-PYX
-run "the two spellings of the setup marker drift apart" "setup would re-run for ever"
-
-# ...and the half that pins the extraction itself: a guard that cannot find either value must say
-# so rather than compare two empty strings and call them equal.
-seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("touch /home/vscode/.jkb-container-setup-complete", ":"))
-PYX
-run "setup.sh stops writing the marker at all" "stopped naming it"
+# THE TWO SETUP-MARKER MUTATIONS ARE GONE with the guard they exercised (D52.5). One drifted the
+# two spellings of the marker path apart, the other made the extraction find nothing; both required
+# check-config.sh to notice. There is one spelling now -- JKB_SETUP_MARKER in lib.sh, sourced by
+# run.sh on the host and by setup.sh inside the container -- so there is nothing to induce, and a
+# mutation for a deleted assertion reports MISSED for ever.
 
 # ...and the second verifier put back, which is how the fix for "a fatal verify hides the attach
 # instructions" comes to hold on one path and not the other again.
@@ -505,7 +491,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=49
+PINNED_BAD_SITES=47
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

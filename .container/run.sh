@@ -32,8 +32,8 @@ HOST_REPOS="$HOME/repos"
 HOST_REPOS_REAL="$(cd "$HOST_REPOS" 2>/dev/null && pwd -P || printf '%s' "$HOST_REPOS")"
 CTR_REPOS="/home/vscode/repos"
 # Written by setup.sh as its LAST act, so its presence means "setup finished", not "setup started".
-# One statement of the path, shared with setup.sh via this being the only place it is spelled here.
-SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
+# The path itself is JKB_SETUP_MARKER in lib.sh, which both this script and setup.sh source (D52.5).
+# Assigned here from that constant rather than spelled again, so the two cannot drift.
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -492,7 +492,7 @@ fi
 # recorded as the definite answer `setup_done=0` — so a container whose setup had completed was
 # told it had not and started the ten-minute toolchain rebuild. An answer that cannot be
 # distinguished from a transport failure is not an answer.
-setup_probe="$(in_container "$NAME" sh -c "test -e '$SETUP_MARKER' && echo done || echo missing" 2>/dev/null)" || setup_probe=""
+setup_probe="$(in_container "$NAME" sh -c "test -e '$JKB_SETUP_MARKER' && echo done || echo missing" 2>/dev/null)" || setup_probe=""
 case "$setup_probe" in
     done)    setup_done=1 ;;
     missing) setup_done=0 ;;

@@ -148,3 +148,18 @@ dc_link_state() { # dc_link_state [home]
     ln -sfn "$h/.claude-state/.credentials.json" "$h/.claude/.credentials.json" 2>/dev/null || true
     ln -sfn "$h/.claude-state/claude.json"       "$h/.claude.json"              2>/dev/null || true
 }
+
+# THE SETUP-COMPLETE MARKER, named once for the two scripts that use it (D52.5).
+#
+# setup.sh `touch`es it inside the container as its LAST act, so its presence means "setup
+# finished" and not "setup started"; run.sh probes for it from the host to decide whether a
+# container still needs setting up. Those are two different processes on two sides of a container
+# boundary, which is why check-config.sh carried a guard comparing the two spellings, justified as
+# "they cannot share a variable".
+#
+# They can: run.sh sources this file on the host, and setup.sh sources it inside the container from
+# the same bind-mounted checkout. So there is one spelling and the guard goes with the duplication.
+#
+# In the writable layer deliberately, not a volume: `run.sh --rm` must genuinely redo setup, and a
+# volume would carry the marker into a container that had never been set up.
+JKB_SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"

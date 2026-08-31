@@ -93,9 +93,9 @@ jkb --version || true
 # FINISHED. Choosing on "did this invocation create the container" instead left an interrupted
 # first run permanently in the verify arm, with no way back to setup short of recreating it.
 #
-# In the writable layer deliberately, not a volume: `run.sh --rm` must genuinely redo setup, and a
-# volume would carry the marker across into a container that had never been set up.
-touch /home/vscode/.jkb-container-setup-complete
+# The path is JKB_SETUP_MARKER in lib.sh, sourced above and shared with run.sh, which probes for
+# it from the host (D52.5). Its "writable layer, not a volume" rationale lives with it there.
+touch "$JKB_SETUP_MARKER"
 
 # VERIFYING IS NOT A SETUP STEP, and it used to be the last line of this file. Two things followed
 # from that and both were wrong. A failing assertion aborted run.sh under `set -e` before it could
