@@ -74,6 +74,19 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/jkb" "$scratch/home/Documents"
+# THE KNOWLEDGE-BASE BIND MUST BE WRITABLE BY THE CONTAINER'S USER, WHOEVER THAT IS ON THIS HOST.
+# This directory is created here, on the host, and bind-mounted at /home/vscode/.jkb -- so it
+# carries the HOST user's uid, while the container runs as vscode (uid 1000). Those agree on a
+# developer's machine and on Docker Desktop for macOS, which maps ownership; they do NOT agree on a
+# GitHub runner, whose user is uid 1001. There, every run failed with
+#   mkdir: cannot create directory '/home/vscode/.jkb/claude-memory': Permission denied
+# and verify.sh reported `auto-memory is not linked (state: unlinked)`, which it treats as fatal --
+# so the control could never pass and every mutation verdict above it was unattributable.
+#
+# This harness had never run on a non-1000 host, so the whole class was invisible. 0777 rather than
+# a chown: it is a throwaway mktemp directory removed on exit, and matching an arbitrary image uid
+# from the host would need root.
+chmod 0777 "$scratch/jkb"
 printf '{}' > "$scratch/home/settings.json"
 SEC="$REPO/.container/seccomp-bwrap.json"
 BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)

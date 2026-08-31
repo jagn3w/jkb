@@ -181,16 +181,34 @@ jobs:
                    kernel.apparmor_restrict_unprivileged_userns; do
             printf '%s = %s\n' "$s" "$(sysctl -n $s 2>&1 || true)"
           done
-          probe='bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
-                   && echo BWRAP-OK || echo BWRAP-FAILED'
           SEC=.container/seccomp-bwrap.json
-          echo "--- [1] stock docker (expected to fail) ---"
-          docker run --rm --user vscode jkb-dev bash -c "$probe" 2>&1 | tail -2
-          echo "--- [2] + the seccomp profile the container ships ---"
-          docker run --rm --user vscode --security-opt seccomp=$SEC jkb-dev bash -c "$probe" 2>&1 | tail -2
-          echo "--- [3] + apparmor unconfined ---"
-          docker run --rm --user vscode --security-opt seccomp=$SEC --security-opt apparmor=unconfined \
-            jkb-dev bash -c "$probe" 2>&1 | tail -2
+          # --entrypoint bash, deliberately. The first version of this probe kept the image's
+          # entrypoint, which refuses to boot when egress is unbounded -- and these arms grant no
+          # NET_ADMIN, so all three printed the refusal and bwrap never ran. Three identical
+          # outputs that discriminated nothing, in the experiment written to settle the question.
+          # The entrypoint is an unrelated moving part here: bwrap's namespace creation depends on
+          # the kernel, seccomp, AppArmor and capabilities, not on what PID 1 is.
+          probe() { # probe <label> <extra docker args...>
+            local label="$1"; shift
+            local out
+            out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c \
+                    'bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
+                       && echo BWRAP-OK || echo BWRAP-FAILED' 2>&1)"
+            # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
+            # whole lesson of the previous version: "no BWRAP-OK in the output" and "the probe
+            # never executed" are different facts and must not print the same way.
+            case "$out" in
+              *BWRAP-OK*)     printf '%-30s OK\n' "$label" ;;
+              *BWRAP-FAILED*) printf '%-30s FAILED\n' "$label"
+                              printf '%s\n' "$out" | grep -v BWRAP- | sed 's/^/      /' | tail -3 ;;
+              *)              printf '%-30s DID NOT RUN - this arm measured NOTHING:\n' "$label"
+                              printf '%s\n' "$out" | sed 's/^/      /' | tail -5 ;;
+            esac
+          }
+          probe "[1] stock docker"        --user vscode
+          probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
+          probe "[3] + apparmor=unconfined" --user vscode --security-opt seccomp=$SEC \
+                                            --security-opt apparmor=unconfined
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
       # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run
