@@ -33,6 +33,11 @@ seed() {
     rm -rf "$work/t"; mkdir -p "$work/t/scripts"
     cp -R "$repo/.container" "$work/t/.container"
     cp "$repo/scripts/auto-mode-posture.json" "$work/t/scripts/"
+    # check-config.sh now compares the gate's --self-test list against CI's, so both files have to
+    # be in the copy or that assertion would fail for every mutation and pass for none.
+    cp "$repo/scripts/check.sh" "$work/t/scripts/"
+    mkdir -p "$work/t/.github/workflows"
+    cp "$repo/.github/workflows/ci.yml" "$work/t/.github/workflows/"
     # check-config.sh derives the locally-built extension's id from here, and skips when the repo
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
@@ -239,12 +244,78 @@ open(p, 'w').write(s.replace("    denied)      bad ", "    refused)     bad ", 1
 PYX
 run "a reader loses the arm for a verdict state" "has no case arm for the 'denied' verdict"
 
-seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('readonly VERDICT_STATES="', 'readonly NOT_THE_STATES="', 1))
+open(p, 'w').write(s.replace('VERDICT_STATES="allowlisted', 'NOT_THE_STATES="allowlisted', 1))
 PYX
-run "the writer stops declaring its states" "no longer declares VERDICT_STATES"
+run "the library stops declaring its states" "no longer declares VERDICT_STATES"
+
+# THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
+# replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
+# never established which occurrence the guard reads, and the guard was in fact reading those
+# messages. This deletes only the invocation line, which is the one thing that must be seen.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys, re
+p = sys.argv[1]; s = open(p).read()
+out = [l for l in s.split("\n")
+       if not re.match(r'^\s*(in_container|docker exec).*bash \.container/verify\.sh', l)]
+assert len(out) < len(s.split("\n")), "no verify invocation line to delete"
+open(p, 'w').write("\n".join(out))
+PYX
+run "run.sh stops invoking verify.sh (messages still name it)" "no longer runs verify.sh"
+
+# THE SECOND ROOT GRANT is subject to the same no-arguments rule as the firewall's, and both halves
+# of it get watched failing — the sudoers pin and the script's own refusal.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/usr/local/bin/egress-status.sh ""', '/usr/local/bin/egress-status.sh', 1))
+PYX
+run "the egress probe's sudoers grant stops pinning its argument" "no longer pins it to no arguments"
+
+seed; python3 - "$work/t/.container/egress-status.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('takes no arguments', 'ignores extra arguments'))
+PYX
+run "the egress probe stops refusing arguments" "egress-status.sh no longer refuses arguments"
+
+# The two self-test lists (D51.9): drop one from each side in turn.
+seed; python3 - "$work/t/scripts/check.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"$(dirname "$0")/../.container/egress-lib.sh" --self-test\n', '', 1))
+PYX
+run "a self-test is dropped from the gate" "disagree about which container self-tests"
+
+seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('          ./.container/egress-status.sh --self-test\n', '', 1))
+PYX
+run "a self-test is dropped from CI" "disagree about which container self-tests"
+
+# ...and the half that stops both lists agreeing about running nothing.
+seed; python3 - "$work/t/scripts/check.sh" "$work/t/.github/workflows/ci.yml" <<'PYX'
+import sys
+for p in sys.argv[1:]:
+    s = open(p).read()
+    for tok in ('"$(dirname "$0")/../.container/egress-status.sh" --self-test\n',
+                '          ./.container/egress-status.sh --self-test\n'):
+        s = s.replace(tok, '')
+    open(p, 'w').write(s)
+PYX
+run "both lists drop the same self-test" "self-test that no gate runs"
+
+# The second sudoers grant is read-only by argument, so the allowed SET is what verify.sh pins.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"may run more than the firewall and the egress probe as root"',
+                             '"may run more than the firewall as root"', 1))
+PYX
+run "a harness expectation drifts from verify.sh" "expects text verify.sh never prints"
 
 # ...and what makes the two ERR-trap rules safe to exempt the self-test from: that it exits.
 seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
@@ -431,7 +502,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=45
+PINNED_BAD_SITES=50
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

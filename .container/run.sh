@@ -413,11 +413,54 @@ esac
 # returns 0 when it does — the refusal is in the container's logs, not in docker's exit code. So
 # the next `docker exec` failed with a bare "Container ... is not running" and `set -e` killed this
 # script, leaving the actual explanation somewhere nothing pointed at.
-if ! docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true; then
-    printf '\033[31merror:\033[0m %s exited immediately after starting.\n' "$NAME" >&2
-    printf 'The entrypoint refuses to run a container whose firewall could not establish that\n' >&2
+# THE ENTRYPOINT'S DECISION TAKES TIME, so this waits for it rather than sampling once (D51.5).
+# `docker run --detach` returns as soon as PID 1 starts, and the entrypoint then spends seconds in
+# DNS lookups and ipset work before it decides. A single `docker inspect` here therefore saw `true`
+# for a container that was about to refuse, the guard passed, and every step below misattributed
+# the refusal: the setup probe recorded the definite answer "setup did not complete" and started a
+# ten-minute rebuild, `verify_rc` took the daemon's exit 1 for verify's verdict, and the run ended
+# by printing "the container is running and attachable" about a container that was not, from a
+# verifier that never ran.
+settle() { # settle -> 0 once PID 1 is past the entrypoint, 1 if the container is gone
+    local i
+    for i in $(seq 1 120); do
+        docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true || return 1
+        # The entrypoint execs the command, so once PID 1 is no longer the entrypoint the decision
+        # has been made. Falls back to a plain running check where ps is unavailable.
+        docker exec "$NAME" sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null \
+            | grep -q 'entrypoint.sh' || return 0
+        sleep 1
+    done
+    return 0
+}
+
+# "Is the container alive, and if not why" DOMINATES every exec below, so it is asked in one place
+# and every failing exec routes through it (D45.5's rule, applied here). It used to be asked once,
+# up front, in a form that could not distinguish a dead container from a false probe.
+container_died() { # container_died <what was being attempted>
+    printf '\n\033[31merror:\033[0m %s is not running (while: %s).\n' "$NAME" "$1" >&2
+    printf 'The entrypoint refuses to start a container whose firewall could not establish that\n' >&2
     printf 'egress is bounded. Its reason is the last thing in the log:\n\n' >&2
     docker logs --tail 20 "$NAME" 2>&1 | sed 's/^/  /' >&2
+}
+
+# Runs a command in the container and tells a TRANSPORT failure from the command's own answer. They
+# shared exit 1, so "the container is gone" and "the thing I asked about is false" were the same
+# value. Returns the command's status; on a dead container it reports and returns 125, which no
+# probe here uses as an answer.
+in_container() { # in_container <args...>
+    local rc=0
+    docker exec "$@" || rc=$?
+    if [ "$rc" -ne 0 ] \
+       && ! docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true; then
+        container_died "docker exec $*"
+        return 125
+    fi
+    return "$rc"
+}
+
+if ! settle; then
+    container_died "waiting for the entrypoint to settle"
     exit 1
 fi
 
@@ -432,7 +475,7 @@ fi
 # verify responsible for — for the one caller that runs it.
 say "egress firewall"
 raise_rc=0
-docker exec "$NAME" sudo -n /usr/local/bin/init-firewall.sh || raise_rc=$?
+in_container "$NAME" sudo -n /usr/local/bin/init-firewall.sh || raise_rc=$?
 if [ "$raise_rc" -ne 0 ]; then
     say "the raise reported a failure (exit $raise_rc) — verify.sh below reports what state it left"
 fi
@@ -444,16 +487,25 @@ fi
 # setup.sh becomes unreachable for the life of the container and only `--rm` escapes. Dev
 # Containers recorded postCreate completion and re-ran it after a failure; this is that. The marker
 # is in the writable layer, not a volume, so recreating the container correctly redoes setup.
-if docker exec "$NAME" test -e "$SETUP_MARKER" 2>/dev/null; then
-    setup_done=1
-else
-    setup_done=0
-fi
+# PRINTS A WORD rather than relying on an exit code the daemon also uses (D51.5). `test -e`
+# returning non-zero meant both "the marker is absent" and "the exec never ran", and the second was
+# recorded as the definite answer `setup_done=0` — so a container whose setup had completed was
+# told it had not and started the ten-minute toolchain rebuild. An answer that cannot be
+# distinguished from a transport failure is not an answer.
+setup_probe="$(in_container "$NAME" sh -c "test -e '$SETUP_MARKER' && echo done || echo missing" 2>/dev/null)" || setup_probe=""
+case "$setup_probe" in
+    done)    setup_done=1 ;;
+    missing) setup_done=0 ;;
+    *)       # Neither word came back: the exec failed. Never read as "setup did not complete".
+             printf '\033[31merror:\033[0m could not ask %s whether setup completed.\n' "$NAME" >&2
+             container_died "probing the setup marker"
+             exit 1 ;;
+esac
 
 if [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
-    docker exec -w "$ctr_repo" "$NAME" bash .container/setup.sh
+    in_container -w "$ctr_repo" "$NAME" bash .container/setup.sh
 fi
 
 # THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was after, and verify.sh exits 1 on
@@ -461,7 +513,7 @@ fi
 # reaper that can finish container-side archive records, whose /home/vscode/... paths the host's
 # `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted postStartCommand
 # ran it unconditionally and this is that shape back.
-docker exec -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
+in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 
 # ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
 # separate call here on the restart path — so the review's "a fatal verify suppresses everything
@@ -471,7 +523,7 @@ docker exec -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 # way to fix it. The exit code is still verify's, at the very end.
 say "verify"
 verify_rc=0
-docker exec -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
+in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
 
 say "attached VS Code windows"
 cat <<EOF
@@ -487,13 +539,28 @@ cat <<EOF
 EOF
 
 if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
-    # OPENING A WINDOW IS AN ACTION, NOT A NOTE. Carrying verify's result so the attach
-    # instructions still print is right; going on to launch an attached VS Code window into a
-    # container whose verifier just reported UNDECLARED mounts, permitted egress to a
-    # non-allowlisted host, or a broken posture is not. Before the result was carried, `set -e`
-    # made this unreachable on a red verify; carrying it is what made it reachable.
+    # OPENING A WINDOW IS AN ACTION, NOT A NOTE — and it is the action of starting an agent session.
+    # Carrying verify's result so the attach instructions still print is right; launching a window
+    # into a container whose verifier just reported UNDECLARED mounts, permitted egress to a
+    # non-allowlisted host, or a broken posture is not.
+    #
+    # BOOTING IS NOT ENDORSING (D51.7). Exit 3 means every failure is a condition this container was
+    # CONFIGURED to accept — in practice, the unfiltered-egress override. That override exists so a
+    # container BOOTS and can be attached to and diagnosed; it does not make that container a place
+    # to run an agent unattended, which is precisely what this flag would do. So it is still
+    # refused, and the message says something that can be acted on: the previous wording told you
+    # to "fix them" about a condition the design REQUIRES to keep failing, which is advice with no
+    # followable step.
     printf '\n\033[31mnot opening a window:\033[0m verify.sh reported problems (exit %s).\n' "$verify_rc" >&2
-    printf 'Fix them, or attach by hand with the Command Palette route above if you know why.\n' >&2
+    if [ "$verify_rc" -eq 3 ]; then
+        printf 'Every failure it reported is a condition this container was configured to accept —\n' >&2
+        printf 'JKB_EGRESS_ACCEPT_UNFILTERED=1, which lets it start with unfiltered egress. That is\n' >&2
+        printf 'a container to attach to and diagnose, not one to run an agent in unattended, so no\n' >&2
+        printf 'window is opened while it holds. Either unset it in container.json and recreate, or\n' >&2
+        printf 'attach by hand with the Command Palette route above.\n' >&2
+    else
+        printf 'Fix them, or attach by hand with the Command Palette route above if you know why.\n' >&2
+    fi
 elif [ "$OPEN" -eq 1 ]; then
     [ -n "$open_path" ] || open_path="$ctr_repo"
     # A HOST PATH IS THE NATURAL THING TO TYPE — you are standing in one — and appending it to the

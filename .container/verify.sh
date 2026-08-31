@@ -7,9 +7,10 @@
 # but not on one that no longer contains what it should). Each assertion below fails for exactly
 # one such edit.
 set -uo pipefail
-pass=0; fail=0
+pass=0; fail=0; accepted_failure=0
 ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
+note() { printf '  \033[33mnote\033[0m %s\n' "$1"; }
 assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 
 # `--declare <mount-point>`: a mount point the CALLER declares, for the one case container.json
@@ -334,10 +335,17 @@ if [ "$sudo_rc" -ne 0 ] && [ -z "$sudo_entries" ]; then
     fi
 elif [ -z "$sudo_entries" ]; then
     bad "sudo -n -l succeeded but listed no grants — cannot establish what this user may run as root"
-elif [ -z "$(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries")" ]; then
-    ok "the only command permitted as root is the firewall ($(grep -c . <<<"$sudo_entries") grant(s))"
 else
-    bad "vscode may run more than the firewall as root: $(grep -v '/usr/local/bin/init-firewall.sh' <<<"$sudo_entries" | tr -s ' ' | tr '\n' ';')"
+# THE ALLOWED SET IS NAMED, and it is exactly two: the firewall, which raises the rules, and the
+# status probe, which reads them (D51.1). The probe is a second grant and therefore a second thing
+# to justify — it is read-only, so a grant to run it is not a grant to change the boundary, and
+# both are pinned to no arguments. Anything else at all fails here, whatever added it.
+sudo_extra="$(grep -vE '/usr/local/bin/(init-firewall|egress-status)\.sh' <<<"$sudo_entries" || true)"
+if [ -z "$sudo_extra" ]; then
+    ok "the only commands permitted as root are the firewall and the egress probe ($(grep -c . <<<"$sudo_entries") grant(s))"
+else
+    bad "vscode may run more than the firewall and the egress probe as root: $(tr -s ' ' <<<"$sudo_extra" | tr '\n' ';')"
+fi
 fi
 
 # 3c. The login-state links. container.json and the README both promise a login survives a
@@ -504,32 +512,64 @@ assert "knowledge base is mounted" "$kb_mounted"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.
-# WHAT THE FIREWALL DID, not what egress happens to do. The two probes below both resolve a name,
-# so a dead resolver produces the same answers as a deny-all — which meant the harness case for
-# `fail_closed` passed without ever establishing that it installed anything. The raise records what
-# it ESTABLISHED on every ending it reaches (D50.2), so this reads that rather than probing.
-# Deliberately NOT the exit code and no longer a bare marker: the marker this replaced was written
-# before any iptables call, so it meant "fail_closed ran" — true both when a deny-all went in and
-# when installing it failed and egress was left wide open.
+# WHAT THE KERNEL HOLDS RIGHT NOW, not what egress happens to do and not what some past raise
+# recorded. The two curl probes below both resolve a name, so a dead resolver produces the same
+# answers as a deny-all — which is why this does not infer the boundary from them. And it no longer
+# reads the RECORD for the state either (D51.1): a record is an event, this is a present-tense
+# question, and the file outlives the rules it describes — `docker stop` destroys every chain while
+# the file survives, so a container restarted without a successful raise reported the previous
+# start's `allowlisted` as healthy. The probe reads the live chains and cannot be stale.
+#
+# The record still supplies the REASON, which the kernel cannot: that DNS failed, that the snapshot
+# was truncated.
 egress_verdict=/run/jkb-egress-verdict
-eg_state="$(sed -n 's/^state=//p' "$egress_verdict" 2>/dev/null | head -1)"
+eg_probe="$(sudo -n /usr/local/bin/egress-status.sh 2>/dev/null)" || eg_probe=""
+eg_state="$(printf '%s\n' "$eg_probe" | sed -n 's/^state=//p' | head -1)"
+eg_v6="$(printf '%s\n' "$eg_probe" | sed -n 's/^v6=//p' | head -1)"
 eg_reason="$(sed -n 's/^reason=//p' "$egress_verdict" 2>/dev/null | head -1)"
-eg_v6="$(sed -n 's/^v6=//p' "$egress_verdict" 2>/dev/null | head -1)"
+[ -n "$eg_reason" ] || eg_reason="(the raise left no reason)"
+
+# THE OVERRIDE IS READ, NEVER INFERRED (D51.4). This used to be deduced from an `unfiltered` state
+# on the reasoning that the entrypoint refuses that state otherwise — which failed both ways. An
+# operator who armed it to get past a refusal, then fixed the host, got `allowlisted` and silence:
+# nothing reported that the boot gate was still disarmed, which is exactly the condition the
+# override's own justification says must never be invisible. And an `unfiltered` state reached by
+# any other route (a re-raise on a running container) was BLAMED on a variable that may be 0.
+# `docker exec` inherits containerEnv, so the value is right here to be read.
+eg_accept="${JKB_EGRESS_ACCEPT_UNFILTERED:-0}"
+if [ "$eg_accept" = 1 ]; then
+    accepted_failure=1
+    bad "the egress boot gate is DISARMED: JKB_EGRESS_ACCEPT_UNFILTERED=1, so this container will
+       start even with unfiltered egress. Reported every run for as long as it is set — an override
+       nobody can see is indistinguishable from a rule that does not exist. Unset it in
+       container.json and recreate. (--open will not open a window while this holds.)"
+fi
+
 case "$eg_state" in
-    allowlisted) ok "the firewall raised an allowlist (IPv4 allowlisted, IPv6 $eg_v6)" ;;
-    denied)      bad "the firewall failed closed and left no allowlist: $eg_reason" ;;
-    # Reachable only via JKB_EGRESS_ACCEPT_UNFILTERED — the entrypoint refuses this state
-    # otherwise — so seeing it means the override is set. It is a failure every run for as long
-    # as it is: an override nobody can see is indistinguishable from a rule that does not exist.
-    unfiltered)  bad "egress is UNFILTERED and the container was started anyway
-       (JKB_EGRESS_ACCEPT_UNFILTERED). $eg_reason" ;;
-    # No file, or a state nothing here knows. Not evidence of anything, and never read as denied:
-    # this is also what a container started with --entrypoint bash looks like, which is exactly
-    # when you most want to be told the firewall's state is unestablished.
-    *)           bad "the firewall left no verdict this understands (state=${eg_state:-<none>}) —
-       it records one on every ending, so it aborted before reaching any of them, or this
-       container was started bypassing the entrypoint" ;;
+    allowlisted) ok "the firewall has an allowlist in the live chain (IPv4 bounded, IPv6 $eg_v6)" ;;
+    denied)      bad "the live chain denies everything and has no allowlist: $eg_reason" ;;
+    # Worded from the evidence this has, not from a cause it assumed. Whether the override is set is
+    # reported separately, above, because it is a separate fact.
+    unfiltered)  bad "egress is UNFILTERED in the live chain (IPv6 $eg_v6) and this container is
+       running anyway: $eg_reason" ;;
+    # No answer at all. The probe reads the live chains, so producing nothing means it could not
+    # run — which says nothing about the network and is never read as bounded. This is also what a
+    # container started with --entrypoint bash looks like, which is exactly when you most want to
+    # be told the firewall's state is unestablished.
+    *)           bad "could not establish whether egress is bounded (state=${eg_state:-<none>}).
+       egress-status.sh reads the live chains; no answer means it could not run — sudo, the
+       sudoers grant, or the image. Last recorded reason: $eg_reason" ;;
 esac
+
+# DRIFT between the two is worth saying and is never acted on. The record is what a past raise
+# concluded; the chain is what is there. They disagree when a raise died after recording, when two
+# raises fought, or when something changed the chain afterwards — each of which an operator wants
+# to know about, and none of which changes the answer above.
+eg_recorded="$(sed -n 's/^state=//p' "$egress_verdict" 2>/dev/null | head -1)"
+if [ -n "$eg_recorded" ] && [ -n "$eg_state" ] && [ "$eg_recorded" != "$eg_state" ]; then
+    note "the last raise recorded '$eg_recorded' but the live chain is '$eg_state' — the chain
+       decides; the record is stale or something changed it afterwards"
+fi
 if curl -sS -m 6 -o /dev/null https://example.com 2>/dev/null; then
     bad "egress to a NON-allowlisted host was permitted (example.com)"
 else
@@ -608,5 +648,19 @@ echo "  cost; do NOT use printenv CLAUDE_CODE_SANDBOXED, which was unset on a ho
 echo "  was provably enforcing), or"
 echo "  ./scripts/auto-mode.sh probe   for the full write/egress/credential probe."
 echo
-if [ "$fail" -ne 0 ]; then printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"; exit 1; fi
+# TWO KINDS OF FAILURE, TWO EXIT CODES (D51.5). One code meant both "the boundary is broken" and
+# "this container is in a state you deliberately configured", and run.sh gated --open on it — so a
+# host using the documented escape could never open a window, and the message told it to fix a
+# condition the design REQUIRES to keep failing. The failure is still reported every run, at full
+# volume; what changes is that a caller can tell the two apart.
+#   1  a real failure
+#   3  the only failures are conditions this container was configured to accept
+if [ "$fail" -ne 0 ]; then
+    printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"
+    if [ "$accepted_failure" -ne 0 ] && [ "$fail" -eq "$accepted_failure" ]; then
+        printf 'every failure above is a condition this container was configured to accept.\n'
+        exit 3
+    fi
+    exit 1
+fi
 printf '\033[32mall %d container checks passed\033[0m\n' "$pass"

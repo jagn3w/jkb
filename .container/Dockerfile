@@ -33,8 +33,16 @@ COPY --chown=root:root init-firewall.sh /usr/local/bin/init-firewall.sh
 # The entrypoint is root-owned for the same reason and by the same argument: it is what raises the
 # firewall on every start, so an agent able to rewrite it could simply not raise it.
 COPY --chown=root:root entrypoint.sh /usr/local/bin/entrypoint.sh
+# The live-chain probe and the library both scripts source. Root-owned by the same argument: the
+# probe is what the boot decision is made on, and the library is what the raise sources as root —
+# either one writable by `vscode` would be a root shell with extra steps. The library is sourced
+# from `$(dirname "$0")`, which is why it sits in /usr/local/bin beside its two callers rather than
+# in a lib directory: one install location, resolving the same way here and in the repo.
+COPY --chown=root:root egress-status.sh /usr/local/bin/egress-status.sh
+COPY --chown=root:root egress-lib.sh    /usr/local/bin/egress-lib.sh
 RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/init-firewall.sh \
-                    /usr/local/bin/entrypoint.sh \
+                    /usr/local/bin/entrypoint.sh /usr/local/bin/egress-status.sh \
+                    /usr/local/bin/egress-lib.sh \
     # Owned explicitly, not inherited. Everything here rests on `vscode` being unable to replace
     # the script sudo runs as root, or the allowlist snapshot beside it — and unlink/replace is
     # governed by the DIRECTORY, not the file mode. Debian-derived images have historically
@@ -43,8 +51,20 @@ RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/in
     # property nothing in this repo stated. verify.sh asserts the result at runtime.
     && chmod 0755 /usr/local /usr/local/bin /usr/local/share \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
+                  /usr/local/bin/egress-status.sh \
+    # IN THE IMAGE it is only ever sourced, so it needs no exec bit, and not having one is a small
+    # statement that it is never a command anybody runs as root by name. (In the repo it does carry
+    # one, because ./scripts/check.sh runs its --self-test directly.)
+    && chmod 0644 /usr/local/bin/egress-lib.sh \
     && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh ""\n' > /etc/sudoers.d/init-firewall \
     && chmod 0440 /etc/sudoers.d/init-firewall \
+    # THE SECOND GRANT, and it is read-only (D51.1). The boot decision asks the kernel what the
+    # filter chains hold, and only root can read them — so the entrypoint (which runs as `vscode`)
+    # needs this. egress-status.sh only inspects and prints: it must never install, flush or modify
+    # a rule, so a grant to run it is not a grant to change the boundary. Pinned to NO ARGUMENTS by
+    # the same rule as the firewall's, because a command naming no argument accepts every argument.
+    && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/egress-status.sh ""\n' > /etc/sudoers.d/egress-status \
+    && chmod 0440 /etc/sudoers.d/egress-status \
     # ...and the grant above means nothing while THIS file exists. The devcontainers base image
     # ships /etc/sudoers.d/vscode containing `vscode ALL=(root) NOPASSWD:ALL`, so the agent could
     # already run anything as root: flush the firewall, delete the allowlist snapshot, rewrite the

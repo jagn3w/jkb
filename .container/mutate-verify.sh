@@ -242,7 +242,7 @@ run "auto-memory is not linked into the shared store" "auto-memory is not linked
 # container is then too tight to work in — which is exactly what verify.sh must say. A container
 # that cannot reach its own allowlist is a real state (a laptop offline at container start), and
 # the honest report is "the firewall is too tight", not silence.
-run "the firewall cannot resolve any allowlisted domain" "failed closed and left no allowlist" \
+run "the firewall cannot resolve any allowlisted domain" "the live chain denies everything and has no allowlist" \
     --dns 127.0.0.1 "${HEALTHY[@]}"
 
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
@@ -261,7 +261,7 @@ run "/usr/local itself is writable by the agent" "is writable by" \
     "${HEALTHY[@]}"
 
 mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/sudoers.d/vscode && chmod 0440 /etc/sudoers.d/vscode"
-run "blanket passwordless root is restored" "may run more than the firewall as root" \
+run "blanket passwordless root is restored" "may run more than the firewall and the egress probe as root" \
     "${HEALTHY[@]}"
 
 # The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher

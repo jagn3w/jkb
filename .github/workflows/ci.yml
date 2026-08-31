@@ -93,7 +93,9 @@ jobs:
       # it defers to actually happens.
       #   run.sh          the docker argument derivation and the staleness fingerprint
       #   entrypoint.sh   the boot decision, against a stubbed firewall raise (D50.3)
-      #   init-firew...   what the raise records, and the format the reader parses (D50.2/D50.4)
+      #   init-firew...   the reason it records, and the format the reader parses (D50.2/D51.8)
+      #   egress-lib      what "egress is bounded" means — one definition, two callers (D51.1)
+      #   egress-status   the live-chain report the entrypoint now boots on (D51.1)
       #   fetch-ext...    the marketplace URL and platform mapping
       #   verify.sh       the mount-exclusion regex
       - name: container derivations
@@ -101,8 +103,13 @@ jobs:
           ./.container/run.sh --self-test
           ./.container/entrypoint.sh --self-test
           ./.container/init-firewall.sh --self-test
+          ./.container/egress-lib.sh --self-test
+          ./.container/egress-status.sh --self-test
           ./.container/fetch-extensions.sh --self-test
           ./.container/verify.sh --self-test
+          # Ran in scripts/check.sh and NOWHERE in CI until check-config.sh started comparing the
+          # two lists — the exact drift that check exists to catch, found on its first run.
+          ./scripts/link-claude-memory.sh --self-test
 
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.

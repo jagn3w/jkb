@@ -1945,6 +1945,82 @@ is who starts the container, and it removes a limitation rather than working aro
   because iptables rules live in the container's network namespace and do not survive a restart and
   because the rest of setup includes a toolchain download.
 
+### Egress is asked of the kernel, not of a record (D51)
+
+Design: `openspec/changes/jkb-egress-liveness/`. Supersedes the **decision** half of D50 below,
+whose diagnosis and reason-record stand. Review round 3 (`low`, 3 reviewers, 17 raw → 10 findings,
+4 must-fix, none pre-existing) is the input; the findings cluster into seven causes, not ten sites.
+
+- **D50 made the raise record what it established. It never made the record say what it is about.**
+  A verdict is an *event* — "at some moment, a raise established X" — and every reader asks a
+  *present-tense* question: is egress bounded **now**? Nothing said when an older verdict stops
+  counting, so it counted for ever, and `docker stop` destroys every iptables rule while the file
+  survives in the writable layer. A raise that died before recording left the **previous start's**
+  `allowlisted` standing; the entrypoint read it, printed nothing, and exec'd the agent onto an
+  empty OUTPUT chain — unrestricted egress, silently, on exactly the `docker start` path the
+  entrypoint was added to cover.
+- **This repo already had the lesson, one subsystem over**: *"evidence of a landing is spent once
+  the task is put back to work."* Turning a history into a present-tense answer needs a rule for
+  when an older row stops counting; there it was written separately in each reader and they
+  disagreed, here it was written nowhere.
+- **So ask the kernel.** `egress-status.sh` is a second root-owned, argument-less, **read-only**
+  script granted by sudoers exactly as the firewall is; it reads the live filter chains and prints
+  one word. `entrypoint.sh` boots on that and `verify.sh` reports from it — which is what finally
+  makes verify's own comment true, since it claimed to report *"what the firewall DID"* while
+  reading a file that can outlive what it describes.
+- **Chosen over making the record trustworthy**, which is the obvious repair: a `state=raising`
+  marker plus a token naming the network namespace plus a staleness rule — three mechanisms
+  reconstructing what the kernel will simply tell you. Asking directly removes the failure class
+  instead of guarding it, and covers a case none of them do: `--entrypoint bash`, the escape D50's
+  own refusal recommends, runs **no raise at all**, so no marker is ever written.
+- **The record still supplies the REASON**, which the kernel cannot — that DNS failed, that the
+  snapshot was truncated. State from the probe, explanation from the record, and a record
+  disagreeing with the probe is reported as drift rather than obeyed.
+- **A measurement must measure its own claim.** `v6_state` was named *"is IPv6 egress provably
+  closed"* and asked *"does a non-loopback address exist"*, which was wrong in **both** directions.
+  Every container on a default Docker bridge gets a link-local `fe80::/64` when the host kernel has
+  IPv6 — nothing can leave — and that read as `open`, so ordinary containers refused to boot and
+  their operators were pushed onto the permanent override. And an *unreadable* table returned
+  `absent`, which the rule reads as provably closed: `grep` exits 0/1/**2** and only two of those
+  are measurements, with the third hidden behind `2>/dev/null`. It measures a **path** now — no
+  off-link address **and** no default route — and a failed read is `open`.
+- **A fact that can be read is never inferred.** `verify.sh` deduced the override from an
+  `unfiltered` state. So an operator who armed it and then fixed the host got `allowlisted` and
+  silence, with the boot gate still disarmed — the exact condition the override's own justification
+  says must never be invisible — and an `unfiltered` state reached any other way was *blamed* on a
+  variable that may be `0`. `docker exec` inherits `containerEnv`; it is read directly.
+- **One exit code cannot carry the transport and the answer.** `docker exec` exits 1 both when the
+  container is gone and when the probed condition is false, and `run.sh` sampled liveness **once**,
+  before the entrypoint had decided — `--detach` returns as PID 1 starts. So a refusal seconds later
+  was misread three ways, ending with *"the container is running and attachable"* about a container
+  that was not, from a verifier that never ran. There is one `docker exec` wrapper now, it waits for
+  the entrypoint to settle, and the setup probe **prints a word** instead of leaning on an exit code
+  the daemon also uses.
+- **Booting is not endorsing.** `--open` launches a VS Code window, which *is* starting a session, so
+  it opens only on a clean verify. The override buys a container you can attach to **by hand** and
+  diagnose. `verify.sh` gained a distinct exit code for "every failure is a condition this container
+  was configured to accept", so the failure is still reported at full volume every run while a caller
+  can tell it from a broken boundary — and the message stops advising you to fix a condition the
+  design requires to keep failing.
+- **Serialise in the callee.** Two raises run concurrently on every fresh create (the entrypoint's
+  and `run.sh`'s re-raise) over one ipset, one chain and one record; the interleavings install a
+  blanket deny on a machine with healthy DNS. `flock` at the top of `init-firewall.sh`, so a third
+  way to start a raise is covered without being told.
+- **A guard and its mutation must both discriminate.** The round-2 guard grepped the string
+  `verify.sh`, which `run.sh` also names in three failure **messages** — text on the pass path and
+  the fail path both — so deleting the invocation left it green; and the mutation written to watch it
+  fail rewrote **every** occurrence, so it never established which one the guard reads. Two rules
+  now: anchor on the **invocation**, and **a mutation changes exactly one thing.** The same cause
+  produced an assertion named *"the reason reaches the reader intact"* that passed only because it
+  was fed a single-line reason the writer never emits, while every real reason is multi-line and the
+  readers' `head -1` stripped the remedy. `record_verdict` flattens newlines — the one place it can
+  be enforced.
+- **Two lists that must agree, derived.** `scripts/check.sh` and `ci.yml` each enumerate the
+  container self-tests; `check-config.sh` compares them, plus a second guard that every
+  `--self-test` in `.container/` is run by the gate, since both lists could otherwise agree about
+  running nothing. **It found a live one immediately**: `link-claude-memory.sh --self-test` ran in
+  the gate and nowhere in CI.
+
 ### The raise records a verdict, and the container boots on it (D50)
 
 Design: `openspec/changes/jkb-egress-verdict/`. Two review rounds produced a must-fix in this one

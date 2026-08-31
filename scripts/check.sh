@@ -99,6 +99,14 @@ else
 # throughout: no iptables, no root, no /proc.
 "$(dirname "$0")/../.container/init-firewall.sh" --self-test
 
+# ...and the two halves D51 split that decision into. The library is what "egress is bounded" MEANS
+# — one definition, sourced by the raise and by the probe, because spelling it twice inside one
+# script is how the success path came to report success on unfiltered IPv6. The probe is what the
+# entrypoint now boots on: it reads the live chains, so unlike the record it was reading before, it
+# cannot describe a network that no longer exists.
+"$(dirname "$0")/../.container/egress-lib.sh" --self-test
+"$(dirname "$0")/../.container/egress-status.sh" --self-test
+
 # ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
 # a regex, and it is the one part of the mount boundary that widens by a typo instead of by an
 # edit somebody reviews — an over-broad exclusion drops a real mount from the set and the

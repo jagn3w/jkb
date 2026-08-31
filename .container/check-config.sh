@@ -236,6 +236,14 @@ if grep -qF 'init-firewall.sh ""' "$here/Dockerfile"; then
 else
     bad "the sudoers grant does not pin the argument list — any readable JSON path would be accepted as the allowlist"
 fi
+# THE SECOND GRANT IS SUBJECT TO THE SAME RULE (D51.1). A command naming no argument accepts every
+# argument, and this one runs as root — so it is pinned the same way, and egress-status.sh refuses
+# any argument itself. Both halves, because either alone is a rule with one enforcer.
+if grep -qE 'egress-status\.sh ""' "$here/Dockerfile" 2>/dev/null; then
+    ok "sudoers grants egress-status.sh with no arguments permitted"
+else
+    bad "the sudoers entry for egress-status.sh no longer pins it to no arguments — a command naming no argument accepts every argument, and this one runs as root"
+fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
 # base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
 # delete the allowlist snapshot or rewrite the root-owned script. verify.sh asks sudo itself at
@@ -244,6 +252,11 @@ if grep -qF 'rm -f /etc/sudoers.d/vscode' "$here/Dockerfile"; then
     ok "the base image's blanket NOPASSWD:ALL grant is removed"
 else
     bad "the Dockerfile no longer removes /etc/sudoers.d/vscode — the agent can sudo anything, and every root-ownership guard here is bypassable"
+fi
+if grep -qF 'takes no arguments' "$here/egress-status.sh"; then
+    ok "egress-status.sh refuses arguments"
+else
+    bad "egress-status.sh no longer refuses arguments — it runs as root, and a command naming no argument accepts every argument"
 fi
 if grep -qF 'takes no arguments' "$here/init-firewall.sh"; then
     ok "init-firewall.sh refuses arguments (its allowlist is the root-owned snapshot)"
@@ -293,8 +306,18 @@ fi
 # ...AND THE OTHER HALF, which the line above claims and did not check. Asserting only that
 # setup.sh does NOT verify, while the passing message says run.sh does, means deleting run.sh's
 # call leaves every harness green and nothing verifying anything.
-if dc_strip_comments "$here/run.sh" | grep -qE 'verify\.sh'; then
-    ok "run.sh runs verify.sh"
+# ANCHORED ON THE INVOCATION, not on a mention of the name (D51.8). Grepping for the bare string
+# passed on run.sh's three failure MESSAGES, which name verify.sh whether or not it is ever called
+# — text present on the pass path and the fail path both, which is this directory's most-repeated
+# defect. Deleting the actual `docker exec ... verify.sh` line left the guard green and nothing
+# checking the mount boundary. And the mutation written to watch it fail rewrote every occurrence
+# of the token, including those messages, so it never established which one the guard reads: a
+# mutation that changes more than one thing proves nothing about any of them.
+#
+# So: require a statement-level exec of it — the shape the firewall-argument guard below already
+# uses — and let mutate-config.sh delete only that line.
+if dc_strip_comments "$here/run.sh" | grep -qE '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh'; then
+    ok "run.sh invokes verify.sh (a statement, not a mention of the name)"
 else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
 fi
@@ -342,12 +365,12 @@ fi
 # ...and on the STATES that path carries. The path agreeing is not enough: a reader with no arm for
 # a state the writer records drops it into `*`, which both readers treat as unknown — and unknown
 # under D50.3 is a container that refuses to boot, permanently, over a word nobody taught them.
-# Single-sourced from init-firewall.sh's VERDICT_STATES so this is not a fourth list to keep in
-# step; the writer's own self-test is what stops verdict_state returning something absent from it.
-verdict_states="$(grep -oE '^readonly VERDICT_STATES="[^"]*"' "$here/init-firewall.sh" 2>/dev/null \
+# Single-sourced from egress-lib.sh's VERDICT_STATES so this is not a fourth list to keep in
+# step; egress-lib.sh's own self-test is what stops verdict_state returning something absent from it.
+verdict_states="$(grep -oE '^(readonly )?VERDICT_STATES="[^"]*"' "$here/egress-lib.sh" 2>/dev/null \
                   | head -1 | sed 's/.*="//; s/"$//')"
 if [ -z "$verdict_states" ]; then
-    bad "init-firewall.sh no longer declares VERDICT_STATES — the check that both readers handle every verdict is now checking nothing"
+    bad "egress-lib.sh no longer declares VERDICT_STATES — the check that both readers handle every verdict is now checking nothing"
 else
     states_ok=1
     for st in $verdict_states; do
@@ -360,6 +383,46 @@ else
         done
     done
     [ "$states_ok" -eq 1 ] && ok "both readers handle every verdict state ($verdict_states)"
+fi
+
+# THE TWO SELF-TEST LISTS AGREE (D51.9). scripts/check.sh and .github/workflows/ci.yml each
+# enumerate the `.container/*.sh --self-test` invocations, because CI re-implements each gate step
+# rather than running check.sh. Add a self-test to check.sh alone and it runs nowhere in CI; drop
+# one from check.sh and CI exercises a script nobody runs locally. Derived from both files and
+# compared, which is the rule this file already applies to the setup marker, the verdict path and
+# run.sh's consumed keys.
+selftests_of() { # selftests_of <file>  -> the .container scripts it runs --self-test on, sorted
+    grep -oE '[A-Za-z0-9_.-]+\.sh" --self-test|[A-Za-z0-9_.-]+\.sh --self-test' "$1" 2>/dev/null \
+        | sed 's/"* --self-test$//' | sed 's#.*/##' | sort -u
+}
+gate_selftests="$(selftests_of "$here/../scripts/check.sh")"
+ci_selftests="$(selftests_of "$here/../.github/workflows/ci.yml")"
+if [ -z "$gate_selftests" ] || [ -z "$ci_selftests" ]; then
+    bad "could not extract the --self-test list from scripts/check.sh and/or ci.yml — this check is comparing nothing"
+elif [ "$gate_selftests" = "$ci_selftests" ]; then
+    ok "the gate and CI run the same container self-tests ($(grep -c . <<<"$gate_selftests"))"
+else
+    bad "scripts/check.sh and ci.yml disagree about which container self-tests to run — only in the gate: $(comm -23 <(printf '%s\n' "$gate_selftests") <(printf '%s\n' "$ci_selftests") | tr '\n' ' '); only in CI: $(comm -13 <(printf '%s\n' "$gate_selftests") <(printf '%s\n' "$ci_selftests") | tr '\n' ' ')"
+fi
+
+# EVERY SCRIPT HERE THAT HAS A --self-test IS RUN BY THE GATE. The check above pins the two lists
+# to each other; without this, both could omit the same one and agree perfectly about running
+# nothing. Found the same way as the derived caller list below: a set nobody compares to reality.
+ungated=()
+for f in "$here"/*.sh; do
+    b="$(basename "$f")"
+    case "$b" in check-config.sh|mutate-config.sh|mutate-verify.sh) continue ;; esac
+    grep -qE '^\s*(if )?\[ "\$\{?1' "$f" 2>/dev/null || true
+    if grep -qF -- '--self-test' "$f" 2>/dev/null; then
+        grep -qF -- "$b\" --self-test" <<<"$(cat "$here/../scripts/check.sh")" \
+            || grep -qF -- "$b --self-test" <<<"$(cat "$here/../scripts/check.sh")" \
+            || ungated+=("$b")
+    fi
+done
+if [ ${#ungated[@]} -eq 0 ]; then
+    ok "every .container script with a --self-test is run by the gate"
+else
+    bad "these have a --self-test that no gate runs: ${ungated[*]} — a self-test nothing invokes is a test that has never run"
 fi
 
 callers_ok=1

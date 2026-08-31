@@ -84,20 +84,34 @@ checked. A boundary that depends on which caller you used is not one. `run.sh` r
 synchronously as well, which is not a second rule — the raise is idempotent — but a way of knowing
 it has finished before the next `docker exec` lands.
 
-**The container boots on what the raise established, not on whether it succeeded** (D50). The
-raise records a verdict in `/run/jkb-egress-verdict` on every ending, and the entrypoint reads it:
+**The container boots on what the KERNEL holds, not on a record of what some raise established**
+(D51). `sudo egress-status.sh` reads the live filter chains and prints one word; the entrypoint
+decides on that, and `verify.sh` reports from it:
 
-| verdict | means | the container |
+| state | means | the container |
 |---|---|---|
-| `allowlisted` | the allowlist is up and both IP families are bounded | starts |
+| `allowlisted` | the allowlist rule is in the live chain and both IP families are bounded | starts |
 | `denied` | no allowlist, but egress is provably denied — DNS and loopback only | starts, loudly: this is the state you attach to in order to repair it |
 | `unfiltered` | denial could **not** be established on one or both families | **refuses to start** |
-| *(no verdict)* | the raise aborted before recording one | **refuses to start** |
+| *(no answer)* | the probe could not run, so nothing was established | **refuses to start** |
 
-An unproven family counts as open — including the case where the success path allowlists IPv4 but
-the kernel has no `ip6tables`, which previously reported success while leaving every allowlist rule
-bypassable over AAAA. A container with no IPv6 at all is a different thing and is fine: there is no
-path to deny, and that is measured rather than assumed.
+An unproven family counts as open. A container with **no way out over IPv6** is a different thing
+and is fine: no off-link address and no default route means there is no path to deny, and that is
+measured rather than assumed — a link-local `fe80::`, which every container on a default Docker
+bridge has, is not a way out.
+
+It used to read a verdict file, and that is the bug D51 fixed: a record is an *event* ("at some
+moment a raise established X") while every reader is asking a *present-tense* question. `docker
+stop` destroys every iptables rule and the file survives in the writable layer, so a restart whose
+raise died before recording read the previous start's `allowlisted`, printed nothing, and started
+an agent on an unrestricted network. The file is still written, and still carries the **reason** —
+the kernel can say egress is unfiltered, it cannot say DNS failed — but nothing decides on it, and
+`verify.sh` reports a record that disagrees with the live chain as drift.
+
+`JKB_EGRESS_ACCEPT_UNFILTERED=1` in `containerEnv` is the one escape: it lets an unfiltered
+container **boot**, so you can attach by hand and diagnose it. It does not make that container a
+place to run an agent — `verify.sh` reports it as a failure on every run for as long as it is set,
+and `run.sh --open` refuses to launch a window, because opening one *is* starting a session.
 
 If your host genuinely cannot be given the guarantee, `JKB_EGRESS_ACCEPT_UNFILTERED` in
 `container.json` boots it anyway — and `verify.sh` then reports a failure on every single run for
