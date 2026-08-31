@@ -251,6 +251,18 @@ open(p, 'w').write(s.replace('VERDICT_STATES="allowlisted', 'NOT_THE_STATES="all
 PYX
 run "the library stops declaring its states" "no longer declares VERDICT_STATES"
 
+# THE PROBE AND THE RAISE MUST STATE ONE RULE. Re-inlining the spec on the probe side is exactly
+# what shipped: `--match-set allowed-new` is the staging set, destroyed before the raise returns, so
+# allowlist_state could never answer `yes`. Mutating ONE side is the point — a mutation that
+# rewrote both would leave them agreeing and prove nothing about the drift this catches.
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('iptables -w 5 -C OUTPUT $RULE_ALLOWLIST',
+                             'iptables -w 5 -C OUTPUT -m set --match-set allowed-new dst -j ACCEPT', 1))
+PYX
+run "the probe spells the allowlist rule itself" "egress-lib.sh spells an OUTPUT rule inline"
+
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
 # never established which occurrence the guard reads, and the guard was in fact reading those
@@ -502,7 +514,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=50
+PINNED_BAD_SITES=51
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

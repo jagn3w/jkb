@@ -52,6 +52,23 @@ probe_state() { # probe_state <v4chain> <v6chain> <v6path> <allowlist> -> allowl
     verdict_state "$v4" "$v6" "$bounded"
 }
 
+# --- the rules themselves, written ONCE ---------------------------------------------------------
+#
+# A probe and an installer that spell the same rule separately are two statements that must agree,
+# and they did not: this probed `--match-set allowed-new`, which is the STAGING set — built up by
+# the raise, swapped into `allowed` and then destroyed. So `allowlist_state` could never answer
+# `yes` on a healthy container, every successful raise reported `denied` instead of `allowlisted`,
+# the entrypoint printed "egress is DENIED" on every normal boot, and verify.sh reported permanent
+# drift between the record and the chain. A guard that cannot fire, again.
+#
+# So the spec is a constant and both sides expand it: `iptables -A OUTPUT $RULE_ALLOWLIST` installs
+# exactly what `iptables -C OUTPUT $RULE_ALLOWLIST` looks for, by construction rather than by two
+# people remembering. Deliberately unquoted at the point of use — these are controlled constants
+# and the words are the point.
+RULE_V4_REJECT="-j REJECT --reject-with icmp-port-unreachable"
+RULE_V6_REJECT="-j REJECT"
+RULE_ALLOWLIST="-m set --match-set allowed dst -j ACCEPT"
+
 # --- the measurements (impure, injectable) ------------------------------------------------------
 
 # IS THERE ANY WAY OUT OVER IPv6? (D51.3)
@@ -109,7 +126,7 @@ v6_path_state() { # v6_path_state [if_inet6] [ipv6_route] -> absent|open
 # Is a terminal REJECT in the v4 OUTPUT chain? A failed read is `open` — never `bounded`.
 v4_chain_state() { # -> bounded|open
     if command -v iptables >/dev/null 2>&1 \
-       && iptables -w 5 -C OUTPUT -j REJECT --reject-with icmp-port-unreachable >/dev/null 2>&1; then
+       && iptables -w 5 -C OUTPUT $RULE_V4_REJECT >/dev/null 2>&1; then
         printf 'bounded'
     else
         printf 'open'
@@ -119,7 +136,7 @@ v4_chain_state() { # -> bounded|open
 # Is a REJECT in the v6 OUTPUT chain? A failed read is `open`.
 v6_chain_state() { # -> denied|open
     if command -v ip6tables >/dev/null 2>&1 \
-       && ip6tables -w 5 -C OUTPUT -j REJECT >/dev/null 2>&1; then
+       && ip6tables -w 5 -C OUTPUT $RULE_V6_REJECT >/dev/null 2>&1; then
         printf 'denied'
     else
         printf 'open'
@@ -130,7 +147,7 @@ v6_chain_state() { # -> denied|open
 # deny-all; both are bounded, and both boot, so it decides the WORD rather than the decision.
 allowlist_state() { # -> yes|no
     if command -v iptables >/dev/null 2>&1 \
-       && iptables -w 5 -C OUTPUT -m set --match-set allowed-new dst -j ACCEPT >/dev/null 2>&1; then
+       && iptables -w 5 -C OUTPUT $RULE_ALLOWLIST >/dev/null 2>&1; then
         printf 'yes'
     else
         printf 'no'

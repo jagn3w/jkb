@@ -84,7 +84,7 @@ fail_closed() { # fail_closed <message...>
     iptables -w 5 -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
     iptables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     local v4 v6
-    iptables -w 5 -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    iptables -w 5 -A OUTPUT $RULE_V4_REJECT 2>/dev/null || true
     # MEASURED, not inferred from whether the install command succeeded. `iptables -A` returning 0
     # is a statement about one command; what the record and the probe both need is what the chain
     # HOLDS, and those come apart under a lost xtables lock or a concurrent flush. Same function the
@@ -97,7 +97,7 @@ fail_closed() { # fail_closed <message...>
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -w 5 -F OUTPUT 2>/dev/null || true
         ip6tables -w 5 -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-        ip6tables -w 5 -A OUTPUT -j REJECT 2>/dev/null || true
+        ip6tables -w 5 -A OUTPUT $RULE_V6_REJECT 2>/dev/null || true
     fi
     # `|| v6=open` is not defensive noise: D50.4 says an unobtainable measurement is
     # `open`, and a bare assignment here would also abort the whole raise into
@@ -383,7 +383,7 @@ if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT >/dev/null 2>&1; 
     ip6tables -w 5 -F OUTPUT
     ip6tables -w 5 -A OUTPUT -o lo -j ACCEPT
     ip6tables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -w 5 -A OUTPUT -j REJECT
+    ip6tables -w 5 -A OUTPUT $RULE_V6_REJECT
 fi
 
 # DNS must survive or nothing resolves, including the allowlisted hosts themselves.
@@ -391,11 +391,11 @@ iptables -w 5 -A OUTPUT -p udp --dport 53 -j ACCEPT
 iptables -w 5 -A OUTPUT -p tcp --dport 53 -j ACCEPT
 iptables -w 5 -A OUTPUT -o lo -j ACCEPT
 iptables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -w 5 -A OUTPUT -m set --match-set allowed dst -j ACCEPT
-iptables -w 5 -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
+iptables -w 5 -A OUTPUT $RULE_ALLOWLIST
+iptables -w 5 -A OUTPUT $RULE_V4_REJECT
 
 # Fail loudly rather than leave a half-applied policy that reads as protection.
-if ! iptables -w 5 -C OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
+if ! iptables -w 5 -C OUTPUT $RULE_V4_REJECT 2>/dev/null; then
     fail_closed "default-REJECT rule is not in place — refusing to report success on a
   half-applied policy."
 fi

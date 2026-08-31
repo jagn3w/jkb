@@ -385,6 +385,35 @@ else
     [ "$states_ok" -eq 1 ] && ok "both readers handle every verdict state ($verdict_states)"
 fi
 
+# THE PROBE LOOKS FOR THE RULE THE RAISE INSTALLS. init-firewall.sh installs the chain with
+# `iptables -A OUTPUT <spec>` and egress-lib.sh reads it back with `iptables -C OUTPUT <spec>`;
+# spelled separately those are two statements that have to agree, and they did not — the probe
+# asked for `--match-set allowed-new`, the raise's STAGING set, which is swapped into `allowed` and
+# destroyed before the raise returns. So `allowlist_state` could never answer `yes`: every healthy
+# container reported `denied` rather than `allowlisted`, printed "egress is DENIED" at every boot,
+# and drifted against its own record for ever.
+#
+# The specs are now single constants both sides expand, so drift is impossible while both sides
+# USE them — which is what this asserts. It does not re-check the specs' contents (that would be a
+# second copy of the thing being checked); it requires that no site spells one out inline.
+rules_ok=1
+for f in init-firewall.sh egress-lib.sh; do
+    # Every OUTPUT-chain install or probe must expand a $RULE_* constant rather than name a match
+    # or a target itself. `-F`/`-P` and the DNS/loopback/conntrack openings are not rules the probe
+    # reads back, so they are not in scope: this is only about the specs that BOTH sides state.
+    while IFS= read -r line; do
+        case "$line" in
+            *'$RULE_'*) ;;
+            *'-j REJECT'*|*'--match-set'*)
+                bad "$f spells an OUTPUT rule inline ($(printf '%s' "$line" | sed 's/^[[:space:]]*//')) instead of expanding a \$RULE_* constant — the probe and the raise can then disagree, which is how allowlist_state came to be unable to fire"
+                rules_ok=0 ;;
+        esac
+    done <<EOF
+$(dc_strip_comments "$here/$f" | grep -E '(iptables|ip6tables) .* -(A|C) OUTPUT ')
+EOF
+done
+[ "$rules_ok" -eq 1 ] && ok "the raise installs and the probe reads back one shared rule spec"
+
 # THE TWO SELF-TEST LISTS AGREE (D51.9). scripts/check.sh and .github/workflows/ci.yml each
 # enumerate the `.container/*.sh --self-test` invocations, because CI re-implements each gate step
 # rather than running check.sh. Add a self-test to check.sh alone and it runs nowhere in CI; drop
