@@ -333,34 +333,16 @@ else
     bad "the Dockerfile does not set ENTRYPOINT to entrypoint.sh — docker start would come up with no firewall"
 fi
 
-# THE VERDICT PATH, spelled in one writer and two readers that are three different processes and
-# cannot share a variable — the same constraint as the setup marker above, so the same guard.
-# Drift means a reader silently sees `unknown` for ever: under D50.3 a container that never boots,
-# or in verify.sh a permanent false alarm.
+# THE VERDICT PATH IS NO LONGER GUARDED HERE, because it is no longer duplicated (D52.5). This
+# carried a check that init-firewall.sh, entrypoint.sh and verify.sh all named /run/jkb-egress-verdict
+# identically, justified by a comment reading "three different processes [that] cannot share a
+# variable". That premise was false: the writer already sourced egress-lib.sh, entrypoint.sh is
+# installed BESIDE it in /usr/local/bin, and verify.sh runs from the checkout that carries it. The
+# path is now `VERDICT_PATH` in that library and there is one spelling, so there is nothing for a
+# guard to compare -- and consolidating surfaced a real inconsistency the guard could not see, that
+# verify.sh alone ignored the JKB_EGRESS_VERDICT override.
 #
-# EACH FILE'S OWN SPELLING, not a search for the literal we expect. Grepping for the path this
-# check already knows can only ever find one distinct value, so the drift branch was unreachable —
-# the exact defect this directory keeps producing, in the guard written to prevent a different one.
-# The mutation caught it. So: pull the path out of each file's own `*verdict*=…/run/…` assignment,
-# which is how all three name it, and compare those. verify.sh mentions several other /run/ paths,
-# which is why this is anchored on the assignment rather than on /run/.
-verdict_missing=""
-verdict_paths=""
-for vf in init-firewall.sh entrypoint.sh verify.sh; do
-    vp="$(grep -ioE '[a-z_]*verdict[a-z_]*=[^[:space:]]*/run/[A-Za-z0-9._-]+' "$here/$vf" 2>/dev/null \
-          | grep -oE '/run/[A-Za-z0-9._-]+' | sort -u | head -1)"
-    if [ -z "$vp" ]; then verdict_missing="$verdict_missing $vf"
-    else verdict_paths="$verdict_paths$vp
-"; fi
-done
-verdict_distinct="$(printf '%s' "$verdict_paths" | sort -u | grep -c . || true)"
-if [ -n "$verdict_missing" ]; then
-    bad "the egress verdict path is not named by:$verdict_missing — init-firewall.sh writes it, entrypoint.sh and verify.sh read it, and a reader that lost it sees 'unknown' for ever"
-elif [ "$verdict_distinct" -ne 1 ]; then
-    bad "the egress verdict path is spelled $verdict_distinct different ways — a reader would see 'unknown' for ever"
-else
-    ok "the writer and both readers agree on the egress verdict path ($(printf '%s' "$verdict_paths" | head -1))"
-fi
+# Removing the possibility beats guarding it; the guard went in the same commit as the duplication.
 
 # ...and on the STATES that path carries. The path agreeing is not enough: a reader with no arm for
 # a state the writer records drops it into `*`, which both readers treat as unknown — and unknown

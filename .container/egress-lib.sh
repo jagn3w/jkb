@@ -41,15 +41,69 @@ verdict_state() { # verdict_state <v4> <v6> <state-if-bounded> -> <state-if-boun
 #   v6chain    denied  | open      a REJECT is in the v6 OUTPUT chain
 #   v6path     absent  | open      whether v6 has any way out at all (see v6_path_state)
 #   allowlist  yes     | no        an allowlist ACCEPT rule is present
+# THE v6 FAMILY COLLAPSED TO ONE WORD, from the two things measured about it. `denied` is a rule in
+# the chain; `absent` is denial by a second means — no off-link address and no default route, which
+# is what lets a container on a kernel without ip6tables boot at all; anything else, INCLUDING a
+# measurement that could not be taken, is `open`.
+#
+# This was spelled three times — here, in egress-status.sh's `report`, and in init-firewall.sh's own
+# `v6_state` — inside a library whose header says the rule is defined once. Worse, the ERR-trap
+# self-test defined a FOURTH copy and asserted about that, so the row aimed at the function where a
+# deny-all regression had just landed was testing something no caller runs.
+v6_from() { # v6_from <v6chain> <v6path> -> denied|absent|open
+    if   [ "$1" = denied ]; then printf 'denied'
+    elif [ "$2" = absent ]; then printf 'absent'
+    else                         printf 'open'
+    fi
+}
+
+# ...and the same collapse taken from the live kernel. This is what init-firewall.sh calls, so it
+# lives here beside the measurements it composes rather than in the caller: a function defined in
+# the caller cannot be reached by this file's self-test, which is exactly how the regression above
+# went unnoticed.
+v6_state() { # -> denied|absent|open
+    v6_from "$(v6_chain_state)" "$(v6_path_state)"
+}
+
 probe_state() { # probe_state <v4chain> <v6chain> <v6path> <allowlist> -> allowlisted|denied|unfiltered
     local v4 v6 bounded
     [ "$1" = bounded ] && v4=denied || v4=open
-    if   [ "$2" = denied ]; then v6=denied
-    elif [ "$3" = absent ]; then v6=absent
-    else                         v6=open
-    fi
+    v6="$(v6_from "$2" "$3")"
     [ "$4" = yes ] && bounded=allowlisted || bounded=denied
     verdict_state "$v4" "$v6" "$bounded"
+}
+
+# --- the record, and the one parser for it ------------------------------------------------------
+#
+# The kernel says WHAT the state is (egress-status.sh); it cannot say WHY it is not allowlisted —
+# that DNS failed, that the snapshot was truncated. The record carries that, and this is where its
+# path and its format live.
+#
+# THE PATH WAS SPELLED THREE TIMES — init-firewall.sh writes it, entrypoint.sh and verify.sh read
+# it — and check-config.sh carried a guard comparing the three, whose comment justified itself with
+# "three different processes [that] cannot share a variable". That premise is false:
+# init-firewall.sh and egress-status.sh already source this file, entrypoint.sh is installed BESIDE
+# it in /usr/local/bin, and verify.sh runs from the checkout that also carries it. So the three
+# spellings become one and the guard is deleted with them (D52.5) — you cannot regress a
+# disagreement between spellings when there is one spelling.
+#
+# Consolidating also fixed a live inconsistency nobody had noticed: verify.sh hard-coded the path
+# and so ignored the JKB_EGRESS_VERDICT override that both other files honour, silently reading the
+# real file under a test that had redirected it.
+VERDICT_PATH="${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}"
+
+# ONE PARSER for the `key=value` format, which the record and egress-status.sh's report share on
+# purpose. It was written out six times across two files as `sed -n 's/^key=//p' | head -1`.
+# `head -1` is the rule, not an accident: a reason may be several lines and only the first is the
+# value (D51.8). Keys here are fixed words (state, v4, v6, reason), so they are safe in the s///.
+kv_field() { # kv_field <key> <text> -> the first value for that key, empty if absent
+    printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1
+}
+
+# ...and the same read against the record on disk. Unreadable is empty, never an error: a missing
+# record means the reason is unknown, which every caller already renders.
+verdict_field() { # verdict_field <key> -> the value from the recorded verdict, empty if unreadable
+    kv_field "$1" "$(cat "$VERDICT_PATH" 2>/dev/null)"
 }
 
 # --- the rules themselves, written ONCE ---------------------------------------------------------
@@ -259,8 +313,6 @@ TABLE
                 . "$LIB"
                 set -E
                 trap "echo fired > \"$TRAPPED\"; exit 97" ERR
-                v6_state() { if [ "$(v6_chain_state)" = denied ]; then printf denied; return; fi
-                             printf "%s" "$(v6_path_state)"; }
                 out="$("$@")" || out=CALL_FAILED
                 printf "%s" "$out"
             ' _ "$@" 2>/dev/null

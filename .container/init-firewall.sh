@@ -60,14 +60,10 @@ record_verdict() { # record_verdict <state> <v4> <v6> <reason...>
     } > "$VERDICT" 2>/dev/null || true
 }
 
-# Is IPv6 egress provably closed? Composed from the shared measurements (D51.3): the chain first,
-# then whether there is any way out at all. `absent` means denial established by a second means —
-# no off-link address and no default route — and it is what lets a container on a kernel without
-# ip6tables still boot. A measurement that could not be taken is `open`, never `absent`.
-v6_state() {
-    if [ "$(v6_chain_state)" = denied ]; then printf 'denied'; return; fi
-    printf '%s' "$(v6_path_state)"
-}
+# `v6_state` is NOT defined here any more — it lives in egress-lib.sh, sourced above, beside the
+# measurements it composes and beside the two other callers that had each spelled the collapse for
+# themselves (D52.5). A function defined in this file could not be reached by the library's own
+# self-test, which is how a regression in it survived a green gate.
 
 # EVERY REFUSAL MUST LEAVE MORE FILTERING THAN IT FOUND, NOT LESS. The refusals below used to
 # `exit 1` before any rule was installed — and iptables rules do NOT survive a container restart,

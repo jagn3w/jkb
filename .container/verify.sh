@@ -7,6 +7,13 @@
 # but not on one that no longer contains what it should). Each assertion below fails for exactly
 # one such edit.
 set -uo pipefail
+
+# The egress verdict path, its `key=value` parser and the verdict-state vocabulary come from here.
+# This script runs from the checkout (`./.container/verify.sh`), which carries egress-lib.sh beside
+# it, so the same `dirname $0` idiom the installed scripts use reaches it here too (D52.5).
+# shellcheck source=egress-lib.sh
+. "$(dirname "$0")/egress-lib.sh"
+
 pass=0; fail=0; accepted_failure=0
 ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
@@ -522,11 +529,13 @@ assert "knowledge base is mounted" "$kb_mounted"
 #
 # The record still supplies the REASON, which the kernel cannot: that DNS failed, that the snapshot
 # was truncated.
-egress_verdict=/run/jkb-egress-verdict
+# The path and the parser come from egress-lib.sh, which sits beside this script in the checkout
+# it runs from (D52.5). Spelling the path here ALSO meant this file ignored the
+# JKB_EGRESS_VERDICT override the writer and the other reader both honour.
 eg_probe="$(sudo -n /usr/local/bin/egress-status.sh 2>/dev/null)" || eg_probe=""
-eg_state="$(printf '%s\n' "$eg_probe" | sed -n 's/^state=//p' | head -1)"
-eg_v6="$(printf '%s\n' "$eg_probe" | sed -n 's/^v6=//p' | head -1)"
-eg_reason="$(sed -n 's/^reason=//p' "$egress_verdict" 2>/dev/null | head -1)"
+eg_state="$(kv_field state "$eg_probe")"
+eg_v6="$(kv_field v6 "$eg_probe")"
+eg_reason="$(verdict_field reason)"
 [ -n "$eg_reason" ] || eg_reason="(the raise left no reason)"
 
 # THE OVERRIDE IS READ, NEVER INFERRED (D51.4). This used to be deduced from an `unfiltered` state
@@ -565,7 +574,7 @@ esac
 # concluded; the chain is what is there. They disagree when a raise died after recording, when two
 # raises fought, or when something changed the chain afterwards — each of which an operator wants
 # to know about, and none of which changes the answer above.
-eg_recorded="$(sed -n 's/^state=//p' "$egress_verdict" 2>/dev/null | head -1)"
+eg_recorded="$(verdict_field state)"
 if [ -n "$eg_recorded" ] && [ -n "$eg_state" ] && [ "$eg_recorded" != "$eg_state" ]; then
     note "the last raise recorded '$eg_recorded' but the live chain is '$eg_state' — the chain
        decides; the record is stale or something changed it afterwards"

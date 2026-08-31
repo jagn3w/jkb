@@ -217,20 +217,11 @@ open(p, 'w').write("".join(l for l in open(p) if not l.startswith("ENTRYPOINT"))
 PYX
 run "the image stops running entrypoint.sh" "does not set ENTRYPOINT"
 
-# The egress verdict path: one writer, two readers, three processes that cannot share a variable.
-seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("/run/jkb-egress-verdict", "/run/jkb-egress-result"))
-PYX
-run "a reader drifts off the verdict path" "spelled 2 different ways"
-
-seed; python3 - "$work/t/.container/entrypoint.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("/run/jkb-egress-verdict", "$SOMETHING_ELSE"))
-PYX
-run "a reader stops naming the verdict at all" "is not named by:"
+# THE VERDICT-PATH MUTATIONS ARE GONE with the guard they exercised (D52.5). They broke one
+# reader's spelling of /run/jkb-egress-verdict and required check-config.sh to notice the drift.
+# There is now one spelling -- `VERDICT_PATH` in egress-lib.sh, sourced by the writer and both
+# readers -- so there is no drift to induce and nothing to catch. A mutation for a deleted
+# assertion reports MISSED for ever, which is a tooling outcome dressed as a guard that did not fire.
 
 seed; jq_dc '{}'
 run "the declaration is emptied" "this check just certified nothing"
@@ -514,7 +505,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=51
+PINNED_BAD_SITES=49
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

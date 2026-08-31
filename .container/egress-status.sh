@@ -41,10 +41,7 @@ set -uo pipefail
 # is a network with nowhere to go. Defined above the self-test because that is what exercises it.
 report() { # report <v4chain> <v6chain> <v6path> <allowlist>
     local v6
-    if   [ "$2" = denied ]; then v6=denied
-    elif [ "$3" = absent ]; then v6=absent
-    else                         v6=open
-    fi
+    v6="$(v6_from "$2" "$3")"
     printf 'state=%s\n' "$(probe_state "$1" "$2" "$3" "$4")"
     printf 'v4=%s\n'    "$1"
     printf 'v6=%s\n'    "$v6"
@@ -58,6 +55,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
 
     # The composition and the measurements are covered by egress-lib.sh --self-test. What is left
     # here is the REPORT: that a reader can parse it, and that it refuses arguments.
+    #
+    # These rows parse with a literal `sed` and NOT with the library's `kv_field`, deliberately,
+    # even though every production reader now goes through that function (D52.5). What is being
+    # asserted is the FORMAT; routing the assertion through the parser would test `report` composed
+    # with `kv_field`, and a break in the parser would cancel against a break in the writer and the
+    # row would still pass. Same reason the tables above are literal rather than re-derived.
     out="$(report bounded denied absent yes)"
     eq "state is the first line"      "$(printf '%s\n' "$out" | sed -n 's/^state=//p')" "allowlisted"
     eq "v4 is reported"               "$(printf '%s\n' "$out" | sed -n 's/^v4=//p')"    "bounded"

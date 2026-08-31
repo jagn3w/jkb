@@ -27,7 +27,11 @@
 # allowlist snapshot was truncated. State from the probe, explanation from the record.
 set -uo pipefail
 
-VERDICT="${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}"
+# The verdict path, the `key=value` parser and the verdict-state vocabulary all come from here --
+# egress-lib.sh is installed BESIDE this script in /usr/local/bin, and sits beside it in the
+# checkout too, so one `dirname $0` reaches it in both places (D52.5).
+# shellcheck source=egress-lib.sh
+. "$(dirname "$0")/egress-lib.sh"
 
 # THE ONE DELIBERATE ESCAPE (D50.6), and it is recorded rather than silent. Refusing to boot on an
 # unfiltered network is right for an unattended agent, and it means a host with real IPv6 and no
@@ -41,11 +45,6 @@ VERDICT="${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}"
 # It buys a container you can ATTACH TO AND DIAGNOSE. It does not make that container a place to run
 # an agent, which is why run.sh's --open still refuses (D51.7).
 ACCEPT="${JKB_EGRESS_ACCEPT_UNFILTERED:-0}"
-
-verdict_field() { # verdict_field <key>  -> value, empty if unreadable
-    [ -r "$VERDICT" ] || return 0
-    sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1
-}
 
 # --- self-test ------------------------------------------------------------------------------
 # The boot decision runs before anything else in the container, and getting it wrong yields either
@@ -147,7 +146,7 @@ fi
 sudo -n /usr/local/bin/init-firewall.sh || true
 
 probe="$(sudo -n /usr/local/bin/egress-status.sh 2>/dev/null)" || probe=""
-state="$(printf '%s\n' "$probe" | sed -n 's/^state=//p' | head -1)"
+state="$(kv_field state "$probe")"
 reason="$(verdict_field reason)"
 [ -n "$reason" ] || reason="(the raise left no reason)"
 
