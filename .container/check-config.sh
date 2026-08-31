@@ -557,7 +557,17 @@ while IFS= read -r want; do
     [ -n "$want" ] || continue
     expects+=("$want")
     grep -qF -e "$want" "$here/verify.sh" || stale_expects+=("$want")
-done < <(sed -n 's/^run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
+done < <(sed -n 's/^[[:space:]]*run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
+# ...AND THE EXTRACTION MUST HAVE FOUND THEM ALL, which an emptiness pin cannot tell you. The
+# pattern was anchored at `^run`, so the first mutation to be indented -- one wrapped in an `if`
+# for a host where it cannot discriminate -- silently dropped out and the guard went on reporting
+# ok about the 13 it could still see. Derived rather than pinned to a number: count the `run "`
+# calls the file actually makes and require the extractor to have matched every one, so this
+# cannot go quiet again without saying so.
+run_calls="$(dc_strip_comments "$here/mutate-verify.sh" | grep -cE '^[[:space:]]*run "' || true)"
+if [ "${#expects[@]}" -ne "$run_calls" ]; then
+    bad "the mutate-verify expectation check reads ${#expects[@]} of $run_calls run() calls — the rest are invisible to it, so their expectations are unchecked"
+fi
 # PINNED AGAINST AN EMPTY EXTRACTION, like the three other derived lists above. Without it this
 # check passes by finding nothing to check: reword mutate-verify.sh's `run` line and the sed
 # stops matching, `stale_expects` is empty, and it prints `ok (0 checked)` — the exact

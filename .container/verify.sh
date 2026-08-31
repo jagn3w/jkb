@@ -17,6 +17,17 @@ set -uo pipefail
 pass=0; fail=0; accepted_failure=0
 ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
+# A failure that is a CONSEQUENCE of a condition this container was configured to accept. Reported
+# at full volume like any other -- what it changes is the exit code, so a caller can tell "this
+# container is misconfigured" from "this container is in a state its operator chose".
+#
+# It is a COUNT, and that is the fix. `accepted_failure` used to be a flag set to 1, compared
+# against `fail` at the end -- but arming the egress override produces THREE failures (the
+# disarmed-gate notice, the unfiltered chain, and the reachability check that follows from having
+# no firewall), so `fail` was 3 against an accepted count of 1 and the exit-3 branch could never be
+# taken. The one state exit 3 exists for was the one state it could not report, and run.sh's
+# handler for it was dead code.
+accept_bad() { bad "$1"; accepted_failure=$((accepted_failure+1)); }
 note() { printf '  \033[33mnote\033[0m %s\n' "$1"; }
 assert() { if [ "$2" = yes ]; then ok "$1"; else bad "$1"; fi; }
 
@@ -210,7 +221,14 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 if bwrap_err="$(bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true 2>&1)"; then
     ok "bubblewrap can create its namespaces (nested sandbox can start)"
 else
-    bad "bubblewrap cannot create namespaces — the nested sandbox cannot start"
+    # ACCEPTED ONLY WHEN AN OPERATOR SAID SO, by name, for this host class. It is still reported at
+    # full volume every run and still names the reason -- what changes is the exit code, so a caller
+    # can tell a container whose nested sandbox is broken by surprise from one running on a host
+    # where it is known not to start. Never inferred from the AppArmor setting: the whole point of
+    # the open investigation is that we have not established the cause, and a check that quietly
+    # excused itself whenever it found the condition it suspects would be assuming the answer.
+    bw_bad=bad; [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && bw_bad=accept_bad
+    $bw_bad "bubblewrap cannot create namespaces — the nested sandbox cannot start"
     [ -n "$bwrap_err" ] && printf '       bwrap said: %s\n' \
         "$(printf '%s' "$bwrap_err" | head -2 | tr '\n' ' ')"
     # Reported as facts, with no cause asserted. `apparmor_restrict_unprivileged_userns=1` is the
@@ -221,6 +239,11 @@ else
         v="$(cat "/proc/sys/$f" 2>/dev/null)" \
             && printf '       host %s = %s\n' "$(basename "$f")" "$v"
     done
+    # The profile confining THIS process, which is the one AppArmor fact observable from in here.
+    # `docker-default (enforce)` means a profile is mediating our syscalls; `unconfined` rules
+    # AppArmor out and leaves seccomp or the kernel as the remaining candidates.
+    v="$(cat /proc/self/attr/current 2>/dev/null)" \
+        && printf '       apparmor profile in force: %s\n' "$v"
     printf '       the seccomp profile is applied by the run flags, so it is not usually the cause;\n'
     printf '       see .github/workflows/ci.yml "Why bubblewrap can or cannot start" for the\n'
     printf '       three-way probe that separates seccomp from AppArmor.\n'
@@ -582,8 +605,7 @@ eg_reason="$(verdict_field reason)"
 # `docker exec` inherits containerEnv, so the value is right here to be read.
 eg_accept="${JKB_EGRESS_ACCEPT_UNFILTERED:-0}"
 if [ "$eg_accept" = 1 ]; then
-    accepted_failure=1
-    bad "the egress boot gate is DISARMED: JKB_EGRESS_ACCEPT_UNFILTERED=1, so this container will
+    accept_bad "the egress boot gate is DISARMED: JKB_EGRESS_ACCEPT_UNFILTERED=1, so this container will
        start even with unfiltered egress. Reported every run for as long as it is set — an override
        nobody can see is indistinguishable from a rule that does not exist. Unset it in
        container.json and recreate. (--open will not open a window while this holds.)"
@@ -594,7 +616,11 @@ case "$eg_state" in
     denied)      bad "the live chain denies everything and has no allowlist: $eg_reason" ;;
     # Worded from the evidence this has, not from a cause it assumed. Whether the override is set is
     # reported separately, above, because it is a separate fact.
-    unfiltered)  bad "egress is UNFILTERED in the live chain (IPv6 $eg_v6) and this container is
+    # Accepted only when the override is what let it run: without it the entrypoint would have
+    # refused, so an unfiltered chain HERE is the operator's stated choice rather than a defect.
+    # With the override unset it stays an ordinary failure.
+    unfiltered)  eg_bad=bad; [ "$eg_accept" = 1 ] && eg_bad=accept_bad
+                 $eg_bad "egress is UNFILTERED in the live chain (IPv6 $eg_v6) and this container is
        running anyway: $eg_reason" ;;
     # No answer at all. The probe reads the live chains, so producing nothing means it could not
     # run — which says nothing about the network and is never read as bounded. This is also what a
@@ -615,7 +641,8 @@ if [ -n "$eg_recorded" ] && [ -n "$eg_state" ] && [ "$eg_recorded" != "$eg_state
        decides; the record is stale or something changed it afterwards"
 fi
 if curl -sS -m 6 -o /dev/null https://example.com 2>/dev/null; then
-    bad "egress to a NON-allowlisted host was permitted (example.com)"
+    reach_bad=bad; [ "$eg_accept" = 1 ] && reach_bad=accept_bad
+    $reach_bad "egress to a NON-allowlisted host was permitted (example.com)"
 else
     ok "egress to a non-allowlisted host is refused"
 fi

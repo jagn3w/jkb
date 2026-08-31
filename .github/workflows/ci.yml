@@ -138,6 +138,18 @@ jobs:
   # has been observed green.
   container:
     runs-on: ubuntu-latest
+    env:
+      # BUBBLEWRAP IS A KNOWN FAILURE ON THIS HOST CLASS, declared by name rather than skipped.
+      # verify.sh still reports it at full volume every run, with bwrap's own error and the host
+      # settings; what this changes is the exit code, so the other ~24 assertions and every
+      # mutation stay readable instead of being blocked behind one open investigation.
+      #
+      # It is NOT a workaround for a CI quirk. The container fails the same way on any stock-Docker
+      # AppArmor host, which is most Linux machines, so this is a real limitation of D49's "both
+      # layers" claim -- tracked as its own change, not papered over here. Remove this line the day
+      # that is fixed, and the stock-seccomp mutation becomes meaningful again with it.
+      JKB_ACCEPT_NO_BWRAP: '1'
+
     # The build is minutes and the harness starts ~13 containers; a wedged docker pull would
     # otherwise sit for the runner's six-hour default. Generous enough that a slow-but-working
     # run is not reported as a broken one.

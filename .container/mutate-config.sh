@@ -333,6 +333,18 @@ open(p, 'w').write(s.replace('"is not inside any host BIND"', '"a string verify.
 PYX
 run "a mutate-verify expectation goes stale" "expects text verify.sh never prints"
 
+# ...and the check that the extractor SEES every run() call. Re-anchoring the pattern at `^run`
+# drops any indented mutation -- which is how it silently went from 14 expectations to 13 the
+# moment one was wrapped in an `if`. An emptiness pin cannot catch a partial loss; this can.
+seed; python3 - "$work/t/.container/check-config.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace(
+    "'s/^[[:space:]]*run \"[^\"]*\" \"\\([^\"]*\\)\".*/\\1/p'",
+    "'s/^run \"[^\"]*\" \"\\([^\"]*\\)\".*/\\1/p'", 1))
+PYX
+run "the expectation extractor stops seeing indented mutations" "run() calls — the rest are invisible"
+
 # A refusal in the firewall that exits before installing any rule is not a refusal: iptables rules
 # do not survive a restart, so the container comes up with unfiltered egress and a message.
 seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
@@ -474,8 +486,11 @@ run "the bind-source derivation returns nothing" "host bind source(s) parsed"
 seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
-# Rename the helper, exactly as an ordinary refactor would.
-open(p, 'w').write(re.sub(r'^run "', 'drive "', s, flags=re.M))
+# Rename the helper, exactly as an ordinary refactor would. Indentation included: a mutation
+# anchored at `^run "` left an indented call behind, so the extractor still found one expectation
+# and neither the emptiness pin nor the completeness check fired -- the mutation stopped
+# expressing "the run-line shape changed" the moment one call was wrapped in an `if`.
+open(p, 'w').write(re.sub(r'^(\s*)run "', r'\1drive "', s, flags=re.M))
 PYX
 run "mutate-verify's run-line shape changes" "this check just certified nothing"
 
@@ -491,7 +506,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=47
+PINNED_BAD_SITES=48
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

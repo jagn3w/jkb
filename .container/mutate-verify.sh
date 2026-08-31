@@ -138,7 +138,12 @@ SUBJECT="$PREAMBLE"'
 # being the only sites that do so makes them visibly the odd ones. Before this, HEALTHY was used
 # by the control alone while ten sites wrote the flags by hand, so tightening the baseline at the
 # run sites would have left the control certifying a container the mutations never ran in.
-HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${BASE[@]}")
+# JKB_ACCEPT_NO_BWRAP is propagated when the caller has set it, so the harness and the container
+# agree about which failures this host is known to produce. Not defaulted here: the acceptance is
+# an operator's statement about a host, and a harness that quietly assumed it would hide the very
+# failure it exists to detect everywhere else.
+ACCEPT_ENV=(); [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && ACCEPT_ENV=(-e JKB_ACCEPT_NO_BWRAP=1)
+HEALTHY=(--security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode "${ACCEPT_ENV[@]}" "${BASE[@]}")
 
 # One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
 # runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
@@ -261,8 +266,20 @@ run "the host's ~/.claude is mounted in" "is a host mount" \
 run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home/settings.json":/home/vscode/.claude/settings.json
-run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
-    --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+# THIS MUTATION CANNOT DISCRIMINATE WHILE BUBBLEWRAP IS A KNOWN FAILURE, so on such a host it is
+# announced as skipped rather than run. It requires verify.sh to fail naming bubblewrap -- and if
+# the HEALTHY container already fails that same assertion, it would report CAUGHT whether or not
+# removing the seccomp profile changed anything. That is the "guard that cannot fire" shape this
+# whole directory keeps producing, and reporting CAUGHT for it would be the worst version: a green
+# line asserting the profile is load-bearing, on a host where nothing tested it.
+if [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ]; then
+    printf '  SKIPPED  stock seccomp (nested sandbox cannot start)\n'
+    printf '           cannot discriminate while bubblewrap fails in the healthy container too;\n'
+    printf '           it becomes meaningful again when that is fixed.\n'
+else
+    run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
+        --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+fi
 # NO NET_ADMIN, WITH THE OVERRIDE ARMED -- and the override is what makes this mutation
 # judgeable at all. Without it the entrypoint (correctly) refuses to boot an unbounded container,
 # so $SUBJECT never runs, verify.sh never runs, and the assertion this mutation names is
@@ -338,7 +355,14 @@ echo "=== self-test: the matcher must stay quiet about a HEALTHY container ==="
 # ONE execution, judged twice: health first, then the matcher over the same captured output.
 control_out="$(docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$SUBJECT" 2>&1)"
 control_rc=$?
-if [ "$control_rc" -ne 0 ] || ! grep -q "container checks passed" <<<"$control_out"; then
+# Exit 3 is "every failure above is a condition this container was configured to accept" -- a
+# healthy container for this harness's purposes, since the mutations are judged against the same
+# baseline. Requiring exit 0 here would make the acceptance mechanism unusable: the control would
+# refuse the very state an operator declared, and every verdict would read as unattributable.
+control_ok=no
+[ "$control_rc" -eq 0 ] && grep -q "container checks passed" <<<"$control_out" && control_ok=yes
+[ "$control_rc" -eq 3 ] && grep -q "configured to accept" <<<"$control_out" && control_ok=yes
+if [ "$control_ok" != yes ]; then
     printf '\033[31mthe unmutated container does not pass verify.sh (exit %s) — every MISSED above is\n' "$control_rc"
     printf 'unattributable, because a container that cannot run looks exactly like a guard that did not fire\033[0m\n'
     sed 's/^/    /' <<<"$control_out" | grep -E "FAIL|failed|not found|Error" | head -5
