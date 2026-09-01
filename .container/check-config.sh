@@ -472,6 +472,64 @@ else
     [ "$aa_ok" -eq 1 ] && ok "the AppArmor profile is docker-default with only \`mount\` relaxed ($aa_name)"
 fi
 
+# THE CALL SHAPE OF `dc_require_apparmor_profile`, because the callee cannot enforce its own refusal.
+#
+# It ends with `exit 1` on a name it cannot read, and its comment claims that means "no future
+# caller can forget". A caller CAN: inside a command substitution `exit` ends only the subshell, so
+# `AA_ARGS=(--security-opt "apparmor=$(dc_require_apparmor_profile …)")` printed the five-line
+# refusal and then handed docker `apparmor=`, which docker reads as its DEFAULT profile --
+# docker-default, whose `mount` denial is exactly what the profile exists to lift. mutate-verify.sh
+# did that, and being `set -uo pipefail` with no `-e`, nothing stopped it.
+#
+# There is no way to fix this in the callee, so the RULE IS CHECKED HERE: every call must be a plain
+# scalar assignment, whose failure either trips `set -e` (run.sh) or is checked explicitly with
+# `|| exit` (mutate-verify.sh, which has no `-e`). Anything else -- an array element, a nested
+# expansion, an argument -- discards the status. A comment beside each call site is precisely what
+# already failed.
+#
+# THREE FILES ARE EXEMPT, and no exemption can hide a real call, because NONE OF THE THREE RUNS
+# DOCKER -- so none of them has anything to spend a profile name on:
+#
+#   lib.sh            defines the function.
+#   check-config.sh   is this file: it names the function in its own pattern and its own message.
+#   mutate-config.sh  contains the bad form ON PURPOSE, as the payload of the mutation that proves
+#                     this guard fires. A harness that writes the defect it hunts will always match
+#                     a grep for that defect.
+#
+# The same self-matching trap as the `GENERATED FILE` marker, which matched the two checkers looking
+# for it, and it cost two rounds here as well: a guard that greps the tree has to say what it is not
+# asking about, and "everything except the things that talk about it" is the answer every time.
+shape_ok=1
+while IFS= read -r hit; do
+    f="${hit%%:*}"; rest="${hit#*:}"; n="${rest%%:*}"; line="${rest#*:}"
+    case "$f" in */lib.sh|*/check-config.sh|*/mutate-config.sh) continue ;; esac
+    case "$line" in
+        *'#'*dc_require_apparmor_profile*) continue ;;   # prose about it, not a call
+    esac
+    if ! printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="\$\(dc_require_apparmor_profile '; then
+        bad "$f:$n calls dc_require_apparmor_profile somewhere its \`exit 1\` cannot stop the script — it must be a plain assignment (\`name=\"\$(dc_require_apparmor_profile …)\"\`), or the empty name it refuses reaches docker as \`apparmor=\`, which is docker-default"
+        shape_ok=0
+    fi
+done < <(grep -rn 'dc_require_apparmor_profile' "$here" "$here/../scripts" "$here/../.github" 2>/dev/null || true)
+[ "$shape_ok" -eq 1 ] && ok "every dc_require_apparmor_profile call is shaped so its refusal actually stops the caller"
+
+# ONE DEFINITION OF "DOES APPARMOR MEDIATE". run.sh, verify.sh and mutate-verify.sh each had their
+# own, and verify.sh's was NOT the same rule -- it preferred /proc/self/attr/apparmor/current, so
+# the launcher that decides whether to pass `--security-opt` and the verifier that decides what it
+# should see answered one question from different primary evidence about the same host. They call
+# `dc_apparmor_mediates` in lib.sh now; this is what stops a fourth copy reappearing beside them.
+# ci.yml is exempt: a workflow step cannot source shell, and its copy is asserted separately below.
+# Exempt for the same three reasons as the call-shape guard above: lib.sh is the definition, this
+# file names the path in its own pattern, and mutate-config.sh carries the second predicate as the
+# payload of the mutation that proves this guard fires.
+stray="$(grep -rln 'apparmor/parameters/enabled' "$here" 2>/dev/null \
+           | grep -v -e '/lib.sh$' -e '/check-config.sh$' -e '/mutate-config.sh$' || true)"
+if [ -n "$stray" ]; then
+    bad "these read /sys/module/apparmor/parameters/enabled directly instead of calling dc_apparmor_mediates, so they can drift from the launcher's answer about the same host: $(printf '%s' "$stray" | tr '\n' ' ')"
+else
+    ok "\`does AppArmor mediate\` has one definition (dc_apparmor_mediates), and .container/ has no second copy"
+fi
+
 # EVERY VENDORED ARTIFACT IS GENERATED, AND CARRIES WHAT THE DRIFT CHECK NEEDS.
 #
 # `.container/` vendors files derived from moby's upstream policies. Vendoring is deliberate (the

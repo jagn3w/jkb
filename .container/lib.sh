@@ -206,6 +206,24 @@ dc_require_apparmor_profile() { # dc_require_apparmor_profile <profile file> -> 
     printf '%s' "$name"
 }
 
+# DOES APPARMOR MEDIATE ON THIS HOST? One definition, for the same reason the profile NAME has one.
+#
+# It was hand-written in four places -- run.sh's `aa_enabled` (which decides whether to pass
+# `--security-opt` at all), mutate-verify.sh, ci.yml, and verify.sh's `aa_mediates` -- and the
+# fourth was not the same rule as the other three: it preferred `/proc/self/attr/apparmor/current`,
+# so the VERIFIER and the LAUNCHER could answer one question from different primary evidence about
+# the same host, which is precisely the disagreement verify.sh's own comment says its copy was
+# added to avoid. Nothing compared them.
+#
+# The kernel parameter is the answer here, not the attr file: the question is whether the LSM
+# mediates at all, which is a property of the host, while an attr file is a property of one
+# process's label. verify.sh still reads the attr file -- to learn WHICH profile is in force -- but
+# it asks this first, so the two scripts start from the same fact.
+dc_apparmor_mediates() { # -> 0 if AppArmor mediates on this host
+    [ -r /sys/module/apparmor/parameters/enabled ] \
+        && grep -qi '^Y' /sys/module/apparmor/parameters/enabled
+}
+
 dc_apparmor_profile() { # dc_apparmor_profile <profile file> -> the declared profile name
     # The name may be quoted -- moby's template writes `profile "{{.Name}}" flags=(...)`, and an
     # unquoted pattern silently returned NOTHING against a correctly generated profile, which

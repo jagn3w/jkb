@@ -146,10 +146,21 @@ ACCEPT_ENV=(); [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && ACCEPT_ENV=(-e JKB_ACCEPT_
 # The same host-conditional AppArmor decision run.sh makes, for the same reason: docker-default
 # denies `mount`, so without this the healthy container fails bubblewrap and every mutation verdict
 # is judged against a container that is not the one run.sh produces.
+. "$REPO/.container/lib.sh"
 AA_ARGS=()
-if [ -r /sys/module/apparmor/parameters/enabled ] \
-   && grep -qi '^Y' /sys/module/apparmor/parameters/enabled; then
-    AA_ARGS=(--security-opt "apparmor=$(. "$REPO/.container/lib.sh"; dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")")
+if dc_apparmor_mediates; then
+    # TWO STEPS, AND THE STATUS IS CHECKED. `dc_require_apparmor_profile` exits on an unreadable
+    # profile name -- but this used to call it inside an array element's command substitution, and
+    # `exit` there ends only the SUBSHELL. The refusal printed its five lines and the empty name it
+    # exists to reject flowed straight into `--security-opt apparmor=`, which docker reads as its
+    # DEFAULT profile: every mutation and the control then ran under docker-default, the exact
+    # silent state this whole change ends. This script is `set -uo pipefail` with no `-e`, so
+    # nothing else would have stopped it. The helper's own comment claims "no future caller can
+    # forget"; the first new caller did, eleven lines from run.sh's comment describing the same
+    # escape. check-config.sh now asserts the CALL SHAPE across the tree, because a callee cannot
+    # force this and a comment beside each call site is what already failed.
+    aa_name="$(dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")" || exit 1
+    AA_ARGS=(--security-opt "apparmor=$aa_name")
 fi
 # ${A[@]+"${A[@]}"}, NOT "${A[@]}". Both arrays are legitimately empty -- AA_ARGS on any host
 # without AppArmor, ACCEPT_ENV whenever the acceptance is unset, i.e. every macOS run -- and

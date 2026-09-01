@@ -260,29 +260,32 @@ fi
 # So this asserts the profile by NAME, and then asserts that a restriction the relaxed profile is
 # supposed to have KEPT still bites. Reading the name alone would pass for a profile called
 # jkb-dev that had been edited into permitting everything -- the name is a label, not the policy.
-# WHICH LSM IS SPEAKING, established before the label is interpreted as an AppArmor profile name.
-# `/proc/self/attr/current` is the GENERIC LSM interface: on Fedora/RHEL it returns an SELinux
-# context like `system_u:system_r:container_t:s0:c103,c771`, which matched no arm below and FAILed
-# with "an unexpected AppArmor profile is in force" -- a confident wrong verdict on a correctly
-# configured container, after which run.sh declines to open a window. run.sh's own `aa_enabled`
-# already asks this question before deciding whether to pass the flag; the verifier has to ask it
-# too or the two disagree about the same host.
-aa_mediates() {
-    [ -r /sys/module/apparmor/parameters/enabled ] \
-        && grep -qi '^Y' /sys/module/apparmor/parameters/enabled
-}
-# Prefer the AppArmor-specific file where the kernel offers it: it cannot return another LSM's
-# label, so there is nothing to misread.
-if [ -r /proc/self/attr/apparmor/current ]; then
-    aa_profile="$(sed 's/ (.*//' /proc/self/attr/apparmor/current 2>/dev/null)"
-elif aa_mediates; then
-    aa_profile="$(sed 's/ (.*//' /proc/self/attr/current 2>/dev/null)"
-else
-    aa_profile="__no_apparmor__"
-fi
-# Derived from the profile file in the checkout, never a literal here: this comparison is the
-# whole assertion, and a name that drifted from the file would make it check the wrong thing.
+# lib.sh FIRST: the mediation predicate and the profile name both live there, and this block needs
+# the first of them. It used to be sourced six lines below, which is why the predicate got written
+# out again here -- and the copy was not the same rule as run.sh's, so the launcher deciding whether
+# to pass `--security-opt` and the verifier deciding what it should see disagreed about one host.
 . "$(dirname "$0")/lib.sh" 2>/dev/null || true
+
+# WHETHER APPARMOR MEDIATES IS ASKED FIRST, of the host, via the one shared predicate. Only then is
+# the process label read -- and only to learn WHICH profile is in force, which is a different
+# question from whether the LSM is active at all.
+#
+# Prefer the AppArmor-specific attr file where the kernel offers it: it cannot return another LSM's
+# label, so there is nothing to misread. `/proc/self/attr/current` is the GENERIC LSM interface and
+# on Fedora/RHEL returns an SELinux context like `system_u:system_r:container_t:s0:c103,c771`,
+# which matched no arm below and FAILed with "an unexpected AppArmor profile is in force" -- a
+# confident wrong verdict on a correctly configured container, after which run.sh declines to open
+# a window.
+if ! dc_apparmor_mediates; then
+    aa_profile="__no_apparmor__"
+elif [ -r /proc/self/attr/apparmor/current ]; then
+    aa_profile="$(sed 's/ (.*//' /proc/self/attr/apparmor/current 2>/dev/null)"
+else
+    aa_profile="$(sed 's/ (.*//' /proc/self/attr/current 2>/dev/null)"
+fi
+# The name below is derived from the profile file in the checkout, never a literal here: that
+# comparison is the whole assertion, and a name that drifted from the file would check the wrong
+# thing.
 aa_want="$(dc_apparmor_profile "$(dirname "$0")/apparmor-jkb-dev" 2>/dev/null)"
 # NO LITERAL FALLBACK. This used to be `[ -n "$aa_want" ] || aa_want=jkb-dev`, which turns "I could
 # not read the profile's name" into "the name is jkb-dev" -- an unestablished answer spelled as a
@@ -295,7 +298,12 @@ fi
 case "$aa_profile" in
     __no_apparmor__)
                    note "AppArmor is not the mediating LSM on this host (SELinux, or none) — the container correctly declares no AppArmor profile, and there is nothing here to check" ;;
-    "")            note "AppArmor is not mediating this container (no profile) — expected on a host without AppArmor, e.g. Docker Desktop for macOS" ;;
+    # REACHED ONLY WHEN APPARMOR DOES MEDIATE AND THE LABEL WOULD NOT READ -- a host without it is
+    # `__no_apparmor__` above. So this says what was OBSERVED and claims nothing about the host:
+    # the macOS example this used to carry now belongs to the arm above, and printing it here
+    # spelled an unread label as a definite answer, in the file whose whole subject is that those
+    # are different things.
+    "")            note "AppArmor mediates on this host, but this process's profile label could not be read — nothing was established about what is confining the container" ;;
     unconfined)    bad "AppArmor is not confining this container (unconfined) — the container ships a profile that keeps every docker-default restriction except \`mount\`; running unconfined discards all of them" ;;
     docker-default)
                    bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile: sudo apparmor_parser -r -W .container/apparmor-jkb-dev" ;;

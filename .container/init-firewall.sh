@@ -39,20 +39,25 @@ say() { printf '[firewall] %s\n' "$*"; }
 # and use this for the explanation, and a record whose state disagrees with the probe is reported as
 # drift rather than obeyed.
 #
-# THE PATH COMES FROM THE LIBRARY, which is sourced above and where both READERS get it. This used
-# to be a second `${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}` declared here -- and the
-# check-config guard that compared the spellings was deleted when egress-lib.sh was introduced, on
-# the stated premise that there was now only one. There were two. Change the compiled-in default in
-# the library alone and the raise would write the old file while `verdict_field` read the new one:
-# the entrypoint gets an empty reason and prints "(the raise left no reason)" on every refusal,
-# discarding the DNS remedy this file's own self-test exists to protect, with every static and
-# mutation guard still green. They shared the JKB_EGRESS_VERDICT override, which is why only a
-# change to the default would have split them -- and why nothing noticed.
+# THE VERDICT PATH IS NOT NAMED IN THIS FILE AT ALL. It is `VERDICT_PATH`, defined once in
+# egress-lib.sh (sourced above) and used verbatim by `record_verdict` below and by `verdict_field`,
+# the reader. There used to be a second `${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}` here, and
+# the check-config guard comparing the two spellings was deleted when egress-lib.sh arrived, on the
+# stated premise that only one remained. There were two.
 #
-# Overridable ONLY so --self-test can point it somewhere writable. It cannot weaken anything: sudo
-# runs with env_reset, so the sudoers-granted path never sees a caller's value, and a non-root run
-# that supplies one cannot write the real file anyway (it is root-owned).
-VERDICT="$VERDICT_PATH"
+# The first repair was `VERDICT="$VERDICT_PATH"` -- one path, but still two NAMES, and that is not
+# the same property. The self-test overrode `VERDICT`, so the aliasing line was exercised by
+# nothing: setting it to a wrong path left all three self-test rows green and exit 0, which is the
+# regression this comment describes, passing its own guard. An alias is a variable that has to
+# agree with another one, and "two things that must agree" is the defect, not the thing to test.
+#
+# So there is one name. The writer and the reader cannot disagree about where the verdict lives,
+# because neither of them decides -- which makes the bug unrepresentable rather than caught.
+# Overriding is still possible for a test, via `VERDICT_PATH` in this process or
+# `JKB_EGRESS_VERDICT` before sourcing; either moves the writer and the reader together, which is
+# the point. It cannot weaken anything: sudo runs with env_reset, so the sudoers-granted path never
+# sees a caller's value, and a non-root run that supplies one cannot write the real file anyway (it
+# is root-owned).
 
 # NEWLINES ARE FLATTENED HERE, which is the one place it can be enforced (D51.8). Every reason on
 # the paths that matter is multi-line, and both readers parse a field with `sed | head -1` — so the
@@ -67,7 +72,7 @@ record_verdict() { # record_verdict <state> <v4> <v6> <reason...>
       printf 'v4=%s\n'    "$v4"
       printf 'v6=%s\n'    "$v6"
       printf 'reason=%s\n' "$reason"
-    } > "$VERDICT" 2>/dev/null || true
+    } > "$VERDICT_PATH" 2>/dev/null || true
 }
 
 # `v6_state` is NOT defined here any more — it lives in egress-lib.sh, sourced above, beside the
@@ -152,7 +157,7 @@ if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then
     # reader intact" and passed only because it was handed a single-line reason the writer never
     # produces, so the remedy on every refusal that matters was being stripped in transit and
     # nothing noticed. record_verdict flattens newlines now; this is what holds it to that.
-    VERDICT="$t/verdict" record_verdict denied denied absent "DNS resolved none of them.
+    VERDICT_PATH="$t/verdict" record_verdict denied denied absent "DNS resolved none of them.
   Fix DNS and re-run this, or restart the container, to restore the allowlist."
     got="$(sed -n 's/^reason=//p' "$t/verdict" | head -1)"
     case "$got" in

@@ -56,6 +56,24 @@ which macOS does not ship.
 ./.container/run.sh             # build if needed, start, firewall, setup, verify
 ```
 
+### On an AppArmor host, the profile must be loaded — and a reboot unloads it
+
+Docker's `docker-default` denies `mount`, so bubblewrap — and therefore Claude Code's nested
+sandbox — cannot start under it. `.container/apparmor-jkb-dev` is `docker-default` with that one
+rule relaxed and every other restriction kept, and it has to be in the kernel before the container
+can use it:
+
+```sh
+sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+```
+
+**Nothing installs it under `/etc/apparmor.d`, so this does not survive a reboot.** Run it again
+after restarting the machine. `run.sh` asks whether Docker can apply the profile *before* it
+creates or starts anything and prints this command with docker's own error beside it, so the
+failure names itself — but it is worth knowing that a container which worked yesterday needs one
+command today. It is deliberately not installed system-wide: jkb runs inside other people's
+repositories and does not add root-owned policy to a machine the user did not ask it to change.
+
 Then attach VS Code: **Command Palette → "Dev Containers: Attach to Running Container" → `jkb-dev`**,
 and File → Open Folder to any path inside. From a terminal in an attached window, `code <path>`
 opens another window on the same container. `run.sh --open [path]` does the attach for you, but the

@@ -377,11 +377,11 @@ while IFS= read -r line; do ARGS+=("$line"); done < <(docker_args "$CONFIG" "$re
 # INSIDE THE FINGERPRINT, deliberately: a container created without the profile is genuinely not
 # the same container as one created with it, and should be reported stale rather than reused.
 AA_PROFILE="$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")"
-aa_enabled() { # -> 0 if AppArmor mediates on this host
-    [ -r /sys/module/apparmor/parameters/enabled ] \
-        && grep -qi '^Y' /sys/module/apparmor/parameters/enabled
-}
-if aa_enabled; then ARGS+=(--security-opt "apparmor=$AA_PROFILE"); fi
+# `dc_apparmor_mediates`, from lib.sh -- not a local `aa_enabled` copy, and not an alias for one
+# either. This was a hand-written predicate here, a second in verify.sh that read DIFFERENT primary
+# evidence, and two more in mutate-verify.sh and ci.yml; the launcher deciding whether to pass
+# `--security-opt` and the verifier deciding what it should see have to start from one fact.
+if dc_apparmor_mediates; then ARGS+=(--security-opt "apparmor=$AA_PROFILE"); fi
 
 # Hashed BEFORE the label is appended, or the value would have to contain itself.
 want_hash="$(fingerprint "$repo" "${ARGS[@]}")"
@@ -408,6 +408,65 @@ fi
 
 state="$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true)"
 fresh=0
+
+# CAN DOCKER APPLY THE PROFILE? ASKED ABOVE THE DISPATCH, so it dominates every arm (D45.5).
+#
+# It used to live in the `*)` create arm alone, on the reasoning that only `docker run` passes
+# `--security-opt`. True, and it misses that `docker start` REPLAYS the flags the container was
+# created with: the profile has to be loaded again for the restart too. Nothing installs it under
+# /etc/apparmor.d, so `apparmor_parser -r -W` loads it into the kernel and a REBOOT UNLOADS IT --
+# after which the restart arm died on docker's raw error, ten lines below a remedy it could not
+# reach. That arm was unreachable on an AppArmor host until the `--entrypoint true` fix landed,
+# because the create probe could never pass and so no container was ever left behind; fixing the
+# probe is what made the gap reachable, which is why it is fixed in the same breath.
+#
+# --entrypoint true, DELIBERATELY. Without it this runs the image's ENTRYPOINT, which refuses to
+# boot when egress is unbounded -- and this probe passes no --cap-add NET_ADMIN, so the raise
+# always fails and the probe always exits non-zero. It therefore reported "the profile is not
+# loaded" on every AppArmor host, loaded or not, and the remedy it printed produced the identical
+# failure: the create path was unusable on exactly the hosts the profile exists for. ci.yml's own
+# bwrap probe had already learned this and says so in its comment ("the first version of this probe
+# kept the image's entrypoint"). What is being asked is only whether DOCKER CAN APPLY THE PROFILE,
+# so everything the entrypoint decides is an unrelated moving part.
+#
+# REFUSED, NEVER FALLEN BACK. Silently dropping the security-opt would start a container whose
+# nested sandbox does not work and whose verifier reports docker-default, which is the state this
+# whole change ends.
+# The image exists by here unconditionally: the block above builds it when it is absent and `set
+# -e` aborts if that fails, so this needs no image guard of its own -- one would be a condition
+# that cannot be false, which is the shape this directory keeps having to delete.
+if dc_apparmor_mediates; then
+    # DOCKER'S OWN ERROR IS THE EVIDENCE, not discarded. This used to be `>/dev/null 2>&1` followed
+    # by a `die` stating one cause -- so a dockerd built without AppArmor support, a transient
+    # daemon error, or a daemon policy refusing `--security-opt apparmor=` was all reported as "the
+    # profile is not loaded", with a remedy (`apparmor_parser -r -W`) that succeeds, changes
+    # nothing, and leaves the next run failing identically. `container_died` below is this script's
+    # own shape for the same problem: name the likely cause AND show what was actually said. A probe
+    # that throws away the one line naming the real cause cannot be right about the cause more often
+    # than its single guess happens to hold.
+    aa_probe_err=""
+    if ! aa_probe_err="$(docker run --rm --entrypoint true \
+            --security-opt "apparmor=$AA_PROFILE" "$IMAGE" 2>&1 >/dev/null)"; then
+        die "docker could not start a container under the AppArmor profile '$AA_PROFILE'.
+
+  docker said:
+$(printf '%s\n' "$aa_probe_err" | sed 's/^/      /')
+
+  The usual cause is that the profile is not loaded on this host. Load it (it needs root, and a
+  container cannot do it for itself) and run this again:
+
+      sudo apparmor_parser -r -W $here/apparmor-jkb-dev
+
+  It does NOT survive a reboot — nothing installs it under /etc/apparmor.d — so this is also what
+  to run after restarting the machine. If docker's message above is about something else (a daemon
+  built without AppArmor support, for instance), that is the thing to fix; loading the profile will
+  not help.
+
+  It is Docker's own docker-default profile with \`mount\` allowed, which bubblewrap needs; see
+  $here/apparmor-jkb-dev for why the whole profile is not simply switched off."
+    fi
+fi
+
 case "$state" in
     running|exited|created)
         # A container created before this label existed reports `<no value>`, and that is reported
@@ -450,30 +509,10 @@ case "$state" in
         say "create $NAME"
         # `sleep infinity` because nothing else keeps it alive: the image's job is to be a place to
         # attach to, not to run a program.
-        # REFUSED, NEVER FALLEN BACK. Without the profile loaded Docker will not start the
-        # container at all, which is the right failure -- but the message it gives is about a
-        # missing AppArmor profile and says nothing about what to do. Silently dropping the
-        # security-opt instead would start a container whose nested sandbox does not work and
-        # whose verifier reports docker-default, which is the state this whole change ends.
-        # --entrypoint true, DELIBERATELY. Without it this runs the image's ENTRYPOINT, which
-        # refuses to boot when egress is unbounded -- and this probe passes no --cap-add NET_ADMIN,
-        # so the raise always fails and the probe always exits non-zero. It therefore reported "the
-        # profile is not loaded" on every AppArmor host, loaded or not, and the remedy it printed
-        # produced the identical failure: the create path was unusable on exactly the hosts the
-        # profile exists for. ci.yml's own bwrap probe had already learned this and says so in its
-        # comment ("the first version of this probe kept the image's entrypoint"); the lesson was
-        # not carried here. What is being asked is only whether DOCKER CAN APPLY THE PROFILE, so
-        # everything the entrypoint decides is an unrelated moving part.
-        if aa_enabled && ! docker run --rm --entrypoint true \
-             --security-opt "apparmor=$AA_PROFILE" "$IMAGE" >/dev/null 2>&1; then
-            die "the AppArmor profile '$AA_PROFILE' is not loaded on this host, so the container's
-  nested sandbox could not start. Load it (it needs root, and a container cannot do it for itself):
-
-      sudo apparmor_parser -r -W $here/apparmor-jkb-dev
-
-  It is Docker's own docker-default profile with \`mount\` allowed, which bubblewrap needs; see
-  $here/apparmor-jkb-dev for why the whole profile is not simply switched off."
-        fi
+        #
+        # No AppArmor probe here any more: it is asked above the dispatch, where it covers `docker
+        # start` too (which replays the flags the container was created with, so the profile has to
+        # be loaded for a restart as well).
         docker run "${ARGS[@]}" "$IMAGE" sleep infinity >/dev/null
         fresh=1
         ;;

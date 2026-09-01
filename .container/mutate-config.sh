@@ -684,6 +684,34 @@ open(p, 'w').write(re.sub(r'^(\s*)run "', r'\1drive "', s, flags=re.M))
 PYX
 run "mutate-verify's run-line shape changes" "this check just certified nothing"
 
+# THE CALL SHAPE OF dc_require_apparmor_profile. The helper ends in `exit 1`, which stops nothing
+# when it is called inside a command substitution -- so the empty name it refuses reaches docker as
+# `apparmor=`, i.e. docker-default. This is that call written the way it was actually written, in
+# the file that actually did it.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '''    aa_name="$(dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")" || exit 1
+    AA_ARGS=(--security-opt "apparmor=$aa_name")'''
+assert s.count(old) == 1, "mutation target absent"
+open(p, 'w').write(s.replace(old,
+    '''    AA_ARGS=(--security-opt "apparmor=$(dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")")'''))
+PYX
+run "a caller swallows dc_require_apparmor_profile's refusal" "cannot stop the script"
+
+# A SECOND DEFINITION OF "DOES APPARMOR MEDIATE", reintroduced in verify.sh -- which is where the
+# divergent copy actually was: it preferred /proc/self/attr/apparmor/current, so the verifier and
+# the launcher answered one question about one host from different primary evidence.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if ! dc_apparmor_mediates; then'
+assert s.count(old) == 1, "mutation target absent"
+open(p, 'w').write(s.replace(old,
+    'if ! { [ -r /sys/module/apparmor/parameters/enabled ] && grep -qi "^Y" /sys/module/apparmor/parameters/enabled; }; then'))
+PYX
+run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparmor_mediates"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -696,7 +724,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=63
+PINNED_BAD_SITES=65
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

@@ -138,6 +138,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/fixture-artifact"
 url="https://fixture.invalid/thing"
 if [ "${1:-}" = --print-target ]; then printf '%s\n' "$out"; exit 0; fi
+# A GENERATOR THAT DIES PART-WAY, which is what a network failure looks like: it has already
+# truncated the artifact when it gives up. The check must report UNCHECKED *and* put the file back.
+if [ -n "${JKB_FIXTURE_FAIL:-}" ]; then
+    printf 'half a policy\n' > "$out"
+    printf 'fixture: could not fetch upstream\n' >&2
+    exit 3
+fi
 { printf '# GENERATED FILE -- DO NOT EDIT.\n'
   printf '# Source: %s\n' "$url"
   printf '# upstream-sha256: %s\n' "${JKB_FIXTURE_DIGEST:-1111111111111111111111111111111111111111111111111111111111111111}"
@@ -146,20 +153,38 @@ GEN
     chmod +x "$d/generate-fixture.sh"
     ( cd "$d" && ./generate-fixture.sh >/dev/null )   # lay down the in-sync artifact
 
+    # THE ARTIFACT MUST BE BYTE-IDENTICAL AFTERWARDS, asserted on every drive that has one.
+    #
+    # This check REGENERATES IN PLACE and puts the file back, so its non-destructiveness is a
+    # property of two lines -- the restore `cp` at the end of the loop and the copy inside
+    # `restore_now` -- and nothing asserted it. Delete both and every row here still passed while a
+    # real run reported drift AND overwrote the edit it had just detected: run it twice and the
+    # second run prints "1 vendored artifact(s) match their generators" and exits 0. That is
+    # verbatim the failure this file's header records as already paid once, and the header is the
+    # only place it was written down. A harness that drives a check without asserting what the check
+    # does to the tree is watching half of it.
     drive() { # drive <label> <expect ok|substring> [env assignments...]
         local label="$1" want="$2"; shift 2
-        local out rc=0
+        local out rc=0 before="" verdict=""
+        [ -f "$d/fixture-artifact" ] && { before="$(mktemp)"; cp "$d/fixture-artifact" "$before"; }
         out="$(env "$@" "$0" --drift-dir "$d" 2>&1)" || rc=$?
         if [ "$want" = ok ]; then
-            if [ "$rc" -eq 0 ]; then printf '  \033[32mok\033[0m   %s\n' "$label"
-            else printf '  \033[31mFAIL\033[0m %s (reported drift: %s)\n' "$label" "$out"; fails=$((fails+1)); fi
+            if [ "$rc" -eq 0 ]; then verdict=ok
+            else verdict="reported drift: $out"; fi
         elif [ "$rc" -eq 0 ]; then
-            printf '  \033[31mFAIL\033[0m %s — reported NO drift, so the comparison cannot fire\n' "$label"; fails=$((fails+1))
+            verdict="reported NO drift, so the comparison cannot fire"
         elif grep -qF -e "$want" <<<"$out"; then
-            printf '  \033[32mok\033[0m   %s\n' "$label"
+            verdict=ok
         else
-            printf '  \033[31mFAIL\033[0m %s — wrong reason: %s\n' "$label" "$out"; fails=$((fails+1))
+            verdict="wrong reason: $out"
         fi
+        # Only where there was an artifact to preserve; two rows below deliberately move it away.
+        if [ -n "$before" ] && [ "$verdict" = ok ] && ! cmp -s "$before" "$d/fixture-artifact"; then
+            verdict="the check MODIFIED the artifact it was only supposed to look at"
+        fi
+        [ -n "$before" ] && rm -f "$before"
+        if [ "$verdict" = ok ]; then printf '  \033[32mok\033[0m   %s\n' "$label"
+        else printf '  \033[31mFAIL\033[0m %s — %s\n' "$label" "$verdict"; fails=$((fails+1)); fi
     }
 
     # THE NEGATIVE CONTROL FIRST. An in-sync fixture must report ok, or every row below is CAUGHT by
@@ -167,6 +192,14 @@ GEN
     drive "an in-sync artifact reports no drift (the control)" ok
     drive "a hand-edited artifact is caught" "hand-edited" JKB_FIXTURE_BODY=different
     drive "a moved upstream is caught and named as such" "upstream moved" JKB_FIXTURE_DIGEST=2222222222222222222222222222222222222222222222222222222222222222
+    # A GENERATOR THAT CANNOT RUN, which is the network-failure path and the one arm whose whole
+    # value is that it does NOT report success. Deleting its `status=1` left every row here green
+    # while a real run printed the red "drift is UNCHECKED, not absent" line AND THEN the green
+    # summary, exiting 0 -- a CI pass asserting an artifact matches a generator that never ran. The
+    # fixture truncates its artifact before giving up, so the `cmp` in `drive` is also what holds
+    # the loop's "restore first: a generator that died part-way must not leave a half-written policy
+    # behind" to its word.
+    drive "a generator that dies part-way reports UNCHECKED, not absent" "drift is UNCHECKED" JKB_FIXTURE_FAIL=1
     chmod -x "$d/generate-fixture.sh"
     drive "a non-executable generator is caught" "is not executable"
     chmod +x "$d/generate-fixture.sh"
