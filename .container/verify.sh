@@ -265,7 +265,14 @@ aa_profile="$(cat /proc/self/attr/current 2>/dev/null | sed 's/ (.*//')"
 # whole assertion, and a name that drifted from the file would make it check the wrong thing.
 . "$(dirname "$0")/lib.sh" 2>/dev/null || true
 aa_want="$(dc_apparmor_profile "$(dirname "$0")/apparmor-jkb-dev" 2>/dev/null)"
-[ -n "$aa_want" ] || aa_want=jkb-dev
+# NO LITERAL FALLBACK. This used to be `[ -n "$aa_want" ] || aa_want=jkb-dev`, which turns "I could
+# not read the profile's name" into "the name is jkb-dev" -- an unestablished answer spelled as a
+# definite one, two lines under a comment saying never to use a literal here. It also MASKED a real
+# defect: dc_apparmor_profile could not read upstream's quoted `profile "jkb-dev"` form and returned
+# empty, so the assertion below was comparing against the fallback and passing for the wrong reason.
+if [ -z "$aa_want" ]; then
+    bad "cannot read the profile name from .container/apparmor-jkb-dev — every AppArmor assertion below compares against it, and run.sh passes it to \`docker run --security-opt apparmor=\`"
+fi
 case "$aa_profile" in
     "")            note "AppArmor is not mediating this container (no profile) — expected on a host without AppArmor, e.g. Docker Desktop for macOS" ;;
     unconfined)    bad "AppArmor is not confining this container (unconfined) — the container ships a profile that keeps every docker-default restriction except \`mount\`; running unconfined discards all of them" ;;
