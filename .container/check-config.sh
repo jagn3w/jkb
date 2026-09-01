@@ -437,10 +437,35 @@ else
     # `apparmor=unconfined` would have discarded -- so deleting the actual `deny` line left the
     # guard green. Caught by its mutation on the first run, which is the shape this directory
     # produces most often.
-    for r in 'sysrq-trigger' 'kcore' '/sys/firmware' '/sys/kernel/security'; do
+    # `network alg`, `network vsock` and `powercap` are on this list because the hand-written
+    # profile OMITTED all three and the list as first written did not ask for them -- a check
+    # derived from the same memory as the thing it checks agrees with it. They are named here so
+    # that a regeneration silently losing them is caught even before the CI drift check runs.
+    for r in 'sysrq-trigger' 'kcore' '/sys/firmware' '/sys/kernel/security' \
+             'network alg' 'network vsock' 'powercap'; do
         grep -E '^[[:space:]]*deny[[:space:]]' "$aa_file" | grep -qF -e "$r" \
             || { bad "$aa_file no longer denies $r — it is supposed to be docker-default with ONE rule relaxed, not a permissive profile wearing its name"; aa_ok=0; }
     done
+    # THE PROFILE IS GENERATED, AND SAYS SO. The first version was transcribed by hand from memory
+    # of moby's template and was missing three deny rules, the ABI declaration, and the runc/crun
+    # signal peers -- none of which is visible by reading the file, and all of which passed the
+    # checks above because those were written from the same memory. What actually closes that is
+    # `generate-apparmor.sh` plus a CI step re-running it and requiring no diff; these assertions
+    # are what stop the file quietly reverting to a hand-maintained one between those runs.
+    aa_gen="$here/generate-apparmor.sh"
+    [ -x "$aa_gen" ] || { bad "$aa_gen is missing or not executable — the AppArmor profile would go back to being hand-maintained, which is how it lost three deny rules"; aa_ok=0; }
+    grep -qF -e 'GENERATED FILE -- DO NOT EDIT' "$aa_file" \
+        || { bad "$aa_file does not declare itself generated — a hand-edit would read as ordinary content"; aa_ok=0; }
+    aa_src="$(sed -n 's/^# Source: //p' "$aa_file" | head -1)"
+    if [ -z "$aa_src" ]; then
+        bad "$aa_file records no upstream Source — its provenance is unverifiable and CI cannot tell drift from an edit"
+        aa_ok=0
+    elif ! grep -qF -e "$aa_src" "$aa_gen"; then
+        bad "$aa_file was generated from $aa_src but $aa_gen no longer fetches that URL — the CI drift check would compare against a different upstream"
+        aa_ok=0
+    fi
+    grep -qE '^# sha256 of that file when this was generated: [0-9a-f]{64}$' "$aa_file" \
+        || { bad "$aa_file records no upstream sha256 — a reviewer cannot tell which upstream revision it came from"; aa_ok=0; }
     # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
     if ! grep -qF -e "apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
         bad "ci.yml does not name the profile the file declares ($aa_name) — its bubblewrap probe would test a profile nothing loads"

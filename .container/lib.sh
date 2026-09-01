@@ -185,5 +185,8 @@ dc_root_installed() { # dc_root_installed <Dockerfile> -> one absolute container
 # started under docker-default, which is precisely the state that made bubblewrap fail. The file
 # that DECLARES the profile is the one place it cannot be wrong.
 dc_apparmor_profile() { # dc_apparmor_profile <profile file> -> the declared profile name
-    sed -n 's/^profile[[:space:]]\{1,\}\([A-Za-z0-9_.-]\{1,\}\)[[:space:]].*/\1/p' "$1" 2>/dev/null | head -1
+    # The name may be quoted -- moby's template writes `profile "{{.Name}}" flags=(...)`, and an
+    # unquoted pattern silently returned NOTHING against a correctly generated profile, which
+    # callers spend on `docker run --security-opt apparmor=`. Quotes optional, never captured.
+    sed -n 's/^profile[[:space:]]\{1,\}"\{0,1\}\([A-Za-z0-9_.-]\{1,\}\)"\{0,1\}[[:space:]].*/\1/p' "$1" 2>/dev/null | head -1
 }

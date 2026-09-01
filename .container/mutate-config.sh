@@ -42,6 +42,9 @@ seed() {
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
     cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
+    # The manifest is what lets mutated() see a DELETION. Taken here rather than derived from a
+    # list, so it still covers a file added to seed() tomorrow.
+    find "$work/t" -type f | sort > "$work/manifest"
 }
 
 DC() { printf '%s' "$work/t/.container/container.json"; }
@@ -63,11 +66,16 @@ EXPECTS=()
 # ui/vscode/package.json and scripts/auto-mode-posture.json -- a second list that has to be kept in
 # step with seed(), which is the defect this file keeps finding elsewhere. Walking what was
 # actually seeded needs no list and covers a file added to seed() tomorrow.
-mutated() { # mutated -> 0 if anything in the seeded tree differs from the repo
+# PRESENCE FIRST, THEN CONTENT. Walking only the files that are THERE cannot see a mutation that
+# DELETES one -- the removed file simply stops appearing, every survivor matches the repo, and a
+# deletion mutation is reported as changing nothing. Found by writing the first such mutation
+# (removing generate-apparmor.sh) and watching a correct guard be called a no-op.
+mutated() { # mutated -> 0 if the seeded tree differs from what seed() laid down, or from the repo
     local f
+    find "$work/t" -type f | sort | cmp -s - "$work/manifest" || return 0
     while IFS= read -r f; do
         cmp -s "$f" "$repo/${f#"$work/t/"}" || return 0
-    done < <(find "$work/t" -type f)
+    done < "$work/manifest"
     return 1
 }
 
@@ -287,9 +295,13 @@ run "the shared-rule check can find no rules to check" "just certified nothing"
 # name while being gutted is the failure mode here: it loads, verify.sh's name check passes, and
 # every docker-default restriction is gone.
 seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
-import sys
+import re, sys
+# Anchored on the RULE, not on the exact line text: the generated profile carries a trailing
+# `# PATCHED:` comment, and matching the bare line made this a silent no-op the moment the
+# generator started emitting it. The header's prose mentions `mount,` too, but every header line
+# begins with `#`, so a two-space-indented anchor cannot reach it.
 p = sys.argv[1]; s = open(p).read()
-out = s.replace("\n  mount,\n", "\n  deny mount,\n", 1)
+out = re.sub(r'^  mount,.*$', '  deny mount,', s, count=1, flags=re.M)
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
@@ -312,6 +324,30 @@ assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
 run "the profile declares no name" "declares no profile"
+
+# THE PROFILE IS GENERATED, AND THE THREE THINGS THAT SAY SO. Each of these is what a return to a
+# hand-maintained profile looks like, which is the state that lost three deny rules, the ABI
+# declaration and the runc/crun signal peers without any check noticing.
+seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+out = s.replace("# GENERATED FILE -- DO NOT EDIT.", "# Hand-maintained profile.", 1)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the profile stops declaring itself generated" "does not declare itself generated"
+
+seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^# Source: .*$', '# Source: https://example.invalid/template.go', s, count=1, flags=re.M)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the profile's recorded upstream is not the one the generator fetches" "no longer fetches that URL"
+
+seed; rm -f "$work/t/.container/generate-apparmor.sh"
+run "the generator is deleted, so the profile goes back to hand-maintained" "is missing or not executable"
 
 seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
 import sys
@@ -588,7 +624,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=54
+PINNED_BAD_SITES=59
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

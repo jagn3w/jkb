@@ -111,6 +111,42 @@ jobs:
           # two lists — the exact drift that check exists to catch, found on its first run.
           ./scripts/link-claude-memory.sh --self-test
 
+      # THE VENDORED APPARMOR PROFILE IS REPRODUCIBLE FROM UPSTREAM. This is the only check that
+      # can see a bad transcription: every other one is written from the same understanding as the
+      # file, so it agrees with it. The profile's first version was typed from memory of moby's
+      # template and was silently missing `deny network alg`, `deny network vsock`,
+      # `deny /sys/devices/virtual/powercap/**`, the `abi <abi/3.0>` declaration (without which
+      # AppArmor 4.0 reads `network,` as excluding unix sockets) and the runc/crun signal peers
+      # `docker stop` needs — while loading fine, keeping its name, and passing every static check.
+      #
+      # Regenerating and requiring no diff catches that AND upstream drift. Both fail, because a
+      # security policy that upstream has moved on from is worth a red build; the two get DIFFERENT
+      # messages, since one is repaired by looking at your own diff and the other by reviewing
+      # moby's. This is also the only network-dependent step here, so it is placed with the other
+      # text-level container checks rather than in the Docker job, which is far more expensive.
+      - name: the AppArmor profile is reproducible from upstream
+        run: |
+          set -euo pipefail
+          sha_of() { sed -n 's/^# sha256 of that file when this was generated: //p' "$1" | head -1; }
+          recorded="$(sha_of .container/apparmor-jkb-dev)"
+          ./.container/generate-apparmor.sh
+          if git diff --quiet -- .container/apparmor-jkb-dev; then
+            echo "the vendored profile is exactly what the generator produces (upstream $recorded)"
+            exit 0
+          fi
+          fetched="$(sha_of .container/apparmor-jkb-dev)"
+          if [ "$fetched" != "$recorded" ]; then
+            echo "::error::moby's AppArmor template changed upstream ($recorded -> $fetched)."
+            echo "::error::Run ./.container/generate-apparmor.sh, review the diff below, and commit it."
+          else
+            echo "::error::.container/apparmor-jkb-dev is NOT what generate-apparmor.sh produces from"
+            echo "::error::the upstream it records — it has been hand-edited, or the generator changed"
+            echo "::error::and the profile was not regenerated. Never hand-edit it: that is how it lost"
+            echo "::error::three deny rules the last time."
+          fi
+          git --no-pager diff -- .container/apparmor-jkb-dev
+          exit 1
+
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny
