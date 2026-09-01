@@ -184,6 +184,28 @@ dc_root_installed() { # dc_root_installed <Dockerfile> -> one absolute container
 # names it in its probe -- five spellings of one fact, and a mismatch means a container silently
 # started under docker-default, which is precisely the state that made bubblewrap fail. The file
 # that DECLARES the profile is the one place it cannot be wrong.
+dc_require_apparmor_profile() { # dc_require_apparmor_profile <profile file> -> the name, or exits
+    # THE CHECK LIVES HERE BECAUSE EVERY CALLER THAT SPENDS THE ANSWER ON DOCKER MUST MAKE IT, and
+    # two of the three did not. `dc_apparmor_profile` answers empty when the file's `profile …`
+    # line does not match (a reformat, a regenerated header) and fails outright when the file is
+    # unreadable -- and an empty name reaches docker as `--security-opt apparmor=`, which docker
+    # reads as its DEFAULT profile. That is docker-default, whose `mount` denial is precisely the
+    # silent state the refusal at the call site exists to prevent: the container starts, the nested
+    # sandbox does not, and nothing says so. Returning the name or exiting means no future caller
+    # can forget, which a comment beside each call site could not achieve.
+    local name
+    name="$(dc_apparmor_profile "$1" 2>/dev/null)" || name=""
+    if [ -z "$name" ]; then
+        printf 'cannot read an AppArmor profile name from %s.\n' "$1" >&2
+        printf 'Its `profile <name> flags=(...)` line is missing or unreadable, and an empty name\n' >&2
+        printf 'reaches docker as the DEFAULT profile -- which is docker-default, whose `mount`\n' >&2
+        printf 'denial is the thing this profile exists to lift. Regenerate it:\n\n' >&2
+        printf '    ./.container/generate-apparmor.sh\n' >&2
+        exit 1
+    fi
+    printf '%s' "$name"
+}
+
 dc_apparmor_profile() { # dc_apparmor_profile <profile file> -> the declared profile name
     # The name may be quoted -- moby's template writes `profile "{{.Name}}" flags=(...)`, and an
     # unquoted pattern silently returned NOTHING against a correctly generated profile, which

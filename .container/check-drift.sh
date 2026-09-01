@@ -118,9 +118,73 @@ if [ "${1:-}" = --self-test ]; then
     printf '# upstream-sha256: abc123\n' > "$t/short"
     check "a truncated digest is not accepted"           "$(recorded_digest "$t/short")" ""
 
+    # ---------------------------------------------------------------- the loop, driven for real
+    # THE `cmp` BELOW IS THE ENTIRE CHECK, and until now nothing drove it. check-config.sh covers
+    # the preconditions (executable, --print-target, a recorded digest) and never that a DIFFERING
+    # artifact is detected -- so inverting the `if`, or rewriting it as `cmp "$snapshot" "$snapshot"`,
+    # would have CI printing "2 vendored artifact(s) match their generators" for a gutted profile,
+    # permanently. This file's own header records that cost as already paid once: the first version
+    # of this check compared against `git diff` and passed for a profile I had gutted. verify.sh has
+    # mutate-verify.sh and check-config.sh has mutate-config.sh; the only check that can see a bad
+    # transcription had neither.
+    #
+    # Driven against a FIXTURE generator in a scratch directory -- no network, no real policy -- by
+    # re-invoking this script with $here pointed at it.
+    d="$t/fix"; mkdir -p "$d"
+    cat > "$d/generate-fixture.sh" <<'GEN'
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+out="$here/fixture-artifact"
+url="https://fixture.invalid/thing"
+if [ "${1:-}" = --print-target ]; then printf '%s\n' "$out"; exit 0; fi
+{ printf '# GENERATED FILE -- DO NOT EDIT.\n'
+  printf '# Source: %s\n' "$url"
+  printf '# upstream-sha256: %s\n' "${JKB_FIXTURE_DIGEST:-1111111111111111111111111111111111111111111111111111111111111111}"
+  printf 'body %s\n' "${JKB_FIXTURE_BODY:-original}"; } > "$out"
+GEN
+    chmod +x "$d/generate-fixture.sh"
+    ( cd "$d" && ./generate-fixture.sh >/dev/null )   # lay down the in-sync artifact
+
+    drive() { # drive <label> <expect ok|substring> [env assignments...]
+        local label="$1" want="$2"; shift 2
+        local out rc=0
+        out="$(env "$@" "$0" --drift-dir "$d" 2>&1)" || rc=$?
+        if [ "$want" = ok ]; then
+            if [ "$rc" -eq 0 ]; then printf '  \033[32mok\033[0m   %s\n' "$label"
+            else printf '  \033[31mFAIL\033[0m %s (reported drift: %s)\n' "$label" "$out"; fails=$((fails+1)); fi
+        elif [ "$rc" -eq 0 ]; then
+            printf '  \033[31mFAIL\033[0m %s — reported NO drift, so the comparison cannot fire\n' "$label"; fails=$((fails+1))
+        elif grep -qF -e "$want" <<<"$out"; then
+            printf '  \033[32mok\033[0m   %s\n' "$label"
+        else
+            printf '  \033[31mFAIL\033[0m %s — wrong reason: %s\n' "$label" "$out"; fails=$((fails+1))
+        fi
+    }
+
+    # THE NEGATIVE CONTROL FIRST. An in-sync fixture must report ok, or every row below is CAUGHT by
+    # something that is present when nothing is wrong.
+    drive "an in-sync artifact reports no drift (the control)" ok
+    drive "a hand-edited artifact is caught" "hand-edited" JKB_FIXTURE_BODY=different
+    drive "a moved upstream is caught and named as such" "upstream moved" JKB_FIXTURE_DIGEST=2222222222222222222222222222222222222222222222222222222222222222
+    chmod -x "$d/generate-fixture.sh"
+    drive "a non-executable generator is caught" "is not executable"
+    chmod +x "$d/generate-fixture.sh"
+    mv "$d/fixture-artifact" "$d/gone"
+    drive "a missing artifact is caught" "which does not exist"
+    mv "$d/gone" "$d/fixture-artifact"
+    mv "$d/generate-fixture.sh" "$d/nope"
+    drive "no generator at all establishes nothing" "no generator was checked"
+    mv "$d/nope" "$d/generate-fixture.sh"
+
     if [ "$fails" -eq 0 ]; then printf '\033[32mcheck-drift self-test passed\033[0m\n'; exit 0; fi
     printf '\033[31mcheck-drift self-test: %s failed\033[0m\n' "$fails"; exit 1
 fi
+
+# --drift-dir <dir> points the loop below at a directory other than this script's own, which is how
+# --self-test drives the real comparison against fixture generators. Deliberately not documented as
+# a user-facing flag: it exists so the check can be watched failing.
+if [ "${1:-}" = --drift-dir ]; then here="$2"; shift 2; fi
 
 # ------------------------------------------------------------------------------------- the check
 # The artifact is regenerated IN PLACE and put back afterwards, so an interrupt between those two

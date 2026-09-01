@@ -126,7 +126,14 @@ fi
 # failure check-config.sh already names for the seccomp profile -- and until this existed NOTHING
 # exercised them: check-drift.sh compares our output against our own output, so a bug in the
 # render/patch logic is invisible to it, and what it produces is a security policy.
-"$(dirname "$0")/../.container/generate-apparmor.sh" --self-test
+# GUARDED, because it drives its fixtures through python3 and this file's own rule is that a fact
+# about the machine degrades to a NAMED skip rather than a red gate. CI always has python3, so a
+# local skip never becomes a CI skip. (check-drift.sh's --self-test above is pure shell.)
+if command -v python3 >/dev/null 2>&1; then
+    "$(dirname "$0")/../.container/generate-apparmor.sh" --self-test
+else
+    echo "   (skipped: python3 not installed; CI runs this gate)"
+fi
 
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are

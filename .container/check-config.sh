@@ -459,7 +459,13 @@ else
     # (That the profile is GENERATED rather than hand-maintained is asserted below, by the derived
     # check over every generator -- not here, where it would be a second rule about one of them.)
     # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
-    if ! grep -qF -e "apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
+    # ANCHORED ON THE INVOCATION, not on a mention of the name. `apparmor=jkb-dev` also appeared in
+    # the probe's LABEL, so changing the actual `--security-opt` flag to `apparmor=unconfined` left
+    # this guard green -- arm [3] then measured unconfined, and the headline "[2] FAILED with [3]
+    # OK" stopped demonstrating the profile and quietly demonstrated that switching AppArmor off
+    # works. The mutation rewrote every occurrence at once, so it reported CAUGHT either way and
+    # could never establish which one the guard reads. The label no longer contains the string.
+    if ! grep -qF -e "--security-opt apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
         bad "ci.yml does not name the profile the file declares ($aa_name) — its bubblewrap probe would test a profile nothing loads"
         aa_ok=0
     fi

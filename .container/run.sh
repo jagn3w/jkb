@@ -376,7 +376,7 @@ while IFS= read -r line; do ARGS+=("$line"); done < <(docker_args "$CONFIG" "$re
 #
 # INSIDE THE FINGERPRINT, deliberately: a container created without the profile is genuinely not
 # the same container as one created with it, and should be reported stale rather than reused.
-AA_PROFILE="$(dc_apparmor_profile "$here/apparmor-jkb-dev")"
+AA_PROFILE="$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")"
 aa_enabled() { # -> 0 if AppArmor mediates on this host
     [ -r /sys/module/apparmor/parameters/enabled ] \
         && grep -qi '^Y' /sys/module/apparmor/parameters/enabled
@@ -455,7 +455,17 @@ case "$state" in
         # missing AppArmor profile and says nothing about what to do. Silently dropping the
         # security-opt instead would start a container whose nested sandbox does not work and
         # whose verifier reports docker-default, which is the state this whole change ends.
-        if aa_enabled && ! docker run --rm --security-opt "apparmor=$AA_PROFILE" "$IMAGE" true >/dev/null 2>&1; then
+        # --entrypoint true, DELIBERATELY. Without it this runs the image's ENTRYPOINT, which
+        # refuses to boot when egress is unbounded -- and this probe passes no --cap-add NET_ADMIN,
+        # so the raise always fails and the probe always exits non-zero. It therefore reported "the
+        # profile is not loaded" on every AppArmor host, loaded or not, and the remedy it printed
+        # produced the identical failure: the create path was unusable on exactly the hosts the
+        # profile exists for. ci.yml's own bwrap probe had already learned this and says so in its
+        # comment ("the first version of this probe kept the image's entrypoint"); the lesson was
+        # not carried here. What is being asked is only whether DOCKER CAN APPLY THE PROFILE, so
+        # everything the entrypoint decides is an unrelated moving part.
+        if aa_enabled && ! docker run --rm --entrypoint true \
+             --security-opt "apparmor=$AA_PROFILE" "$IMAGE" >/dev/null 2>&1; then
             die "the AppArmor profile '$AA_PROFILE' is not loaded on this host, so the container's
   nested sandbox could not start. Load it (it needs root, and a container cannot do it for itself):
 
@@ -598,7 +608,11 @@ fi
 # recorded as the definite answer `setup_done=0` — so a container whose setup had completed was
 # told it had not and started the ten-minute toolchain rebuild. An answer that cannot be
 # distinguished from a transport failure is not an answer.
-setup_probe="$(in_container "$NAME" sh -c "test -e '$JKB_SETUP_MARKER' && echo done || echo missing" 2>/dev/null)" || setup_probe=""
+# NO `2>/dev/null` ON THIS CALL. `in_container` dumps `docker logs --tail 20` through
+# `container_died` when the container is gone, and redirecting the callee's stderr threw away the
+# one diagnostic that would have named the reason -- while the arm below went on to say the
+# container "is still running".
+setup_probe="$(in_container "$NAME" sh -c "test -e '$JKB_SETUP_MARKER' && echo done || echo missing")" || setup_probe=""
 case "$setup_probe" in
     done)    setup_done=1 ;;
     missing) setup_done=0 ;;
@@ -606,13 +620,20 @@ case "$setup_probe" in
              # that answer would start a ten-minute toolchain rebuild on a container that had
              # already been set up.
              #
-             # It does NOT call container_died here any more. `in_container` reports and exits when
-             # the container is gone, so reaching this point means the exec failed while the
-             # container was still running -- a transient daemon error, a paused container -- and
-             # announcing "not running" about a running container is the misattribution this whole
-             # seam exists to remove.
-             printf '\n\033[31merror:\033[0m could not ask %s whether setup completed, but it is\n' "$NAME" >&2
-             printf 'still running — so the exec failed for a reason this script has not established.\n' >&2
+             # THE QUESTION IS ASKED, NOT INFERRED. This used to assert the container "is still
+             # running" on the grounds that `in_container` reports and exits when it is gone -- but
+             # that call is inside a COMMAND SUBSTITUTION, so its `exit 1` ends only the subshell
+             # (its own comment says so). A container that died between `settle` and this probe --
+             # an OOM kill, an external `docker stop`, a daemon restart -- therefore reached this
+             # arm and was described as running. Announcing the wrong cause is the misattribution
+             # this seam exists to remove, and inferring it from a guard that cannot stop us is how
+             # it came back one level along.
+             if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then
+                 container_died "asking whether first-run setup had completed"
+                 exit 1
+             fi
+             printf '\n\033[31merror:\033[0m could not ask %s whether setup completed, and it IS\n' "$NAME" >&2
+             printf 'running — so the exec failed for a reason this script has not established.\n' >&2
              printf 'Try again; if it persists, attach by hand and look at the container.\n' >&2
              exit 1 ;;
 esac

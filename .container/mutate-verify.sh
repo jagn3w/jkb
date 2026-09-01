@@ -149,9 +149,15 @@ ACCEPT_ENV=(); [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && ACCEPT_ENV=(-e JKB_ACCEPT_
 AA_ARGS=()
 if [ -r /sys/module/apparmor/parameters/enabled ] \
    && grep -qi '^Y' /sys/module/apparmor/parameters/enabled; then
-    AA_ARGS=(--security-opt "apparmor=$(. "$REPO/.container/lib.sh"; dc_apparmor_profile "$REPO/.container/apparmor-jkb-dev")")
+    AA_ARGS=(--security-opt "apparmor=$(. "$REPO/.container/lib.sh"; dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")")
 fi
-HEALTHY=(--security-opt seccomp="$SEC" "${AA_ARGS[@]}" --cap-add=NET_ADMIN --user vscode "${ACCEPT_ENV[@]}" "${BASE[@]}")
+# ${A[@]+"${A[@]}"}, NOT "${A[@]}". Both arrays are legitimately empty -- AA_ARGS on any host
+# without AppArmor, ACCEPT_ENV whenever the acceptance is unset, i.e. every macOS run -- and
+# expanding an empty array under `set -u` is an UNBOUND VARIABLE ABORT on bash 3.2, which is what
+# /usr/bin/env bash is on macOS (3.2.57). So `--control`, the one sanctioned "is my container
+# healthy" command and the one run.sh's own refusals point at, died on this line naming nothing.
+# run.sh:147 already uses this idiom for exactly this reason.
+HEALTHY=(--security-opt seccomp="$SEC" ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 
 # One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
 # runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
@@ -277,6 +283,13 @@ run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
 # THIS MUTATION CANNOT DISCRIMINATE WHILE BUBBLEWRAP IS A KNOWN FAILURE, so on such a host it is
 # announced as skipped rather than run. It requires verify.sh to fail naming bubblewrap -- and if
 # the HEALTHY container already fails that same assertion, it would report CAUGHT whether or not
+# EACH SUBTRACTIVE MUTATION SUBTRACTS ONLY THE FLAG IT NAMES, which is why all three carry
+# $AA_ARGS. They spelled their reduced flag sets by hand and so also dropped the AppArmor profile
+# when it joined HEALTHY -- and on an AppArmor host removing the profile ALONE makes bubblewrap
+# fail, so "stock seccomp (nested sandbox cannot start)" reported CAUGHT whether or not the seccomp
+# profile was load-bearing. That is verbatim the reasoning fourteen lines below for SKIPping this
+# mutation under the acceptance ("a green line asserting the profile is load-bearing, on a host
+# where nothing tested it"), reintroduced one flag over in the same commit that wrote it.
 # removing the seccomp profile changed anything. That is the "guard that cannot fire" shape this
 # whole directory keeps producing, and reporting CAUGHT for it would be the worst version: a green
 # line asserting the profile is load-bearing, on a host where nothing tested it.
@@ -286,7 +299,7 @@ if [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ]; then
     printf '           it becomes meaningful again when that is fixed.\n'
 else
     run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
-        --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+        ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
 fi
 # NO NET_ADMIN, WITH THE OVERRIDE ARMED -- and the override is what makes this mutation
 # judgeable at all. Without it the entrypoint (correctly) refuses to boot an unbounded container,
@@ -301,9 +314,9 @@ fi
 # FAIL line.
 run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
     -e JKB_EGRESS_ACCEPT_UNFILTERED=1 \
-    --security-opt seccomp="$SEC" --user vscode "${BASE[@]}"
+    --security-opt seccomp="$SEC" ${AA_ARGS[@]+"${AA_ARGS[@]}"} --user vscode "${BASE[@]}"
 run "runs as root" "runs as a non-root user" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user root "${BASE[@]}"
+    --security-opt seccomp="$SEC" ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user root "${BASE[@]}"
 
 # The nested-bind exception must not be usable as a general one. A `--declare` naming anything
 # OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the
@@ -312,6 +325,24 @@ run "runs as root" "runs as a non-root user" \
 # the name, which it must do whether or not something is mounted there.
 run "a --declare outside every declared target" "is not inside any host BIND" \
     -e JKB_VERIFY_DECLARE=/host "${HEALTHY[@]}"
+
+# THE TWO AppArmor STATES THIS WHOLE CHANGE EXISTS TO DETECT, each one docker flag away from being
+# watchable and neither watched until now. `docker-default` is the silent state: the container
+# starts, the nested sandbox does not, and before this it was produced only as a SIDE EFFECT of the
+# stock-seccomp mutation above and never judged. `unconfined` is the other way to lose the boundary
+# -- it runs the sandbox with no profile at all, which is what the profile exists to avoid doing.
+# Skipped as a group on a host without AppArmor: there both arms produce the no-profile `note`, so
+# they would be MISSED for a fact about the machine.
+if [ ${#AA_ARGS[@]} -eq 0 ]; then
+    printf '  SKIPPED  the two AppArmor arms (no AppArmor on this host, so neither state is reachable)\n'
+else
+    run "apparmor=unconfined (the boundary is dropped entirely)" "AppArmor is not confining this container" \
+        --security-opt seccomp="$SEC" --security-opt apparmor=unconfined \
+        --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}"
+    run "no --security-opt apparmor (docker-default, the silent state)" "AppArmor is applying docker-default" \
+        --security-opt seccomp="$SEC" \
+        --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}"
+fi
 
 # Auto-memory sharing is a README promise whose entire mechanism is one symlink, which is exactly
 # the shape 3c exists for. Skip the linking step and the assertion must say so — otherwise the

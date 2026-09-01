@@ -415,7 +415,16 @@ run "every generator is deleted" "no generate-*.sh found"
 seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-out = s.replace("apparmor=jkb-dev", "apparmor=jkb-container")
+# ONLY THE FLAG OCCURRENCE, and the count is asserted. The guard reads
+# `--security-opt apparmor=<name>`; the string used to appear in the probe's LABEL too, so
+# rewriting every occurrence could not establish which one the guard was reading -- and the guard
+# was in fact satisfied by the label, leaving arm [3] free to measure `apparmor=unconfined` while
+# check-config.sh reported the profile correctly named. The label no longer carries the string, and
+# this assertion is what stops it coming back silently.
+n = s.count("apparmor=jkb-dev")
+assert n == 1, ("apparmor=jkb-dev appears %d times in ci.yml; this mutation can no longer "
+                "establish which occurrence the guard reads" % n)
+out = s.replace("--security-opt apparmor=jkb-dev", "--security-opt apparmor=jkb-container", 1)
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX

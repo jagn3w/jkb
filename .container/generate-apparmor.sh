@@ -178,6 +178,22 @@ profile = profile.replace(DENY_MOUNT + "\n", PATCHED + "\n")
 # branch dropped, which would otherwise produce a profile that loads and is quietly weaker.
 if "{{" in profile or "}}" in profile:
     sys.exit("rendered profile still contains template actions")
+# THE ACTION-PRODUCED LINES, ASSERTED BY NAME. The `missing` check below compares literal template
+# lines and SKIPS every line containing `{{` -- which is precisely the set of lines an action
+# produces, so it is blind by construction to all of them. Deleting render()'s `if` arm left all
+# seven self-test rows green and the profile carrying no `abi` line at all: nothing else covers it,
+# since check-config.sh's kept-restrictions list greps only `deny` lines. Losing the ABI
+# declaration is one of the five failures this generator exists to prevent -- without it AppArmor
+# 4.0 reads bare `network,` as EXCLUDING unix sockets, which is a functional break, not a weaker
+# policy. Each of these comes from an action and from nowhere else.
+for required in (f"abi <{DATA['Abi']}>,",
+                 DATA["Imports"][0],
+                 "  " + DATA["InnerImports"][0],
+                 f'profile "{DATA["Name"]}" flags=(attach_disconnected,mediate_deleted) {{'):
+    if required not in profile.splitlines():
+        sys.exit(f"the rendered profile is missing an action-produced line: {required!r} — the "
+                 f"renderer dropped a branch, and `missing` cannot see it because it skips every "
+                 f"template line containing an action")
 missing = [ln for ln in tpl.splitlines()
            if "{{" not in ln and ln.strip() and ln != DENY_MOUNT and ln not in profile.splitlines()]
 if missing:

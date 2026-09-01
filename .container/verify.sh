@@ -260,7 +260,26 @@ fi
 # So this asserts the profile by NAME, and then asserts that a restriction the relaxed profile is
 # supposed to have KEPT still bites. Reading the name alone would pass for a profile called
 # jkb-dev that had been edited into permitting everything -- the name is a label, not the policy.
-aa_profile="$(cat /proc/self/attr/current 2>/dev/null | sed 's/ (.*//')"
+# WHICH LSM IS SPEAKING, established before the label is interpreted as an AppArmor profile name.
+# `/proc/self/attr/current` is the GENERIC LSM interface: on Fedora/RHEL it returns an SELinux
+# context like `system_u:system_r:container_t:s0:c103,c771`, which matched no arm below and FAILed
+# with "an unexpected AppArmor profile is in force" -- a confident wrong verdict on a correctly
+# configured container, after which run.sh declines to open a window. run.sh's own `aa_enabled`
+# already asks this question before deciding whether to pass the flag; the verifier has to ask it
+# too or the two disagree about the same host.
+aa_mediates() {
+    [ -r /sys/module/apparmor/parameters/enabled ] \
+        && grep -qi '^Y' /sys/module/apparmor/parameters/enabled
+}
+# Prefer the AppArmor-specific file where the kernel offers it: it cannot return another LSM's
+# label, so there is nothing to misread.
+if [ -r /proc/self/attr/apparmor/current ]; then
+    aa_profile="$(sed 's/ (.*//' /proc/self/attr/apparmor/current 2>/dev/null)"
+elif aa_mediates; then
+    aa_profile="$(sed 's/ (.*//' /proc/self/attr/current 2>/dev/null)"
+else
+    aa_profile="__no_apparmor__"
+fi
 # Derived from the profile file in the checkout, never a literal here: this comparison is the
 # whole assertion, and a name that drifted from the file would make it check the wrong thing.
 . "$(dirname "$0")/lib.sh" 2>/dev/null || true
@@ -274,20 +293,41 @@ if [ -z "$aa_want" ]; then
     bad "cannot read the profile name from .container/apparmor-jkb-dev — every AppArmor assertion below compares against it, and run.sh passes it to \`docker run --security-opt apparmor=\`"
 fi
 case "$aa_profile" in
+    __no_apparmor__)
+                   note "AppArmor is not the mediating LSM on this host (SELinux, or none) — the container correctly declares no AppArmor profile, and there is nothing here to check" ;;
     "")            note "AppArmor is not mediating this container (no profile) — expected on a host without AppArmor, e.g. Docker Desktop for macOS" ;;
     unconfined)    bad "AppArmor is not confining this container (unconfined) — the container ships a profile that keeps every docker-default restriction except \`mount\`; running unconfined discards all of them" ;;
     docker-default)
                    bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile: sudo apparmor_parser -r -W .container/apparmor-jkb-dev" ;;
     "$aa_want")
-        # THE POLICY, NOT THE LABEL. sysrq-trigger is denied `rwklx` by docker-default and this
-        # profile keeps that line verbatim, so a write that SUCCEEDS means the profile in force is
-        # not the one in the repo. Deliberately a path the container has no reason to touch, and
-        # one whose denial comes from AppArmor rather than from file permissions: it is
-        # root-writable, and this container is not root, so the check also states what it proves.
-        if printf '' > /proc/sysrq-trigger 2>/dev/null; then
-            bad "the AppArmor profile $aa_want is in force but a docker-default restriction it is supposed to keep (deny /proc/sysrq-trigger) did not apply — the loaded profile is not the one in this repo"
+        # THE POLICY, NOT THE LABEL -- a name is a label, and a profile called jkb-dev that had
+        # been edited into permitting everything would pass a name check.
+        #
+        # THE PREVIOUS PROBE COULD NOT FIRE, and its own comment contained the refutation: it wrote
+        # to /proc/sysrq-trigger, "root-writable, and this container is not root". A write that is
+        # refused by the permission bits is refused whether or not AppArmor is loaded, so the
+        # strongest assurance in this file was printed for a gutted profile. The rule the whole
+        # directory keeps relearning: assert on a signal that DISCRIMINATES, and a denial only
+        # discriminates when nothing else could have produced it.
+        #
+        # /proc/kcore does. Docker masks it by bind-mounting /dev/null over it, so under a
+        # permissive profile the read SUCCEEDS (0 bytes from a world-readable char device), while
+        # docker-default's `deny @{PROC}/kcore rwklx` -- which this profile keeps verbatim --
+        # refuses it. Two things are established before the answer is believed:
+        #
+        #   the mask   `-c` says it is the char device runc substituted. Without the mask (a
+        #              `systempaths=unconfined` container) the real /proc/kcore is 0400 root:root
+        #              and DAC would refuse it, which is the old defect exactly.
+        #   a control  a read that must succeed. If reads are failing wholesale the denial says
+        #              nothing about policy, so that is reported as unestablished, not as a pass.
+        if [ ! -c /proc/kcore ]; then
+            note "cannot check the profile's POLICY: /proc/kcore is not the masked char device this probe needs, so a denial could come from the permission bits rather than from AppArmor ($aa_want is in force by name)"
+        elif ! head -c1 /proc/self/cmdline >/dev/null 2>&1; then
+            note "cannot check the profile's POLICY: the control read failed too, so a denial here would establish nothing ($aa_want is in force by name)"
+        elif head -c1 /proc/kcore >/dev/null 2>&1; then
+            bad "the AppArmor profile $aa_want is in force but a docker-default restriction it is supposed to keep (deny @{PROC}/kcore) did not apply — /proc/kcore was readable, so the loaded profile is not the one in this repo"
         else
-            ok "AppArmor is applying the container's own profile ($aa_want), and the restrictions it keeps still apply"
+            ok "AppArmor is applying the container's own profile ($aa_want), and a restriction it keeps (deny @{PROC}/kcore) still bites while a control read succeeds"
         fi ;;
     *)             bad "an unexpected AppArmor profile is in force ($aa_profile) — this container declares $aa_want" ;;
 esac

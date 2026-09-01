@@ -39,10 +39,20 @@ say() { printf '[firewall] %s\n' "$*"; }
 # and use this for the explanation, and a record whose state disagrees with the probe is reported as
 # drift rather than obeyed.
 #
+# THE PATH COMES FROM THE LIBRARY, which is sourced above and where both READERS get it. This used
+# to be a second `${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}` declared here -- and the
+# check-config guard that compared the spellings was deleted when egress-lib.sh was introduced, on
+# the stated premise that there was now only one. There were two. Change the compiled-in default in
+# the library alone and the raise would write the old file while `verdict_field` read the new one:
+# the entrypoint gets an empty reason and prints "(the raise left no reason)" on every refusal,
+# discarding the DNS remedy this file's own self-test exists to protect, with every static and
+# mutation guard still green. They shared the JKB_EGRESS_VERDICT override, which is why only a
+# change to the default would have split them -- and why nothing noticed.
+#
 # Overridable ONLY so --self-test can point it somewhere writable. It cannot weaken anything: sudo
 # runs with env_reset, so the sudoers-granted path never sees a caller's value, and a non-root run
 # that supplies one cannot write the real file anyway (it is root-owned).
-VERDICT="${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}"
+VERDICT="$VERDICT_PATH"
 
 # NEWLINES ARE FLATTENED HERE, which is the one place it can be enforced (D51.8). Every reason on
 # the paths that matter is multi-line, and both readers parse a field with `sed | head -1` — so the

@@ -242,9 +242,18 @@ jobs:
           probe() { # probe <label> <extra docker args...>
             local label="$1"; shift
             local out
+            # `|| true`, because GitHub runs an unqualified `run:` block as `bash -e {0}` and a
+            # BARE assignment from a failing command substitution is a simple command -- errexit
+            # fires and the step dies. The inner bwrap invocation always exits 0 (it is `&&/||`),
+            # so the only way this returns non-zero is docker refusing to START the container,
+            # which is exactly what arm [3] does when the profile is not loaded. The step would
+            # then abort after arms [1] and [2], never printing the third arm's message, and turn
+            # the job red for a fact about the machine -- from a step that is purely diagnostic.
+            # The `*)` arm below exists precisely for that case and was unreachable for its most
+            # likely cause.
             out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c \
                     'bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
-                       && echo BWRAP-OK || echo BWRAP-FAILED' 2>&1)"
+                       && echo BWRAP-OK || echo BWRAP-FAILED' 2>&1)" || true
             # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
             # whole lesson of the previous version: "no BWRAP-OK in the output" and "the probe
             # never executed" are different facts and must not print the same way.
@@ -261,7 +270,7 @@ jobs:
           # The SHIPPED remedy, not `unconfined`: that is what run.sh passes and what has to work.
           # Arm [2] is the broken state (docker-default), so [2] FAILED with [3] OK is the fix
           # demonstrated rather than argued.
-          probe "[3] + apparmor=jkb-dev" --user vscode --security-opt seccomp=$SEC \
+          probe "[3] + the container's own AppArmor profile" --user vscode --security-opt seccomp=$SEC \
                                          --security-opt apparmor=jkb-dev
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
