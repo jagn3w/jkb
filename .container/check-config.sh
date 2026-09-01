@@ -446,32 +446,93 @@ else
         grep -E '^[[:space:]]*deny[[:space:]]' "$aa_file" | grep -qF -e "$r" \
             || { bad "$aa_file no longer denies $r — it is supposed to be docker-default with ONE rule relaxed, not a permissive profile wearing its name"; aa_ok=0; }
     done
-    # THE PROFILE IS GENERATED, AND SAYS SO. The first version was transcribed by hand from memory
-    # of moby's template and was missing three deny rules, the ABI declaration, and the runc/crun
-    # signal peers -- none of which is visible by reading the file, and all of which passed the
-    # checks above because those were written from the same memory. What actually closes that is
-    # `generate-apparmor.sh` plus a CI step re-running it and requiring no diff; these assertions
-    # are what stop the file quietly reverting to a hand-maintained one between those runs.
-    aa_gen="$here/generate-apparmor.sh"
-    [ -x "$aa_gen" ] || { bad "$aa_gen is missing or not executable — the AppArmor profile would go back to being hand-maintained, which is how it lost three deny rules"; aa_ok=0; }
-    grep -qF -e 'GENERATED FILE -- DO NOT EDIT' "$aa_file" \
-        || { bad "$aa_file does not declare itself generated — a hand-edit would read as ordinary content"; aa_ok=0; }
-    aa_src="$(sed -n 's/^# Source: //p' "$aa_file" | head -1)"
-    if [ -z "$aa_src" ]; then
-        bad "$aa_file records no upstream Source — its provenance is unverifiable and CI cannot tell drift from an edit"
-        aa_ok=0
-    elif ! grep -qF -e "$aa_src" "$aa_gen"; then
-        bad "$aa_file was generated from $aa_src but $aa_gen no longer fetches that URL — the CI drift check would compare against a different upstream"
-        aa_ok=0
-    fi
-    grep -qE '^# sha256 of that file when this was generated: [0-9a-f]{64}$' "$aa_file" \
-        || { bad "$aa_file records no upstream sha256 — a reviewer cannot tell which upstream revision it came from"; aa_ok=0; }
+    # (That the profile is GENERATED rather than hand-maintained is asserted below, by the derived
+    # check over every generator -- not here, where it would be a second rule about one of them.)
     # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
     if ! grep -qF -e "apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
         bad "ci.yml does not name the profile the file declares ($aa_name) — its bubblewrap probe would test a profile nothing loads"
         aa_ok=0
     fi
     [ "$aa_ok" -eq 1 ] && ok "the AppArmor profile is docker-default with only \`mount\` relaxed ($aa_name)"
+fi
+
+# EVERY VENDORED ARTIFACT IS GENERATED, AND CARRIES WHAT THE DRIFT CHECK NEEDS.
+#
+# `.container/` vendors files derived from moby's upstream policies. Vendoring is deliberate (the
+# policy is reviewable in a diff, and a build works offline) but a vendored file can become a lie
+# two ways -- hand-edited, or upstream moved -- and neither is visible by reading it. The AppArmor
+# profile was first TRANSCRIBED BY HAND and was missing three deny rules, the ABI declaration and
+# the runc/crun signal peers; every static guard passed, because every static guard was written
+# from the same understanding as the file.
+#
+# What actually closes that is check-drift.sh, which regenerates from upstream and compares -- and
+# it needs the network, so it runs in CI. THIS is the offline half: the preconditions that check
+# has to have, asserted so a generator or artifact cannot quietly stop satisfying them between CI
+# runs. DERIVED OVER THE GENERATORS, so a third one joins both checks by existing rather than by
+# somebody remembering to add it to a list.
+# NOTHING HERE EXECUTES A GENERATOR. The first version asked each one `--print-target`, which is
+# how check-drift.sh discovers artifacts -- and that is right for a check that is about to run them
+# anyway, and wrong here. This file runs 61 times inside mutate-config.sh, and a mutation that
+# leaves the flag's grep satisfied but its branch broken would make the generator RUN: a network
+# fetch and a rewritten policy file, as a side effect of a static check. It timed out on the first
+# try. Both halves are derived from the text instead, and pairing is by recorded URL rather than by
+# asking a generator which file is its.
+gen_ok=1
+gen_n=0
+
+for gen in "$here"/generate-*.sh; do
+    [ -e "$gen" ] || continue
+    gen_n=$((gen_n+1))
+    gname="$(basename "$gen")"
+    [ -x "$gen" ] || { bad "$gname is not executable — nothing can regenerate its artifact, so drift in it is undetectable"; gen_ok=0; }
+    grep -q -- '--print-target' "$gen" \
+        || { bad "$gname does not support --print-target — check-drift.sh discovers artifacts by asking, so this generator sits outside the drift check while looking inside it"; gen_ok=0; }
+    gurl="$(sed -n 's|^url="\([^"]*\)".*|\1|p' "$gen" | head -1)" || gurl=""
+    # PAIRED FROM THE GENERATOR, which is the authority on what it writes. The first version found
+    # artifacts by scanning .container/* for the "GENERATED FILE" marker -- and matched THIS FILE
+    # and mutate-config.sh, which both contain that string in an assertion and a mutation. Same
+    # defect as grepping the whole AppArmor profile and matching its own header: a guard that reads
+    # a marker anywhere in a file reads its own description of the marker.
+    gout="$(sed -n 's|^out="\$here/\([^"]*\)".*|\1|p' "$gen" | head -1)" || gout=""
+    if [ -z "$gurl" ] || [ -z "$gout" ]; then
+        bad "$gname does not declare both \`url=\` and \`out=\"\$here/...\"\` — its upstream and its artifact cannot be paired without running it"
+        gen_ok=0; continue
+    fi
+    art="$here/$gout"
+    if [ ! -f "$art" ]; then
+        bad "$gname writes $gout, which does not exist — the drift check would have nothing to compare"; gen_ok=0; continue
+    fi
+    grep -qF -e 'GENERATED FILE -- DO NOT EDIT' "$art" \
+        || { bad "$gout does not declare itself generated — a hand-edit would read as ordinary content"; gen_ok=0; }
+    # The digest is what lets the drift check tell "upstream moved" from "somebody edited this",
+    # which are repaired by looking at different diffs. Without it a difference is unattributable.
+    grep -qE 'upstream-sha256: [0-9a-f]{64}' "$art" \
+        || { bad "$gout records no upstream-sha256 — a difference from its generator could not be attributed to upstream or to a local edit"; gen_ok=0; }
+    grep -qF -e "Source: $gurl" "$art" \
+        || { bad "$gout does not record \`Source: $gurl\`, the URL $gname fetches — the drift check could not tell whose upstream it came from"; gen_ok=0; }
+done
+
+# AND NOTHING GENERATED IS ORPHANED. The loop above is over GENERATORS, so deleting one leaves its
+# artifact in the tree with nothing checking it -- silently, because a smaller set still passes.
+# Counting from the artifact side closes that. `*.sh` is excluded: a generated script is not a
+# thing in this design, and both checkers contain the marker string in their own assertions, so
+# scanning them found four "artifacts" and two generators the first time this was written.
+art_n=0
+for art in "$here"/*; do
+    [ -f "$art" ] || continue
+    case "$art" in *.sh) continue ;; esac
+    grep -qF -e 'GENERATED FILE -- DO NOT EDIT' "$art" 2>/dev/null && art_n=$((art_n+1))
+done
+if [ "$art_n" -ne "$gen_n" ]; then
+    bad "$gen_n generator(s) but $art_n generated artifact(s) in $here — one of them is outside the drift check"
+    gen_ok=0
+fi
+# A loop that iterated over nothing must not report success — `generate-*.sh` matching no files is
+# the state in which this check is most likely to be believed and least entitled to be.
+if [ "$gen_n" -eq 0 ]; then
+    bad "no generate-*.sh found in $here — the vendored policies would be hand-maintained with nothing checking them"
+elif [ "$gen_ok" -eq 1 ]; then
+    ok "every vendored artifact declares itself generated and records its upstream ($gen_n generator(s))"
 fi
 
 # THE TWO SELF-TEST LISTS AGREE (D51.9). scripts/check.sh and .github/workflows/ci.yml each

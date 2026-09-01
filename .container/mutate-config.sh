@@ -42,9 +42,21 @@ seed() {
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
     cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
-    # The manifest is what lets mutated() see a DELETION. Taken here rather than derived from a
-    # list, so it still covers a file added to seed() tomorrow.
-    find "$work/t" -type f | sort > "$work/manifest"
+    # The manifest is what lets mutated() see a DELETION or a MODE CHANGE. Taken here rather than
+    # derived from a list, so it still covers a file added to seed() tomorrow.
+    tree_manifest > "$work/manifest"
+}
+
+# One line per file: its executability and its path. Executability is in here because `chmod -x` is
+# a mutation that changes no BYTES -- the second blind spot found in this guard, after deletion,
+# and by the same method: writing the mutation and watching a correct assertion be called a no-op.
+# Only the x bit, not the full mode: it is portable (BSD and GNU `stat` disagree on flags) and it
+# is the only mode any mutation here changes.
+tree_manifest() {
+    local f
+    find "$work/t" -type f | sort | while IFS= read -r f; do
+        if [ -x "$f" ]; then printf 'x %s\n' "$f"; else printf -- '- %s\n' "$f"; fi
+    done
 }
 
 DC() { printf '%s' "$work/t/.container/container.json"; }
@@ -71,9 +83,10 @@ EXPECTS=()
 # deletion mutation is reported as changing nothing. Found by writing the first such mutation
 # (removing generate-apparmor.sh) and watching a correct guard be called a no-op.
 mutated() { # mutated -> 0 if the seeded tree differs from what seed() laid down, or from the repo
-    local f
-    find "$work/t" -type f | sort | cmp -s - "$work/manifest" || return 0
-    while IFS= read -r f; do
+    local line f
+    tree_manifest | cmp -s - "$work/manifest" || return 0
+    while IFS= read -r line; do
+        f="${line#? }"
         cmp -s "$f" "$repo/${f#"$work/t/"}" || return 0
     done < "$work/manifest"
     return 1
@@ -325,9 +338,10 @@ open(p, 'w').write(out)
 PYX
 run "the profile declares no name" "declares no profile"
 
-# THE PROFILE IS GENERATED, AND THE THREE THINGS THAT SAY SO. Each of these is what a return to a
-# hand-maintained profile looks like, which is the state that lost three deny rules, the ABI
-# declaration and the runc/crun signal peers without any check noticing.
+# THE VENDORED ARTIFACTS ARE GENERATED, one mutation per precondition the drift check needs. A
+# return to a hand-maintained policy is the state that lost three deny rules, the ABI declaration
+# and the runc/crun signal peers without any check noticing -- and the drift check that WOULD have
+# noticed runs in CI, so these are what stop the tree drifting out from under it between runs.
 seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -335,19 +349,56 @@ out = s.replace("# GENERATED FILE -- DO NOT EDIT.", "# Hand-maintained profile."
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
-run "the profile stops declaring itself generated" "does not declare itself generated"
+run "an artifact stops declaring itself generated" "does not declare itself generated"
 
 seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
-out = re.sub(r'^# Source: .*$', '# Source: https://example.invalid/template.go', s, count=1, flags=re.M)
+out = re.sub(r'^# upstream-sha256: [0-9a-f]{64}$', '# upstream-sha256: unknown', s, count=1, flags=re.M)
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
-run "the profile's recorded upstream is not the one the generator fetches" "no longer fetches that URL"
+run "an artifact stops recording its upstream digest" "records no upstream-sha256"
+
+seed; python3 - "$work/t/.container/generate-apparmor.sh" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^url="[^"]*"', 'url="https://example.invalid/template.go"', s, count=1, flags=re.M)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "a generator fetches a different upstream than its artifact records" "the URL generate-apparmor.sh fetches"
+
+seed; python3 - "$work/t/.container/generate-apparmor.sh" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^out="\$here/[^"]*"', 'out="/tmp/wherever"', s, count=1, flags=re.M)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "a generator stops declaring where it writes" "cannot be paired without running it"
+
+seed; python3 - "$work/t/.container/generate-apparmor.sh" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^if \[ "\$\{1:-\}" = --print-target \].*\n', '', s, count=1, flags=re.M)
+out = re.sub(r'^# check-drift\.sh asks every generator.*\n(?:# .*\n)*', '', out, count=1, flags=re.M)
+assert 'print-target' not in out, "the flag is still mentioned, so the text check would still pass"
+open(p, 'w').write(out)
+PYX
+run "a generator drops --print-target, leaving it outside the drift check" "does not support --print-target"
+
+seed; chmod -x "$work/t/.container/generate-apparmor.sh"
+run "a generator is not executable" "is not executable"
+
+seed; rm -f "$work/t/.container/apparmor-jkb-dev"
+run "a generator's artifact is missing" "which does not exist"
 
 seed; rm -f "$work/t/.container/generate-apparmor.sh"
-run "the generator is deleted, so the profile goes back to hand-maintained" "is missing or not executable"
+run "a generator is deleted, orphaning its artifact" "outside the drift check"
+
+seed; bash -c 'rm -f "$1"/generate-*.sh' _ "$work/t/.container"
+run "every generator is deleted" "no generate-*.sh found"
 
 seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
 import sys
@@ -624,7 +675,7 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=59
+PINNED_BAD_SITES=63
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

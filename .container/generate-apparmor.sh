@@ -32,6 +32,11 @@ out="$here/apparmor-jkb-dev"
 # moby/moby's own profiles/apparmor/template.go now 404s.
 url="https://raw.githubusercontent.com/moby/profiles/main/apparmor/template.go"
 
+# check-drift.sh asks every generator what it writes rather than carrying a list of artifacts that
+# has to be kept in step with the set of generators. A generator added tomorrow joins the drift
+# check by existing.
+if [ "${1:-}" = --print-target ]; then printf '%s\n' "$out"; exit 0; fi
+
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 curl -fsSL -o "$tmp" "$url"
@@ -172,7 +177,7 @@ HEADER = f"""\
 #
 # GENERATED FILE -- DO NOT EDIT. Run .container/generate-apparmor.sh to refresh it.
 # Source: {url}
-# sha256 of that file when this was generated: {digest}
+# upstream-sha256: {digest}
 #
 # This is Docker's own `docker-default` with EXACTLY ONE rule changed: `deny mount,` becomes
 # `mount,` (the line marked PATCHED below). Everything else is rendered verbatim from moby's

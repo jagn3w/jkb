@@ -114,6 +114,13 @@ else
 "$(dirname "$0")/../.container/verify.sh" --self-test
 fi
 
+# ...and the drift check's decision, which is pure. The check ITSELF needs the network — it fetches
+# each generator's upstream and regenerates — so it runs in CI, not here: a gate that only works
+# online is one that gets skipped. What runs here is the part that decides whether a difference is
+# upstream drift, a hand-edit, or unattributable, plus the digest extractor against both artifact
+# formats it has to read. Deliberately outside the jq group: it reads no container.json.
+"$(dirname "$0")/../.container/check-drift.sh" --self-test
+
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are
 # exercised against a scratch HOME. No container, no Docker, no network — and deliberately OUTSIDE

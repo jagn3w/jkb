@@ -2,7 +2,7 @@
 #
 # GENERATED FILE -- DO NOT EDIT. Run .container/generate-apparmor.sh to refresh it.
 # Source: https://raw.githubusercontent.com/moby/profiles/main/apparmor/template.go
-# sha256 of that file when this was generated: cce1c730656ad73cb04b19bf25caa2351732a00e04a06eeaf3010105e1ba6a57
+# upstream-sha256: cce1c730656ad73cb04b19bf25caa2351732a00e04a06eeaf3010105e1ba6a57
 #
 # This is Docker's own `docker-default` with EXACTLY ONE rule changed: `deny mount,` becomes
 # `mount,` (the line marked PATCHED below). Everything else is rendered verbatim from moby's
