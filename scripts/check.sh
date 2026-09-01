@@ -121,6 +121,13 @@ fi
 # formats it has to read. Deliberately outside the jq group: it reads no container.json.
 "$(dirname "$0")/../.container/check-drift.sh" --self-test
 
+# ...and the AppArmor generator's own refusals, driven with fixture templates instead of the
+# network. These are what stop a patch silently no-opping against changed upstream -- the exact
+# failure check-config.sh already names for the seccomp profile -- and until this existed NOTHING
+# exercised them: check-drift.sh compares our output against our own output, so a bug in the
+# render/patch logic is invisible to it, and what it produces is a security policy.
+"$(dirname "$0")/../.container/generate-apparmor.sh" --self-test
+
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are
 # exercised against a scratch HOME. No container, no Docker, no network — and deliberately OUTSIDE

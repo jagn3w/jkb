@@ -111,6 +111,7 @@ jobs:
           # two lists — the exact drift that check exists to catch, found on its first run.
           ./scripts/link-claude-memory.sh --self-test
           ./.container/check-drift.sh --self-test
+          ./.container/generate-apparmor.sh --self-test
 
       # EVERY VENDORED POLICY IS REPRODUCIBLE FROM UPSTREAM. This is the only check that can see a
       # bad transcription: every other one is written from the same understanding as the file, so
@@ -146,19 +147,28 @@ jobs:
   # and `--security-opt seccomp=<file>` are ordinary docker-CLI flags here, and the bwrap-nesting
   # measurement this container is built around was taken on Ubuntu/Docker, which is what this is.
   #
-  # OPEN QUESTION THIS JOB EXISTS TO SETTLE (D52.2, tasks 1.3): whether bubblewrap can create its
-  # namespaces under a runner's kernel — verify.sh asserts it directly. If it cannot, the honest
-  # response is to skip THAT assertion by name and say so, not to weaken the job; everything else
-  # here (the firewall raise, ~24 verify.sh assertions, every mutation) is exercised regardless.
-  # Nothing has been deleted from the static layer against this job, and nothing will be until it
-  # has been observed green.
+  # SETTLED (D52.2/D52.13, task 1.3): bubblewrap DOES start, and this job is what established it.
+  # It took three runs, and each failure named the next thing:
+  #   1. docker-default (enforce)  →  Failed to make / slave        (AppArmor denies `mount`)
+  #   2. jkb-dev (enforce)         →  pivot_root: Permission denied (a rule type of its own)
+  #   3. jkb-dev (enforce)         →  green
+  # Run 2 is also what ruled out the kernel-policy explanation: the host sets
+  # apparmor_restrict_unprivileged_userns=1, and had that been transitioning bwrap into a restricted
+  # profile the MS_SLAVE mount would still have been refused. It was not, so the profile applies
+  # INSIDE the user namespace. The nested sandbox is therefore reachable on a stock Ubuntu/Docker
+  # host with the profile loaded — which was the open question this whole change exists for.
+  #
+  # verify.sh asserts it directly and JKB_ACCEPT_NO_BWRAP is not set, so a regression here fails the
+  # build rather than being narrated. The static layer has now been observed green against this job,
+  # which is the precondition D52.6 attaches to deleting any of it — a separate piece of work.
   container:
     runs-on: ubuntu-latest
-    # JKB_ACCEPT_NO_BWRAP IS DELIBERATELY NOT SET ANY MORE. It parked the bubblewrap failure while
-    # the cause was unknown; the cause is now established (docker-default denies `mount`) and the
-    # container ships a profile that fixes it, so a bubblewrap failure is once again a real failure
-    # and must fail the build. Keeping the acceptance would mean the remedy could silently not work.
-    # The stock-seccomp mutation becomes meaningful again with it.
+    # JKB_ACCEPT_NO_BWRAP IS DELIBERATELY NOT SET. It parked the bubblewrap failure while the cause
+    # was unknown; the cause is established (docker-default denies `mount`, and names no pivot_root
+    # rule at all), the container ships a profile that fixes it, and the job is green with it. So a
+    # bubblewrap failure is a real failure again and must fail the build -- with the acceptance set,
+    # the remedy could silently stop working. The stock-seccomp mutation is meaningful again too:
+    # it was CAUGHT for the wrong reason while the healthy container failed that same assertion.
 
     # The build is minutes and the harness starts ~13 containers; a wedged docker pull would
     # otherwise sit for the runner's six-hour default. Generous enough that a slow-but-working
@@ -214,7 +224,7 @@ jobs:
       # restricts unprivileged user namespaces by default, and the design's own measurement was
       # taken on 26.04. Reported, never acted on automatically: `apparmor=unconfined` is a real
       # weakening of the container and is a decision, not a fix to apply because a probe suggested it.
-      - name: Why bubblewrap can or cannot start (settles task 1.3)
+      - name: Why bubblewrap can or cannot start (the discriminator, task 1.3)
         if: always()
         run: |
           echo "--- runner facts ---"; uname -a

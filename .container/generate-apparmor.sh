@@ -38,13 +38,13 @@ url="https://raw.githubusercontent.com/moby/profiles/main/apparmor/template.go"
 # check by existing.
 if [ "${1:-}" = --print-target ]; then printf '%s\n' "$out"; exit 0; fi
 
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
-curl -fsSL -o "$tmp" "$url"
-grep -q 'baseTemplate' "$tmp" || {
-    echo "upstream file has no baseTemplate (moved again?): $url" >&2; exit 1; }
-
-python3 - "$tmp" "$out" "$url" <<'PY'
+# The render/patch/verify half, factored out so --self-test can drive it with fixture templates
+# instead of the network. Everything that can REFUSE lives in here, and until this was callable
+# none of those refusals was exercised by anything -- the drift check compares our output against
+# our own output, so a bug in this logic is invisible to it, and what it produces is a security
+# policy.
+render_profile() { # render_profile <template.go> <out> <url>
+    python3 - "$1" "$2" "$3" <<'PY'
 import hashlib, re, sys
 
 src, dst, url = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -244,3 +244,99 @@ print(f"wrote {dst}: profile {DATA['Name']}, {kept} deny rules kept, {relaxed} r
 print(f"  from {url}")
 print(f"  upstream sha256 {digest}")
 PY
+}
+
+if [ "${1:-}" = --self-test ]; then
+    t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
+    fails=0
+    # Fixtures are WHOLE Go files, so the backtick-literal extraction is exercised too rather than
+    # bypassed by handing the renderer a bare template string.
+    python3 - "$t" <<'FIX'
+import os, sys
+d = sys.argv[1]
+GOOD = """{{if .Abi}}abi <{{.Abi}}>,
+{{- end}}
+{{range $value := .Imports}}
+{{$value}}
+{{- end}}
+
+profile "{{.Name}}" flags=(attach_disconnected,mediate_deleted) {
+{{- range $value := .InnerImports}}
+  {{$value}}
+{{- end}}
+  umount,
+  signal (receive) peer="{{.DaemonProfile}}",
+  deny @{PROC}/sysrq-trigger rwklx,
+
+  deny mount,
+}"""
+V = {
+    "good":   GOOD,
+    "nodeny": GOOD.replace("  deny mount,", "  # upstream stopped denying mount"),
+    "twice":  GOOD.replace("  deny mount,", "  deny mount,\n  deny mount,"),
+    "pivot":  GOOD.replace("  umount,", "  umount,\n  pivot_root,"),
+    "action": GOOD.replace("  umount,", '  {{template "partial"}}'),
+    "field":  GOOD.replace("{{.Name}}", "{{.Nope}}"),
+}
+for name, body in V.items():
+    with open(os.path.join(d, name + ".go"), "w") as f:
+        f.write("package apparmor\n\nconst baseTemplate = `" + body + "`\n")
+FIX
+
+    expect() { # expect <label> <fixture> <ok|refuse> [substring the refusal must contain]
+        # `|| rc=$?`, never a bare `out="$(...)"; rc=$?`. Every fixture below is EXPECTED to make
+        # render_profile exit non-zero, and a bare assignment from a failing command substitution
+        # is a simple command in no conditional context -- so `errexit` fires and the self-test
+        # dies after its two passing rows, reporting nothing about the five refusals it exists to
+        # exercise. Written here after fixing the identical bug in check-drift.sh the same day.
+        local out rc=0
+        out="$(render_profile "$t/$2.go" "$t/$2.out" "https://fixture.invalid/x" 2>&1)" || rc=$?
+        if [ "$3" = ok ]; then
+            if [ "$rc" -eq 0 ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+            else printf '  \033[31mFAIL\033[0m %s (refused: %s)\n' "$1" "$out"; fails=$((fails+1)); fi
+        elif [ "$rc" -eq 0 ]; then
+            printf '  \033[31mFAIL\033[0m %s — it was ACCEPTED, so the refusal cannot fire\n' "$1"; fails=$((fails+1))
+        elif grep -qF -e "$4" <<<"$out"; then
+            printf '  \033[32mok\033[0m   %s\n' "$1"
+        else
+            printf '  \033[31mFAIL\033[0m %s — refused for the wrong reason: %s\n' "$1" "$out"; fails=$((fails+1))
+        fi
+    }
+
+    expect "a well-formed template renders and patches" good ok
+
+    # What the patch is FOR, asserted against the generator's own output rather than only in
+    # check-config.sh: a profile is answerable for carrying both rules and for keeping the rest.
+    if [ -f "$t/good.out" ]; then
+        bad_out=0
+        for want in '^  mount,$' '^  pivot_root,$'; do
+            grep -qE "$want" "$t/good.out" || { printf '  \033[31mFAIL\033[0m the rendered profile has no %s\n' "$want"; bad_out=1; }
+        done
+        grep -qE '^[[:space:]]*deny[[:space:]]+mount,' "$t/good.out" \
+            && { printf '  \033[31mFAIL\033[0m the deny survived the patch\n'; bad_out=1; }
+        grep -qF -e 'deny @{PROC}/sysrq-trigger rwklx,' "$t/good.out" \
+            || { printf '  \033[31mFAIL\033[0m an unrelated upstream rule was lost in the render\n'; bad_out=1; }
+        if [ "$bad_out" -eq 0 ]; then
+            printf '  \033[32mok\033[0m   the output carries mount and pivot_root, drops the deny, keeps the rest\n'
+        else fails=$((fails+1)); fi
+    fi
+
+    # A patch that no-ops against changed upstream is the failure check-config.sh already names for
+    # the seccomp profile: a policy that parses, applies, and leaves the sandbox unable to start.
+    expect "a template with no \`deny mount,\` is refused" nodeny refuse "found 0"
+    expect "a template with two of them is refused" twice refuse "found 2"
+    expect "upstream naming pivot_root itself is refused, not doubled" pivot refuse "re-derive the patch"
+    expect "an unsupported action is refused, not rendered as nothing" action refuse "does not implement"
+    expect "a field this script supplies no value for is refused" field refuse "supplies no value"
+
+    if [ "$fails" -eq 0 ]; then printf '\033[32mgenerate-apparmor self-test passed\033[0m\n'; exit 0; fi
+    printf '\033[31mgenerate-apparmor self-test: %s failed\033[0m\n' "$fails"; exit 1
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL -o "$tmp" "$url"
+grep -q 'baseTemplate' "$tmp" || {
+    echo "upstream file has no baseTemplate (moved again?): $url" >&2; exit 1; }
+
+render_profile "$tmp" "$out" "$url"
