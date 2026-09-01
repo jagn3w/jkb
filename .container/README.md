@@ -50,20 +50,215 @@ a failure is attributable to the container profile and not the kernel.
 ## Using it
 
 Needs a container runtime on the host (Docker Desktop, OrbStack, colima, or Apple's `container`),
-which macOS does not ship. Then "Reopen in Container" in VS Code, or:
+which macOS does not ship.
 
 ```sh
-docker build -t jkb-dev .devcontainer
-./.devcontainer/verify.sh          # inside the container: assert it is what it claims
+./.container/run.sh             # build if needed, start, firewall, setup, verify
 ```
 
-`setup.sh` runs on create: firewall first (the lifecycle is postCreate → postStart, so leaving it
-to `postStartCommand` would run the whole of create with open egress), then the posture, then
-`verify.sh`.
+### On an AppArmor host, the profile must be loaded — and a reboot unloads it
+
+Docker's `docker-default` denies `mount`, so bubblewrap — and therefore Claude Code's nested
+sandbox — cannot start under it. `.container/apparmor-jkb-dev` is `docker-default` with that one
+rule relaxed and every other restriction kept, and it has to be in the kernel before the container
+can use it:
+
+```sh
+sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+```
+
+**Nothing installs it under `/etc/apparmor.d`, so this does not survive a reboot.** Run it again
+after restarting the machine. `run.sh` asks whether Docker can apply the profile *before* it
+creates or starts anything and prints this command with docker's own error beside it, so the
+failure names itself — but it is worth knowing that a container which worked yesterday needs one
+command today. It is deliberately not installed system-wide: jkb runs inside other people's
+repositories and does not add root-owned policy to a machine the user did not ask it to change.
+
+Then attach VS Code: **Command Palette → "Dev Containers: Attach to Running Container" → `jkb-dev`**,
+and File → Open Folder to any path inside. From a terminal in an attached window, `code <path>`
+opens another window on the same container. `run.sh --open [path]` does the attach for you, but the
+Command Palette route is the documented one — the attached-container URI it builds is VS Code's
+spelling and nothing here can test it.
+
+On a **fresh** container, one more step: extensions are not installed yet. VS Code puts its server
+into the container when you *attach*, which is after `run.sh` has finished — so setup finds nothing
+to install into and says so. From a terminal in the attached window:
+
+```sh
+./.container/install-extensions.sh     # marketplace extensions from disk, then the jkb explorer
+```
+
+then *Developer: Reload Window*. `run.sh` cannot do it for you: it drives Docker from the host, and
+the container deliberately has none. Automating it means a `postAttachCommand` in VS Code's
+attached-container configuration (`imageConfigs/<image>.json` in its globalStorage), which is not
+wired up yet.
+
+The firewall is raised by the image's **entrypoint**, so it comes up on `docker run` *and* on
+`docker start` — including Docker Desktop's start button and a daemon restart — rather than only
+when `run.sh` is the one starting it. That matters because iptables rules live in the container's
+network namespace and do not survive a stop: when the raise belonged to `run.sh` alone, every
+other way of starting the container gave an unattended agent unrestricted egress, and nothing
+checked. A boundary that depends on which caller you used is not one. `run.sh` re-raises it
+synchronously as well, which is not a second rule — the raise is idempotent — but a way of knowing
+it has finished before the next `docker exec` lands.
+
+**The container boots on what the KERNEL holds, not on a record of what some raise established**
+(D51). `sudo egress-status.sh` reads the live filter chains and prints one word; the entrypoint
+decides on that, and `verify.sh` reports from it:
+
+| state | means | the container |
+|---|---|---|
+| `allowlisted` | the allowlist rule is in the live chain and both IP families are bounded | starts |
+| `denied` | no allowlist, but egress is provably denied — DNS and loopback only | starts, loudly: this is the state you attach to in order to repair it |
+| `unfiltered` | denial could **not** be established on one or both families | **refuses to start** |
+| *(no answer)* | the probe could not run, so nothing was established | **refuses to start** |
+
+An unproven family counts as open. A container with **no way out over IPv6** is a different thing
+and is fine: no off-link address and no default route means there is no path to deny, and that is
+measured rather than assumed — a link-local `fe80::`, which every container on a default Docker
+bridge has, is not a way out.
+
+It used to read a verdict file, and that is the bug D51 fixed: a record is an *event* ("at some
+moment a raise established X") while every reader is asking a *present-tense* question. `docker
+stop` destroys every iptables rule and the file survives in the writable layer, so a restart whose
+raise died before recording read the previous start's `allowlisted`, printed nothing, and started
+an agent on an unrestricted network. The file is still written, and still carries the **reason** —
+the kernel can say egress is unfiltered, it cannot say DNS failed — but nothing decides on it, and
+`verify.sh` reports a record that disagrees with the live chain as drift.
+
+`JKB_EGRESS_ACCEPT_UNFILTERED=1` in `containerEnv` is the one escape: it lets an unfiltered
+container **boot**, so you can attach by hand and diagnose it. It does not make that container a
+place to run an agent — `verify.sh` reports it as a failure on every run for as long as it is set,
+and `run.sh --open` refuses to launch a window, because opening one *is* starting a session.
+
+If your host genuinely cannot be given the guarantee, `JKB_EGRESS_ACCEPT_UNFILTERED` in
+`container.json` boots it anyway — and `verify.sh` then reports a failure on every single run for
+as long as it is set. It lives in `containerEnv` rather than as a `run.sh` flag so that
+`docker start` honours the same decision and a session inside the container cannot grant it to
+itself. Turning it on is a reviewable edit plus a recreate.
+
+`run.sh` then runs `setup.sh` (posture, toolchain, `jkb`, extensions, `verify.sh`) if setup has
+not completed in this container, and `verify.sh` alone if it has. That is decided by a marker
+`setup.sh` writes as its last act, **not** by whether this invocation created the container: an
+interrupted first run used to leave setup unreachable for the container's whole life. It also
+sweeps deferred worktree archives — the container's job, because a session cannot archive its own
+checkout and the host's reaper cannot see `/home/vscode/...` paths — and it does that *before*
+verifying, so a failing assertion about something else cannot disable it.
+
+```sh
+./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
+./.container/run.sh --stop      # stop it; volumes and image survive
+./.container/run.sh --rm        # remove it, so the next run redoes first-run setup
+./.container/run.sh --dry-run   # print the docker command instead of running it
+```
+
+### It is not a Dev Containers config, and the file is not called `devcontainer.json`
+
+The declaration is `.container/container.json`. The name matters: VS Code detects
+`devcontainer.json` and offers *Reopen in Container*, which would be a **second** way to get a
+container — one built by Dev Containers, one by `run.sh` — and two launch paths that start
+identical drift, in the mount list, which is the security boundary here.
+
+Dev Containers was dropped because of one limitation with no workaround. Its `workspaceFolder` can
+only be built from `${localWorkspaceFolderBasename}`; there is no variable for a folder's path
+*relative* to the mount, and `initializeCommand` cannot supply one (it is a subprocess, and
+substitution has already happened). So a folder nested inside the mount could not be opened —
+`~/repos/jkb/.jkb/work/sess` resolved to `/home/vscode/repos/sess`, which does not exist — and the
+near-miss was worse than the miss: a literal fallback silently started the agent in a **different
+checkout**, with every guard passing, because the wrong repo is a perfectly good repo. A whole
+host-side preflight (`check-workspace.sh`, now deleted) existed to refuse that case.
+
+Attaching has no `workspaceFolder` at all. You open any path inside the container, at any depth, so
+the limitation and the guard that policed it both stop existing — and **one** container serves every
+repo under `~/repos` instead of one per opened folder.
+
+What replaces the guard is a smaller, checkable claim. `run.sh` is now the only thing that applies
+`container.json`, so a key nobody reads is possible and looks exactly like configuration — and the
+key most likely to be added is another `mounts`-shaped one. `run.sh --consumed-keys` names what it
+reads and `check-config.sh` fails on any declared key that is not in that list, so adding one forces
+the decision at the moment it is added. `run.sh --self-test` (in `./scripts/check.sh`) exercises the
+derivation itself, including that an unset `${localEnv:VAR}` is **refused** rather than substituted
+empty — Dev Containers' own default, and the way `source=${localEnv:HOME}/repos` quietly becomes
+`source=/repos`.
+
+## Extensions are fetched at build time, and pinned
+
+VS Code installs extensions when you **connect**, which is after `setup.sh` has raised the egress
+firewall. Measured: both declared extensions failed with `ECONNREFUSED` to `*.gallery.vsassets.io`
+and the container came up with neither installed — including the Claude Code extension, which is
+most of what this container is for — as a non-fatal log line nothing gated on. Reordering cannot
+fix it, because the firewall is re-raised on every start.
+
+So `fetch-extensions.sh` downloads the `.vsix` files during `docker build`, where egress is
+ordinary because the firewall only exists inside the running container, and `setup.sh` installs
+them from disk. **This needs no widening of `allowedDomains`** — and the alternative is worse than
+it sounds: the firewall pins names to IPs at raise time and cannot pin a wildcard, so
+`*.vsassets.io` would not help and every extension *publisher* would need its own concrete host,
+pinned to CDN addresses that rotate.
+
+**Every entry must be version-pinned** (`publisher.name@version`); `check-config.sh` fails the
+gate on one that is not, because unpinned means VS Code resolves "latest" over the network and we
+are back to the download that cannot succeed. Adding or upgrading an extension is therefore an
+edit plus a **rebuild**, the same ceremony the allowlist already asks for.
+
+The list lives once, in `container.json`, and is read through `lib.sh`'s `dc_extensions` by all
+four users of it — the build fetch, the install, the pinning gate, and `verify.sh`'s assertion
+that they are actually present. `verify.sh` **skips** that last one where there is no VS Code
+server, since `devcontainer up`, a plain `docker run` and `mutate-verify.sh` all build a correct
+container with no VS Code in it; the skip is printed, and the judgement itself
+(`missing_extensions`) is a pure function exercised by `verify.sh --self-test`, so its failure arm
+is watched even though no container harness can reach it.
+
+**The pin binds the download, not the installed version.** Measured on a container *restart*: VS
+Code auto-updated `anthropic.claude-code` from the pinned 2.1.250 to 2.1.251 and fetched it
+successfully, apparently through `code-server --use-host-proxy`, which tunnels via the host and so
+does not meet the container's firewall at all. That path is not reliable — the same flag was
+present in the create that failed — so it changes nothing about staging the `.vsix` at build time.
+It does mean the assertion compares **ids, not versions**: an auto-update must not read as a
+missing extension.
+
+## One extension is built, not downloaded
+
+The jkb explorer (`ui/vscode`) is not on the marketplace, so it is not in `container.json`'s
+list and `fetch-extensions.sh` cannot stage it. Nothing installed it, nothing declared it, and
+therefore nothing could assert it either — so **every container ever built came up without the
+side panel**, silently. Two of this repo's recurring shapes at once: an absence nothing was
+checking, and a rule (`code` vs `code-server`) that the host installer knew and the container did
+not.
+
+`install-extensions.sh` builds and installs it from the workspace, by calling
+`scripts/install-extension.sh` — the **host's** installer, reused unchanged, so the container cannot
+ship a different build of the extension from the one you install on the host for reasons nobody
+decided. `setup.sh` calls that script too, but on a fresh container it finds no VS Code server and
+correctly does nothing: the server arrives when you **attach**, which is after setup has run. So on
+a new container this is the one step you run by hand, from a terminal in the attached window — see
+*Using it* above. (Under Dev Containers the order was the reverse, which is why it was never a
+separate step.) That script resolves
+`code-server` and its `--server-data-dir` itself when there is no `code` CLI, which is the dev
+container case. It builds from the checkout rather than from a snapshot baked into the image, so
+the panel matches the code you are working in, and it needs only `registry.npmjs.org`, which the
+posture already allowlists.
+
+It builds into `~/.jkb-ui-build`, **not** into the workspace, and that is not tidiness.
+`ui/node_modules` is inside the bind mount, so the container and the host share one copy — and it
+is not portable: esbuild ships a native binary per platform and pnpm links only the current one.
+A build in here would leave linux links there, and the host's `./scripts/check.sh` runs
+`pnpm run build` with **no `pnpm install`** in front of it, so the next host gate would fail with
+an esbuild platform error and nothing pointing at the container. One shared mutable directory,
+two writers with incompatible requirements; the copy removes the sharing rather than adding a rule
+both sides have to remember.
+
+It is **fatal** on failure, like the `jkb` install, and for the same reason: the binary and the
+panel are the two things that make this a jkb container rather than a generic one. `verify.sh`
+appends its id to the declared list and asserts it like any other; `check-config.sh` pins the
+derivation, because a rename dropping `publisher` from `ui/vscode/package.json` would otherwise
+make that assertion silently check one fewer extension — the invisible-again failure. Both steps
+are skipped where the repo builds no extension of its own, since this container is meant to serve
+any repo under `~/repos`.
 
 ## The mount list is the security boundary
 
-Everything absent from `devcontainer.json`'s `mounts` does not exist inside the container. Add to
+Everything absent from `container.json`'s `mounts` does not exist inside the container. Add to
 it one path at a time and never mount all of `$HOME`. `verify.sh` asserts the mounted set is
 **exactly** what is declared — exhaustively, from `/proc/self/mountinfo`, rather than by listing
 paths that ought to be absent, because a list of absences can never be complete.
@@ -74,13 +269,32 @@ credential file either. Authenticate inside the container (`claude auth login`);
 the credential and account-state files into the `.claude-state` volume, so a login survives a
 rebuild without anything of the host's being visible.
 
-The expected set is **derived** from `devcontainer.json`, so adding a mount is a one-file change
+The expected set is **derived** from `container.json`, so adding a mount is a one-file change
 and cannot drift out of step with the verifier. It used to be transcribed into `verify.sh` as
 well, and the first time the mounts changed the copy went stale and a correctly-built container
 failed its own verifier.
 
-All of **`~/repos`** is mounted, at `/home/vscode/repos`, and `workspaceFolder` follows the folder
-you opened — `/home/vscode/repos/${localWorkspaceFolderBasename}`. The argument
+**`/vscode` is excluded, and it is the one exclusion the container runtime does not own.** The Dev
+launcher mounts a named volume there to hold the VS Code server. It comes from the launcher's own
+docker flags, so it can be declared neither in `container.json` — which would claim we create it,
+when under `run.sh` or a plain `docker run` it is simply absent — nor with `--declare`, which is
+refused for anything not nested inside a declared bind. Until it was excluded, opening the
+container **failed outright** on `UNDECLARED mounts: /vscode`: the supported path was the one path
+no harness drove, because `mutate-verify.sh` spells its own docker flags and never mounts it.
+Anchored `^/vscode$`, so a bind at `/vscode/anything` still fails. It is kept now that we attach
+rather than let Dev Containers create the container: whether a given VS Code version stages its
+server through that volume is the launcher's business, an exclusion for a mount that never appears
+costs nothing, and its absence costs a container that cannot start. The cost, stated: from inside
+the container a volume and a bind are indistinguishable, so this one path is a spot where a host
+bind would pass — which is not the threat this check is for, and a careless line in
+`container.json` still is.
+
+`verify.sh --self-test` exercises that exclusion list on a host with no Docker (it is in
+`./scripts/check.sh`), because every entry is an *exclusion*: one that matches more than it names
+drops a real mount from the set and the assertion still prints `ok`. That is this file's own
+history — `^/dev` once matched `/devtools`.
+
+All of **`~/repos`** is mounted, at `/home/vscode/repos`. The argument
 for the width is consistency, not convenience: `scripts/auto-mode-posture.json` already grants
 `~/repos` in both `allowRead` and `allowWrite`, so a container holding only jkb was *tighter* than
 the boundary the same agent runs under on the host. That difference was nothing anyone had
@@ -88,14 +302,17 @@ decided, and it made a cross-repo task impossible in here rather than deliberate
 Everything the posture does not grant is still absent by the kernel: `~/.ssh`, `~/.aws`,
 `~/Documents`, the rest of `$HOME`.
 
-**Only a folder directly inside `~/repos` can be opened**, and `initializeCommand`
-(`check-workspace.sh`) refuses anything else before the container is created. A literal
-`workspaceFolder` would be worse than a refusal: a `jkb task work` session lives at
-`<repo>/.jkb/work/<session>`, which is inside the mount but is not `~/repos/<name>`, so the
-container would start the agent in the **main checkout** instead — silently, with every guard
-still passing, because the wrong repo is a perfectly good repo. Keeping those two apart is the
-entire point of a session (D36). Sessions are worked on the host; the container is for the main
-checkout.
+It is also what makes **one** container enough. You attach to it and open any path inside, so a
+`jkb task work` session at `<repo>/.jkb/work/<session>` — inside the mount, but not
+`~/repos/<name>` — is just another folder. Under Dev Containers it was not: `workspaceFolder` could
+only name a basename, so opening a session started the agent in the **main checkout** instead,
+silently, with every guard passing, and a host-side preflight had to refuse the case outright.
+Keeping those two checkouts apart is the entire point of a session (D36), and it is now the
+container's ordinary behaviour rather than something a guard protects.
+
+The one path constraint left is about the checkout that *provides* the container, not about what
+you may open: `run.sh` has to hand the container a path to its own `setup.sh`, so that checkout has
+to be under `~/repos`. It says so and stops.
 
 ### A nested bind must be named
 
@@ -111,7 +328,7 @@ exfiltration — and the source cannot be checked from inside the container, bec
 Desktop for macOS `/proc/self/mountinfo` reports the path inside the VM rather than the host path.
 So the exception is named instead: `verify.sh --declare <mount-point>` **adds** to the derived set
 (it can never switch a check off) and is **refused** unless the value is a strict descendant of a
-target `devcontainer.json` declares **as a bind**. Not a volume: a named volume reaches no host
+target `container.json` declares **as a bind**. Not a volume: a named volume reaches no host
 filesystem, which is exactly why `check-config.sh` reviews bind sources and waves volumes through
 — so a bind nested under `~/.cargo/target` would be a host mount somewhere nobody reviewed. `--declare /host`, `--declare /var/run/docker.sock`
 and `--declare /home/vscode/.claude/settings.json` are therefore all refused by `verify.sh`
@@ -257,12 +474,17 @@ consequence to know about is the usual one: the DB migrates in place, so a conta
 from a branch with a newer migration will lock the host binary out until it is rebuilt. Point
 `JKB_DB` at a container-local path if you would rather they were independent.
 
-## Open the repo root, not a session worktree
+## A session worktree is an ordinary folder in here
 
 `jkb task work` puts worktrees at `<repo>/.jkb/work/<session>`, and a linked worktree's `.git` is a
-*file* pointing into `<repo>/.git/worktrees/…`. Mount the repo root and both ends are inside the
-container, so sessions work normally. Mount only the worktree and git breaks, because the gitdir
-it points at is not there.
+*file* pointing into `<repo>/.git/worktrees/…`. All of `~/repos` is mounted, so both ends are
+inside the container and sessions work normally — attach and open the worktree like any other
+folder. (Mounting only the worktree would break git, because the gitdir it points at would not be
+there; that is why the mount is the parent and not the folder you happen to be working in.)
+
+This is what the move off Dev Containers bought. Its `workspaceFolder` could not express a nested
+path, so a session could not be opened at all, and the fallback opened the main checkout instead —
+which meant a change to this directory could only be tested after landing it.
 
 Costs, stated: on macOS this is a Linux VM, so bind-mount IO is slower and the toolchain is the
 container's, not your host's. `~/repos` mounted is still writable and push-able — the container's

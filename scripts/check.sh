@@ -54,25 +54,91 @@ else
 fi
 
 # The dev container's configuration (design D49). Static only — no Docker — so it belongs in the
-# gate; the parts that need a container are .devcontainer/verify.sh and mutate-verify.sh. It
+# gate; the parts that need a container are .container/verify.sh and mutate-verify.sh. It
 # mainly guards the GENERATED seccomp profile, whose patch silently no-opping against a changed
 # upstream yields a profile that parses, applies, and leaves the nested sandbox unable to start.
-echo "==> devcontainer config"
-"$(dirname "$0")/../.devcontainer/check-config.sh"
+#
+# ONE jq GUARD FOR THE WHOLE GROUP, not one per script. Every check below reads container.json
+# through lib.sh's `dc_*` helpers, so they stand or fall together — and they did not: check-config.sh
+# announced its own skip while run.sh --self-test went on to die red on the same missing tool, so a
+# fact about the machine read as a broken container derivation. A skip decided per-assertion is not
+# a skip; it is three different answers to one question.
+echo "==> container config"
+if ! command -v jq >/dev/null 2>&1; then
+    echo "   (skipped: jq not installed — 'brew install jq'; CI runs these gates)"
+else
+"$(dirname "$0")/../.container/check-config.sh"
 
 # ...and every assertion in it, watched failing. check-config.sh had no such harness while
 # verify.sh did, and three review rounds each found the same defect in it — an assertion that
 # cannot fail. Needs no Docker either, so it belongs in the gate rather than beside mutate-verify.
-"$(dirname "$0")/../.devcontainer/mutate-config.sh"
+"$(dirname "$0")/../.container/mutate-config.sh"
+
+# ...and the container's argument derivation. run.sh is the ONLY thing that applies
+# container.json now that VS Code does not read it, so a mistake in the derivation is a container
+# built to a different specification than the one every other check reads. The derivation is pure,
+# so it is exercised here; the parts needing Docker are verify.sh and mutate-verify.sh.
+"$(dirname "$0")/../.container/run.sh" --self-test
+
+# ...and the marketplace URL derivation. It was the one --self-test in .container/ that no caller
+# ran: the publisher/name split, the arm64/amd64 platform mapping and the refusal of an unknown
+# architecture were exercised by nothing, so breaking any of them kept the gate green and surfaced
+# as a 404 in somebody's `docker build`.
+"$(dirname "$0")/../.container/fetch-extensions.sh" --self-test
+
+# ...and what the container does when the firewall raise fails. It has three outcomes and getting
+# the two failing ones the wrong way round yields either a container that will not boot or one
+# running unprotected — decided by the first thing that executes in there, which nothing had run.
+# Exercised against a stubbed sudo, so it needs no Docker and no privileges.
+"$(dirname "$0")/../.container/entrypoint.sh" --self-test
+
+# ...and the other half of that decision: what the raise RECORDS. The reader above had fourteen
+# assertions and its writer had none, which is the asymmetry that matters least in the direction
+# it was — a verdict is only as good as the measurement behind it, and "both families provably
+# closed" was spelled twice, in two shapes, at the two sites that decide it. Pure and path-injected
+# throughout: no iptables, no root, no /proc.
+"$(dirname "$0")/../.container/init-firewall.sh" --self-test
+
+# ...and the two halves D51 split that decision into. The library is what "egress is bounded" MEANS
+# — one definition, sourced by the raise and by the probe, because spelling it twice inside one
+# script is how the success path came to report success on unfiltered IPv6. The probe is what the
+# entrypoint now boots on: it reads the live chains, so unlike the record it was reading before, it
+# cannot describe a network that no longer exists.
+"$(dirname "$0")/../.container/egress-lib.sh" --self-test
+"$(dirname "$0")/../.container/egress-status.sh" --self-test
+
+# ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
+# a regex, and it is the one part of the mount boundary that widens by a typo instead of by an
+# edit somebody reviews — an over-broad exclusion drops a real mount from the set and the
+# assertion still prints `ok`. mutate-verify.sh covers it and needs Docker; this costs nothing.
+"$(dirname "$0")/../.container/verify.sh" --self-test
+fi
+
+# ...and the drift check's decision, which is pure. The check ITSELF needs the network — it fetches
+# each generator's upstream and regenerates — so it runs in CI, not here: a gate that only works
+# online is one that gets skipped. What runs here is the part that decides whether a difference is
+# upstream drift, a hand-edit, or unattributable, plus the digest extractor against both artifact
+# formats it has to read. Deliberately outside the jq group: it reads no container.json.
+"$(dirname "$0")/../.container/check-drift.sh" --self-test
+
+# ...and the AppArmor generator's own refusals, driven with fixture templates instead of the
+# network. These are what stop a patch silently no-opping against changed upstream -- the exact
+# failure check-config.sh already names for the seccomp profile -- and until this existed NOTHING
+# exercised them: check-drift.sh compares our output against our own output, so a bug in the
+# render/patch logic is invisible to it, and what it produces is a security policy.
+# GUARDED, because it drives its fixtures through python3 and this file's own rule is that a fact
+# about the machine degrades to a NAMED skip rather than a red gate. CI always has python3, so a
+# local skip never becomes a CI skip. (check-drift.sh's --self-test above is pure shell.)
+if command -v python3 >/dev/null 2>&1; then
+    "$(dirname "$0")/../.container/generate-apparmor.sh" --self-test
+else
+    echo "   (skipped: python3 not installed; CI runs this gate)"
+fi
 
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are
-# exercised against a scratch HOME. No container, no Docker, no network.
+# exercised against a scratch HOME. No container, no Docker, no network — and deliberately OUTSIDE
+# the jq group above: it reads no container.json, so a missing jq is no reason to skip it.
 "$(dirname "$0")/link-claude-memory.sh" --self-test
-
-# ...and the workspace preflight. It is the one guard between the widened container mount and a
-# silent wrong-checkout open, and until now it was certified as wired (check-config.sh reads the
-# JSON) but never as working.
-"$(dirname "$0")/../.devcontainer/check-workspace.sh" --self-test
 
 echo "All checks passed."

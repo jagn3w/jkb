@@ -79,18 +79,227 @@ jobs:
         run: ./scripts/auto-mode-test.sh
 
       # The dev container's static configuration checks (design D49): seconds, no Docker needed.
-      - name: devcontainer config
-        run: ./.devcontainer/check-config.sh
+      - name: container config
+        run: ./.container/check-config.sh
 
       # Each of those assertions, watched failing. No Docker needed; the container-level harness
       # (mutate-verify.sh) is the one that cannot run here.
-      - name: devcontainer config guards fire
-        run: ./.devcontainer/mutate-config.sh
+      - name: container config guards fire
+        run: ./.container/mutate-config.sh
+
+      # The pure derivations behind the container, each exercised without Docker. They were in
+      # scripts/check.sh only — behind a jq guard whose skip text says "CI runs this gate", which
+      # was not true: on a machine without jq they ran NOWHERE. A skip is only honest if the thing
+      # it defers to actually happens.
+      #   run.sh          the docker argument derivation and the staleness fingerprint
+      #   entrypoint.sh   the boot decision, against a stubbed firewall raise (D50.3)
+      #   init-firew...   the reason it records, and the format the reader parses (D50.2/D51.8)
+      #   egress-lib      what "egress is bounded" means — one definition, two callers (D51.1)
+      #   egress-status   the live-chain report the entrypoint now boots on (D51.1)
+      #   fetch-ext...    the marketplace URL and platform mapping
+      #   verify.sh       the mount-exclusion regex
+      - name: container derivations
+        run: |
+          ./.container/run.sh --self-test
+          ./.container/entrypoint.sh --self-test
+          ./.container/init-firewall.sh --self-test
+          ./.container/egress-lib.sh --self-test
+          ./.container/egress-status.sh --self-test
+          ./.container/fetch-extensions.sh --self-test
+          ./.container/verify.sh --self-test
+          # Ran in scripts/check.sh and NOWHERE in CI until check-config.sh started comparing the
+          # two lists — the exact drift that check exists to catch, found on its first run.
+          ./scripts/link-claude-memory.sh --self-test
+          ./.container/check-drift.sh --self-test
+          ./.container/generate-apparmor.sh --self-test
+
+      # EVERY VENDORED POLICY IS REPRODUCIBLE FROM UPSTREAM. This is the only check that can see a
+      # bad transcription: every other one is written from the same understanding as the file, so
+      # it agrees with it. The AppArmor profile's first version was typed from memory of moby's
+      # template and was silently missing `deny network alg`, `deny network vsock`,
+      # `deny /sys/devices/virtual/powercap/**`, the `abi <abi/3.0>` declaration (without which
+      # AppArmor 4.0 reads `network,` as excluding unix sockets) and the runc/crun signal peers
+      # `docker stop` needs — while loading fine, keeping its name, and passing every static check.
+      #
+      # It runs HERE rather than in the Docker job because it needs only the network, and it is not
+      # in scripts/check.sh because the gate must work offline. Upstream drift and a hand-edit both
+      # fail, with different messages: a security policy upstream has moved on from is worth a red
+      # build, and the two are repaired by looking at different diffs.
+      - name: vendored policies are reproducible from upstream
+        run: ./.container/check-drift.sh
 
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The dev container, BUILT AND RUN (design D52). Everything above this job is a statement about
+  # the TEXT of the container scripts; this is the only job that executes them.
+  #
+  # WHY IT DID NOT EXIST UNTIL NOW, which is the whole point of D52. `.container/verify.sh` and
+  # `mutate-verify.sh` need a Docker daemon, and the D48 auto-mode posture blankets `~` under
+  # `denyRead`, so `~/.docker/bin/docker` is unreachable on the machine this repo is developed on.
+  # They were therefore documented as human-run steps — and nobody ran them, for four review rounds
+  # and 53 findings. That state is STABLE precisely because it is unrepeatable, which is why the
+  # static layer kept growing: it was the only thing the gate could reach.
+  #
+  # A runner is not under that posture and ships a working rootful daemon. `--cap-add NET_ADMIN`
+  # and `--security-opt seccomp=<file>` are ordinary docker-CLI flags here, and the bwrap-nesting
+  # measurement this container is built around was taken on Ubuntu/Docker, which is what this is.
+  #
+  # SETTLED (D52.2/D52.13, task 1.3): bubblewrap DOES start, and this job is what established it.
+  # It took three runs, and each failure named the next thing:
+  #   1. docker-default (enforce)  →  Failed to make / slave        (AppArmor denies `mount`)
+  #   2. jkb-dev (enforce)         →  pivot_root: Permission denied (a rule type of its own)
+  #   3. jkb-dev (enforce)         →  green
+  # Run 2 is also what ruled out the kernel-policy explanation: the host sets
+  # apparmor_restrict_unprivileged_userns=1, and had that been transitioning bwrap into a restricted
+  # profile the MS_SLAVE mount would still have been refused. It was not, so the profile applies
+  # INSIDE the user namespace. The nested sandbox is therefore reachable on a stock Ubuntu/Docker
+  # host with the profile loaded — which was the open question this whole change exists for.
+  #
+  # verify.sh asserts it directly and JKB_ACCEPT_NO_BWRAP is not set, so a regression here fails the
+  # build rather than being narrated. The static layer has now been observed green against this job,
+  # which is the precondition D52.6 attaches to deleting any of it — a separate piece of work.
+  container:
+    runs-on: ubuntu-latest
+    # JKB_ACCEPT_NO_BWRAP IS DELIBERATELY NOT SET. It parked the bubblewrap failure while the cause
+    # was unknown; the cause is established (docker-default denies `mount`, and names no pivot_root
+    # rule at all), the container ships a profile that fixes it, and the job is green with it. So a
+    # bubblewrap failure is a real failure again and must fail the build -- with the acceptance set,
+    # the remedy could silently stop working. The stock-seccomp mutation is meaningful again too:
+    # it was CAUGHT for the wrong reason while the healthy container failed that same assertion.
+
+    # The build is minutes and the harness starts ~13 containers; a wedged docker pull would
+    # otherwise sit for the runner's six-hour default. Generous enough that a slow-but-working
+    # run is not reported as a broken one.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image carries a Rust toolchain, the Claude CLI and the pinned VS Code extensions, so
+      # it is a genuinely large build (~4 GB, several minutes). Deliberately NOT cached on the
+      # first pass: a cache that silently serves a stale image would make this job report on
+      # something other than the committed Dockerfile, which is the failure mode the job exists to
+      # remove. Revisit once it has a track record.
+      # THE CONTAINER'S APPARMOR PROFILE, loaded before anything starts a container. Docker's
+      # docker-default denies `mount`, so bubblewrap creates its namespaces and then fails at its
+      # first mount -- which is how the nested sandbox came to have never started on any AppArmor
+      # host. The profile is docker-default with that one rule allowed and every other restriction
+      # kept, so this is a narrower change than `apparmor=unconfined` and is asserted at runtime by
+      # verify.sh, which checks the profile by name AND that a restriction it keeps still bites.
+      #
+      # Loading needs root and a container cannot do it for itself, which is why run.sh refuses
+      # with this command rather than silently falling back to docker-default.
+      - name: Load the container's AppArmor profile
+        run: |
+          if [ -r /sys/module/apparmor/parameters/enabled ] \
+             && grep -qi '^Y' /sys/module/apparmor/parameters/enabled; then
+            sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+            echo "loaded jkb-dev"
+          else
+            echo "AppArmor is not enabled on this runner — nothing to load, and run.sh adds no profile"
+          fi
+
+      - name: Build the image
+        run: docker build -t jkb-dev .container
+
+      # ONE HEALTHY CONTAINER, with the real flags and the real preamble. Deliberately reuses
+      # mutate-verify.sh's own --control rather than spelling a `docker run` here: a hand-rolled
+      # one omitted the seccomp profile, NET_ADMIN, the binds and the firewall-raising preamble,
+      # and produced a dozen FAILs that read as a broken container instead of as a wrong command.
+      # "Is the container healthy" and "did that guard fire" must not be answerable about two
+      # different containers.
+      - name: The container is what it claims to be
+        run: ./.container/mutate-verify.sh --control
+
+      # WHY BUBBLEWRAP CAN OR CANNOT START. The first real run answered D52 task 1.3 with a FAIL:
+      # `bubblewrap cannot create namespaces`. That is the nested sandbox's mechanism, so it needs
+      # a cause and not a skip — the seccomp profile IS applied by the flags above (docker errors
+      # on a missing profile file), so something else is refusing.
+      #
+      # This step DELIBERATELY assembles its own docker flags, which the diagnostic below does not:
+      # varying the flags IS the experiment. [2] is exactly what the container ships, so if [3]
+      # succeeds where [2] fails the cause is AppArmor — Ubuntu 24.04 (which ubuntu-latest is)
+      # restricts unprivileged user namespaces by default, and the design's own measurement was
+      # taken on 26.04. Reported, never acted on automatically: `apparmor=unconfined` is a real
+      # weakening of the container and is a decision, not a fix to apply because a probe suggested it.
+      - name: Why bubblewrap can or cannot start (the discriminator, task 1.3)
+        if: always()
+        run: |
+          echo "--- runner facts ---"; uname -a
+          for s in kernel.unprivileged_userns_clone user.max_user_namespaces \
+                   kernel.apparmor_restrict_unprivileged_userns; do
+            printf '%s = %s\n' "$s" "$(sysctl -n $s 2>&1 || true)"
+          done
+          SEC=.container/seccomp-bwrap.json
+          # --entrypoint bash, deliberately. The first version of this probe kept the image's
+          # entrypoint, which refuses to boot when egress is unbounded -- and these arms grant no
+          # NET_ADMIN, so all three printed the refusal and bwrap never ran. Three identical
+          # outputs that discriminated nothing, in the experiment written to settle the question.
+          # The entrypoint is an unrelated moving part here: bwrap's namespace creation depends on
+          # the kernel, seccomp, AppArmor and capabilities, not on what PID 1 is.
+          probe() { # probe <label> <extra docker args...>
+            local label="$1"; shift
+            local out
+            # `|| true`, because GitHub runs an unqualified `run:` block as `bash -e {0}` and a
+            # BARE assignment from a failing command substitution is a simple command -- errexit
+            # fires and the step dies. The inner bwrap invocation always exits 0 (it is `&&/||`),
+            # so the only way this returns non-zero is docker refusing to START the container,
+            # which is exactly what arm [3] does when the profile is not loaded. The step would
+            # then abort after arms [1] and [2], never printing the third arm's message, and turn
+            # the job red for a fact about the machine -- from a step that is purely diagnostic.
+            # The `*)` arm below exists precisely for that case and was unreachable for its most
+            # likely cause.
+            out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c \
+                    'bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
+                       && echo BWRAP-OK || echo BWRAP-FAILED' 2>&1)" || true
+            # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
+            # whole lesson of the previous version: "no BWRAP-OK in the output" and "the probe
+            # never executed" are different facts and must not print the same way.
+            case "$out" in
+              *BWRAP-OK*)     printf '%-30s OK\n' "$label" ;;
+              *BWRAP-FAILED*) printf '%-30s FAILED\n' "$label"
+                              printf '%s\n' "$out" | grep -v BWRAP- | sed 's/^/      /' | tail -3 ;;
+              *)              printf '%-30s DID NOT RUN - this arm measured NOTHING:\n' "$label"
+                              printf '%s\n' "$out" | sed 's/^/      /' | tail -5 ;;
+            esac
+          }
+          probe "[1] stock docker"        --user vscode
+          probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
+          # The SHIPPED remedy, not `unconfined`: that is what run.sh passes and what has to work.
+          # Arm [2] is the broken state (docker-default), so [2] FAILED with [3] OK is the fix
+          # demonstrated rather than argued.
+          probe "[3] + the container's own AppArmor profile" --user vscode --security-opt seccomp=$SEC \
+                                         --security-opt apparmor=jkb-dev
+
+      # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
+      # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run
+      # reported the state without the reason. Re-running it verbosely in the SAME container the
+      # control uses is the whole diagnostic — and it goes through `--shell` rather than a
+      # hand-assembled `docker run` precisely because this one is not an experiment about flags.
+      - name: What the memory linker actually says
+        if: always()
+        run: |
+          ./.container/mutate-verify.sh --shell '
+            echo "--- linker, verbose (the preamble already ran it quietly) ---"
+            ./scripts/link-claude-memory.sh; echo "linker exit=$?"
+            echo "--- what it reports for this repo ---"
+            ./scripts/link-claude-memory.sh --status /home/vscode/repos/jkb
+            echo "--- the paths it works over ---"
+            ls -ld /home/vscode/.claude /home/vscode/.claude/projects /home/vscode/.jkb 2>&1
+            ls -la /home/vscode/.jkb 2>&1 | head -5'
+
+      # ...and every one of those assertions watched failing. This harness has NEVER executed:
+      # each of its mutations breaks one property (an undeclared mount, the host ~/.claude mounted,
+      # stock seccomp, no NET_ADMIN, running as root, the sudoers grant restored) and requires
+      # verify.sh to fail naming it, with a negative control proving the matcher discriminates.
+      #
+      # `if: always()` so a failing control does not hide whether the guards themselves work —
+      # those are different questions, and the first real run needs both answered in one go.
+      - name: Every container guard, watched failing
+        if: always()
+        run: ./.container/mutate-verify.sh
 
   # The `ui/` pnpm workspace, gated separately: it needs neither the Rust toolchain nor the
   # disk cleanup above, so it runs in parallel and fails fast on its own.

@@ -21,7 +21,7 @@
 # bounded. check-config.sh refuses such a mount, verify.sh asserts against it, and
 # mutate-verify.sh watches both fire. It would also collide with `dc_link_state`, which replaces
 # ~/.claude/projects with a symlink into the state volume, and it would need `initializeCommand`
-# to resolve a slug that no devcontainer.json substitution can express.
+# to resolve a slug that no container.json substitution can express.
 #
 # WHAT THIS DOES INSTEAD. `~/.jkb` is ALREADY bind-mounted into the container, already declared and
 # already reviewed, so it costs no boundary change at all: the shared store is
@@ -321,6 +321,22 @@ run() { # run <home> <repos> <store>
 # The state of ONE repo, printed as a single word and nothing else. `verify.sh` asks this rather
 # than inferring breakage from a missing symlink, so the container check and this script state the
 # same rule instead of opposite ones.
+# Does `run`'s walk reach this path at all? It iterates `$repos/*/`, so it manages exactly the
+# DIRECT children of the repos root — and asking that here, rather than in verify.sh, is what keeps
+# the two from disagreeing about which paths this script is responsible for.
+#
+# It became a question worth asking when the container stopped being opened by Dev Containers. That
+# could only open a top-level repo, so every workspace was managed by construction; now any path
+# inside the mount can be opened, and a `jkb task work` session at `<repo>/.jkb/work/<session>` is
+# the ordinary case. Reported rather than repaired: Claude Code keys memory by absolute path, so a
+# worktree session really does write to its own directory on both sides, and whether those should
+# be merged into the repo's single store — where several sessions would then collide on MEMORY.md
+# — is a decision, not a fix.
+managed_path() { # managed_path <repos-root> <repo-path>
+    local root="${1%/}" path="${2%/}"
+    [ "$(dirname "$path")" = "$root" ]
+}
+
 status_of() { # status_of <home> <store> <repo-path>
     state_of "$1" "$1/.claude/projects" "$2" "$3"
 }
@@ -420,6 +436,19 @@ if [ "$self_test" -eq 1 ]; then
         "$([ -L "$t/.claude/projects/$(slugify "$t/repos/other")/memory" ] && echo yes || echo no)"
     check "--status agrees with what was done" \
         "$([ "$(status_of "$t" "$t/.jkb/claude-memory" "$t/repos/jkb")" = linked ] && echo yes || echo no)"
+
+    # WHICH PATHS THIS SCRIPT IS RESPONSIBLE FOR. `run` walks `$repos/*/`, so a session worktree at
+    # `<repo>/.jkb/work/<session>` is never visited — and once the container could be opened on one,
+    # verify.sh asked about it and got `unlinked`, which it treats as fatal. The distinction is the
+    # point: `unlinked` means the linker failed, `unmanaged` means it was never asked.
+    check "a top-level repo is managed by the walk" \
+        "$(managed_path "$t/repos" "$t/repos/jkb" && echo yes || echo no)"
+    check "a trailing slash does not change that" \
+        "$(managed_path "$t/repos/" "$t/repos/jkb/" && echo yes || echo no)"
+    check "a session worktree inside a repo is NOT" \
+        "$(managed_path "$t/repos" "$t/repos/jkb/.jkb/work/sess" && echo no || echo yes)"
+    check "nor is the repos root itself" \
+        "$(managed_path "$t/repos" "$t/repos" && echo no || echo yes)"
     # The other half of run()'s contract, and the half that was missing: a clean run must SUCCEED.
     # `note` used to write to stdout, which `run` captures, so the state never equalled `linked`
     # and every clean run exited 1 — the "needs attention" assertion below passed unconditionally
@@ -562,7 +591,15 @@ fi
 repos="${repos:-$home/repos}"
 store="${store:-$home/.jkb/claude-memory}"
 if [ -n "$status_repo" ]; then
-    status_of "$home" "$store" "$status_repo"
+    # `unmanaged` before any observation: the link would be absent for a path the walk never
+    # visits, and reporting that as `unlinked` says the linker failed at something it never
+    # attempted. verify.sh treats `unlinked` as fatal, and rightly — so the two states must not
+    # share a word.
+    if managed_path "$repos" "$status_repo"; then
+        status_of "$home" "$store" "$status_repo"
+    else
+        echo unmanaged
+    fi
     exit 0
 fi
 [ -z "$status_file" ] || : > "$status_file"

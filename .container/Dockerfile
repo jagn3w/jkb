@@ -4,7 +4,7 @@
 # that is not mounted does not exist in here, so Claude Code's in-process tools (Read/Glob/Grep/
 # Edit) are bounded by the mount namespace rather than by permission rules, which is the one
 # property the rule model cannot express. Claude Code's OWN sandbox then runs nested inside it,
-# giving per-command confinement and the egress allowlist. .devcontainer/README.md has the
+# giving per-command confinement and the egress allowlist. .container/README.md has the
 # measurements behind each choice.
 #
 # NON-ROOT IS LOAD-BEARING, not hygiene. Measured: a root process inside a container cannot create
@@ -30,7 +30,19 @@ RUN apt-get update -qq \
 # path. It must never be run from the mounted workspace: a script the agent can edit, that the
 # agent can also sudo, is a root shell with extra steps.
 COPY --chown=root:root init-firewall.sh /usr/local/bin/init-firewall.sh
+# The entrypoint is root-owned for the same reason and by the same argument: it is what raises the
+# firewall on every start, so an agent able to rewrite it could simply not raise it.
+COPY --chown=root:root entrypoint.sh /usr/local/bin/entrypoint.sh
+# The live-chain probe and the library both scripts source. Root-owned by the same argument: the
+# probe is what the boot decision is made on, and the library is what the raise sources as root —
+# either one writable by `vscode` would be a root shell with extra steps. The library is sourced
+# from `$(dirname "$0")`, which is why it sits in /usr/local/bin beside its two callers rather than
+# in a lib directory: one install location, resolving the same way here and in the repo.
+COPY --chown=root:root egress-status.sh /usr/local/bin/egress-status.sh
+COPY --chown=root:root egress-lib.sh    /usr/local/bin/egress-lib.sh
 RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/init-firewall.sh \
+                    /usr/local/bin/entrypoint.sh /usr/local/bin/egress-status.sh \
+                    /usr/local/bin/egress-lib.sh \
     # Owned explicitly, not inherited. Everything here rests on `vscode` being unable to replace
     # the script sudo runs as root, or the allowlist snapshot beside it — and unlink/replace is
     # governed by the DIRECTORY, not the file mode. Debian-derived images have historically
@@ -38,9 +50,21 @@ RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/in
     # add the user to a group at any time. Same shape as the blanket-sudo grant: an inherited
     # property nothing in this repo stated. verify.sh asserts the result at runtime.
     && chmod 0755 /usr/local /usr/local/bin /usr/local/share \
-    && chmod 0755 /usr/local/bin/init-firewall.sh \
+    && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
+                  /usr/local/bin/egress-status.sh \
+    # IN THE IMAGE it is only ever sourced, so it needs no exec bit, and not having one is a small
+    # statement that it is never a command anybody runs as root by name. (In the repo it does carry
+    # one, because ./scripts/check.sh runs its --self-test directly.)
+    && chmod 0644 /usr/local/bin/egress-lib.sh \
     && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh ""\n' > /etc/sudoers.d/init-firewall \
     && chmod 0440 /etc/sudoers.d/init-firewall \
+    # THE SECOND GRANT, and it is read-only (D51.1). The boot decision asks the kernel what the
+    # filter chains hold, and only root can read them — so the entrypoint (which runs as `vscode`)
+    # needs this. egress-status.sh only inspects and prints: it must never install, flush or modify
+    # a rule, so a grant to run it is not a grant to change the boundary. Pinned to NO ARGUMENTS by
+    # the same rule as the firewall's, because a command naming no argument accepts every argument.
+    && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/egress-status.sh ""\n' > /etc/sudoers.d/egress-status \
+    && chmod 0440 /etc/sudoers.d/egress-status \
     # ...and the grant above means nothing while THIS file exists. The devcontainers base image
     # ships /etc/sudoers.d/vscode containing `vscode ALL=(root) NOPASSWD:ALL`, so the agent could
     # already run anything as root: flush the firewall, delete the allowlist snapshot, rewrite the
@@ -72,4 +96,24 @@ RUN mkdir -p /home/vscode/.cargo/target \
              /home/vscode/.claude-state \
              /home/vscode/.claude
 
-WORKDIR /workspaces
+# --- VS Code extensions, fetched HERE rather than at connect time ----------------------------
+# A build has ordinary egress; the running container does not. Measured on a real "Reopen in
+# Container": VS Code starts installing extensions ~1s before setup.sh raises the egress firewall,
+# the downloads land just after it is up, and both failed with ECONNREFUSED — non-fatally, so the
+# container came up with neither installed and nothing gated on it. Fetching at build time needs
+# no widening of the posture's allowedDomains. setup.sh installs these from disk; verify.sh
+# asserts the result. See fetch-extensions.sh for why the CDN was not allowlisted instead.
+#
+# Deliberately the LAST thing in the file: it copies container.json, which changes often, and
+# nothing above it should be rebuilt when it does.
+COPY --chown=vscode:vscode lib.sh container.json fetch-extensions.sh /home/vscode/.container-build/
+RUN /home/vscode/.container-build/fetch-extensions.sh /home/vscode/.vsix
+
+# Where an attached VS Code terminal lands by default. `/workspaces` was Dev Containers' own
+# convention and nothing puts anything there now.
+WORKDIR /home/vscode/repos
+
+# The egress firewall is raised HERE, by the container itself, so that `docker start` and Docker
+# Desktop's start button get it too — not only `run.sh`. See entrypoint.sh for why the two failure
+# modes are answered differently.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

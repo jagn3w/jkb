@@ -12,7 +12,7 @@ relate to each other, what kind of tags each node has, and how nodes are discove
 - Right now, jkb's most advanced usage is in driving agents in a DAG task manager with
   git-backed work sessions and review-gated landing. This is currently the focus of
   active development. The agent lifecycle is already a formal state machine, and a
-  container sandbox ships in `.devcontainer/`; next up is RBAC on jkb commands, so that
+  container sandbox ships in `.container/`; next up is RBAC on jkb commands, so that
   agents can coordinate and implement tasks as independently as possible. jkb has a
   VS Code extension to facilitate coordinating agents.
 - jkb also has a searchable document store that embeds documents and provides an API to
@@ -309,13 +309,13 @@ be available (measured working on Ubuntu 26.04 even with
 emitting an overlay that would do nothing. On WSL the `/mnt` deny is the valuable one — that is
 where the Windows filesystem lives.
 
-**Both layers, in a container.** `.devcontainer/` runs Claude Code's sandbox *nested inside* a
+**Both layers, in a container.** `.container/` runs Claude Code's sandbox *nested inside* a
 dev container, which adds the one thing the host posture cannot express: file access that is
 default-deny **by the kernel**, since an unmounted host path does not exist in the container at
 all. It needs a container runtime (macOS ships none) and a non-root user plus a targeted seccomp
 profile — measured requirements, not folklore: stock Docker cannot run the nested sandbox, and
 neither `--privileged` nor `seccomp=unconfined` is needed. See
-[`.devcontainer/README.md`](.devcontainer/README.md).
+[`.container/README.md`](.container/README.md).
 
 Stated consequence: with `~/.ssh` unreadable, `git push` over SSH fails inside the sandbox —
 the right default for an unattended agent. Set `JKB_AUTO_MODE_SSH_AGENT=1` before

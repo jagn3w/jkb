@@ -21,47 +21,171 @@ set -euo pipefail
 
 say() { printf '[firewall] %s\n' "$*"; }
 
-# EVERY REFUSAL MUST LEAVE MORE FILTERING THAN IT FOUND, NOT LESS. The refusals below used to
-# `exit 1` before any rule was installed — and iptables rules do NOT survive a container restart
-# (that is why postStart re-raises them), so a container that started offline kept UNFILTERED
-# egress while the script printed "Refusing". The refusal path was less safe than the success path,
-# which is the one direction this layer must never go.
-readonly FAILED_MARKER=/run/jkb-egress-failed
+# THE MEASUREMENT AND THE RULE COME FROM ONE PLACE (D51.1). `verdict_state`, `v6_path_state` and the
+# chain probes used to live in this file; egress-status.sh needs the same answers for the boot
+# decision, and D50's own history is what makes a second copy unacceptable — the rule was spelled
+# twice inside THIS script and that is precisely how the success path came to report success on
+# unfiltered IPv6.
+# shellcheck source=egress-lib.sh
+. "$(dirname "$0")/egress-lib.sh"
 
+# WHY THIS RAISE ENDED AS IT DID, written on every ending (D50.1). Under D51 this is no longer what
+# decides anything: the entrypoint and verify.sh ask the kernel (egress-status.sh) what the chains
+# hold right now, because a record is an EVENT and they are asking a present-tense question. What
+# only the record can supply is the REASON — the kernel can say egress is unfiltered, it cannot say
+# DNS failed at 09:14 or that the allowlist snapshot was truncated.
+#
+# So a stale record is no longer dangerous, merely unhelpful: readers take the state from the probe
+# and use this for the explanation, and a record whose state disagrees with the probe is reported as
+# drift rather than obeyed.
+#
+# THE VERDICT PATH IS NOT NAMED IN THIS FILE AT ALL. It is `VERDICT_PATH`, defined once in
+# egress-lib.sh (sourced above) and used verbatim by `record_verdict` below and by `verdict_field`,
+# the reader. There used to be a second `${JKB_EGRESS_VERDICT:-/run/jkb-egress-verdict}` here, and
+# the check-config guard comparing the two spellings was deleted when egress-lib.sh arrived, on the
+# stated premise that only one remained. There were two.
+#
+# The first repair was `VERDICT="$VERDICT_PATH"` -- one path, but still two NAMES, and that is not
+# the same property. The self-test overrode `VERDICT`, so the aliasing line was exercised by
+# nothing: setting it to a wrong path left all three self-test rows green and exit 0, which is the
+# regression this comment describes, passing its own guard. An alias is a variable that has to
+# agree with another one, and "two things that must agree" is the defect, not the thing to test.
+#
+# So there is one name. The writer and the reader cannot disagree about where the verdict lives,
+# because neither of them decides -- which makes the bug unrepresentable rather than caught.
+# Overriding is still possible for a test, via `VERDICT_PATH` in this process or
+# `JKB_EGRESS_VERDICT` before sourcing; either moves the writer and the reader together, which is
+# the point. It cannot weaken anything: sudo runs with env_reset, so the sudoers-granted path never
+# sees a caller's value, and a non-root run that supplies one cannot write the real file anyway (it
+# is root-owned).
+
+# NEWLINES ARE FLATTENED HERE, which is the one place it can be enforced (D51.8). Every reason on
+# the paths that matter is multi-line, and both readers parse a field with `sed | head -1` — so the
+# DNS refusal lost "Fix DNS and re-run this, or restart the container, to restore it" and the
+# posture refusal lost its whole remedy list. D50 chose refusing-to-boot on the argument that it
+# prints its own escape, and the escape was being stripped in transit. The round-trip assertion
+# passed only because it was fed a single-line reason the writer never emits.
+record_verdict() { # record_verdict <state> <v4> <v6> <reason...>
+    local state="$1" v4="$2" v6="$3"; shift 3
+    local reason; reason="$(printf '%s' "$*" | tr '\n' ' ' | tr -s ' ')"
+    { printf 'state=%s\n' "$state"
+      printf 'v4=%s\n'    "$v4"
+      printf 'v6=%s\n'    "$v6"
+      printf 'reason=%s\n' "$reason"
+    } > "$VERDICT_PATH" 2>/dev/null || true
+}
+
+# `v6_state` is NOT defined here any more — it lives in egress-lib.sh, sourced above, beside the
+# measurements it composes and beside the two other callers that had each spelled the collapse for
+# themselves (D52.5). A function defined in this file could not be reached by the library's own
+# self-test, which is how a regression in it survived a green gate.
+
+# EVERY REFUSAL MUST LEAVE MORE FILTERING THAN IT FOUND, NOT LESS. The refusals below used to
+# `exit 1` before any rule was installed — and iptables rules do NOT survive a container restart,
+# so a container that started offline kept UNFILTERED egress while the script printed "Refusing".
+# The refusal path was less safe than the success path, which is the one direction this layer must
+# never go. What it leaves is now also RECORDED, so a caller can act on it rather than infer it.
 fail_closed() { # fail_closed <message...>
     printf 'init-firewall: %s\n' "$*" >&2
-    # A DURABLE SIGNAL, because the only other one is this script's stderr — which postCreate
-    # swallows and which nothing later can read. `verify.sh` runs as `vscode` and cannot ask
-    # iptables anything, so without a marker it can only observe the SYMPTOM (egress fails), and a
-    # broken resolver produces that symptom just as well: the harness case written for this path
-    # passed whether or not a deny-all was ever installed.
-    printf '%s\n' "$*" > "$FAILED_MARKER" 2>/dev/null || true
     # DNS and loopback stay open so the container can be diagnosed and can retry; everything else
     # is denied. Deliberately does not depend on the `allowed` set having any contents.
-    iptables -F OUTPUT 2>/dev/null || true
-    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    local v4=no v6=no
-    iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null && v4=yes
-    # IPv6 TOO, or the verdict below is false on a first raise: the success path denies v6
-    # outright further down, so a refusal that rebuilt only the v4 chain left v6 egress entirely
-    # unfiltered while printing "egress is DENIED". Best-effort like the rest of this function —
-    # a kernel without ip6tables is a normal state, and it is reported rather than assumed.
+    iptables -w 5 -F OUTPUT 2>/dev/null || true
+    iptables -w 5 -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -w 5 -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -w 5 -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+    iptables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    local v4 v6
+    iptables -w 5 -A OUTPUT $RULE_V4_REJECT 2>/dev/null || true
+    # MEASURED, not inferred from whether the install command succeeded. `iptables -A` returning 0
+    # is a statement about one command; what the record and the probe both need is what the chain
+    # HOLDS, and those come apart under a lost xtables lock or a concurrent flush. Same function the
+    # boot probe uses, so the two cannot disagree about what bounded means.
+    v4="$(v4_chain_state)" || v4=open
+    [ "$v4" = bounded ] && v4=denied
+    # IPv6 TOO, or the verdict is false on a first raise: the success path denies v6 outright
+    # further down, so a refusal that rebuilt only the v4 chain left v6 egress entirely unfiltered
+    # while printing "egress is DENIED". Best-effort like the rest of this function.
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -F OUTPUT 2>/dev/null || true
-        ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-        ip6tables -A OUTPUT -j REJECT 2>/dev/null && v6=yes
-    else
-        v6=absent
+        ip6tables -w 5 -F OUTPUT 2>/dev/null || true
+        ip6tables -w 5 -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+        ip6tables -w 5 -A OUTPUT $RULE_V6_REJECT 2>/dev/null || true
     fi
+    # `|| v6=open` is not defensive noise: D50.4 says an unobtainable measurement is
+    # `open`, and a bare assignment here would also abort the whole raise into
+    # fail_closed under the ERR trap. The guard and the rule want the same line.
+    v6="$(v6_state)" || v6=open
+
+    # THE STATE IT LEAVES BEHIND, not the fact that it ran (D50.2). Both families must be provably
+    # closed to call this denied; anything else is unfiltered, and under D50.3 the entrypoint
+    # refuses to boot on it rather than printing that egress is denied and running anyway.
+    record_verdict "$(verdict_state "$v4" "$v6" denied)" "$v4" "$v6" "$*"
+
     # NAMES WHAT IT ACTUALLY COVERED. "DENIED" unconditionally is the one sentence an operator
     # would act on, and it was asserting a state this function had not established.
-    echo "  egress: IPv4 denied=$v4, IPv6 denied=$v6. Fix the cause and re-run to restore the allowlist." >&2
-    [ "$v4" = yes ] || echo "  WARNING: the IPv4 deny-all chain could not be installed — egress may be unfiltered." >&2
+    echo "  egress: IPv4=$v4, IPv6=$v6. Fix the cause and re-run to restore the allowlist." >&2
+    if [ "$v4" != denied ]; then
+        echo "  WARNING: the IPv4 deny-all chain could not be installed — egress is UNFILTERED." >&2
+    fi
+    if [ "$v6" = open ]; then
+        echo "  WARNING: IPv6 egress is UNFILTERED (no ip6tables, and this container has IPv6)." >&2
+    fi
     exit 1
 }
+
+# --- self-test --------------------------------------------------------------------------------
+# What this script RECORDS no longer decides the boot (D51 moved that to egress-status.sh, which
+# asks the kernel), but it is still the only source of the REASON a refusal prints — and D50 chose
+# refusing-to-boot on the argument that it prints its own escape. So what is covered here is the
+# half only this script owns: that a reason survives the trip to the reader intact.
+#
+# The rule itself and every measurement now live in egress-lib.sh and are covered by its own
+# self-test; duplicating those rows here would be a second copy of the thing this change exists to
+# have one of. Placed above `set -E`/the ERR trap deliberately: a failing assertion should report
+# itself, not route into fail_closed. Only when it is the sole argument.
+if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then
+    fails=0
+    eq() { # eq <label> <got> <want>
+        if [ "$2" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+        else fails=$((fails+1)); printf '  \033[31mFAIL\033[0m %s (got %s, wanted %s)\n' "$1" "$2" "$3"; fi
+    }
+    echo "==> firewall self-test: the reason it records"
+    t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
+
+    # A MULTI-LINE REASON, because that is what this script actually emits — every fail_closed
+    # message and the unfiltered branch are multi-line, and both readers parse a field with
+    # `sed | head -1`. The previous version of this assertion was named "the reason reaches the
+    # reader intact" and passed only because it was handed a single-line reason the writer never
+    # produces, so the remedy on every refusal that matters was being stripped in transit and
+    # nothing noticed. record_verdict flattens newlines now; this is what holds it to that.
+    VERDICT_PATH="$t/verdict" record_verdict denied denied absent "DNS resolved none of them.
+  Fix DNS and re-run this, or restart the container, to restore the allowlist."
+    got="$(sed -n 's/^reason=//p' "$t/verdict" | head -1)"
+    case "$got" in
+        *"Fix DNS and re-run this"*) printf '  \033[32mok\033[0m   a multi-line reason survives head -1\n' ;;
+        *) fails=$((fails+1)); printf '  \033[31mFAIL\033[0m a multi-line reason loses its remedy (got: %s)\n' "$got" ;;
+    esac
+    eq "the record is still one field per line" "$(grep -c '=' "$t/verdict")" "4"
+
+    # ...and against the REAL reader, which is the contract no static check can reach.
+    ep="$(dirname "$0")/entrypoint.sh"
+    if [ ! -r "$ep" ]; then
+        fails=$((fails+1)); printf '  \033[31mFAIL\033[0m entrypoint.sh is not beside this script — the round-trip below checked nothing\n'
+    else
+        mkdir -p "$t/bin"
+        # The raise is a no-op (the record is already written); the probe reports a bounded kernel,
+        # so the entrypoint boots and prints the recorded reason for the `denied` arm.
+        printf '#!/usr/bin/env bash\ncase "$*" in *egress-status*) printf "state=denied\\n";; esac\nexit 0\n' > "$t/bin/sudo"
+        chmod +x "$t/bin/sudo"
+        JKB_EGRESS_VERDICT="$t/verdict" PATH="$t/bin:$PATH" bash "$ep" echo BOOTED >/dev/null 2>"$t/err" || true
+        eq "the remedy reaches the operator" "$(grep -c 'Fix DNS and re-run this' "$t/err")" "1"
+    fi
+
+    echo
+    [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
+    printf '\033[32mfirewall self-test passed\033[0m\n'
+    exit 0
+fi
+# ------------------------------------------------------------------------------------------------
 
 # EVERY abort routes through it, not just the ones written as refusals. `set -e` aborts do not go
 # near `fail_closed`, and one of them fires with the OUTPUT chain already flushed and empty —
@@ -69,6 +193,24 @@ fail_closed() { # fail_closed <message...>
 # check-config.sh stays as second-line defence: it can see a stray `exit 1` and cannot see this.
 set -E
 trap 'fail_closed "an unexpected failure at line $LINENO — refusing to leave the chain as it is."' ERR
+
+# ONE RAISE AT A TIME, SERIALISED IN THE CALLEE (D51.6). Two raises run concurrently on every fresh
+# create — the entrypoint's, and run.sh's re-raise — because `docker run --detach` returns as soon
+# as PID 1 starts, while this script is still inside ~15 DNS lookups. They share one `allowed-new`
+# ipset, one OUTPUT chain and one record, and the interleavings are destructive: B's `ipset flush`
+# wipes what A accumulated; A's `ipset destroy` makes B's adds fail silently into `resolved=0`,
+# which calls fail_closed and installs a blanket deny on a machine with perfectly healthy DNS.
+#
+# In the CALLEE, because a rule every caller must remember is the defect — a third way to start a
+# raise (a hand-run `docker exec`, a future verb) is covered without being told. `-w` on iptables
+# closes only the xtables-lock half and is kept below as the narrower backstop.
+#
+# Best-effort: a container image without flock still raises, unserialised, exactly as before. That
+# is the same trade as the rest of this function — never fail to raise because a helper is missing.
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/jkb-egress-raise.lock 2>/dev/null || true
+    flock 9 2>/dev/null || true
+fi
 
 # Defined FIRST, above every refusal in this file, because that is the only way the rule it
 # states can hold. It used to sit below two of them: the unparseable-snapshot guard and the
@@ -238,8 +380,8 @@ say "allowed $resolved addresses from $declared domains"
 [ ${#skipped[@]} -eq 0 ] || say "not pinned at the IP layer (the sandbox matches these by name): ${skipped[*]}"
 
 # Flush first so a re-run is idempotent rather than additive.
-iptables -F OUTPUT
-iptables -F INPUT 2>/dev/null || true
+iptables -w 5 -F OUTPUT
+iptables -w 5 -F INPUT 2>/dev/null || true
 
 # IPv6 is a SECOND, independent egress path. Filtering only v4 leaves the whole allowlist
 # bypassable over AAAA while this script prints "default-deny is active" — a firewall that
@@ -249,34 +391,51 @@ iptables -F INPUT 2>/dev/null || true
 have_v6=0
 if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT >/dev/null 2>&1; then
     have_v6=1
-    ip6tables -F OUTPUT
-    ip6tables -A OUTPUT -o lo -j ACCEPT
-    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A OUTPUT -j REJECT
+    ip6tables -w 5 -F OUTPUT
+    ip6tables -w 5 -A OUTPUT -o lo -j ACCEPT
+    ip6tables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -w 5 -A OUTPUT $RULE_V6_REJECT
 fi
 
 # DNS must survive or nothing resolves, including the allowlisted hosts themselves.
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m set --match-set allowed dst -j ACCEPT
-iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
+iptables -w 5 -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -w 5 -A OUTPUT -p tcp --dport 53 -j ACCEPT
+iptables -w 5 -A OUTPUT -o lo -j ACCEPT
+iptables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -w 5 -A OUTPUT $RULE_ALLOWLIST
+iptables -w 5 -A OUTPUT $RULE_V4_REJECT
 
 # Fail loudly rather than leave a half-applied policy that reads as protection.
-if ! iptables -C OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
+if ! iptables -w 5 -C OUTPUT $RULE_V4_REJECT 2>/dev/null; then
     fail_closed "default-REJECT rule is not in place — refusing to report success on a
   half-applied policy."
 fi
-# Cleared only HERE, on the one path that installed a real allowlist — so the marker means
-# exactly "the last raise could not establish one", and nothing else has to be kept in agreement.
-rm -f "$FAILED_MARKER" 2>/dev/null || true
-if [ "$have_v6" -eq 1 ]; then
-    say "egress default-deny is active (IPv4 allowlisted, IPv6 denied outright)"
+# THE SUCCESS PATH IS SUBJECT TO THE SAME RULE (D50.2/D50.4). It used to allowlist IPv4, print
+# "IPv6 is UNFILTERED", and report success anyway — its own comment conceding that was "safe only
+# because the container has no IPv6 route, which is not checked here". It is checked now: an
+# unproven family is open, and a container with real IPv6 and no ip6tables has a bypassable
+# allowlist, so the verdict says so and the entrypoint refuses to boot on it.
+# See fail_closed: an unobtainable measurement is `open` (D50.4), and a bare assignment
+# would abort into fail_closed under the ERR trap.
+v6="$(v6_state)" || v6=open
+# The check above established IPv4: the default-REJECT rule is in place behind the allowlist, so
+# `allowlisted` here is measured, not assumed. Same rule as fail_closed's, same function.
+if [ "$(verdict_state allowlisted "$v6" allowlisted)" = allowlisted ]; then
+    record_verdict allowlisted allowlisted "$v6" "allowlist raised for $resolved addresses from $declared domains"
+    if [ "$v6" = denied ]; then
+        say "egress default-deny is active (IPv4 allowlisted, IPv6 denied outright)"
+    else
+        say "egress default-deny is active (IPv4 allowlisted; this container has no way out over"
+        say "  IPv6 — no off-link address and no default route, measured rather than assumed)"
+    fi
 else
-    # Not silently: an operator who believes v6 is filtered here would be wrong.
-    say "egress default-deny is active (IPv4 only — ip6tables unavailable, so IPv6 is UNFILTERED;"
-    say "  this is safe only because the container has no IPv6 route, which is not checked here)"
+    record_verdict unfiltered allowlisted open "IPv4 is allowlisted but IPv6 is unfiltered:
+  ip6tables is unavailable and this container has a way out over IPv6 (an off-link address or a
+  default route), so the allowlist is bypassable over AAAA. Set JKB_EGRESS_ACCEPT_UNFILTERED=1 in
+  container.json and recreate if you accept that; the container will not start otherwise."
+    say "IPv4 is allowlisted, but IPv6 is UNFILTERED — ip6tables is unavailable and this container"
+    say "  has IPv6, so every allowlisted-host rule is bypassable over AAAA. Recorded as unfiltered;"
+    say "  the container will refuse to start. See JKB_EGRESS_ACCEPT_UNFILTERED in container.json."
 fi
 
 # #13: the ipset is resolved once, at start. A CDN-fronted allowlisted host whose A records rotate

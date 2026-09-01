@@ -1260,7 +1260,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   `~/.docker/bin/docker` fails with `Operation not permitted` — the directory is under
   `denyRead: ["~"]` and in no `allowRead` entry. An unattended agent that can reach Docker can
   mount `/` into a container and is root on the host, so this is the boundary doing its job; the
-  cost is that `.devcontainer/verify.sh` and `mutate-verify.sh` become **human-run** steps, which
+  cost is that `.container/verify.sh` and `mutate-verify.sh` become **human-run** steps, which
   is now stated where they are documented rather than discovered when they stop working.
 - **Installing it for real found two things no amount of checking could.** `install` ran clean
   (preflight green, 45 pre-existing allow rules and the theme preserved, `/tmp`, `$TMPDIR` and
@@ -1459,7 +1459,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     `verify.sh`'s hand-written mount list where two were intended, dropping `.cargo/registry` — so
     a correctly-built container failed its own verifier, after the full toolchain build, because
     `setup.sh` ends by running it. Two lists that must agree **is** the defect: the list is now
-    **derived** from `devcontainer.json` (both the string and object mount spellings), so there is
+    **derived** from `container.json` (both the string and object mount spellings), so there is
     one. A `CARGO_TARGET_DIR` guard added an hour earlier pinned a single string in that very file
     and could not see the list beside it — a guard aimed at the instance, not the class.
   - **The third round found the same class again, so the fix stopped being a fix and became a
@@ -1468,7 +1468,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     could not cross a shell quote and so never caught the exact code it existed to prevent, and a
     rewrite that dropped the `type=volume` half of its own check while keeping the failure message
     about volumes. Hand-mutating after each round works until nobody does it.
-    `.devcontainer/mutate-config.sh` breaks each config property in turn (18 of them) and requires
+    `.container/mutate-config.sh` breaks each config property in turn (18 of them) and requires
     a FAIL naming it, with the same negative control — and it needs no Docker, so unlike
     `mutate-verify.sh` it runs in `check.sh` and CI. **It found a live one on its first run**: the
     seccomp assertion grepped for the `seccomp=…` value anywhere in the file, so deleting the
@@ -1499,7 +1499,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
   - **Removing a mount left the plumbing shaped around it.** `setup.sh`'s symlink loop linked only
     the *directories* under `~/.claude`, because the credential file was the one thing bind-mounted
     and the loop had to go around it. With the mount gone, nothing linked it — so an in-container
-    login sat in the writable layer and died with the next rebuild, while `devcontainer.json`
+    login sat in the writable layer and died with the next rebuild, while `container.json`
     promised the opposite. `.credentials.json` and `~/.claude.json` are now linked into the volume
     too, dangling until first write. The residual is stated rather than designed away: a writer
     that replaces a file by temp-and-rename would drop the link, which costs one re-login at the
@@ -1517,7 +1517,7 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
 
 ## Both layers: the dev container with the sandbox nested inside (D49)
 
-`.devcontainer/` is the "both" configuration of D48 — a container **and** Claude Code's own
+`.container/` is the "both" configuration of D48 — a container **and** Claude Code's own
 sandbox running inside it. `scripts/auto-mode.sh` alone is host-only; this adds the one property
 the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7, D49).
 
@@ -1578,7 +1578,7 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
   directly.
 - **The mount list is the security boundary, and it is asserted exhaustively.** `verify.sh` reads
   `/proc/self/mountinfo` and fails if the mounted set is anything other than what
-  `devcontainer.json` declares — rather than listing paths that ought to be absent, which is the
+  `container.json` declares — rather than listing paths that ought to be absent, which is the
   "enumerate the secrets" shape the host posture is *forced* into and the container is not. Only
   `~/.claude/.credentials.json` is mounted, never `~/.claude`: that directory holds the posture,
   and a process the posture bounds must not read or write the file deciding whether it is bounded.
@@ -1604,7 +1604,7 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
 - **Where VS Code runs does not matter; where the `claude` process runs does.** Under Dev
   Containers the UI is on the host and the server, extension host and terminals are in the
   container. The Claude Code extension declares no `extensionKind` and has a Node `main`, so VS
-  Code runs it as a **workspace** extension — in the container — and `devcontainer.json` lists it
+  Code runs it as a **workspace** extension — in the container — and `container.json` lists it
   so the linux build is installed inside (a host copy is platform-specific and separate).
 - **Open the repo root, not a session worktree.** `jkb task work` puts worktrees at
   `<repo>/.jkb/work/<session>` and a linked worktree's `.git` is a *file* pointing into
@@ -1617,7 +1617,7 @@ the host cannot express. Design in `openspec/changes/jkb-safe-auto-mode/` (D48.7
 
 ## The dev container mounts ~/repos, and a session worktree is archived (D49)
 
-The container follow-up bucket. Design in `.devcontainer/README.md`; the container harnesses are
+The container follow-up bucket. Design in `.container/README.md`; the container harnesses are
 `check-config.sh` + `mutate-config.sh` (static, in the gate) and `verify.sh` + `mutate-verify.sh`
 (need Docker).
 
@@ -1648,7 +1648,7 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   `-home-vscode-repos-jkb`) and widening the workspace mount does not change that. Binding the
   host's memory dir is the one mount forbidden everywhere in this design (`~/.claude` holds
   `settings.json`, which IS the posture), it collides with `dc_link_state`'s symlink, and the slug
-  is inexpressible in `devcontainer.json`. So `scripts/link-claude-memory.sh` symlinks each side's
+  is inexpressible in `container.json`. So `scripts/link-claude-memory.sh` symlinks each side's
   `memory` dir at `~/.jkb/claude-memory/<repo>/` — inside the bind that already exists. It migrates
   file by file and **never overwrites**: a name on both sides is left alone and reported. Opt-in on
   the host (`setup.sh --link-memory`), because `post-merge` re-runs `setup.sh` and a `git pull`
@@ -1726,7 +1726,7 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
 - **A remedy the machine does not accept is worse than no remedy.** `check-workspace.sh` advised
   setting `JKB_REPOS_DIR`, read by nothing else in the tree: following the advice switched the
   preflight off without moving the mount, producing the exact silent wrong-checkout open the file
-  exists to prevent. One statement of where repos live, and it is `devcontainer.json`'s.
+  exists to prevent. One statement of where repos live, and it is `container.json`'s.
 - **The sweep may only delete inside the tree it owns.** The worst defect on this branch, and it
   survived two reviews: the retention arm passed whatever absolute path a record's `archive` field
   named to `remove_dir_all`. The record store lives in `~/.jkb`, which is bind-mounted into the
@@ -1891,6 +1891,280 @@ The container follow-up bucket. Design in `.devcontainer/README.md`; the contain
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,
   not by parsing `status --porcelain` — whose leading status column is exactly what the trimming
   capture helper eats.
+
+## The container is started by a script and attached to, not opened by Dev Containers (D49)
+
+Everything above about mounts, seccomp, the firewall and the harnesses is unchanged. What changed
+is who starts the container, and it removes a limitation rather than working around one.
+
+- **Dev Containers could not open a folder nested inside the mount.** `workspaceFolder` can only be
+  built from `${localWorkspaceFolderBasename}` — there is no variable for a path *relative* to the
+  mount, and `initializeCommand` cannot supply one (a subprocess cannot set its parent's
+  environment, and substitution has already happened). So `~/repos/jkb/.jkb/work/sess` resolved to
+  `/home/vscode/repos/sess`, which does not exist, and the near-miss was worse than the miss: a
+  literal fallback opened a **different checkout** silently, with every guard passing, because the
+  wrong repo is a perfectly good repo. **This is what supersedes the `workspaceFolder`/
+  `initializeCommand`/`check-workspace.sh` bullets in the section above.**
+- **The cost was concrete: a change to the container could only be tested after landing it.** A
+  session worktree carries its own `.container/`, so opening one is exactly how you would exercise
+  an edit — and that was the one thing Dev Containers could not do. Two rebuilds in a row tested
+  `main` instead, and read as the container being broken.
+- **Attaching has no `workspaceFolder`.** `.container/run.sh` starts one long-lived container from
+  `container.json`; you attach ("Dev Containers: Attach to Running Container") and open any path
+  inside, at any depth, with `code <path>` from an attached terminal opening more windows on the
+  same container. So the limitation and the guard that policed it both stop existing — and **one**
+  container serves every repo under `~/repos` rather than one per opened folder, which is what the
+  widened mount was for in the first place.
+- **Three alternatives were worked out and rejected, each on a fact rather than a preference.** A
+  relative symlink `~/repos/<name>` → the worktree gives `find_workspace_posture` a second
+  directory carrying `scripts/auto-mode-posture.json`, and it `fail_closed`s on first raise — that
+  refusal is deliberate and must not learn an exception. A nested bind at
+  `/home/vscode/repos/<basename>` has the same effect for the same reason. A **constant** workspace
+  path (`workspaceMount` from `${localWorkspaceFolder}` to a fixed target) handles any depth and
+  breaks session identity instead: claims are `session:<pid>:<worktree>` and liveness is *does that
+  worktree exist*, so every container would record one shared path and no claim would ever be
+  reclaimable.
+- **The file is `container.json` and the folder is `.container/`, and the names are the point.**
+  VS Code detects `devcontainer.json` and offers *Reopen in Container*, which would be a second way
+  to get a container — one built by Dev Containers, one by `run.sh` — and two launch paths that
+  start identical drift, in the mount list, which is the security boundary. Detection is
+  file-based as far as is known, so renaming the folder is belt-and-braces; it is done anyway
+  because the name asserted something no longer true, which is the same argument that renamed the
+  file.
+- **What replaces the deleted guard is a smaller, checkable claim.** `run.sh` is now the only thing
+  that applies `container.json`, so a key nobody reads is possible and looks exactly like
+  configuration — and the key most likely to be added is another `mounts`-shaped one.
+  `run.sh --consumed-keys` names what it reads and `check-config.sh` fails on any declared key not
+  in that list, so adding one forces the decision at the moment it is added rather than at the
+  moment somebody notices it never applied. `run.sh --self-test` is in `./scripts/check.sh`.
+- **An unset `${localEnv:VAR}` is REFUSED, where Dev Containers substitutes the empty string.**
+  That default is how `source=${localEnv:HOME}/repos` quietly becomes `source=/repos` — a different
+  host directory, mounted, with nothing to notice. A boundary must not be able to move because a
+  variable was not set.
+- **The lifecycle rule survives its mechanism.** The firewall is raised **first**, on every start,
+  because iptables rules live in the container's network namespace and do not survive a restart and
+  because the rest of setup includes a toolchain download.
+
+### Egress is asked of the kernel, not of a record (D51)
+
+Design: `openspec/changes/jkb-egress-liveness/`. Supersedes the **decision** half of D50 below,
+whose diagnosis and reason-record stand. Review round 3 (`low`, 3 reviewers, 17 raw → 10 findings,
+4 must-fix, none pre-existing) is the input; the findings cluster into seven causes, not ten sites.
+
+- **D50 made the raise record what it established. It never made the record say what it is about.**
+  A verdict is an *event* — "at some moment, a raise established X" — and every reader asks a
+  *present-tense* question: is egress bounded **now**? Nothing said when an older verdict stops
+  counting, so it counted for ever, and `docker stop` destroys every iptables rule while the file
+  survives in the writable layer. A raise that died before recording left the **previous start's**
+  `allowlisted` standing; the entrypoint read it, printed nothing, and exec'd the agent onto an
+  empty OUTPUT chain — unrestricted egress, silently, on exactly the `docker start` path the
+  entrypoint was added to cover.
+- **This repo already had the lesson, one subsystem over**: *"evidence of a landing is spent once
+  the task is put back to work."* Turning a history into a present-tense answer needs a rule for
+  when an older row stops counting; there it was written separately in each reader and they
+  disagreed, here it was written nowhere.
+- **So ask the kernel.** `egress-status.sh` is a second root-owned, argument-less, **read-only**
+  script granted by sudoers exactly as the firewall is; it reads the live filter chains and prints
+  one word. `entrypoint.sh` boots on that and `verify.sh` reports from it — which is what finally
+  makes verify's own comment true, since it claimed to report *"what the firewall DID"* while
+  reading a file that can outlive what it describes.
+- **Chosen over making the record trustworthy**, which is the obvious repair: a `state=raising`
+  marker plus a token naming the network namespace plus a staleness rule — three mechanisms
+  reconstructing what the kernel will simply tell you. Asking directly removes the failure class
+  instead of guarding it, and covers a case none of them do: `--entrypoint bash`, the escape D50's
+  own refusal recommends, runs **no raise at all**, so no marker is ever written.
+- **The record still supplies the REASON**, which the kernel cannot — that DNS failed, that the
+  snapshot was truncated. State from the probe, explanation from the record, and a record
+  disagreeing with the probe is reported as drift rather than obeyed.
+- **A measurement must measure its own claim.** `v6_state` was named *"is IPv6 egress provably
+  closed"* and asked *"does a non-loopback address exist"*, which was wrong in **both** directions.
+  Every container on a default Docker bridge gets a link-local `fe80::/64` when the host kernel has
+  IPv6 — nothing can leave — and that read as `open`, so ordinary containers refused to boot and
+  their operators were pushed onto the permanent override. And an *unreadable* table returned
+  `absent`, which the rule reads as provably closed: `grep` exits 0/1/**2** and only two of those
+  are measurements, with the third hidden behind `2>/dev/null`. It measures a **path** now — no
+  off-link address **and** no default route — and a failed read is `open`.
+- **A fact that can be read is never inferred.** `verify.sh` deduced the override from an
+  `unfiltered` state. So an operator who armed it and then fixed the host got `allowlisted` and
+  silence, with the boot gate still disarmed — the exact condition the override's own justification
+  says must never be invisible — and an `unfiltered` state reached any other way was *blamed* on a
+  variable that may be `0`. `docker exec` inherits `containerEnv`; it is read directly.
+- **One exit code cannot carry the transport and the answer.** `docker exec` exits 1 both when the
+  container is gone and when the probed condition is false, and `run.sh` sampled liveness **once**,
+  before the entrypoint had decided — `--detach` returns as PID 1 starts. So a refusal seconds later
+  was misread three ways, ending with *"the container is running and attachable"* about a container
+  that was not, from a verifier that never ran. There is one `docker exec` wrapper now, it waits for
+  the entrypoint to settle, and the setup probe **prints a word** instead of leaning on an exit code
+  the daemon also uses.
+- **Booting is not endorsing.** `--open` launches a VS Code window, which *is* starting a session, so
+  it opens only on a clean verify. The override buys a container you can attach to **by hand** and
+  diagnose. `verify.sh` gained a distinct exit code for "every failure is a condition this container
+  was configured to accept", so the failure is still reported at full volume every run while a caller
+  can tell it from a broken boundary — and the message stops advising you to fix a condition the
+  design requires to keep failing.
+- **Serialise in the callee.** Two raises run concurrently on every fresh create (the entrypoint's
+  and `run.sh`'s re-raise) over one ipset, one chain and one record; the interleavings install a
+  blanket deny on a machine with healthy DNS. `flock` at the top of `init-firewall.sh`, so a third
+  way to start a raise is covered without being told.
+- **A guard and its mutation must both discriminate.** The round-2 guard grepped the string
+  `verify.sh`, which `run.sh` also names in three failure **messages** — text on the pass path and
+  the fail path both — so deleting the invocation left it green; and the mutation written to watch it
+  fail rewrote **every** occurrence, so it never established which one the guard reads. Two rules
+  now: anchor on the **invocation**, and **a mutation changes exactly one thing.** The same cause
+  produced an assertion named *"the reason reaches the reader intact"* that passed only because it
+  was fed a single-line reason the writer never emits, while every real reason is multi-line and the
+  readers' `head -1` stripped the remedy. `record_verdict` flattens newlines — the one place it can
+  be enforced.
+- **Two lists that must agree, derived.** `scripts/check.sh` and `ci.yml` each enumerate the
+  container self-tests; `check-config.sh` compares them, plus a second guard that every
+  `--self-test` in `.container/` is run by the gate, since both lists could otherwise agree about
+  running nothing. **It found a live one immediately**: `link-claude-memory.sh --self-test` ran in
+  the gate and nowhere in CI.
+
+### The raise records a verdict, and the container boots on it (D50)
+
+Design: `openspec/changes/jkb-egress-verdict/`. Two review rounds produced a must-fix in this one
+subsystem, **the second caused by the first's fix**, which is the signal to model rather than
+patch again.
+
+- **`init-firewall.sh` computed whether egress was denied, printed it, and threw it away.** What it
+  recorded was a *cause string*, written by `fail_closed` **before** any `iptables` call with every
+  one of those calls `|| true` — so the marker meant *"`fail_closed` ran"*, which is a different
+  fact from *"egress is denied"*. Its four endings collapsed into two distinguishable ones, and the
+  two that mattered most — deny-all installed, and deny-all **failed** — wrote the identical thing.
+  `entrypoint.sh` read presence as proof of denial, printed `egress is DENIED`, and booted. On the
+  second one that sentence is false and an unattended agent gets an open network, on precisely the
+  `docker start` routes the entrypoint was added to cover.
+- **It is the house defect — an unestablished answer spelled as a definite one** — reproduced while
+  fixing a finding about a boundary that depended on its caller. `Fact::Unknown` collapsed to
+  `false`, `ahead_count` returning `0`, `has_own_commits` answering *no* when `rev-list` failed.
+- **The raise records a verdict** (`/run/jkb-egress-verdict`, root-owned, written on every ending):
+  `state=allowlisted|denied|unfiltered` plus the per-family detail and the reason. **Absence is its
+  own answer** — dying before the record leaves `unknown`, never `denied` — which is what makes
+  writing it *late* safe, where writing the old marker early was what made it uninformative.
+- **Denial must be ESTABLISHED, on both families.** A family that is not provably closed is open.
+  That rule now reaches the **success** path too: it used to allowlist IPv4, print *"IPv6 is
+  UNFILTERED"*, and report success anyway, its own comment conceding this was *"safe only because
+  the container has no IPv6 route, which is not checked here."*
+- **`unfiltered` refuses to boot.** The asymmetry decides it: refusing costs a debugging session and
+  prints its own escape (`docker run --entrypoint bash`); booting costs the guarantee, silently, on
+  the paths nothing else watches. A container in that state is nearly useless anyway — no allowlist
+  means no npm, no crates.io, no `api.anthropic.com` — so staying up buys diagnosability, not work.
+  `denied` still boots, loudly: it is safe, and it is the state you need to attach to in order to
+  repair it.
+- **…but absence of the path establishes denial too.** No `/proc/net/if_inet6`, or no non-loopback
+  v6 address, means no source address and no route: `v6=absent` satisfies the rule rather than
+  weakening it. Without that clause the container refuses to boot on any kernel lacking `ip6tables`
+  *even where IPv6 is not in play at all*. It is a measurement, and an unobtainable measurement is
+  `open` — which is also, exactly, what the existing `set -E`/ERR-trap guard demanded of the
+  assignment. **That guard caught this change as it was written**: a bare `v6="$(v6_state)"` would
+  have aborted the whole raise into `fail_closed`.
+- **The rule is stated once (`verdict_state`), because it was already spelled twice.** The
+  fail-closed path and the success path each decided "both families provably closed" in their own
+  wording, and that is *how* the success path came to report success on unfiltered IPv6: one site
+  was fixed and the other kept its own reading. They differ only in what bounded is called there —
+  a blanket deny is `denied`, a raised allowlist is `allowlisted` — which is an argument, not a
+  second rule. Found by this file's own question, *who else implements this rule*.
+- **The writer's half now has a self-test, and it was the half that had none.** The reader had
+  fourteen assertions and the measurement behind its verdict had zero — the wrong way round, since a
+  verdict is only as good as what established it. `init-firewall.sh --self-test` is pure and
+  path-injected (`JKB_INET6_PATH`, `JKB_EGRESS_VERDICT`): no iptables, no root, no `/proc`. It pins
+  the rule as a **literal table** rather than a re-derivation — writing the expectation as a second
+  copy of the condition passes for any condition, including the wrong one this replaced — and it
+  round-trips `record_verdict` through the **real** `entrypoint.sh`, which is the one contract
+  spanning two files that no static check can reach. All three groups were watched failing.
+- **The vocabulary is single-sourced too** (`VERDICT_STATES`). A reader with no arm for a state the
+  writer records drops it into `*`, and unknown means a container that refuses to boot **for ever**,
+  over a word. `check-config.sh` requires both readers to carry an arm for every declared state;
+  the self-test requires `verdict_state` to return nothing outside it. Neither half is decorative.
+- **Two existing guards fired on this change, and exempting them needed a guard of its own.** The
+  self-test block sits above `set -E`, so the stray-exit and bare-substitution rules do not apply to
+  it — but that is only true while it *exits* before the trap is installed. So the exemption is
+  paired with a check that the block ends in an exit: a refactor that let it fall through would run
+  during a real raise while still exempt from the two rules that make one survivable.
+- **The one escape is recorded.** `JKB_EGRESS_ACCEPT_UNFILTERED=1` in `containerEnv` — fixed at
+  create, so a session inside cannot grant it to itself, and `docker start` honours the same
+  decision, which a `run.sh` flag could not. `verify.sh` reports it as a **failure** every run for
+  as long as it is set: an override nobody can see is indistinguishable from a rule that does not
+  exist. Without it, a host with real IPv6 and no `ip6tables` could not start the container at all.
+- **`run.sh` learned that the entrypoint can refuse.** `docker run --detach` still returns 0, so
+  the next `docker exec` failed with a bare *"Container … is not running"* and `set -e` killed the
+  script, leaving the explanation in `docker logs` which nothing pointed at. And the synchronous
+  re-raise's failure is now recorded rather than fatal — under `set -e` it skipped the reap and
+  `verify.sh`, i.e. the very reporting the design assigns to verify.
+- **`--open` is an action, not a note.** Carrying verify's exit code so the attach instructions
+  still print is right; going on to launch a window into a container whose verifier just reported
+  undeclared mounts is not. Before the result was carried, `set -e` made that unreachable.
+- **Four guards, because a guard that cannot fire is this directory's recurring defect.** Nothing
+  asserted the Dockerfile still wires the `ENTRYPOINT` — delete one line and every check stays
+  green while `docker start` comes up unfiltered. The round-1 "one verifier" guard checked only
+  that `setup.sh` does *not* verify while its passing line claimed `run.sh` does. The verdict path
+  is spelled by one writer and two readers in three processes that cannot share a variable, so
+  their agreement is asserted like the setup marker's. **And the mutation harness caught the
+  drift-detection guard being unable to fire**: grepping for the literal path it already knew could
+  only ever find one distinct value, so it now extracts each file's own spelling and compares those.
+
+### What review round 1 found: replacing a lifecycle moves its guarantees onto whoever replaces it
+
+Fifteen findings, four must-fix, **every one `introduced`** — and three of the four are one
+sentence: `postCreateCommand`/`postStartCommand` were not just *steps*, they were the statements
+*this happens on every start* and *this happens until it succeeds*. Deleting the lifecycle deleted
+the guarantees while the steps survived, and each defect is one guarantee that then had no owner.
+
+- **The firewall belongs to the CONTAINER, not to `run.sh`.** As one caller's step, `docker start
+  jkb-dev`, Docker Desktop's start button and a daemon restart all brought the container up with no
+  allowlist, and nothing checked, because attaching runs nothing. It is the image's **ENTRYPOINT**
+  now, so every route raises it. `run.sh` re-raises it synchronously — not a second rule, the raise
+  is idempotent, but `docker run` returns before the entrypoint finishes and the next `docker exec`
+  would race it. Two failure modes, answered differently: `init-firewall.sh`'s own `fail_closed`
+  has already installed deny-all and recorded why, so the container stays **up** (egress denied,
+  `verify.sh` reports the marker, a person can repair it); a failure that left no marker installed
+  no rules and **refuses to run**.
+- **"Did this invocation create the container" is not "did setup finish".** `fresh=1` is true a
+  minute before setup completes, so an interrupted first run left `setup.sh` permanently
+  unreachable — every later run took the verify arm, and only `--rm` escaped. The arm is chosen on
+  a marker `setup.sh` writes as its **last** act. It is spelled in two files that cannot share a
+  variable (one runs on the host, one in the container), so `check-config.sh` asserts they agree:
+  drift there re-runs the whole of setup for ever while reporting success, which reads as slowness
+  rather than as a bug.
+- **A fingerprint of the derived arguments included the host checkout path.** `runArgs` names the
+  seccomp profile by `${localWorkspaceFolder}`, so a session worktree — *the case this change
+  exists to enable* — computed a different hash from its main checkout, was told `created from a
+  different container.json` about a file that had not changed, and was advised `--rm`, destroying
+  the shared container plus `~/.vscode-server`, its extensions and `~/.jkb-ui-build`, none of which
+  are in a volume. Then the main checkout refused identically: two checkouts ping-ponging over a
+  declaration they agreed on. The workspace root is normalised out and the profile's **content** is
+  folded in, so a profile that really differs still forces a recreate.
+- **An assertion whose two conditions used to be one.** `verify.sh` checked the declared extensions
+  under the same condition `setup.sh` installs them under — true under Dev Containers, where the
+  server was unpacked before `postCreate`. Now the server arrives when you **attach**, so setup
+  installs nothing and the next `run.sh` finds a server with nothing in it: fatal, under `set -e`,
+  with the remedy "rebuild the container" — which reproduces that exact state. The never-installed
+  case reports and names `install-extensions.sh`; a server that has extensions but is missing a
+  declared one is still a failure, because that is the original bug.
+- **A verify that aborts is a verify that suppresses everything after it.** The deferred-archive
+  reap was unconditional in `postStartCommand` and ended up downstream of a fatal `verify.sh`, so
+  one unrelated assertion disabled the only reaper that can finish container-side archive records.
+  It runs **before** the verify now, and the verify's result is *carried* rather than exiting at
+  the point of failure — several assertions name a remedy you run from inside an attached window,
+  and dying printed the problem while withholding the way to fix it. The exit code is still
+  verify's.
+- **Two guards could not fire and one was inert.** `fetch-extensions.sh --self-test` was called by
+  nothing, so the marketplace URL derivation was exercised by no automated run; a zero-length
+  extension list staged nothing and exited 0; and `consumed_keys()` listed `name` and `build` while
+  `run.sh` read neither — so "every key is applied" was a true sentence about two inert
+  declarations, and the fix for the *next* inert key would have been to add it to the list, which
+  silences the check rather than satisfying it. Both keys are read now.
+- **Deriving a list forces a distinction that enumerating one hides.** The firewall-argument guard
+  named `setup.sh` and `run.sh` by hand, in a directory this change gave a third caller. Derived
+  over the directory, it immediately produced three false positives — the file name in a comment,
+  in an error message, and in a list of paths to `chmod` — because "mentions it" was only ever a
+  good enough proxy for "calls it" across two hand-picked files. It is anchored on `sudo` now,
+  which is the only way it *can* be invoked.
+- **`--build` rebuilt the image and left the container on the old one**, so a newly staged `.vsix`
+  never arrived while `install-extensions.sh` said "rebuild the container" — advice just followed.
+  The staleness check's own argument (`docker start` reuses what the container was built with)
+  applies to the image and was applied only to the arguments.
 
 ## Code review (D37) — our own reviewer, because the host's is not composable
 
