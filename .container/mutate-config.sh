@@ -318,7 +318,19 @@ out = re.sub(r'^  mount,.*$', '  deny mount,', s, count=1, flags=re.M)
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
-run "the profile denies mount again" "still denies"
+run "the profile denies mount again" 'still denies `mount`'
+
+# pivot_root is the half that is easy to lose, because a profile carrying only `mount,` reads
+# exactly like one that works -- that was the state the second CI run measured, and it failed with
+# `pivot_root: Permission denied` after the first had failed at `Failed to make / slave`.
+seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+out = re.sub(r'^  pivot_root,.*\n', '', s, count=1, flags=re.M)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the profile drops pivot_root, which mount, does not cover" 'does not allow `pivot_root`'
 
 seed; python3 - "$work/t/.container/apparmor-jkb-dev" <<'PYX'
 import re, sys

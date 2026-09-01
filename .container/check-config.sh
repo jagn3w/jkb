@@ -419,10 +419,20 @@ if [ -z "$aa_name" ]; then
     bad "$aa_file declares no profile — run.sh, mutate-verify.sh and verify.sh all derive the profile name from it, so they would pass an empty one to docker"
 else
     aa_ok=1
-    # The one deliberate difference. An explicit `deny` cannot be overridden later in AppArmor, so
-    # the deny must be ABSENT rather than merely followed by an allow.
-    grep -qE '^[[:space:]]*mount,' "$aa_file" || { bad "$aa_file does not allow \`mount\` — bubblewrap cannot start under it, which is the whole reason it exists"; aa_ok=0; }
-    grep -qE '^[[:space:]]*deny[[:space:]]+mount,' "$aa_file" && { bad "$aa_file still denies \`mount\` — an explicit deny wins over any later allow in AppArmor, so bubblewrap would still fail"; aa_ok=0; }
+    # The deliberate difference: the mount FAMILY. `pivot_root` is a rule type of its own in
+    # AppArmor and is NOT covered by `mount,` -- docker-default names no pivot_root rule, and an
+    # unnamed rule type is denied. Both are asserted because they were needed in sequence and each
+    # was measured: allowing `mount,` alone moved bwrap's failure from `Failed to make / slave` to
+    # `pivot_root: Permission denied`, and a profile with only the first reads exactly like a
+    # profile that works. `umount,` is upstream's own and is covered by the kept-restrictions list.
+    for allow in mount pivot_root; do
+        grep -qE "^[[:space:]]*$allow," "$aa_file" \
+            || { bad "$aa_file does not allow \`$allow\` — bubblewrap cannot start under it, which is the whole reason the profile exists"; aa_ok=0; }
+        # An explicit `deny` cannot be overridden later in AppArmor, so a deny must be ABSENT
+        # rather than merely followed by an allow.
+        grep -qE "^[[:space:]]*deny[[:space:]]+$allow," "$aa_file" \
+            && { bad "$aa_file still denies \`$allow\` — an explicit deny wins over any later allow in AppArmor, so bubblewrap would still fail"; aa_ok=0; }
+    done
     # ...and the restrictions it is supposed to KEEP. Named members, not a count, for the reason
     # the seccomp check gives: a threshold passes while silently losing the entries under it.
     # ANCHORED ON THE RULE, not on a mention of it, and with NO HAND-ROLLED REGEX ESCAPING --

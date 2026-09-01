@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Regenerate .container/apparmor-jkb-dev (design D49/D52).
 #
-# The profile is Docker's OWN `docker-default` with exactly one rule changed: `deny mount,` becomes
-# `mount,`. It is vendored rather than generated at run time for the reason generate-seccomp.sh
-# gives: the security policy the container actually runs under is then reviewable in a diff, and
-# loading works offline. Re-run this to refresh it against a newer upstream.
+# The profile is Docker's OWN `docker-default` with the mount family opened up: `deny mount,`
+# becomes `mount,`, and `pivot_root,` is added (AppArmor denies a rule type nobody names). It is
+# vendored rather than generated at run time for the reason generate-seccomp.sh gives: the security
+# policy the container actually runs under is then reviewable in a diff, and loading works offline.
+# Re-run this to refresh it against a newer upstream.
 #
 # WHY THIS SCRIPT EXISTS AT ALL. The first version of the profile was TRANSCRIBED BY HAND from
 # memory of moby's template, and hand-transcribing a security policy is exactly as bad as it
@@ -19,12 +20,12 @@
 #
 # WHY NOT `apparmor=unconfined`: that discards the whole profile -- the /proc write denials,
 # sysrq-trigger, kcore, the /sys restrictions, the network denials and the ptrace confinement --
-# none of which bubblewrap needs. This gives up one rule instead of all of them.
-# WHY THE ONE RULE IS A SMALLER CONCESSION THAN IT LOOKS: `.container/seccomp-bwrap.json` already
-# re-allows the mount syscalls for the same purpose and states the same reason -- they are only
-# reachable inside the user namespace bubblewrap creates, where the process holds no privilege
-# over the host. AppArmor was silently overriding a decision this design had already taken and
-# reviewed, which is why the nested sandbox had never actually started on Linux.
+# none of which bubblewrap needs. This gives up the mount family instead of all of them.
+# WHY THAT IS A SMALLER CONCESSION THAN IT LOOKS: `.container/seccomp-bwrap.json` already re-allows
+# `mount`, `umount2` and `pivot_root` by name for the same purpose and states the same reason --
+# they are only reachable inside the user namespace bubblewrap creates, where the process holds no
+# privilege over the host. AppArmor was silently overriding a decision this design had already
+# taken and reviewed, which is why the nested sandbox had never actually started on Linux.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/apparmor-jkb-dev"
@@ -149,12 +150,26 @@ profile = render(tree, {})
 
 # ---------------------------------------------------------------------- the one deliberate patch
 DENY_MOUNT = "  deny mount,"
-PATCHED = "  mount,  # PATCHED: upstream docker-default has `deny mount,` here. See the header."
+PATCHED = """\
+  # PATCHED, and this is the ONLY difference from docker-default. Upstream has `deny mount,` here
+  # and names no pivot_root rule at all -- and in AppArmor an unnamed rule type is DENIED, so both
+  # lines are needed. Measured in that order: allowing `mount,` alone moved bubblewrap's failure
+  # from `Failed to make / slave` to `pivot_root: Permission denied`, which is what named the
+  # second line. AppArmor's mount family is mount / remount / umount / pivot_root; `umount,` is
+  # already granted above and `remount` is a mount option covered by the unqualified `mount,`, so
+  # with these two the family is complete and no third line should become necessary.
+  mount,
+  pivot_root,"""
 n = profile.count(DENY_MOUNT + "\n")
 if n != 1:
     sys.exit(f"expected exactly one `{DENY_MOUNT}` line in the rendered profile, found {n} — "
              f"upstream changed the rule this patch targets, so the patch must be re-derived "
              f"rather than silently applied to nothing")
+# Upstream naming a pivot_root rule of its own would mean this patch is adding a line beside one
+# that already exists -- a duplicate at best, and a contradiction if theirs is a deny.
+if "pivot_root" in profile:
+    sys.exit("upstream now names a pivot_root rule of its own — re-derive the patch rather than "
+             "adding a second one beside it")
 profile = profile.replace(DENY_MOUNT + "\n", PATCHED + "\n")
 
 # --------------------------------------------------------------------------- verify the render
@@ -179,31 +194,36 @@ HEADER = f"""\
 # Source: {url}
 # upstream-sha256: {digest}
 #
-# This is Docker's own `docker-default` with EXACTLY ONE rule changed: `deny mount,` becomes
-# `mount,` (the line marked PATCHED below). Everything else is rendered verbatim from moby's
-# template, so every other restriction docker-default imposes is kept.
+# This is Docker's own `docker-default` with ONE CHANGE, at the single site marked PATCHED below:
+# the mount family is opened up. `deny mount,` becomes `mount,`, and `pivot_root,` is added --
+# AppArmor denies a rule type no rule names, and docker-default names none for pivot_root.
+# Everything else is rendered verbatim from moby's template, so every other restriction
+# docker-default imposes is kept.
 #
 # WHY THE CHANGE IS NEEDED. Claude Code's Linux sandbox shells out to bubblewrap, which creates a
-# user namespace and then re-mounts the root inside it. docker-default denies `mount` outright, so
-# bwrap fails at its first mount with `Failed to make / slave: Permission denied` -- namespaces
-# created, mounts refused. Measured, not assumed: a container reports
-# `apparmor profile in force: docker-default (enforce)` and fails exactly there, while the seccomp
-# profile demonstrably allows the mount syscalls.
+# user namespace, re-mounts the root inside it, and pivots into it. docker-default denies `mount`
+# outright, so bwrap failed at its first mount with `Failed to make / slave: Permission denied`.
+# Allowing `mount,` moved the failure to `pivot_root: Permission denied` -- reported by a container
+# whose profile in force was `jkb-dev (enforce)`, which is also the evidence that the profile
+# applies INSIDE the user namespace and that Ubuntu's apparmor_restrict_unprivileged_userns is not
+# transitioning bwrap into some other profile. Each step measured, not assumed.
 #
-# WHY IT IS NOT A NEW CONCESSION. `.container/seccomp-bwrap.json` already re-allows `mount`,
-# `umount2`, `pivot_root` and the rest for precisely this purpose, and states the reason: those
-# calls are only reachable inside the user namespace bubblewrap creates, where the process holds
-# no privilege over the host. AppArmor was silently overriding a decision this design had already
-# taken and reviewed -- which is why the nested sandbox had never actually started on Linux.
+# WHY NEITHER IS A NEW CONCESSION. `.container/seccomp-bwrap.json` already re-allows `mount`,
+# `umount2` and `pivot_root` BY NAME for precisely this purpose, and states the reason: those calls
+# are only reachable inside the user namespace bubblewrap creates, where the process holds no
+# privilege over the host. AppArmor was silently overriding a decision this design had already
+# taken and reviewed -- twice, once per rule -- which is why the nested sandbox had never actually
+# started on Linux.
 #
 # AN EXPLICIT `deny` CANNOT BE OVERRIDDEN LATER IN APPARMOR -- deny wins over allow whatever the
 # order -- so the rule has to be REPLACED rather than followed by an allow. That is why this is a
 # whole profile rather than an include-plus-override.
 #
-# NARROWING, stated rather than pretended: `mount,` permits every mount operation, not only the
-# ones bwrap performs. AppArmor can qualify by fstype and mount point, but bwrap's sequence spans
-# several (tmpfs, proc, sysfs, bind, MS_SLAVE propagation changes) and a too-narrow rule fails at
-# run time in a way that reads exactly like the bug this fixes. Left broad deliberately, bounded
+# NARROWING, stated rather than pretended: `mount,` permits every mount operation and
+# `pivot_root,` every pivot, not only the ones bwrap performs. AppArmor can qualify by fstype and
+# mount point, but bwrap's sequence spans several (tmpfs, proc, sysfs, bind, MS_SLAVE propagation
+# changes) and a too-narrow rule fails at run time in a way that reads exactly like the bug this
+# fixes. Left broad deliberately, bounded
 # by being reachable only inside the user namespace, and noted as the next tightening.
 #
 # LOADING IT IS A HOST ACTION and needs root, so a container cannot do it for itself:
@@ -219,7 +239,8 @@ with open(dst, "w") as f:
     f.write(profile if profile.endswith("\n") else profile + "\n")
 
 kept = sum(1 for ln in profile.splitlines() if ln.strip().startswith("deny "))
-print(f"wrote {dst}: profile {DATA['Name']}, {kept} deny rules kept, 1 rule relaxed")
+relaxed = sum(1 for ln in PATCHED.splitlines() if ln.strip() and not ln.strip().startswith("#"))
+print(f"wrote {dst}: profile {DATA['Name']}, {kept} deny rules kept, {relaxed} rule(s) relaxed")
 print(f"  from {url}")
 print(f"  upstream sha256 {digest}")
 PY
