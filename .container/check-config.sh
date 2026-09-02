@@ -42,6 +42,22 @@ else
     bad "container.json does not pair --security-opt with seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json — Docker would apply its default profile and bubblewrap could not start"
 fi
 
+# `systempaths=unconfined` is the second half of what bubblewrap needs, and it is separate from
+# seccomp: Docker's masked /proc paths are SUBMOUNTS, so /proc is not "fully visible" and the
+# kernel refuses a fresh proc mount inside a user namespace whatever the syscall filter allows.
+# Without it the nested sandbox cannot start at all, and because the posture fails closed that
+# surfaces as Bash erroring rather than as anything naming this flag. Asserted as a FLAG/VALUE
+# PAIR for the same reason as the profile above — an orphaned value reads as a declaration and
+# applies nothing.
+if jq -e --arg v "systempaths=unconfined" \
+      '[.runArgs // [] | to_entries[] | select(.value == "--security-opt") | .key]
+       | any(. as $i | ($ARGS.named.v) == ($in_args[$i+1] // ""))' \
+      --argjson in_args "$(jq -c '.runArgs // []' <<<"$dc")" <<<"$dc" >/dev/null 2>&1; then
+    ok "runArgs pairs --security-opt with systempaths=unconfined"
+else
+    bad "container.json does not pair --security-opt with systempaths=unconfined — Docker's masked /proc paths would make the kernel refuse bubblewrap's proc mount, so Claude Code's nested sandbox could not start"
+fi
+
 # Non-root is load-bearing (root cannot create a mount namespace in a container), so a
 # `"remoteUser": "root"` would break the nested sandbox while looking like a simplification.
 if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — the nested sandbox cannot start"; fi

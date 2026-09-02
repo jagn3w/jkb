@@ -144,6 +144,11 @@ run "remoteUser becomes root" "remoteUser is root"
 seed; jq_dc '.runArgs |= map(select(. != "--security-opt"))'
 run "the --security-opt flag is dropped, leaving its value orphaned" "--security-opt"
 
+# ONE THING: drops only the systempaths VALUE, so the seccomp pair still holds and this can only
+# be the new assertion failing. Dropping the flag (above) breaks both, which establishes neither.
+seed; jq_dc '.runArgs |= map(select(. != "systempaths=unconfined"))'
+run "the /proc unmask is dropped, so bubblewrap could not mount proc" "systempaths=unconfined"
+
 seed; sub_dc '"--cap-add=NET_ADMIN",' ''
 run "NET_ADMIN is dropped" "no longer declares --cap-add=NET_ADMIN"
 
@@ -724,7 +729,7 @@ run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparm
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=65
+PINNED_BAD_SITES=66
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

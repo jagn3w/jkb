@@ -168,7 +168,16 @@ fi
 # /usr/bin/env bash is on macOS (3.2.57). So `--control`, the one sanctioned "is my container
 # healthy" command and the one run.sh's own refusals point at, died on this line naming nothing.
 # run.sh:147 already uses this idiom for exactly this reason.
-HEALTHY=(--security-opt seccomp="$SEC" ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
+# `systempaths=unconfined` is in here because container.json passes it and a control that does not
+# certifies a container nobody runs: without it Docker's masked /proc paths make the kernel refuse
+# bubblewrap's proc mount, so the nested sandbox cannot start. It also changes what verify.sh can
+# see — the AppArmor policy probe needs the MASKED /proc/kcore and degrades to a note without the
+# mask — so a harness missing this flag would exercise an arm the real container never reaches.
+# NOTE: the subtractive mutations below still spell reduced sets by hand and do not carry it. That
+# is harmless while nothing verify.sh asserts depends on the unmask, and must be revisited with the
+# bwrap probe (task:verify-sh-should-assert-the-nest-18d1758d49e87458), or those mutations will
+# differ from healthy in two ways at once and establish nothing.
+HEALTHY=(--security-opt seccomp="$SEC" --security-opt systempaths=unconfined ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 
 # One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
 # runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
