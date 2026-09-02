@@ -447,6 +447,58 @@ plain dotfiles with identical TCC status differing only in the posture.
 Use `auto-mode.sh sandboxed` for this, **never** `printenv CLAUDE_CODE_SANDBOXED`: that variable was
 **unset** throughout the measurement above. It had been this repo's recommended test.
 
+One half of it **is** now established, negatively and then positively: the nested sandbox was not
+running at all, because `bwrap` could not mount `/proc` — see the section below. That was invisible
+for as long as it was, because nothing here ever asserted the nested sandbox works. `verify.sh`
+checks mounts, seccomp, sudo, egress and extensions, and never checked the thing the container
+exists to host.
+
+## `/proc` has to be unmasked, and on Linux that is an unfinished trade
+
+Docker masks a dozen `/proc` and `/sys` paths by mounting over them. Those masks are *submounts*,
+which makes `/proc` not "fully visible", and the kernel then refuses a fresh `proc` mount inside a
+non-initial user namespace (`mount_too_revealing()`). So `bwrap` fails with `Can't mount proc on
+/newroot/proc`, and because the posture sets `failIfUnavailable: true`, Bash **errors** rather than
+running unconfined. `container.json` therefore passes `--security-opt systempaths=unconfined`.
+Measured with a negative control, one flag apart: with it the nested proc mount succeeds, without it
+it is denied.
+
+**Seccomp was necessary, not sufficient.** The 14 syscalls fixed namespace *creation*; mounting
+`proc` is a later step, and nothing had ever exercised it — `generate-apparmor.sh` says as much
+("the nested sandbox had never actually started on Linux").
+
+Docker has no selective unmask, so this is all-or-nothing. What the masks hid is still denied by
+the permission bits — `kcore`, `sysrq-trigger` and `/proc/sys` writes are root-only, and the
+container is not root — so what is traded away is *information*, not capability. Three host classes,
+and only one of them is a problem:
+
+| host | compensating layer | residual |
+|---|---|---|
+| macOS / Docker Desktop | none, but the exposed host is the LinuxKit VM | small |
+| Linux **with** AppArmor | `apparmor-jkb-dev` re-denies `kcore`, `sysrq-trigger`, `/sys/firmware`, powercap | smallest |
+| Linux **without** AppArmor (SELinux, or no LSM) | **none** | timing side channels against the real host — `/proc/interrupts` is world-readable and was protected only by the mask |
+
+**The third row is the unfinished part, and it matters more as Linux becomes the main platform.**
+How it should be fixed, in order of leverage:
+
+1. **Upstream, which removes the trade entirely.** If `bwrap` bind-mounted `/proc` instead of
+   fresh-mounting it, no flag would be needed. That invocation belongs to
+   `@anthropic-ai/sandbox-runtime`, not to us, so this is a report to file rather than a patch.
+2. **Fail closed on the uncompensated cell.** On Linux, masks off *and* no LSM profile mediating
+   should refuse to start, the same shape as the egress boot gate — a container that cannot honour
+   the boundary should say so rather than run and look identical to one that can. macOS is accepted
+   explicitly, because the host there is the VM.
+3. **Report which layer is in force.** When masks are off, `verify.sh` should say whether
+   `apparmor-jkb-dev`, some other LSM, or nothing is compensating. An unstated residual is
+   indistinguishable from coverage.
+4. **Restore the discriminator the flag cost.** The mask is what made the AppArmor profile testable
+   — docker-default's denials otherwise overlap what DAC already restricts to root, so a denial
+   proves nothing. Replacement is a `bwrap` probe (which separates this profile from stock
+   `docker-default`) plus the `(enforce)` mode, which `verify.sh` currently reads and discards.
+5. **Check whether podman's `--security-opt unmask=` helps.** Reasoned dead — any surviving mask
+   should still trip the kernel check — but unverified, and it needs a Linux box with podman. If it
+   works it is strictly better than all-or-nothing.
+
 ## On a Linux host
 
 Better, mostly: no VM, so bind mounts are native and the IO penalty above disappears. Two things
