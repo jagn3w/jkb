@@ -1,0 +1,25 @@
+{
+  // A `jkb task work` session is a full checkout inside the repo, so this folder holds several
+  // Cargo workspace roots. `linkedProjects` disables rust-analyzer's auto-discovery so it indexes
+  // only this one; the path is relative, so it is also right for a window opened on a session.
+  "rust-analyzer.linkedProjects": ["Cargo.toml"],
+  "rust-analyzer.files.excludeDirs": ["target", ".jkb", ".swarm", "ui/node_modules"],
+
+  // The file watcher does not read .gitignore, so build output and nested checkouts need
+  // excluding here as well as there.
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.jkb/**": true,
+    "**/.swarm/**": true,
+    "**/node_modules/**": true,
+    "**/.git/objects/**": true
+  },
+
+  // Only matters if `search.useIgnoreFiles` is turned off.
+  "search.exclude": {
+    "**/target": true,
+    "**/.jkb": true,
+    "**/.swarm": true,
+    "**/node_modules": true
+  }
+}
