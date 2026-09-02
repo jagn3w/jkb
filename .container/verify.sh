@@ -328,6 +328,11 @@ case "$aa_profile" in
         #              and DAC would refuse it, which is the old defect exactly.
         #   a control  a read that must succeed. If reads are failing wholesale the denial says
         #              nothing about policy, so that is reported as unestablished, not as a pass.
+        # NOW PERMANENTLY THE FIRST ARM, because container.json passes `systempaths=unconfined` --
+        # the nested sandbox cannot start without it. The mask was what made this profile testable:
+        # docker-default's denials otherwise overlap what DAC already restricts to root, so a
+        # denial discriminates nothing. Kept rather than deleted so the check returns if the mask
+        # ever does. Named residual: an edited profile that still allows `mount` is undetectable.
         if [ ! -c /proc/kcore ]; then
             note "cannot check the profile's POLICY: /proc/kcore is not the masked char device this probe needs, so a denial could come from the permission bits rather than from AppArmor ($aa_want is in force by name)"
         elif ! head -c1 /proc/self/cmdline >/dev/null 2>&1; then

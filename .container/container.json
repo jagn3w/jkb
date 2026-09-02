@@ -41,6 +41,14 @@
     // it with the checkout that provides this container, which is what it always meant here.
     "--security-opt", "seccomp=${localWorkspaceFolder}/.container/seccomp-bwrap.json",
 
+    // Docker's masked /proc paths are submounts, so /proc is not "fully visible" and the kernel
+    // refuses a fresh proc mount inside a user namespace -- bubblewrap, and so Claude Code's
+    // nested sandbox, cannot start. Measured with a control, one flag apart. Docker has no
+    // selective unmask. What the masks were hiding stays denied by the permission bits (kcore,
+    // sysrq-trigger and /proc/sys writes are all root-only) and, where AppArmor mediates, by
+    // apparmor-jkb-dev; the residual is timing side channels on a Linux host with neither.
+    "--security-opt", "systempaths=unconfined",
+
     // For init-firewall.sh. Scoped to this container's own network namespace, so it cannot touch
     // host networking.
     "--cap-add=NET_ADMIN",
