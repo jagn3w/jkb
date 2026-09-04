@@ -956,6 +956,22 @@ if [ -f "$here/../ui/vscode/package.json" ]; then
     fi
 fi
 
+# A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process
+# substitution's exit status, so a refusal inside one kills the subshell alone and the reading loop
+# keeps whatever was emitted before it. `dc_subst` refuses on an unset ${localEnv:…} precisely so a
+# boundary cannot move because a variable was not set; `dc_run_args` and `docker_args` carry that
+# refusal outward. All three emit as they go, so the caller is left holding not nothing — which
+# every caller checks for — but a TRUNCATED list: a container started without the mounts or the
+# security flags it declares, a fingerprint over half a declaration, a control certified without
+# the flag it was assembled to carry. That last one is the state deriving the control's flags was
+# meant to end, so the derivation would have reintroduced it one level down.
+procsub="$(grep -n '< <([[:space:]]*\(docker_args\|dc_run_args\|dc_subst\)' "$here"/*.sh /dev/null || true)"
+if [ -z "$procsub" ]; then
+    ok "no refusing producer is read through a process substitution"
+else
+    bad "a refusing producer is read through < <( ), which discards its refusal and leaves a truncated list: $(tr '\n' ' ' <<<"$procsub")"
+fi
+
 for s in "$here"/*.sh; do
     if bash -n "$s" 2>/dev/null; then ok "$(basename "$s") parses"; else bad "$(basename "$s") has a syntax error"; fi
 done

@@ -205,7 +205,13 @@ fi
 # mounts (a scratch knowledge base, the repo bind this harness `--declare`s) and are documented
 # above as the harness's own.
 RUNARGS=()
-while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done < <(dc_run_args "$REPO/.container/container.json" "$REPO")
+# Read through `$( )`: a `< <( )` here would discard dc_run_args' refusal, and because it emits
+# each argument as it substitutes it, a refusal PART WAY would leave a truncated set the emptiness
+# check below cannot see — a control missing one declared flag, which is the exact state this
+# derivation exists to end. See lib.sh, and check-config.sh, which fails the gate on that shape.
+if _ra="$(dc_run_args "$REPO/.container/container.json" "$REPO")" && [ -n "$_ra" ]; then
+    while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done <<<"$_ra"
+fi
 # EMPTY IS A FAILURE, NOT A CONTROL WITH NO FLAGS. `dc_run_args` returns 1 on an unset ${localEnv:…}
 # and yields nothing on unreadable or malformed JSON; a control assembled from that would run with
 # no seccomp profile and no /proc unmask, and its FAILs would read as a broken container.

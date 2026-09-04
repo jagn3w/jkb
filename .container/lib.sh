@@ -58,6 +58,17 @@ dc_run_args() { # dc_run_args <container.json> <repo-root>  -> one docker argume
     done < <(dc_strip "$1" 2>/dev/null | jq -r '(.runArgs // [])[]' 2>/dev/null)
 }
 
+# READ A REFUSING PRODUCER THROUGH `$( )`, NEVER THROUGH `< <( )`. `dc_subst`, `dc_run_args` and
+# run.sh's `docker_args` all REFUSE — that is the whole point of the unset-${localEnv:…} error
+# above — and bash discards a process substitution's exit status, so a refusal inside one kills
+# only the subshell while the reading loop keeps whatever was emitted before it. These producers
+# emit as they go, so what the caller is left holding is not nothing (which every caller checks
+# for) but a TRUNCATED list: a container started without the mounts or the security flags it
+# declares, a fingerprint taken over half a declaration, a control certified without the flag it
+# was assembled to carry. Command substitution propagates the status; check-config.sh fails the
+# gate on a `< <(` reading any of the three, so this is a rule the checker keeps rather than one
+# each call site has to remember.
+
 # The user the container runs as, or empty when it declares none.
 dc_remote_user() { # dc_remote_user <container.json>
     dc_strip "$1" 2>/dev/null | jq -r '.remoteUser // empty' 2>/dev/null

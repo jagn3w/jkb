@@ -141,8 +141,13 @@ fingerprint() { # fingerprint <repo-root> <arg>...
 # function of something other than what gets run. No declared value contains whitespace today,
 # which is what makes this the cheap moment to fix it rather than the expensive one.
 config_hash() { # config_hash <config> <repo-root>
-    local a=() l
-    while IFS= read -r l; do a+=("$l"); done < <(docker_args "$1" "$2")
+    local a=() l out
+    # `$( )`, not `< <( )`: see lib.sh. A `die` inside docker_args exits only the subshell, so
+    # reading it that way fingerprinted whatever had been emitted before the refusal — half a
+    # declaration, hashed as if it were the whole one, which then either matches a running
+    # container it does not describe or advises recreating one that was fine.
+    out="$(docker_args "$1" "$2")" || die "container.json could not be read; refusing to fingerprint half a declaration"
+    while IFS= read -r l; do a+=("$l"); done <<<"$out"
     fingerprint "$2" ${a[@]+"${a[@]}"}
 }
 
@@ -361,9 +366,13 @@ ctr_repo="$(container_path "$repo")" || die "this checkout ($repo) is not under 
   the answer is any of them: you attach to the container and open any path inside it.)"
 
 # Read with a plain loop, not `mapfile`: macOS ships bash 3.2, which does not have it, and this
-# script's whole point is to be the way a Mac gets a container.
+# script's whole point is to be the way a Mac gets a container. Through `$( )` rather than
+# `< <( )` so that docker_args' refusal reaches this script instead of dying in a subshell and
+# leaving a truncated argument list here — a container started without the mounts or the security
+# flags it declares. See lib.sh.
 ARGS=()
-while IFS= read -r line; do ARGS+=("$line"); done < <(docker_args "$CONFIG" "$repo")
+ARGS_OUT="$(docker_args "$CONFIG" "$repo")" || die "container.json could not be read; refusing to start a container from a partial declaration"
+while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"
 
 # THE APPARMOR PROFILE IS A HOST FACT, so it is decided here rather than declared in
 # container.json: whether AppArmor mediates containers at all depends on the machine, and passing

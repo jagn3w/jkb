@@ -773,6 +773,38 @@ open(p, 'w').write(s.replace(old,
 PYX
 run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparmor_mediates"
 
+# A REFUSING PRODUCER READ BACK THROUGH A PROCESS SUBSTITUTION, which is how all three consumers
+# were written before the rule was stated. BOTH files, because the guard globs $here/*.sh and a
+# pattern that only ever matched one of them would look identical to one that covers them all.
+#
+# The offending text is BUILT rather than written out: check-config.sh scans every *.sh in the
+# directory, this harness among them, and it cannot tell a shell command from the same characters
+# sitting inside a python payload. Spelling it here would make the guard fail on a healthy tree —
+# so it is `PS`, and re-inlining it is what would turn the gate red.
+PS='< <'
+seed; python3 - "$work/t/.container/run.sh" "$PS" <<'PYX'
+import sys
+p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
+old = ('ARGS_OUT="$(docker_args "$CONFIG" "$repo")" || die "container.json could not be read; '
+       'refusing to start a container from a partial declaration"\n'
+       'while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"')
+assert old in s, "mutation target absent"
+new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(docker_args "$CONFIG" "$repo")' % ps
+open(p, 'w').write(s.replace(old, new, 1))
+PYX
+run "run.sh reads docker_args through a process substitution again" "which discards its refusal"
+
+seed; python3 - "$work/t/.container/mutate-verify.sh" "$PS" <<'PYX'
+import sys
+p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
+old = 'if _ra="$(dc_run_args "$REPO/.container/container.json" "$REPO")" && [ -n "$_ra" ]; then'
+assert old in s, "mutation target absent"
+new = ('if true; then _ra=""\n    while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done '
+       '%s(dc_run_args "$REPO/.container/container.json" "$REPO")' % ps)
+open(p, 'w').write(s.replace(old, new, 1))
+PYX
+run "the control reads dc_run_args through a process substitution again" "which discards its refusal"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -785,7 +817,7 @@ run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparm
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=70
+PINNED_BAD_SITES=71
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
