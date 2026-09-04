@@ -260,8 +260,22 @@ if [ "${1:-}" = --self-test ]; then
     args="$(docker_args "$CONFIG" "$repo")"
     # `-e`, because every pattern here starts with a dash and grep would read it as a flag.
     yes_no() { if grep -q -e "$1" <<<"$args"; then printf 'yes'; else printf 'no'; fi; }
+    # ASSERTED AS A FLAG/VALUE PAIR, never as the flag alone. `--security-opt` on its own was the
+    # old test, and container.json now carries three of them — so "carries the seccomp profile"
+    # passed on finding ANY of them, including with no seccomp profile derived at all. Adjacency is
+    # what makes it a pair: `args` is one argument per line, in order, so the value must be the
+    # line after its flag. check-config.sh asserts the same pairing in container.json; this asserts
+    # the derivation carries it through.
+    pair() { awk -v f="$1" -v v="$2" 'p==f && $0 ~ v {n=1} {p=$0} END {print n?"yes":"no"}' <<<"$args"; }
     eq "runs as the non-root user (bubblewrap cannot make namespaces as root)" "$(yes_no '^--user$')" "yes"
-    eq "carries the seccomp profile"        "$(yes_no '^--security-opt$')" "yes"
+    eq "carries the seccomp profile" \
+       "$(pair '--security-opt' '^seccomp=.*/seccomp-bwrap\.json$')" "yes"
+    # The second half of what bubblewrap needs: docker's masked /proc paths are submounts, so /proc
+    # is not fully visible and the kernel refuses a proc mount inside the user namespace whatever
+    # the syscall filter allows. Dropped here, run.sh starts a container whose nested sandbox
+    # cannot start — which is the state the container shipped in.
+    eq "carries the /proc unmask the nested sandbox needs" \
+       "$(pair '--security-opt' '^systempaths=unconfined$')" "yes"
     eq "carries NET_ADMIN for the firewall" "$(yes_no '^--cap-add=NET_ADMIN$')" "yes"
     eq "mounts ~/repos"                     "$(yes_no "target=$CTR_REPOS,")" "yes"
     eq "no variable survives into the command line" "$(yes_no '\${local')" "no"

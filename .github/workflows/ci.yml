@@ -235,10 +235,26 @@ jobs:
           SEC=.container/seccomp-bwrap.json
           # --entrypoint bash, deliberately. The first version of this probe kept the image's
           # entrypoint, which refuses to boot when egress is unbounded -- and these arms grant no
-          # NET_ADMIN, so all three printed the refusal and bwrap never ran. Three identical
+          # NET_ADMIN, so every one of them printed the refusal and bwrap never ran. Identical
           # outputs that discriminated nothing, in the experiment written to settle the question.
           # The entrypoint is an unrelated moving part here: bwrap's namespace creation depends on
           # the kernel, seccomp, AppArmor and capabilities, not on what PID 1 is.
+          #
+          # TWO MEASUREMENTS PER ARM, because there are two refusals and they have different causes.
+          # Creating the user namespace is what seccomp and AppArmor decide; mounting proc INSIDE
+          # one is what docker's masked /proc paths decide, via the kernel's mount_too_revealing()
+          # -- a MaskedPath is a submount, so /proc is not "fully visible" and a fresh proc mount is
+          # refused whatever the syscall filter allows. Folding them into one OK/FAILED column
+          # would have destroyed this experiment's original question: with `--proc` every arm below
+          # [4] fails, so the AppArmor discrimination arms [2] and [3] exist for would read as a
+          # flat wall of FAILED. Reported as two columns, each arm adding one flag.
+          INNER='ns=FAILED; proc=FAILED; why=
+            bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true 2>/dev/null \
+              && ns=OK
+            if why="$(bwrap --new-session --die-with-parent --bind / / --proc /proc \
+                        --unshare-net /bin/true 2>&1)"; then proc=OK; why=; fi
+            echo "BWRAP-NS=$ns"; echo "BWRAP-PROC=$proc"
+            echo "BWRAP-WHY=$(printf %s "$why" | tail -1)"'
           probe() { # probe <label> <extra docker args...>
             local label="$1"; shift
             local out
@@ -251,27 +267,40 @@ jobs:
             # the job red for a fact about the machine -- from a step that is purely diagnostic.
             # The `*)` arm below exists precisely for that case and was unreachable for its most
             # likely cause.
-            out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c \
-                    'bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
-                       && echo BWRAP-OK || echo BWRAP-FAILED' 2>&1)" || true
+            out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c "$INNER" 2>&1)" || true
             # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
-            # whole lesson of the previous version: "no BWRAP-OK in the output" and "the probe
-            # never executed" are different facts and must not print the same way.
+            # whole lesson of the previous version: "no BWRAP-NS=" and "the probe never executed"
+            # are different facts and must not print the same way.
             case "$out" in
-              *BWRAP-OK*)     printf '%-30s OK\n' "$label" ;;
-              *BWRAP-FAILED*) printf '%-30s FAILED\n' "$label"
-                              printf '%s\n' "$out" | grep -v BWRAP- | sed 's/^/      /' | tail -3 ;;
-              *)              printf '%-30s DID NOT RUN - this arm measured NOTHING:\n' "$label"
-                              printf '%s\n' "$out" | sed 's/^/      /' | tail -5 ;;
+              *BWRAP-NS=*)
+                printf '%-42s namespaces=%-7s proc-mount=%s\n' "$label" \
+                       "$(sed -n 's/^BWRAP-NS=//p' <<<"$out" | head -1)" \
+                       "$(sed -n 's/^BWRAP-PROC=//p' <<<"$out" | head -1)"
+                sed -n 's/^BWRAP-WHY=\(..*\)/      \1/p' <<<"$out" | head -1 ;;
+              *)
+                printf '%-42s DID NOT RUN - this arm measured NOTHING:\n' "$label"
+                printf '%s\n' "$out" | sed 's/^/      /' | tail -5 ;;
             esac
           }
           probe "[1] stock docker"        --user vscode
           probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
-          # The SHIPPED remedy, not `unconfined`: that is what run.sh passes and what has to work.
-          # Arm [2] is the broken state (docker-default), so [2] FAILED with [3] OK is the fix
-          # demonstrated rather than argued.
+          # ONE LITERAL OCCURRENCE of the profile flag in this file, deliberately -- including in
+          # the comments, which is why this sentence does not spell it either. check-config.sh's
+          # guard greps for that exact string, and its mutation rewrites the FIRST occurrence and
+          # asserts there is only one: with two, rewriting one leaves the guard green and the
+          # mutation establishes nothing about which the guard reads. Two arms need the flag, so
+          # they share the variable rather than repeating the string.
+          AA=(--security-opt apparmor=jkb-dev)
           probe "[3] + the container's own AppArmor profile" --user vscode --security-opt seccomp=$SEC \
-                                         --security-opt apparmor=jkb-dev
+                                         "${AA[@]}"
+          # THE SHIPPED CONFIGURATION, and the only arm that should show proc-mount=OK. It names
+          # the container's own profile, not `unconfined`: that is what run.sh passes and what has
+          # to work. Each arm adds exactly ONE flag to the one above it, so the column that flips
+          # names the flag responsible -- which is the whole point of a ladder, and is why the
+          # unmask is a fourth arm rather than being folded into [3].
+          probe "[4] + the /proc unmask (what run.sh ships)" --user vscode --security-opt seccomp=$SEC \
+                                         "${AA[@]}" \
+                                         --security-opt systempaths=unconfined
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
       # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run

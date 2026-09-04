@@ -44,9 +44,12 @@
     // Docker's masked /proc paths are submounts, so /proc is not "fully visible" and the kernel
     // refuses a fresh proc mount inside a user namespace -- bubblewrap, and so Claude Code's
     // nested sandbox, cannot start. Measured with a control, one flag apart. Docker has no
-    // selective unmask. What the masks were hiding stays denied by the permission bits (kcore,
-    // sysrq-trigger and /proc/sys writes are all root-only) and, where AppArmor mediates, by
-    // apparmor-jkb-dev; the residual is timing side channels on a Linux host with neither.
+    // selective unmask, and the flag is broader than its name: it clears ReadonlyPaths as well as
+    // MaskedPaths. The read-only half stays denied by the permission bits (/proc/sys and
+    // sysrq-trigger writes are root-only and this container is not root); what is really traded
+    // away is READ access to the masked list. apparmor-jkb-dev re-denies four of the eleven, and
+    // on Linux without an LSM nothing does. README.md has the full list and the residual per host
+    // class; verify.sh's bwrap probe and mutate-verify.sh watch this flag failing.
     "--security-opt", "systempaths=unconfined",
 
     // For init-firewall.sh. Scoped to this container's own network namespace, so it cannot touch

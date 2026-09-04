@@ -173,11 +173,44 @@ fi
 # bubblewrap's proc mount, so the nested sandbox cannot start. It also changes what verify.sh can
 # see — the AppArmor policy probe needs the MASKED /proc/kcore and degrades to a note without the
 # mask — so a harness missing this flag would exercise an arm the real container never reaches.
-# NOTE: the subtractive mutations below still spell reduced sets by hand and do not carry it. That
-# is harmless while nothing verify.sh asserts depends on the unmask, and must be revisited with the
-# bwrap probe (task:verify-sh-should-assert-the-nest-18d1758d49e87458), or those mutations will
-# differ from healthy in two ways at once and establish nothing.
+# The subtractive mutations below are DERIVED from this array by `without`, so a flag added here
+# reaches every one of them and none of them can drop it by omission.
 HEALTHY=(--security-opt seccomp="$SEC" --security-opt systempaths=unconfined ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
+
+# A MUTATION CHANGES EXACTLY ONE THING, and hand-spelling the reduced flag set is how that stopped
+# being true — twice, the same way. The sets dropped $AA_ARGS when the AppArmor profile joined
+# HEALTHY (so "stock seccomp" reported CAUGHT on an AppArmor host whether or not the seccomp
+# profile was load-bearing, because removing the profile alone breaks bwrap), and then dropped
+# `systempaths=unconfined` when the /proc unmask joined it. Neither was a mistake anyone made at
+# the mutation; both were the consequence of writing the control's flags out a second time. So the
+# subtractive sets are computed FROM $HEALTHY: `without <ere>...` sets $MUT to every element that
+# matches none of the patterns, treating a value-taking flag and its value as one unit so a
+# `--security-opt` can never survive the value it introduced.
+takes_value() { case "$1" in -v|-e|-w|--user|--mount|--security-opt) return 0 ;; *) return 1 ;; esac; }
+without() {
+  local pats=("$@") i=0 n=${#HEALTHY[@]} e nxt p drop unit paired
+  MUT=()
+  while [ "$i" -lt "$n" ]; do
+    e="${HEALTHY[$i]}"; paired=0; nxt=""; unit="$e"
+    if takes_value "$e" && [ "$((i+1))" -lt "$n" ]; then
+      nxt="${HEALTHY[$((i+1))]}"; unit="$e $nxt"; paired=1
+    fi
+    drop=0
+    for p in "${pats[@]}"; do [[ "$unit" =~ $p ]] && drop=1; done
+    if [ "$drop" -eq 0 ]; then
+      MUT+=("$e"); [ "$paired" -eq 1 ] && MUT+=("$nxt")
+    fi
+    i=$((i + 1 + paired))
+  done
+  # A PATTERN THAT MATCHED NOTHING IS A MUTATION THAT DID NOT HAPPEN, which would run the healthy
+  # container and report the guard as broken. Refused rather than reported, because every caller
+  # below is about to hand $MUT to `run` and there is nothing useful it could do with a set that
+  # was not reduced.
+  if [ "${#MUT[@]}" -eq "$n" ]; then
+    echo "mutate-verify: 'without ${pats[*]}' matched nothing in HEALTHY — the mutation would be a no-op" >&2
+    exit 1
+  fi
+}
 
 # One healthy run, printed verbatim. Uses the SAME flags and the SAME preamble every mutation
 # runs in, so "is my container ok" and "did this guard fire" cannot be answered about different
@@ -288,9 +321,8 @@ run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts"
 # extra one, so the boundary check still passes, and the memory linker reports `linked` against a
 # container-local store that dies with the container. Unlike the paths the coverage note below
 # excuses, this one needs a docker flag and nothing else.
-run "the knowledge base is NOT mounted" "knowledge base is mounted" \
-    --security-opt seccomp="$SEC" --cap-add=NET_ADMIN --user vscode \
-    -v "$REPO":/home/vscode/repos/jkb -w /home/vscode/repos/jkb
+without '/home/vscode/\.jkb$'
+run "the knowledge base is NOT mounted" "knowledge base is mounted" "${MUT[@]}"
 run "the host's ~/.claude is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/home/vscode/.claude
@@ -300,26 +332,29 @@ run "the host's ~/.claude is mounted in" "is a host mount" \
 run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home/settings.json":/home/vscode/.claude/settings.json
-# THIS MUTATION CANNOT DISCRIMINATE WHILE BUBBLEWRAP IS A KNOWN FAILURE, so on such a host it is
-# announced as skipped rather than run. It requires verify.sh to fail naming bubblewrap -- and if
+# THE TWO FLAGS THE NESTED SANDBOX NEEDS, each watched failing on its own. They are separate
+# refusals in separate subsystems: seccomp decides whether the namespace syscalls are allowed at
+# all, and docker's masked /proc paths decide whether a proc mount is permitted INSIDE the
+# namespace once created. Both end at the same verify.sh assertion, which is why that assertion had
+# to grow `--proc /proc` before either of these could discriminate — without it the probe passed in
+# the state the unmask exists to fix, and the container shipped that way.
+#
+# NEITHER CAN DISCRIMINATE WHILE BUBBLEWRAP IS A KNOWN FAILURE, so on such a host they are
+# announced as skipped rather than run. Each requires verify.sh to fail naming bubblewrap -- and if
 # the HEALTHY container already fails that same assertion, it would report CAUGHT whether or not
-# EACH SUBTRACTIVE MUTATION SUBTRACTS ONLY THE FLAG IT NAMES, which is why all three carry
-# $AA_ARGS. They spelled their reduced flag sets by hand and so also dropped the AppArmor profile
-# when it joined HEALTHY -- and on an AppArmor host removing the profile ALONE makes bubblewrap
-# fail, so "stock seccomp (nested sandbox cannot start)" reported CAUGHT whether or not the seccomp
-# profile was load-bearing. That is verbatim the reasoning fourteen lines below for SKIPping this
-# mutation under the acceptance ("a green line asserting the profile is load-bearing, on a host
-# where nothing tested it"), reintroduced one flag over in the same commit that wrote it.
-# removing the seccomp profile changed anything. That is the "guard that cannot fire" shape this
-# whole directory keeps producing, and reporting CAUGHT for it would be the worst version: a green
-# line asserting the profile is load-bearing, on a host where nothing tested it.
+# the flag was load-bearing. That is the "guard that cannot fire" shape this whole directory keeps
+# producing, and reporting CAUGHT for it would be the worst version: a green line asserting the
+# flag is load-bearing, on a host where nothing tested it.
 if [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ]; then
     printf '  SKIPPED  stock seccomp (nested sandbox cannot start)\n'
+    printf '  SKIPPED  the /proc unmask is dropped (nested sandbox cannot start)\n'
     printf '           cannot discriminate while bubblewrap fails in the healthy container too;\n'
-    printf '           it becomes meaningful again when that is fixed.\n'
+    printf '           they become meaningful again when that is fixed.\n'
 else
-    run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces" \
-        ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode "${BASE[@]}"
+    without 'seccomp='
+    run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces or mount /proc" "${MUT[@]}"
+    without 'systempaths=unconfined'
+    run "the /proc unmask is dropped (nested sandbox cannot start)" "bubblewrap cannot create namespaces or mount /proc" "${MUT[@]}"
 fi
 # NO NET_ADMIN, WITH THE OVERRIDE ARMED -- and the override is what makes this mutation
 # judgeable at all. Without it the entrypoint (correctly) refuses to boot an unbounded container,
@@ -332,11 +367,13 @@ fi
 # separate property and is covered by entrypoint.sh --self-test; it cannot be judged here, because
 # `judge` requires the expectation and the word FAIL on one line and the refusal is not a verify.sh
 # FAIL line.
+without 'NET_ADMIN'
 run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
-    -e JKB_EGRESS_ACCEPT_UNFILTERED=1 \
-    --security-opt seccomp="$SEC" ${AA_ARGS[@]+"${AA_ARGS[@]}"} --user vscode "${BASE[@]}"
-run "runs as root" "runs as a non-root user" \
-    --security-opt seccomp="$SEC" ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user root "${BASE[@]}"
+    -e JKB_EGRESS_ACCEPT_UNFILTERED=1 "${MUT[@]}"
+# The one REPLACEMENT rather than a subtraction: `--user` is removed as a unit and re-added, so a
+# second `--user` cannot be left for docker's last-wins rule to resolve.
+without '^--user '
+run "runs as root" "runs as a non-root user" "${MUT[@]}" --user root
 
 # The nested-bind exception must not be usable as a general one. A `--declare` naming anything
 # OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the

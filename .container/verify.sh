@@ -218,8 +218,17 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 # separate probe to say anything at all. What decides it is bwrap's own message, so print that, and
 # print the two host settings that produce this — read through /proc, which a container can
 # usually see even though it cannot set them.
-if bwrap_err="$(bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true 2>&1)"; then
-    ok "bubblewrap can create its namespaces (nested sandbox can start)"
+#
+# `--proc /proc` IS NOT OPTIONAL, and its absence made this the probe that could not fail for the
+# defect it names. The kernel's `mount_too_revealing()` refuses a fresh proc mount in a non-initial
+# user namespace unless an existing FULLY VISIBLE /proc exists, and docker's MaskedPaths are
+# submounts over /proc, so it is not — which is a separate refusal from namespace creation and
+# happens strictly after it. Without `--proc` this probe printed `ok` in exactly the state the
+# `systempaths=unconfined` flag exists to fix, and the container demonstrably shipped in it: the
+# only report was Claude Code's own `bwrap: Can't mount proc on /newroot/proc`. The invocation must
+# stay the shape Claude Code invokes, or it certifies a mechanism nobody runs.
+if bwrap_err="$(bwrap --new-session --die-with-parent --bind / / --proc /proc --unshare-net /bin/true 2>&1)"; then
+    ok "bubblewrap creates its namespaces and mounts /proc (the nested sandbox's mechanism works)"
 else
     # ACCEPTED ONLY WHEN AN OPERATOR SAID SO, by name, for this host class. It is still reported at
     # full volume every run and still names the reason -- what changes is the exit code, so a caller
@@ -228,9 +237,16 @@ else
     # the open investigation is that we have not established the cause, and a check that quietly
     # excused itself whenever it found the condition it suspects would be assuming the answer.
     bw_bad=bad; [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && bw_bad=accept_bad
-    $bw_bad "bubblewrap cannot create namespaces — the nested sandbox cannot start"
+    $bw_bad "bubblewrap cannot create namespaces or mount /proc — the nested sandbox cannot start"
     [ -n "$bwrap_err" ] && printf '       bwrap said: %s\n' \
         "$(printf '%s' "$bwrap_err" | head -2 | tr '\n' ' ')"
+    # THE THIRD CAUSE, and the only one visible from inside. The two sysctls below explain a refusal
+    # to create the user namespace; a submount over /proc explains a refusal to mount proc INSIDE
+    # one, which is what `systempaths=unconfined` removes. Counted rather than asserted: a container
+    # legitimately has some, and what matters is that a reader sees the number beside bwrap's own
+    # message rather than being sent to audit the two sysctls when neither is the cause.
+    v="$(awk '$5 ~ "^/proc/" {n++} END {print n+0}' /proc/self/mountinfo 2>/dev/null)" \
+        && printf '       submounts under /proc = %s (any at all defeat the proc mount; see systempaths=unconfined)\n' "$v"
     # Reported as facts, with no cause asserted. `apparmor_restrict_unprivileged_userns=1` is the
     # Ubuntu 24.04+ default and restricts exactly this; `max_user_namespaces=0` disables it
     # outright. Either explains the failure, and neither is fixable from inside the container —
@@ -332,7 +348,11 @@ case "$aa_profile" in
         # the nested sandbox cannot start without it. The mask was what made this profile testable:
         # docker-default's denials otherwise overlap what DAC already restricts to root, so a
         # denial discriminates nothing. Kept rather than deleted so the check returns if the mask
-        # ever does. Named residual: an edited profile that still allows `mount` is undetectable.
+        # ever does. What replaces it is the bwrap probe above, which now mounts `proc`:
+        # docker-default denies `mount`, so on an AppArmor host a pass there separates this profile
+        # from the stock one. Named residual: it does NOT separate this profile from
+        # `apparmor=unconfined`, which passes the same probe, so an edited profile that still
+        # allows `mount` is undetectable from in here.
         if [ ! -c /proc/kcore ]; then
             note "cannot check the profile's POLICY: /proc/kcore is not the masked char device this probe needs, so a denial could come from the permission bits rather than from AppArmor ($aa_want is in force by name)"
         elif ! head -c1 /proc/self/cmdline >/dev/null 2>&1; then

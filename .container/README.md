@@ -448,10 +448,16 @@ Use `auto-mode.sh sandboxed` for this, **never** `printenv CLAUDE_CODE_SANDBOXED
 **unset** throughout the measurement above. It had been this repo's recommended test.
 
 One half of it **is** now established, negatively and then positively: the nested sandbox was not
-running at all, because `bwrap` could not mount `/proc` — see the section below. That was invisible
-for as long as it was, because nothing here ever asserted the nested sandbox works. `verify.sh`
-checks mounts, seccomp, sudo, egress and extensions, and never checked the thing the container
-exists to host.
+running at all, because `bwrap` could not mount `/proc` — see the section below.
+
+That was invisible for as long as it was because of a **probe that could not fail**, which is this
+directory's recurring defect and not, as first written here, an absent one. `verify.sh` did run
+`bwrap`, and printed `ok  bubblewrap can create its namespaces (nested sandbox can start)` — but
+the invocation omitted `--proc /proc`, so it stopped one step short of the refusal. Namespace
+creation and the proc mount are separate kernel checks with separate causes; passing the first
+says nothing about the second, and the message claimed the second. The probe now mounts `proc`,
+its `ok` line claims only what it establishes, and both flags the mechanism depends on
+(`seccomp=…`, `systempaths=unconfined`) are watched failing by `mutate-verify.sh`.
 
 ## `/proc` has to be unmasked, and on Linux that is an unfinished trade
 
@@ -467,16 +473,26 @@ it is denied.
 `proc` is a later step, and nothing had ever exercised it — `generate-apparmor.sh` says as much
 ("the nested sandbox had never actually started on Linux").
 
-Docker has no selective unmask, so this is all-or-nothing. What the masks hid is still denied by
-the permission bits — `kcore`, `sysrq-trigger` and `/proc/sys` writes are root-only, and the
-container is not root — so what is traded away is *information*, not capability. Three host classes,
-and only one of them is a problem:
+Docker has no selective unmask, and the flag is broader than its name: `systempaths=unconfined`
+clears **both** `MaskedPaths` and `ReadonlyPaths`. Concretely it re-exposes
+
+- **masked (were mounted over):** `/proc/asound`, `/proc/acpi`, `/proc/kcore`, `/proc/keys`,
+  `/proc/latency_stats`, `/proc/timer_list`, `/proc/timer_stats`, `/proc/sched_debug`,
+  `/proc/scsi`, `/sys/firmware`, `/sys/devices/virtual/powercap`
+- **read-only (were mounted `ro`), now writable:** `/proc/bus`, `/proc/fs`, `/proc/irq`,
+  `/proc/sys`, `/proc/sysrq-trigger`
+
+The read-only half is covered by DAC and not by the mask being gone: writing any of it is root-only
+and the container is not root. So what is actually traded away is *information*, from the first
+list. Several of those are themselves mode `0400` root-only (`kcore`, `keys`, `timer_list`,
+`sched_debug`), which leaves the world-readable remainder — `/proc/acpi`, `/proc/asound`,
+`/proc/scsi`, `/sys/firmware`, powercap — as the honest residual. Three host classes:
 
 | host | compensating layer | residual |
 |---|---|---|
-| macOS / Docker Desktop | none, but the exposed host is the LinuxKit VM | small |
-| Linux **with** AppArmor | `apparmor-jkb-dev` re-denies `kcore`, `sysrq-trigger`, `/sys/firmware`, powercap | smallest |
-| Linux **without** AppArmor (SELinux, or no LSM) | **none** | timing side channels against the real host — `/proc/interrupts` is world-readable and was protected only by the mask |
+| macOS / Docker Desktop | none, but the exposed host is the LinuxKit VM, not your machine | small |
+| Linux **with** AppArmor | `apparmor-jkb-dev` re-denies 4 of the 11: `kcore`, `sysrq-trigger`, `/sys/firmware`, powercap | the other 7, `/proc/acpi` and `/proc/scsi` among them — AppArmor does **not** cover them, and it re-denies nothing on the read-only list |
+| Linux **without** AppArmor (SELinux, or no LSM) | **none** | all 11, against the real host — powercap being the one with a published side channel (PLATYPUS) |
 
 **The third row is the unfinished part, and it matters more as Linux becomes the main platform.**
 How it should be fixed, in order of leverage:
@@ -493,8 +509,11 @@ How it should be fixed, in order of leverage:
    indistinguishable from coverage.
 4. **Restore the discriminator the flag cost.** The mask is what made the AppArmor profile testable
    — docker-default's denials otherwise overlap what DAC already restricts to root, so a denial
-   proves nothing. Replacement is a `bwrap` probe (which separates this profile from stock
-   `docker-default`) plus the `(enforce)` mode, which `verify.sh` currently reads and discards.
+   proves nothing. Half of the replacement has landed: `verify.sh`'s `bwrap` probe now mounts
+   `proc`, and `docker-default` denies `mount`, so on an AppArmor host a pass separates this
+   profile from the stock one. It does not separate *this* profile from `apparmor=unconfined`,
+   which also passes. The other half is the `(enforce)` mode, which `verify.sh` still reads out of
+   `/proc/self/attr/apparmor/current` and then discards with a `sed`.
 5. **Check whether podman's `--security-opt unmask=` helps.** Reasoned dead — any surviving mask
    should still trip the kernel check — but unverified, and it needs a Linux box with podman. If it
    works it is strictly better than all-or-nothing.
