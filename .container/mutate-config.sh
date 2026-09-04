@@ -417,23 +417,79 @@ run "a generator is deleted, orphaning its artifact" "outside the drift check"
 seed; bash -c 'rm -f "$1"/generate-*.sh' _ "$work/t/.container"
 run "every generator is deleted" "no generate-*.sh found"
 
+# THE PROFILE FLAG IS SPELLED ON EVERY PROBE THAT USES IT, so a mutation rewriting one occurrence
+# has to say WHICH -- and the guard is trustworthy only if breaking the FIRST and breaking the LAST
+# are both caught. That is what establishes it reads every invocation rather than the first, which
+# is the property its two previous versions each lacked in a different way: it was satisfied by the
+# probe's LABEL, and then, once the flag was hoisted into a shared array to satisfy the
+# one-occurrence assertion this harness used to make, by the ARRAY ASSIGNMENT. The assertion was
+# the wrong lever: it constrained the SUBJECT so that a weak guard could be mutated, instead of
+# making the guard read what it claims to.
 seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-# ONLY THE FLAG OCCURRENCE, and the count is asserted. The guard reads
-# `--security-opt apparmor=<name>`; the string used to appear in the probe's LABEL too, so
-# rewriting every occurrence could not establish which one the guard was reading -- and the guard
-# was in fact satisfied by the label, leaving arm [3] free to measure `apparmor=unconfined` while
-# check-config.sh reported the profile correctly named. The label no longer carries the string, and
-# this assertion is what stops it coming back silently.
-n = s.count("apparmor=jkb-dev")
-assert n == 1, ("apparmor=jkb-dev appears %d times in ci.yml; this mutation can no longer "
-                "establish which occurrence the guard reads" % n)
-out = s.replace("--security-opt apparmor=jkb-dev", "--security-opt apparmor=jkb-container", 1)
+tgt = "--security-opt apparmor=jkb-dev"
+assert s.count(tgt) >= 2, "expected the flag on at least two probe invocations"
+open(p, 'w').write(s.replace(tgt, "--security-opt apparmor=jkb-container", 1))
+PYX
+run "the FIRST CI probe names a profile nothing loads" "does not name the profile the file declares"
+
+seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+tgt = "--security-opt apparmor=jkb-dev"
+i = s.rfind(tgt); assert i != -1, "mutation target absent"
+open(p, 'w').write(s[:i] + "--security-opt apparmor=jkb-container" + s[i + len(tgt):])
+PYX
+run "the LAST CI probe names a profile nothing loads" "does not name the profile the file declares"
+
+# THE REGRESSION THE GUARD WAS REPAIRED FOR, watched directly: hoist the flag into a shared array
+# so NO probe invocation names the profile and only an assignment does. The previous guard reported
+# ok for exactly this, and the arm calling itself the shipped configuration measured it under
+# docker-default.
+seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
+import sys, re
+p = sys.argv[1]; s = open(p).read()
+s = s.replace('          probe "[3]',
+              '          AA=(--security-opt apparmor=jkb-dev)\n          probe "[3]', 1)
+out = re.sub(r'--security-opt apparmor=jkb-dev(?=\s*\\?\n)', '"${AA[@]}"', s)
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
-run "CI probes a profile nothing loads" "does not name the profile the file declares"
+run "the CI profile flag is hoisted into an array no probe has to use" "does not name the profile the file declares"
+
+# ...and the READER itself. Every other way the joining awk can break -- a reindent, a quoting
+# change, a rename -- looks exactly like "no arm names a foreign profile", which is the PASSING
+# answer, so the extraction is pinned against reading nothing.
+seed; sed -i.bak 's/^          probe "/          proberun "/' "$work/t/.github/workflows/ci.yml"
+rm -f "$work/t/.github/workflows/ci.yml.bak"
+run "CI's probe invocations cannot be extracted at all" "continuation-joining is broken"
+
+# THE CONTROL SET MUST CARRY WHAT THE DECLARATION DECLARES (D52.6). Three ways that stops being
+# true, each its own failure path: the declaration goes unreadable, the assembly produces nothing,
+# and the assembly silently drops the derived flags -- the last being the real defect, and what
+# mutate-verify.sh's HEALTHY did for four commits of this branch while CI called it healthy.
+seed; python3 - "$work/t/.container/container.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+out = s.replace('"--security-opt",', '"--ignored-opt",')
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "container.json declares no --security-opt pair at all" "no --security-opt pairs could be read"
+
+seed; printf '#!/usr/bin/env bash\nexit 0\n' > "$work/t/.container/mutate-verify.sh"
+chmod +x "$work/t/.container/mutate-verify.sh"
+run "the control's flag set cannot be assembled" "produced nothing"
+
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+out = s.replace('HEALTHY=("${RUNARGS[@]}" ', 'HEALTHY=(')
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
+PYX
+run "the control drops the flags it derived from container.json" "missing declared --security-opt"
 
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
@@ -729,7 +785,7 @@ run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparm
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=66
+PINNED_BAD_SITES=70
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

@@ -218,12 +218,22 @@ jobs:
       # a cause and not a skip — the seccomp profile IS applied by the flags above (docker errors
       # on a missing profile file), so something else is refusing.
       #
-      # This step DELIBERATELY assembles its own docker flags, which the diagnostic below does not:
-      # varying the flags IS the experiment. [2] is exactly what the container ships, so if [3]
-      # succeeds where [2] fails the cause is AppArmor — Ubuntu 24.04 (which ubuntu-latest is)
-      # restricts unprivileged user namespaces by default, and the design's own measurement was
+      # THE NUMBERED ARMS ARE HYPOTHESES, NOT THE CONTAINER. They deliberately assemble their own
+      # docker flags — varying the flags IS the experiment — and each rung adds exactly ONE flag to
+      # the one above it, so the column that flips names the flag responsible. [3] succeeding where
+      # [2] fails isolates AppArmor in the `namespaces` column: Ubuntu 24.04 (which ubuntu-latest
+      # is) restricts unprivileged user namespaces by default, and the design's own measurement was
       # taken on 26.04. Reported, never acted on automatically: `apparmor=unconfined` is a real
       # weakening of the container and is a decision, not a fix to apply because a probe suggested it.
+      #
+      # NO NUMBERED ARM IS "WHAT THE CONTAINER SHIPS", and this comment used to say [2] was while
+      # the fourth arm's own comment said [4] was — two contradicting statements about the shipped
+      # security configuration in one block, and the first of them describing the exact broken state
+      # this branch exists to leave. The shipped set is not spellable here: it is container.json's
+      # runArgs plus a host-conditional AppArmor profile. So the last row DERIVES it, by running the
+      # same probe through `mutate-verify.sh --shell`, which starts the control container — zero
+      # flags written out. A rung that drifts from the declaration is then a broken hypothesis,
+      # visible in its own column, and no longer a claim about what ships.
       - name: Why bubblewrap can or cannot start (the discriminator, task 1.3)
         if: always()
         run: |
@@ -248,13 +258,43 @@ jobs:
           # would have destroyed this experiment's original question: with `--proc` every arm below
           # [4] fails, so the AppArmor discrimination arms [2] and [3] exist for would read as a
           # flat wall of FAILED. Reported as two columns, each arm adding one flag.
+          #
+          # THE PROC PROBE RUNS ONLY WHEN THE NAMESPACE WAS CREATED. An arm that died at namespace
+          # creation never reached mount_too_revealing(), so it establishes NOTHING about the proc
+          # mount -- and printing FAILED there spells "unestablished" exactly like "proven no",
+          # which reads as "the proc mount is refused under stock docker independently of the
+          # unmask". That is the defect the `*)` arm below exists for, one level down. The third
+          # value is `not-reached`, and the namespace probe's own stderr becomes WHY, or the line
+          # would go blank for precisely those arms.
           INNER='ns=FAILED; proc=FAILED; why=
-            bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true 2>/dev/null \
-              && ns=OK
-            if why="$(bwrap --new-session --die-with-parent --bind / / --proc /proc \
-                        --unshare-net /bin/true 2>&1)"; then proc=OK; why=; fi
+            if why="$(bwrap --new-session --die-with-parent --bind / / \
+                        --unshare-net /bin/true 2>&1)"; then
+              ns=OK; why=
+              if why="$(bwrap --new-session --die-with-parent --bind / / --proc /proc \
+                          --unshare-net /bin/true 2>&1)"; then proc=OK; why=; fi
+            else
+              proc=not-reached
+            fi
             echo "BWRAP-NS=$ns"; echo "BWRAP-PROC=$proc"
             echo "BWRAP-WHY=$(printf %s "$why" | tail -1)"'
+          # SPLIT so one rendering serves both kinds of row: the numbered arms, which spell their
+          # own flags, and the derived [shipped] row, which cannot. A second `case` for the second
+          # kind is how the two would come to disagree about what a column means.
+          report() { # report <label> <output>
+            # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
+            # whole lesson of the previous version: "no BWRAP-NS=" and "the probe never executed"
+            # are different facts and must not print the same way.
+            case "$2" in
+              *BWRAP-NS=*)
+                printf '%-42s namespaces=%-7s proc-mount=%s\n' "$1" \
+                       "$(sed -n 's/^BWRAP-NS=//p' <<<"$2" | head -1)" \
+                       "$(sed -n 's/^BWRAP-PROC=//p' <<<"$2" | head -1)"
+                sed -n 's/^BWRAP-WHY=\(..*\)/      \1/p' <<<"$2" | head -1 ;;
+              *)
+                printf '%-42s DID NOT RUN - this arm measured NOTHING:\n' "$1"
+                printf '%s\n' "$2" | sed 's/^/      /' | tail -5 ;;
+            esac
+          }
           probe() { # probe <label> <extra docker args...>
             local label="$1"; shift
             local out
@@ -268,39 +308,32 @@ jobs:
             # The `*)` arm below exists precisely for that case and was unreachable for its most
             # likely cause.
             out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c "$INNER" 2>&1)" || true
-            # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
-            # whole lesson of the previous version: "no BWRAP-NS=" and "the probe never executed"
-            # are different facts and must not print the same way.
-            case "$out" in
-              *BWRAP-NS=*)
-                printf '%-42s namespaces=%-7s proc-mount=%s\n' "$label" \
-                       "$(sed -n 's/^BWRAP-NS=//p' <<<"$out" | head -1)" \
-                       "$(sed -n 's/^BWRAP-PROC=//p' <<<"$out" | head -1)"
-                sed -n 's/^BWRAP-WHY=\(..*\)/      \1/p' <<<"$out" | head -1 ;;
-              *)
-                printf '%-42s DID NOT RUN - this arm measured NOTHING:\n' "$label"
-                printf '%s\n' "$out" | sed 's/^/      /' | tail -5 ;;
-            esac
+            report "$label" "$out"
           }
           probe "[1] stock docker"        --user vscode
           probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
-          # ONE LITERAL OCCURRENCE of the profile flag in this file, deliberately -- including in
-          # the comments, which is why this sentence does not spell it either. check-config.sh's
-          # guard greps for that exact string, and its mutation rewrites the FIRST occurrence and
-          # asserts there is only one: with two, rewriting one leaves the guard green and the
-          # mutation establishes nothing about which the guard reads. Two arms need the flag, so
-          # they share the variable rather than repeating the string.
-          AA=(--security-opt apparmor=jkb-dev)
+          # THE FLAG IS WRITTEN OUT ON EVERY ARM THAT USES IT, not shared through a variable.
+          # A shared `AA=(...)` array satisfied check-config.sh's guard with its ASSIGNMENT -- the
+          # guard's stated job is that a probe INVOCATION names the declared profile, and after the
+          # hoist no invocation had to name it at all: deleting the array use from an arm left the
+          # guard green. The guard now reads probe invocations and requires every `apparmor=` on one
+          # to be the declared name, so two spellings are what it needs rather than what it cannot
+          # tell apart, and mutate-config.sh breaks the first and the last in turn.
           probe "[3] + the container's own AppArmor profile" --user vscode --security-opt seccomp=$SEC \
-                                         "${AA[@]}"
-          # THE SHIPPED CONFIGURATION, and the only arm that should show proc-mount=OK. It names
-          # the container's own profile, not `unconfined`: that is what run.sh passes and what has
-          # to work. Each arm adds exactly ONE flag to the one above it, so the column that flips
-          # names the flag responsible -- which is the whole point of a ladder, and is why the
-          # unmask is a fourth arm rather than being folded into [3].
-          probe "[4] + the /proc unmask (what run.sh ships)" --user vscode --security-opt seccomp=$SEC \
-                                         "${AA[@]}" \
+                                         --security-opt apparmor=jkb-dev
+          # The last NUMBERED rung, and the first that should show proc-mount=OK. It is a
+          # hypothesis like the others -- "does the unmask alone flip the proc column" -- and is
+          # deliberately no longer labelled as what the container ships; the derived row below is.
+          probe "[4] + the /proc unmask" --user vscode --security-opt seccomp=$SEC \
+                                         --security-opt apparmor=jkb-dev \
                                          --security-opt systempaths=unconfined
+          # THE CONTAINER AS run.sh STARTS IT, derived rather than spelled: `--shell` runs the same
+          # probe inside the control container, whose flags come from container.json plus the same
+          # host-conditional AppArmor decision run.sh makes. This is the row that answers "can the
+          # nested sandbox start in the thing we ship", and it cannot drift from the declaration
+          # because it does not restate it.
+          out="$(./.container/mutate-verify.sh --shell "$INNER" 2>&1)" || true
+          report "[shipped] the control container" "$out"
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
       # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run

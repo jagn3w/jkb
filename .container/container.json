@@ -47,9 +47,11 @@
     // selective unmask, and the flag is broader than its name: it clears ReadonlyPaths as well as
     // MaskedPaths. The read-only half stays denied by the permission bits (/proc/sys and
     // sysrq-trigger writes are root-only and this container is not root); what is really traded
-    // away is READ access to the masked list. apparmor-jkb-dev re-denies four of the eleven, and
-    // on Linux without an LSM nothing does. README.md has the full list and the residual per host
-    // class; verify.sh's bwrap probe and mutate-verify.sh watch this flag failing.
+    // away is READ access to the masked list. apparmor-jkb-dev re-denies a few of those and on
+    // Linux without an LSM nothing does -- README.md names which, and deliberately does not COUNT
+    // them: the length was restated here and in three sentences there, and when the upstream list
+    // gained a path every one of those copies went quietly stale. verify.sh's bwrap probe and
+    // mutate-verify.sh watch this flag failing.
     "--security-opt", "systempaths=unconfined",
 
     // For init-firewall.sh. Scoped to this container's own network namespace, so it cannot touch

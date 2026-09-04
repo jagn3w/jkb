@@ -59,23 +59,11 @@ KEYS
 # Derivation. Pure functions, so --self-test can exercise them on a host with no Docker.
 # ---------------------------------------------------------------------------------------------
 
-# Dev Containers' variable syntax, with ONE deliberate difference: an unset ${localEnv:VAR} is a
-# hard error here, where Dev Containers substitutes the empty string. That default is how
-# `source=${localEnv:HOME}/repos` quietly becomes `source=/repos` — a different host directory,
-# mounted into the container, with nothing to notice it. A boundary must not be able to move
-# because a variable was not set.
-dc_subst() { # dc_subst <string> <repo-root>
-    local s="$1" root="$2" var val
-    s="${s//\$\{localWorkspaceFolderBasename\}/$(basename "$root")}"
-    s="${s//\$\{localWorkspaceFolder\}/$root}"
-    while [[ "$s" =~ \$\{localEnv:([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
-        var="${BASH_REMATCH[1]}"
-        [ -n "${!var+set}" ] || die "container.json references \${localEnv:$var}, which is not set"
-        val="${!var}"
-        s="${s//\$\{localEnv:$var\}/$val}"
-    done
-    printf '%s' "$s"
-}
+# `dc_subst`, `dc_run_args` and `dc_remote_user` now live in lib.sh, which this sources before any
+# call. They moved because mutate-verify.sh needs the same derivation: its control set was a hand
+# copy of container.json's runArgs, and a copy is how the harness came to certify a container this
+# script does not produce (D52.6). `dc_subst` returns 1 where this file's copy called `die` — lib.sh
+# is sourced by scripts without `set -e` and must not exit for them — so every call here is wrapped.
 
 # The container path of a host path under ~/repos. This is the ONLY thing left of the old host-side
 # preflight, and it is a much smaller claim: not "which folder may you open" (attaching answers
@@ -159,27 +147,27 @@ config_hash() { # config_hash <config> <repo-root>
 }
 
 docker_args() { # docker_args <config> <repo-root>  -> one argument per line
-    local cfg="$1" root="$2" line stripped
+    local cfg="$1" root="$2" line sub stripped
     stripped="$(dc_strip "$cfg")"
 
     printf '%s\n' "--name" "$NAME" "--detach" "--workdir" "$CTR_REPOS"
 
-    local user; user="$(jq -r '.remoteUser // empty' <<<"$stripped")"
+    local user; user="$(dc_remote_user "$cfg")"
     [ -n "$user" ] && printf '%s\n' "--user" "$user"
 
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        printf '%s\n' "$(dc_subst "$line" "$root")"
-    done < <(jq -r '(.runArgs // [])[]' <<<"$stripped")
+    # The security flags, from the shared reader mutate-verify.sh's control also uses.
+    dc_run_args "$cfg" "$root" || die "container.json's runArgs could not be substituted"
 
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        printf '%s\n' "--mount" "$(dc_subst "$line" "$root")"
+        sub="$(dc_subst "$line" "$root")" || die "container.json's mounts could not be substituted"
+        printf '%s\n' "--mount" "$sub"
     done < <(dc_mount_specs "$cfg")
 
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        printf '%s\n' "--env" "$(dc_subst "$line" "$root")"
+        sub="$(dc_subst "$line" "$root")" || die "container.json's containerEnv could not be substituted"
+        printf '%s\n' "--env" "$sub"
     done < <(jq -r '(.containerEnv // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$stripped")
 }
 

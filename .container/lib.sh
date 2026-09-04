@@ -10,6 +10,59 @@
 # container.json permits // comments; strip them the way the spec's parsers do.
 dc_strip() { sed 's://.*$::' "$1"; }
 
+# Dev Containers' variable syntax, with ONE deliberate difference: an unset ${localEnv:VAR} is a
+# hard error here, where Dev Containers substitutes the empty string. That default is how
+# `source=${localEnv:HOME}/repos` quietly becomes `source=/repos` — a different host directory,
+# mounted into the container, with nothing to notice it. A boundary must not be able to move
+# because a variable was not set.
+#
+# It RETURNS 1 rather than calling `die`, which is run.sh's and does not exist here: lib.sh is
+# sourced by scripts with and without `set -e`, so a helper that exits would take a caller's shell
+# down with it. run.sh wraps its calls with `|| die`.
+dc_subst() { # dc_subst <string> <repo-root>
+    local s="$1" root="$2" var val
+    s="${s//\$\{localWorkspaceFolderBasename\}/$(basename "$root")}"
+    s="${s//\$\{localWorkspaceFolder\}/$root}"
+    while [[ "$s" =~ \$\{localEnv:([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+        var="${BASH_REMATCH[1]}"
+        if [ -z "${!var+set}" ]; then
+            printf 'container.json references ${localEnv:%s}, which is not set\n' "$var" >&2
+            return 1
+        fi
+        val="${!var}"
+        s="${s//\$\{localEnv:$var\}/$val}"
+    done
+    printf '%s' "$s"
+}
+
+# THE DOCKER SECURITY FLAGS THE CONTAINER DECLARES, substituted, one argument per line (D52.6).
+#
+# container.json's `runArgs` is the declaration; run.sh has always derived from it, and
+# mutate-verify.sh's HEALTHY re-typed it by hand. That is what let commit 8266a2b add
+# `systempaths=unconfined` to the declaration while the harness went on starting — and certifying —
+# a container without it, under a step named "The container is what it claims to be". It had
+# silently omitted `--pids-limit 4096` since the day that was declared, which nobody had noticed at
+# all.
+#
+# So the control's flags are READ from the declaration. `--user` comes with it (dc_remote_user)
+# because it is the same kind of fact and run.sh already derives it: bubblewrap cannot create a
+# namespace as root, so a harness running as a different user from the real container is not a
+# control either. What mutate-verify.sh still spells by hand is only its own scratch binds, which
+# are deliberately NOT container.json's mounts.
+dc_run_args() { # dc_run_args <container.json> <repo-root>  -> one docker argument per line
+    local line sub
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        sub="$(dc_subst "$line" "$2")" || return 1
+        printf '%s\n' "$sub"
+    done < <(dc_strip "$1" 2>/dev/null | jq -r '(.runArgs // [])[]' 2>/dev/null)
+}
+
+# The user the container runs as, or empty when it declares none.
+dc_remote_user() { # dc_remote_user <container.json>
+    dc_strip "$1" 2>/dev/null | jq -r '.remoteUser // empty' 2>/dev/null
+}
+
 # Every mount point the container declares, one per line, sorted.
 #
 # The devcontainer spec allows a mount as either a comma-separated string or an object, and the

@@ -15,6 +15,22 @@ bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 echo "==> container config"
 command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0; }
 
+# THE `probe …` INVOCATIONS IN ci.yml, one per line, with `\`-continuations joined.
+#
+# ci.yml's bubblewrap ladder spells its flags in shell inside a `run:` block, and its arms are
+# multi-line. A guard that greps the raw file cannot tell a flag ON an invocation from the same
+# text in a comment, a label or an array assignment — which is exactly how the AppArmor-profile
+# guard below came to read an assignment and stop establishing anything. Comment lines are dropped
+# first, so a flag named in prose is never mistaken for one that is passed.
+ci_probe_calls() { # ci_probe_calls <ci.yml>
+    sed '/^[[:space:]]*#/d' "$1" 2>/dev/null \
+      | awk '{ s = $0
+               sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
+               if (s ~ /\\$/) { sub(/\\$/, "", s); buf = buf s " "; next }
+               print buf s; buf = "" }' \
+      | grep '^probe "'
+}
+
 # Sourced HERE rather than 80 lines down, so this file has one copy of the comment-stripping rule
 # instead of a verbatim `strip()` beside the `dc_strip()` it later sources — two halves of one file
 # parsing the same input through two copies that can disagree.
@@ -61,6 +77,56 @@ fi
 # Non-root is load-bearing (root cannot create a mount namespace in a container), so a
 # `"remoteUser": "root"` would break the nested sandbox while looking like a simplification.
 if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — the nested sandbox cannot start"; fi
+
+# THE CONTROL RUNS WHAT THE DECLARATION DECLARES (D52.6).
+#
+# run.sh derives its flags from container.json; mutate-verify.sh's HEALTHY used to re-type them,
+# and a copy of a declaration goes stale. Commit 8266a2b added `systempaths=unconfined` here, run.sh
+# picked it up, the harness did not — so for four commits CI's `mutate-verify.sh --control` step,
+# titled "The container is what it claims to be", started a container WITHOUT the flag and judged
+# every mutation verdict against a container run.sh does not produce. `--pids-limit 4096` had been
+# missing from it since the day it was declared, and nobody had noticed at all.
+#
+# HEALTHY is derived now, so what this guards is the ASSEMBLY: that the derived elements are still
+# IN it. Asserting the declaration against `HEALTHY=(…)`'s source text was the obvious version and
+# is the wrong one — it greps a bash array literal, matches inside comments, is blind to a later
+# reassignment, and once the array is derived it is a guard over one spelling rather than over the
+# result. `--print-flags` prints the assembled set and needs no Docker, which is why it sits above
+# that script's daemon preflights: those exit 0 with a skip, and an empty read would pass here on
+# every machine without a running daemon.
+#
+# ADJACENCY, not membership: an orphaned value reads as a declaration and applies nothing, the same
+# reason the two pair checks above exist. And pinned against an empty extraction on both sides,
+# because "no declared pairs" and "the control carries them all" are otherwise the same answer.
+mv_flags="$("$here/mutate-verify.sh" --print-flags 2>/dev/null)"
+declared_pairs="$(jq -r '[.runArgs // [] | .[]] as $a
+                         | range(0; ($a | length))
+                         | select($a[.] == "--security-opt")
+                         | $a[.+1] // empty' <<<"$dc" 2>/dev/null)"
+n_declared="$(printf '%s\n' "$declared_pairs" | grep -c . || true)"
+if [ "$n_declared" -eq 0 ]; then
+    bad "no --security-opt pairs could be read out of container.json's runArgs — the control-set guard below would pass having compared nothing"
+elif [ -z "$mv_flags" ]; then
+    bad "mutate-verify.sh --print-flags produced nothing — the control's flag set could not be assembled, so nothing establishes that it carries what container.json declares"
+else
+    # The declared value is SUBSTITUTED before comparing, through the same `dc_subst` the control
+    # and run.sh both use: the assembled set holds a real path, and comparing against the raw
+    # `${localWorkspaceFolder}/…` spelling would make this guard fail for every declaration that
+    # uses a variable — i.e. exactly the seccomp profile it most needs to check.
+    root="$(cd "$here/.." && pwd)"
+    missing=""
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        sub="$(dc_subst "$v" "$root")" || sub="$v"
+        awk -v p="$sub" 'prev == "--security-opt" && $0 == p { n = 1 } { prev = $0 } END { exit !n }' \
+            <<<"$mv_flags" || missing="$missing $v"
+    done <<<"$declared_pairs"
+    if [ -n "$missing" ]; then
+        bad "the control set mutate-verify.sh assembles is missing declared --security-opt value(s):$missing — its mutations would be judged against a container run.sh does not produce"
+    else
+        ok "the control set carries every --security-opt container.json declares ($n_declared)"
+    fi
+fi
 
 # The whole point of the profile: these must be unconditionally allowed. Checked against the
 # generator's own list so the two cannot drift.
@@ -475,15 +541,43 @@ else
     # (That the profile is GENERATED rather than hand-maintained is asserted below, by the derived
     # check over every generator -- not here, where it would be a second rule about one of them.)
     # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
-    # ANCHORED ON THE INVOCATION, not on a mention of the name. `apparmor=jkb-dev` also appeared in
-    # the probe's LABEL, so changing the actual `--security-opt` flag to `apparmor=unconfined` left
-    # this guard green -- arm [3] then measured unconfined, and the headline "[2] FAILED with [3]
-    # OK" stopped demonstrating the profile and quietly demonstrated that switching AppArmor off
-    # works. The mutation rewrote every occurrence at once, so it reported CAUGHT either way and
-    # could never establish which one the guard reads. The label no longer contains the string.
-    if ! grep -qF -e "--security-opt apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
-        bad "ci.yml does not name the profile the file declares ($aa_name) — its bubblewrap probe would test a profile nothing loads"
+    #
+    # ANCHORED ON THE INVOCATION, not on a mention of the name -- and this is the SECOND time that
+    # sentence has had to be made true. `apparmor=jkb-dev` first appeared in the probe's LABEL, so
+    # changing the actual flag to `apparmor=unconfined` left the guard green while arm [3] measured
+    # unconfined. The label was cleaned up; then the flag itself was hoisted into a shared
+    # `AA=(--security-opt apparmor=jkb-dev)` array, and a `grep -F` for the literal matched THE
+    # ASSIGNMENT -- so deleting the array use from an arm left the guard green again, and the arm
+    # that claimed to be the shipped configuration measured it without the profile. A guard whose
+    # subject is "the string exists somewhere in this file" cannot survive an edit that moves the
+    # string; the fix is to make its subject the thing it is about.
+    #
+    # So: join `\`-continued lines, take the `probe …` INVOCATIONS, and require every `apparmor=`
+    # value on one to be the declared name, with at least one present. Two arms spelling the flag
+    # out is now what the guard needs rather than what it cannot tell apart, and mutate-config.sh
+    # breaks the first and the last in turn to prove it reads both.
+    #
+    # PINNED AGAINST AN EMPTY EXTRACTION, because every other failure of the joining awk -- a
+    # reindent, a quoting change, a rename of `probe` -- looks exactly like "no arm names a foreign
+    # profile", which is the passing answer.
+    ci_yml="$here/../.github/workflows/ci.yml"
+    # `|| true`, NOT `|| printf 0`: grep -c prints its count and then exits 1 when that count is
+    # zero, so the fallback appended a SECOND zero and the failure message came out split across
+    # two lines with its explanation on the far side of the break.
+    n_probes="$(grep -c '^[[:space:]]*probe "' "$ci_yml" 2>/dev/null || true)"
+    probe_calls="$(ci_probe_calls "$ci_yml")"
+    n_calls="$(printf '%s\n' "$probe_calls" | grep -c . || true)"
+    if [ "$n_calls" -lt "$n_probes" ] || [ "$n_calls" -eq 0 ]; then
+        bad "check-config.sh extracted $n_calls probe invocation(s) from ci.yml but it has $n_probes — the continuation-joining is broken, so the AppArmor-profile guard below is reading nothing"
         aa_ok=0
+    else
+        aa_vals="$(printf '%s\n' "$probe_calls" | grep -o 'apparmor=[^ "]*' || true)"
+        n_aa="$(printf '%s\n' "$aa_vals" | grep -c . || true)"
+        wrong="$(printf '%s\n' "$aa_vals" | grep -v "^apparmor=$aa_name\$" | grep . || true)"
+        if [ "$n_aa" -eq 0 ] || [ -n "$wrong" ]; then
+            bad "a ci.yml probe invocation does not name the profile the file declares ($aa_name; found: ${wrong:-none at all}) — that arm tests a profile nothing loads"
+            aa_ok=0
+        fi
     fi
     [ "$aa_ok" -eq 1 ] && ok "the AppArmor profile is docker-default with only \`mount\` relaxed ($aa_name)"
 fi

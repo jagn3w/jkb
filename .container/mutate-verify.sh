@@ -17,29 +17,23 @@
 # live in check-config.sh.
 set -uo pipefail
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
-# Without this, a host with no docker on PATH reports every guard as MISSED and exits 1 saying
-# "N guard(s) did not fire" — a security-shaped alarm for what is only a fact about the shell.
-# Docker Desktop installs to ~/.docker/bin, which an interactive profile may export and a plain
-# shell may not, so this is the normal way to meet it rather than an exotic one.
-# USABILITY, not presence. `command -v docker` succeeds on the far more common host state — Docker
-# Desktop installed but not running — and every mutation then printed MISSED with exit 125 before
-# the control finally said they were unattributable. Ten container starts to deliver the exact
-# ten-broken-guards alarm this block exists to remove, for the same fact about the host that the
-# PATH case reports as a clean skip.
-if ! command -v docker >/dev/null 2>&1; then
-    echo "=== container guards ==="
-    echo "   (skipped: docker is not on PATH — try: export PATH=\"\$HOME/.docker/bin:\$PATH\")"
-    echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
-    exit 0
-elif ! docker info >/dev/null 2>&1; then
-    echo "=== container guards ==="
-    echo "   (skipped: the Docker daemon is not reachable — is Docker Desktop running?)"
-    echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
-    exit 0
-fi
 CONTROL_ONLY=0
 SHELL_CMD=""
+PRINT_FLAGS=0
 if [ "${1:-}" = --control ]; then CONTROL_ONLY=1; shift; fi
+# `--print-flags`: the assembled control flag set, one argument per line, and nothing else.
+#
+# It exists so check-config.sh can assert — on any host, in ./scripts/check.sh — that what the
+# control actually RUNS still carries what container.json declares. Asserting that against the
+# `HEALTHY=(…)` source line was the obvious version and is the wrong one: it greps a bash array
+# literal, matches inside comments, is blind to a later reassignment, and once HEALTHY is derived
+# it is a guard over one spelling rather than over the result. This prints the assembly.
+#
+# IT MUST NOT BE BEHIND THE DOCKER PREFLIGHTS, which is why the argument parse moved above them.
+# Those exit 0 with a skip when Docker is absent or stopped — correct for a mutation run, fatal
+# here: the check would read empty output as a pass on every machine without a running daemon,
+# which is most of them.
+if [ "${1:-}" = --print-flags ]; then PRINT_FLAGS=1; shift; fi
 # `--shell <command>`: run one command in a healthy container, after the same preamble every
 # mutation and the control run. It exists so a DIAGNOSTIC never has to hand-roll the docker flags
 # -- the failure this file's header already records, where an assembled-by-hand `docker run`
@@ -52,25 +46,50 @@ if [ "${1:-}" = --shell ]; then
 fi
 IMAGE="${1:-jkb-dev}"
 
-# THE SUBJECT HAS TO EXIST, and be named on purpose. Same reason the docker checks above exist:
-# without this, an image that is not there produces nine MISSED lines and three BUILD-FAILED
-# blocks before the control finally reports them all unattributable — thirteen alarming lines for
-# a fact about the command. It happened with a stray em dash pasted as the image name, copied out
-# of prose where one followed the command; `docker run … — bash -c …` exits 125 ("could not start
-# the container"), which `judge` reads as a non-zero verify.sh and reports as a guard that did
-# not fire.
 if [ "$#" -gt 1 ]; then
     echo "=== container guards ==="
-    echo "   usage: $(basename "$0") [--control] [image]" >&2
+    echo "   usage: $(basename "$0") [--control|--print-flags] [image]" >&2
     echo "   got $# arguments: $*" >&2
     echo "   (a command copied with trailing prose attached is the usual cause)" >&2
     exit 2
 fi
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "=== container guards ==="
-    echo "   no image named '$IMAGE'. Nothing was verified — this is NOT a passing result." >&2
-    echo "   Build it first:  docker build -t jkb-dev .container" >&2
-    exit 2
+# EVERY PREFLIGHT THAT NEEDS A DOCKER HOST, skipped as a group under --print-flags, which needs
+# none: it derives and prints the flag set and exits.
+#
+# Without this, a host with no docker on PATH reports every guard as MISSED and exits 1 saying
+# "N guard(s) did not fire" — a security-shaped alarm for what is only a fact about the shell.
+# Docker Desktop installs to ~/.docker/bin, which an interactive profile may export and a plain
+# shell may not, so this is the normal way to meet it rather than an exotic one.
+# USABILITY, not presence. `command -v docker` succeeds on the far more common host state — Docker
+# Desktop installed but not running — and every mutation then printed MISSED with exit 125 before
+# the control finally said they were unattributable. Ten container starts to deliver the exact
+# ten-broken-guards alarm this block exists to remove, for the same fact about the host that the
+# PATH case reports as a clean skip.
+#
+# THE SUBJECT HAS TO EXIST, and be named on purpose, for the same reason: without the image check,
+# an image that is not there produces nine MISSED lines and three BUILD-FAILED blocks before the
+# control finally reports them all unattributable — thirteen alarming lines for a fact about the
+# command. It happened with a stray em dash pasted as the image name, copied out of prose where one
+# followed the command; `docker run … — bash -c …` exits 125 ("could not start the container"),
+# which `judge` reads as a non-zero verify.sh and reports as a guard that did not fire.
+if [ "$PRINT_FLAGS" -eq 0 ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "=== container guards ==="
+        echo "   (skipped: docker is not on PATH — try: export PATH=\"\$HOME/.docker/bin:\$PATH\")"
+        echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
+        exit 0
+    elif ! docker info >/dev/null 2>&1; then
+        echo "=== container guards ==="
+        echo "   (skipped: the Docker daemon is not reachable — is Docker Desktop running?)"
+        echo "   Nothing was verified. This is NOT a passing result, and not a failing one either."
+        exit 0
+    fi
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        echo "=== container guards ==="
+        echo "   no image named '$IMAGE'. Nothing was verified — this is NOT a passing result." >&2
+        echo "   Build it first:  docker build -t jkb-dev .container" >&2
+        exit 2
+    fi
 fi
 # CLEANUP HAS THE SAME UID PROBLEM AS THE MOUNT, one level along. The container writes into the
 # scratch knowledge base as uid 1000, creating directories it owns; removing a file needs write
@@ -105,7 +124,6 @@ mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 # from the host would need root.
 chmod 0777 "$scratch/jkb"
 printf '{}' > "$scratch/home/settings.json"
-SEC="$REPO/.container/seccomp-bwrap.json"
 BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)
 # A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
 # useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
@@ -133,11 +151,11 @@ PREAMBLE='
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1'
 SUBJECT="$PREAMBLE"'
       ./.container/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
-# The baseline every ADDITIVE mutation runs in, and the control with it. The three subtractive
-# mutations below deliberately spell a reduced set instead — that is what they are testing — and
-# being the only sites that do so makes them visibly the odd ones. Before this, HEALTHY was used
-# by the control alone while ten sites wrote the flags by hand, so tightening the baseline at the
-# run sites would have left the control certifying a container the mutations never ran in.
+# The baseline for the control and for every mutation, additive or subtractive: NO run site spells
+# a flag set. Additive ones pass "${HEALTHY[@]}" plus what they add; subtractive ones pass "${MUT[@]}",
+# which `without` derives from HEALTHY by removing exactly the named unit. Hand-spelling a reduced
+# set is what let a mutation differ from the control in two ways at once — three times, each after
+# a new flag joined HEALTHY and the copies did not follow.
 # JKB_ACCEPT_NO_BWRAP is propagated when the caller has set it, so the harness and the container
 # agree about which failures this host is known to produce. Not defaulted here: the acceptance is
 # an operator's statement about a host, and a harness that quietly assumed it would hide the very
@@ -168,32 +186,72 @@ fi
 # /usr/bin/env bash is on macOS (3.2.57). So `--control`, the one sanctioned "is my container
 # healthy" command and the one run.sh's own refusals point at, died on this line naming nothing.
 # run.sh:147 already uses this idiom for exactly this reason.
-# `systempaths=unconfined` is in here because container.json passes it and a control that does not
-# certifies a container nobody runs: without it Docker's masked /proc paths make the kernel refuse
-# bubblewrap's proc mount, so the nested sandbox cannot start. It also changes what verify.sh can
-# see — the AppArmor policy probe needs the MASKED /proc/kcore and degrades to a note without the
-# mask — so a harness missing this flag would exercise an arm the real container never reaches.
-# The subtractive mutations below are DERIVED from this array by `without`, so a flag added here
-# reaches every one of them and none of them can drop it by omission.
-HEALTHY=(--security-opt seccomp="$SEC" --security-opt systempaths=unconfined ${AA_ARGS[@]+"${AA_ARGS[@]}"} --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
+# THE CONFIG HALF OF THE CONTROL IS READ FROM container.json, NOT RE-TYPED (D52.6).
+#
+# It used to be a hand copy, and a copy of the declaration is a copy that goes stale: commit
+# 8266a2b added `--security-opt systempaths=unconfined` to container.json, run.sh picked it up
+# automatically because it derives, and this array did not — so for four commits CI's
+# `mutate-verify.sh --control` step, the one titled "The container is what it claims to be",
+# started a container WITHOUT the flag, reported it healthy, and judged every mutation verdict
+# against a container run.sh does not produce. It had also silently omitted `--pids-limit 4096`
+# since the day that was declared, which nobody noticed at all — the copy was never right, only
+# right enough.
+#
+# `--user` comes from `remoteUser` for the same reason and is the same kind of fact: bubblewrap
+# cannot create a namespace as root, so a control running as a different user from the real
+# container is not a control either.
+#
+# What is still spelled by hand is BASE alone, deliberately: those binds are NOT container.json's
+# mounts (a scratch knowledge base, the repo bind this harness `--declare`s) and are documented
+# above as the harness's own.
+RUNARGS=()
+while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done < <(dc_run_args "$REPO/.container/container.json" "$REPO")
+# EMPTY IS A FAILURE, NOT A CONTROL WITH NO FLAGS. `dc_run_args` returns 1 on an unset ${localEnv:…}
+# and yields nothing on unreadable or malformed JSON; a control assembled from that would run with
+# no seccomp profile and no /proc unmask, and its FAILs would read as a broken container.
+if [ "${#RUNARGS[@]}" -eq 0 ]; then
+    echo "mutate-verify: container.json declares no runArgs, or they could not be substituted." >&2
+    echo "  The control's security flags come from there; refusing to certify a container without them." >&2
+    exit 2
+fi
+USER_ARGS=(); _u="$(dc_remote_user "$REPO/.container/container.json")"; [ -n "$_u" ] && USER_ARGS=(--user "$_u")
+HEALTHY=("${RUNARGS[@]}" ${AA_ARGS[@]+"${AA_ARGS[@]}"} ${USER_ARGS[@]+"${USER_ARGS[@]}"} ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
+
+# THE ASSEMBLED CONTROL, for check-config.sh to assert against the declaration. Printed here
+# because this is where it is assembled: printing the derivation instead would compare
+# container.json with itself.
+if [ "$PRINT_FLAGS" -eq 1 ]; then printf '%s\n' "${HEALTHY[@]}"; exit 0; fi
 
 # A MUTATION CHANGES EXACTLY ONE THING, and hand-spelling the reduced flag set is how that stopped
-# being true — twice, the same way. The sets dropped $AA_ARGS when the AppArmor profile joined
-# HEALTHY (so "stock seccomp" reported CAUGHT on an AppArmor host whether or not the seccomp
-# profile was load-bearing, because removing the profile alone breaks bwrap), and then dropped
-# `systempaths=unconfined` when the /proc unmask joined it. Neither was a mistake anyone made at
-# the mutation; both were the consequence of writing the control's flags out a second time. So the
-# subtractive sets are computed FROM $HEALTHY: `without <ere>...` sets $MUT to every element that
-# matches none of the patterns, treating a value-taking flag and its value as one unit so a
-# `--security-opt` can never survive the value it introduced.
-takes_value() { case "$1" in -v|-e|-w|--user|--mount|--security-opt) return 0 ;; *) return 1 ;; esac; }
+# being true — three times, the same way. The sets dropped $AA_ARGS when the AppArmor profile
+# joined HEALTHY (so "stock seccomp" reported CAUGHT on an AppArmor host whether or not the seccomp
+# profile was load-bearing, because removing the profile alone breaks bwrap); then they dropped
+# `systempaths=unconfined` when the /proc unmask joined it; and when five sites were converted to
+# `without`, the two AppArmor arms were left spelling their own and immediately drifted the same
+# way. Not one of those was a mistake made AT a mutation — each was the consequence of writing the
+# control's flags out a second time, which is why the answer is that no site does.
+# `without <ere>...` sets $MUT to every element of HEALTHY matching none of the patterns, treating
+# a flag and its value as one unit so a `--security-opt` can never survive the value it introduced.
+#
+# PAIRING IS A RULE, NOT A LIST OF FLAGS. It used to be `takes_value`, a hand-maintained set
+# (-v -e -w --user --mount --security-opt) that had to be kept in step with a hand-written HEALTHY —
+# and deriving HEALTHY from container.json immediately brought in `--pids-limit 4096`, which that
+# list does not know. `without` would have dropped the flag and left `4096` behind as a stray
+# argument docker reads as the image name: a harness bug, reported as a guard that did not fire.
+# The rule needs no list, because it is true of every element HEALTHY can hold: AN ELEMENT THAT
+# DOES NOT BEGIN WITH `-` IS THE VALUE OF THE ELEMENT BEFORE IT.
+#
+# Residual, stated rather than guarded: a docker option whose VALUE begins with `-` would pair
+# wrongly. None exists here, and the guard for it is the unit count in the still-open nit — not
+# added blind, since nothing on this host can watch it fail.
 without() {
   local pats=("$@") i=0 n=${#HEALTHY[@]} e nxt p drop unit paired
   MUT=()
   while [ "$i" -lt "$n" ]; do
     e="${HEALTHY[$i]}"; paired=0; nxt=""; unit="$e"
-    if takes_value "$e" && [ "$((i+1))" -lt "$n" ]; then
-      nxt="${HEALTHY[$((i+1))]}"; unit="$e $nxt"; paired=1
+    if [ "$((i+1))" -lt "$n" ]; then
+      nxt="${HEALTHY[$((i+1))]}"
+      case "$nxt" in -*) nxt="" ;; *) unit="$e $nxt"; paired=1 ;; esac
     fi
     drop=0
     for p in "${pats[@]}"; do [[ "$unit" =~ $p ]] && drop=1; done
@@ -393,12 +451,21 @@ run "a --declare outside every declared target" "is not inside any host BIND" \
 if [ ${#AA_ARGS[@]} -eq 0 ]; then
     printf '  SKIPPED  the two AppArmor arms (no AppArmor on this host, so neither state is reachable)\n'
 else
-    run "apparmor=unconfined (the boundary is dropped entirely)" "AppArmor is not confining this container" \
-        --security-opt seccomp="$SEC" --security-opt apparmor=unconfined \
-        --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}"
+    # DERIVED, like every other subtractive mutation. These two were the last sites spelling a flag
+    # set by hand, and they had already drifted: neither carried `systempaths=unconfined` once
+    # container.json declared it, so each differed from the control in TWO ways and additionally
+    # failed the bwrap assertion for a reason that is not AppArmor. The comment above HEALTHY
+    # claimed no site could drop a flag by omission; it was true of the five `without` callers and
+    # these two were not among them.
+    without 'apparmor='
     run "no --security-opt apparmor (docker-default, the silent state)" "AppArmor is applying docker-default" \
-        --security-opt seccomp="$SEC" \
-        --cap-add=NET_ADMIN --user vscode ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}"
+        "${MUT[@]}"
+    # A REPLACEMENT, the idiom the `--user root` case uses: the profile is removed as a unit and a
+    # different one appended, so a second `--security-opt apparmor=` cannot be left for docker's
+    # last-wins rule to resolve.
+    without 'apparmor='
+    run "apparmor=unconfined (the boundary is dropped entirely)" "AppArmor is not confining this container" \
+        "${MUT[@]}" --security-opt apparmor=unconfined
 fi
 
 # Auto-memory sharing is a README promise whose entire mechanism is one symlink, which is exactly
