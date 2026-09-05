@@ -152,8 +152,7 @@ config_hash() { # config_hash <config> <repo-root>
 }
 
 docker_args() { # docker_args <config> <repo-root>  -> one argument per line
-    local cfg="$1" root="$2" line sub stripped
-    stripped="$(dc_strip "$cfg")"
+    local cfg="$1" root="$2" line sub
 
     printf '%s\n' "--name" "$NAME" "--detach" "--workdir" "$CTR_REPOS"
 
@@ -169,11 +168,18 @@ docker_args() { # docker_args <config> <repo-root>  -> one argument per line
         printf '%s\n' "--mount" "$sub"
     done < <(dc_mount_specs "$cfg")
 
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        sub="$(dc_subst "$line" "$root")" || die "container.json's containerEnv could not be substituted"
-        printf '%s\n' "--env" "$sub"
-    done < <(jq -r '(.containerEnv // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$stripped")
+    # Through the shared reader, read through `$( )` — the inline jq this replaces was itself a
+    # `< <( )` over a producer that can fail, i.e. the shape lib.sh's rule forbids, sitting in the
+    # file the rule was written for. mutate-verify.sh's control derives its environment from the
+    # same function, so the two cannot disagree about what the container declares.
+    local env_out
+    env_out="$(dc_container_env "$cfg" "$root")" || die "container.json's containerEnv could not be read"
+    if [ -n "$env_out" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            printf '%s\n' "--env" "$line"
+        done <<<"$env_out"
+    fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -280,6 +286,21 @@ if [ "${1:-}" = --self-test ]; then
     eq "every declared mount reaches the command line" \
        "$(grep -cxF -- '--mount' <<<"$args" || true)" "$declared"
     eq "...and there is at least one to reach it" "$([ "$declared" -gt 0 ] && echo yes || echo no)" "yes"
+
+    # A DECLARATION THAT DECLARES NO FLAGS IS REFUSED, not started without them. `dc_run_args` used
+    # to exit 0 with no output for an absent `runArgs` — a `while` loop that never runs its body
+    # succeeds — so the `|| die` above could not fire and this script would have gone on to build a
+    # `docker run` line with no seccomp profile, no /proc unmask, no NET_ADMIN and no pid limit,
+    # reporting nothing wrong. mutate-verify.sh refused that state and this file did not, which is
+    # a rule two callers had to remember; the refusal is `dc_run_args`' now. `rc_of` runs it in a
+    # subshell, or the `die` would take this self-test down with it.
+    # Removed inline rather than through a `trap … EXIT`, which replaces rather than adds: the two
+    # already here mean only the last one runs.
+    norunargs="$(mktemp)"
+    dc_strip "$CONFIG" | jq 'del(.runArgs)' > "$norunargs"
+    eq "a declaration with no runArgs is refused, not started without its security flags" \
+       "$(rc_of docker_args "$norunargs" "$repo")" "1"
+    rm -f "$norunargs"
 
     # The fingerprint that decides whether a running container is stale. The realistic way for it
     # to be useless is to be insensitive to the thing that matters, so it is tested against a

@@ -45,14 +45,31 @@ for want in '"remoteUser": "vscode"' '--cap-add=NET_ADMIN'; do
     else bad "container.json no longer declares $want"; fi
 done
 
-# The seccomp profile is asserted as a FLAG/VALUE PAIR in runArgs, not as a string present
-# somewhere in the file. Grepping for the value alone passed when the `--security-opt` flag was
-# deleted and the value left orphaned — Docker would then apply its default profile, bubblewrap
-# would fail, and the config still read as declaring a profile. Found by mutate-config.sh.
-if jq -e --arg v "seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json" \
-      '[.runArgs // [] | to_entries[] | select(.value == "--security-opt") | .key]
-       | any(. as $i | ($ARGS.named.v) == ($in_args[$i+1] // ""))' \
-      --argjson in_args "$(jq -c '.runArgs // []' <<<"$dc")" <<<"$dc" >/dev/null 2>&1; then
+# THE ONE EXTRACTION of "which values does runArgs pair with --security-opt". This was spelled
+# three times within seventy lines — two near-verbatim jq `to_entries|any` blocks and this
+# `range/select` — in the file that fails the build when `dc_require_apparmor_profile` or
+# `dc_apparmor_mediates` gains a second definition. The next `--security-opt` the container
+# declares would have needed a fourth spelling.
+#
+# ADJACENCY, not membership: an orphaned value reads as a declaration and applies nothing. Delete
+# the `--security-opt` flag and leave `seccomp=…` behind, and Docker applies its DEFAULT profile —
+# whose `mount` denial is what bubblewrap dies on — while the file still reads as declaring one.
+# Found by mutate-config.sh, which is why this is a pair check and not a grep for the value.
+declared_pairs="$(jq -r '[.runArgs // [] | .[]] as $a
+                         | range(0; ($a | length))
+                         | select($a[.] == "--security-opt")
+                         | $a[.+1] // empty' <<<"$dc" 2>/dev/null)"
+n_declared="$(printf '%s\n' "$declared_pairs" | grep -c . || true)"
+if [ "$n_declared" -eq 0 ]; then
+    bad "no --security-opt pairs could be read out of container.json's runArgs — every check over them below would pass having compared nothing"
+fi
+declares_security_opt() { printf '%s\n' "$declared_pairs" | grep -qxF -- "$1"; }
+
+# WHAT IS DECLARED is a different question from what the control carries, and both are asked. This
+# one goes red when the profile is removed from container.json; the control guard below cannot,
+# because a declaration-less file passes it vacuously (the control would derive nothing to be
+# missing). Sharing the extraction was the fix; merging the questions would have deleted a check.
+if declares_security_opt "seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json"; then
     ok "runArgs pairs --security-opt with the seccomp profile"
 else
     bad "container.json does not pair --security-opt with seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json — Docker would apply its default profile and bubblewrap could not start"
@@ -62,13 +79,8 @@ fi
 # seccomp: Docker's masked /proc paths are SUBMOUNTS, so /proc is not "fully visible" and the
 # kernel refuses a fresh proc mount inside a user namespace whatever the syscall filter allows.
 # Without it the nested sandbox cannot start at all, and because the posture fails closed that
-# surfaces as Bash erroring rather than as anything naming this flag. Asserted as a FLAG/VALUE
-# PAIR for the same reason as the profile above — an orphaned value reads as a declaration and
-# applies nothing.
-if jq -e --arg v "systempaths=unconfined" \
-      '[.runArgs // [] | to_entries[] | select(.value == "--security-opt") | .key]
-       | any(. as $i | ($ARGS.named.v) == ($in_args[$i+1] // ""))' \
-      --argjson in_args "$(jq -c '.runArgs // []' <<<"$dc")" <<<"$dc" >/dev/null 2>&1; then
+# surfaces as Bash erroring rather than as anything naming this flag.
+if declares_security_opt "systempaths=unconfined"; then
     ok "runArgs pairs --security-opt with systempaths=unconfined"
 else
     bad "container.json does not pair --security-opt with systempaths=unconfined — Docker's masked /proc paths would make the kernel refuse bubblewrap's proc mount, so Claude Code's nested sandbox could not start"
@@ -95,37 +107,40 @@ if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — th
 # that script's daemon preflights: those exit 0 with a skip, and an empty read would pass here on
 # every machine without a running daemon.
 #
-# ADJACENCY, not membership: an orphaned value reads as a declaration and applies nothing, the same
-# reason the two pair checks above exist. And pinned against an empty extraction on both sides,
-# because "no declared pairs" and "the control carries them all" are otherwise the same answer.
+# THE WHOLE OF `runArgs`, AS ONE CONTIGUOUS BLOCK — not the `--security-opt` pairs, which is what
+# this compared first and is a narrower question than the comment above it claimed. `--pids-limit
+# 4096` is not a `--security-opt`, and its absence from HEALTHY "since the day it was declared" is
+# the very omission cited three paragraphs up as the motivating example: the guard written to catch
+# it could not see it. `--cap-add=NET_ADMIN` was likewise checked as a declaration and never as
+# something the control carries.
+#
+# CONTIGUOUS is the property, and it is exactly the right strength. `HEALTHY=("${RUNARGS[@]}" …)`
+# enters the derived flags as ONE array expansion, so they are necessarily an unbroken run of lines
+# — meaning what this asserts is "RUNARGS went in as a unit, unedited", which is what
+# mutate-config.sh breaks by deleting that expansion. It is not a change-detector: reordering
+# HEALTHY moves the block intact and still passes. The only edit that breaks contiguity is somebody
+# hand-interleaving flags into the derived run, which is a return to the hand-typed copy this whole
+# derivation exists to end. Set membership would lose the adjacency the pair checks above argue for.
+#
+# The comparison is against the SUBSTITUTED derivation, through the same `dc_run_args` the control
+# and run.sh both use: the assembled set holds a real path, and comparing against the raw
+# `${localWorkspaceFolder}/…` spelling would fail for every declaration using a variable — i.e. for
+# the seccomp profile it most needs to check. Pinned against an empty read on both sides, because
+# "nothing was derived" and "the control carries it all" are otherwise the same answer.
 mv_flags="$("$here/mutate-verify.sh" --print-flags 2>/dev/null)"
-declared_pairs="$(jq -r '[.runArgs // [] | .[]] as $a
-                         | range(0; ($a | length))
-                         | select($a[.] == "--security-opt")
-                         | $a[.+1] // empty' <<<"$dc" 2>/dev/null)"
-n_declared="$(printf '%s\n' "$declared_pairs" | grep -c . || true)"
-if [ "$n_declared" -eq 0 ]; then
-    bad "no --security-opt pairs could be read out of container.json's runArgs — the control-set guard below would pass having compared nothing"
+root="$(cd "$here/.." && pwd)"
+derived="$(dc_run_args "$here/container.json" "$root" 2>/dev/null)" || derived=""
+if [ -z "$derived" ]; then
+    bad "container.json's runArgs could not be derived here, so nothing establishes that the control carries them — the declaration is unreadable, unparseable, empty, or names a variable that is not set"
 elif [ -z "$mv_flags" ]; then
     bad "mutate-verify.sh --print-flags produced nothing — the control's flag set could not be assembled, so nothing establishes that it carries what container.json declares"
 else
-    # The declared value is SUBSTITUTED before comparing, through the same `dc_subst` the control
-    # and run.sh both use: the assembled set holds a real path, and comparing against the raw
-    # `${localWorkspaceFolder}/…` spelling would make this guard fail for every declaration that
-    # uses a variable — i.e. exactly the seccomp profile it most needs to check.
-    root="$(cd "$here/.." && pwd)"
-    missing=""
-    while IFS= read -r v; do
-        [ -n "$v" ] || continue
-        sub="$(dc_subst "$v" "$root")" || sub="$v"
-        awk -v p="$sub" 'prev == "--security-opt" && $0 == p { n = 1 } { prev = $0 } END { exit !n }' \
-            <<<"$mv_flags" || missing="$missing $v"
-    done <<<"$declared_pairs"
-    if [ -n "$missing" ]; then
-        bad "the control set mutate-verify.sh assembles is missing declared --security-opt value(s):$missing — its mutations would be judged against a container run.sh does not produce"
-    else
-        ok "the control set carries every --security-opt container.json declares ($n_declared)"
-    fi
+    case $'\n'"$mv_flags"$'\n' in
+      *$'\n'"$derived"$'\n'*)
+        ok "the control set carries container.json's runArgs verbatim ($(printf '%s\n' "$derived" | grep -c .) argument(s))" ;;
+      *)
+        bad "the control set mutate-verify.sh assembles does not contain container.json's runArgs as one contiguous block — its mutations would be judged against a container run.sh does not produce" ;;
+    esac
 fi
 
 # The whole point of the profile: these must be unconditionally allowed. Checked against the
@@ -959,13 +974,17 @@ fi
 # A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process
 # substitution's exit status, so a refusal inside one kills the subshell alone and the reading loop
 # keeps whatever was emitted before it. `dc_subst` refuses on an unset ${localEnv:…} precisely so a
-# boundary cannot move because a variable was not set; `dc_run_args` and `docker_args` carry that
-# refusal outward. All three emit as they go, so the caller is left holding not nothing — which
-# every caller checks for — but a TRUNCATED list: a container started without the mounts or the
-# security flags it declares, a fingerprint over half a declaration, a control certified without
-# the flag it was assembled to carry. That last one is the state deriving the control's flags was
-# meant to end, so the derivation would have reintroduced it one level down.
-procsub="$(grep -n '< <([[:space:]]*\(docker_args\|dc_run_args\|dc_subst\)' "$here"/*.sh /dev/null || true)"
+# boundary cannot move because a variable was not set; `dc_run_args`, `dc_container_env` and
+# `docker_args` carry that refusal outward. All of them emit as they go, so the caller is left
+# holding not nothing — which every caller checks for — but a TRUNCATED list: a container started
+# without the mounts or the security flags it declares, a fingerprint over half a declaration, a
+# control certified without the flag it was assembled to carry. That last one is the state deriving
+# the control's flags was meant to end, so the derivation would have reintroduced it one level down.
+#
+# The list is this checker's to maintain, and `dc_container_env` joined it late: run.sh read its
+# environment through an inline `< <(jq …)` — the forbidden shape, in the file the rule was written
+# for — and a three-name list could not see it.
+procsub="$(grep -n '< <([[:space:]]*\(docker_args\|dc_run_args\|dc_container_env\|dc_subst\)' "$here"/*.sh /dev/null || true)"
 if [ -z "$procsub" ]; then
     ok "no refusing producer is read through a process substitution"
 else

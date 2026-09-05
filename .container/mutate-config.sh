@@ -489,7 +489,13 @@ out = s.replace('HEALTHY=("${RUNARGS[@]}" ', 'HEALTHY=(')
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
-run "the control drops the flags it derived from container.json" "missing declared --security-opt"
+run "the control drops the flags it derived from container.json" "as one contiguous block"
+
+# THE OTHER SIDE OF THAT GUARD: nothing to compare against. The control-set check asks whether
+# HEALTHY contains the derived runArgs, and "the derivation produced nothing" and "the control
+# carries it all" are the same answer unless the empty case is refused on its own.
+seed; sub_dc '"runArgs": [' '"runArgs2": ['
+run "container.json declares no runArgs at all" "could not be derived here"
 
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
@@ -797,11 +803,13 @@ run "run.sh reads docker_args through a process substitution again" "which disca
 seed; python3 - "$work/t/.container/mutate-verify.sh" "$PS" <<'PYX'
 import sys
 p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
-old = 'if _ra="$(dc_run_args "$REPO/.container/container.json" "$REPO")" && [ -n "$_ra" ]; then'
+old = '_ra="$(dc_run_args "$CFG" "$REPO")" || {'
 assert old in s, "mutation target absent"
-new = ('if true; then _ra=""\n    while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done '
-       '%s(dc_run_args "$REPO/.container/container.json" "$REPO")' % ps)
-open(p, 'w').write(s.replace(old, new, 1))
+i = s.index(old)
+j = s.index('while IFS= read -r _l', i)
+k = s.index('\n', j)
+new = 'while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done %s(dc_run_args "$CFG" "$REPO")' % ps
+open(p, 'w').write(s[:i] + new + s[k:])
 PYX
 run "the control reads dc_run_args through a process substitution again" "which discards its refusal"
 
@@ -817,7 +825,7 @@ run "the control reads dc_run_args through a process substitution again" "which 
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=71
+PINNED_BAD_SITES=72
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

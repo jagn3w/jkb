@@ -49,17 +49,60 @@ dc_subst() { # dc_subst <string> <repo-root>
 # namespace as root, so a harness running as a different user from the real container is not a
 # control either. What mutate-verify.sh still spells by hand is only its own scratch binds, which
 # are deliberately NOT container.json's mounts.
+# EMPTY IS A REFUSAL, AND IT LIVES HERE rather than in a caller. A `while` loop that never runs its
+# body exits 0, so an absent or unreadable `runArgs` used to leave this function reporting success
+# with no output — and run.sh's `|| die` therefore could not fire, so the launcher that starts the
+# container people attach to would build a `docker run` line with no seccomp profile, no
+# `systempaths=unconfined`, no `NET_ADMIN` and no pid limit, and say nothing was wrong.
+# mutate-verify.sh refused that state and run.sh did not, which is a rule two callers had to
+# remember and one did. There is no legitimate empty here: `runArgs` IS this container's security
+# configuration.
+#
+# The jq is read through `$( )` too, so "container.json does not parse" and "it declares no
+# runArgs" arrive as different messages instead of as one empty stream — inside the very function
+# the rule above is written over. (A malformed container.json also empties the mount and env
+# readers, and there is still no single `jq empty` above `docker_args`' dispatch to catch all
+# three at once; that is filed, not fixed here.)
 dc_run_args() { # dc_run_args <container.json> <repo-root>  -> one docker argument per line
-    local line sub
+    local raw line sub
+    [ -r "$1" ] || { printf 'container.json is not readable: %s\n' "$1" >&2; return 1; }
+    raw="$(dc_strip "$1" | jq -r '(.runArgs // [])[]' 2>/dev/null)" \
+        || { printf 'container.json does not parse: %s\n' "$1" >&2; return 1; }
+    if [ -z "$raw" ]; then
+        printf 'container.json declares no runArgs: %s\n' "$1" >&2
+        return 1
+    fi
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         sub="$(dc_subst "$line" "$2")" || return 1
         printf '%s\n' "$sub"
-    done < <(dc_strip "$1" 2>/dev/null | jq -r '(.runArgs // [])[]' 2>/dev/null)
+    done <<<"$raw"
 }
 
-# READ A REFUSING PRODUCER THROUGH `$( )`, NEVER THROUGH `< <( )`. `dc_subst`, `dc_run_args` and
-# run.sh's `docker_args` all REFUSE — that is the whole point of the unset-${localEnv:…} error
+# The environment the container declares, substituted, one `KEY=VALUE` per line.
+#
+# It is on the DECLARATION side of the line that decides what a control container must copy. The
+# control copies everything that is a property of the declaration — `runArgs`, `remoteUser`,
+# `containerEnv` — and supplies its own only for what is a property of the HOST'S DATA, which is
+# the mount sources: the real ~/repos and ~/.jkb become the harness's scratch binds. `containerEnv`
+# names container paths, never host ones, so there is nothing about it for a harness to substitute.
+#
+# Unlike runArgs, empty is legitimate: a container may declare no environment. Unreadable is not.
+dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY=VALUE per line
+    local raw line sub
+    [ -r "$1" ] || { printf 'container.json is not readable: %s\n' "$1" >&2; return 1; }
+    raw="$(dc_strip "$1" | jq -r '(.containerEnv // {}) | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)" \
+        || { printf 'container.json does not parse: %s\n' "$1" >&2; return 1; }
+    [ -n "$raw" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        sub="$(dc_subst "$line" "$2")" || return 1
+        printf '%s\n' "$sub"
+    done <<<"$raw"
+}
+
+# READ A REFUSING PRODUCER THROUGH `$( )`, NEVER THROUGH `< <( )`. `dc_subst`, `dc_run_args`,
+# `dc_container_env` and run.sh's `docker_args` all REFUSE — that is the whole point of the unset-${localEnv:…} error
 # above — and bash discards a process substitution's exit status, so a refusal inside one kills
 # only the subshell while the reading loop keeps whatever was emitted before it. These producers
 # emit as they go, so what the caller is left holding is not nothing (which every caller checks

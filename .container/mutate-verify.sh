@@ -12,9 +12,14 @@
 # exactly like a guard that did not fire" this file already guards its own control against, so the
 # correct invocation is here, defined ONCE, rather than written out in prose somewhere.
 #
-# Needs a Docker host and the image built (`docker build -t jkb-dev .container`), so it is this
-# change's #[ignore] test and is never part of ./scripts/check.sh — the host-side static checks
-# live in check-config.sh.
+# Needs a Docker host and the image built (`docker build -t jkb-dev .container`), so the mutation
+# run is this change's #[ignore] test — the host-side static checks live in check-config.sh.
+#
+# ONE MODE IS AN EXCEPTION AND THE GATE DEPENDS ON IT: `--print-flags` assembles the control's flag
+# set and prints it, needing no daemon, and check-config.sh runs it on every ./scripts/check.sh to
+# compare that set against container.json. That is why the docker preflights below are skipped for
+# it rather than merely tolerated — they exit 0 with a skip, so an empty read would have passed the
+# gate on every machine without a running daemon.
 set -uo pipefail
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 CONTROL_ONLY=0
@@ -48,7 +53,7 @@ IMAGE="${1:-jkb-dev}"
 
 if [ "$#" -gt 1 ]; then
     echo "=== container guards ==="
-    echo "   usage: $(basename "$0") [--control|--print-flags] [image]" >&2
+    echo "   usage: $(basename "$0") [--control|--print-flags|--shell <command>] [image]" >&2
     echo "   got $# arguments: $*" >&2
     echo "   (a command copied with trailing prose attached is the usual cause)" >&2
     exit 2
@@ -204,24 +209,44 @@ fi
 # What is still spelled by hand is BASE alone, deliberately: those binds are NOT container.json's
 # mounts (a scratch knowledge base, the repo bind this harness `--declare`s) and are documented
 # above as the harness's own.
-RUNARGS=()
 # Read through `$( )`: a `< <( )` here would discard dc_run_args' refusal, and because it emits
-# each argument as it substitutes it, a refusal PART WAY would leave a truncated set the emptiness
-# check below cannot see — a control missing one declared flag, which is the exact state this
-# derivation exists to end. See lib.sh, and check-config.sh, which fails the gate on that shape.
-if _ra="$(dc_run_args "$REPO/.container/container.json" "$REPO")" && [ -n "$_ra" ]; then
-    while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done <<<"$_ra"
-fi
-# EMPTY IS A FAILURE, NOT A CONTROL WITH NO FLAGS. `dc_run_args` returns 1 on an unset ${localEnv:…}
-# and yields nothing on unreadable or malformed JSON; a control assembled from that would run with
-# no seccomp profile and no /proc unmask, and its FAILs would read as a broken container.
-if [ "${#RUNARGS[@]}" -eq 0 ]; then
-    echo "mutate-verify: container.json declares no runArgs, or they could not be substituted." >&2
-    echo "  The control's security flags come from there; refusing to certify a container without them." >&2
+# each argument as it substitutes it, a refusal PART WAY would leave a truncated set — a control
+# missing one declared flag, which is the exact state this derivation exists to end. See lib.sh,
+# and check-config.sh, which fails the gate on that shape.
+#
+# THE EMPTINESS REFUSAL IS THE CALLEE'S, not a block here. It used to be written out at this one
+# call site, which meant run.sh — the launcher that starts the container people actually attach to
+# — did not make it, and would start a container with none of its declared security flags while
+# reporting nothing wrong. A rule two callers must remember is the defect; `dc_run_args` refuses.
+CFG="$REPO/.container/container.json"
+RUNARGS=()
+_ra="$(dc_run_args "$CFG" "$REPO")" || {
+    echo "mutate-verify: the control's security flags come from container.json's runArgs (above)." >&2
+    echo "  Refusing to certify a container assembled without them." >&2
     exit 2
+}
+while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done <<<"$_ra"
+
+USER_ARGS=(); _u="$(dc_remote_user "$CFG")"; [ -n "$_u" ] && USER_ARGS=(--user "$_u")
+
+# containerEnv, from the same reader run.sh uses. It is on the DECLARATION side of the line lib.sh
+# draws: the control copies what the declaration says and substitutes only what is a property of
+# the host's data, which is the mount sources alone. Leaving it out meant the control ran without
+# the environment the real container carries -- and `JKB_EGRESS_ACCEPT_UNFILTERED` is exactly the
+# entry somebody will one day set to "1" (D50.6, the documented escape), after which verify.sh
+# reports a FAILURE in the real container on every run while the control, not carrying it, went on
+# printing "the container is what it claims to be". Every declared value happens to equal its own
+# default today, which is why the omission has cost nothing so far and why nobody noticed.
+ENV_ARGS=()
+_ce="$(dc_container_env "$CFG" "$REPO")" || {
+    echo "mutate-verify: container.json's containerEnv could not be read (above)." >&2
+    exit 2
+}
+if [ -n "$_ce" ]; then
+    while IFS= read -r _l; do [ -n "$_l" ] && ENV_ARGS+=(--env "$_l"); done <<<"$_ce"
 fi
-USER_ARGS=(); _u="$(dc_remote_user "$REPO/.container/container.json")"; [ -n "$_u" ] && USER_ARGS=(--user "$_u")
-HEALTHY=("${RUNARGS[@]}" ${AA_ARGS[@]+"${AA_ARGS[@]}"} ${USER_ARGS[@]+"${USER_ARGS[@]}"} ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
+
+HEALTHY=("${RUNARGS[@]}" ${AA_ARGS[@]+"${AA_ARGS[@]}"} ${USER_ARGS[@]+"${USER_ARGS[@]}"} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 
 # THE ASSEMBLED CONTROL, for check-config.sh to assert against the declaration. Printed here
 # because this is where it is assembled: printing the derivation instead would compare
@@ -431,9 +456,16 @@ fi
 # separate property and is covered by entrypoint.sh --self-test; it cannot be judged here, because
 # `judge` requires the expectation and the word FAIL on one line and the refusal is not a verify.sh
 # FAIL line.
-without 'NET_ADMIN'
+#
+# A REPLACEMENT, like `--user` below, and it had to become one the moment `containerEnv` joined the
+# derived half: HEALTHY now carries the declared `--env JKB_EGRESS_ACCEPT_UNFILTERED=0`, so passing
+# the override BEFORE $MUT left docker two values for one key and its last-wins rule chose the
+# declared `0`. The entrypoint would then refuse to boot exactly as it does unarmed, $SUBJECT would
+# never run, and this mutation would report MISSED for ever — the tooling outcome its own comment
+# above says it exists to avoid. Dropped as a unit and re-added last instead, so there is one.
+without 'NET_ADMIN' 'JKB_EGRESS_ACCEPT_UNFILTERED'
 run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
-    -e JKB_EGRESS_ACCEPT_UNFILTERED=1 "${MUT[@]}"
+    "${MUT[@]}" --env JKB_EGRESS_ACCEPT_UNFILTERED=1
 # The one REPLACEMENT rather than a subtraction: `--user` is removed as a unit and re-added, so a
 # second `--user` cannot be left for docker's last-wins rule to resolve.
 without '^--user '

@@ -219,10 +219,13 @@ jobs:
       # on a missing profile file), so something else is refusing.
       #
       # THE NUMBERED ARMS ARE HYPOTHESES, NOT THE CONTAINER. They deliberately assemble their own
-      # docker flags — varying the flags IS the experiment — and each rung adds exactly ONE flag to
-      # the one above it, so the column that flips names the flag responsible. [3] succeeding where
-      # [2] fails isolates AppArmor in the `namespaces` column: Ubuntu 24.04 (which ubuntu-latest
-      # is) restricts unprivileged user namespaces by default, and the design's own measurement was
+      # docker flags — varying the flags IS the experiment — and each rung is meant to add one flag
+      # to the one above it. Attribution is read off the `flags:` line each row PRINTS, never off
+      # that intention: nothing enforces the ladder's shape, an arm that quietly lost a flag would
+      # still read as a ladder, and the flip would then be credited to whatever its label said was
+      # added. [3] succeeding where [2] fails isolates AppArmor in the `namespaces` column: Ubuntu
+      # 24.04 (which ubuntu-latest is) restricts unprivileged user namespaces by default, and the
+      # design's own measurement was
       # taken on 26.04. Reported, never acted on automatically: `apparmor=unconfined` is a real
       # weakening of the container and is a decision, not a fix to apply because a probe suggested it.
       #
@@ -280,19 +283,31 @@ jobs:
           # SPLIT so one rendering serves both kinds of row: the numbered arms, which spell their
           # own flags, and the derived [shipped] row, which cannot. A second `case` for the second
           # kind is how the two would come to disagree about what a column means.
-          report() { # report <label> <output>
+          report() { # report <label> <flags> <output>
             # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
             # whole lesson of the previous version: "no BWRAP-NS=" and "the probe never executed"
             # are different facts and must not print the same way.
-            case "$2" in
+            #
+            # THE FLAGS ARE PRINTED, NOT INFERRED FROM THE LABEL. Attribution used to rest on a
+            # rule about labels -- "each rung adds exactly one flag, so the column that flips names
+            # the flag responsible" -- which nothing enforced and nothing could: build the arms
+            # from a cumulative list and the invocations stop naming their own flags, which is the
+            # state check-config.sh's profile guard exists to refuse (mutate-config.sh requires
+            # that hoisting the AppArmor flag into an array FAILS the gate). Delete a flag from an
+            # arm and the ladder still read as a ladder, so a flip got attributed to whatever the
+            # label said was added -- printing this branch's evidence as the opposite of its
+            # thesis. A fact that can be read is never inferred: the row says what it ran with.
+            case "$3" in
               *BWRAP-NS=*)
                 printf '%-42s namespaces=%-7s proc-mount=%s\n' "$1" \
-                       "$(sed -n 's/^BWRAP-NS=//p' <<<"$2" | head -1)" \
-                       "$(sed -n 's/^BWRAP-PROC=//p' <<<"$2" | head -1)"
-                sed -n 's/^BWRAP-WHY=\(..*\)/      \1/p' <<<"$2" | head -1 ;;
+                       "$(sed -n 's/^BWRAP-NS=//p' <<<"$3" | head -1)" \
+                       "$(sed -n 's/^BWRAP-PROC=//p' <<<"$3" | head -1)"
+                printf '      flags: %s\n' "${2:-(none)}"
+                sed -n 's/^BWRAP-WHY=\(..*\)/      \1/p' <<<"$3" | head -1 ;;
               *)
                 printf '%-42s DID NOT RUN - this arm measured NOTHING:\n' "$1"
-                printf '%s\n' "$2" | sed 's/^/      /' | tail -5 ;;
+                printf '      flags: %s\n' "${2:-(none)}"
+                printf '%s\n' "$3" | sed 's/^/      /' | tail -5 ;;
             esac
           }
           probe() { # probe <label> <extra docker args...>
@@ -308,7 +323,9 @@ jobs:
             # The `*)` arm below exists precisely for that case and was unreachable for its most
             # likely cause.
             out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c "$INNER" 2>&1)" || true
-            report "$label" "$out"
+            # `$*` is the arm's own argument list, so what is reported is what docker was handed
+            # rather than what the label claims.
+            report "$label" "$*" "$out"
           }
           probe "[1] stock docker"        --user vscode
           probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
@@ -333,7 +350,11 @@ jobs:
           # nested sandbox start in the thing we ship", and it cannot drift from the declaration
           # because it does not restate it.
           out="$(./.container/mutate-verify.sh --shell "$INNER" 2>&1)" || true
-          report "[shipped] the control container" "$out"
+          # Its flags come from the same assembly the run used, printed rather than described --
+          # `--print-flags` needs no daemon, so this costs nothing and cannot describe a different
+          # container from the one `--shell` just started.
+          report "[shipped] the control container" \
+                 "$(./.container/mutate-verify.sh --print-flags 2>/dev/null | tr '\n' ' ')" "$out"
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
       # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run
