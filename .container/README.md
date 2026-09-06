@@ -469,6 +469,23 @@ running unconfined. `container.json` therefore passes `--security-opt systempath
 Measured with a negative control, one flag apart: with it the nested proc mount succeeds, without it
 it is denied.
 
+**Necessity is host-dependent, and that was measured too.** On macOS / Docker Desktop the same
+negative control gives the opposite answer: without the flag the container really does carry the
+masks (10 submounts under `/proc`, against 0 with it) and `bwrap --bind / / --proc /proc` mounts
+proc **anyway**. `mount_too_revealing()` is a kernel check, and the LinuxKit VM's kernel permits
+what Ubuntu 26.04 refuses. So on a Mac the flag is paid for in full — ten paths unmasked — and buys
+nothing observable. Whether it should therefore be passed only where it is load-bearing is a design
+question, not a fix: making the run flags host-dependent moves the container's fingerprint with the
+host and needs its own pass. `mutate-verify.sh` now reports the two bubblewrap mutations as
+**SKIPPED** rather than MISSED wherever the flag they remove is inert, deciding that from what the
+run reported and never from the platform name.
+
+What this does **not** establish is that Claude Code's own sandbox behaves like the probe. The probe
+is a bare `--proc /proc`; the failure that motivated the flag was Claude Code's own
+`bwrap: Can't mount proc on /newroot/proc`. If those ever disagree on one host, the probe is weaker
+than the mechanism it certifies and its `ok` line over-claims — the defect `--proc /proc` was added
+to close, one level along.
+
 **Seccomp was necessary, not sufficient.** The 14 syscalls fixed namespace *creation*; mounting
 `proc` is a later step, and nothing had ever exercised it — `generate-apparmor.sh` says as much
 ("the nested sandbox had never actually started on Linux").

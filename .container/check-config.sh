@@ -912,6 +912,43 @@ while IFS= read -r want; do
     expects+=("$want")
     grep -qF -e "$want" "$here/verify.sh" || stale_expects+=("$want")
 done < <(sed -n 's/^[[:space:]]*run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
+# THE INERT MARKERS ARE THE SAME RULE. `RUN_INERT_IF` names a string verify.sh prints when the
+# mechanism worked despite the mutation, which is how the harness tells "this guard did not fire"
+# from "there was nothing to notice on this host". Reword verify.sh's ok line and the marker matches
+# nothing: the skip silently stops happening and the mutation goes back to reporting MISSED on a
+# host where it cannot discriminate — an alarm about the machine, blamed on a guard. Checked with
+# the same staleness rule and counted separately, because these are not `run` calls and folding
+# them into `expects` would break the count check above.
+stale_inerts=()
+inerts=()
+while IFS= read -r want; do
+    [ -n "$want" ] || continue
+    inerts+=("$want")
+    grep -qF -e "$want" "$here/verify.sh" || stale_inerts+=("$want")
+done < <(sed -n 's/^[[:space:]]*RUN_INERT_IF="\([^"][^"]*\)".*/\1/p' "$here/mutate-verify.sh")
+# COUNTED BY A PREDICATE INDEPENDENT OF THE EXTRACTOR'S, which is the whole point of a count pin
+# and is easy to get wrong: the first version of this line asked for `RUN_INERT_IF="[^"]` — the
+# extractor's own double-quoted shape — so respelling an assignment with single quotes dropped BOTH
+# counts to zero, they agreed, and it printed `ok (0 checked)` having checked nothing. Reproduced by
+# hand before this was rewritten. Any non-empty assignment counts, however it is quoted.
+inert_sites="$(dc_strip_comments "$here/mutate-verify.sh" \
+    | awk '/^[[:space:]]*RUN_INERT_IF=/ && $0 !~ /^[[:space:]]*RUN_INERT_IF=""[[:space:]]*$/ {n++} END {print n+0}')"
+if [ "$inert_sites" -eq 0 ]; then
+    # PINNED AGAINST NONE AT ALL, like every other derived list here, and for a reason this harness
+    # has now demonstrated twice: delete both assignments and the count and the extraction agree at
+    # zero, so it printed `ok (0 checked)` while the two bubblewrap mutations went back to reporting
+    # MISSED on every host where their flag is not load-bearing. This file is KNOWN to need them —
+    # macOS/Docker Desktop mounts /proc with the masks in place — so zero is a state that has to be
+    # argued for at the moment of the edit rather than passing silently.
+    bad "mutate-verify.sh sets no RUN_INERT_IF marker — the two bubblewrap mutations would report MISSED rather than SKIPPED on a host where the flag they remove is not load-bearing"
+elif [ "${#inerts[@]}" -ne "$inert_sites" ]; then
+    bad "the inert-marker check reads ${#inerts[@]} of $inert_sites RUN_INERT_IF assignments — the rest are unchecked, so a stale one would silently stop a mutation being skipped where it cannot discriminate"
+elif [ ${#stale_inerts[@]} -ne 0 ]; then
+    bad "mutate-verify.sh's inert marker(s) name text verify.sh never prints: ${stale_inerts[*]} — those mutations would report MISSED on a host where the flag is not load-bearing"
+else
+    ok "every mutate-verify inert marker is a string verify.sh prints (${#inerts[@]} checked)"
+fi
+
 # ...AND THE EXTRACTION MUST HAVE FOUND THEM ALL, which an emptiness pin cannot tell you. The
 # pattern was anchored at `^run`, so the first mutation to be indented -- one wrapped in an `if`
 # for a host where it cannot discriminate -- silently dropped out and the guard went on reporting

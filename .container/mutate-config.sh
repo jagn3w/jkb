@@ -813,6 +813,40 @@ open(p, 'w').write(s[:i] + new + s[k:])
 PYX
 run "the control reads dc_run_args through a process substitution again" "which discards its refusal"
 
+# THE INERT MARKERS, all three failure paths. They decide whether a mutation whose flag is not
+# load-bearing on this host reports SKIPPED (a fact about the machine) or MISSED (an alarm about a
+# guard) -- measured on macOS/Docker Desktop, where bwrap mounts /proc with the masks in place.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"'
+assert s.count(old) == 2, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'RUN_INERT_IF="bubblewrap is fine actually"'))
+PYX
+run "an inert marker names text verify.sh never prints" "name text verify.sh never prints"
+
+# THE COUNT PIN MUST NOT SHARE THE EXTRACTOR'S PREDICATE, which is the whole point of a count pin
+# and which the first version of this guard got wrong: it counted the extractor's own double-quoted
+# shape, so respelling an assignment dropped BOTH counts to zero, they agreed, and it printed
+# `ok (0 checked)`. Reproduced by hand, then pinned here.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '    RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "    RUN_INERT_IF='bubblewrap creates its namespaces and mounts /proc'", 1))
+PYX
+run "an inert marker is respelled so the extractor cannot read it" "RUN_INERT_IF assignments"
+
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '    RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"\n'
+assert s.count(old) == 2, "mutation target absent"
+open(p, 'w').write(s.replace(old, ''))
+PYX
+run "the inert markers are removed entirely" "sets no RUN_INERT_IF marker"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -825,7 +859,7 @@ run "the control reads dc_run_args through a process substitution again" "which 
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=72
+PINNED_BAD_SITES=75
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
