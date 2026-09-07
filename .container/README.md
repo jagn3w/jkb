@@ -476,9 +476,14 @@ proc **anyway**. `mount_too_revealing()` is a kernel check, and the LinuxKit VM'
 what Ubuntu 26.04 refuses. So on a Mac the flag is paid for in full — ten paths unmasked — and buys
 nothing observable. Whether it should therefore be passed only where it is load-bearing is a design
 question, not a fix: making the run flags host-dependent moves the container's fingerprint with the
-host and needs its own pass. `mutate-verify.sh` now reports the two bubblewrap mutations as
-**SKIPPED** rather than MISSED wherever the flag they remove is inert, deciding that from what the
-run reported and never from the platform name.
+host and needs its own pass.
+
+None of that reaches the harness any more, because the mutation stopped asking about it.
+`verify.sh` asserts the flag's **direct effect** — if `container.json` carries it, this container
+must have zero submounts under `/proc` — so `without 'systempaths=unconfined'` is caught on macOS,
+on Ubuntu and on any docker that masks at all, with no host knowledge and no skip. Asserting the
+*consequence* (does bubblewrap then fail?) is what made the mutation host-dependent in the first
+place; the mechanism added to paper over that is deleted (D53.1).
 
 What this does **not** establish is that Claude Code's own sandbox behaves like the probe. The probe
 is a bare `--proc /proc`; the failure that motivated the flag was Claude Code's own
