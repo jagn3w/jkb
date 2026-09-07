@@ -338,7 +338,7 @@ fi
 # print a note, asserting nothing: "the declaration could not be read" spelled the same as "the
 # declaration says no". Same rule as lib.sh's, one file along.
 if ! declared_run_args="$(dc_run_args "$(dirname "$0")/container.json" "$(cd "$(dirname "$0")/.." && pwd)" 2>/dev/null)"; then
-    bad "container.json's runArgs could not be read from inside the container — nothing establishes whether the declared /proc unmask is in force ($proc_submounts submounts under /proc)"
+    bad "container.json's runArgs could not be read from inside the container — nothing establishes whether the declared /proc unmask is in force (${proc_submounts:-an unreadable count of} submounts under /proc)"
 elif grep -qxF 'systempaths=unconfined' <<<"$declared_run_args"; then
     if [ -z "$proc_submounts" ]; then
         bad "/proc/self/mountinfo could not be read, so whether the declared /proc unmask is in force was not established — which is not the same as finding it in force"
