@@ -466,9 +466,13 @@ rm -f "$work/t/.github/workflows/ci.yml.bak"
 run "CI's probe invocations cannot be extracted at all" "continuation-joining is broken"
 
 # THE CONTROL SET MUST CARRY WHAT THE DECLARATION DECLARES (D52.6). Three ways that stops being
-# true, each its own failure path: the declaration goes unreadable, the assembly produces nothing,
-# and the assembly silently drops the derived flags -- the last being the real defect, and what
-# mutate-verify.sh's HEALTHY did for four commits of this branch while CI called it healthy.
+# true, each with its own failure path: the assembly produces nothing at all, a declared reader
+# yields nothing, and the assembly drops a block it derived. (A fourth -- the declaration going
+# unreadable -- collapsed into the first when the guard became per-reader: with no runArgs there
+# is no control to assemble, so `--print-flags` refuses before any block is compared.)
+#
+# The last is the real defect, and what mutate-verify.sh's HEALTHY did for four commits of this
+# branch while CI called it healthy.
 seed; python3 - "$work/t/.container/container.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -536,12 +540,16 @@ open(p, 'w').write(s.replace(old, '\nCONFIG_PATH="$REPO/.container/container.jso
 PYX
 run "the assembly region cannot be located" "certified nothing about coverage"
 
+# INSERTED ABOVE THE OLD ANCHOR, deliberately. The pin used to read a `^CFG=`..`^HEALTHY=` slice,
+# and AA_ARGS already derives a HEALTHY contributor 48 lines above it -- so a reader placed HERE
+# was a false green on the one property this guard exists to assert. It reads the whole file now,
+# and this is the position that proves it.
 seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'HEALTHY=("${RUNARGS[@]}"'
+old = 'AA_ARGS=()\n'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '_extra="$(dc_mount_specs "$CFG")"\n' + old, 1))
+open(p, 'w').write(s.replace(old, old + '_extra="$(dc_mount_specs "$REPO/.container/container.json")"\n', 1))
 PYX
 run "a fourth declaration reader joins the assembly" "the block table does not render"
 

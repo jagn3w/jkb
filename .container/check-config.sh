@@ -22,6 +22,17 @@ command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0
 # text in a comment, a label or an array assignment — which is exactly how the AppArmor-profile
 # guard below came to read an assignment and stop establishing anything. Comment lines are dropped
 # first, so a flag named in prose is never mistaken for one that is passed.
+# COMMENT-STRIPPING, DEFINED BEFORE ANY USE. Bash resolves a function at call time, so using one
+# above its definition is not a syntax error — it is an empty result, and an extraction that reads
+# nothing looks exactly like a subject with nothing to find. That has now happened three times in
+# this file with this very function, each caught only because the guard using it was pinned against
+# an empty read. It lives at the TOP so the next guard cannot repeat it -- being first is the whole
+# protection. A textual use-before-define check was considered and rejected: it cannot tell a
+# top-level call from a call inside a function body (bash resolves at call time, so a helper naming
+# a helper defined below it is correct), so it would redden this gate for correct code, which is
+# the harm the pin below is written against.
+dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
+
 ci_probe_calls() { # ci_probe_calls <ci.yml>
     sed '/^[[:space:]]*#/d' "$1" 2>/dev/null \
       | awk '{ s = $0
@@ -141,6 +152,11 @@ root="$(cd "$here/.." && pwd)"
 # against a second copy of itself — and would force reordering the assembly to suit a guard. The
 # property contiguity argues for is "this derived run entered HEALTHY as one expansion, unedited",
 # and that is true PER READER, so it is asserted per reader.
+# ONE LIST, feeding both the loop below and the pin further down. Spelled twice, the half that
+# fails SILENTLY is the table: add a reader to the assembly and to the pin's pattern -- the natural
+# edit when the gate goes red -- and the pin passes while the table compares nothing for it, which
+# is the same end state as the pin having no teeth at all.
+READERS=(run_args remote_user container_env)
 render_run_args()      { dc_run_args "$1" "$2" 2>/dev/null; }
 render_remote_user()   { local u; u="$(dc_remote_user "$1")"; [ -n "$u" ] && printf -- '--user\n%s\n' "$u"; }
 render_container_env() { local l; dc_container_env "$1" "$2" 2>/dev/null | while IFS= read -r l
@@ -156,7 +172,7 @@ if [ -z "$mv_flags" ]; then
     bad "mutate-verify.sh --print-flags produced nothing — the control's flag set could not be assembled, so nothing establishes that it carries what container.json declares"
 else
     missing_blocks=""; empty_blocks=""; checked=0
-    for reader in run_args remote_user container_env; do
+    for reader in "${READERS[@]}"; do
         eval "want=\$expect_$reader"
         blk="$(render_$reader "$here/container.json" "$root")"
         if [ -z "$blk" ]; then
@@ -179,20 +195,42 @@ else
 fi
 
 
-# ...AND NO FOURTH READER MAY JOIN THE ASSEMBLY WITHOUT JOINING THE TABLE ABOVE. The table is a
-# hand list, so it needs a pin whose predicate is not the table's: read the assembly itself. Same
-# shape as run.sh --consumed-keys, with the source as the second reader. Pinned against an empty
-# extraction, since a moved anchor would otherwise report ok having read no calls at all.
-asm="$(sed -n '/^CFG=/,/^HEALTHY=/p' "$here/mutate-verify.sh")"
-asm_readers="$(printf '%s\n' "$asm" | grep -o 'dc_[a-z_][a-z_]*' | sort -u)"
+# ...AND NO FOURTH READER MAY JOIN THE CONTROL WITHOUT JOINING THAT LIST. The table is a hand list,
+# so its pin reads the source instead. Three things it got wrong first time, all reproduced:
+#
+#   REGION. It read a `^CFG=`..`^HEALTHY=` slice, and `AA_ARGS` already derives a HEALTHY
+#   contributor 48 lines ABOVE that anchor -- so a reader placed beside it, or appended by a later
+#   `HEALTHY+=`, left both guards printing ok with an unchecked block in the control. It reads the
+#   WHOLE file now: a declaration reader called anywhere in this harness contributes to what the
+#   control runs, and there is no line at which that stops being true.
+#
+#   COMMENTS. It matched un-stripped text, so one comment merely NAMING a reader reddened the
+#   shared gate. Stripped, like every other source-reading check here.
+#
+#   MENTIONS vs CALLS. A name is a call only where an argument follows it; `dc_mount_targets` in a
+#   string or a message is not one.
+#
+#   AND WHICH CALLS COUNT is decided by what they READ, not by a second hand list. lib.sh also
+#   holds host-fact readers -- dc_require_apparmor_profile takes the AppArmor profile, and what it
+#   contributes to HEALTHY is a host decision, not a declaration block. Exempting those BY NAME
+#   would be the two-lists-that-must-agree defect one level along. A DECLARATION reader is one
+#   called with container.json, so the argument discriminates and no list is needed.
+#
+# The accepted set is DERIVED from $READERS, so adding a reader to the table is what admits it
+# here -- one list, not two that must agree.
+asm_expected="$(printf 'dc_%s\n' "${READERS[@]}" | paste -sd'|' -)"
+asm_readers="$(dc_strip_comments "$here/mutate-verify.sh" \
+                 | grep -oE 'dc_[a-z_][a-z_]*[[:space:]]+"[^"]*"' \
+                 | grep -E '"[$]CFG"|container[.]json"' \
+                 | sed 's/[[:space:]]*"[^"]*"$//' | sort -u)"
 if [ -z "$asm_readers" ]; then
-    bad "no dc_* readers could be read out of mutate-verify.sh's HEALTHY assembly — the block-table check above cannot tell whether it covers them, so it certified nothing about coverage"
+    bad "no dc_* reader CALLS could be read out of mutate-verify.sh — the block-table check above cannot tell whether it covers them, so it certified nothing about coverage"
 else
-    stray_readers="$(printf '%s\n' "$asm_readers" | grep -vxE 'dc_run_args|dc_remote_user|dc_container_env' || true)"
+    stray_readers="$(printf '%s\n' "$asm_readers" | grep -vxE "$asm_expected" || true)"
     if [ -n "$stray_readers" ]; then
-        bad "mutate-verify.sh's assembly calls declaration reader(s) the block table does not render: $(tr '\n' ' ' <<<"$stray_readers")— whatever they contribute to the control is unchecked"
+        bad "mutate-verify.sh calls declaration reader(s) the block table does not render: $(tr '\n' ' ' <<<"$stray_readers")— whatever they contribute to the control is unchecked"
     else
-        ok "every declaration reader in the control's assembly has a block in the table"
+        ok "every declaration reader mutate-verify.sh calls has a block in the table (${#READERS[@]} readers)"
     fi
 fi
 
@@ -425,7 +463,6 @@ fi
 # and is asserted non-empty and complete below, where adding a caller needs no edit at all.
 # Shell comments, removed. Two guards below need it and had one copy between them; a second
 # spelling of "what is a comment" is a second answer to the question they both ask.
-dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
 # THE SETUP MARKER IS NO LONGER GUARDED HERE, because it is no longer spelled twice (D52.5). This
 # compared run.sh's and setup.sh's spellings of the marker path, justified by a comment reading
@@ -1033,7 +1070,14 @@ fi
 # "they disagree" branch was unreachable — and on the ci side it matched the COMMENT above the code,
 # so deleting the read left it green. Both are the defect this file exists to catch, written into
 # the guard for it; comments are stripped and each side is read out of the construct that uses it.
-mv_marker="$(sed -n "s/.*printf '\\([A-Z][A-Z-]*\\)=%s.*/\\1/p" "$here/mutate-verify.sh" | head -1)"
+# THE MV SIDE GOES THROUGH THE STRIPPER TOO, and is anchored to the `--shell` branch. It used to
+# read the raw file and take the first match anywhere -- while the comment above claimed both sides
+# were stripped, which was true of one. Comments here quote code constantly, so documenting the
+# mechanism with a comment naming the printf and then renaming the real one left this guard reading
+# the marker out of the comment and printing ok, which is the harm its own failure message names.
+mv_marker="$(dc_strip_comments "$here/mutate-verify.sh" \
+             | sed -n '/^if \[ -n "\$SHELL_CMD" \]/,/^fi$/p' \
+             | sed -n "s/.*printf '\\([A-Z][A-Z-]*\\)=%s.*/\\1/p" | head -1)"
 if [ -z "$mv_marker" ]; then
     bad "mutate-verify.sh --shell no longer prints a control-flags marker — ci.yml's shipped row would report the flags it ran with as (none)"
 elif ! dc_strip_comments "$here/../.github/workflows/ci.yml" | grep -qF "s/^$mv_marker=//p"; then

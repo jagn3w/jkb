@@ -204,6 +204,19 @@ fi
 
 echo "==> container posture"
 
+# READ ONCE, AND AN EMPTY TABLE IS NOT A ZERO. This count feeds a pass/fail verdict below, and it
+# used to be a byte-identical second copy of the diagnostic beside bwrap's error — two copies of one
+# predicate, free to drift. Worse, it spelled a readable-but-empty /proc/self/mountinfo as "no
+# submounts", i.e. as a PASS, while this file's other mountinfo consumer calls that same state
+# unreadable and reports "the mount boundary was not checked, which is not the same as finding it
+# clean". One run, two readers, opposite verdicts about one observation. The empty case is what the
+# comment there records as having already shipped here once.
+if proc_mountinfo="$(cat /proc/self/mountinfo 2>/dev/null)" && [ -n "$proc_mountinfo" ]; then
+    proc_submounts="$(awk '$5 ~ "^/proc/" {n++} END {print n+0}' <<<"$proc_mountinfo")"
+else
+    proc_submounts=""
+fi
+
 # 1. Non-root. Load-bearing, not hygiene: root in a container cannot create a mount namespace
 #    directly even with seccomp relaxed, so bubblewrap fails and the nested sandbox with it.
 assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo yes || echo no)"
@@ -219,15 +232,36 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 # print the two host settings that produce this — read through /proc, which a container can
 # usually see even though it cannot set them.
 #
-# `--proc /proc` IS NOT OPTIONAL, and its absence made this the probe that could not fail for the
-# defect it names. The kernel's `mount_too_revealing()` refuses a fresh proc mount in a non-initial
-# user namespace unless an existing FULLY VISIBLE /proc exists, and docker's MaskedPaths are
-# submounts over /proc, so it is not — which is a separate refusal from namespace creation and
-# happens strictly after it. Without `--proc` this probe printed `ok` in exactly the state the
-# `systempaths=unconfined` flag exists to fix, and the container demonstrably shipped in it: the
-# only report was Claude Code's own `bwrap: Can't mount proc on /newroot/proc`. The invocation must
-# stay the shape Claude Code invokes, or it certifies a mechanism nobody runs.
-if bwrap_err="$(bwrap --new-session --die-with-parent --bind / / --proc /proc --unshare-net /bin/true 2>&1)"; then
+# THE INVOCATION IS CLAUDE CODE'S, FLAG FOR FLAG, and that is not a stylistic preference — it is
+# the difference between this probe passing and failing in the state it exists to detect.
+#
+# Read out of the binary (2.1.260), which builds, in this order:
+#     --new-session --die-with-parent [--unshare-net …] <fs binds, starting --bind / />
+#     --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc -- <shell> -c <cmd>
+#
+# MEASURED, in a container with docker's masks in place (10 submounts under /proc) and again with
+# `systempaths=unconfined`:
+#     --bind / / --proc /proc --unshare-net          → OK            ← what this probe used to be
+#     + --unshare-pid                                → Can't mount proc on /newroot/proc
+#     + --unshare-user --cap-drop ALL                → OK
+#     the full shape above                           → Can't mount proc on /newroot/proc
+# and all four pass once the unmask is applied. `--unshare-pid` is the trigger: a fresh procfs for
+# a NEW pid namespace is what the kernel refuses while the existing /proc is not fully visible, and
+# docker's MaskedPaths are submounts, so it is not.
+#
+# TWICE NOW THIS PROBE HAS BEEN WEAKER THAN THE MECHANISM, and both times it printed `ok` in
+# exactly the broken state. First it omitted `--proc /proc` entirely; then, with `--proc` added, it
+# still omitted `--unshare-pid` — and passed on a host where Claude Code's own sandbox was failing
+# with the error above. That second gap is what produced two rounds of wrong diagnosis: the
+# harness's MISSED was a TRUE report that its guard could not fire, and it was read as a fact about
+# the host ("the unmask must be inert here") because the weak probe agreed. The flag is
+# load-bearing on macOS and on Linux alike.
+#
+# So a change to this line is a change to what the container certifies. Keep it equal to what the
+# binary builds; if that ever diverges, this probe is certifying a mechanism nobody runs.
+if bwrap_err="$(bwrap --new-session --die-with-parent --unshare-net --bind / / \
+                      --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc \
+                      -- /bin/sh -c true 2>&1)"; then
     ok "bubblewrap creates its namespaces and mounts /proc (the nested sandbox's mechanism works)"
 else
     # ACCEPTED ONLY WHEN AN OPERATOR SAID SO, by name, for this host class. It is still reported at
@@ -245,8 +279,8 @@ else
     # one, which is what `systempaths=unconfined` removes. Counted rather than asserted: a container
     # legitimately has some, and what matters is that a reader sees the number beside bwrap's own
     # message rather than being sent to audit the two sysctls when neither is the cause.
-    v="$(awk '$5 ~ "^/proc/" {n++} END {print n+0}' /proc/self/mountinfo 2>/dev/null)" \
-        && printf '       submounts under /proc = %s (any at all defeat the proc mount; see systempaths=unconfined)\n' "$v"
+    [ -n "$proc_submounts" ] \
+        && printf '       submounts under /proc = %s (any at all defeat the proc mount; see systempaths=unconfined)\n' "$proc_submounts"
     # Reported as facts, with no cause asserted. `apparmor_restrict_unprivileged_userns=1` is the
     # Ubuntu 24.04+ default and restricts exactly this; `max_user_namespaces=0` disables it
     # outright. Either explains the failure, and neither is fixable from inside the container —
@@ -299,7 +333,6 @@ fi
 # DERIVED FROM THE DECLARATION, never assumed. If container.json stops carrying the flag — the
 # README's open question is whether it should be passed only where it is load-bearing — this becomes
 # a note and asserts nothing, rather than failing every run until somebody remembers it is here.
-proc_submounts="$(awk '$5 ~ "^/proc/" {n++} END {print n+0}' /proc/self/mountinfo 2>/dev/null)"
 # READ THROUGH `$( )` FIRST. Piping the reader into grep discards its refusal, so an unreadable or
 # unparseable container.json -- or a jq that is not installed -- would take the `else` branch and
 # print a note, asserting nothing: "the declaration could not be read" spelled the same as "the
@@ -307,7 +340,9 @@ proc_submounts="$(awk '$5 ~ "^/proc/" {n++} END {print n+0}' /proc/self/mountinf
 if ! declared_run_args="$(dc_run_args "$(dirname "$0")/container.json" "$(cd "$(dirname "$0")/.." && pwd)" 2>/dev/null)"; then
     bad "container.json's runArgs could not be read from inside the container — nothing establishes whether the declared /proc unmask is in force ($proc_submounts submounts under /proc)"
 elif grep -qxF 'systempaths=unconfined' <<<"$declared_run_args"; then
-    if [ "${proc_submounts:-1}" -eq 0 ]; then
+    if [ -z "$proc_submounts" ]; then
+        bad "/proc/self/mountinfo could not be read, so whether the declared /proc unmask is in force was not established — which is not the same as finding it in force"
+    elif [ "$proc_submounts" -eq 0 ]; then
         ok "the declared /proc unmask is in force (no submounts under /proc)"
     else
         bad "the declared /proc unmask is not in force: $proc_submounts submounts under /proc — container.json passes systempaths=unconfined and this container did not get it, so bubblewrap may be unable to mount proc"

@@ -426,33 +426,34 @@ run "the host's ~/.claude is mounted in" "is a host mount" \
 run "the host's ~/.claude/settings.json is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home/settings.json":/home/vscode/.claude/settings.json
-# THE TWO FLAGS THE NESTED SANDBOX NEEDS, each watched failing on its own. They are separate
-# refusals in separate subsystems: seccomp decides whether the namespace syscalls are allowed at
-# all, and docker's masked /proc paths decide whether a proc mount is permitted INSIDE the
-# namespace once created. Both end at the same verify.sh assertion, which is why that assertion had
-# to grow `--proc /proc` before either of these could discriminate — without it the probe passed in
-# the state the unmask exists to fix, and the container shipped that way.
+# THE TWO FLAGS THE NESTED SANDBOX NEEDS, each watched failing on its own -- and they are now
+# judged by DIFFERENT verify.sh assertions, which is what decides whether each can be skipped.
 #
-# NEITHER CAN DISCRIMINATE WHILE BUBBLEWRAP IS A KNOWN FAILURE, so on such a host they are
-# announced as skipped rather than run. Each requires verify.sh to fail naming bubblewrap -- and if
-# the HEALTHY container already fails that same assertion, it would report CAUGHT whether or not
-# the flag was load-bearing. That is the "guard that cannot fire" shape this whole directory keeps
-# producing, and reporting CAUGHT for it would be the worst version: a green line asserting the
-# flag is load-bearing, on a host where nothing tested it.
+# The /proc unmask is judged on its DIRECT effect: verify.sh counts the submounts docker puts over
+# /proc and fails when the declaration says there should be none (D53.1). That is a mountinfo read,
+# so it fires whether or not bubblewrap works, and this arm therefore runs on every host.
+#
+# Seccomp is judged on bubblewrap failing, because that IS its effect here -- it decides whether the
+# namespace syscalls are permitted at all, and nothing else observable changes. So this one arm
+# cannot discriminate on a host where bubblewrap is a known failure: if the HEALTHY container
+# already fails that assertion, the mutation would report CAUGHT whether or not the flag was
+# load-bearing. A green line asserting a flag is load-bearing on a host where nothing tested it is
+# the worst version of the "guard that cannot fire" shape this directory keeps producing, so on
+# such a host it is announced as skipped.
+#
+# BOTH ARMS USED TO SIT IN THAT SKIP, which was right while both ended at the bubblewrap assertion
+# and wrong the moment the unmask arm stopped: on exactly the hosts the acceptance exists for, a
+# newly added guard was discarded under a printed reason that no longer applied to it.
+without 'systempaths=unconfined'
+run "the /proc unmask is dropped (the masks come back)" "the declared /proc unmask is not in force" "${MUT[@]}"
 if [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ]; then
     printf '  SKIPPED  stock seccomp (nested sandbox cannot start)\n'
-    printf '  SKIPPED  the /proc unmask is dropped (nested sandbox cannot start)\n'
     printf '           cannot discriminate while bubblewrap fails in the healthy container too;\n'
-    printf '           they become meaningful again when that is fixed.\n'
+    printf '           it becomes meaningful again when that is fixed. The /proc unmask arm above\n'
+    printf '           is unaffected: it is judged on a mountinfo count, not on bubblewrap.\n'
 else
     without 'seccomp='
     run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces or mount /proc" "${MUT[@]}"
-    # JUDGED ON THE FLAG'S DIRECT EFFECT, not on whether bubblewrap then fails (D53.1). The unmask
-    # removes docker's submounts over /proc; whether the kernel goes on to refuse a nested proc
-    # mount is a consequence hosts disagree about -- measured, macOS mounts proc with all 10 masks
-    # in place where Ubuntu 26.04 refuses. Expecting the consequence made this MISSED on a Mac.
-    without 'systempaths=unconfined'
-    run "the /proc unmask is dropped (the masks come back)" "the declared /proc unmask is not in force" "${MUT[@]}"
 fi
 # NO NET_ADMIN, WITH THE OVERRIDE ARMED -- and the override is what makes this mutation
 # judgeable at all. Without it the entrypoint (correctly) refuses to boot an unbounded container,
