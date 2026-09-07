@@ -129,18 +129,71 @@ if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — th
 # "nothing was derived" and "the control carries it all" are otherwise the same answer.
 mv_flags="$("$here/mutate-verify.sh" --print-flags 2>/dev/null)"
 root="$(cd "$here/.." && pwd)"
-derived="$(dc_run_args "$here/container.json" "$root" 2>/dev/null)" || derived=""
-if [ -z "$derived" ]; then
-    bad "container.json's runArgs could not be derived here, so nothing establishes that the control carries them — the declaration is unreadable, unparseable, empty, or names a variable that is not set"
-elif [ -z "$mv_flags" ]; then
+
+# ONE BLOCK PER READER, in any order — not one assembled expectation (D53.3). The control derives
+# THREE things from the declaration now: runArgs, remoteUser and containerEnv. This compared only
+# the first, so deleting the ENV_ARGS or USER_ARGS expansion from HEALTHY left all these checks
+# green while the control ran without the declared environment, or as root — under which bubblewrap
+# cannot create a namespace at all and every mutation verdict is unattributable.
+#
+# Assembling ONE expectation would make this re-implement the harness's interleaving (its AppArmor
+# args, its acceptance env, its own binds) in order to predict the result — comparing the assembly
+# against a second copy of itself — and would force reordering the assembly to suit a guard. The
+# property contiguity argues for is "this derived run entered HEALTHY as one expansion, unedited",
+# and that is true PER READER, so it is asserted per reader.
+render_run_args()      { dc_run_args "$1" "$2" 2>/dev/null; }
+render_remote_user()   { local u; u="$(dc_remote_user "$1")"; [ -n "$u" ] && printf -- '--user\n%s\n' "$u"; }
+render_container_env() { local l; dc_container_env "$1" "$2" 2>/dev/null | while IFS= read -r l
+                             do [ -n "$l" ] && printf -- '--env\n%s\n' "$l"; done; }
+
+# EXPECTED FROM THE DECLARATION, so a reader that silently returns nothing is a failure rather than
+# a skipped comparison — the vacuous-pass shape every derived list in this file is pinned against.
+expect_run_args=1
+expect_remote_user=0; jq -e 'has("remoteUser")' <<<"$dc" >/dev/null 2>&1 && expect_remote_user=1
+expect_container_env=0; jq -e '(.containerEnv // {}) | length > 0' <<<"$dc" >/dev/null 2>&1 && expect_container_env=1
+
+if [ -z "$mv_flags" ]; then
     bad "mutate-verify.sh --print-flags produced nothing — the control's flag set could not be assembled, so nothing establishes that it carries what container.json declares"
 else
-    case $'\n'"$mv_flags"$'\n' in
-      *$'\n'"$derived"$'\n'*)
-        ok "the control set carries container.json's runArgs verbatim ($(printf '%s\n' "$derived" | grep -c .) argument(s))" ;;
-      *)
-        bad "the control set mutate-verify.sh assembles does not contain container.json's runArgs as one contiguous block — its mutations would be judged against a container run.sh does not produce" ;;
-    esac
+    missing_blocks=""; empty_blocks=""; checked=0
+    for reader in run_args remote_user container_env; do
+        eval "want=\$expect_$reader"
+        blk="$(render_$reader "$here/container.json" "$root")"
+        if [ -z "$blk" ]; then
+            [ "$want" -eq 1 ] && empty_blocks="$empty_blocks $reader"
+            continue
+        fi
+        checked=$((checked+1))
+        case $'\n'"$mv_flags"$'\n' in
+          *$'\n'"$blk"$'\n'*) ;;
+          *) missing_blocks="$missing_blocks $reader" ;;
+        esac
+    done
+    if [ -n "$empty_blocks" ]; then
+        bad "container.json declares them but these readers yielded nothing here:$empty_blocks — the control-set check would pass having compared nothing for them"
+    elif [ -n "$missing_blocks" ]; then
+        bad "the control set mutate-verify.sh assembles does not contain container.json's$missing_blocks as one contiguous block — its mutations would be judged against a container run.sh does not produce"
+    else
+        ok "the control set carries every derived block container.json declares ($checked readers)"
+    fi
+fi
+
+
+# ...AND NO FOURTH READER MAY JOIN THE ASSEMBLY WITHOUT JOINING THE TABLE ABOVE. The table is a
+# hand list, so it needs a pin whose predicate is not the table's: read the assembly itself. Same
+# shape as run.sh --consumed-keys, with the source as the second reader. Pinned against an empty
+# extraction, since a moved anchor would otherwise report ok having read no calls at all.
+asm="$(sed -n '/^CFG=/,/^HEALTHY=/p' "$here/mutate-verify.sh")"
+asm_readers="$(printf '%s\n' "$asm" | grep -o 'dc_[a-z_][a-z_]*' | sort -u)"
+if [ -z "$asm_readers" ]; then
+    bad "no dc_* readers could be read out of mutate-verify.sh's HEALTHY assembly — the block-table check above cannot tell whether it covers them, so it certified nothing about coverage"
+else
+    stray_readers="$(printf '%s\n' "$asm_readers" | grep -vxE 'dc_run_args|dc_remote_user|dc_container_env' || true)"
+    if [ -n "$stray_readers" ]; then
+        bad "mutate-verify.sh's assembly calls declaration reader(s) the block table does not render: $(tr '\n' ' ' <<<"$stray_readers")— whatever they contribute to the control is unchecked"
+    else
+        ok "every declaration reader in the control's assembly has a block in the table"
+    fi
 fi
 
 # The whole point of the profile: these must be unconditionally allowed. Checked against the
@@ -912,43 +965,6 @@ while IFS= read -r want; do
     expects+=("$want")
     grep -qF -e "$want" "$here/verify.sh" || stale_expects+=("$want")
 done < <(sed -n 's/^[[:space:]]*run "[^"]*" "\([^"]*\)".*/\1/p' "$here/mutate-verify.sh")
-# THE INERT MARKERS ARE THE SAME RULE. `RUN_INERT_IF` names a string verify.sh prints when the
-# mechanism worked despite the mutation, which is how the harness tells "this guard did not fire"
-# from "there was nothing to notice on this host". Reword verify.sh's ok line and the marker matches
-# nothing: the skip silently stops happening and the mutation goes back to reporting MISSED on a
-# host where it cannot discriminate — an alarm about the machine, blamed on a guard. Checked with
-# the same staleness rule and counted separately, because these are not `run` calls and folding
-# them into `expects` would break the count check above.
-stale_inerts=()
-inerts=()
-while IFS= read -r want; do
-    [ -n "$want" ] || continue
-    inerts+=("$want")
-    grep -qF -e "$want" "$here/verify.sh" || stale_inerts+=("$want")
-done < <(sed -n 's/^[[:space:]]*RUN_INERT_IF="\([^"][^"]*\)".*/\1/p' "$here/mutate-verify.sh")
-# COUNTED BY A PREDICATE INDEPENDENT OF THE EXTRACTOR'S, which is the whole point of a count pin
-# and is easy to get wrong: the first version of this line asked for `RUN_INERT_IF="[^"]` — the
-# extractor's own double-quoted shape — so respelling an assignment with single quotes dropped BOTH
-# counts to zero, they agreed, and it printed `ok (0 checked)` having checked nothing. Reproduced by
-# hand before this was rewritten. Any non-empty assignment counts, however it is quoted.
-inert_sites="$(dc_strip_comments "$here/mutate-verify.sh" \
-    | awk '/^[[:space:]]*RUN_INERT_IF=/ && $0 !~ /^[[:space:]]*RUN_INERT_IF=""[[:space:]]*$/ {n++} END {print n+0}')"
-if [ "$inert_sites" -eq 0 ]; then
-    # PINNED AGAINST NONE AT ALL, like every other derived list here, and for a reason this harness
-    # has now demonstrated twice: delete both assignments and the count and the extraction agree at
-    # zero, so it printed `ok (0 checked)` while the two bubblewrap mutations went back to reporting
-    # MISSED on every host where their flag is not load-bearing. This file is KNOWN to need them —
-    # macOS/Docker Desktop mounts /proc with the masks in place — so zero is a state that has to be
-    # argued for at the moment of the edit rather than passing silently.
-    bad "mutate-verify.sh sets no RUN_INERT_IF marker — the two bubblewrap mutations would report MISSED rather than SKIPPED on a host where the flag they remove is not load-bearing"
-elif [ "${#inerts[@]}" -ne "$inert_sites" ]; then
-    bad "the inert-marker check reads ${#inerts[@]} of $inert_sites RUN_INERT_IF assignments — the rest are unchecked, so a stale one would silently stop a mutation being skipped where it cannot discriminate"
-elif [ ${#stale_inerts[@]} -ne 0 ]; then
-    bad "mutate-verify.sh's inert marker(s) name text verify.sh never prints: ${stale_inerts[*]} — those mutations would report MISSED on a host where the flag is not load-bearing"
-else
-    ok "every mutate-verify inert marker is a string verify.sh prints (${#inerts[@]} checked)"
-fi
-
 # ...AND THE EXTRACTION MUST HAVE FOUND THEM ALL, which an emptiness pin cannot tell you. The
 # pattern was anchored at `^run`, so the first mutation to be indented -- one wrapped in an `if`
 # for a host where it cannot discriminate -- silently dropped out and the guard went on reporting
@@ -1006,6 +1022,24 @@ if [ -f "$here/../ui/vscode/package.json" ]; then
     else
         bad "ui/vscode/package.json no longer yields a publisher.name — verify.sh would silently stop checking that the jkb explorer is installed"
     fi
+fi
+
+# THE CONTROL-FLAGS MARKER IS SPELLED IN TWO FILES THAT CANNOT SHARE A VARIABLE. `--shell` prints
+# it; ci.yml's bubblewrap ladder reads it to say what the shipped row ran with. Drift and the row
+# silently reports `flags: (none)` — an evidence line that has quietly stopped being evidence, which
+# is worse than not printing one, because the reader cannot tell.
+# EACH FILE'S OWN SPELLING IS READ, never a literal both sides are matched against. The first
+# version grepped for `CONTROL-FLAGS=` in both, so the two extractions could not differ and the
+# "they disagree" branch was unreachable — and on the ci side it matched the COMMENT above the code,
+# so deleting the read left it green. Both are the defect this file exists to catch, written into
+# the guard for it; comments are stripped and each side is read out of the construct that uses it.
+mv_marker="$(sed -n "s/.*printf '\\([A-Z][A-Z-]*\\)=%s.*/\\1/p" "$here/mutate-verify.sh" | head -1)"
+if [ -z "$mv_marker" ]; then
+    bad "mutate-verify.sh --shell no longer prints a control-flags marker — ci.yml's shipped row would report the flags it ran with as (none)"
+elif ! dc_strip_comments "$here/../.github/workflows/ci.yml" | grep -qF "s/^$mv_marker=//p"; then
+    bad "ci.yml's shipped row does not read the marker mutate-verify.sh prints ($mv_marker=) — its evidence line is parsing something the harness does not emit"
+else
+    ok "the shipped row reads the marker the control run prints ($mv_marker=)"
 fi
 
 # A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process

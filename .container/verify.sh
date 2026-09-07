@@ -282,6 +282,40 @@ fi
 # to pass `--security-opt` and the verifier deciding what it should see disagreed about one host.
 . "$(dirname "$0")/lib.sh" 2>/dev/null || true
 
+# 2c. THE DECLARED /proc UNMASK IS IN FORCE — asserted as the flag's DIRECT EFFECT, which is the
+# whole point of this assertion existing (D53.1).
+#
+# `systempaths=unconfined` does exactly one thing: it removes docker's submounts over /proc. That is
+# observable from in here on every host. Whether the kernel then refuses a nested proc mount is a
+# CONSEQUENCE, mediated by mount_too_revealing(), and hosts disagree about it: measured, macOS /
+# Docker Desktop mounts proc happily with all 10 masks present, where Ubuntu 26.04 refuses.
+#
+# The mutation that removes this flag used to be judged on that consequence, so on a Mac it reported
+# MISSED — a guard blamed for a fact about the machine — and the fix for THAT reported SKIPPED on
+# evidence the verdict already entailed, which silently downgraded a genuinely weak probe. Asserting
+# the direct effect ends both: `without 'systempaths=unconfined'` is caught on any docker that masks
+# at all, with no host knowledge, no operator flag and no skip.
+#
+# DERIVED FROM THE DECLARATION, never assumed. If container.json stops carrying the flag — the
+# README's open question is whether it should be passed only where it is load-bearing — this becomes
+# a note and asserts nothing, rather than failing every run until somebody remembers it is here.
+proc_submounts="$(awk '$5 ~ "^/proc/" {n++} END {print n+0}' /proc/self/mountinfo 2>/dev/null)"
+# READ THROUGH `$( )` FIRST. Piping the reader into grep discards its refusal, so an unreadable or
+# unparseable container.json -- or a jq that is not installed -- would take the `else` branch and
+# print a note, asserting nothing: "the declaration could not be read" spelled the same as "the
+# declaration says no". Same rule as lib.sh's, one file along.
+if ! declared_run_args="$(dc_run_args "$(dirname "$0")/container.json" "$(cd "$(dirname "$0")/.." && pwd)" 2>/dev/null)"; then
+    bad "container.json's runArgs could not be read from inside the container — nothing establishes whether the declared /proc unmask is in force ($proc_submounts submounts under /proc)"
+elif grep -qxF 'systempaths=unconfined' <<<"$declared_run_args"; then
+    if [ "${proc_submounts:-1}" -eq 0 ]; then
+        ok "the declared /proc unmask is in force (no submounts under /proc)"
+    else
+        bad "the declared /proc unmask is not in force: $proc_submounts submounts under /proc — container.json passes systempaths=unconfined and this container did not get it, so bubblewrap may be unable to mount proc"
+    fi
+else
+    note "container.json declares no /proc unmask; $proc_submounts submounts under /proc (asserting nothing)"
+fi
+
 # WHETHER APPARMOR MEDIATES IS ASKED FIRST, of the host, via the one shared predicate. Only then is
 # the process label read -- and only to learn WHICH profile is in force, which is a different
 # question from whether the LSM is active at all.

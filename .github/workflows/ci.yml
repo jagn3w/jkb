@@ -350,11 +350,12 @@ jobs:
           # nested sandbox start in the thing we ship", and it cannot drift from the declaration
           # because it does not restate it.
           out="$(./.container/mutate-verify.sh --shell "$INNER" 2>&1)" || true
-          # Its flags come from the same assembly the run used, printed rather than described --
-          # `--print-flags` needs no daemon, so this costs nothing and cannot describe a different
-          # container from the one `--shell` just started.
+          # Its flags come out of the run itself: `--shell` prints CONTROL-FLAGS= before starting,
+          # so the evidence and the result are the same process. Taking them from a second
+          # `--print-flags` process described a container differing in its scratch bind, naming a
+          # temp directory the first run's EXIT trap had already removed.
           report "[shipped] the control container" \
-                 "$(./.container/mutate-verify.sh --print-flags 2>/dev/null | tr '\n' ' ')" "$out"
+                 "$(sed -n 's/^CONTROL-FLAGS=//p' <<<"$out" | head -1)" "$out"
 
       # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
       # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run

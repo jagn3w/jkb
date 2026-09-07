@@ -306,6 +306,11 @@ without() {
 # containers.
 if [ -n "$SHELL_CMD" ]; then
     echo "=== a healthy container, running your command after the standard preamble ==="
+    # THE FLAGS THIS RUN USES, printed BY this run. A caller that wants to report what the control
+    # ran with used to take them from a second `--print-flags` process -- which mints its own
+    # scratch directory, so the reported ~/.jkb bind named a path that this run's EXIT trap had
+    # already deleted, under a comment claiming it could not describe a different container.
+    printf 'CONTROL-FLAGS=%s\n' "${HEALTHY[*]}"
     docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$PREAMBLE
       $SHELL_CMD"
     exit $?
@@ -328,21 +333,6 @@ fi
 
 RUN_IMAGE=""
 MUTANT_FAILED=0
-# A MUTATION IS UNJUDGEABLE WHERE THE FLAG IT REMOVES IS NOT LOAD-BEARING, and whether it is
-# load-bearing is a fact about the HOST that only the run can establish. Set this to a string
-# verify.sh prints when the mechanism worked ANYWAY, and `run` reports SKIPPED with the reason
-# instead of MISSED. Consumed and cleared per call, like RUN_IMAGE.
-#
-# Measured on macOS/Docker Desktop, one flag apart: with `systempaths=unconfined` the container has
-# 0 submounts under /proc, without it 10 -- and bwrap mounts /proc in BOTH. The masks are really
-# there and that kernel permits the mount regardless, where Ubuntu 26.04 refuses it. So on this
-# host dropping the flag breaks nothing, verify.sh correctly passes, and MISSED was the harness
-# blaming a guard for a fact about the machine -- the "tooling outcome dressed as a guard that did
-# not fire" this file already names one mutation below.
-#
-# NOT a platform test. `uname` would be a guess that goes wrong the day a kernel changes in either
-# direction; this reads what the run reported.
-RUN_INERT_IF=""
 # A build failure must NOT fall through to the base image: the mutation would then run against an
 # unmutated container, verify.sh would correctly pass, and the harness would report the guard as
 # broken. A tooling failure reported as a guard failure sends you to read the wrong code.
@@ -366,9 +356,8 @@ mutant() { # mutant <tag> <root-shell-command>
 
 run() { # run <label> <expect-substring> <docker args...>
   local label="$1" expect="$2"; shift 2
-  local out rc img="${RUN_IMAGE:-$IMAGE}" inert="$RUN_INERT_IF"
+  local out rc img="${RUN_IMAGE:-$IMAGE}"
   RUN_IMAGE=""
-  RUN_INERT_IF=""
   # ...and if its mutant did not build, do NOT quietly test the base image instead: an unmutated
   # container passes verify.sh, which this would then report as the guard failing to fire.
   if [ "$MUTANT_FAILED" = 1 ]; then
@@ -378,16 +367,6 @@ run() { # run <label> <expect-substring> <docker args...>
   fi
   out="$(docker run --rm "$@" "$img" bash -c "$SUBJECT" 2>&1)"
   rc=$?
-  # BOTH CONDITIONS, and they are not the same one twice: the subject passed, AND it reported the
-  # mechanism working. Either alone would be wrong — a pass with no such line is a guard that did
-  # not fire and must stay MISSED, and the line without a pass means something else failed.
-  if [ -n "$inert" ] && [ "$rc" -eq 0 ] && grep -qF -e "$inert" <<<"$out"; then
-    printf '  SKIPPED  %s\n' "$label"
-    printf '           the removed flag is not load-bearing on this host — verify.sh passed AND\n'
-    printf '           reported the mechanism working, so there was nothing for it to notice.\n'
-    printf '           Measured from this run; never assumed from the platform.\n'
-    return
-  fi
   judge "$label" "$expect" "$out" "$rc"
 }
 
@@ -466,15 +445,14 @@ if [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ]; then
     printf '           cannot discriminate while bubblewrap fails in the healthy container too;\n'
     printf '           they become meaningful again when that is fixed.\n'
 else
-    # Both carry the inert marker, because which of the two refusals a given kernel actually makes
-    # is a host fact and neither is guaranteed. Measured on macOS/Docker Desktop: seccomp IS
-    # load-bearing there (stock docker fails at namespace creation) and the /proc unmask is NOT.
     without 'seccomp='
-    RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"
     run "stock seccomp (nested sandbox cannot start)" "bubblewrap cannot create namespaces or mount /proc" "${MUT[@]}"
+    # JUDGED ON THE FLAG'S DIRECT EFFECT, not on whether bubblewrap then fails (D53.1). The unmask
+    # removes docker's submounts over /proc; whether the kernel goes on to refuse a nested proc
+    # mount is a consequence hosts disagree about -- measured, macOS mounts proc with all 10 masks
+    # in place where Ubuntu 26.04 refuses. Expecting the consequence made this MISSED on a Mac.
     without 'systempaths=unconfined'
-    RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"
-    run "the /proc unmask is dropped (nested sandbox cannot start)" "bubblewrap cannot create namespaces or mount /proc" "${MUT[@]}"
+    run "the /proc unmask is dropped (the masks come back)" "the declared /proc unmask is not in force" "${MUT[@]}"
 fi
 # NO NET_ADMIN, WITH THE OVERRIDE ARMED -- and the override is what makes this mutation
 # judgeable at all. Without it the entrypoint (correctly) refuses to boot an unbounded container,

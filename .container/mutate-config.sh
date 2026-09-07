@@ -491,11 +491,93 @@ open(p, 'w').write(out)
 PYX
 run "the control drops the flags it derived from container.json" "as one contiguous block"
 
-# THE OTHER SIDE OF THAT GUARD: nothing to compare against. The control-set check asks whether
-# HEALTHY contains the derived runArgs, and "the derivation produced nothing" and "the control
-# carries it all" are the same answer unless the empty case is refused on its own.
+# THE OTHER TWO DERIVED BLOCKS. The control derives runArgs, remoteUser AND containerEnv; the guard
+# used to compare only the first, so deleting either of these left every check green while the
+# control ran without the declared environment, or as root -- under which bubblewrap cannot create a
+# namespace at all and every mutation verdict is unattributable. Measured green before the fix.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the control drops the environment it derived" "container.json's container_env as one contiguous block"
+
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ' ${USER_ARGS[@]+"${USER_ARGS[@]}"}'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the control drops the user it derived" "container.json's remote_user as one contiguous block"
+
+# A READER THAT YIELDS NOTHING while the declaration says it should, which is a different failure
+# from a block that is present but not contiguous -- and the one that would otherwise pass by
+# comparing nothing.
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY=VALUE per line'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, old + '\n    return 0', 1))
+PYX
+run "a declared reader silently yields nothing" "readers yielded nothing here"
+
+# THE ASSEMBLY REGION ITSELF, both halves. The block table is a hand list, so its pin reads the
+# source instead -- and a pin that cannot find the region reports ok about coverage it never checked.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '\nCFG="$REPO/.container/container.json"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '\nCONFIG_PATH="$REPO/.container/container.json"', 1).replace('"$CFG"', '"$CONFIG_PATH"'))
+PYX
+run "the assembly region cannot be located" "certified nothing about coverage"
+
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'HEALTHY=("${RUNARGS[@]}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '_extra="$(dc_mount_specs "$CFG")"\n' + old, 1))
+PYX
+run "a fourth declaration reader joins the assembly" "the block table does not render"
+
+# THE CONTROL-FLAGS MARKER, both halves. It is spelled in two files that cannot share a variable --
+# mutate-verify.sh --shell prints it, ci.yml's shipped row reads it -- so drift makes that row
+# report `flags: (none)`: an evidence line that has quietly stopped being evidence, which is worse
+# than none because the reader cannot tell. The ci half is mutated in the CODE with the comment
+# above it left alone, because the guard's first version matched that comment and stayed green.
+seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "printf 'CONTROL-FLAGS=%s"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "printf 'flags: %s", 1))
+PYX
+run "the control run stops printing its flags" "no longer prints a control-flags marker"
+
+seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "s/^CONTROL-FLAGS=//p"
+assert s.count(old) == 1, "mutation target absent or ambiguous"
+open(p, 'w').write(s.replace(old, "s/^BOGUS=//p", 1))
+PYX
+run "the shipped row reads a marker nothing emits" "does not read the marker"
+
+# THE OTHER SIDE OF THAT GUARD: nothing to compare against. "The derivation produced nothing" and
+# "the control carries it all" are the same answer unless the empty case is refused on its own.
+#
+# It shares its expect with the stubbed-harness mutation above, and drives it by a different input:
+# there the harness cannot assemble a set, here the DECLARATION has none to assemble from, so
+# `--print-flags` refuses and the guard fires one branch earlier than the per-reader comparison.
+# Predicted wrongly first time -- it was written expecting the empty-block branch -- and corrected
+# from what the run reported.
 seed; sub_dc '"runArgs": [' '"runArgs2": ['
-run "container.json declares no runArgs at all" "could not be derived here"
+run "container.json declares no runArgs at all" "produced nothing"
 
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
@@ -813,40 +895,6 @@ open(p, 'w').write(s[:i] + new + s[k:])
 PYX
 run "the control reads dc_run_args through a process substitution again" "which discards its refusal"
 
-# THE INERT MARKERS, all three failure paths. They decide whether a mutation whose flag is not
-# load-bearing on this host reports SKIPPED (a fact about the machine) or MISSED (an alarm about a
-# guard) -- measured on macOS/Docker Desktop, where bwrap mounts /proc with the masks in place.
-seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = 'RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"'
-assert s.count(old) == 2, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'RUN_INERT_IF="bubblewrap is fine actually"'))
-PYX
-run "an inert marker names text verify.sh never prints" "name text verify.sh never prints"
-
-# THE COUNT PIN MUST NOT SHARE THE EXTRACTOR'S PREDICATE, which is the whole point of a count pin
-# and which the first version of this guard got wrong: it counted the extractor's own double-quoted
-# shape, so respelling an assignment dropped BOTH counts to zero, they agreed, and it printed
-# `ok (0 checked)`. Reproduced by hand, then pinned here.
-seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = '    RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"'
-assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, "    RUN_INERT_IF='bubblewrap creates its namespaces and mounts /proc'", 1))
-PYX
-run "an inert marker is respelled so the extractor cannot read it" "RUN_INERT_IF assignments"
-
-seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = '    RUN_INERT_IF="bubblewrap creates its namespaces and mounts /proc"\n'
-assert s.count(old) == 2, "mutation target absent"
-open(p, 'w').write(s.replace(old, ''))
-PYX
-run "the inert markers are removed entirely" "sets no RUN_INERT_IF marker"
-
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -859,7 +907,7 @@ run "the inert markers are removed entirely" "sets no RUN_INERT_IF marker"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=75
+PINNED_BAD_SITES=76
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
