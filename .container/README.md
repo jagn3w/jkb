@@ -497,6 +497,81 @@ same false premise. An alarm that is explained away twice is usually correct.
 `verify.sh`'s probe is Claude Code's invocation flag for flag now, and its comment records the
 measurement so the next edit to that line knows what it costs.
 
+**What the flag costs is unchanged by the correction above, and this section lost it once.** The
+commit that fixed the measurement replaced this whole passage and deleted the enumeration, the host
+table and the follow-ups with it — 92 lines removed against 26 added, and its message never said so.
+Restored here. Correcting a claim is not licence to drop the analysis around it, and a security
+document quietly losing its residual is a worse defect than the wrong sentence that prompted the
+edit.
+
+Docker has no selective unmask, and the flag is broader than its name: `systempaths=unconfined`
+clears **both** `MaskedPaths` and `ReadonlyPaths`. Concretely it re-exposes
+
+- **masked (were mounted over):** `/proc/acpi`, `/proc/asound`, `/proc/interrupts`, `/proc/kcore`,
+  `/proc/keys`, `/proc/latency_stats`, `/proc/sched_debug`, `/proc/scsi`, `/proc/timer_list`,
+  `/proc/timer_stats`, `/sys/devices/virtual/powercap`, `/sys/firmware`, and one
+  `/sys/devices/system/cpu/cpuN/thermal_throttle` per CPU that has one
+- **read-only (were mounted `ro`), now writable:** `/proc/bus`, `/proc/fs`, `/proc/irq`,
+  `/proc/sys`, `/proc/sysrq-trigger`
+
+**That list is a snapshot of somebody else's moving list, and it is deliberately not counted.** It
+is `defaultLinuxMaskedPaths()` in moby's `daemon/pkg/oci/defaults.go`, read at `d5370d34d328`
+(2026-04-27). `/proc/interrupts` and the `thermal_throttle` files were added by advisory
+[GHSA-6fw5-f8r9-fgfm](https://github.com/moby/moby/security/advisories/GHSA-6fw5-f8r9-fgfm) and
+powercap by [GHSA-jq35-85cj-fj4p](https://github.com/moby/moby/security/advisories/GHSA-jq35-85cj-fj4p),
+so a daemon older than those masks *fewer* paths and your residual is correspondingly **smaller**
+— the direction it is safe to be wrong in. This section used to state the length ("4 of the 11",
+"the other 7", "all 11") and each of those was a second copy of the list: when `/proc/interrupts`
+was dropped in an edit, three sentences of arithmetic silently agreed with the shorter list. Paths
+are named here and never counted. Making it derived instead of copied is follow-up 6 below.
+
+The read-only half is covered by DAC and not by the mask being gone: writing any of it is root-only
+and the container is not root. So what is actually traded away is *information*, from the first
+list. Every path on it is treated here as exposed: an earlier version subtracted the ones it
+asserted were mode `0400` (`kcore`, `keys`, `timer_list`, `sched_debug`), which was a third copy of
+a fact — this time a kernel fact, asserted from memory, varying by version, and subtracting in the
+**unsafe** direction. Measuring it is follow-up 3. Three host classes:
+
+| host | compensating layer | residual |
+|---|---|---|
+| macOS / Docker Desktop | none, but the exposed host is the LinuxKit VM, not your machine | small |
+| Linux **with** AppArmor | `apparmor-jkb-dev` re-denies *read* on `/proc/kcore`, `/sys/firmware/**` and `/sys/devices/virtual/powercap/**`, and on `/proc/sysrq-trigger` from the read-only list | everything else on the masked list — `/proc/acpi`, `/proc/asound`, `/proc/interrupts`, `/proc/keys`, `/proc/latency_stats`, `/proc/sched_debug`, `/proc/scsi`, `/proc/timer_list`, `/proc/timer_stats`, `thermal_throttle`. The `deny /sys/[^f]*/** wklx` rule is **write-only**, so it does not cover `thermal_throttle` |
+| Linux **without** AppArmor (SELinux, or no LSM) | **none** | the whole masked list, against the real host — `powercap` and the `interrupts`/`thermal_throttle` pair each carrying a published side channel (PLATYPUS, and GHSA-6fw5-f8r9-fgfm respectively) |
+
+**The third row is the unfinished part, and it matters more as Linux becomes the main platform.**
+How it should be fixed, in order of leverage:
+
+1. **Upstream, which removes the trade entirely.** If `bwrap` bind-mounted `/proc` instead of
+   fresh-mounting it, no flag would be needed. That invocation belongs to
+   `@anthropic-ai/sandbox-runtime`, not to us, so this is a report to file rather than a patch.
+2. **Fail closed on the uncompensated cell.** On Linux, masks off *and* no LSM profile mediating
+   should refuse to start, the same shape as the egress boot gate — a container that cannot honour
+   the boundary should say so rather than run and look identical to one that can. macOS is accepted
+   explicitly, because the host there is the VM.
+3. **Report which layer is in force.** When masks are off, `verify.sh` should say whether
+   `apparmor-jkb-dev`, some other LSM, or nothing is compensating. An unstated residual is
+   indistinguishable from coverage.
+4. **Restore the discriminator the flag cost.** The mask is what made the AppArmor profile testable
+   — docker-default's denials otherwise overlap what DAC already restricts to root, so a denial
+   proves nothing. Half of the replacement has landed: `verify.sh`'s `bwrap` probe now mounts
+   `proc`, and `docker-default` denies `mount`, so on an AppArmor host a pass separates this
+   profile from the stock one. It does not separate *this* profile from `apparmor=unconfined`,
+   which also passes. The other half is the `(enforce)` mode, which `verify.sh` still reads out of
+   `/proc/self/attr/apparmor/current` and then discards with a `sed`.
+5. **Check whether podman's `--security-opt unmask=` helps.** Reasoned dead — any surviving mask
+   should still trip the kernel check — but unverified, and it needs a Linux box with podman. If it
+   works it is strictly better than all-or-nothing.
+6. **Vendor the masked-path list instead of copying it.** The enumeration above is a hand copy of a
+   list upstream changes by security advisory, and it has already drifted once — losing
+   `/proc/interrupts` in an edit, with three counted sentences agreeing with the shorter list. The
+   structurally right home is the vendored-artifact framework this repo already has
+   (`generate-*.sh` + `check-drift.sh`, which is what keeps the seccomp profile honest): a
+   `generate-masked-paths.sh` extracting the slice from `defaults.go`, drift-checked in CI, with
+   the README pointing at the artifact. Deliberately **not** done in the fix round that found the
+   drift: a `sed` over Go source is exactly the extraction that silently truncates — the failure
+   `check-config.sh` documents for the seccomp generator — so it needs its own emptiness and
+   named-member pins and its own mutations. A must-fix in prose is fixed in prose.
+
 ## On a Linux host
 
 Better, mostly: no VM, so bind mounts are native and the IO penalty above disappears. Two things
