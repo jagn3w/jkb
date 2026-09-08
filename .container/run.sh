@@ -151,22 +151,46 @@ config_hash() { # config_hash <config> <repo-root>
     fingerprint "$2" ${a[@]+"${a[@]}"}
 }
 
-docker_args() { # docker_args <config> <repo-root>  -> one argument per line
-    local cfg="$1" root="$2" line sub
+# TWO HALVES, ONE EMITTER (D54.1). Every flag is emitted at exactly one place here, and a caller
+# chooses which halves it wants rather than re-deriving or subtracting:
+#
+#   INSTANCE  --name/--detach/--workdir and the mounts. What makes this container THIS container:
+#             its identity and its binding to this host's data.
+#   POSTURE   --user, runArgs and containerEnv (plus the AppArmor flag, added by assembled_args).
+#             What makes it a jkb-dev container at all -- the security configuration.
+#
+# `posture` as the third argument omits the instance half. mutate-verify.sh's control uses it: the
+# harness supplies its own name, its own scratch knowledge base and its own repo bind, and must NOT
+# inherit this host's. Subtracting the instance flags from the full set instead would work until a
+# pattern stopped matching, and the failure would be the harness's containers bind-mounting the
+# REAL ~/.jkb -- mutations writing to the live store. A mode cannot fail that way: the mount lines
+# are not emitted at all.
+docker_args() { # docker_args <config> <repo-root> [posture]  -> one argument per line
+    local cfg="$1" root="$2" half="${3:-all}" line sub
 
-    printf '%s\n' "--name" "$NAME" "--detach" "--workdir" "$CTR_REPOS"
+    [ "$half" = posture ] || printf '%s\n' "--name" "$NAME" "--detach" "--workdir" "$CTR_REPOS"
 
-    local user; user="$(dc_remote_user "$cfg")"
+    local user
+    user="$(dc_remote_user "$cfg")" || die "container.json's remoteUser could not be read"
     [ -n "$user" ] && printf '%s\n' "--user" "$user"
 
     # The security flags, from the shared reader mutate-verify.sh's control also uses.
     dc_run_args "$cfg" "$root" || die "container.json's runArgs could not be substituted"
 
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        sub="$(dc_subst "$line" "$root")" || die "container.json's mounts could not be substituted"
-        printf '%s\n' "--mount" "$sub"
-    done < <(dc_mount_specs "$cfg")
+    if [ "$half" != posture ]; then
+        # `$( )`, not `< <( )`. The mount list is the security boundary, and a process substitution
+        # discards its producer's exit status -- so a jq that failed part way would leave this loop
+        # holding a TRUNCATED list and the container would start with some of its mounts, reporting
+        # nothing wrong. This was the one `dc_*` reader still read that way; the checker's guard had
+        # a hand-written list of producer names and could not see it.
+        local specs
+        specs="$(dc_mount_specs "$cfg")" || die "container.json's mounts could not be read"
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            sub="$(dc_subst "$line" "$root")" || die "container.json's mounts could not be substituted"
+            printf '%s\n' "--mount" "$sub"
+        done <<<"$specs"
+    fi
 
     # Through the shared reader, read through `$( )` — the inline jq this replaces was itself a
     # `< <( )` over a producer that can fail, i.e. the shape lib.sh's rule forbids, sitting in the
@@ -180,6 +204,35 @@ docker_args() { # docker_args <config> <repo-root>  -> one argument per line
             printf '%s\n' "--env" "$line"
         done <<<"$env_out"
     fi
+}
+
+# THE ONE ASSEMBLY (D54.1). The launcher below and `--print-args` -- which mutate-verify.sh's
+# control is derived from -- both go through this, so the container people attach to and the
+# container the harness certifies cannot be assembled differently.
+#
+# mutate-verify.sh used to re-derive its control from container.json with the same readers, one
+# file apart. Twelve review findings and eight must-fixes are that second assembly, or the static
+# guard written to keep the two agreeing: the guard compared only the security-opt pairs, then only
+# the runArgs third, then read a hand-picked source region, then matched only one spelling of the
+# argument. Each fix was correct and the next round found the next hole, because a guard over two
+# copies cannot be complete. One derivation has no agreement to guard.
+#
+# THE APPARMOR FLAG IS PART OF IT, not something a caller adds afterwards. It is a host fact rather
+# than a declared one -- whether AppArmor mediates depends on the machine, and `apparmor=` where it
+# does not is an error, not a no-op -- so a caller reconstructing the flag set from container.json
+# alone gets a DIFFERENT container on every Linux host. That is what the two hand-spelled AppArmor
+# mutations drifted into twice.
+assembled_args() { # assembled_args <repo-root> [posture] -> one docker argument per line
+    docker_args "$CONFIG" "$1" "${2:-all}" || return 1
+    dc_apparmor_mediates || return 0
+    # Refused rather than allowed to be empty: `--security-opt apparmor=` reaches docker as its
+    # DEFAULT profile, which is docker-default, whose `mount` denial is the silent state this
+    # profile exists to lift. `dc_require_apparmor_profile` exits on an unreadable name, and inside
+    # `$( )` that kills only the subshell -- so the emptiness is checked here too.
+    local prof
+    prof="$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")" || return 1
+    [ -n "$prof" ] || return 1
+    printf '%s\n' --security-opt "apparmor=$prof"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -302,6 +355,30 @@ if [ "${1:-}" = --self-test ]; then
        "$(rc_of docker_args "$norunargs" "$repo")" "1"
     rm -f "$norunargs"
 
+    # ...AND AN UNREADABLE ONE, which is a different failure and used to be a silent success.
+    # `dc_remote_user` was a bare pipe with its errors suppressed, so it answered 0-with-no-output
+    # for a file it could not read -- "could not tell" spelled exactly like "declares nothing". A
+    # verify.sh assertion written on top of that had an unreachable refusal branch and asserted
+    # nothing about the running user on precisely the input it existed for.
+    # ASSERTED OF THE READER, WITHOUT pipefail. Two earlier versions of these rows could not fail:
+    # against `docker_args`, whose refusal is over-determined (dc_run_args and dc_container_env
+    # refuse on the same input, so its status said nothing about the reader under test); then
+    # against the reader under THIS script's options, where `pipefail` alone makes a bare pipe
+    # refuse. lib.sh sets no options and is sourced by several scripts, so what matters is that the
+    # reader refuses on its own. Both were found by reverting the fix and re-running -- the only
+    # thing that finds a test which cannot fail.
+    unparseable="$(mktemp)"; printf 'not json at all\n' > "$unparseable"
+    eq "an unreadable declaration is refused by the reader itself, with no pipefail to do it" \
+       "$(set +o pipefail; rc_of dc_remote_user /nonexistent-container.json 2>/dev/null)" "1"
+    eq "...and so is an unparseable one" \
+       "$(set +o pipefail; rc_of dc_remote_user "$unparseable" 2>/dev/null)" "1"
+    # THE CONTRASTING CASE, or the two rows above pass for a reader that refuses EVERYTHING.
+    nouser="$(mktemp)"; printf '{ "mounts": [] }\n' > "$nouser"
+    eq "...while a declaration that genuinely omits remoteUser is not" \
+       "$(rc_of dc_remote_user "$nouser" 2>/dev/null)" "0"
+    eq "...and answers empty for it" "$(dc_remote_user "$nouser" 2>/dev/null)" ""
+    rm -f "$unparseable" "$nouser"
+
     # The fingerprint that decides whether a running container is stale. The realistic way for it
     # to be useless is to be insensitive to the thing that matters, so it is tested against a
     # changed MOUNT rather than against an arbitrary edit — the mount list is the boundary, and a
@@ -372,6 +449,23 @@ while [ $# -gt 0 ]; do
         --dry-run)       DRY=1; shift ;;
         --open)          OPEN=1; shift; case "${1:-}" in -*|"") ;; *) open_path="$1"; shift ;; esac ;;
         --consumed-keys) consumed_keys; exit 0 ;;
+        # THE CONTROL'S FLAGS COME FROM HERE (D54.1). Deliberately before the `container_path`
+        # check below: that refuses a checkout outside ~/repos, which is right for STARTING a
+        # container and wrong for printing what one would be started with -- CI checks out to
+        # /home/runner/work, and mutate-verify.sh's control has to be derivable there.
+        # The root is an argument for the same reason: it is the harness's, not this script's.
+        --print-args)    shift
+                         pa_half=all
+                         if [ "${1:-}" = --posture ]; then pa_half=posture; shift; fi
+                         command -v jq >/dev/null 2>&1 || die "jq is required to read $CONFIG"
+                         [ -f "$CONFIG" ] || die "no $CONFIG"
+                         # `$( )`, not a bare call: a `die` inside assembled_args exits only the
+                         # subshell, and a partial argument list printed as if it were whole is
+                         # the control-missing-a-declared-flag state D54.1 exists to end.
+                         args_out="$(assembled_args "${1:-$repo}" "$pa_half")" \
+                             || die "container.json could not be read; refusing to print a partial declaration"
+                         [ -n "$args_out" ] || die "the assembly produced no arguments"
+                         printf '%s\n' "$args_out"; exit 0 ;;
         --stop)          docker stop "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME was not running"; exit 0 ;;
         --rm)            docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME did not exist"; exit 0 ;;
         *)               die "unknown argument '$1' (see the header of $0)" ;;
@@ -392,7 +486,7 @@ ctr_repo="$(container_path "$repo")" || die "this checkout ($repo) is not under 
 # leaving a truncated argument list here — a container started without the mounts or the security
 # flags it declares. See lib.sh.
 ARGS=()
-ARGS_OUT="$(docker_args "$CONFIG" "$repo")" || die "container.json could not be read; refusing to start a container from a partial declaration"
+ARGS_OUT="$(assembled_args "$repo")" || die "container.json could not be read; refusing to start a container from a partial declaration"
 while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"
 
 # THE APPARMOR PROFILE IS A HOST FACT, so it is decided here rather than declared in
@@ -408,12 +502,10 @@ while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"
 #
 # INSIDE THE FINGERPRINT, deliberately: a container created without the profile is genuinely not
 # the same container as one created with it, and should be reported stale rather than reused.
+# The flag itself is appended by `assembled_args` above, which is the one assembly. This name is
+# still needed for the preflight `docker run` further down, which reports a profile docker will not
+# accept -- a different question from what the container is assembled with.
 AA_PROFILE="$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")"
-# `dc_apparmor_mediates`, from lib.sh -- not a local `aa_enabled` copy, and not an alias for one
-# either. This was a hand-written predicate here, a second in verify.sh that read DIFFERENT primary
-# evidence, and two more in mutate-verify.sh and ci.yml; the launcher deciding whether to pass
-# `--security-opt` and the verifier deciding what it should see have to start from one fact.
-if dc_apparmor_mediates; then ARGS+=(--security-opt "apparmor=$AA_PROFILE"); fi
 
 # Hashed BEFORE the label is appended, or the value would have to contain itself.
 want_hash="$(fingerprint "$repo" "${ARGS[@]}")"

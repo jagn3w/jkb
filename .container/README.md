@@ -471,16 +471,20 @@ it is denied.
 
 **Necessity was measured on both platforms, and the first measurement here was WRONG.** This
 section previously said the flag was inert on macOS — that ten paths were unmasked and nothing was
-bought. That came from a probe (`verify.sh`'s) that omits `--unshare-pid`, which is the one flag
-that triggers the refusal. Re-measured with Claude Code's actual invocation, in a container with
-the masks in place:
+bought. That came from a probe omitting `--unshare-pid`, which is the one flag that triggers the
+refusal. Re-measured with Claude Code's actual invocation, in a container with the masks in place.
+
+**The rows are NOT cumulative.** Each is the base invocation plus the flags its own row names, and
+reading them as a ladder says the wrong flag is the trigger — row 3 would appear to cancel row 2's
+refusal and row 4 to restore it. Base = `--new-session --die-with-parent --unshare-net --bind / /
+--dev /dev --proc /proc`:
 
 | invocation | masks present | unmask applied |
 |---|---|---|
-| `--bind / / --proc /proc --unshare-net` (the old probe) | OK | OK |
-| `+ --unshare-pid` | **`Can't mount proc on /newroot/proc`** | OK |
-| `+ --unshare-user --cap-drop ALL` | OK | OK |
-| Claude Code's full shape | **`Can't mount proc on /newroot/proc`** | OK |
+| base (this is what the old probe ran) | OK | OK |
+| base `+ --unshare-pid` | **`Can't mount proc on /newroot/proc`** | OK |
+| base `+ --unshare-user --cap-drop ALL` | OK | OK |
+| base `+ --unshare-pid --unshare-user --cap-drop ALL` (Claude Code's full shape) | **`Can't mount proc on /newroot/proc`** | OK |
 
 So the flag is **load-bearing on macOS exactly as on Linux**, and the error in that table is the
 one that motivated it. `--unshare-pid` is the trigger: the kernel refuses a fresh procfs for a NEW
@@ -494,8 +498,20 @@ and it was read as a fact about the host, because the weak probe agreed with the
 mechanism was then added to silence it, and when that was rejected the redesign was justified by the
 same false premise. An alarm that is explained away twice is usually correct.
 
-`verify.sh`'s probe is Claude Code's invocation flag for flag now, and its comment records the
-measurement so the next edit to that line knows what it costs.
+**This table is the only copy.** `.container/bwrap-probe.sh` runs Claude Code's invocation and
+points here rather than restating the measurement; `verify.sh` and CI both call that script rather
+than each keeping a probe. The retracted claim above survived for a while precisely because it was
+written in three places and corrected in one — a measurement in a script comment is a claim nothing
+re-establishes, so measurements live here, dated, once (D54.5). What the script's own header keeps
+is the one fact that makes a simpler probe wrong: drop `--unshare-pid` and it passes in exactly the
+state the flag exists to fix. `bwrap-probe.sh --self-test` asserts that flag is present and that the
+two rungs differ by the proc mount alone, and `./scripts/check.sh` runs it.
+
+**Why bubblewrap can or cannot start on a given host** is answered by
+`./.container/mutate-verify.sh --ladder`, which re-measures with one security flag removed at a
+time, starting from the container that ships. CI runs it as its diagnostic step. It replaced four
+hand-written `docker run` arms in `ci.yml` that were a second copy of the shipped configuration and
+drifted from it in every review round they survived.
 
 **What the flag costs is unchanged by the correction above, and this section lost it once.** The
 commit that fixed the measurement replaced this whole passage and deleted the enumeration, the host

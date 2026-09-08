@@ -2,8 +2,9 @@
 # Each case breaks ONE property the container is supposed to have. verify.sh must fail, and must
 # fail naming that property — a guard nobody has watched fail is not a guard.
 #
-#   ./.container/mutate-verify.sh [image]           every guard, each watched failing
+#   ./.container/mutate-verify.sh [image]            every guard, each watched failing
 #   ./.container/mutate-verify.sh --control [image]  ONE healthy run, for "is this container ok"
+#   ./.container/mutate-verify.sh --ladder [image]   WHY bubblewrap can or cannot start here
 #
 # `--control` exists because assembling that `docker run` by hand goes wrong: it needs the seccomp
 # profile, NET_ADMIN, both binds, and a preamble that raises the firewall, links the state, links
@@ -15,30 +16,24 @@
 # Needs a Docker host and the image built (`docker build -t jkb-dev .container`), so the mutation
 # run is this change's #[ignore] test — the host-side static checks live in check-config.sh.
 #
-# ONE MODE IS AN EXCEPTION AND THE GATE DEPENDS ON IT: `--print-flags` assembles the control's flag
-# set and prints it, needing no daemon, and check-config.sh runs it on every ./scripts/check.sh to
-# compare that set against container.json. That is why the docker preflights below are skipped for
-# it rather than merely tolerated — they exit 0 with a skip, so an empty read would have passed the
-# gate on every machine without a running daemon.
+# NO MODE HERE RUNS WITHOUT DOCKER any more. `--print-flags` existed so check-config.sh could
+# compare the control's assembled flags against container.json on every ./scripts/check.sh -- and
+# under D54.1 the control no longer assembles anything: it asks `run.sh --print-args --posture`,
+# which IS offline-observable. An offline guard that wants to know what the control runs with asks
+# run.sh, which is the one place the answer is produced.
 set -uo pipefail
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 CONTROL_ONLY=0
 SHELL_CMD=""
-PRINT_FLAGS=0
+LADDER=0
 if [ "${1:-}" = --control ]; then CONTROL_ONLY=1; shift; fi
-# `--print-flags`: the assembled control flag set, one argument per line, and nothing else.
+# `--ladder`: WHY bubblewrap can or cannot start on this host, as a table (D54.3).
 #
-# It exists so check-config.sh can assert — on any host, in ./scripts/check.sh — that what the
-# control actually RUNS still carries what container.json declares. Asserting that against the
-# `HEALTHY=(…)` source line was the obvious version and is the wrong one: it greps a bash array
-# literal, matches inside comments, is blind to a later reassignment, and once HEALTHY is derived
-# it is a guard over one spelling rather than over the result. This prints the assembly.
-#
-# IT MUST NOT BE BEHIND THE DOCKER PREFLIGHTS, which is why the argument parse moved above them.
-# Those exit 0 with a skip when Docker is absent or stopped — correct for a mutation run, fatal
-# here: the check would read empty output as a pass on every machine without a running daemon,
-# which is most of them.
-if [ "${1:-}" = --print-flags ]; then PRINT_FLAGS=1; shift; fi
+# The rungs are the control minus one security flag at a time, so the top rung IS the container
+# that ships and a rung cannot lose a flag by omission. This replaced four hand-spelled `docker
+# run` invocations in ci.yml, which drifted from the shipped set in every review round they
+# survived -- and which nobody could run by hand, being YAML.
+if [ "${1:-}" = --ladder ]; then LADDER=1; shift; fi
 # `--shell <command>`: run one command in a healthy container, after the same preamble every
 # mutation and the control run. It exists so a DIAGNOSTIC never has to hand-roll the docker flags
 # -- the failure this file's header already records, where an assembled-by-hand `docker run`
@@ -53,13 +48,12 @@ IMAGE="${1:-jkb-dev}"
 
 if [ "$#" -gt 1 ]; then
     echo "=== container guards ==="
-    echo "   usage: $(basename "$0") [--control|--print-flags|--shell <command>] [image]" >&2
+    echo "   usage: $(basename "$0") [--control|--ladder|--shell <command>] [image]" >&2
     echo "   got $# arguments: $*" >&2
     echo "   (a command copied with trailing prose attached is the usual cause)" >&2
     exit 2
 fi
-# EVERY PREFLIGHT THAT NEEDS A DOCKER HOST, skipped as a group under --print-flags, which needs
-# none: it derives and prints the flag set and exits.
+# EVERY PREFLIGHT THAT NEEDS A DOCKER HOST. Every mode does now, so there is no exemption.
 #
 # Without this, a host with no docker on PATH reports every guard as MISSED and exits 1 saying
 # "N guard(s) did not fire" — a security-shaped alarm for what is only a fact about the shell.
@@ -77,7 +71,7 @@ fi
 # command. It happened with a stray em dash pasted as the image name, copied out of prose where one
 # followed the command; `docker run … — bash -c …` exits 125 ("could not start the container"),
 # which `judge` reads as a non-zero verify.sh and reports as a guard that did not fire.
-if [ "$PRINT_FLAGS" -eq 0 ]; then
+if true; then
     if ! command -v docker >/dev/null 2>&1; then
         echo "=== container guards ==="
         echo "   (skipped: docker is not on PATH — try: export PATH=\"\$HOME/.docker/bin:\$PATH\")"
@@ -166,92 +160,54 @@ SUBJECT="$PREAMBLE"'
 # an operator's statement about a host, and a harness that quietly assumed it would hide the very
 # failure it exists to detect everywhere else.
 ACCEPT_ENV=(); [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && ACCEPT_ENV=(-e JKB_ACCEPT_NO_BWRAP=1)
-# The same host-conditional AppArmor decision run.sh makes, for the same reason: docker-default
-# denies `mount`, so without this the healthy container fails bubblewrap and every mutation verdict
-# is judged against a container that is not the one run.sh produces.
+# THE CONTROL'S SECURITY CONFIGURATION IS run.sh's, ASKED FOR (D54.1) -- not derived again here.
+#
+# `run.sh --print-args --posture` prints the half of the assembly that makes a container a jkb-dev
+# container: --user, container.json's runArgs, containerEnv, and the host-conditional AppArmor
+# flag. It omits the instance half -- the name, --detach, the workdir and the MOUNTS -- because the
+# harness supplies its own scratch knowledge base and its own repo bind and must not inherit this
+# host's.
+#
+# WHY IT IS ASKED FOR RATHER THAN DERIVED. This block used to re-read container.json with the same
+# readers run.sh uses, one file apart, and then a static guard in check-config.sh kept the two
+# agreeing. Twelve review findings and eight must-fixes are that arrangement: the guard compared
+# only the security-opt pairs, then only the runArgs third, then read a hand-picked region of this
+# file, then matched only one spelling of the argument -- each fix correct, each round finding the
+# next hole, because a guard over two copies cannot be complete. There is one copy now, so the
+# block table, the reader pin and their mutations are gone rather than fixed a fourth time.
+#
+# THE FAILURE DIRECTION IS SAFE. A flag added to run.sh flows in here (the control carries MORE of
+# the launcher, never less). A flag DROPPED from run.sh is caught by verify.sh, whose assertions
+# derive from container.json itself and not from this set -- so the two things that could go wrong
+# are covered by different evidence than the thing that produces them.
 . "$REPO/.container/lib.sh"
-AA_ARGS=()
-if dc_apparmor_mediates; then
-    # TWO STEPS, AND THE STATUS IS CHECKED. `dc_require_apparmor_profile` exits on an unreadable
-    # profile name -- but this used to call it inside an array element's command substitution, and
-    # `exit` there ends only the SUBSHELL. The refusal printed its five lines and the empty name it
-    # exists to reject flowed straight into `--security-opt apparmor=`, which docker reads as its
-    # DEFAULT profile: every mutation and the control then ran under docker-default, the exact
-    # silent state this whole change ends. This script is `set -uo pipefail` with no `-e`, so
-    # nothing else would have stopped it. The helper's own comment claims "no future caller can
-    # forget"; the first new caller did, eleven lines from run.sh's comment describing the same
-    # escape. check-config.sh now asserts the CALL SHAPE across the tree, because a callee cannot
-    # force this and a comment beside each call site is what already failed.
-    aa_name="$(dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")" || exit 1
-    AA_ARGS=(--security-opt "apparmor=$aa_name")
-fi
-# ${A[@]+"${A[@]}"}, NOT "${A[@]}". Both arrays are legitimately empty -- AA_ARGS on any host
-# without AppArmor, ACCEPT_ENV whenever the acceptance is unset, i.e. every macOS run -- and
-# expanding an empty array under `set -u` is an UNBOUND VARIABLE ABORT on bash 3.2, which is what
-# /usr/bin/env bash is on macOS (3.2.57). So `--control`, the one sanctioned "is my container
-# healthy" command and the one run.sh's own refusals point at, died on this line naming nothing.
-# run.sh:147 already uses this idiom for exactly this reason.
-# THE CONFIG HALF OF THE CONTROL IS READ FROM container.json, NOT RE-TYPED (D52.6).
-#
-# It used to be a hand copy, and a copy of the declaration is a copy that goes stale: commit
-# 8266a2b added `--security-opt systempaths=unconfined` to container.json, run.sh picked it up
-# automatically because it derives, and this array did not — so for four commits CI's
-# `mutate-verify.sh --control` step, the one titled "The container is what it claims to be",
-# started a container WITHOUT the flag, reported it healthy, and judged every mutation verdict
-# against a container run.sh does not produce. It had also silently omitted `--pids-limit 4096`
-# since the day that was declared, which nobody noticed at all — the copy was never right, only
-# right enough.
-#
-# `--user` comes from `remoteUser` for the same reason and is the same kind of fact: bubblewrap
-# cannot create a namespace as root, so a control running as a different user from the real
-# container is not a control either.
-#
-# What is still spelled by hand is BASE alone, deliberately: those binds are NOT container.json's
-# mounts (a scratch knowledge base, the repo bind this harness `--declare`s) and are documented
-# above as the harness's own.
-# Read through `$( )`: a `< <( )` here would discard dc_run_args' refusal, and because it emits
-# each argument as it substitutes it, a refusal PART WAY would leave a truncated set — a control
-# missing one declared flag, which is the exact state this derivation exists to end. See lib.sh,
-# and check-config.sh, which fails the gate on that shape.
-#
-# THE EMPTINESS REFUSAL IS THE CALLEE'S, not a block here. It used to be written out at this one
-# call site, which meant run.sh — the launcher that starts the container people actually attach to
-# — did not make it, and would start a container with none of its declared security flags while
-# reporting nothing wrong. A rule two callers must remember is the defect; `dc_run_args` refuses.
-CFG="$REPO/.container/container.json"
-RUNARGS=()
-_ra="$(dc_run_args "$CFG" "$REPO")" || {
-    echo "mutate-verify: the control's security flags come from container.json's runArgs (above)." >&2
-    echo "  Refusing to certify a container assembled without them." >&2
+POSTURE=()
+_pa="$("$REPO/.container/run.sh" --print-args --posture "$REPO")" || {
+    echo "mutate-verify: run.sh could not print the container's security configuration (above)." >&2
+    echo "  Refusing to certify a container assembled without it." >&2
     exit 2
 }
-while IFS= read -r _l; do [ -n "$_l" ] && RUNARGS+=("$_l"); done <<<"$_ra"
-
-USER_ARGS=(); _u="$(dc_remote_user "$CFG")"; [ -n "$_u" ] && USER_ARGS=(--user "$_u")
-
-# containerEnv, from the same reader run.sh uses. It is on the DECLARATION side of the line lib.sh
-# draws: the control copies what the declaration says and substitutes only what is a property of
-# the host's data, which is the mount sources alone. Leaving it out meant the control ran without
-# the environment the real container carries -- and `JKB_EGRESS_ACCEPT_UNFILTERED` is exactly the
-# entry somebody will one day set to "1" (D50.6, the documented escape), after which verify.sh
-# reports a FAILURE in the real container on every run while the control, not carrying it, went on
-# printing "the container is what it claims to be". Every declared value happens to equal its own
-# default today, which is why the omission has cost nothing so far and why nobody noticed.
-ENV_ARGS=()
-_ce="$(dc_container_env "$CFG" "$REPO")" || {
-    echo "mutate-verify: container.json's containerEnv could not be read (above)." >&2
+while IFS= read -r _l; do [ -n "$_l" ] && POSTURE+=("$_l"); done <<<"$_pa"
+# An empty set is a refusal, not an empty control. run.sh refuses this itself, so this is the
+# second reader of one fact -- kept because the cost of being wrong is a container certified with
+# no security flags at all, and because `$( )` of a script that died still yields empty here.
+[ "${#POSTURE[@]}" -gt 0 ] || {
+    echo "mutate-verify: run.sh printed no security configuration -- refusing to certify." >&2
     exit 2
 }
-if [ -n "$_ce" ]; then
-    while IFS= read -r _l; do [ -n "$_l" ] && ENV_ARGS+=(--env "$_l"); done <<<"$_ce"
-fi
 
-HEALTHY=("${RUNARGS[@]}" ${AA_ARGS[@]+"${AA_ARGS[@]}"} ${USER_ARGS[@]+"${USER_ARGS[@]}"} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
+# ${A[@]+"${A[@]}"}, NOT "${A[@]}". ACCEPT_ENV is legitimately empty whenever the acceptance is
+# unset, i.e. every macOS run, and expanding an empty array under `set -u` is an UNBOUND VARIABLE
+# ABORT on bash 3.2, which is what /usr/bin/env bash is on macOS (3.2.57). So `--control`, the one
+# sanctioned "is my container healthy" command, died on this line naming nothing.
+HEALTHY=("${POSTURE[@]}" ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 
-# THE ASSEMBLED CONTROL, for check-config.sh to assert against the declaration. Printed here
-# because this is where it is assembled: printing the derivation instead would compare
-# container.json with itself.
-if [ "$PRINT_FLAGS" -eq 1 ]; then printf '%s\n' "${HEALTHY[@]}"; exit 0; fi
+# WHETHER AN AppArmor PROFILE IS IN THE CONTROL is read off the control, not decided a second time.
+# It used to be `${#AA_ARGS[@]} -eq 0`, i.e. this file's own copy of run.sh's host decision; the two
+# AppArmor mutations below are skipped as a group when there is none, and skipping them on a
+# DIFFERENT answer from the one the container was started with is a guard reporting about another
+# machine.
+control_has_apparmor() { printf '%s\n' "${HEALTHY[@]}" | grep -q '^apparmor='; }
 
 # A MUTATION CHANGES EXACTLY ONE THING, and hand-spelling the reduced flag set is how that stopped
 # being true — three times, the same way. The sets dropped $AA_ARGS when the AppArmor profile
@@ -306,14 +262,77 @@ without() {
 # containers.
 if [ -n "$SHELL_CMD" ]; then
     echo "=== a healthy container, running your command after the standard preamble ==="
-    # THE FLAGS THIS RUN USES, printed BY this run. A caller that wants to report what the control
-    # ran with used to take them from a second `--print-flags` process -- which mints its own
-    # scratch directory, so the reported ~/.jkb bind named a path that this run's EXIT trap had
-    # already deleted, under a comment claiming it could not describe a different container.
-    printf 'CONTROL-FLAGS=%s\n' "${HEALTHY[*]}"
+    # THE FLAGS THIS RUN USES, printed BY this run rather than by a second process -- which mints
+    # its own scratch directory, so a separately-derived report named a ~/.jkb bind that this run's
+    # EXIT trap had already deleted. Nothing parses this: it is here so a reader of the output can
+    # see what the container was started with.
+    printf '  flags: %s\n' "${HEALTHY[*]}"
     docker run --rm "${HEALTHY[@]}" "$IMAGE" bash -c "$PREAMBLE
       $SHELL_CMD"
     exit $?
+fi
+
+# WHY BUBBLEWRAP CAN OR CANNOT START HERE (D54.3). The rungs are the control MINUS one security
+# flag at a time, so the top rung IS the container that ships and no rung can lose a flag by
+# omission -- which is what four hand-spelled `docker run` arms in ci.yml did, in every review
+# round they survived. Each row prints the flags of the array it actually ran, so attribution is
+# read off the run rather than off the label.
+#
+# SUBTRACTIVE, NOT ADDITIVE. An additive ladder has to spell a starting set, and that set is a
+# second copy of the shipped configuration -- the copy this whole design exists to delete. Reading
+# it is the same: rung N is the container minus the flags named on its own line.
+#
+# It runs no assertions and returns 0 whatever it measures: it is an experiment, and a host where
+# the nested sandbox cannot start is a result rather than a failure of this command.
+if [ "$LADDER" -eq 1 ]; then
+    echo "=== why bubblewrap can or cannot start here ==="
+    echo
+    uname -a
+    echo
+    # THE IMAGE'S OWN ENTRYPOINT IS KEPT, so the top rung really is the container as it ships. The
+    # arms this replaced used `--entrypoint bash` because they granted no NET_ADMIN, so the
+    # entrypoint refused to boot on unbounded egress and bwrap never ran. These rungs subtract only
+    # the three security flags under test and keep NET_ADMIN, so that cause does not apply -- and a
+    # rung the entrypoint does refuse reports `did-not-run` with its reason rather than a verdict.
+    ladder_row() { # ladder_row <label> <flags...>
+        local label="$1"; shift
+        local out ns proc why
+        # RELATIVE TO THE WORKDIR $BASE SETS, not an absolute path spelled again here: the bind
+        # target is BASE's to choose, and a second copy of it would break this silently -- the
+        # container would start, the probe would not be found, and the row would read did-not-run
+        # as though the kernel had refused something.
+        out="$(docker run --rm "$@" "$IMAGE" bash -c './.container/bwrap-probe.sh' 2>&1)"
+        ns="$(printf   '%s\n' "$out" | sed -n 's/^BWRAP-NS=//p')"
+        proc="$(printf '%s\n' "$out" | sed -n 's/^BWRAP-PROC=//p')"
+        why="$(printf  '%s\n' "$out" | sed -n 's/^BWRAP-WHY=//p')"
+        # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result: "no BWRAP-NS=" and
+        # "the probe never executed" are different facts and must not print the same way.
+        [ -n "$ns" ] || { ns="did-not-run"; proc="did-not-run"; why="$(printf '%s' "$out" | tail -1)"; }
+        printf '  %-46s namespaces=%-12s proc-mount=%s\n' "$label" "$ns" "$proc"
+        [ -n "$why" ] && printf '  %-46s   why: %s\n' "" "$why"
+        printf '  %-46s   flags: %s\n' "" "$*"
+    }
+    ladder_row "[shipped]  the container as it ships" "${HEALTHY[@]}"
+    without 'systempaths=unconfined'
+    ladder_row "[-unmask]  ...minus the /proc unmask" "${MUT[@]}"
+    if control_has_apparmor; then
+        without 'systempaths=unconfined' 'apparmor='
+        ladder_row "[-unmask -aa]  ...minus the AppArmor profile too" "${MUT[@]}"
+        without 'systempaths=unconfined' 'apparmor=' 'seccomp='
+        ladder_row "[-unmask -aa -seccomp]  ...stock docker security" "${MUT[@]}"
+    else
+        # SKIPPED WITH A REASON, not silently: on a host with no AppArmor the profile is not in the
+        # control at all, so a rung "without" it would be identical to the one above and would read
+        # as the profile making no difference.
+        printf '  %-46s (skipped: no AppArmor on this host, so it is in no rung)\n' "[-unmask -aa], [-unmask -aa -seccomp]"
+        without 'systempaths=unconfined' 'seccomp='
+        ladder_row "[-unmask -seccomp]  ...minus the seccomp profile too" "${MUT[@]}"
+    fi
+    echo
+    echo "  Read DOWN: the first row is what ships. A column that flips on a row names the flag"
+    echo "  that row removed. 'not-reached' means the namespace step failed first, so that row"
+    echo "  establishes nothing about the proc mount."
+    exit 0
 fi
 
 if [ "$CONTROL_ONLY" -eq 1 ]; then
@@ -481,6 +500,33 @@ run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)
 without '^--user '
 run "runs as root" "runs as a non-root user" "${MUT[@]}" --user root
 
+# THE OTHER TWO DECLARATION READERS, watched (D54.2). Until this branch only `runArgs` had any
+# evidence that its effect reached the running container; `remoteUser` and `containerEnv` were
+# covered by a static guard over the harness's own copy of the declaration, which is the
+# arrangement D54.1 deletes. These are what replace it, so they are watched failing like the rest.
+#
+# THE SAME SINGLE CHANGE, WATCHED BY THE OTHER GUARD IT TRIPS. `judge` takes one expect, and
+# running as root fails two assertions: "not root" (above) and "not the user the declaration names"
+# (2d). A second run of the identical mutation is how both are watched without either being
+# asserted on a container broken in some other way.
+#
+# TRIED FIRST AS `--user 4242`, a non-root user that is not the declared one -- which reads better
+# and is a WORSE MUTATION, because it changes more than one thing: that uid has no passwd entry, is
+# not in sudoers, and cannot write /home/vscode, so it also breaks the firewall raise, the preamble
+# and the memory linker. It reported MISSED, and whichever of those preempted the assertion, a
+# mutation whose verdict depends on that is not evidence about the guard. Root changes one thing
+# the harness already models.
+without '^--user '
+run "runs as a user the declaration does not name" "container.json declares remoteUser" \
+    "${MUT[@]}" --user root
+
+# A DECLARED ENVIRONMENT ENTRY, OVERRIDDEN. Appended rather than subtracted, because docker's rule
+# is last-wins: this is the shape the escape hatch really takes (JKB_EGRESS_ACCEPT_UNFILTERED set
+# at `docker run` beats containerEnv silently), and subtracting the flag would test a container
+# nobody starts.
+run "a declared environment entry is overridden at run time" "reached this container with different values" \
+    "${HEALTHY[@]}" --env JKB_DB=/tmp/not-the-declared-path
+
 # The nested-bind exception must not be usable as a general one. A `--declare` naming anything
 # OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the
 # docker.sock-shaped mount two cases above — so the refusal is watched here rather than argued for
@@ -496,7 +542,7 @@ run "a --declare outside every declared target" "is not inside any host BIND" \
 # -- it runs the sandbox with no profile at all, which is what the profile exists to avoid doing.
 # Skipped as a group on a host without AppArmor: there both arms produce the no-profile `note`, so
 # they would be MISSED for a fact about the machine.
-if [ ${#AA_ARGS[@]} -eq 0 ]; then
+if ! control_has_apparmor; then
     printf '  SKIPPED  the two AppArmor arms (no AppArmor on this host, so neither state is reachable)\n'
 else
     # DERIVED, like every other subtractive mutation. These two were the last sites spelling a flag

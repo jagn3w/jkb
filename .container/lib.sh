@@ -114,7 +114,21 @@ dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY
 
 # The user the container runs as, or empty when it declares none.
 dc_remote_user() { # dc_remote_user <container.json>
-    dc_strip "$1" 2>/dev/null | jq -r '.remoteUser // empty' 2>/dev/null
+    # REFUSES IN ITS OWN RIGHT, like dc_container_env beside it. This was a bare pipe with both
+    # errors suppressed, which refuses only because every caller happens to set `pipefail` -- and
+    # THIS FILE SETS NO SHELL OPTIONS, so that is a rule every present and future caller has to
+    # remember, in a reader whose empty output is a legitimate answer ("declares no remoteUser").
+    # Sourced into a shell without pipefail it answered 0-with-no-output for a file it could not
+    # read, i.e. "could not tell" spelled exactly like "declares nothing".
+    #
+    # (The claim first written here -- that verify.sh's refusal branch was already unreachable --
+    # was WRONG: verify.sh sets pipefail too. What is true is that nothing in the reader made it
+    # so, and the two siblings that do this explicitly are the ones to match.)
+    [ -r "$1" ] || { printf 'container.json is not readable: %s\n' "$1" >&2; return 1; }
+    local out
+    out="$(dc_strip "$1" | jq -r '.remoteUser // empty' 2>/dev/null)" \
+        || { printf 'container.json does not parse: %s\n' "$1" >&2; return 1; }
+    printf '%s' "$out"
 }
 
 # Every mount point the container declares, one per line, sorted.

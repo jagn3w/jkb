@@ -112,6 +112,13 @@ else
 # edit somebody reviews — an over-broad exclusion drops a real mount from the set and the
 # assertion still prints `ok`. mutate-verify.sh covers it and needs Docker; this costs nothing.
 "$(dirname "$0")/../.container/verify.sh" --self-test
+
+# ...and the bubblewrap probe's SHAPE, which is pure and is the one thing about that probe a host
+# with no Docker can establish. The measurement needs a container; that the two rungs differ by the
+# proc mount and by nothing else does not — and a probe weaker than the mechanism it names is the
+# defect this file's subject has shipped twice, passing `ok` in exactly the broken state both
+# times.
+"$(dirname "$0")/../.container/bwrap-probe.sh" --self-test
 fi
 
 # ...and the drift check's decision, which is pure. The check ITSELF needs the network — it fetches

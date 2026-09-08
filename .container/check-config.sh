@@ -33,15 +33,6 @@ command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0
 # the harm the pin below is written against.
 dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
-ci_probe_calls() { # ci_probe_calls <ci.yml>
-    sed '/^[[:space:]]*#/d' "$1" 2>/dev/null \
-      | awk '{ s = $0
-               sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
-               if (s ~ /\\$/) { sub(/\\$/, "", s); buf = buf s " "; next }
-               print buf s; buf = "" }' \
-      | grep '^probe "'
-}
-
 # Sourced HERE rather than 80 lines down, so this file has one copy of the comment-stripping rule
 # instead of a verbatim `strip()` beside the `dc_strip()` it later sources — two halves of one file
 # parsing the same input through two copies that can disagree.
@@ -101,138 +92,34 @@ fi
 # `"remoteUser": "root"` would break the nested sandbox while looking like a simplification.
 if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — the nested sandbox cannot start"; fi
 
-# THE CONTROL RUNS WHAT THE DECLARATION DECLARES (D52.6).
+# THE CONTROL RUNS WHAT THE DECLARATION DECLARES — and this is no longer checked here, because
+# there is no longer anything to check (D54.1).
 #
-# run.sh derives its flags from container.json; mutate-verify.sh's HEALTHY used to re-type them,
-# and a copy of a declaration goes stale. Commit 8266a2b added `systempaths=unconfined` here, run.sh
-# picked it up, the harness did not — so for four commits CI's `mutate-verify.sh --control` step,
-# titled "The container is what it claims to be", started a container WITHOUT the flag and judged
-# every mutation verdict against a container run.sh does not produce. `--pids-limit 4096` had been
-# missing from it since the day it was declared, and nobody had noticed at all.
+# mutate-verify.sh used to re-derive its control's flags from container.json with the same readers
+# run.sh uses, one file apart, and two guards lived here to keep the copies agreeing: a per-reader
+# contiguous-block comparison, and a pin that no fourth reader could join the assembly without
+# joining the table. Between them they produced five findings and three must-fixes across four
+# review rounds — the comparison covered only the security-opt pairs, then only the runArgs third;
+# the pin read a hand-picked source region, then matched only one spelling of its argument. Each
+# fix was right and the next round found the next hole, because a guard over two copies cannot be
+# complete: it has to enumerate what to compare, and whatever it fails to enumerate reads as
+# agreement.
 #
-# HEALTHY is derived now, so what this guards is the ASSEMBLY: that the derived elements are still
-# IN it. Asserting the declaration against `HEALTHY=(…)`'s source text was the obvious version and
-# is the wrong one — it greps a bash array literal, matches inside comments, is blind to a later
-# reassignment, and once the array is derived it is a guard over one spelling rather than over the
-# result. `--print-flags` prints the assembled set and needs no Docker, which is why it sits above
-# that script's daemon preflights: those exit 0 with a skip, and an empty read would pass here on
-# every machine without a running daemon.
+# The control asks `run.sh --print-args --posture` now. One derivation, no agreement to guard, so
+# these are deleted rather than corrected a fourth time. What replaces them is not a better static
+# check but different evidence, in two places that already existed:
 #
-# THE WHOLE OF `runArgs`, AS ONE CONTIGUOUS BLOCK — not the `--security-opt` pairs, which is what
-# this compared first and is a narrower question than the comment above it claimed. `--pids-limit
-# 4096` is not a `--security-opt`, and its absence from HEALTHY "since the day it was declared" is
-# the very omission cited three paragraphs up as the motivating example: the guard written to catch
-# it could not see it. `--cap-add=NET_ADMIN` was likewise checked as a declaration and never as
-# something the control carries.
+#   * verify.sh asserts the DECLARATION'S EFFECTS from inside the running container — the /proc
+#     unmask, the user, the environment — deriving each from container.json rather than from the
+#     control's flag list. CI runs it on every push through `mutate-verify.sh --control`, so a
+#     control that drifts from the declaration on any reader is red in the harness's own control.
+#   * run.sh refuses to print a partial or empty assembly and mutate-verify.sh refuses an empty
+#     one, so a truncated read cannot be certified as a container.
 #
-# CONTIGUOUS is the property, and it is exactly the right strength. `HEALTHY=("${RUNARGS[@]}" …)`
-# enters the derived flags as ONE array expansion, so they are necessarily an unbroken run of lines
-# — meaning what this asserts is "RUNARGS went in as a unit, unedited", which is what
-# mutate-config.sh breaks by deleting that expansion. It is not a change-detector: reordering
-# HEALTHY moves the block intact and still passes. The only edit that breaks contiguity is somebody
-# hand-interleaving flags into the derived run, which is a return to the hand-typed copy this whole
-# derivation exists to end. Set membership would lose the adjacency the pair checks above argue for.
-#
-# The comparison is against the SUBSTITUTED derivation, through the same `dc_run_args` the control
-# and run.sh both use: the assembled set holds a real path, and comparing against the raw
-# `${localWorkspaceFolder}/…` spelling would fail for every declaration using a variable — i.e. for
-# the seccomp profile it most needs to check. Pinned against an empty read on both sides, because
-# "nothing was derived" and "the control carries it all" are otherwise the same answer.
-mv_flags="$("$here/mutate-verify.sh" --print-flags 2>/dev/null)"
+# What is still checked here about that script is its expectation strings (further down): those
+# name lines verify.sh must print, and a stale one is MISSED-for-ever on a harness that needs
+# Docker and therefore cannot run in this gate.
 root="$(cd "$here/.." && pwd)"
-
-# ONE BLOCK PER READER, in any order — not one assembled expectation (D53.3). The control derives
-# THREE things from the declaration now: runArgs, remoteUser and containerEnv. This compared only
-# the first, so deleting the ENV_ARGS or USER_ARGS expansion from HEALTHY left all these checks
-# green while the control ran without the declared environment, or as root — under which bubblewrap
-# cannot create a namespace at all and every mutation verdict is unattributable.
-#
-# Assembling ONE expectation would make this re-implement the harness's interleaving (its AppArmor
-# args, its acceptance env, its own binds) in order to predict the result — comparing the assembly
-# against a second copy of itself — and would force reordering the assembly to suit a guard. The
-# property contiguity argues for is "this derived run entered HEALTHY as one expansion, unedited",
-# and that is true PER READER, so it is asserted per reader.
-# ONE LIST, feeding both the loop below and the pin further down. Spelled twice, the half that
-# fails SILENTLY is the table: add a reader to the assembly and to the pin's pattern -- the natural
-# edit when the gate goes red -- and the pin passes while the table compares nothing for it, which
-# is the same end state as the pin having no teeth at all.
-READERS=(run_args remote_user container_env)
-render_run_args()      { dc_run_args "$1" "$2" 2>/dev/null; }
-render_remote_user()   { local u; u="$(dc_remote_user "$1")"; [ -n "$u" ] && printf -- '--user\n%s\n' "$u"; }
-render_container_env() { local l; dc_container_env "$1" "$2" 2>/dev/null | while IFS= read -r l
-                             do [ -n "$l" ] && printf -- '--env\n%s\n' "$l"; done; }
-
-# EXPECTED FROM THE DECLARATION, so a reader that silently returns nothing is a failure rather than
-# a skipped comparison — the vacuous-pass shape every derived list in this file is pinned against.
-expect_run_args=1
-expect_remote_user=0; jq -e 'has("remoteUser")' <<<"$dc" >/dev/null 2>&1 && expect_remote_user=1
-expect_container_env=0; jq -e '(.containerEnv // {}) | length > 0' <<<"$dc" >/dev/null 2>&1 && expect_container_env=1
-
-if [ -z "$mv_flags" ]; then
-    bad "mutate-verify.sh --print-flags produced nothing — the control's flag set could not be assembled, so nothing establishes that it carries what container.json declares"
-else
-    missing_blocks=""; empty_blocks=""; checked=0
-    for reader in "${READERS[@]}"; do
-        eval "want=\$expect_$reader"
-        blk="$(render_$reader "$here/container.json" "$root")"
-        if [ -z "$blk" ]; then
-            [ "$want" -eq 1 ] && empty_blocks="$empty_blocks $reader"
-            continue
-        fi
-        checked=$((checked+1))
-        case $'\n'"$mv_flags"$'\n' in
-          *$'\n'"$blk"$'\n'*) ;;
-          *) missing_blocks="$missing_blocks $reader" ;;
-        esac
-    done
-    if [ -n "$empty_blocks" ]; then
-        bad "container.json declares them but these readers yielded nothing here:$empty_blocks — the control-set check would pass having compared nothing for them"
-    elif [ -n "$missing_blocks" ]; then
-        bad "the control set mutate-verify.sh assembles does not contain container.json's$missing_blocks as one contiguous block — its mutations would be judged against a container run.sh does not produce"
-    else
-        ok "the control set carries every derived block container.json declares ($checked readers)"
-    fi
-fi
-
-
-# ...AND NO FOURTH READER MAY JOIN THE CONTROL WITHOUT JOINING THAT LIST. The table is a hand list,
-# so its pin reads the source instead. Three things it got wrong first time, all reproduced:
-#
-#   REGION. It read a `^CFG=`..`^HEALTHY=` slice, and `AA_ARGS` already derives a HEALTHY
-#   contributor 48 lines ABOVE that anchor -- so a reader placed beside it, or appended by a later
-#   `HEALTHY+=`, left both guards printing ok with an unchecked block in the control. It reads the
-#   WHOLE file now: a declaration reader called anywhere in this harness contributes to what the
-#   control runs, and there is no line at which that stops being true.
-#
-#   COMMENTS. It matched un-stripped text, so one comment merely NAMING a reader reddened the
-#   shared gate. Stripped, like every other source-reading check here.
-#
-#   MENTIONS vs CALLS. A name is a call only where an argument follows it; `dc_mount_targets` in a
-#   string or a message is not one.
-#
-#   AND WHICH CALLS COUNT is decided by what they READ, not by a second hand list. lib.sh also
-#   holds host-fact readers -- dc_require_apparmor_profile takes the AppArmor profile, and what it
-#   contributes to HEALTHY is a host decision, not a declaration block. Exempting those BY NAME
-#   would be the two-lists-that-must-agree defect one level along. A DECLARATION reader is one
-#   called with container.json, so the argument discriminates and no list is needed.
-#
-# The accepted set is DERIVED from $READERS, so adding a reader to the table is what admits it
-# here -- one list, not two that must agree.
-asm_expected="$(printf 'dc_%s\n' "${READERS[@]}" | paste -sd'|' -)"
-asm_readers="$(dc_strip_comments "$here/mutate-verify.sh" \
-                 | grep -oE 'dc_[a-z_][a-z_]*[[:space:]]+"[^"]*"' \
-                 | grep -E '"[$]CFG"|container[.]json"' \
-                 | sed 's/[[:space:]]*"[^"]*"$//' | sort -u)"
-if [ -z "$asm_readers" ]; then
-    bad "no dc_* reader CALLS could be read out of mutate-verify.sh — the block-table check above cannot tell whether it covers them, so it certified nothing about coverage"
-else
-    stray_readers="$(printf '%s\n' "$asm_readers" | grep -vxE "$asm_expected" || true)"
-    if [ -n "$stray_readers" ]; then
-        bad "mutate-verify.sh calls declaration reader(s) the block table does not render: $(tr '\n' ' ' <<<"$stray_readers")— whatever they contribute to the control is unchecked"
-    else
-        ok "every declaration reader mutate-verify.sh calls has a block in the table (${#READERS[@]} readers)"
-    fi
-fi
 
 # The whole point of the profile: these must be unconditionally allowed. Checked against the
 # generator's own list so the two cannot drift.
@@ -645,45 +532,14 @@ else
     done
     # (That the profile is GENERATED rather than hand-maintained is asserted below, by the derived
     # check over every generator -- not here, where it would be a second rule about one of them.)
-    # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
     #
-    # ANCHORED ON THE INVOCATION, not on a mention of the name -- and this is the SECOND time that
-    # sentence has had to be made true. `apparmor=jkb-dev` first appeared in the probe's LABEL, so
-    # changing the actual flag to `apparmor=unconfined` left the guard green while arm [3] measured
-    # unconfined. The label was cleaned up; then the flag itself was hoisted into a shared
-    # `AA=(--security-opt apparmor=jkb-dev)` array, and a `grep -F` for the literal matched THE
-    # ASSIGNMENT -- so deleting the array use from an arm left the guard green again, and the arm
-    # that claimed to be the shipped configuration measured it without the profile. A guard whose
-    # subject is "the string exists somewhere in this file" cannot survive an edit that moves the
-    # string; the fix is to make its subject the thing it is about.
-    #
-    # So: join `\`-continued lines, take the `probe …` INVOCATIONS, and require every `apparmor=`
-    # value on one to be the declared name, with at least one present. Two arms spelling the flag
-    # out is now what the guard needs rather than what it cannot tell apart, and mutate-config.sh
-    # breaks the first and the last in turn to prove it reads both.
-    #
-    # PINNED AGAINST AN EMPTY EXTRACTION, because every other failure of the joining awk -- a
-    # reindent, a quoting change, a rename of `probe` -- looks exactly like "no arm names a foreign
-    # profile", which is the passing answer.
-    ci_yml="$here/../.github/workflows/ci.yml"
-    # `|| true`, NOT `|| printf 0`: grep -c prints its count and then exits 1 when that count is
-    # zero, so the fallback appended a SECOND zero and the failure message came out split across
-    # two lines with its explanation on the far side of the break.
-    n_probes="$(grep -c '^[[:space:]]*probe "' "$ci_yml" 2>/dev/null || true)"
-    probe_calls="$(ci_probe_calls "$ci_yml")"
-    n_calls="$(printf '%s\n' "$probe_calls" | grep -c . || true)"
-    if [ "$n_calls" -lt "$n_probes" ] || [ "$n_calls" -eq 0 ]; then
-        bad "check-config.sh extracted $n_calls probe invocation(s) from ci.yml but it has $n_probes — the continuation-joining is broken, so the AppArmor-profile guard below is reading nothing"
-        aa_ok=0
-    else
-        aa_vals="$(printf '%s\n' "$probe_calls" | grep -o 'apparmor=[^ "]*' || true)"
-        n_aa="$(printf '%s\n' "$aa_vals" | grep -c . || true)"
-        wrong="$(printf '%s\n' "$aa_vals" | grep -v "^apparmor=$aa_name\$" | grep . || true)"
-        if [ "$n_aa" -eq 0 ] || [ -n "$wrong" ]; then
-            bad "a ci.yml probe invocation does not name the profile the file declares ($aa_name; found: ${wrong:-none at all}) — that arm tests a profile nothing loads"
-            aa_ok=0
-        fi
-    fi
+    # THAT ci.yml NAMES THIS PROFILE IS NO LONGER A QUESTION. It used to spell the flag out in four
+    # hand-written bubblewrap arms, and the guard for it -- "every probe invocation names the
+    # declared profile" -- had to be made true twice, because the name first appeared only in an
+    # arm's LABEL and then moved into a shared array a `grep -F` matched at the ASSIGNMENT. Both
+    # times an arm claiming to be the shipped configuration was measuring something else while the
+    # gate stayed green. ci.yml runs `mutate-verify.sh --ladder` now, whose rungs are the control
+    # minus a named flag, so no file outside run.sh spells the profile at all (D54.3).
     [ "$aa_ok" -eq 1 ] && ok "the AppArmor profile is docker-default with only \`mount\` relaxed ($aa_name)"
 fi
 
@@ -1061,49 +917,55 @@ if [ -f "$here/../ui/vscode/package.json" ]; then
     fi
 fi
 
-# THE CONTROL-FLAGS MARKER IS SPELLED IN TWO FILES THAT CANNOT SHARE A VARIABLE. `--shell` prints
-# it; ci.yml's bubblewrap ladder reads it to say what the shipped row ran with. Drift and the row
-# silently reports `flags: (none)` — an evidence line that has quietly stopped being evidence, which
-# is worse than not printing one, because the reader cannot tell.
-# EACH FILE'S OWN SPELLING IS READ, never a literal both sides are matched against. The first
-# version grepped for `CONTROL-FLAGS=` in both, so the two extractions could not differ and the
-# "they disagree" branch was unreachable — and on the ci side it matched the COMMENT above the code,
-# so deleting the read left it green. Both are the defect this file exists to catch, written into
-# the guard for it; comments are stripped and each side is read out of the construct that uses it.
-# THE MV SIDE GOES THROUGH THE STRIPPER TOO, and is anchored to the `--shell` branch. It used to
-# read the raw file and take the first match anywhere -- while the comment above claimed both sides
-# were stripped, which was true of one. Comments here quote code constantly, so documenting the
-# mechanism with a comment naming the printf and then renaming the real one left this guard reading
-# the marker out of the comment and printing ok, which is the harm its own failure message names.
-mv_marker="$(dc_strip_comments "$here/mutate-verify.sh" \
-             | sed -n '/^if \[ -n "\$SHELL_CMD" \]/,/^fi$/p' \
-             | sed -n "s/.*printf '\\([A-Z][A-Z-]*\\)=%s.*/\\1/p" | head -1)"
-if [ -z "$mv_marker" ]; then
-    bad "mutate-verify.sh --shell no longer prints a control-flags marker — ci.yml's shipped row would report the flags it ran with as (none)"
-elif ! dc_strip_comments "$here/../.github/workflows/ci.yml" | grep -qF "s/^$mv_marker=//p"; then
-    bad "ci.yml's shipped row does not read the marker mutate-verify.sh prints ($mv_marker=) — its evidence line is parsing something the harness does not emit"
-else
-    ok "the shipped row reads the marker the control run prints ($mv_marker=)"
-fi
-
 # A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process
 # substitution's exit status, so a refusal inside one kills the subshell alone and the reading loop
 # keeps whatever was emitted before it. `dc_subst` refuses on an unset ${localEnv:…} precisely so a
-# boundary cannot move because a variable was not set; `dc_run_args`, `dc_container_env` and
-# `docker_args` carry that refusal outward. All of them emit as they go, so the caller is left
-# holding not nothing — which every caller checks for — but a TRUNCATED list: a container started
-# without the mounts or the security flags it declares, a fingerprint over half a declaration, a
-# control certified without the flag it was assembled to carry. That last one is the state deriving
-# the control's flags was meant to end, so the derivation would have reintroduced it one level down.
+# boundary cannot move because a variable was not set, and the readers built on it carry that
+# refusal outward. They all emit as they go, so the caller is left holding not nothing — which
+# every caller checks for — but a TRUNCATED list: a container started without some of the mounts or
+# security flags it declares, a fingerprint over half a declaration, a control certified without a
+# flag it was assembled to carry.
 #
-# The list is this checker's to maintain, and `dc_container_env` joined it late: run.sh read its
-# environment through an inline `< <(jq …)` — the forbidden shape, in the file the rule was written
-# for — and a three-name list could not see it.
-procsub="$(grep -n '< <([[:space:]]*\(docker_args\|dc_run_args\|dc_container_env\|dc_subst\)' "$here"/*.sh /dev/null || true)"
-if [ -z "$procsub" ]; then
-    ok "no refusing producer is read through a process substitution"
+# AN ALLOWLIST, NOT A LIST OF PRODUCERS, and the direction is the whole point. This was a
+# hand-maintained list of four names, and its own comment recorded that `dc_container_env` had
+# "joined it late" after run.sh read its environment through the forbidden shape and a three-name
+# list could not see it. A list of things to REFUSE fails open: the next producer nobody adds is
+# unguarded, silently, which is how `dc_mount_specs` sat in run.sh's own mount loop — the security
+# boundary — unseen by the guard written for exactly that. Naming what is SAFE fails closed
+# instead: a producer nobody classified turns this gate red, which is a minute's work and an
+# obvious message, rather than a hole.
+#
+# What is safe is a plain text filter reading a file or a string: it has no refusal to lose, and
+# a caller that cares about its status is not using a loop like this. Anything that reads the
+# DECLARATION -- every `dc_*`, `docker_args`, `assembled_args`, or a script invoked for one of its
+# --print modes -- is not on this list and must go through `$( )`.
+procsub_safe='jq|sed|awk|grep|cat|printf|echo|sort|tr|find|ls|comm|diff'
+# Comment-stripped per file, so the file name and line number survive for the message -- and so
+# that a comment QUOTING the forbidden shape (this block does, twice) is not itself a finding.
+procsub=""; procsub_scanned=0; procsub_seen=0
+for f in "$here"/*.sh; do
+    stripped="$(dc_strip_comments "$f")" || continue
+    [ -n "$stripped" ] || continue
+    procsub_scanned=$((procsub_scanned+1))
+    all="$(printf '%s\n' "$stripped" | grep -nE '< <\(' || true)"
+    [ -n "$all" ] && procsub_seen=$((procsub_seen + $(printf '%s\n' "$all" | grep -c .)))
+    hits="$(printf '%s\n' "$all" | grep -vE "< <\([[:space:]]*($procsub_safe)[[:space:]]" | grep . || true)"
+    [ -n "$hits" ] && procsub="$procsub $(basename "$f"):$(printf '%s' "$hits" | cut -d: -f1 | tr '\n' ',')"
+done
+procsub="$(printf '%s' "$procsub" | sed 's/^ *//')"
+# PINNED AGAINST HAVING READ NOTHING. "No producer is read unsafely" and "the scan found no files"
+# are the same value here — an empty `procsub` — and this guard's whole subject is that a check can
+# pass having observed nothing. So the count in the `ok` line comes from what was READ, and zero
+# files read is a failure rather than a clean report.
+if [ "$procsub_scanned" -eq 0 ]; then
+    bad "no .container script could be read to check its process substitutions — this check certified nothing"
+elif [ -z "$procsub" ]; then
+    ok "every process substitution reads a plain text filter, never a producer that can refuse ($procsub_seen in $procsub_scanned files)"
 else
-    bad "a refusing producer is read through < <( ), which discards its refusal and leaves a truncated list: $(tr '\n' ' ' <<<"$procsub")"
+    # THE MESSAGE MUST NOT SPELL THE SHAPE IT LOOKS FOR. Written out, this line matched the guard's
+    # own scan of this file -- a check reporting itself, which reads as a real finding and cannot be
+    # cleared by fixing anything.
+    bad "a producer that can refuse is read through a process substitution, which discards its refusal and leaves a truncated list: $(tr '\n' ' ' <<<"$procsub") — read it through a command substitution instead, or add it to procsub_safe if it genuinely cannot refuse"
 fi
 
 for s in "$here"/*.sh; do

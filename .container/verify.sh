@@ -221,82 +221,64 @@ fi
 #    directly even with seccomp relaxed, so bubblewrap fails and the nested sandbox with it.
 assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo yes || echo no)"
 
-# 2. The nested sandbox's mechanism. This is the exact shape Claude Code invokes.
+# 2. THE NESTED SANDBOX'S MECHANISM, measured by the one probe (D54.3).
 #
-# THE ERROR IS CAPTURED AND REPORTED, NOT DISCARDED. This used to send stderr to /dev/null and then
-# advise "check the seccomp profile is applied" — naming one cause among several, and naming the
-# wrong one wherever the profile demonstrably IS applied, which docker guarantees by failing
-# outright on a missing profile file. A remedy that does not fit the failure is worse than no
-# remedy (D48): it sends the reader to audit a file that is fine, and it made this failure need a
-# separate probe to say anything at all. What decides it is bwrap's own message, so print that, and
-# print the two host settings that produce this — read through /proc, which a container can
-# usually see even though it cannot set them.
+# `bwrap-probe.sh` runs Claude Code's own bubblewrap invocation in two steps -- namespaces and
+# filesystem, then the /proc mount -- and prints three lines. It is a separate script because
+# ci.yml needed the same measurement and had its own copy of it: the two were byte-equivalent
+# until this branch strengthened one, after which CI's "why bubblewrap can or cannot start" table
+# reported the mechanism working in exactly the state the gate beside it was failing on. See that
+# script's header for whose invocation it is and what is not enforced about it.
 #
-# THE INVOCATION IS CLAUDE CODE'S, FLAG FOR FLAG, and that is not a stylistic preference — it is
-# the difference between this probe passing and failing in the state it exists to detect.
-#
-# Read out of the binary (2.1.260), which builds, in this order:
-#     --new-session --die-with-parent [--unshare-net …] <fs binds, starting --bind / />
-#     --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc -- <shell> -c <cmd>
-#
-# MEASURED, in a container with docker's masks in place (10 submounts under /proc) and again with
-# `systempaths=unconfined`:
-#     --bind / / --proc /proc --unshare-net          → OK            ← what this probe used to be
-#     + --unshare-pid                                → Can't mount proc on /newroot/proc
-#     + --unshare-user --cap-drop ALL                → OK
-#     the full shape above                           → Can't mount proc on /newroot/proc
-# and all four pass once the unmask is applied. `--unshare-pid` is the trigger: a fresh procfs for
-# a NEW pid namespace is what the kernel refuses while the existing /proc is not fully visible, and
-# docker's MaskedPaths are submounts, so it is not.
-#
-# TWICE NOW THIS PROBE HAS BEEN WEAKER THAN THE MECHANISM, and both times it printed `ok` in
-# exactly the broken state. First it omitted `--proc /proc` entirely; then, with `--proc` added, it
-# still omitted `--unshare-pid` — and passed on a host where Claude Code's own sandbox was failing
-# with the error above. That second gap is what produced two rounds of wrong diagnosis: the
-# harness's MISSED was a TRUE report that its guard could not fire, and it was read as a fact about
-# the host ("the unmask must be inert here") because the weak probe agreed. The flag is
-# load-bearing on macOS and on Linux alike.
-#
-# So a change to this line is a change to what the container certifies. Keep it equal to what the
-# binary builds; if that ever diverges, this probe is certifying a mechanism nobody runs.
-if bwrap_err="$(bwrap --new-session --die-with-parent --unshare-net --bind / / \
-                      --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc \
-                      -- /bin/sh -c true 2>&1)"; then
+# THE ERROR IS REPORTED, NOT DISCARDED. This used to send stderr to /dev/null and advise "check the
+# seccomp profile is applied" -- one cause among several, and the wrong one wherever the profile
+# demonstrably IS applied, which docker guarantees by failing outright on a missing profile file. A
+# remedy that does not fit the failure is worse than no remedy (D48).
+probe_out="$("$(dirname "$0")/bwrap-probe.sh" 2>&1)"
+bwrap_ns="$(printf '%s\n' "$probe_out"   | sed -n 's/^BWRAP-NS=//p')"
+bwrap_proc="$(printf '%s\n' "$probe_out" | sed -n 's/^BWRAP-PROC=//p')"
+bwrap_err="$(printf '%s\n' "$probe_out"  | sed -n 's/^BWRAP-WHY=//p')"
+
+if [ "$bwrap_ns" = OK ] && [ "$bwrap_proc" = OK ]; then
     ok "bubblewrap creates its namespaces and mounts /proc (the nested sandbox's mechanism works)"
+elif [ -z "$bwrap_ns" ]; then
+    # THE PROBE ITSELF DID NOT ANSWER, which is not a measurement of the kernel. Reported as a bad
+    # rather than folded into the refusal below, or "the probe is missing" reads as "the sandbox
+    # cannot start" and sends a reader to audit the host.
+    bad "the bubblewrap probe produced no verdict -- nothing establishes whether the nested sandbox can start"
+    [ -n "$probe_out" ] && printf '       it said: %s\n' "$(printf '%s' "$probe_out" | head -2 | tr '\n' ' ')"
 else
-    # ACCEPTED ONLY WHEN AN OPERATOR SAID SO, by name, for this host class. It is still reported at
-    # full volume every run and still names the reason -- what changes is the exit code, so a caller
-    # can tell a container whose nested sandbox is broken by surprise from one running on a host
-    # where it is known not to start. Never inferred from the AppArmor setting: the whole point of
-    # the open investigation is that we have not established the cause, and a check that quietly
-    # excused itself whenever it found the condition it suspects would be assuming the answer.
+    # ACCEPTED ONLY WHEN AN OPERATOR SAID SO, by name, for this host class. Still reported at full
+    # volume and still naming the reason -- what changes is the exit code, so a caller can tell a
+    # container whose nested sandbox is broken by surprise from one running on a host where it is
+    # known not to start. Never inferred from the AppArmor setting: a check that quietly excused
+    # itself whenever it found the condition it suspects would be assuming the answer.
     bw_bad=bad; [ "${JKB_ACCEPT_NO_BWRAP:-0}" = 1 ] && bw_bad=accept_bad
     $bw_bad "bubblewrap cannot create namespaces or mount /proc — the nested sandbox cannot start"
-    [ -n "$bwrap_err" ] && printf '       bwrap said: %s\n' \
-        "$(printf '%s' "$bwrap_err" | head -2 | tr '\n' ' ')"
-    # THE THIRD CAUSE, and the only one visible from inside. The two sysctls below explain a refusal
-    # to create the user namespace; a submount over /proc explains a refusal to mount proc INSIDE
-    # one, which is what `systempaths=unconfined` removes. Counted rather than asserted: a container
-    # legitimately has some, and what matters is that a reader sees the number beside bwrap's own
-    # message rather than being sent to audit the two sysctls when neither is the cause.
+    printf '       namespaces: %s, /proc mount: %s\n' "$bwrap_ns" "$bwrap_proc"
+    [ -n "$bwrap_err" ] && printf '       bwrap said: %s\n' "$bwrap_err"
+    # THE CAUSE THAT IS VISIBLE FROM INSIDE. The two sysctls below explain a refusal to create the
+    # user namespace; a submount over /proc explains a refusal to mount proc INSIDE one, which is
+    # what `systempaths=unconfined` removes. Counted rather than asserted: a container legitimately
+    # has some, and what matters is that a reader sees the number beside bwrap's own message
+    # rather than being sent to audit two sysctls when neither is the cause.
     [ -n "$proc_submounts" ] \
         && printf '       submounts under /proc = %s (any at all defeat the proc mount; see systempaths=unconfined)\n' "$proc_submounts"
     # Reported as facts, with no cause asserted. `apparmor_restrict_unprivileged_userns=1` is the
     # Ubuntu 24.04+ default and restricts exactly this; `max_user_namespaces=0` disables it
-    # outright. Either explains the failure, and neither is fixable from inside the container —
-    # they are the host's, so an operator needs to see them rather than be sent to the profile.
+    # outright. Neither is fixable from inside the container — they are the host's.
     for f in kernel/apparmor_restrict_unprivileged_userns user/max_user_namespaces; do
         v="$(cat "/proc/sys/$f" 2>/dev/null)" \
             && printf '       host %s = %s\n' "$(basename "$f")" "$v"
     done
-    # The profile confining THIS process, which is the one AppArmor fact observable from in here.
+    # The profile confining THIS process, the one AppArmor fact observable from in here.
     # `docker-default (enforce)` means a profile is mediating our syscalls; `unconfined` rules
     # AppArmor out and leaves seccomp or the kernel as the remaining candidates.
     v="$(cat /proc/self/attr/current 2>/dev/null)" \
         && printf '       apparmor profile in force: %s\n' "$v"
     printf '       the seccomp profile is applied by the run flags, so it is not usually the cause;\n'
-    printf '       see .github/workflows/ci.yml "Why bubblewrap can or cannot start" for the\n'
-    printf '       three-way probe that separates seccomp from AppArmor.\n'
+    printf '       for the flag-by-flag discrimination run, from the host:\n'
+    printf '           ./.container/mutate-verify.sh --ladder\n'
 fi
 
 # 2b. WHICH AppArmor PROFILE IS IN FORCE, and that relaxing one rule did not relax the rest.
@@ -319,20 +301,15 @@ fi
 # 2c. THE DECLARED /proc UNMASK IS IN FORCE — asserted as the flag's DIRECT EFFECT, which is the
 # whole point of this assertion existing (D53.1).
 #
-# `systempaths=unconfined` does exactly one thing: it removes docker's submounts over /proc. That is
-# observable from in here on every host. Whether the kernel then refuses a nested proc mount is a
-# CONSEQUENCE, mediated by mount_too_revealing(), and hosts disagree about it: measured, macOS /
-# Docker Desktop mounts proc happily with all 10 masks present, where Ubuntu 26.04 refuses.
+# `systempaths=unconfined` does exactly one thing: it removes docker's submounts over /proc, and
+# that is observable from in here on EVERY host. Whether the kernel then refuses a nested proc
+# mount is a CONSEQUENCE, mediated by mount_too_revealing(), and assertion 2 above is what measures
+# it. Splitting them is the point: the mutation that removes this flag used to be judged on the
+# consequence, and a probe too weak to see the consequence then reported the flag as inert.
 #
-# The mutation that removes this flag used to be judged on that consequence, so on a Mac it reported
-# MISSED — a guard blamed for a fact about the machine — and the fix for THAT reported SKIPPED on
-# evidence the verdict already entailed, which silently downgraded a genuinely weak probe. Asserting
-# the direct effect ends both: `without 'systempaths=unconfined'` is caught on any docker that masks
-# at all, with no host knowledge, no operator flag and no skip.
-#
-# DERIVED FROM THE DECLARATION, never assumed. If container.json stops carrying the flag — the
-# README's open question is whether it should be passed only where it is load-bearing — this becomes
-# a note and asserts nothing, rather than failing every run until somebody remembers it is here.
+# DERIVED FROM THE DECLARATION, never assumed, so it follows container.json rather than having to
+# be remembered: a declaration that stops carrying the flag makes this a note asserting nothing
+# instead of a failure on every run.
 # READ THROUGH `$( )` FIRST. Piping the reader into grep discards its refusal, so an unreadable or
 # unparseable container.json -- or a jq that is not installed -- would take the `else` branch and
 # print a note, asserting nothing: "the declaration could not be read" spelled the same as "the
@@ -349,6 +326,65 @@ elif grep -qxF 'systempaths=unconfined' <<<"$declared_run_args"; then
     fi
 else
     note "container.json declares no /proc unmask; $proc_submounts submounts under /proc (asserting nothing)"
+fi
+
+# 2d. THE DECLARATION'S OTHER TWO READERS, asserted the same way (D54.2).
+#
+# container.json is read by three declaration readers -- runArgs (2c above), remoteUser and
+# containerEnv -- and until now only the first had any evidence that its effect reached the running
+# container. That asymmetry was load-bearing: the static gate compared the harness's control
+# against the declaration for all three, so the effects of the other two were "checked" only by a
+# guard over a copy, and dropping `--user` or the environment from the assembly left every check
+# green. The guard over the copy is gone (D54.1) and the copy with it; these are what replace it,
+# and they are evidence of a different kind -- what the container IS, not what a flag list SAYS.
+#
+# Each derives from the declaration, so a declaration that stops saying something makes the
+# assertion a note rather than a failure nobody can clear.
+cfg_path="$(dirname "$0")/container.json"
+cfg_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Read through `$( )` so the reader's refusal reaches this branch: piping into a comparison would
+# spell "the declaration could not be read" exactly like "the declaration says nothing".
+if ! declared_user="$(dc_remote_user "$cfg_path" 2>/dev/null)"; then
+    bad "container.json's remoteUser could not be read from inside the container — nothing establishes which user this container runs as"
+elif [ -z "$declared_user" ]; then
+    note "container.json declares no remoteUser (asserting nothing about the running user)"
+elif [ "$(id -un)" = "$declared_user" ]; then
+    ok "running as the declared user ($declared_user)"
+else
+    # Not the same assertion as #1 above, which asks only for non-root. A container running as some
+    # OTHER non-root user passes that and is still not the container that was declared: the state
+    # volumes, the cargo caches and ~/.jkb are all owned by the declared user, so it would fail on
+    # first write with an error naming a path rather than a user.
+    bad "this container runs as '$(id -un)', but container.json declares remoteUser '$declared_user' — the volumes and caches are owned by the declared user"
+fi
+
+if ! declared_env="$(dc_container_env "$cfg_path" "$cfg_root" 2>/dev/null)"; then
+    bad "container.json's containerEnv could not be read from inside the container — nothing establishes that its environment reached this container"
+elif [ -z "$declared_env" ]; then
+    note "container.json declares no containerEnv (asserting nothing about the environment)"
+else
+    env_missing=""; env_wrong=""; env_n=0
+    while IFS= read -r decl; do
+        [ -n "$decl" ] || continue
+        env_n=$((env_n+1))
+        k="${decl%%=*}"; want="${decl#*=}"
+        # `printenv` rather than `[ -z "${!k}" ]`: an empty declared value is a legitimate
+        # declaration, and indirect expansion cannot tell it from an unset name.
+        if ! got="$(printenv "$k")"; then env_missing="$env_missing $k"
+        elif [ "$got" != "$want" ]; then env_wrong="$env_wrong $k(=$got, declared $want)"
+        fi
+    done <<<"$declared_env"
+    if [ -n "$env_missing" ]; then
+        bad "container.json declares these environment entries and this container does not carry them:$env_missing — it was not started from the declaration"
+    elif [ -n "$env_wrong" ]; then
+        # JKB_EGRESS_ACCEPT_UNFILTERED is the entry that will not stay at its default (D50.6), and
+        # an override set at `docker run` beats containerEnv silently. Reported as a difference
+        # rather than as an absence, because those have different causes and different repairs.
+        bad "container.json's environment reached this container with different values:$env_wrong — something overrode the declaration at run time"
+    else
+        ok "every declared environment entry reached this container ($env_n checked)"
+    fi
 fi
 
 # WHETHER APPARMOR MEDIATES IS ASKED FIRST, of the host, via the one shared predicate. Only then is
