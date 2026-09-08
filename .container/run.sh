@@ -8,6 +8,10 @@
 #   ./.container/run.sh --rm            stop AND remove it, so the next run redoes setup
 #   ./.container/run.sh --dry-run       print the docker command instead of running it
 #   ./.container/run.sh --consumed-keys list the container.json keys this tooling reads
+#   ./.container/run.sh --print-args [--posture] [<repo-root>]
+#                                    the assembled docker arguments, one per line. `--posture`
+#                                    prints only the security half (no name, no mounts, no
+#                                    workdir); mutate-verify.sh's control is derived from it.
 #   ./.container/run.sh --self-test     exercise the derivation; no Docker needed
 #
 # WHY THIS EXISTS RATHER THAN DEV CONTAINERS. Its `workspaceFolder` can only be built from
@@ -165,8 +169,16 @@ config_hash() { # config_hash <config> <repo-root>
 # pattern stopped matching, and the failure would be the harness's containers bind-mounting the
 # REAL ~/.jkb -- mutations writing to the live store. A mode cannot fail that way: the mount lines
 # are not emitted at all.
-docker_args() { # docker_args <config> <repo-root> [posture]  -> one argument per line
+docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argument per line
     local cfg="$1" root="$2" half="${3:-all}" line sub
+    # REFUSED, not defaulted. `[ "$half" = posture ] || <emit>` read every unrecognised value as
+    # `all`, so a caller that misspelled the mode got the instance half -- the real ~/.jkb bind
+    # among it -- with nothing to notice. The two halves are the security-relevant distinction
+    # here, so an unknown one is an error.
+    case "$half" in
+        all|posture) ;;
+        *) printf 'docker_args: unknown half %s (expected all or posture)\n' "$half" >&2; return 1 ;;
+    esac
 
     [ "$half" = posture ] || printf '%s\n' "--name" "$NAME" "--detach" "--workdir" "$CTR_REPOS"
 
@@ -455,14 +467,37 @@ while [ $# -gt 0 ]; do
         # /home/runner/work, and mutate-verify.sh's control has to be derivable there.
         # The root is an argument for the same reason: it is the harness's, not this script's.
         --print-args)    shift
-                         pa_half=all
-                         if [ "${1:-}" = --posture ]; then pa_half=posture; shift; fi
+                         # PARSED AS A SET, NOT AS A FIXED ORDER, and an unconsumed argument is
+                         # refused. This tested `--posture` in the next position ONLY, so the
+                         # natural `--print-args <root> --posture` left the mode at `all`, exited
+                         # 0, and printed the INSTANCE half -- `--name jkb-dev`, `--detach` and the
+                         # real ~/.jkb bind. A caller deriving a control that way builds mutation
+                         # containers bind-mounting the live knowledge base, which is the exact
+                         # failure docker_args' own comment says a mode makes impossible. A silent
+                         # wrong answer from an argument order nobody would call wrong.
+                         pa_half=all; pa_root=""
+                         while [ $# -gt 0 ]; do
+                             case "$1" in
+                                 --posture) pa_half=posture; shift ;;
+                                 -*)        die "--print-args: unknown option '$1' (it takes --posture and an optional repo root)" ;;
+                                 *)         [ -z "$pa_root" ] \
+                                                || die "--print-args: two repo roots given ('$pa_root' and '$1')"
+                                            pa_root="$1"; shift ;;
+                             esac
+                         done
+                         pa_root="${pa_root:-$repo}"
+                         # A ROOT THAT IS NOT A DIRECTORY IS REFUSED. It is substituted into every
+                         # ${localWorkspaceFolder}, so a typo'd or flag-shaped value silently
+                         # produced `seccomp=--oops/.container/seccomp-bwrap.json` -- a path docker
+                         # would reject at run time, from a command that exited 0.
+                         [ -d "$pa_root" ] \
+                             || die "--print-args: '$pa_root' is not a directory, and it is substituted into every \${localWorkspaceFolder}"
                          command -v jq >/dev/null 2>&1 || die "jq is required to read $CONFIG"
                          [ -f "$CONFIG" ] || die "no $CONFIG"
                          # `$( )`, not a bare call: a `die` inside assembled_args exits only the
                          # subshell, and a partial argument list printed as if it were whole is
                          # the control-missing-a-declared-flag state D54.1 exists to end.
-                         args_out="$(assembled_args "${1:-$repo}" "$pa_half")" \
+                         args_out="$(assembled_args "$pa_root" "$pa_half")" \
                              || die "container.json could not be read; refusing to print a partial declaration"
                          [ -n "$args_out" ] || die "the assembly produced no arguments"
                          printf '%s\n' "$args_out"; exit 0 ;;

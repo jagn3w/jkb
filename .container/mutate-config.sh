@@ -785,6 +785,35 @@ open(p, 'w').write(s.replace(old, "dc_strip_comments() { return 1; }", 1))
 PYX
 run "the process-substitution scan reads no files at all" "certified nothing"
 
+# THE POSTURE HALF LEAKING AN INSTANCE FLAG, which is the one property keeping the harness's
+# containers off the real ~/repos and ~/.jkb. A third emission site outside docker_args' two
+# `[ "$half" != posture ]` gates is how it goes -- and it is why the guard RUNS the program instead
+# of grepping those gates, which any such site would satisfy.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '    local user\n    user="$(dc_remote_user "$cfg")"'
+assert old in s, "mutation target absent"
+leak = '    printf \'%s\\n\' "--mount" "source=$HOME/.jkb,target=/home/vscode/.jkb,type=bind"\n'
+open(p, 'w').write(s.replace(old, leak + old, 1))
+PYX
+run "the posture half leaks a mount the harness would inherit" "instance flag(s) the harness must not inherit"
+
+# ...AND THE VACUOUS DIRECTION. A docker_args emitting no instance flags at all passes "posture
+# carries none" while breaking the launcher, so the guard also asserts the full half CARRIES them.
+# That contrasting case is what makes it discriminate rather than merely not-fail.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index('    [ "$half" = posture ] || printf ')
+j = s.index('\n', i) + 1
+s = s[:i] + '    :\n' + s[j:]
+i = s.index('    if [ "$half" != posture ]; then')
+j = s.index('    fi\n', i) + len('    fi\n')
+open(p, 'w').write(s[:i] + s[j:])
+PYX
+run "run.sh stops emitting any instance flag" "emits no instance flag at all"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -797,7 +826,7 @@ run "the process-substitution scan reads no files at all" "certified nothing"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=68
+PINNED_BAD_SITES=71
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

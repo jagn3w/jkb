@@ -474,17 +474,18 @@ section previously said the flag was inert on macOS — that ten paths were unma
 bought. That came from a probe omitting `--unshare-pid`, which is the one flag that triggers the
 refusal. Re-measured with Claude Code's actual invocation, in a container with the masks in place.
 
-**The rows are NOT cumulative.** Each is the base invocation plus the flags its own row names, and
-reading them as a ladder says the wrong flag is the trigger — row 3 would appear to cancel row 2's
-refusal and row 4 to restore it. Base = `--new-session --die-with-parent --unshare-net --bind / /
---dev /dev --proc /proc`:
+**The rows are NOT cumulative, and rows 1-3 share a base that is NOT Claude Code's full shape.**
+Reading them as a ladder says the wrong flag is the trigger — row 3 would appear to cancel row 2's
+refusal and row 4 to restore it. Rows 1-3 are `--bind / / --proc /proc --unshare-net` plus the flags
+each row names; row 4 is the full invocation `bwrap-probe.sh` runs, which additionally carries
+`--new-session --die-with-parent --dev /dev`.
 
 | invocation | masks present | unmask applied |
 |---|---|---|
-| base (this is what the old probe ran) | OK | OK |
-| base `+ --unshare-pid` | **`Can't mount proc on /newroot/proc`** | OK |
-| base `+ --unshare-user --cap-drop ALL` | OK | OK |
-| base `+ --unshare-pid --unshare-user --cap-drop ALL` (Claude Code's full shape) | **`Can't mount proc on /newroot/proc`** | OK |
+| `--bind / / --proc /proc --unshare-net` — this is exactly what the old probe ran | OK | OK |
+| that `+ --unshare-pid` | **`Can't mount proc on /newroot/proc`** | OK |
+| that `+ --unshare-user --cap-drop ALL` | OK | OK |
+| Claude Code's full shape (see `bwrap-probe.sh`) | **`Can't mount proc on /newroot/proc`** | OK |
 
 So the flag is **load-bearing on macOS exactly as on Linux**, and the error in that table is the
 one that motivated it. `--unshare-pid` is the trigger: the kernel refuses a fresh procfs for a NEW

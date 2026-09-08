@@ -121,6 +121,37 @@ if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — th
 # Docker and therefore cannot run in this gate.
 root="$(cd "$here/.." && pwd)"
 
+# THE POSTURE HALF OMITS THE INSTANCE HALF (D54.1). This is the one property keeping the harness's
+# containers off the real ~/repos and ~/.jkb -- mutate-verify.sh appends `--print-args --posture`
+# straight into the control, so an instance flag leaking into it means every mutation runs
+# bind-mounting the LIVE knowledge base and colliding on the live container's name. It was argued
+# in a comment ("A mode cannot fail that way") and checked nowhere.
+#
+# ASKED BY RUNNING BOTH HALVES, not by reading docker_args' source. The property is about what the
+# program emits; its `[ "$half" != posture ]` gates are one way to implement that and a third
+# emission site outside a gate would satisfy any grep over them.
+#
+# BOTH DIRECTIONS, because the negative alone is vacuous: a docker_args that emitted no mounts at
+# all would pass "posture carries none" while silently breaking the launcher. So the `all` half
+# must carry each instance flag and the `posture` half must carry none of it -- the contrasting
+# case that makes the check discriminate rather than merely not-fail.
+INSTANCE_FLAGS='^--name$|^--detach$|^--workdir$|^--mount$'
+pa_all="$("$here/run.sh" --print-args "$root" 2>/dev/null)" || pa_all=""
+pa_posture="$("$here/run.sh" --print-args --posture "$root" 2>/dev/null)" || pa_posture=""
+if [ -z "$pa_all" ] || [ -z "$pa_posture" ]; then
+    bad "run.sh --print-args produced nothing for one or both halves — nothing establishes that the control the harness derives omits this host's mounts"
+else
+    n_all="$(grep -cE "$INSTANCE_FLAGS" <<<"$pa_all" || true)"
+    leaked="$(grep -E "$INSTANCE_FLAGS" <<<"$pa_posture" | sort -u | tr '\n' ' ' || true)"
+    if [ "$n_all" -eq 0 ]; then
+        bad "run.sh --print-args emits no instance flag at all — the launcher would start a container with no name, no workdir and no mounts, and the posture check below would pass having compared nothing"
+    elif [ -n "$leaked" ]; then
+        bad "run.sh --print-args --posture carries instance flag(s) the harness must not inherit: $leaked — mutate-verify.sh appends this to its control, so every mutation would bind-mount the real ~/.jkb"
+    else
+        ok "the posture half carries none of the $n_all instance arguments the full half does"
+    fi
+fi
+
 # The whole point of the profile: these must be unconditionally allowed. Checked against the
 # generator's own list so the two cannot drift.
 prof="$here/seccomp-bwrap.json"

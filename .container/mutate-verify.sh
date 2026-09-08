@@ -207,7 +207,8 @@ HEALTHY=("${POSTURE[@]}" ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 # AppArmor mutations below are skipped as a group when there is none, and skipping them on a
 # DIFFERENT answer from the one the container was started with is a guard reporting about another
 # machine.
-control_has_apparmor() { printf '%s\n' "${HEALTHY[@]}" | grep -q '^apparmor='; }
+control_has() { printf '%s\n' "${HEALTHY[@]}" | grep -qF -- "$1"; }
+control_has_apparmor() { control_has 'apparmor='; }
 
 # A MUTATION CHANGES EXACTLY ONE THING, and hand-spelling the reduced flag set is how that stopped
 # being true — three times, the same way. The sets dropped $AA_ARGS when the AppArmor profile
@@ -313,21 +314,28 @@ if [ "$LADDER" -eq 1 ]; then
         printf '  %-46s   flags: %s\n' "" "$*"
     }
     ladder_row "[shipped]  the container as it ships" "${HEALTHY[@]}"
-    without 'systempaths=unconfined'
-    ladder_row "[-unmask]  ...minus the /proc unmask" "${MUT[@]}"
-    if control_has_apparmor; then
-        without 'systempaths=unconfined' 'apparmor='
-        ladder_row "[-unmask -aa]  ...minus the AppArmor profile too" "${MUT[@]}"
-        without 'systempaths=unconfined' 'apparmor=' 'seccomp='
-        ladder_row "[-unmask -aa -seccomp]  ...stock docker security" "${MUT[@]}"
-    else
-        # SKIPPED WITH A REASON, not silently: on a host with no AppArmor the profile is not in the
-        # control at all, so a rung "without" it would be identical to the one above and would read
-        # as the profile making no difference.
-        printf '  %-46s (skipped: no AppArmor on this host, so it is in no rung)\n' "[-unmask -aa], [-unmask -aa -seccomp]"
-        without 'systempaths=unconfined' 'seccomp='
-        ladder_row "[-unmask -seccomp]  ...minus the seccomp profile too" "${MUT[@]}"
-    fi
+
+    # THE RUNGS ARE BUILT FROM WHAT THE CONTROL ACTUALLY CARRIES, so `without` is never asked to
+    # match nothing. Its no-op refusal is an `exit 1` -- correct for a mutation run, FATAL for a
+    # diagnostic: a declaration that stops carrying the unmask (a state verify.sh 2c supports, with
+    # a `note` branch saying so) would have killed this table after its first row, with a message
+    # naming a mutation this command does not perform, in the CI step you read when the control
+    # fails. Only the AppArmor rung was guarded this way; the other two flags were not, and the
+    # guard is now the loop rather than one arm's special case.
+    #
+    # SKIPPED WITH A REASON, never silently: a rung subtracting a flag the control does not carry
+    # would be identical to the row above it and would read as that flag making no difference.
+    acc=(); label=""
+    for spec in 'systempaths=unconfined|/proc unmask|unmask' 'apparmor=|AppArmor profile|aa' 'seccomp=|seccomp profile|seccomp'; do
+        pat="${spec%%|*}"; rest="${spec#*|}"; name="${rest%%|*}"; short="${rest#*|}"
+        if ! control_has "$pat"; then
+            printf '  %-46s (skipped: the control carries no %s, so it is in no rung)\n' "[-$short]" "$pat"
+            continue
+        fi
+        acc+=("$pat"); label="$label -$short"
+        without "${acc[@]}"
+        ladder_row "[${label# }]  ...minus the $name" "${MUT[@]}"
+    done
     echo
     echo "  Read DOWN: the first row is what ships. A column that flips on a row names the flag"
     echo "  that row removed. 'not-reached' means the namespace step failed first, so that row"
