@@ -547,11 +547,12 @@ _is_exclude_pattern_line() {
 # for them cost a stranded block. `yes` — we own this pattern and it must be excluded. `no` —
 # nothing of ours may hide it. `undecided` — the chainer install failed, so nothing is known
 # about THIS pattern and its block is left as found, while every other block is still swept.
-# `unknown` — the derivation itself could not answer, so nothing at all is touched. Under
-# `undecided`, nothing is known about
-# THIS pattern; its block is left exactly as found. The sweep of every OTHER jkb block runs
-# on all three, because that sweep does not depend on the undecided fact: it is the condition,
-# and a condition must dominate every arm rather than have one that opts out.
+# `unknown` — the derivation itself could not answer, so nothing at all is touched. Anything
+# else is refused rather than falling through to a branch that sweeps.
+#
+# So the sweep of every OTHER jkb block runs on three of the four — `yes`, `no` and
+# `undecided` — and not on `unknown`. It does not depend on the undecided fact: it is the
+# condition, and a condition must dominate every arm rather than have one that opts out.
 #
 # WHAT JKB SWEEPS is only blocks bearing a marker in `exclude_known_markers` — its own, by
 # byte identity. `session::ensure_excluded` (crates/jkb-cli/src/session.rs) writes a DIFFERENT
@@ -573,6 +574,18 @@ reconcile_exclude() {
     fi
     case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
     exclude="$common/info/exclude"
+
+    # An unrecognised `want` refuses. The fall-through was the `no` branch, which SWEEPS: a
+    # caller typo, or a fifth word added at one site and forgotten here, silently retracted
+    # every block jkb owns and then printed a line the renderer reads as "nothing was changed".
+    # This very change added a fourth word at the caller and a matching arm here; had that arm
+    # been missed, that is what it would have done, unattended, from the post-merge hook. Every
+    # renderer in this file has a warning default arm; the one consumer that can destroy the
+    # user's file had none.
+    case "$want" in
+        yes|no|undecided|unknown) ;;
+        *) printf 'exclude=failed (unrecognised want %s; nothing was changed)\n' "$want"; return 0 ;;
+    esac
 
     # `unknown` — the DERIVATION could not establish anything — touches nothing at all:
     # sweeping with `keep=""` would retract every block jkb owns on the strength of an answer
@@ -805,7 +818,13 @@ install_git_hooks() {
         # Derived from the world, not from the outcome word: `foreign` and `failed` each cover
         # a file that will dispatch and one that will not. `-f` as well as `-x`, because a
         # directory is executable to `test` and unrunnable to git.
-        if [ "$want" = yes ]; then
+        # `ours`, not `want`: the same three outcomes, but `want` is collapsed to `no` by the
+        # pattern-empty rule in the funnel, so reading it here is correct only because this
+        # block happens to run first. Two live names for one fact, one carrying an unstated
+        # ordering requirement — move this below the funnel and a healthy jkb chainer on an
+        # `exposed` path reports `dispatch=unknown`, whose renderer warns that jkb's own
+        # working chainer may never run.
+        if [ "$ours" = yes ]; then
             verdict="chained $chainer"
         elif [ -f "$chainer" ] && [ -x "$chainer" ]; then
             verdict="unknown $chainer"
@@ -840,11 +859,20 @@ install_git_hooks() {
     # This runs BEFORE that rule, and asks the question it actually means.
     case "$pat_line" in
         "exposed "*)
-            # Suppressed only on a PROVEN `foreign` — the user's own file, none of jkb's
-            # business. On `yes` and on `unknown` the warning stands: the file is untracked in
-            # a real tree either way, and that is what makes the tree read dirty.
-            [ "$ours" != no ] \
-                || pattern_reason="none (the file at that path is not one jkb wrote)"
+            # TWO questions, and both must be yes. Ownership: suppressed on a PROVEN
+            # `foreign`, which is the user's own file and none of jkb's business. And
+            # EXISTENCE, asked of the world the way the dispatch verdict asks it — because
+            # this is a claim about a file. A failed install can leave nothing at that path at
+            # all, and then the report said "the chainer there is not hidden … that working
+            # tree will read dirty" beside `dispatch=dead` ("nothing runnable is at …") about
+            # an empty directory in a clean tree: two contradictory statements in one report.
+            # The comment that used to sit here asserted the premise — "the file is untracked
+            # in a real tree either way" — that is false in exactly that case.
+            if [ "$ours" = no ]; then
+                pattern_reason="none (the file at that path is not one jkb wrote)"
+            elif [ ! -e "$chainer" ]; then
+                pattern_reason="none (nothing was installed at that path, so nothing of ours is visible there)"
+            fi
             ;;
     esac
     # Nothing to own means nothing to want, whatever the chainer did — unless the derivation

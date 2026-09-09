@@ -706,6 +706,18 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   and *the derivation could not answer* (touch nothing). Sharing the word made a failed chainer
   install with a decidably-empty pattern skip the sweep and strand a stale block permanently.
   They are `undecided` and `unknown` now, and `ours` is `yes|no|unknown`.
+- **A claim about a file is asked of the file.** `dispatch=` had that rule written down —
+  derived from the world, not from the outcome word — and its sibling claim did not use it. An
+  install that fails before creating anything leaves the path EMPTY, and `exposed` then said
+  "the chainer there is not hidden … that working tree will read dirty" beside `dispatch=dead`
+  ("nothing runnable is at …"), about an empty directory in a clean tree: two contradictory
+  statements in one report. `exposed` now needs both ownership and existence.
+- **The one consumer that can destroy the user's file refuses an input it does not recognise.**
+  `reconcile_exclude`'s `want` had no default arm and fell through to the branch that SWEEPS,
+  so a typo — or a fifth word added at the caller and forgotten at the callee, which is
+  precisely the edit that introduced `unknown` — would retract every block jkb owns and then
+  print a line the renderer reads as "nothing was changed". Every *renderer* in that file
+  already had a warning default; the destructive consumer had none.
 - **A claim about jkb's own file is gated on ownership, not on a variable that means something
   else.** The `exposed` downgrade read `want`, which the pattern-empty rule collapses to `no`
   two lines later — and an exposed line is by definition pattern-empty, so the downgrade was

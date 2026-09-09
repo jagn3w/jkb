@@ -476,17 +476,31 @@ case6m() {
     # set — kept saying `none`, which the caller collapses to want=no and which therefore
     # retracts jkb's own block. The message on that line already said "could not be listed"
     # while the answer claimed proven absence.
-    local arm bad=""
-    for arm in "$work/not-a-repo"; do
-        mkdir -p "$arm"
-        case "$(git_hooks_exclude_pattern "$arm" 2>/dev/null)" in
+    # BOTH arms, because a list of one is not a register of arms — the next person adding a
+    # fifth `none`/`undecided` arm reads this as the place they are enumerated, adds nothing,
+    # and the suite stays green.
+    local arm got bad=""
+    mkdir -p "$work/not-a-repo"                       # worktree list cannot answer
+    local unresolvable="$work/unresolvable"           # config --get cannot answer
+    git_q init -q "$unresolvable" >/dev/null 2>&1
+    git_q -C "$unresolvable" commit -q --allow-empty -m init
+    git_q -C "$unresolvable" config core.hooksPath "~jkb-no-such-account-$$/hooks"
+    for arm in "$work/not-a-repo" "$unresolvable"; do
+        # A git that resolves `~nosuchuser` without failing cannot exercise the second arm.
+        if [ "$arm" = "$unresolvable" ] \
+            && git -C "$arm" config --get --path core.hooksPath >/dev/null 2>&1; then
+            skip "this git expands ~jkb-no-such-account-$$ without failing"
+            continue
+        fi
+        got="$(git_hooks_exclude_pattern "$arm" 2>/dev/null)"
+        case "$got" in
             "undecided "*) ;;
-            *) bad="$bad [$arm -> '$(git_hooks_exclude_pattern "$arm" 2>/dev/null)']" ;;
+            *) bad="$bad [$arm -> '$got']" ;;
         esac
     done
     [ -z "$bad" ] \
-        && ok "an unlistable worktree set is undecided, not proven absence" \
-        || fail "undecided: worktrees" "wrong:$bad"
+        && ok "every arm that means git would not answer says undecided, not proven absence" \
+        || fail "undecided: arms" "wrong:$bad"
 
     # `unknown` — the DERIVATION could not answer — leaves every block exactly as it was.
     # Distinct from `undecided`, which says only that THIS pattern is undecided and must still
@@ -774,7 +788,7 @@ case9() {
     # python, and the zsh.
     [ "$n" = "7" ] \
         && ok "and it counts what it parsed, selecting by shebang rather than by extension" \
-        || fail "gate: count" "parsed $n files, expected 4: $out"
+        || fail "gate: count" "parsed $n files, expected 7: $out"
     printf '%s\n' "$(shell_sources "$d")" | grep -q 'no-newline' \
         && ok "including a shebang with no trailing newline" \
         || fail "gate: no-newline" "a one-line shebang file was dropped: $(shell_sources "$d" | tr '\n' ' ')"

@@ -623,6 +623,62 @@ case10g() {
         *"exclude=exposed"*) ok "and the dirty-worktree warning still stands" ;;
         *) fail "failedowner: silent" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
+
+    # THE OTHER HALF OF `failed`, where the claim is wrong: an install that leaves NOTHING at
+    # the path. `exposed` is a claim about a file, so it must be asked of the file — otherwise
+    # the report says "the chainer there is not hidden … that working tree will read dirty"
+    # beside `dispatch=dead` ("nothing runnable is at …") about an empty directory in a clean
+    # tree. Reproduced end to end before the fix.
+    local e="$d/empty"
+    git_q init -q "$e/main" >/dev/null 2>&1
+    git_q -C "$e/main" commit -q --allow-empty -m init
+    git_q -C "$e/main" worktree add -q "$e/wt" -b side >/dev/null 2>&1
+    mkdir -p "$e/wt/.githooks"                       # exists, EMPTY, unwritable
+    git_q -C "$e/main" config core.hooksPath "$e/wt/.githooks"
+    chmod 555 "$e/wt/.githooks"
+    out="$(install_git_hooks "$e/main" "$d/src" 2>/dev/null)"
+    chmod 755 "$e/wt/.githooks"
+
+    case "$out" in
+        *"chainer=failed"*"dispatch=dead"*) ok "an install that leaves nothing is failed and dead" ;;
+        *) fail "empty: premise" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"exclude=exposed"*)
+            fail "empty: contradiction" "it claimed a chainer is visible in a tree that is clean and a path that is empty" ;;
+        *) ok "and does not also claim a chainer is visible there" ;;
+    esac
+    [ -z "$(git_q -C "$e/wt" status --porcelain)" ] \
+        && ok "the worktree really is clean, so there was nothing to warn about" \
+        || fail "empty: dirty" "$(git_q -C "$e/wt" status --porcelain | tr '\n' ' ')"
+}
+
+# --- 10h. an unrecognised `want` refuses instead of sweeping -------------------------------
+# The fall-through was the `no` branch, which SWEEPS. A caller typo — or a fifth word added at
+# one site and forgotten at the other, which is exactly the edit two rounds ago made — would
+# silently retract every block jkb owns and then print a line the renderer reads as "nothing
+# was changed". Every renderer here has a warning default arm; the one consumer that can
+# destroy the user's file had none.
+case10h() {
+    local d="$work/badwant" r got
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    printf '%s\n/.githooks/post-merge\n' "$(exclude_marker)" >>"$r/.git/info/exclude"
+
+    got="$(reconcile_exclude "$r" "" Unknown "undecided (x)")"
+    case "$got" in
+        "exclude=failed (unrecognised want"*) ok "an unrecognised want is refused" ;;
+        *) fail "badwant: state" "got: $(printf '%s' "$got" | tr '\n' '|')" ;;
+    esac
+    grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude" \
+        && ok "and nothing of the user's file is touched" \
+        || fail "badwant: swept" "the block was retracted: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    case "$got" in
+        *retracted*) fail "badwant: retracted" "it reported a retraction" ;;
+        *) ok "and no retraction is reported" ;;
+    esac
 }
 
 # --- 11. the report survives `set -e`, and never claims a hook was skipped -----------------
@@ -1149,6 +1205,6 @@ EOF
 }
 
 echo "==> scripts/lib.sh::install_chainer"
-run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case11 case11b case11c case11d case12 case12b case13 case14 case15
+run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case11 case11b case11c case11d case12 case12b case13 case14 case15
 
 finish
