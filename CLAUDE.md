@@ -684,6 +684,24 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   two arms that create nothing now name the command that repairs it instead of asserting the
   roots — "re-run setup.sh" was not a remedy, since the failure leaves the db file behind and
   the re-run takes the *left untouched* arm.
+- **The test runner refuses a case name that is not a function.** `finish` asks only whether
+  the FILE asserted anything, so with a hundred passing assertions beside them two deleted case
+  bodies cost nothing: bash printed `case6g: command not found` on stderr and the suite exited
+  0. Two regression pins — the cross-worktree agreement set and the whole CRLF exclude set, both
+  for bugs shipped once already — went that way with the gate green. `run_cases` checks
+  `declare -F` first, which is the harness's own stated failure mode closed one level down.
+- **An answer git refused to give is `undecided`, never `none`.** `none` means *proven absence*
+  and the caller turns it into `want=no`, so a transient `worktree list` or `config --get`
+  failure swept jkb's own block away and reported "jkb no longer stands behind hiding it" —
+  false: jkb could not check. Both inputs run unattended from the post-merge hook. `undecided`
+  with no pattern makes `reconcile_exclude` touch nothing at all, which is the only safe move
+  when the desired state is unknown.
+- **A claim about jkb's own file is gated on ownership, not on a variable that means something
+  else.** The `exposed` downgrade read `want`, which the pattern-empty rule collapses to `no`
+  two lines later — and an exposed line is by definition pattern-empty, so the downgrade was
+  unconditional and the state unreachable the day it was added. Its test asserted only that
+  `exposed` was *absent*, which passes just as well when it can never appear; the positive half
+  is what catches it.
 - **The shell-syntax gate is one function, not two copies of a file list.** `shell_sources` +
   `check_shell_syntax` live in lib.sh and CI calls them, because the hand-written copy in
   `check.sh` and the one in `ci.yml` drifted by a `*.md` skip within a commit of each other —

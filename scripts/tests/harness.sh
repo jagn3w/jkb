@@ -20,6 +20,26 @@ ok()   { _asserts=$((_asserts + 1)); printf '  ok   %s\n' "$1"; }
 fail() { _asserts=$((_asserts + 1)); _failures=$((_failures + 1)); printf '  FAIL %s\n     %s\n' "$1" "$2"; }
 skip() { printf '  skip %s\n' "$1"; }
 
+# run_cases <name>… — run each named case, refusing a name that is not a declared function.
+#
+# The runner was a hand-written second list of case names, and bash treats an unknown one as a
+# command: `case6g: command not found` on stderr, and the file still exits 0. Two regression
+# pins — the cross-worktree agreement set and the whole CRLF exclude set, both for bugs this
+# repo has shipped once already — were deleted that way with the gate green. `finish` cannot
+# catch it, because it asks only whether the FILE asserted something and the surviving cases
+# assert plenty. That is this harness's own stated failure mode, one level down.
+run_cases() {
+    local c missing=""
+    for c in "$@"; do
+        declare -F "$c" >/dev/null 2>&1 || missing="$missing $c"
+    done
+    if [ -n "$missing" ]; then
+        echo "the runner names cases that do not exist:$missing" >&2
+        exit 1
+    fi
+    for c in "$@"; do "$c"; done
+}
+
 # finish — exit 1 if anything failed, or if nothing was asserted at all.
 finish() {
     if [ "$_asserts" -eq 0 ]; then

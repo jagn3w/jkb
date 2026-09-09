@@ -339,6 +339,158 @@ case6d() {
     esac
 }
 
+# --- 6g. the desired state is the same from every worktree -------------------------------
+# THE regression guard for the sweep. `.git/info/exclude` lives in the common dir and applies
+# to every worktree at once, so a desired state computed from `--show-toplevel` differs per
+# run — and a sweep that enforces it flip-flops: a main-checkout run added the block, the next
+# run from a `jkb task work` session retracted it, and the main checkout read dirty in
+# between, which is the state `jkb task land` refuses. D36 makes that the normal case.
+#
+# So the pattern comes from the raw config string and the shared facts. Asserting the two
+# answers are byte-identical is what makes that structural rather than remembered: reverting
+# the helper to resolve against the current tree fails this immediately.
+case6g() {
+    local m="$work/shared" wt got_main got_wt
+    git_q init -q "$m" >/dev/null 2>&1
+    git_q -C "$m" commit -q --allow-empty -m init
+    wt="$work/shared-wt"
+    git_q -C "$m" worktree add -q "$wt" -b side >/dev/null 2>&1
+
+    # Relative: git resolves it inside EACH worktree's top, so one anchored pattern is right
+    # for all of them at once.
+    git_q -C "$m" config core.hooksPath .githooks
+    got_main="$(git_hooks_exclude_pattern "$m")"
+    got_wt="$(git_hooks_exclude_pattern "$wt")"
+    if [ "$got_main" = "pattern /.githooks/post-merge" ] && [ "$got_wt" = "$got_main" ]; then
+        ok "a relative core.hooksPath: the same pattern from the checkout and the worktree"
+    else
+        fail "shared: relative" "main='$got_main' worktree='$got_wt'"
+    fi
+
+    # Absolute, inside the main checkout: still one answer, and it is the main tree's.
+    git_q -C "$m" config core.hooksPath "$m/.githooks"
+    got_main="$(git_hooks_exclude_pattern "$m")"
+    got_wt="$(git_hooks_exclude_pattern "$wt")"
+    if [ "$got_main" = "pattern /.githooks/post-merge" ] && [ "$got_wt" = "$got_main" ]; then
+        ok "an absolute one inside the checkout: the same answer from both"
+    else
+        fail "shared: absolute" "main='$got_main' worktree='$got_wt'"
+    fi
+
+    # Absolute, inside a LINKED worktree only: not hidden, and the reason says why — an
+    # anchored rule would apply to every tree, including ones the path is not in.
+    git_q -C "$m" config core.hooksPath "$wt/.githooks"
+    got_main="$(git_hooks_exclude_pattern "$m")"
+    got_wt="$(git_hooks_exclude_pattern "$wt")"
+    # `exposed`, not `none`: the chainer really is an untracked file in a real tree. An
+    # anchored rule applies to every worktree at once so hiding it is not available — but
+    # `none` is rendered silently, which left that tree dirty for ever with nothing
+    # attributing the file to jkb.
+    case "$got_main" in
+        "exposed ("*) [ "$got_wt" = "$got_main" ] \
+            && ok "one inside a linked worktree only: reported exposed, same answer from both" \
+            || fail "shared: linked" "main='$got_main' worktree='$got_wt'" ;;
+        *) fail "shared: linked" "expected an exposed state, got '$got_main'" ;;
+    esac
+    case "$got_main" in
+        *"$wt"*) ok "and it names the tree that will read dirty" ;;
+        *) fail "shared: linked detail" "the reason does not name the worktree: $got_main" ;;
+    esac
+
+    # And end to end: the block a main run adds must survive a worktree run.
+    git_q -C "$m" config core.hooksPath "$m/.githooks"
+    printf '#!/bin/sh\necho HOOK\n' >"$work/shared-src"
+    install_git_hooks "$m" "$work/shared-src" >/dev/null 2>&1
+    install_git_hooks "$wt" "$work/shared-src" >/dev/null 2>&1
+    if grep -qxF '/.githooks/post-merge' "$m/.git/info/exclude"; then
+        ok "and a run from the worktree does not retract what the checkout added"
+    else
+        fail "shared: flip" "the worktree run removed the block: $(tr '\n' '|' <"$m/.git/info/exclude")"
+    fi
+    [ -z "$(git_q -C "$m" status --porcelain)" ] \
+        && ok "so the main checkout is not left dirty by a session's pull" \
+        || fail "shared: dirty" "$(git_q -C "$m" status --porcelain | tr '\n' ' ')"
+}
+
+# --- 6e. an exclude file git can read, we can read -----------------------------------------
+# git trims one trailing CR from every ignore/exclude line, so a CRLF file is functional to
+# git. Ours did not, so on such a file it recognised neither its own block nor the pattern,
+# and appended a fresh one on every qualifying pull — unbounded growth in a file of the
+# user's rules. Also pins that the surviving lines keep their original endings: agreeing with
+# git about what a line MEANS is not licence to rewrite how it is spelled.
+case6e() {
+    local r="$work/crlf" chainer override got
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    override="$(git_hooks_override "$r")"
+    chainer="$override/post-merge"
+    mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
+    # OUR OWN BLOCK, written with CRLF endings — as a Windows editor would leave it after any
+    # visit to the file. Planting CRLF only on the user's lines does not exercise this: the
+    # block we then append has LF endings and matches on the next run either way, so the test
+    # passed with the trim reverted.
+    printf '# my rules\r\n*.log\r\n%s\r\n/.githooks/post-merge\r\n' "$(exclude_marker)" \
+        >"$r/.git/info/exclude"
+
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
+    if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
+        && [ "$(grep -c 'githooks/post-merge' "$r/.git/info/exclude")" = "1" ]; then
+        ok "a CRLF exclude file: our own block is recognised, not appended a second time"
+    else
+        fail "crlf: duplicate" "said '$got'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    if [ "$(head -1 "$r/.git/info/exclude" | od -c | grep -c '\\r')" = "1" ]; then
+        ok "and the user's own line endings are left alone"
+    else
+        fail "crlf: rewritten" "the file's existing CRLF endings were changed"
+    fi
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
+    if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
+        && ! grep -q 'githooks/post-merge' "$r/.git/info/exclude"; then
+        ok "and a CRLF block is retracted, marker and all"
+    else
+        fail "crlf: retract" "said '$got'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    [ "$(grep -c '^\*\.log' "$r/.git/info/exclude")" = "1" ] \
+        && ok "and the user's rules survive the rewrite" \
+        || fail "crlf: lost" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+}
+
+# --- 6m. an answer git refused to give must not sweep --------------------------------------
+# `none` means PROVEN absence and the caller turns it into want=no, so spelling "git could not
+# answer" that way swept jkb's own block away and reported "jkb no longer stands behind hiding
+# it" — false; jkb could not check. Both failing inputs run unattended from the post-merge
+# hook, after which every worktree reads dirty until the next good setup.sh run.
+case6m() {
+    local r="$work/undecided" ex got
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
+    ex="$r/.git/info/exclude"
+    reconcile_exclude "$r" "/.githooks/post-merge" yes >/dev/null
+
+    # Undecided with no pattern: every block stays exactly as it was.
+    got="$(reconcile_exclude "$r" "" undecided "undecided (core.hooksPath could not be read)")"
+    case "$got" in
+        "exclude=undecided ("*) ok "an unobtainable answer is reported undecided" ;;
+        *) fail "undecided: state" "got '$got'" ;;
+    esac
+    grep -qxF '/.githooks/post-merge' "$ex" \
+        && ok "and jkb's own block is left exactly where it was" \
+        || fail "undecided: swept" "the block was retracted: $(tr '\n' '|' <"$ex")"
+    case "$got" in
+        *retracted*) fail "undecided: retracted" "it reported a retraction it did not make" ;;
+        *) ok "and nothing is reported as retracted" ;;
+    esac
+    # The renderer must say it, not stay silent the way `none` does.
+    case "$(printf '%s\n' "$got" | render_git_hooks_report 2>&1)" in
+        *"could not work out what to hide"*) ok "and the rendering says so" ;;
+        *) fail "undecided: render" "$(printf '%s\n' "$got" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+    esac
+}
+
 # --- 6k. every spelling of core.hooksPath normalizes to what git actually matches ---------
 # A pair of prefix strips left `.`, `a/.`, `a//b`, `.//x` and `hooks/./x` as
 # `/./post-merge`, `/a/./post-merge`, `/a//b/post-merge` … — patterns git does not match. It
@@ -613,24 +765,6 @@ case9() {
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-case1
-case2
-case3
-case4
-case5
-case6
-case6b
-case6c
-case6d
-case6g
-case6k
-case6h
-case6j
-case6i
-case6e
-case6f
-case7
-case8
-case9
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9
 
 finish

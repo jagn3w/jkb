@@ -103,6 +103,33 @@ case2c() {
     fi
 }
 
+# --- 2d. the runner refuses to name a case that does not exist ----------------------------
+# `finish` asks only whether the FILE asserted something, so with a hundred passing assertions
+# beside them two deleted case bodies cost nothing: bash printed `case6g: command not found`
+# on stderr and the file exited 0. Two regression pins for bugs this repo has shipped once
+# already went that way, with the whole gate green. That is this harness's own stated failure
+# mode, one level down.
+case2d() {
+    local child="$work/child-missing.sh" status out
+    cat >"$child" <<EOF
+. "$harness"
+new_workdir
+present() { ok "ran"; }
+run_cases present absent
+finish
+EOF
+    out="$(bash "$child" 2>&1)"; status=$?
+    if [ "$status" -ne 0 ]; then
+        ok "naming a case that does not exist fails the file"
+    else
+        fail "runner: silent" "a missing case exited 0: $out"
+    fi
+    case "$out" in
+        *"do not exist"*absent*) ok "and says which name it could not find" ;;
+        *) fail "runner: mute" "no useful message: $out" ;;
+    esac
+}
+
 # --- 3. a file that asserts nothing fails -------------------------------------------------
 # `finish`'s reason for existing: a suite whose every case bailed out on a failed premise used
 # to exit 0, indistinguishable from one that checked everything and was happy.
@@ -136,11 +163,6 @@ EOF
 }
 
 echo "==> scripts/tests/harness.sh"
-case1
-case2
-case2b
-case2c
-case3
-case4
+run_cases case1 case2 case2b case2c case2d case3 case4
 
 finish

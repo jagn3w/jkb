@@ -519,10 +519,29 @@ case10f() {
     git_q -C "$m" commit -q --allow-empty -m init
     git_q -C "$m" worktree add -q "$d/wt" -b side >/dev/null 2>&1
     mkdir -p "$d/wt/.githooks"
-    printf '#!/bin/sh\n# my own hook\ndirenv reload\n' >"$d/wt/.githooks/post-merge"
     git_q -C "$m" config core.hooksPath "$d/wt/.githooks"
-    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
 
+    # THE POSITIVE HALF FIRST. Asserting only that `exposed` is absent passes just as well
+    # when the gate suppresses it unconditionally — which is the state the code was in: the
+    # downgrade read `want`, which the pattern-empty rule had already collapsed to `no`, so
+    # `exposed` was unreachable and jkb's own chainer in a worktree went back to being
+    # reported as nothing at all.
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    rm -f "$d/wt/.githooks/post-merge"
+    out="$(install_git_hooks "$m" "$d/src")"
+    case "$out" in
+        *"chainer=installed"*"exclude=exposed"*)
+            ok "jkb's OWN chainer in a linked worktree is reported exposed" ;;
+        *) fail "foreignexposed: positive" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"chainer jkb installed is not hidden"*"$d/wt"*)
+            ok "and the warning names the tree that will read dirty" ;;
+        *) fail "foreignexposed: positive render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+    esac
+
+    # Now the user's own file at the same path.
+    printf '#!/bin/sh\n# my own hook\ndirenv reload\n' >"$d/wt/.githooks/post-merge"
     out="$(install_git_hooks "$m" "$d/src")"
     case "$out" in
         *"chainer=foreign"*) ok "a foreign chainer in a linked worktree is reported foreign" ;;
@@ -1032,6 +1051,26 @@ case15() {
         && ok "and the two that created nothing name the repair instead of asserting roots" \
         || fail "summary: honesty" "wrong:$bad"
 
+    # The PRODUCER's vocabulary, read out of setup.sh. Only the rendering moved into lib.sh;
+    # the arms deciding WHICH word each section reports still live in setup.sh, which no test
+    # executes — and those arms are where all three prior findings were. Renaming
+    # `watcher_state=failed` to `watcher_state=failure` leaves the gate green, and the
+    # unattended run then prints no watcher line at all, just a warning on stderr: a summary
+    # section vanishing, which is the silent-omission mode this block keeps producing.
+    local setup="$repo_root/scripts/setup.sh" word key states_ok=1 unknown=""
+    while IFS= read -r word; do
+        key="${word%%_state=*}"
+        rendered="$(printf '%s=%s x\n' "$key" "${word#*=}" | render_setup_summary 2>&1)"
+        case "$rendered" in
+            *unrecognised*) states_ok=0; unknown="$unknown [$word]" ;;
+        esac
+    done <<EOF
+$(grep -oE '(scaffold|extension|watcher)_state=[a-z]+' "$setup" | sort -u)
+EOF
+    [ "$states_ok" = 1 ] \
+        && ok "every state word setup.sh can assign has a render arm" \
+        || fail "summary: vocabulary" "setup.sh emits states lib.sh does not render:$unknown"
+
     # Default arms, as everywhere else in this protocol.
     local defaults_ok=1 noisy=""
     for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways'; do
@@ -1047,30 +1086,6 @@ case15() {
 }
 
 echo "==> scripts/lib.sh::install_chainer"
-case1
-case1b
-case2
-case3
-case4
-case5
-case6
-case7
-case8
-case9
-case10
-case10b
-case10c
-case10d
-case10e
-case10f
-case11
-case11b
-case11c
-case11d
-case12
-case12b
-case13
-case14
-case15
+run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case11 case11b case11c case11d case12 case12b case13 case14 case15
 
 finish

@@ -145,10 +145,6 @@ case5() {
 }
 
 echo "==> scripts/lib.sh::install_exec"
-case1
-case2
-case3
-case4
-case5
+run_cases case1 case2 case3 case4 case5
 
 finish
