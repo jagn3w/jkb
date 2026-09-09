@@ -520,11 +520,15 @@ _is_exclude_pattern_line() {
 #   exclude=deduplicated <pattern>   extra copies of the block we are keeping were removed
 #   exclude=tidied <n> marker(s)     orphaned jkb marker lines were removed
 #   exclude=unowned <pattern>        a rule excludes it that jkb cannot prove it wrote — kept
+#   exclude=exposed <reason>         ours IS inside a working tree and cannot be hidden there
+#   exclude=undecided <reason>       nothing could be established; nothing was changed
 #   exclude=none <reason>            nothing to do
 #   exclude=failed <reason>          a write was attempted and did not land
 #
 # <want> is three-valued. `yes` — we own this pattern and it must be excluded. `no` — nothing
-# of ours may hide it. `undecided` — the chainer install failed, so nothing is known about
+# of ours may hide it. `undecided` reaches here two ways: the chainer install failed (with a
+# pattern — the OTHER blocks are still swept), or the derivation could not establish a pattern
+# at all (without one — then nothing is touched). In the first, nothing is known about
 # THIS pattern; its block is left exactly as found. The sweep of every OTHER jkb block runs
 # on all three, because that sweep does not depend on the undecided fact: it is the condition,
 # and a condition must dominate every arm rather than have one that opts out.
@@ -640,7 +644,10 @@ reconcile_exclude() {
         return 0
     fi
     if [ "$want" = undecided ]; then
-        printf 'exclude=none (the chainer install failed; nothing was decided about %s)\n' "$pattern"
+        # `undecided`, like the other way of reaching this: one condition, one word. It said
+        # `none` — proven absence — for a situation whose whole point is that nothing was
+        # established.
+        printf 'exclude=undecided (the chainer install failed; nothing was decided about %s)\n' "$pattern"
         return 0
     fi
     if [ "$want" = yes ]; then
@@ -686,9 +693,11 @@ reconcile_exclude() {
 #   repo-hook=<path>          the hook, installed where git actually runs hooks from
 #   chainer=<outcome> <path>  installed | up-to-date | refreshed | foreign | failed
 #   exclude=<state> <detail>  added | kept | retracted | deduplicated | tidied | unowned |
-#                             exposed | none | failed  (repeatable: the sweep reports one line
-#                             per block). `exposed` and `none` differ in one thing: `exposed`
-#                             means ours IS in a working tree and jkb is declining to hide it.
+#                             exposed | undecided | none | failed  (repeatable: the sweep
+#                             reports one line per block). Three are easy to confuse: `none` is
+#                             PROVEN absence, `exposed` means ours IS in a working tree and jkb
+#                             is declining to hide it, and `undecided` means jkb could not
+#                             establish anything and therefore changed nothing.
 #   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #

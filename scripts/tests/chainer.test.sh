@@ -771,7 +771,7 @@ case11d() {
         *) fail "skipsweep: sweep" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     case "$out" in
-        *"nothing was decided about /.githooks/post-merge"*)
+        *"exclude=undecided (the chainer install failed; nothing was decided about /.githooks/post-merge)"*)
             ok "while this run's own pattern is left undecided, not retracted" ;;
         *) fail "skipsweep: undecided" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
@@ -963,6 +963,7 @@ case14() {
         'exclude=deduplicated /p|duplicate jkb entries for /p removed'
         'exclude=tidied 1 orphaned marker(s)|1 orphaned marker(s) removed from .git/info/exclude'
         'exclude=exposed (inside the worktree at /w)|that working tree will read dirty'
+        'exclude=undecided (core.hooksPath could not be read)|could not work out what to hide'
         'exclude=unowned /p|cannot prove it wrote'
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'

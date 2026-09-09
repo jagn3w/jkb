@@ -28,13 +28,22 @@ skip() { printf '  skip %s\n' "$1"; }
 # repo has shipped once already — were deleted that way with the gate green. `finish` cannot
 # catch it, because it asks only whether the FILE asserted something and the surviving cases
 # assert plenty. That is this harness's own stated failure mode, one level down.
+# BOTH directions. A name with no body is the bug above; a body no name calls is the same
+# class the other way round — a case that looks like coverage, runs never, and can rot into
+# something that would fail if it were run. Neither is catchable by `finish`.
 run_cases() {
-    local c missing=""
+    local c defined missing="" orphaned=""
     for c in "$@"; do
         declare -F "$c" >/dev/null 2>&1 || missing="$missing $c"
     done
-    if [ -n "$missing" ]; then
-        echo "the runner names cases that do not exist:$missing" >&2
+    while IFS= read -r defined; do
+        case " $* " in *" $defined "*) ;; *) orphaned="$orphaned $defined" ;; esac
+    done <<EOF
+$(declare -F | sed -n 's/^declare -f \(case[0-9][0-9a-z]*\)$/\1/p')
+EOF
+    if [ -n "$missing" ] || [ -n "$orphaned" ]; then
+        [ -z "$missing" ]  || echo "the runner names cases that do not exist:$missing" >&2
+        [ -z "$orphaned" ] || echo "these cases are defined but never run:$orphaned" >&2
         exit 1
     fi
     for c in "$@"; do "$c"; done

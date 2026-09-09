@@ -128,6 +128,28 @@ EOF
         *"do not exist"*absent*) ok "and says which name it could not find" ;;
         *) fail "runner: mute" "no useful message: $out" ;;
     esac
+
+    # The mirror: a body nothing calls looks like coverage, runs never, and can rot into
+    # something that would fail if it were run. `finish` cannot see that either.
+    local orphan="$work/child-orphan.sh"
+    cat >"$orphan" <<EOF
+. "$harness"
+new_workdir
+case1() { ok "ran"; }
+case2() { ok "never called"; }
+run_cases case1
+finish
+EOF
+    out="$(bash "$orphan" 2>&1)"; status=$?
+    if [ "$status" -ne 0 ]; then
+        ok "and a case body the runner never names fails it too"
+    else
+        fail "runner: orphan" "an uncalled case exited 0: $out"
+    fi
+    case "$out" in
+        *"never run"*case2*) ok "naming the one it found" ;;
+        *) fail "runner: orphan mute" "no useful message: $out" ;;
+    esac
 }
 
 # --- 3. a file that asserts nothing fails -------------------------------------------------
