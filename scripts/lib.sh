@@ -315,6 +315,24 @@ _exclude_mentions() {
     return 1
 }
 
+# _exposure_answer <absolute dir> <tops> <skip, or empty> — the one answer for "this path is
+# not anchorable to the main checkout": `exposed …` if it is inside some working tree anyway,
+# `none …` if it is inside none.
+#
+# One function because there are two branches that ask it — bare and non-bare — and two copies
+# of a four-line answer are two answers waiting to drift. The distinction they carry is the one
+# this area keeps getting wrong: `none` is proven absence and licenses the sweep to retract;
+# `exposed` is a real untracked file in a real tree that jkb is declining to hide.
+_exposure_answer() {
+    local dir="$1" tops="$2" skip="$3" hit
+    hit="$(_worktree_containing "$dir" "$tops" "$skip")" || hit=""
+    if [ -n "$hit" ]; then
+        printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
+    else
+        printf 'none (core.hooksPath is outside every working tree, so nothing of ours is hidden)\n'
+    fi
+}
+
 # git_hooks_exclude_pattern <repo_root> — the ONE exclude pattern jkb wants in this
 # repository, as exactly one of FOUR lines:
 #
@@ -408,12 +426,7 @@ EOF
                 # Skip the main entry: `worktree list` reports the bare git dir as a record,
                 # and it is not a working tree — naming it as one told the user their chainer
                 # was inside a tree that does not exist.
-                hit="$(_worktree_containing "$configured" "$tops" "$main_top")" || hit=""
-                if [ -n "$hit" ]; then
-                    printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
-                else
-                    printf 'none (core.hooksPath is outside every working tree, so nothing of ours is hidden)\n'
-                fi
+                _exposure_answer "$configured" "$tops" "$main_top"
                 return 0
             fi
             if [ "$configured" = "$main_top" ]; then
@@ -430,12 +443,7 @@ EOF
                         # quiet about it is not the same trade.
                         # No skip: this arm is reached only when `$configured` did NOT
                         # match `"$main_top"/*`, so main cannot match here either.
-                        hit="$(_worktree_containing "$configured" "$tops" "")" || hit=""
-                        if [ -n "$hit" ]; then
-                            printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
-                        else
-                            printf 'none (core.hooksPath is outside every working tree, so nothing of ours is hidden)\n'
-                        fi
+                        _exposure_answer "$configured" "$tops" ""
                         return 0 ;;
                 esac
             fi
