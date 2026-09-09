@@ -339,20 +339,29 @@ _exclude_mentions() {
 # here detects that; the failure is a pattern computed for one worktree's value, which is the
 # pre-existing behaviour rather than a new one.
 git_hooks_exclude_pattern() {
-    local repo_root="$1" configured rc rel line main_top="" bare=0 first=1 wt hit=""
+    local repo_root="$1" configured rc rel line wt hit=""
+    local tops="" main_top="" bare=0 rec=0
     # Every worktree's top, main first, and whether the main entry is BARE. Asked of the
     # repository through the porcelain rather than `--is-bare-repository` of `$repo_root`:
     # in a bare-repo-plus-worktrees layout that question answers `false` from a worktree, the
     # bare git dir became the "main checkout", and a pattern derived from it marked the user's
     # own untracked file ignored while hiding nothing — and gave two different answers from
     # two places, falsifying this function's whole claim.
+    # A worktree path containing a newline would break this parse; `--porcelain -z` is the
+    # cure and needs git 2.36 plus `read -d ''`. Stated rather than built: the failure is a
+    # wrong `none`, which hides nothing and destroys nothing.
     while IFS= read -r line; do
         case "$line" in
             "worktree "*)
+                rec=$((rec + 1))
                 wt="$(_real_dir "${line#worktree }")"
-                if [ "$first" -eq 1 ]; then main_top="$wt"; first=0; fi
+                if [ "$rec" -eq 1 ]; then main_top="$wt"; fi
+                tops="$tops$wt
+"
                 ;;
-            bare) [ -n "$main_top" ] && [ "$first" -eq 0 ] && [ -z "$hit" ] && bare=1 ;;
+            # Only the FIRST record's `bare`. The guard here used to test `first -eq 0`, true
+            # of every record after the first, and a `$hit` that is always empty at this point.
+            bare) if [ "$rec" -eq 1 ]; then bare=1; fi ;;
         esac
     done <<EOF
 $(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
@@ -390,16 +399,16 @@ EOF
                         # ever with nothing attributing the file to jkb. An anchored rule
                         # applies to every tree at once, so hiding it is not available; being
                         # quiet about it is not the same trade.
-                        while IFS= read -r line; do
-                            case "$line" in
-                                "worktree "*)
-                                    wt="$(_real_dir "${line#worktree }")"
-                                    [ "$wt" = "$main_top" ] && continue
-                                    case "$configured/" in "$wt"/*) hit="$wt" ;; esac
-                                    ;;
-                            esac
+                        # No "skip the main worktree" guard: this arm is only reached when
+                        # `$configured` did NOT match `"$main_top"/*`, so main can never
+                        # match here either. A guard that cannot fire is a second model of
+                        # the world rather than defence in depth — and a mutation removing
+                        # it left every suite green, which is how it was noticed.
+                        while IFS= read -r wt; do
+                            [ -n "$wt" ] || continue
+                            case "$configured/" in "$wt"/*) hit="$wt" ;; esac
                         done <<EOF2
-$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
+$tops
 EOF2
                         if [ -n "$hit" ]; then
                             printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
