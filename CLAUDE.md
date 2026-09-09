@@ -718,7 +718,9 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   inside that unrelated repository**, reporting `dispatch=chained`, while the repo it was asked
   about kept a dead hook. Measured. jkb runs inside other people's professional repositories and
   must not decorate them — the same rule that keeps it from writing a git ref (D46) — and this
-  is a wrapper rather than a note at each call site because there are a dozen of them.
+  is a wrapper rather than a note at each of the six call sites. It stops at `lib.sh`'s
+  boundary on purpose: a **hook** must honour the environment git hands it, so `scripts/hooks/
+  post-merge` and the emitted chainer keep bare `git`.
 - **A relative `core.hooksPath` is anchored at the working tree top — and with NO working tree
   it has no anchor at all.** Measured from three directories on git 2.51.1: git resolves it
   against the *invoking process's cwd*, so `git --git-dir=B rev-parse --git-path

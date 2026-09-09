@@ -36,7 +36,13 @@ warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 #
 # jkb runs inside other people's professional repositories and must not decorate them; that is
 # the same rule that keeps it from writing a git ref (D46). A wrapper rather than a note at
-# each call site, because there are a dozen of them and the next one would forget.
+# each of the six call sites, because the next one added would forget.
+#
+# It stops at this file's boundary, deliberately. A HOOK must honour the environment git hands
+# it — git sets `GIT_DIR` when it runs one, and in a linked worktree that is the only way to
+# reach the right repository — so `scripts/hooks/post-merge` and the `chainer_body` heredoc use
+# bare `git` on purpose. Routing those through `_git` for consistency would break them. Every
+# caller HERE passes `-C "$repo_root"`, so stripping the inherited selection loses nothing.
 _git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git "$@"; }
 
 # install_exec <dest> — install stdin as an executable file at <dest>, ATOMICALLY.
