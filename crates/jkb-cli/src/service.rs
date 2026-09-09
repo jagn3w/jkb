@@ -66,12 +66,29 @@ pub fn print(db: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error on an unsupported platform, or if a file can't be written.
 pub fn install(db: &Path) -> Result<()> {
-    let manager = manager()?;
-    for (label, path, unit) in units_for_platform(db)? {
+    install_units(manager()?, units_for_platform(db)?)
+}
+
+/// Write each unit to its own path and say how to activate it.
+///
+/// Split from [`install`] so the destinations are an ARGUMENT rather than something derived
+/// from `$HOME` inside `units_for_platform`. That derivation is the reason nothing could
+/// reach this code: reverting its `atomic::write` to `std::fs::write` passed the whole gate,
+/// because `atomic::write`'s own tests exercise the seam in isolation and no test could get
+/// here to assert that this caller goes through it. Same split, for the same reason, as
+/// `commands::install_into`.
+///
+/// # Errors
+/// Returns an error if a unit's directory cannot be created or the unit cannot be written.
+fn install_units(manager: Manager, units: Vec<Unit>) -> Result<()> {
+    for (label, path, unit) in units {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        // `atomic::write`, never `fs::write`: a supervisor may be reading this unit as we
+        // replace it (`launchctl load` / `systemctl daemon-reload`), and setup.sh re-runs
+        // `service install` on every pull that touched `scripts/`.
         crate::atomic::write(&path, unit.as_bytes())?;
         println!("wrote {}", path.display());
         match manager {
@@ -294,8 +311,8 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit, xml_escape, LABEL,
-        REAP_LABEL,
+        install_units, launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit,
+        xml_escape, Manager, LABEL, REAP_LABEL,
     };
     use std::path::Path;
 
@@ -346,6 +363,56 @@ mod tests {
         let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
+    }
+
+    /// Pins the CALLER, not the seam. `atomic::write` has its own test, and it stays green
+    /// when this function is reverted to `std::fs::write` — writing works; it is the reader
+    /// mid-`launchctl load` that an in-place rewrite corrupts. So this holds a handle open
+    /// across a reinstall, the way a supervisor does, and asserts it still sees the whole old
+    /// unit. Reverting `install_units`'s `atomic::write` fails it with "the reinstall rewrote
+    /// a unit a supervisor was already reading".
+    ///
+    /// It can exist at all only because `install_units` takes its destinations as an
+    /// argument. While `install` derived them from `$HOME`, this call site was unreachable.
+    #[test]
+    #[cfg(unix)]
+    fn installing_a_unit_replaces_it_by_rename_never_rewriting_it_in_place() {
+        use std::io::Read;
+        const PREVIOUS: &str = "<!-- the unit that was installed before this upgrade -->\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub").join(format!("{LABEL}.plist"));
+        let unit = || {
+            vec![(
+                LABEL,
+                path.clone(),
+                launchd_plist(Path::new("/usr/local/bin/jkb"), Path::new("/home/u/jkb.db")),
+            )]
+        };
+
+        install_units(Manager::Launchd, unit()).expect("first install");
+        assert!(path.is_file(), "install_units created no unit");
+        // Stand the installed unit in for an older version of itself. The generators are
+        // deterministic, so a second install writes identical bytes and the assertion below
+        // could not tell a rename from a truncate-and-rewrite.
+        std::fs::write(&path, PREVIOUS).expect("plant an older version");
+
+        let mut supervisor = std::fs::File::open(&path).expect("open the installed unit");
+        install_units(Manager::Launchd, unit()).expect("reinstall");
+
+        let mut seen = String::new();
+        supervisor
+            .read_to_string(&mut seen)
+            .expect("read through the open handle");
+        assert_eq!(
+            seen, PREVIOUS,
+            "the reinstall rewrote a unit a supervisor was already reading"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            launchd_plist(Path::new("/usr/local/bin/jkb"), Path::new("/home/u/jkb.db")),
+            "the upgrade did not land"
+        );
     }
 
     #[test]

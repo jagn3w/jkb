@@ -48,7 +48,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+# `warn` comes from lib.sh, which renders the git-hook report and needs it too.
 
 # --- 1. jkb binary -----------------------------------------------------------
 # Re-running this after `git pull` is the supported way to refresh the binary — the
@@ -143,29 +143,15 @@ fi
 say "installing git hooks"
 hooks_src="$repo_root/scripts/hooks/post-merge"
 if [ -f "$hooks_src" ]; then
-  # The whole block lives in lib.sh (`install_git_hooks`), which reports what it did as
-  # `key=value` lines; this is only the rendering. Inline, none of it was reachable from a
-  # test — reverting the hooks directory to `--git-dir` left the entire gate green.
-  while IFS= read -r line; do
-    case "$line" in
-      repo-hook=*) echo "  • repo hook:  ${line#repo-hook=}" ;;
-      excluded=*)  echo "  • excluded:   ${line#excluded=} (inside the working tree; added to .git/info/exclude)" ;;
-      chainer=*)
-        rest="${line#chainer=}"; outcome="${rest%% *}"; path="${rest#* }"
-        case "$outcome" in
-          installed)  echo "  • chainer:    $path (core.hooksPath is set, so this is required)" ;;
-          up-to-date) echo "  • chainer:    $path (up to date)" ;;
-          refreshed)  echo "  • chainer:    $path (refreshed)" ;;
-          foreign)
-            # Not byte-for-byte something jkb wrote, so it is not ours to replace — it may be
-            # your own file, or ours with your edits in it.
-            warn "$path was not written by jkb (or has been edited) — left untouched."
-            warn "  if it does not exec \"\$(git rev-parse --git-common-dir)/hooks/post-merge\", the repo hook never runs." ;;
-          *) warn "could not install the chainer at $path" ;;
-        esac ;;
-      error=*) warn "${line#error=}; skipping hook install" ;;
-    esac
-  done < <(install_git_hooks "$repo_root" "$hooks_src" || true)
+  # BOTH halves live in lib.sh — the installer and its rendering. Leaving the rendering
+  # inline drew the seam one level too low: nothing runs setup.sh, so its `case` arms were
+  # reachable from no test, and two review findings lived in them with the gate green.
+  #
+  # `< <(…)`, not a pipe and not `|| true`: a process substitution's exit status is never
+  # checked, so a failing installer cannot kill this script, and nothing here is load-bearing
+  # for the report arriving. `install_git_hooks` is itself `set -e`-safe (see lib.sh's header)
+  # — it used to depend on an incidental `|| true` right here for that.
+  render_git_hooks_report < <(install_git_hooks "$repo_root" "$hooks_src")
 fi
 
 # --- shared claude memory (opt-in) -------------------------------------------

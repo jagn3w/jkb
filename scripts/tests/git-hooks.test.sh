@@ -169,11 +169,11 @@ case6() {
         return
     fi
 
-    got="$(git_exclude_locally "$r" "$chainer")"
-    if [ "$got" = "/.githooks/post-merge" ]; then
+    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    if [ "$got" = "added /.githooks/post-merge" ]; then
         ok "a chainer inside the working tree: excluded locally"
     else
-        fail "exclude: pattern" "expected /.githooks/post-merge, got '$got'"
+        fail "exclude: pattern" "expected 'added /.githooks/post-merge', got '$got'"
     fi
     if [ -z "$(git_q -C "$r" status --porcelain)" ]; then
         ok "the working tree is clean again, so a session can land"
@@ -181,11 +181,68 @@ case6() {
         fail "exclude: dirty" "still dirty: $(git_q -C "$r" status --porcelain | tr '\n' ' ')"
     fi
     # Twice must not duplicate the line — setup.sh runs on every qualifying pull.
-    got="$(git_exclude_locally "$r" "$chainer")"
-    if [ -z "$got" ] && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
+    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    if [ "$got" = "kept /.githooks/post-merge" ] \
+        && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
         ok "running it again adds nothing"
     else
         fail "exclude: idempotence" "second run printed '$got' and the pattern appears $(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude") time(s)"
+    fi
+
+    # And the reverse decision retracts it, leaving the user's own rules alone. Adding the
+    # rule on the run that installs a chainer and never revisiting it is how a user who later
+    # replaced that chainer with their own hook had it git-ignored for ever.
+    got="$(reconcile_exclude "$r" "$chainer" no)"
+    if [ "$got" = "retracted /.githooks/post-merge" ] \
+        && ! grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
+        ok "and asking for it to be gone retracts it"
+    else
+        fail "exclude: retract" "printed '$got'; file still: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    if [ -n "$(git_q -C "$r" status --porcelain)" ]; then
+        ok "so the file it was hiding is visible to git again"
+    else
+        fail "exclude: still hidden" "the chainer is still invisible to git status"
+    fi
+    # The marker goes with the pattern: a retraction that left its own comment behind would
+    # accumulate one per cycle.
+    if ! grep -q '^# jkb:' "$r/.git/info/exclude"; then
+        ok "and takes its marker comment with it"
+    else
+        fail "exclude: marker" "the marker survived: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+}
+
+# --- 6c. a pattern jkb cannot prove it wrote is reported, never deleted -------------------
+# The one case retraction must NOT repair. A bare pattern with no marker above it may be a
+# rule the user wrote themselves; deleting it to fix our own mess would destroy something
+# they own. Ownership is byte identity, exactly as it is for the chainer body — so this is
+# reported instead, which turns a silent permanent harm into a visible one with a remedy.
+case6c() {
+    local r="$work/unowned" chainer override got
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    override="$(git_hooks_override "$r")"
+    if [ "$(abs_dir "$override")" != "$(abs_dir "$r")/.githooks" ]; then
+        fail "unowned: premise" "git_hooks_override returned '$override'"
+        return
+    fi
+    chainer="$override/post-merge"
+    mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
+    # Their rule, written by hand: the pattern with no marker line above it.
+    printf '# things I do not want to see\n/.githooks/post-merge\n' >>"$r/.git/info/exclude"
+
+    got="$(reconcile_exclude "$r" "$chainer" no)"
+    if [ "$got" = "unowned /.githooks/post-merge" ]; then
+        ok "an unmarked exclude rule is reported as unowned"
+    else
+        fail "unowned: state" "expected 'unowned /.githooks/post-merge', got '$got'"
+    fi
+    if grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
+        ok "and is left exactly where the user put it"
+    else
+        fail "unowned: deleted" "jkb deleted a rule it could not prove it wrote"
     fi
 }
 
@@ -208,7 +265,7 @@ case6b() {
     # No trailing newline, exactly as a hand-edited file often is.
     printf '# my rules\n*.log' >"$r/.git/info/exclude"
 
-    git_exclude_locally "$r" "$chainer" >/dev/null
+    reconcile_exclude "$r" "$chainer" yes >/dev/null
 
     if [ "$(grep -c '^\*\.log$' "$r/.git/info/exclude")" = "1" ]; then
         ok "an exclude file with no trailing newline keeps its last rule"
@@ -226,15 +283,19 @@ case6b() {
 # The ordinary case: an absolute core.hooksPath is nobody's working tree, so there is nothing
 # to hide and nothing should be written to .git/info/exclude.
 case7() {
-    local r="$work/outside" got before after
+    local r="$work/outside" got before after got_ok
     git_q init -q "$r" >/dev/null 2>&1
     git_q -C "$r" commit -q --allow-empty -m init
     # `git init` ships a commented default exclude file, so "unchanged" is the assertion,
     # not "empty".
     before="$(cat "$r/.git/info/exclude" 2>/dev/null)"
-    got="$(git_exclude_locally "$r" "$work/elsewhere/post-merge")"
+    got="$(reconcile_exclude "$r" "$work/elsewhere/post-merge" yes)"
     after="$(cat "$r/.git/info/exclude" 2>/dev/null)"
-    if [ -z "$got" ] && [ "$before" = "$after" ]; then
+    case "$got" in
+        "none (outside the working tree"*) got_ok=1 ;;
+        *) got_ok=0 ;;
+    esac
+    if [ "$got_ok" = 1 ] && [ "$before" = "$after" ]; then
         ok "a hooks path outside the tree: nothing excluded"
     else
         fail "outside: wrote" "printed '$got'; exclude file changed=$([ "$before" = "$after" ] && echo no || echo YES)"
@@ -263,7 +324,7 @@ case8() {
     fi
 }
 
-echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + git_exclude_locally"
+echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
 case1
 case2
 case3
@@ -271,6 +332,7 @@ case4
 case5
 case6
 case6b
+case6c
 case7
 case8
 

@@ -589,7 +589,7 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   happened to run from. Same shape as the `--git-dir` bug one bullet up, which is why both rules
   now live in `lib.sh` rather than at the call site.
 - **Every file `setup.sh` installs is written atomically** — `scripts/lib.sh`'s `install_exec`
-  (temp file + `mv`), and `jkb service install`'s `write_atomic` for the unit. The loop above
+  (temp file + `mv`), and `jkb_cli::atomic::write` for `jkb service install`'s units. The loop above
   is why: the hook runs `setup.sh`, and `setup.sh` installs *that hook*. `cp` rewrites the
   target inode in place, and bash reads a script lazily **by byte offset** — so a hook replaced
   mid-run by one of a different length resumes at an offset that no longer means what it meant
@@ -617,22 +617,67 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   exactly the claim that these installs are unreachable from a Rust test. They were unreachable
   from everything. `scripts/tests/chainer.test.sh` drives all four outcomes and runs the
   installed chainer in both a plain checkout and a worktree.
-- **A hooks path inside the working tree is excluded locally** (`git_exclude_locally`). A
+- **A hooks path inside the working tree is excluded locally** (`reconcile_exclude`). A
   relative `core.hooksPath` resolves inside the tree, so the untracked chainer made every
   `jkb task work` session read dirty and `jkb task land` refuse it — and deleting it did not
   help, since the next pull recreates it. `.git/info/exclude` is the local, unpushed write D36
   already sanctions for `.jkb/`; editing someone's tracked `.gitignore` is not.
-- **The whole hook block is `lib.sh`'s `install_git_hooks`, reporting `key=value` lines**;
-  setup.sh only renders them. Every test drove the helpers and nothing drove the block that
-  calls them, so reverting the hooks directory to `--git-dir` left the gate green with the
-  headline fix undone. The same move as the chainer body one bullet up, for the same reason.
+- **The exclude rule is reconciled on every run, and ownership is byte identity again.** It was
+  written once, on the run that installed a chainer, and never revisited — so a user who later
+  replaced that chainer with their own hook had it git-ignored **for ever**: the next run said
+  `chainer=foreign`, left the rule in place, and `git status` went silent with nothing
+  attributing it to jkb. `reconcile_exclude <repo> <path> yes|no` now makes the file agree with
+  the chainer outcome in both directions, which is one rule rather than two, because excluding
+  a `foreign` chainer and refusing to touch it are opposite positions on the same question.
+  jkb writes a **marked two-line block** and retracts only that exact adjacent pair — the
+  `chainer_body` lesson applied a second time. A bare pattern may be a rule the user wrote, so
+  it is reported (`unowned`) and never deleted: the residual harm becomes visible with a
+  remedy instead of silent and permanent.
+- **`install_git_hooks` reports STATES, not actions, and ends in a verdict.** Three findings
+  were one shape: while each key named something jkb *did*, every state that arises from **not**
+  acting had no key, no render arm and no test — a stale exclude rule, an exclusion attempted
+  and failed, a hook installed where git will never run it. So `chainer=`/`exclude=` carry a
+  state word with its evidence, and `dispatch=direct|chained|unknown|dead` is emitted on every
+  successful run, answering the one question the feature exists for. It is derived from the
+  world (`[ -x "$chainer" ]`), not from the outcome word, because `foreign` and `failed` each
+  cover a file that will dispatch and one that will not — and it is three-valued because a
+  foreign chainer may dispatch perfectly well and we cannot know, so it is `unknown`, never
+  `dead`. `error=` now means *nothing was done* and is always the sole line: it used to follow
+  `repo-hook=`, so setup.sh printed "repo hook: …" and then "skipping hook install".
+- **Both halves of the seam live in `lib.sh` — the installer AND `render_git_hooks_report`.**
+  Moving only the installer drew the boundary one level too low: nothing runs setup.sh, so its
+  `case` arms were reachable from no test, and two findings sat in them with the gate green
+  while the tests re-parsed the protocol themselves. Every `case` in the renderer has a default
+  arm that **warns**, so a key added to the producer with no arm surfaces instead of vanishing.
+  setup.sh is one line: `render_git_hooks_report < <(install_git_hooks …)`.
+- **Every function in `lib.sh` behaves the same with `set -e` on or off**, and a reporter says
+  `failed` in words rather than in its exit status. The report used to reach setup.sh only
+  because the call happened to be written `… || true`, which disables `set -e` for the whole
+  function body; without it the subshell died inside `install_chainer` and setup.sh printed the
+  repo hook and **nothing else**, while `core.hooksPath` was set and that hook was dead. The
+  suites cannot be sourced under `set -e` (`fail` increments and continues by design), so one
+  case runs the installer in a `bash -euo pipefail` child instead.
+- **A redirection that fails on a `{ …; }` group is not reported to `if !`** — only on a simple
+  command or a function call, where bash returns non-zero as expected. Written as a group, the
+  exclude append printed `added` for a write that had just been refused: the very defect the
+  `failed` state exists to report, reintroduced inside its own fix. Found by running the new
+  test, not by reading it.
 - **An append to `.git/info/exclude` writes its separator first.** A file not ending in a
   newline — a hand-edited one usually does not — had its last rule fused with ours (`*.log` +
   `/.githooks/post-merge`), destroying a rule the user owns while our own pattern stayed inert,
   under a success message. `session::ensure_excluded` computes the same `sep`: one rule, an
   implementation in each language, and the shell copy was written without consulting the Rust
-  one. Excluding is also gated on the chainer being **ours** — hiding a `foreign` file would
-  take the opposite position on ownership from the line that just refused to touch it.
+  one.
+- **A caller of the atomic write is pinned by the destination's INODE, not by its content.**
+  The primitive having a test is not the claim; the mutation that matters is at a call site,
+  and a rename and an in-place rewrite leave identical content. Replacing `install_exec` at
+  `install_git_hooks`' own call with `cp && chmod 755` — exactly the code this change exists to
+  remove — left all four suites green, as did the same swap at the three `install_chainer`
+  arms. `harness.sh`'s `inode_of` makes the assertion one line, and `lib.sh`'s header states
+  that `install_exec` is the only function permitted to write an executable destination.
+  `service::install` was the same gap in Rust and had no way to be tested at all: it derived
+  its destinations from `$HOME`, so `install_units(manager, units)` now takes them as an
+  argument — the split `commands::install_into` already made, for the same reason.
 - **The atomic write is one seam, `jkb_cli::atomic::write`**, used by `service::install` and by
   `commands::write_all`. The shell half was fixed first, the service unit second, and the
   `~/.claude/{workflows,commands}` assets were still truncating in place — on a path setup.sh

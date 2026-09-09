@@ -149,8 +149,7 @@ fn write_all(base: &Path, verbose: bool) -> Result<()> {
             // post-merge hook, which runs setup.sh, which reinstalls the binary, whose next
             // invocation reconciles the bundle. `fs::write` truncates in place, so a reader
             // in that window sees a half-written script.
-            crate::atomic::write(&path, body.as_bytes())
-                .with_context(|| format!("writing {}", path.display()))?;
+            crate::atomic::write(&path, body.as_bytes())?;
             if verbose {
                 println!("wrote {}", path.display());
             }

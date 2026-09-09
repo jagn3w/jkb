@@ -74,6 +74,16 @@ isolate_git() {
 # git_q … — git with an identity, so `commit` works under the isolated config.
 git_q() { git -c user.name=t -c user.email=t@example.com "$@"; }
 
+# inode_of <path> — the file's inode number.
+#
+# The faithful observable for "was this replaced safely?". A rename (or unlink+create) gives
+# the destination a NEW inode and leaves the old one intact for whoever is reading — or
+# executing — it; `cp` and `> "$dest"` truncate and rewrite the same inode underneath them.
+# So an assertion on content cannot tell the two apart, and every mutation at a call site
+# survived the suites until this was asserted. `ls -di` rather than `stat`, whose flags split
+# GNU (`-c`) from BSD (`-f`).
+inode_of() { ls -di "$1" 2>/dev/null | awk '{print $1}'; }
+
 # entries_in <dir> — every entry, sorted. Tests assert a directory's whole contents rather
 # than searching for a name they expect: looking for `.jkb-install.*` meant the assertion
 # knew install_exec's temp template, so renaming it made those cases pass regardless.

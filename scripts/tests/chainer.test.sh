@@ -44,11 +44,20 @@ case1() {
 # 644; git skips a non-executable hook, so reporting "up to date" would mean the repo hook
 # silently never runs — the exact failure the chainer exists to prevent.
 case1b() {
-    local d="$work/mode" got
+    local d="$work/mode" got before
     mkdir -p "$d"
     chainer_body >"$d/post-merge"
     chmod 644 "$d/post-merge"
+    before="$(inode_of "$d/post-merge")"
     got="$(install_chainer "$d/post-merge")"
+    # The replacement must be a rename. `cp`/`> "$dest"` leave the inode alone and rewrite it
+    # underneath whoever is reading — or executing — the old file, and the mode and content
+    # assertions below pass either way, which is how every call-site mutation survived.
+    if [ -n "$before" ] && [ "$(inode_of "$d/post-merge")" != "$before" ]; then
+        ok "the re-install replaced it by rename, not in place"
+    else
+        fail "mode: inode" "the destination kept inode $before — it was rewritten in place"
+    fi
     if [ "$got" = "up-to-date" ]; then
         fail "mode: outcome" "reported up-to-date for a chainer git will not execute"
     else
@@ -61,11 +70,17 @@ case1b() {
 
 # --- 2. a chainer from before the worktree fix is upgraded -------------------------------
 case2() {
-    local d="$work/legacy" got
+    local d="$work/legacy" got before
     mkdir -p "$d"
     chainer_body_v1 >"$d/post-merge"
     chmod 755 "$d/post-merge"
+    before="$(inode_of "$d/post-merge")"
     got="$(install_chainer "$d/post-merge")"
+    if [ -n "$before" ] && [ "$(inode_of "$d/post-merge")" != "$before" ]; then
+        ok "the upgrade replaced it by rename, not in place"
+    else
+        fail "legacy: inode" "the destination kept inode $before — it was rewritten in place"
+    fi
     if [ "$got" = "refreshed" ] && chainer_body | cmp -s - "$d/post-merge"; then
         ok "a known older body: refreshed to the current one"
     else
@@ -157,7 +172,7 @@ case6() {
 # them, so reverting the hooks directory to `--git-dir` left the entire gate green while the
 # headline fix was undone. The oracle is git's own answer.
 case7() {
-    local d="$work/block" main wt out hook
+    local d="$work/block" main wt out hook before
     mkdir -p "$d"
     main="$d/main"
     git_q init -q "$main" >/dev/null 2>&1
@@ -165,6 +180,13 @@ case7() {
     git_q -C "$main" worktree add -q "$d/wt" -b side >/dev/null 2>&1
     wt="$d/wt"
     printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    # An EXISTING hook, so the install is a replacement and the inode assertion below has a
+    # "before". This is the headline bug's own call site: a pull runs the hook, the hook runs
+    # setup.sh, and setup.sh installs that hook — `cp` there rewrites the running script's
+    # inode and the shell resumes at a byte offset that no longer means what it meant.
+    printf '#!/bin/sh\necho OLD\n' >"$(git_hooks_dir "$wt")/post-merge"
+    chmod 755 "$(git_hooks_dir "$wt")/post-merge"
+    before="$(inode_of "$(git_hooks_dir "$wt")/post-merge")"
 
     # Run it the way a session does: against the WORKTREE, which is where the bug lived.
     out="$(install_git_hooks "$wt" "$d/src")"
@@ -176,10 +198,21 @@ case7() {
     fi
     [ -x "$hook" ] && ok "and it is executable" || fail "block: mode" "$hook is not executable"
 
-    # No core.hooksPath here, so it must report no chainer and exclude nothing.
+    if [ -n "$before" ] && [ "$(inode_of "$hook")" != "$before" ]; then
+        ok "and replaced the old hook by rename, not in place"
+    else
+        fail "block: inode" "the hook kept inode $before — it was rewritten under any process running it"
+    fi
+
+    # No core.hooksPath here, so git reads .git/hooks itself: no chainer, nothing to hide,
+    # and the verdict says the hook will run.
     case "$out" in
-        *chainer=*|*excluded=*) fail "block: extra" "reported a chainer with no core.hooksPath: $out" ;;
+        *chainer=*|*exclude=*) fail "block: extra" "reported a chainer with no core.hooksPath: $out" ;;
         *) ok "with no core.hooksPath it installs only the repo hook" ;;
+    esac
+    case "$out" in
+        *"dispatch=direct"*) ok "and the verdict is that git runs it directly" ;;
+        *) fail "block: verdict" "expected dispatch=direct, got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
 }
 
@@ -203,9 +236,15 @@ case8() {
         *"chainer=foreign"*) ok "a foreign chainer is reported as foreign" ;;
         *) fail "foreign: outcome" "expected chainer=foreign, got: $out" ;;
     esac
+    # `exclude=added`/`kept` here would take the opposite position on ownership from the line
+    # above: jkb declaring the file not its to touch and then writing a permanent ignore rule
+    # for it. Matched on the states, not on the ABSENCE of a key — `exclude=` is emitted on
+    # every run that reaches a chainer, so "no exclude line" would be a guard that cannot fire.
     case "$out" in
-        *excluded=*) fail "foreign: excluded" "jkb hid a chainer it had just declared not its own" ;;
-        *) ok "and it is not added to .git/info/exclude" ;;
+        *"exclude=added"*|*"exclude=kept"*)
+            fail "foreign: excluded" "jkb hid a chainer it had just declared not its own" ;;
+        *exclude=*) ok "and it is not added to .git/info/exclude" ;;
+        *) fail "foreign: no verdict" "no exclude= line at all: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     grep -q 'my own hook' "$repo/.githooks/post-merge" \
         && ok "the user's hook is untouched" \
@@ -234,6 +273,256 @@ case9() {
         || ok "and writes nothing"
 }
 
+
+# --- 10. the ordinary path, end to end: install -> up-to-date -> refresh -> foreign --------
+# Pass 5's must-fix twice over. Nothing drove `install_git_hooks` down the arm that INSTALLS
+# a chainer — case 7 has no core.hooksPath, case 8 starts foreign, case 9 is not a repo — so
+# mutating lib.sh's `installed|up-to-date|refreshed)` to `never-matches-this)` left 40/40
+# assertions ok. That arm is the whole exclusion composition, on the ordinary configuration
+# of every machine that sets core.hooksPath globally.
+#
+# And step 4 is the other must-fix: the exclude rule was written once and never revisited, so
+# a user who replaced jkb's chainer with their own hook had it git-ignored for ever — run 2
+# said `foreign`, left run 1's rule in place, and `git status` went silent.
+#
+# Each step also pipes its own report through `render_git_hooks_report`, so the arms setup.sh
+# used to hold inline are executed rather than re-parsed by the test.
+case10() {
+    local d="$work/lifecycle" r out rendered chainer before
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    # RELATIVE, so git resolves the chainer inside the working tree and exclusion is in play.
+    git_q -C "$r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    chainer="$r/.githooks/post-merge"
+
+    # 1. first run — installs the chainer and hides it.
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"chainer=installed $chainer"*) ok "an ordinary core.hooksPath: the chainer is installed" ;;
+        *) fail "life: install" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"exclude=added /.githooks/post-merge"*) ok "and hidden from git status" ;;
+        *) fail "life: exclude" "expected exclude=added, got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"dispatch=chained"*) ok "and the verdict is that the repo hook will run" ;;
+        *) fail "life: verdict" "expected dispatch=chained, got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ -z "$(git_q -C "$r" status --porcelain)" ] \
+        && ok "so the tree is clean and a session can land" \
+        || fail "life: dirty" "still dirty: $(git_q -C "$r" status --porcelain | tr '\n' ' ')"
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"core.hooksPath is set, so this is required"*"added to .git/info/exclude"*)
+            ok "and setup.sh's rendering of it says both" ;;
+        *) fail "life: render install" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+
+    # 2. second run — idempotent, and the rule is not duplicated.
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"chainer=up-to-date"*"exclude=kept /.githooks/post-merge"*)
+            ok "running it again: up-to-date, rule kept" ;;
+        *) fail "life: idempotent" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ] \
+        && ok "and the pattern appears exactly once" \
+        || fail "life: duplicate" "appears $(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude") times"
+
+    # 3. a chainer from before the worktree fix — the `refreshed` outcome word, by rename.
+    chainer_body_v1 >"$chainer"; chmod 755 "$chainer"
+    before="$(inode_of "$chainer")"
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"chainer=refreshed"*) ok "an older chainer is refreshed through the block" ;;
+        *) fail "life: refresh" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ -n "$before" ] && [ "$(inode_of "$chainer")" != "$before" ] \
+        && ok "and by rename, so a running chainer keeps its bytes" \
+        || fail "life: refresh inode" "the chainer kept inode $before"
+
+    # 4. the user replaces it with their own hook. jkb must stop hiding it.
+    printf '#!/bin/sh\n# my own post-merge\ndirenv reload\n' >"$chainer"
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"chainer=foreign"*"exclude=retracted /.githooks/post-merge"*)
+            ok "replacing the chainer: foreign, and the exclude rule is retracted" ;;
+        *) fail "life: retract" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    if [ -n "$(git_q -C "$r" status --porcelain)" ]; then
+        ok "so the user's own hook is visible to git again"
+    else
+        fail "life: still hidden" "the user's hook is still hidden by a rule jkb wrote"
+    fi
+    grep -q 'direnv reload' "$chainer" \
+        && ok "and their file was not touched" \
+        || fail "life: clobbered" "the user's hook was overwritten"
+    case "$out" in
+        *"dispatch=unknown"*) ok "and the verdict is unknown, not dead — a foreign chainer may dispatch" ;;
+        *) fail "life: foreign verdict" "expected dispatch=unknown, got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"was not written by jkb"*"dropped from .git/info/exclude"*"the repo hook never runs"*)
+            ok "and the rendering says all three" ;;
+        *) fail "life: render foreign" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 11. the report survives `set -e`, and never claims a hook was skipped -----------------
+# Two findings. The report used to reach setup.sh only because the call happened to be
+# written `… || true`, which disables `set -e` for the whole function body; without it the
+# subshell died inside `install_chainer` and setup.sh printed the repo hook and nothing else,
+# while core.hooksPath was set and that hook was therefore dead. And the failure was reported
+# as `error=`, which setup.sh renders "skipping hook install" — directly under the line
+# saying the hook was installed.
+case11() {
+    local d="$work/seterr" r out rendered
+    if [ "$(id -u)" = "0" ]; then
+        skip "an unwritable directory cannot be simulated as root"
+        return
+    fi
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    mkdir -p "$d/ro"
+    git_q -C "$r" config core.hooksPath "$d/ro"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    # Exists, so `mkdir -p` succeeds; unwritable, so install_exec's mktemp fails.
+    chmod 555 "$d/ro"
+
+    # A CHILD shell with `set -euo pipefail`, which is what setup.sh runs under. Sourcing the
+    # harness under `set -e` is not an option — `fail` increments and continues by design —
+    # so the difference is covered here rather than assumed.
+    out="$(bash -euo pipefail -c '. "$1/scripts/lib.sh"; install_git_hooks "$2" "$3"' _ \
+        "$repo_root" "$r" "$d/src" 2>/dev/null)"
+    chmod 755 "$d/ro"
+
+    case "$out" in
+        *repo-hook=*) ok "under set -e the repo hook is still reported" ;;
+        *) fail "seterr: hook" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"chainer=failed"*) ok "and so is the chainer failure, instead of the shell dying on it" ;;
+        *) fail "seterr: chainer" "the report stopped early: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"dispatch=dead"*) ok "and the verdict says the hook just installed will not run" ;;
+        *) fail "seterr: verdict" "expected dispatch=dead, got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # `error=` means nothing was done, so it must never follow a line saying something was.
+    case "$out" in
+        *error=*) fail "seterr: error=" "a chainer failure was reported as error=, which renders 'skipping hook install'" ;;
+        *) ok "and it is not reported as error=, which would say the install was skipped" ;;
+    esac
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"skipping hook install"*)
+            fail "seterr: render" "the rendering says the hook install was skipped, under a line saying it was installed" ;;
+        *"git will NOT run the repo hook above"*)
+            ok "and the rendering states the consequence" ;;
+        *) fail "seterr: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 11b. the override directory itself cannot be created ---------------------------------
+# Concern 4's own reproduction (`core.hooksPath=/etc/githooks-nope`, a root-owned parent).
+# This arm printed `error=cannot create …` AFTER `repo-hook=`, and setup.sh renders `error=`
+# as "skipping hook install" — so it said the hook was installed and then that the install
+# was skipped, while the state that actually mattered (core.hooksPath is set, no chainer
+# exists, so git will never run the hook just reported) was stated nowhere.
+case11b() {
+    local d="$work/nomkdir" r out rendered
+    if [ "$(id -u)" = "0" ]; then
+        skip "an uncreatable directory cannot be simulated as root"
+        return
+    fi
+    mkdir -p "$d/parent"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath "$d/parent/githooks"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    chmod 555 "$d/parent"
+
+    out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    chmod 755 "$d/parent"
+
+    case "$out" in
+        *repo-hook=*"chainer=failed"*) ok "an uncreatable hooks directory: the chainer is reported failed" ;;
+        *) fail "nomkdir: report" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *error=*) fail "nomkdir: error=" "reported error= after repo-hook=, which renders 'skipping hook install'" ;;
+        *) ok "and not as error=, which claims nothing was done" ;;
+    esac
+    case "$out" in
+        *"dispatch=dead"*) ok "and the verdict says the repo hook will not run" ;;
+        *) fail "nomkdir: verdict" "expected dispatch=dead, got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"skipping hook install"*) fail "nomkdir: render" "the rendering contradicts the line above it" ;;
+        *"git will NOT run the repo hook above"*) ok "and the rendering says so where a person reads it" ;;
+        *) fail "nomkdir: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 12. an exclusion that could not be written says so -----------------------------------
+# It used to return success with no output — a failed exclusion spelled exactly like "nothing
+# needed". The tree then read dirty, `jkb task land` refused it, and nothing attributed the
+# dirt to jkb. `Unknown` is never spelled `no`, and neither is `failed`.
+case12() {
+    local d="$work/excludefail" r out rendered
+    if [ "$(id -u)" = "0" ]; then
+        skip "an unwritable file cannot be simulated as root"
+        return
+    fi
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    : >"$r/.git/info/exclude"
+    chmod 444 "$r/.git/info/exclude"
+
+    out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    chmod 644 "$r/.git/info/exclude"
+
+    case "$out" in
+        *"exclude=failed"*) ok "an exclude file that cannot be written is reported as failed" ;;
+        *) fail "excludefail: state" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"could not update .git/info/exclude"*"jkb task land"*)
+            ok "and the rendering names the consequence a session will hit" ;;
+        *) fail "excludefail: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 13. a key with no render arm is not swallowed ----------------------------------------
+# The default arms. A key added to the producer without an arm here used to vanish, which is
+# how an `error=` line contradicting the line above it stayed invisible for three passes.
+case13() {
+    local rendered
+    rendered="$(printf 'invented=1\nchainer=sideways /x\n' | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"unrecognised report line: invented=1"*) ok "an unknown key is warned about, not swallowed" ;;
+        *) fail "render: unknown key" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+    case "$rendered" in
+        *"unrecognised chainer outcome"*) ok "and so is an unknown value of a known key" ;;
+        *) fail "render: unknown value" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
 echo "==> scripts/lib.sh::install_chainer"
 case1
 case1b
@@ -245,5 +534,10 @@ case6
 case7
 case8
 case9
+case10
+case11
+case11b
+case12
+case13
 
 finish

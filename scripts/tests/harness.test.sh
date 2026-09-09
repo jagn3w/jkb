@@ -82,6 +82,27 @@ EOF
     fi
 }
 
+# --- 2c. inode_of distinguishes a rename from an in-place rewrite -------------------------
+# The whole point of the helper: every atomicity assertion in the other suites is built on it,
+# so if it answered the same for both it would turn three real pins into three vacuous ones.
+case2c() {
+    local f="$work/inode" before
+    printf 'one\n' >"$f"
+    before="$(inode_of "$f")"
+    printf 'two\n' >"$f"                       # in place: same inode
+    if [ -n "$before" ] && [ "$(inode_of "$f")" = "$before" ]; then
+        ok "inode_of is unchanged by an in-place rewrite"
+    else
+        fail "inode_of: in place" "before=$before after=$(inode_of "$f")"
+    fi
+    printf 'three\n' >"$f.tmp" && mv -f "$f.tmp" "$f"   # rename: new inode
+    if [ "$(inode_of "$f")" != "$before" ]; then
+        ok "and changes when the file is replaced by rename"
+    else
+        fail "inode_of: rename" "still $before after a rename"
+    fi
+}
+
 # --- 3. a file that asserts nothing fails -------------------------------------------------
 # `finish`'s reason for existing: a suite whose every case bailed out on a failed premise used
 # to exit 0, indistinguishable from one that checked everything and was happy.
@@ -118,6 +139,7 @@ echo "==> scripts/tests/harness.sh"
 case1
 case2
 case2b
+case2c
 case3
 case4
 

@@ -38,8 +38,15 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
 
     // Both fallible steps clean up through one path — a write that fails part-way leaves a
     // temp file just as surely as a failed rename does.
+    //
+    // BOTH contexts name `path`, never `tmp`. The temp file is an implementation detail and
+    // by the time the error is printed it has been removed, so naming it sent the operator to
+    // `…/.com.jkb.sync.plist.4711.tmp` — a path that does not exist and that they never asked
+    // jkb to write. One caller compensated by wrapping the whole call in its own
+    // `writing {path}`, which then read doubled; the other had dropped that wrapping. Saying
+    // it once, here, is why this is a seam.
     let installed = std::fs::write(&tmp, contents)
-        .with_context(|| format!("writing {}", tmp.display()))
+        .with_context(|| format!("writing {}", path.display()))
         .and_then(|()| {
             std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
         });
