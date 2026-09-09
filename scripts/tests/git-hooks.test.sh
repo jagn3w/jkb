@@ -339,6 +339,41 @@ case6d() {
     esac
 }
 
+# --- 6n. the override agrees with git's own answer, in every layout ------------------------
+# The oracle, not a snapshot. A round asserted that a relative `core.hooksPath` with no working
+# tree is unresolvable; git resolves it against the git dir and runs the hook, so the claim was
+# false and jkb stopped installing a chainer where git dispatches from. Asking git in each
+# layout is what makes that unrepeatable — including the two layouts nobody had measured, a
+# `.git` gitfile and a repo whose worktree has been removed.
+case6n() {
+    local d="$work/oracle" label dir ours theirs bad=""
+    mkdir -p "$d"
+    git_q init -q --bare "$d/bare.git" >/dev/null 2>&1
+    git_q -C "$d/bare.git" config core.hooksPath .githooks
+    git_q init -q "$d/norm" >/dev/null 2>&1
+    git_q -C "$d/norm" commit -q --allow-empty -m init
+    git_q -C "$d/norm" config core.hooksPath .githooks
+    git_q -C "$d/norm" worktree add -q "$d/wt" -b side >/dev/null 2>&1
+    git_q init -q --separate-git-dir="$d/gitdir" "$d/sep" >/dev/null 2>&1
+    git_q -C "$d/sep" commit -q --allow-empty -m init
+    git_q -C "$d/sep" config core.hooksPath .githooks
+
+    for dir in "$d/bare.git" "$d/norm" "$d/wt" "$d/sep"; do
+        ours="$(git_hooks_override "$dir" 2>/dev/null)/post-merge"
+        theirs="$(cd "$dir" && git rev-parse --path-format=absolute --git-path hooks/post-merge 2>/dev/null)"
+        [ "$ours" = "$theirs" ] || bad="$bad [$dir ours=$ours git=$theirs]"
+    done
+    # And once more with a worktree removed behind git's back.
+    rm -rf "$d/wt"
+    ours="$(git_hooks_override "$d/norm" 2>/dev/null)/post-merge"
+    theirs="$(cd "$d/norm" && git rev-parse --path-format=absolute --git-path hooks/post-merge 2>/dev/null)"
+    [ "$ours" = "$theirs" ] || bad="$bad [pruned ours=$ours git=$theirs]"
+
+    [ -z "$bad" ] \
+        && ok "core.hooksPath resolves the way git resolves it, in every layout" \
+        || fail "oracle" "disagreed:$bad"
+}
+
 # --- 6g. the desired state is the same from every worktree -------------------------------
 # THE regression guard for the sweep. `.git/info/exclude` lives in the common dir and applies
 # to every worktree at once, so a desired state computed from `--show-toplevel` differs per
@@ -834,6 +869,6 @@ case9() {
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9
 
 finish

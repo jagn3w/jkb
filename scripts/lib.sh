@@ -809,15 +809,17 @@ install_git_hooks() {
     # precondition was itself persistent.
     override="$(git_hooks_override "$repo_root")" || override_rc=$?
     if [ "$override_rc" -eq 2 ]; then
-        # `want=unknown`, not the `no` default this branch used to leave in place. `no`
-        # SWEEPS, so a run that has just said it established nothing printed
-        # `exclude=retracted …` beside `dispatch=unreadable` — two lines making opposite
-        # epistemic claims about one path, after which the chainer read untracked and the next
-        # resolvable run put the block back: the flip-flop the worktree-invariant derivation
-        # exists to prevent, reintroduced through the destructive half. The sibling rc-2 cause
-        # is already right because the derivation answers `undecided` for it; this branch
-        # bypasses the derivation, so it carries the fact itself.
-        want=unknown
+        # This branch decides the VERDICT only, and leaves `want` to the derivation in the
+        # funnel below — because rc 2 covers two causes that differ on exactly the question
+        # `want` answers. A value git cannot expand establishes nothing, and the derivation
+        # says `undecided` for it, which the funnel maps to `want=unknown`: touch nothing. An
+        # EMPTY value establishes a great deal — nothing of ours is anywhere — and the
+        # derivation says `none (core.hooksPath is empty)`, which maps to `want=no`, so a
+        # stale block is swept, which is the whole point of the sweep.
+        #
+        # Setting `want=unknown` here would be right for the first and wrong for the second,
+        # stranding a stale block for ever: round 4's original harm, restored while fixing
+        # round 12's. One fact, one source.
         verdict="unreadable core.hooksPath"
     elif [ -z "$override" ]; then
         verdict="direct"

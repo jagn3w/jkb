@@ -783,15 +783,38 @@ case10k() {
         *"dispatch=unreadable"*) ok "an empty core.hooksPath is not reported as no override" ;;
         *) fail "empty: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
-    # THE MUST-FIX: a verdict that admits nothing was established must not sweep.
+    # `dispatch=unreadable` covers TWO causes that differ on exactly the question the sweep
+    # asks, so the verdict must not decide it. An EMPTY value establishes a great deal —
+    # nothing of ours is anywhere — so a stale block is swept, which is the whole point of the
+    # sweep. Deciding `want` from the verdict instead of from the derivation would be right
+    # for the sibling cause and would strand this one for ever: round 4's original harm,
+    # restored while fixing round 12's.
     case "$out" in
-        *"exclude=retracted"*)
-            fail "empty: swept" "it retracted a block under a verdict saying nothing was established" ;;
-        *) ok "and does not sweep under a verdict that established nothing" ;;
+        *"exclude=retracted /.githooks/post-merge"*) ok "a stale block is swept: nothing of ours is anywhere" ;;
+        *) fail "empty: not swept" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     grep -qxF '/.githooks/post-merge' "$ex" \
-        && ok "so the block that was there is still there" \
-        || fail "empty: gone" "file: $(tr '\n' '|' <"$ex")"
+        && fail "empty: still there" "the stale block survived" \
+        || ok "and it is gone from the file"
+
+    # The SIBLING cause, which establishes nothing and must therefore touch nothing.
+    local u="$d/unexpandable"
+    git_q init -q "$u" >/dev/null 2>&1
+    git_q -C "$u" commit -q --allow-empty -m init
+    printf '%s\n/.githooks/post-merge\n' "$(exclude_marker)" >>"$u/.git/info/exclude"
+    git_q -C "$u" config core.hooksPath "~jkb-no-such-account-$$/hooks"
+    if git -C "$u" config --get --path core.hooksPath >/dev/null 2>&1; then
+        skip "this git expands ~jkb-no-such-account-$$ without failing"
+    else
+        out="$(install_git_hooks "$u" "$d/src" 2>/dev/null)"
+        case "$out" in
+            *"exclude=undecided"*) ok "an unexpandable value establishes nothing and says so" ;;
+            *) fail "unexp: state" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+        grep -qxF '/.githooks/post-merge' "$u/.git/info/exclude" \
+            && ok "and its block is left exactly where it was" \
+            || fail "unexp: swept" "the block was retracted under an unestablished answer"
+    fi
     case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
         *"names no usable hooks directory"*) ok "and the operator is told why" ;;
         *) fail "empty: render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
