@@ -690,12 +690,22 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   0. Two regression pins — the cross-worktree agreement set and the whole CRLF exclude set, both
   for bugs shipped once already — went that way with the gate green. `run_cases` checks
   `declare -F` first, which is the harness's own stated failure mode closed one level down.
-- **An answer git refused to give is `undecided`, never `none`.** `none` means *proven absence*
-  and the caller turns it into `want=no`, so a transient `worktree list` or `config --get`
-  failure swept jkb's own block away and reported "jkb no longer stands behind hiding it" —
-  false: jkb could not check. Both inputs run unattended from the post-merge hook. `undecided`
-  with no pattern makes `reconcile_exclude` touch nothing at all, which is the only safe move
-  when the desired state is unknown.
+- **An answer git refused to give is `undecided`, never `none` — in EVERY arm that means it.**
+  `none` is *proven absence* and the caller turns it into `want=no`, so a transient
+  `worktree list` or `config --get` failure swept jkb's own block away and reported "jkb no
+  longer stands behind hiding it": false, jkb could not check. Both run unattended from the
+  post-merge hook. Fixing one arm and leaving its sibling — whose message already said "could
+  not be listed" while its answer claimed proven absence — is the shape this area keeps
+  producing, and is why the test enumerates the arms rather than checking one.
+- **Three-valued means three values, and two different unknowns need two words.** This one
+  function collapsed a `Fact` three rounds running. `ours` was a boolean, so a chainer install
+  that FAILED counted as proven not-jkb's — the run asserted "the file at that path is not one
+  jkb wrote" about a file jkb had written, and dropped the dirty-worktree warning with it,
+  three lines below a comment saying that file may well be one jkb wrote. And `want=undecided`
+  carried two unrelated unknowns: *nothing is decided about this pattern* (sweep the others)
+  and *the derivation could not answer* (touch nothing). Sharing the word made a failed chainer
+  install with a decidably-empty pattern skip the sweep and strand a stale block permanently.
+  They are `undecided` and `unknown` now, and `ours` is `yes|no|unknown`.
 - **A claim about jkb's own file is gated on ownership, not on a variable that means something
   else.** The `exposed` downgrade read `want`, which the pattern-empty rule collapses to `no`
   two lines later — and an exposed line is by definition pattern-empty, so the downgrade was

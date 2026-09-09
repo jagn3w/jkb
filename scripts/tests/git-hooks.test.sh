@@ -471,8 +471,27 @@ case6m() {
     ex="$r/.git/info/exclude"
     reconcile_exclude "$r" "/.githooks/post-merge" yes >/dev/null
 
-    # Undecided with no pattern: every block stays exactly as it was.
-    got="$(reconcile_exclude "$r" "" undecided "undecided (core.hooksPath could not be read)")"
+    # EVERY arm of the helper that means "git would not answer" must use the one word. Only
+    # one of the two was changed when this was fixed, and the other — an unlistable worktree
+    # set — kept saying `none`, which the caller collapses to want=no and which therefore
+    # retracts jkb's own block. The message on that line already said "could not be listed"
+    # while the answer claimed proven absence.
+    local arm bad=""
+    for arm in "$work/not-a-repo"; do
+        mkdir -p "$arm"
+        case "$(git_hooks_exclude_pattern "$arm" 2>/dev/null)" in
+            "undecided "*) ;;
+            *) bad="$bad [$arm -> '$(git_hooks_exclude_pattern "$arm" 2>/dev/null)']" ;;
+        esac
+    done
+    [ -z "$bad" ] \
+        && ok "an unlistable worktree set is undecided, not proven absence" \
+        || fail "undecided: worktrees" "wrong:$bad"
+
+    # `unknown` — the DERIVATION could not answer — leaves every block exactly as it was.
+    # Distinct from `undecided`, which says only that THIS pattern is undecided and must still
+    # sweep the others; sharing one word stranded a stale block permanently.
+    got="$(reconcile_exclude "$r" "" unknown "undecided (core.hooksPath could not be read)")"
     case "$got" in
         "exclude=undecided ("*) ok "an unobtainable answer is reported undecided" ;;
         *) fail "undecided: state" "got '$got'" ;;
@@ -488,6 +507,15 @@ case6m() {
     case "$(printf '%s\n' "$got" | render_git_hooks_report 2>&1)" in
         *"could not work out what to hide"*) ok "and the rendering says so" ;;
         *) fail "undecided: render" "$(printf '%s\n' "$got" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+    esac
+
+    # And the sibling word is NOT that: `undecided` with a decidably-empty pattern must still
+    # sweep the other blocks, or a failed chainer install strands them for ever.
+    printf '%s\n/.stale/post-merge\n' "$(exclude_marker)" >>"$ex"
+    got="$(reconcile_exclude "$r" "" undecided "none (core.hooksPath is outside every working tree)")"
+    case "$got" in
+        *"exclude=retracted /.stale/post-merge"*) ok "while undecided still sweeps the others" ;;
+        *) fail "undecided: sibling" "got: $(printf '%s' "$got" | tr '\n' '|')" ;;
     esac
 }
 
@@ -718,6 +746,12 @@ case9() {
     mkdir -p "$d/scripts/tests" "$d/scripts/hooks" "$d/.claude/hooks" "$d/.container"
     printf '#!/usr/bin/env bash\ntrue\n' >"$d/scripts/a.sh"
     printf '#!/bin/sh\ntrue\n' >"$d/scripts/hooks/post-merge"     # no .sh, still shell
+    # One extensionless file per glob that was widened from `*.sh` to `*`, so each has a file
+    # only it can match. Without them, narrowing those globs back left this case green — the
+    # only extensionless fixture lived in `scripts/hooks/`, which was already `*`.
+    printf '#!/usr/bin/env bash\ntrue\n' >"$d/scripts/preflight"
+    printf '#!/bin/sh\ntrue\n' >"$d/.container/entrypoint"
+    printf '#!/usr/bin/env bash\ntrue\n' >"$d/scripts/tests/helper"
     printf 'not shell at all: [unclosed\n' >"$d/.claude/hooks/notes.txt"
     printf '# a readme\n' >"$d/scripts/hooks/README.md"
     printf '#!/usr/bin/python\nprint(1)\n' >"$d/.claude/hooks/probe.py"
@@ -735,9 +769,10 @@ case9() {
         return
     fi
     n="$(printf '%s' "$out" | grep -o '[0-9]* shell file' | grep -o '[0-9]*')"
-    # 4: the .sh, the extensionless hook, the one with flags, and the one with no trailing
-    # newline. Out: the .txt, the .md, the python, and the zsh.
-    [ "$n" = "4" ] \
+    # 7: the .sh, the extensionless hook, the three extensionless files in the widened globs,
+    # the one with flags, and the one with no trailing newline. Out: the .txt, the .md, the
+    # python, and the zsh.
+    [ "$n" = "7" ] \
         && ok "and it counts what it parsed, selecting by shebang rather than by extension" \
         || fail "gate: count" "parsed $n files, expected 4: $out"
     printf '%s\n' "$(shell_sources "$d")" | grep -q 'no-newline' \

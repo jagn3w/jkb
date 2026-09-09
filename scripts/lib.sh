@@ -316,7 +316,17 @@ _exclude_mentions() {
 }
 
 # git_hooks_exclude_pattern <repo_root> — the ONE exclude pattern jkb wants in this
-# repository, as `pattern <glob>` or `none <reason>`.
+# repository, as exactly one of FOUR lines:
+#
+#   pattern <glob>       this is what must be excluded
+#   none <reason>        PROVEN absence: nothing of ours is inside any working tree
+#   exposed <reason>     ours IS inside a working tree and an anchored rule cannot hide it
+#   undecided <reason>   git would not answer; nothing was established, so change nothing
+#
+# The last three are not interchangeable and the caller must not collapse them: `none` licenses
+# the sweep to retract, `undecided` must not, and `exposed` is a warning. Reading two shapes
+# from a header that described two is how `undecided` came to be spelled `none` in the first
+# place.
 #
 # THE RULE THIS FUNCTION EXISTS FOR: the desired state is a pure function of facts every
 # worktree shares — the raw `core.hooksPath` value, the common dir, the main checkout — and
@@ -367,7 +377,7 @@ git_hooks_exclude_pattern() {
 $(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
 EOF
     if [ -z "$main_top" ]; then
-        printf 'none (the repository'"'"'s worktrees could not be listed)\n'
+        printf 'undecided (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
     configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
@@ -525,10 +535,12 @@ _is_exclude_pattern_line() {
 #   exclude=none <reason>            nothing to do
 #   exclude=failed <reason>          a write was attempted and did not land
 #
-# <want> is three-valued. `yes` — we own this pattern and it must be excluded. `no` — nothing
-# of ours may hide it. `undecided` reaches here two ways: the chainer install failed (with a
-# pattern — the OTHER blocks are still swept), or the derivation could not establish a pattern
-# at all (without one — then nothing is touched). In the first, nothing is known about
+# <want> is four-valued, because there are two different unknowns here and sharing one word
+# for them cost a stranded block. `yes` — we own this pattern and it must be excluded. `no` —
+# nothing of ours may hide it. `undecided` — the chainer install failed, so nothing is known
+# about THIS pattern and its block is left as found, while every other block is still swept.
+# `unknown` — the derivation itself could not answer, so nothing at all is touched. Under
+# `undecided`, nothing is known about
 # THIS pattern; its block is left exactly as found. The sweep of every OTHER jkb block runs
 # on all three, because that sweep does not depend on the undecided fact: it is the condition,
 # and a condition must dominate every arm rather than have one that opts out.
@@ -554,10 +566,13 @@ reconcile_exclude() {
     case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
     exclude="$common/info/exclude"
 
-    # Undecided with no pattern is "nothing was established", so nothing is touched: sweeping
-    # with `keep=""` would retract every block jkb owns on the strength of an answer git
-    # refused to give.
-    if [ "$want" = undecided ] && [ -z "$pattern" ]; then
+    # `unknown` — the DERIVATION could not establish anything — touches nothing at all:
+    # sweeping with `keep=""` would retract every block jkb owns on the strength of an answer
+    # git refused to give. It is its own word rather than a second meaning for `undecided`,
+    # which says only "nothing is decided about THIS pattern" and must still sweep the others;
+    # sharing one word made a failed chainer install with a decidably-empty pattern skip the
+    # sweep too, stranding a stale block permanently.
+    if [ "$want" = unknown ]; then
         printf 'exclude=%s\n' "${empty_report:-undecided (nothing could be established)}"
         return 0
     fi
@@ -725,7 +740,7 @@ reconcile_exclude() {
 install_git_hooks() {
     local repo_root="$1" hooks_src="$2"
     local hooks_dir chainer="" outcome override override_rc=0
-    local want=no ours=0 verdict="" pat_line pattern="" pattern_reason=""
+    local want=no ours=unknown verdict="" pat_line pattern="" pattern_reason=""
 
     # The two `error=` arms stay AHEAD of the funnel below: `error=` means nothing was done,
     # it is contractually the only line, and there is no exclude question to answer before a
@@ -767,9 +782,13 @@ install_git_hooks() {
         printf 'chainer=%s %s\n' "$outcome" "$chainer"
         case "$outcome" in
             # `ours` is the ownership fact on its own, because `want` answers a different
-            # question and gets collapsed on its way to the funnel.
-            installed|up-to-date|refreshed) want=yes; ours=1 ;;
-            foreign) want=no ;;
+            # question and gets collapsed on its way to the funnel. THREE-valued, like every
+            # other answer here: a failed install leaves a file that may well be one jkb
+            # wrote — three lines down this arm says exactly that — and spelling that unknown
+            # as a definite `no` dropped the dirty-worktree warning and asserted "the file at
+            # that path is not one jkb wrote" about a file jkb did write.
+            installed|up-to-date|refreshed) want=yes; ours=yes ;;
+            foreign) want=no; ours=no ;;
             # A failed install decides nothing about THIS pattern — the file there may be a
             # chainer jkb wrote before the refresh failed — but it decides nothing about the
             # other blocks either, and they need no decision.
@@ -791,10 +810,11 @@ install_git_hooks() {
     pat_line="$(git_hooks_exclude_pattern "$repo_root")"
     case "$pat_line" in
         "pattern "*) pattern="${pat_line#pattern }" ;;
-        # The derivation could not establish anything. Leave every block exactly as found —
-        # `want=undecided` with no pattern makes `reconcile_exclude` touch nothing — rather
-        # than sweeping on the strength of an answer git refused to give.
-        "undecided "*) pattern=""; pattern_reason="$pat_line"; want=undecided ;;
+        # The derivation could not establish anything. `unknown`, not `undecided`: those are
+        # two different unknowns and `reconcile_exclude` treats them differently — this one
+        # touches nothing at all, rather than sweeping on the strength of an answer git
+        # refused to give.
+        "undecided "*) pattern=""; pattern_reason="$pat_line"; want=unknown ;;
         # Not a pattern: the helper already worded the whole report line — `none …`
         # (nothing of ours anywhere, rendered silently) or `exposed …` (ours IS in a tree
         # and we are declining to hide it, which the renderer warns about).
@@ -812,13 +832,16 @@ install_git_hooks() {
     # This runs BEFORE that rule, and asks the question it actually means.
     case "$pat_line" in
         "exposed "*)
-            [ "$ours" -eq 1 ] \
+            # Suppressed only on a PROVEN `foreign` — the user's own file, none of jkb's
+            # business. On `yes` and on `unknown` the warning stands: the file is untracked in
+            # a real tree either way, and that is what makes the tree read dirty.
+            [ "$ours" != no ] \
                 || pattern_reason="none (the file at that path is not one jkb wrote)"
             ;;
     esac
     # Nothing to own means nothing to want, whatever the chainer did — unless the derivation
     # said it could not tell, in which case not knowing is the answer.
-    if [ -z "$pattern" ] && [ "$want" != undecided ]; then want=no; fi
+    if [ -z "$pattern" ] && [ "$want" != unknown ]; then want=no; fi
     reconcile_exclude "$repo_root" "$pattern" "$want" "$pattern_reason"
 
     printf 'dispatch=%s\n' "$verdict"
@@ -873,7 +896,7 @@ render_git_hooks_report() {
                     none)       : ;;   # nothing to hide, and so nothing worth a line
                     undecided)  warn "could not work out what to hide from git: $detail"
                                 warn "  nothing in .git/info/exclude was changed." ;;
-                    exposed)    warn "the chainer jkb installed is not hidden from git: $detail"
+                    exposed)    warn "the chainer there is not hidden from git: $detail"
                                 warn "  that working tree will read dirty, and \`jkb task land\` refuses a dirty target." ;;
                     failed)     warn "could not update .git/info/exclude $detail"
                                 warn "  the chainer will read as untracked, so the tree looks dirty and \`jkb task land\` refuses it." ;;

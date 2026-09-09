@@ -454,6 +454,12 @@ case10d() {
     git_q -C "$r" commit -q --allow-empty -m init
     printf '#!/bin/sh\necho HOOK\n' >"$d/src"
     user="jkb-no-such-account-$$"
+    # A jkb block already in the file. The end-to-end halves of the `undecided` fix — the
+    # helper's word and the caller's mapping arm — were both revertible with the whole gate
+    # green, because the only case that drove `undecided` called `reconcile_exclude` by hand,
+    # which is the half that was never wrong. With either reverted, this repo has every jkb
+    # block retracted on an unattended post-merge run.
+    printf '%s\n/.githooks/post-merge\n' "$(exclude_marker)" >>"$r/.git/info/exclude"
     git_q -C "$r" config core.hooksPath "~$user/hooks"
     if git -C "$r" config --get --path core.hooksPath >/dev/null 2>&1; then
         skip "this git expands ~$user without failing"
@@ -474,6 +480,19 @@ case10d() {
         *"git runs NO hooks in this repository"*) ok "and the rendering says so" ;;
         *) fail "unreadable: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
     esac
+
+    # And nothing was swept on the strength of an answer git refused to give.
+    case "$out" in
+        *"exclude=undecided"*) ok "the exclude decision is reported undecided, not none" ;;
+        *) fail "unreadable: exclude" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"exclude=retracted"*) fail "unreadable: swept" "it retracted a block it could not decide about" ;;
+        *) ok "and no block is reported as retracted" ;;
+    esac
+    grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude" \
+        && ok "and the block that was there is still there" \
+        || fail "unreadable: gone" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
 }
 
 # --- 10e. the same directory, spelled differently -----------------------------------------
@@ -535,7 +554,7 @@ case10f() {
         *) fail "foreignexposed: positive" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
-        *"chainer jkb installed is not hidden"*"$d/wt"*)
+        *"chainer there is not hidden"*"$d/wt"*)
             ok "and the warning names the tree that will read dirty" ;;
         *) fail "foreignexposed: positive render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
     esac
@@ -554,13 +573,56 @@ case10f() {
     esac
     # And the same run must not warn about a tree it did not dirty.
     case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
-        *"chainer jkb installed is not hidden"*)
+        *"chainer there is not hidden"*)
             fail "foreignexposed: render" "it warned about jkb's chainer dirtying the tree" ;;
         *) ok "nor warn about dirtying a tree with it" ;;
     esac
     grep -q 'direnv reload' "$d/wt/.githooks/post-merge" \
         && ok "and the user's hook is untouched" \
         || fail "foreignexposed: clobbered" "the user's hook was overwritten"
+}
+
+# --- 10g. a failed install is unknown ownership, not proven not-ours -----------------------
+# `ours` was two-valued, so a chainer install that FAILED counted as proven not-jkb's: the run
+# asserted "the file at that path is not one jkb wrote" about a file jkb had written, and
+# dropped the dirty-worktree warning with it. Three lines up, the `failed` arm's own comment
+# says the file there may well be a chainer jkb wrote — the code spelled that unknown as a
+# definite no.
+case10g() {
+    local d="$work/failedowner" m out
+    if [ "$(id -u)" = "0" ]; then
+        skip "an unwritable directory cannot be simulated as root"
+        return
+    fi
+    mkdir -p "$d"
+    m="$d/main"
+    git_q init -q "$m" >/dev/null 2>&1
+    git_q -C "$m" commit -q --allow-empty -m init
+    git_q -C "$m" worktree add -q "$d/wt" -b side >/dev/null 2>&1
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    # jkb's own OLD chainer body in a linked worktree, in a directory it cannot rewrite: the
+    # refresh fails, so ownership is unknown rather than disproven.
+    mkdir -p "$d/wt/.githooks"
+    chainer_body_v1 >"$d/wt/.githooks/post-merge"; chmod 755 "$d/wt/.githooks/post-merge"
+    git_q -C "$m" config core.hooksPath "$d/wt/.githooks"
+    chmod 555 "$d/wt/.githooks"
+
+    out="$(install_git_hooks "$m" "$d/src" 2>/dev/null)"
+    chmod 755 "$d/wt/.githooks"
+
+    case "$out" in
+        *"chainer=failed"*) ok "a chainer jkb cannot refresh is reported failed" ;;
+        *) fail "failedowner: premise" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"not one jkb wrote"*)
+            fail "failedowner: claim" "it asserted the file is not jkb's, about one jkb wrote" ;;
+        *) ok "and jkb does not claim the file is not its own" ;;
+    esac
+    case "$out" in
+        *"exclude=exposed"*) ok "and the dirty-worktree warning still stands" ;;
+        *) fail "failedowner: silent" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
 }
 
 # --- 11. the report survives `set -e`, and never claims a hook was skipped -----------------
@@ -1087,6 +1149,6 @@ EOF
 }
 
 echo "==> scripts/lib.sh::install_chainer"
-run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case11 case11b case11c case11d case12 case12b case13 case14 case15
+run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case11 case11b case11c case11d case12 case12b case13 case14 case15
 
 finish
