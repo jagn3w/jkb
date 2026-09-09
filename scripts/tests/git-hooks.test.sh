@@ -568,6 +568,13 @@ case9() {
     printf '#!/bin/sh\ntrue\n' >"$d/scripts/hooks/post-merge"     # no .sh, still shell
     printf 'not shell at all: [unclosed\n' >"$d/.claude/hooks/notes.txt"
     printf '# a readme\n' >"$d/scripts/hooks/README.md"
+    printf '#!/usr/bin/python\nprint(1)\n' >"$d/.claude/hooks/probe.py"
+    printf '#!/bin/bash -e\ntrue\n' >"$d/.claude/hooks/flags"
+    # A shebang with NO trailing newline: `read` returns non-zero at EOF having already
+    # assigned, and a `|| head=""` on that dropped the file out of the gate silently.
+    printf '#!/bin/sh' >"$d/.claude/hooks/no-newline"
+    # `bash -n` cannot parse zsh, so selecting it would turn a valid script into a red gate.
+    printf '#!/usr/bin/env zsh\nsetopt extendedglob\n' >"$d/.claude/hooks/zshy"
 
     if out="$(check_shell_syntax "$d" 2>&1)"; then
         ok "a tree of valid shell parses"
@@ -576,9 +583,17 @@ case9() {
         return
     fi
     n="$(printf '%s' "$out" | grep -o '[0-9]* shell file' | grep -o '[0-9]*')"
-    [ "$n" = "2" ] \
-        && ok "and it counts what it parsed — the extensionless hook in, the .txt and .md out" \
-        || fail "gate: count" "parsed $n files, expected 2: $out"
+    # 4: the .sh, the extensionless hook, the one with flags, and the one with no trailing
+    # newline. Out: the .txt, the .md, the python, and the zsh.
+    [ "$n" = "4" ] \
+        && ok "and it counts what it parsed, selecting by shebang rather than by extension" \
+        || fail "gate: count" "parsed $n files, expected 4: $out"
+    printf '%s\n' "$(shell_sources "$d")" | grep -q 'no-newline' \
+        && ok "including a shebang with no trailing newline" \
+        || fail "gate: no-newline" "a one-line shebang file was dropped: $(shell_sources "$d" | tr '\n' ' ')"
+    printf '%s\n' "$(shell_sources "$d")" | grep -q 'zshy' \
+        && fail "gate: zsh" "zsh was selected; bash -n cannot parse it" \
+        || ok "and not zsh, which bash -n cannot parse"
 
     # An empty tree is a broken gate, not an idle one.
     mkdir -p "$d/empty"

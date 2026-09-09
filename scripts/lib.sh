@@ -902,12 +902,12 @@ render_setup_summary() {
                     # this run created nothing and checked nothing — and the previous wording
                     # asserted five roots for a KB some other command may have made with one.
                     untouched) printf '  • roots:      not verified (an existing KB was left untouched)\n'
-                               printf '                run: jkb --db %s ns mk repos tasks media references memory\n' "$detail" ;;
+                               printf '                run: jkb --db '"'"'%s'"'"' ns mk repos tasks media references memory\n' "$detail" ;;
                     skipped)   printf '  • roots:      skipped (--no-scaffold)\n' ;;
                     # The remedy is the command that repairs it, not "re-run setup.sh": the
                     # failure leaves the db file behind, so a re-run takes the `existing KB —
                     # left untouched` arm and never retries.
-                    failed)    printf '  • roots:      NOT created — run: jkb --db %s ns mk repos tasks media references memory\n' "$detail" ;;
+                    failed)    printf '  • roots:      NOT created — run: jkb --db '"'"'%s'"'"' ns mk repos tasks media references memory\n' "$detail" ;;
                     *)         warn "unrecognised scaffold state: $line" ;;
                 esac ;;
             extension=*)
@@ -949,8 +949,17 @@ shell_sources() {
         case "$f" in
             *.sh) printf '%s\n' "$f"; continue ;;
         esac
-        IFS= read -r head <"$f" || head=""
+        # `read` returns non-zero at EOF on a file whose last line has no newline — and it
+        # has ALREADY assigned. `|| head=""` therefore wiped the shebang of any one-line file
+        # saved without a trailing newline, dropping it out of the gate silently, which is
+        # precisely the class of file this gate exists for.
+        head=""
+        IFS= read -r head <"$f" || :
         case "$head" in
+            # `zsh` is excluded on purpose: `bash -n` cannot parse it, so accepting it would
+            # turn a valid script into a red gate — and a false red blocks a landing and
+            # points at innocent code, which is worse here than a missed file.
+            '#!'*zsh|'#!'*zsh\ *) : ;;
             '#!'*sh|'#!'*sh\ *) printf '%s\n' "$f" ;;
         esac
     done
