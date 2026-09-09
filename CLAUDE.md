@@ -712,6 +712,12 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   "the chainer there is not hidden … that working tree will read dirty" beside `dispatch=dead`
   ("nothing runnable is at …"), about an empty directory in a clean tree: two contradictory
   statements in one report. `exposed` now needs both ownership and existence.
+- **A guard belongs where it can see the failure it was written for.** The refusal for an
+  unrecognised intent went into `reconcile_exclude` — and the caller's own default turned an
+  unknown derivation word into `pattern=""`, which the funnel collapses to a perfectly
+  recognised `want=no`, so the callee's guard never ran: the sweep retracted jkb's block and
+  the renderer warned about the unknown word *after* the file had changed. Both ends now
+  default to touching nothing.
 - **The one consumer that can destroy the user's file refuses an input it does not recognise.**
   `reconcile_exclude`'s `want` had no default arm and fell through to the branch that SWEEPS,
   so a typo — or a fifth word added at the caller and forgotten at the callee, which is

@@ -651,6 +651,19 @@ case10g() {
     [ -z "$(git_q -C "$e/wt" status --porcelain)" ] \
         && ok "the worktree really is clean, so there was nothing to warn about" \
         || fail "empty: dirty" "$(git_q -C "$e/wt" status --porcelain | tr '\n' ' ')"
+    # The POSITIVE half. Asserting only the absence of `exposed` leaves three other words that
+    # would keep the suite green — `undecided` among them, which warns "could not work out what
+    # to hide … nothing was changed" on every pull in a clean tree.
+    case "$out" in
+        *"exclude=none (nothing was installed at that path"*)
+            ok "and reports none, naming why there is nothing of ours there" ;;
+        *) fail "empty: word" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"could not work out what to hide"*|*"not hidden from git"*)
+            fail "empty: render" "it warned about hiding, in a clean tree with an empty path" ;;
+        *) ok "and the rendering says nothing about hiding at all" ;;
+    esac
 }
 
 # --- 10h. an unrecognised `want` refuses instead of sweeping -------------------------------
@@ -678,6 +691,63 @@ case10h() {
     case "$got" in
         *retracted*) fail "badwant: retracted" "it reported a retraction" ;;
         *) ok "and no retraction is reported" ;;
+    esac
+}
+
+# --- 10i. a derivation word the caller does not know must not sweep -----------------------
+# The refusal added for this lives in `reconcile_exclude`, at the one point that cannot see the
+# failure it was written for: the caller's `*)` arm set `pattern=""`, the funnel collapsed that
+# to a perfectly recognised `want=no`, and the callee's guard never ran — so jkb's own block
+# was retracted and the renderer warned about the unknown word AFTER the file had changed.
+# Adding a fifth word to the derivation is exactly the edit made two rounds ago.
+case10i() {
+    local d="$work/fifthword" r out ex
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    ex="$r/.git/info/exclude"
+    printf '%s\n/.githooks/post-merge\n' "$(exclude_marker)" >>"$ex"
+
+    # A word nobody taught the caller, supplied the way a future edit would supply it.
+    out="$(
+        git_hooks_exclude_pattern() { printf 'refused (a word nobody taught the caller)\n'; }
+        install_git_hooks "$r" "$d/src" 2>/dev/null
+    )"
+    grep -qxF '/.githooks/post-merge' "$ex" \
+        && ok "an unrecognised derivation word does not sweep jkb's own block" \
+        || fail "fifthword: swept" "the block is gone: $(tr '\n' '|' <"$ex")"
+    case "$out" in
+        *"exclude=retracted"*) fail "fifthword: retracted" "it reported a retraction" ;;
+        *) ok "and reports no retraction" ;;
+    esac
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *unrecognised*) ok "and the renderer surfaces the word it does not know" ;;
+        *) fail "fifthword: silent" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 10j. a relative core.hooksPath with no working tree is unreadable, not direct ---------
+# `git_hooks_override` returned "not set" when the setting IS set and holds a relative value it
+# could not resolve, so the run reported `dispatch=direct` — the best verdict, and the one the
+# renderer prints nothing for — about a repository whose repo hook git will never run. The
+# config read is three-valued for this reason; the toplevel resolution was not.
+case10j() {
+    local d="$work/norelbase" out
+    mkdir -p "$d"
+    git_q init -q --bare "$d/b.git" >/dev/null 2>&1
+    git_q -C "$d/b.git" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    out="$(install_git_hooks "$d/b.git" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=unreadable"*) ok "a relative hooksPath git cannot resolve is unreadable" ;;
+        *) fail "norelbase: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"dispatch=direct"*) fail "norelbase: direct" "it reported the silent good verdict" ;;
+        *) ok "and not direct, which the renderer prints nothing for" ;;
     esac
 }
 
@@ -941,8 +1011,8 @@ case12() {
     esac
     rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
     case "$rendered" in
-        *"could not update .git/info/exclude"*"jkb task land"*)
-            ok "and the rendering names the consequence a session will hit" ;;
+        *"could not update .git/info/exclude"*"as it was"*)
+            ok "and the rendering says only what is true of every failure" ;;
         *) fail "excludefail: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
     esac
 }
@@ -1205,6 +1275,6 @@ EOF
 }
 
 echo "==> scripts/lib.sh::install_chainer"
-run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case11 case11b case11c case11d case12 case12b case13 case14 case15
+run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case11 case11b case11c case11d case12 case12b case13 case14 case15
 
 finish

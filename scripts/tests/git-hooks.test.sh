@@ -494,8 +494,12 @@ case6m() {
         fi
         got="$(git_hooks_exclude_pattern "$arm" 2>/dev/null)"
         checked=$((checked + 1))
-        case "$got" in
-            "undecided "*) ;;
+        # The arm's OWN reason, not just the `undecided ` prefix: matching the prefix alone
+        # means a fixture that quietly stops being what it was — a repo that failed to init,
+        # say — answers through the other arm and the case still counts it.
+        case "$arm:$got" in
+            "$work/not-a-repo:undecided (the repository"*) ;;
+            "$unresolvable:undecided (core.hooksPath could not be read)"*) ;;
             *) bad="$bad [$arm -> '$got']" ;;
         esac
     done
@@ -528,13 +532,24 @@ case6m() {
         *) fail "undecided: render" "$(printf '%s\n' "$got" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
     esac
 
-    # And the sibling word is NOT that: `undecided` with a decidably-empty pattern must still
-    # sweep the other blocks, or a failed chainer install strands them for ever.
+    # And the sibling word is NOT that. `undecided` must sweep the OTHER blocks while leaving
+    # its own — driven with a NON-EMPTY pattern, which is the only shape `install_git_hooks`
+    # can actually emit: on an empty pattern the funnel collapses `want` to `no`, and
+    # `keep=""` makes `undecided` byte-identical to `no`, so an empty-pattern fixture drives
+    # an unreachable state and pins neither half.
     printf '%s\n/.stale/post-merge\n' "$(exclude_marker)" >>"$ex"
-    got="$(reconcile_exclude "$r" "" undecided "none (core.hooksPath is outside every working tree)")"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" undecided)"
     case "$got" in
         *"exclude=retracted /.stale/post-merge"*) ok "while undecided still sweeps the others" ;;
         *) fail "undecided: sibling" "got: $(printf '%s' "$got" | tr '\n' '|')" ;;
+    esac
+    grep -qxF '/.githooks/post-merge' "$ex" \
+        && ok "and leaves its own block exactly where it was" \
+        || fail "undecided: own block" "file: $(tr '\n' '|' <"$ex")"
+    case "$got" in
+        *"retracted /.githooks/post-merge"*)
+            fail "undecided: own retracted" "it retracted the block it was undecided about" ;;
+        *) ok "and reports no retraction for it" ;;
     esac
 }
 

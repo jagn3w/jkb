@@ -136,8 +136,14 @@ git_hooks_override() {
     case "$configured" in
         /*) ;;
         *)
-            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 0
-            [ -n "$top" ] || return 0
+            # rc 2, not 0. Reaching here means `core.hooksPath` IS set and holds a relative
+            # value we could not resolve — an unestablished answer, which `|| return 0` spelled
+            # as "genuinely not set" and the caller then reported `dispatch=direct`: the best
+            # verdict, rendered silently, about a repository whose repo hook git will never
+            # run. The config read three lines up is three-valued for this reason; the
+            # toplevel resolution was not.
+            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 2
+            [ -n "$top" ] || return 2
             configured="$top/$configured"
             ;;
     esac
@@ -844,10 +850,15 @@ install_git_hooks() {
         # touches nothing at all, rather than sweeping on the strength of an answer git
         # refused to give.
         "undecided "*) pattern=""; pattern_reason="$pat_line"; want=unknown ;;
-        # Not a pattern: the helper already worded the whole report line — `none …`
-        # (nothing of ours anywhere, rendered silently) or `exposed …` (ours IS in a tree
-        # and we are declining to hide it, which the renderer warns about).
-        *) pattern=""; pattern_reason="$pat_line" ;;
+        # The helper already worded the whole report line.
+        "none "*|"exposed "*) pattern=""; pattern_reason="$pat_line" ;;
+        # A word this caller does not know. `want=unknown` — touch nothing — because the
+        # default here used to be `pattern=""`, which the funnel then collapsed to a perfectly
+        # recognised `want=no`, so the callee's refusal never saw it and the sweep ran anyway:
+        # jkb's own block retracted, and the renderer warning about the unknown state AFTER
+        # the file had been changed. Adding a fifth word to the derivation is exactly the edit
+        # made two rounds ago, so this is not hypothetical.
+        *) pattern=""; pattern_reason="$pat_line"; want=unknown ;;
     esac
     # `exposed` says "the chainer JKB INSTALLED is visible in that tree". The derivation knows
     # only the path, so it cannot tell whether jkb wrote the file there — and for a `foreign`
@@ -936,8 +947,14 @@ render_git_hooks_report() {
                                 warn "  nothing in .git/info/exclude was changed." ;;
                     exposed)    warn "the chainer there is not hidden from git: $detail"
                                 warn "  that working tree will read dirty, and \`jkb task land\` refuses a dirty target." ;;
+                    # Only what is true of EVERY `failed`. The second line used to name the
+                    # untracked-chainer consequence, which holds for the append-side failure
+                    # and is false for a failed sweep (the block is still there, and the
+                    # chainer may be nowhere near a working tree) and vacuous for a refusal
+                    # that never opened the file. A false diagnosis handed to an operator on
+                    # an unattended pull is worse than a vaguer true one.
                     failed)     warn "could not update .git/info/exclude $detail"
-                                warn "  the chainer will read as untracked, so the tree looks dirty and \`jkb task land\` refuses it." ;;
+                                warn "  nothing was changed, so whatever jkb meant to hide or unhide is as it was." ;;
                     *)          warn "unrecognised exclude state: $line" ;;
                 esac ;;
             dispatch=*)
