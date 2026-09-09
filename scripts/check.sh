@@ -3,23 +3,28 @@
 # commit; CI runs the same thing.
 set -euo pipefail
 
+# Parse every shell file in the repo before running anything. NOTHING executes setup.sh, so a
+# control-flow edit there (an unbalanced `if`, a stray `fi`) reached the gate unchecked — and
+# setup.sh is what the post-merge hook runs unattended after a pull. The same is true of the
+# PreToolUse hooks and the container scripts, and there it is sharper: bash exits 2 on a syntax
+# error, and a PreToolUse hook exiting 2 reads as DENY, so a broken hook does not fail open the
+# way its own header promises — it blocks every Bash tool call for everyone after a pull.
+# `bash -n`, not shellcheck: always present, and this is the syntax gate rather than the lint.
+# CI runs the identical loop first, for the same reasons.
+echo "==> shell syntax"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+for f in "$root"/scripts/*.sh "$root"/scripts/tests/*.sh "$root"/scripts/hooks/* \
+         "$root"/.claude/hooks/* "$root"/.container/*.sh; do
+    [ -f "$f" ] || continue
+    case "$f" in *.md|*.json) continue ;; esac
+    bash -n "$f" || { echo "   $f does not parse" >&2; exit 1; }
+done
+
 echo "==> rustfmt (check)"
 cargo fmt --all -- --check
 
 echo "==> clippy (warnings are errors)"
 cargo clippy --all-targets --all-features -- -D warnings
-
-# Parse every shell file before running anything. The suites drive lib.sh's functions, but
-# NOTHING executes setup.sh — so a control-flow edit there (an unbalanced `if`, a stray `fi`)
-# reached the gate unchecked, and setup.sh is the file the post-merge hook runs unattended
-# after a pull. `bash -n` rather than shellcheck: it is always present, and this is the
-# syntax gate, not the lint.
-echo "==> shell syntax (scripts)"
-for f in "$(dirname "$0")"/*.sh "$(dirname "$0")"/tests/*.sh "$(dirname "$0")"/hooks/*; do
-    [ -f "$f" ] || continue
-    case "$f" in *.md) continue ;; esac
-    bash -n "$f" || { echo "   $f does not parse" >&2; exit 1; }
-done
 
 # The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
 # reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.

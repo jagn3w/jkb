@@ -339,13 +339,33 @@ _exclude_mentions() {
 # here detects that; the failure is a pattern computed for one worktree's value, which is the
 # pre-existing behaviour rather than a new one.
 git_hooks_exclude_pattern() {
-    local repo_root="$1" configured rc main_top rel
-    # Bare-ness is a property of the repository, not of a worktree, so asking it here keeps
-    # the answer shared. There is no tree to hide anything in.
-    if [ "$(git -C "$repo_root" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
-        printf 'none (a bare repository has no working tree)\n'
+    local repo_root="$1" configured rc rel line main_top="" bare=0 first=1 wt hit=""
+    # Every worktree's top, main first, and whether the main entry is BARE. Asked of the
+    # repository through the porcelain rather than `--is-bare-repository` of `$repo_root`:
+    # in a bare-repo-plus-worktrees layout that question answers `false` from a worktree, the
+    # bare git dir became the "main checkout", and a pattern derived from it marked the user's
+    # own untracked file ignored while hiding nothing — and gave two different answers from
+    # two places, falsifying this function's whole claim.
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                wt="$(_real_dir "${line#worktree }")"
+                if [ "$first" -eq 1 ]; then main_top="$wt"; first=0; fi
+                ;;
+            bare) [ -n "$main_top" ] && [ "$first" -eq 0 ] && [ -z "$hit" ] && bare=1 ;;
+        esac
+    done <<EOF
+$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
+EOF
+    if [ -z "$main_top" ]; then
+        printf 'none (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
+    if [ "$bare" -eq 1 ]; then
+        printf 'none (a bare repository has no working tree of its own)\n'
+        return 0
+    fi
+
     configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
     rc=$?
     case "$rc" in
@@ -357,28 +377,42 @@ git_hooks_exclude_pattern() {
 
     case "$configured" in
         /*)
-            # Absolute: inside the main checkout, or nowhere we may anchor a pattern.
-            main_top="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null \
-                | sed -n '1s/^worktree //p')"
-            if [ -z "$main_top" ]; then
-                printf 'none (the main worktree could not be located)\n'
-                return 0
-            fi
-            main_top="$(_real_dir "$main_top")"
             configured="$(_real_dir "$configured")"
             if [ "$configured" = "$main_top" ]; then
                 rel=""
             else
                 case "$configured/" in
                     "$main_top"/*) rel="${configured#"$main_top"/}" ;;
-                    *) printf 'none (core.hooksPath is not inside the main checkout, so an anchored rule would apply to every worktree)\n'
-                       return 0 ;;
+                    *)
+                        # Not in the main checkout. If it is inside SOME other worktree the
+                        # chainer is a real untracked file in a real tree, and saying `none`
+                        # — which the renderer prints nothing for — left that tree dirty for
+                        # ever with nothing attributing the file to jkb. An anchored rule
+                        # applies to every tree at once, so hiding it is not available; being
+                        # quiet about it is not the same trade.
+                        while IFS= read -r line; do
+                            case "$line" in
+                                "worktree "*)
+                                    wt="$(_real_dir "${line#worktree }")"
+                                    [ "$wt" = "$main_top" ] && continue
+                                    case "$configured/" in "$wt"/*) hit="$wt" ;; esac
+                                    ;;
+                            esac
+                        done <<EOF2
+$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
+EOF2
+                        if [ -n "$hit" ]; then
+                            printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
+                        else
+                            printf 'none (core.hooksPath is outside every working tree, so nothing of ours is hidden)\n'
+                        fi
+                        return 0 ;;
                 esac
             fi
             ;;
         *)
             rel="$(_normalize_rel "$configured")" \
-                || { printf 'none (core.hooksPath escapes the working tree)\n'; return 0; }
+                || { printf 'none (core.hooksPath resolves above the working tree)\n'; return 0; }
             ;;
     esac
     # An empty `rel` is the tree root, which is a real place to hide something, not a reason
@@ -401,7 +435,21 @@ _normalize_rel() {
         case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
         case "$seg" in
             ''|.) continue ;;
-            ..) return 1 ;;
+            ..)
+                # An INTERIOR `..` resolves: `x/../y` is `y`, plainly inside the tree.
+                # Refusing every `..` reported "escapes the working tree" for a path that
+                # does not, and the reason was printed as a silent `none` — so the chainer
+                # stayed visible and the tree read dirty, which is the failure this exists
+                # to prevent, under a message that was false about why.
+                [ -n "$out" ] || return 1
+                # Pop one segment. `${out%/*}` alone is a no-op when `out` holds a single
+                # segment with no `/` in it, which left `x/../y` as `x/y`.
+                case "$out" in
+                    */*) out="${out%/*}" ;;
+                    *) out="" ;;
+                esac
+                continue
+                ;;
         esac
         out="${out:+$out/}$seg"
     done
@@ -451,7 +499,7 @@ _is_exclude_pattern_line() {
 #
 # Always returns 0 — `failed` is a word, not an exit status (see the header's `set -e` rule).
 reconcile_exclude() {
-    local repo_root="$1" pattern="$2" want="$3" reason="${4:-}"
+    local repo_root="$1" pattern="$2" want="$3" empty_report="${4:-}"
     local common exclude tmp line nxt cur keep=""
     local -a lines=() out=() removed=() deduped=()
     local i n seen_keep=0 changed=0 probe_retracted=0 tidied=0
@@ -543,7 +591,7 @@ reconcile_exclude() {
     fi
 
     if [ -z "$pattern" ]; then
-        printf 'exclude=none %s\n' "${reason:-(nothing of ours is inside the tree)}"
+        printf 'exclude=%s\n' "${empty_report:-none (nothing of ours is inside the tree)}"
         return 0
     fi
     if [ "$want" = undecided ]; then
@@ -685,7 +733,10 @@ install_git_hooks() {
     pat_line="$(git_hooks_exclude_pattern "$repo_root")"
     case "$pat_line" in
         "pattern "*) pattern="${pat_line#pattern }" ;;
-        *) pattern=""; pattern_reason="${pat_line#none }" ;;
+        # Not a pattern: the helper already worded the whole report line — `none …`
+        # (nothing of ours anywhere, rendered silently) or `exposed …` (ours IS in a tree
+        # and we are declining to hide it, which the renderer warns about).
+        *) pattern=""; pattern_reason="$pat_line" ;;
     esac
     # Nothing to own means nothing to want, whatever the chainer did.
     [ -n "$pattern" ] || want=no
@@ -741,6 +792,8 @@ render_git_hooks_report() {
                     unowned)    warn "$detail is excluded by a rule in .git/info/exclude that jkb cannot prove it wrote."
                                 warn "  it is hiding that file from \`git status\` — remove the line yourself if you did not add it." ;;
                     none)       : ;;   # nothing to hide, and so nothing worth a line
+                    exposed)    warn "the chainer jkb installed is not hidden from git: $detail"
+                                warn "  that working tree will read dirty, and \`jkb task land\` refuses a dirty target." ;;
                     failed)     warn "could not update .git/info/exclude $detail"
                                 warn "  the chainer will read as untracked, so the tree looks dirty and \`jkb task land\` refuses it." ;;
                     *)          warn "unrecognised exclude state: $line" ;;

@@ -281,14 +281,38 @@ case6b() {
 # the arm is unreachable-in-practice code that reads as a safeguard; with one it is a stated
 # answer. Nothing can be hidden from a `git status` that cannot be run.
 case6d() {
-    local r="$work/bare.git" got
+    local r="$work/bare.git" wt got_bare got_wt
     git_q init -q --bare "$r" >/dev/null 2>&1
     git_q -C "$r" config core.hooksPath hooks
-    got="$(git_hooks_exclude_pattern "$r" 2>/dev/null)"
-    case "$got" in
+    got_bare="$(git_hooks_exclude_pattern "$r" 2>/dev/null)"
+    case "$got_bare" in
         "none ("*) ok "a repository with no working tree: nothing to exclude, and it says so" ;;
-        *) fail "bare: state" "expected a none state, got '$got'" ;;
+        *) fail "bare: state" "expected a none state, got '$got_bare'" ;;
     esac
+
+    # A bare repo WITH worktrees is the case that made this wrong. Asked of `$repo_root`,
+    # `--is-bare-repository` answers false from the worktree, the porcelain's first record
+    # (the bare dir) became the "main checkout", and a pattern derived from it marked the
+    # user's own untracked file ignored while hiding nothing — and gave two different answers
+    # from two places, which is the property the derivation exists to have.
+    git_q -C "$work" init -q "$work/bare-seed" >/dev/null 2>&1
+    git_q -C "$work/bare-seed" commit -q --allow-empty -m init
+    git_q -C "$work/bare-seed" push -q "$r" HEAD:refs/heads/main 2>/dev/null
+    wt="$work/bare-wt"
+    if ! git_q -C "$r" worktree add -q "$wt" main >/dev/null 2>&1; then
+        skip "could not add a worktree to the bare repo"
+        return
+    fi
+    git_q -C "$r" config core.hooksPath "$r/myhooks"
+    got_bare="$(git_hooks_exclude_pattern "$r" 2>/dev/null)"
+    got_wt="$(git_hooks_exclude_pattern "$wt" 2>/dev/null)"
+    case "$got_wt" in
+        "none ("*) ok "a bare repo with worktrees: still nothing to exclude" ;;
+        *) fail "bare: worktree" "from the worktree it answered '$got_wt'" ;;
+    esac
+    [ "$got_wt" = "$got_bare" ] \
+        && ok "and the same answer from the bare dir and from the worktree" \
+        || fail "bare: disagree" "bare='$got_bare' worktree='$got_wt'"
 }
 
 # --- 6g. the desired state is the same from every worktree -------------------------------
@@ -334,11 +358,19 @@ case6g() {
     git_q -C "$m" config core.hooksPath "$wt/.githooks"
     got_main="$(git_hooks_exclude_pattern "$m")"
     got_wt="$(git_hooks_exclude_pattern "$wt")"
+    # `exposed`, not `none`: the chainer really is an untracked file in a real tree. An
+    # anchored rule applies to every worktree at once so hiding it is not available — but
+    # `none` is rendered silently, which left that tree dirty for ever with nothing
+    # attributing the file to jkb.
     case "$got_main" in
-        "none ("*) [ "$got_wt" = "$got_main" ] \
-            && ok "one inside a linked worktree only: not hidden, same answer from both" \
+        "exposed ("*) [ "$got_wt" = "$got_main" ] \
+            && ok "one inside a linked worktree only: reported exposed, same answer from both" \
             || fail "shared: linked" "main='$got_main' worktree='$got_wt'" ;;
-        *) fail "shared: linked" "expected a none state, got '$got_main'" ;;
+        *) fail "shared: linked" "expected an exposed state, got '$got_main'" ;;
+    esac
+    case "$got_main" in
+        *"$wt"*) ok "and it names the tree that will read dirty" ;;
+        *) fail "shared: linked detail" "the reason does not name the worktree: $got_main" ;;
     esac
 
     # And end to end: the block a main run adds must survive a worktree run.
@@ -421,7 +453,9 @@ case6k() {
         './/.githooks|pattern /.githooks/post-merge'
         'hooks/./x|pattern /hooks/x/post-merge'
         '..|none'
-        'x/../y|none'
+        '../x|none'
+        'x/../y|pattern /y/post-merge'
+        'a/b/../c|pattern /a/c/post-merge'
     )
     for entry in "${table[@]}"; do
         v="${entry%%|*}"; want="${entry#*|}"
@@ -527,7 +561,7 @@ case6i() {
     ex="$r/.git/info/exclude"
     printf '# jkb task sessions (git worktrees)\n/.jkb/\n' >>"$ex"
     # want=no with no pattern: the widest sweep there is.
-    reconcile_exclude "$r" "" no "(no core.hooksPath)" >/dev/null
+    reconcile_exclude "$r" "" no "none (no core.hooksPath)" >/dev/null
     if grep -qxF '/.jkb/' "$ex" && grep -qxF '# jkb task sessions (git worktrees)' "$ex"; then
         ok "the sessions block another jkb writer owns survives the widest sweep"
     else
@@ -544,13 +578,26 @@ case6f() {
     mkdir -p "$r"
     git_q init -q "$r" >/dev/null 2>&1
     git_q -C "$r" commit -q --allow-empty -m init
+
+    # The remaining unquoted-glob exposure is `case "$configured/" in "$main_top"/*)`, on the
+    # ABSOLUTE branch of git_hooks_exclude_pattern — so that is what this must drive. It used
+    # to hand `reconcile_exclude` a literal pattern and use a relative core.hooksPath, which
+    # reaches neither the derivation nor that branch: the guard named an exposure it could no
+    # longer fail on.
+    git_q -C "$r" config core.hooksPath "$(cd "$r" && pwd -P)/.githooks"
+    got="$(git_hooks_exclude_pattern "$r")"
+    [ "$got" = "pattern /.githooks/post-merge" ] \
+        && ok "a repo path with glob metacharacters: the absolute branch still matches it" \
+        || fail "glob: derive" "got '$got'"
+
+    # And end to end, so the exclusion really lands in a tree named like that.
     git_q -C "$r" config core.hooksPath .githooks
     override="$(git_hooks_override "$r")"
     chainer="$override/post-merge"
     mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
     [ "$got" = "exclude=added /.githooks/post-merge" ] \
-        && ok "a repo path with glob metacharacters: still excluded" \
+        && ok "and it is excluded" \
         || fail "glob: state" "got '$got'"
     [ -z "$(git_q -C "$r" status --porcelain)" ] \
         && ok "and the tree is clean" \
@@ -567,7 +614,7 @@ case7() {
     # `git init` ships a commented default exclude file, so "unchanged" is the assertion,
     # not "empty".
     before="$(cat "$r/.git/info/exclude" 2>/dev/null)"
-    got="$(reconcile_exclude "$r" "" yes "(outside the working tree)")"
+    got="$(reconcile_exclude "$r" "" yes "none (outside the working tree)")"
     after="$(cat "$r/.git/info/exclude" 2>/dev/null)"
     case "$got" in
         "exclude=none (outside the working tree"*) got_ok=1 ;;

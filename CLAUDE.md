@@ -652,7 +652,17 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   one anchored pattern is simultaneously right for all of them; an absolute one is hidden only
   when it is inside the **main** checkout, because an anchored rule would otherwise hide a
   same-named path in every other tree. The regression guard is an equality assertion — the same
-  answer from the checkout and from a linked worktree — not a behaviour snapshot.
+  answer from the checkout and from a linked worktree — not a behaviour snapshot. Bare-ness is
+  read from the porcelain's own `bare` attribute, not from `--is-bare-repository` of the
+  directory this run was handed: in a bare-repo-plus-worktrees layout that answers `false` from
+  the worktree, and the bare git dir then became the "main checkout".
+- **Declining to hide something is not the same as having nothing to hide, and only one of them
+  is silent.** An absolute `core.hooksPath` inside a *linked* worktree cannot be excluded — an
+  anchored rule applies to every tree at once — but the chainer really is an untracked file in a
+  real tree, so it is `exposed` and the renderer warns, naming the tree and that `jkb task land`
+  refuses a dirty target. Reported as `none`, which renders nothing, that tree read dirty for
+  ever with nothing attributing the file to jkb: the very failure the exclusion exists to
+  prevent, reached by the mechanism meant to prevent it.
 - **A jkb block is defined positively, so the bad shapes follow instead of being remembered**: a
   known marker line immediately followed by a *pattern-shaped* line (non-empty, not itself a
   marker, not a comment). A marker that heads nothing is an **orphan** — jkb's own line, inert

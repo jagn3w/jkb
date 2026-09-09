@@ -32,6 +32,7 @@ link_memory=0
 # the write alone left the summary claiming "watcher: running" after `launchctl load` or
 # `systemctl --user enable` had just failed and said so two lines earlier — four ways for one
 # line to lie, three of them still open.
+scaffold_ok=1
 service_ok=1
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
@@ -90,12 +91,16 @@ elif [ -f "$db" ]; then
   say "existing KB detected ($db) — left untouched"
 else
   say "scaffold KB namespaces ($db)"
-  # Wrapped for the same reason as the two steps below it. NOTHING before the git-hooks
-  # section may be fatal: the hook is what re-runs this script after a later pull, so a
-  # machine that dies here never installs it and no `git pull` will ever repair that. The
-  # rule used to live in no one place and had to be remembered by whoever added a step —
-  # `scripts/check.sh`'s `bash -n` pass is the gate that at least keeps these arms parseable.
+  # Wrapped for the same reason as the two steps below it. THE RULE, stated where it can be
+  # checked against the file: everything after the binary is non-fatal, because the git-hooks
+  # section is what installs the hook that re-runs this script after a later pull — a machine
+  # that dies before it never installs the hook, and no `git pull` will then repair that. The
+  # binary itself is the one hard precondition and is deliberately still fatal: every step
+  # after it needs `jkb`, so skipping the hook section is the accepted cost there, and a
+  # machine whose `cargo install` fails has nothing working to repair anyway. On the
+  # unattended pull path the hook is already installed from an earlier run, so it survives.
   if mkdir -p "$(dirname "$db")" && jkb --db "$db" ns mk repos tasks media references memory; then :; else
+    scaffold_ok=0
     warn "could not scaffold the KB at $db — continuing to the git hooks."
   fi
 fi
@@ -145,7 +150,10 @@ if [ "$do_service" -eq 1 ]; then
         warn "systemctl not found; activate the printed units manually."
         service_ok=0
       fi ;;
-    *) warn "unsupported OS for auto-activation; the units were written — activate them manually."
+    # Reachable only after `jkb service install` succeeded, and that refuses any platform but
+    # macOS and Linux — so "unsupported OS" was the wrong diagnosis for the one state that
+    # gets here: `uname` said something the two arms above did not recognise.
+    *) warn "unrecognised platform '$(uname -s)'; the units were written — activate them manually."
        service_ok=0 ;;
   esac
   else
@@ -190,7 +198,14 @@ fi
 say "setup complete"
 echo "  • jkb:        $(command -v jkb)"
 echo "  • database:   $db"
-echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
+# Gated for the same reason as the watcher line below: making the scaffold non-fatal turned
+# this into an assertion that could be printed one screen after warning it had failed. `set -e`
+# used to keep it honest by killing the script.
+if [ "$scaffold_ok" -eq 1 ]; then
+  echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
+else
+  echo "  • roots:      NOT created — re-run setup.sh once the KB at $db is reachable"
+fi
 # `if`, not `[ … ] && echo`. `set -e` does NOT exit here — it exempts every command in an
 # `&&` list but the last — but the list's status is still non-zero, and as the final statement
 # that becomes the script's own. So `setup.sh --no-service` exited 1, and the post-merge hook's
@@ -198,6 +213,12 @@ echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
 if [ "$do_extension" -eq 1 ]; then
   echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
 fi
-if [ "$do_service" -eq 1 ] && [ "$service_ok" -eq 1 ]; then
+if [ "$do_service" -eq 0 ]; then
+  echo "  • watcher:    skipped (--no-service)"
+elif [ "$service_ok" -eq 1 ]; then
   echo "  • watcher:    running; file edits under mounts auto-sync"
+else
+  # The distinction `service_ok` exists for only reaches the reader if the negative outcome is
+  # printed too — silence in both cases is what made the flag invisible.
+  echo "  • watcher:    NOT running; see the warnings above to activate it"
 fi

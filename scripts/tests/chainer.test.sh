@@ -904,6 +904,7 @@ case14() {
         'exclude=retracted /p|dropped from .git/info/exclude'
         'exclude=deduplicated /p|duplicate jkb entries for /p removed'
         'exclude=tidied 1 orphaned marker(s)|1 orphaned marker(s) removed from .git/info/exclude'
+        'exclude=exposed (inside the worktree at /w)|that working tree will read dirty'
         'exclude=unowned /p|cannot prove it wrote'
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'
