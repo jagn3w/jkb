@@ -25,6 +25,20 @@
 # `render_git_hooks_report` is here, and two copies of one line drift.
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
+# _git … — git, with the caller's repository selection stripped out.
+#
+# EVERY git call in this file goes through it. `GIT_DIR`, `GIT_WORK_TREE` and
+# `GIT_COMMON_DIR` outrank `-C`, so with `GIT_WORK_TREE` exported — the standard bare-dotfiles
+# shell recipe — `rev-parse --show-toplevel` answered somebody else's tree, and
+# `install_git_hooks` then created `.githooks/` INSIDE that unrelated repository and reported
+# `dispatch=chained`, the good verdict, while the repo it was actually asked about kept a dead
+# hook. Measured on git 2.51.1.
+#
+# jkb runs inside other people's professional repositories and must not decorate them; that is
+# the same rule that keeps it from writing a git ref (D46). A wrapper rather than a note at
+# each call site, because there are a dozen of them and the next one would forget.
+_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git "$@"; }
+
 # install_exec <dest> — install stdin as an executable file at <dest>, ATOMICALLY.
 #
 # Writes a temp file in <dest>'s own directory and `mv`s it into place. This is
@@ -82,7 +96,7 @@ install_exec() {
 # for a worktree, so it is normalised here rather than at each call site.
 git_hooks_dir() {
     local repo_root="$1" common
-    common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    common="$(_git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 1
     [ -n "$common" ] || return 1
     case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
     # `--git-common-dir` answers `.` in a bare repo, which made every reported path read
@@ -99,11 +113,16 @@ _real_dir() {
 
 # git_hooks_override <repo_root> — print the absolute `core.hooksPath` in effect for
 # <repo_root>, or nothing when there is none. Returns 0 for both of those — "no override" is
-# an answer, not a failure — and **2** when the setting exists and yields no one hooks
-# directory, which is neither. Three causes reach rc 2: a value git cannot expand (`~someuser`
-# for an absent account), a value set to the empty string (git resolves it to `/post-merge`
-# and finds nothing), and a RELATIVE value in a repository with no working tree, where git
-# anchors it on the invoking process's current directory and so there is no one place at all.
+# an answer, not a failure. Three OTHER codes each name a way the setting exists and yields no
+# one hooks directory, because they need three different sentences and three different repairs:
+#
+#   2  git will not expand it (`~someuser` for an account this machine does not have)
+#   3  it is set to the empty string (git resolves it to `/post-merge` and finds nothing)
+#   4  it is relative and this repository has no working tree, so git anchors it on the
+#      INVOKING PROCESS'S current directory and there is no one place at all
+#
+# One code for all three sent the operator a check that prints a perfectly normal value for
+# code 4, which is the same failure `--show-origin` was introduced to fix for code 3.
 #
 # Both halves are corrections of a cwd-scoped read, and both fail silently:
 #
@@ -131,11 +150,11 @@ git_hooks_override() {
     # second into the first reported the BEST verdict (`dispatch=direct`, rendered silently)
     # for a repo in which git cannot resolve its hooks path at all. `dispatch` is three-valued
     # exactly so an unestablished answer is not spelled as the good one.
-    configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
+    configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
     case "$?" in
         0) ;;
         1) return 0 ;;      # genuinely not set
-        *) return 2 ;;      # set to something git will not resolve
+        *) return 2 ;;      # set, and git will not expand it
     esac
     # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
     # printing nothing, `rev-parse --git-path hooks/post-merge` answers `/post-merge`, and
@@ -143,7 +162,7 @@ git_hooks_override() {
     # dead. Folded into "not set", the caller reported `dispatch=direct`, which the renderer
     # prints nothing for: the D34 post-merge automation silently off, which is the exact harm
     # `dispatch` was made many-valued to surface.
-    [ -n "$configured" ] || return 2
+    [ -n "$configured" ] || return 3
     case "$configured" in
         /*) ;;
         *)
@@ -161,8 +180,8 @@ git_hooks_override() {
             # not exist. There is nothing to resolve to, so rc 2 and say so; running setup.sh
             # against a worktree instead resolves normally and installs the chainer where that
             # worktree's pulls will find it.
-            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 2
-            [ -n "$top" ] || return 2
+            top="$(_git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 4
+            [ -n "$top" ] || return 4
             configured="$top/$configured"
             ;;
     esac
@@ -417,13 +436,13 @@ git_hooks_exclude_pattern() {
             bare) if [ "$rec" -eq 1 ]; then bare=1; fi ;;
         esac
     done <<EOF
-$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
+$(_git -C "$repo_root" worktree list --porcelain 2>/dev/null)
 EOF
     if [ -z "$main_top" ]; then
         printf 'undecided (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
-    configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
+    configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
     rc=$?
     case "$rc" in
         0) ;;
@@ -617,12 +636,12 @@ _exclude_write() {
 #
 # Always returns 0 — `failed` is a word, not an exit status (see the header's `set -e` rule).
 reconcile_exclude() {
-    local repo_root="$1" pattern="$2" want="$3" empty_report="${4:-}"
+    local repo_root="$1" pattern="$2" want="$3" empty_report="${4:-}" why="${5:-the chainer install failed}"
     local common exclude tmp line nxt cur keep=""
     local -a lines=() out=() removed=() deduped=()
     local i n seen_keep=0 changed=0 probe_retracted=0 tidied=0
 
-    common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || common=""
+    common="$(_git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || common=""
     if [ -z "$common" ]; then
         printf 'exclude=none (not a git repository)\n'
         return 0
@@ -721,7 +740,10 @@ reconcile_exclude() {
         # `undecided`, like the other way of reaching this: one condition, one word. It said
         # `none` — proven absence — for a situation whose whole point is that nothing was
         # established.
-        printf 'exclude=undecided (the chainer install failed; nothing was decided about %s)\n' "$pattern"
+        # The caller supplies the reason: `undecided` has two producers now — a chainer
+        # install that failed, and a `core.hooksPath` the caller refused to anchor — and
+        # naming the first for both reported a step that never ran.
+        printf 'exclude=undecided (%s; nothing was decided about %s)\n' "$why" "$pattern"
         return 0
     fi
     if [ "$want" = yes ]; then
@@ -773,7 +795,7 @@ reconcile_exclude() {
 #                             PROVEN absence, `exposed` means ours IS in a working tree and jkb
 #                             is declining to hide it, and `undecided` means jkb could not
 #                             establish anything and therefore changed nothing.
-#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable
+#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while
@@ -785,9 +807,11 @@ reconcile_exclude() {
 # exists for: will git run the repo hook? It is derived from the world rather than from the
 # chainer outcome word — `[ -x "$chainer" ]` — because `foreign` and `failed` each cover both
 # a file that will dispatch and one that will not. `unknown` exists on purpose: a foreign
-# chainer may dispatch perfectly well and we cannot know, so it is never spelled `dead` —
-# and neither is `unreadable`, which is a `core.hooksPath` git itself will not resolve, so no
-# hook runs in the repository at all.
+# chainer may dispatch perfectly well and we cannot know, so it is never spelled `dead`. Nor
+# is `unreadable` (a `core.hooksPath` that names no one hooks directory) nor `unanchored` (a
+# relative one in a repository with no working tree) — and neither of those claims that no hook
+# runs anywhere, because a worktree of such a repository resolves the value normally and does
+# run one.
 #
 # `error=` means nothing was done, so it is never printed after another key. The chainer half
 # failing is not that: the repo hook WAS installed, and saying "skipping hook install" under a
@@ -800,7 +824,7 @@ reconcile_exclude() {
 install_git_hooks() {
     local repo_root="$1" hooks_src="$2"
     local hooks_dir chainer="" outcome override override_rc=0
-    local want=no ours=unknown verdict="" pat_line pattern="" pattern_reason=""
+    local want=no ours=unknown verdict="" pat_line pattern="" pattern_reason="" undecided_why=""
 
     # The two `error=` arms stay AHEAD of the funnel below: `error=` means nothing was done,
     # it is contractually the only line, and there is no exclude question to answer before a
@@ -820,7 +844,7 @@ install_git_hooks() {
     # returned early, and a stale block therefore survived for ever whenever the failing
     # precondition was itself persistent.
     override="$(git_hooks_override "$repo_root")" || override_rc=$?
-    if [ "$override_rc" -eq 2 ]; then
+    if [ "$override_rc" -ge 2 ]; then
         # `undecided` — nothing is known about THIS pattern — because that is the one thing
         # this branch does know: no chainer was attempted, so jkb cannot say whether its own
         # is at the derived path. The derivation still has the last word through the funnel
@@ -838,7 +862,18 @@ install_git_hooks() {
         # which directory setup.sh was pointed at, which is the flip-flop the whole derivation
         # exists to prevent.
         want=undecided
-        verdict="unreadable core.hooksPath"
+        # The reason comes from the CALLER, which knows which cause fired. `reconcile_exclude`
+        # used to word `undecided` as "the chainer install failed" — its only producer when
+        # that text was written — so this path, where no chainer is attempted at all, reported
+        # a step that never ran, on the exact configuration the refusal exists for.
+        case "$override_rc" in
+            2) verdict="unreadable core.hooksPath cannot be expanded on this machine"
+               undecided_why="core.hooksPath cannot be expanded" ;;
+            3) verdict="unreadable core.hooksPath is set to the empty string"
+               undecided_why="core.hooksPath is empty" ;;
+            *) verdict="unanchored core.hooksPath"
+               undecided_why="core.hooksPath is relative and this repository has no working tree" ;;
+        esac
     elif [ -z "$override" ]; then
         verdict="direct"
     elif [ "$(_real_dir "$override")" = "$(_real_dir "$hooks_dir")" ]; then
@@ -939,7 +974,7 @@ install_git_hooks() {
     # Nothing to own means nothing to want, whatever the chainer did — unless the derivation
     # said it could not tell, in which case not knowing is the answer.
     if [ -z "$pattern" ] && [ "$want" != unknown ]; then want=no; fi
-    reconcile_exclude "$repo_root" "$pattern" "$want" "$pattern_reason"
+    reconcile_exclude "$repo_root" "$pattern" "$want" "$pattern_reason" "$undecided_why"
 
     printf 'dispatch=%s\n' "$verdict"
     return 0
@@ -1021,10 +1056,19 @@ render_git_hooks_report() {
                     # True of both causes that reach here: a value git cannot expand (it
                     # fatals), and a value set to the empty string (git resolves it to
                     # `/post-merge` and finds nothing). It used to also cover a relative path
-                    # in a repo with no working tree, which git resolves perfectly well — the
-                    # sentence was false there and its own suggested check contradicted it.
+                    # in a repo with no working tree — which has no anchor at all and now has
+                    # its own arm above, because git resolves it against the pulling process's
+                    # cwd and this sentence was false of it.
+                    # Its OWN arm and its own repair. Sharing `unreadable`'s sentence sent the
+                    # operator to `git config --show-origin --get core.hooksPath`, which for
+                    # this cause prints a perfectly normal `.githooks` and appears to refute
+                    # the warning — the same failure `--show-origin` was introduced to fix one
+                    # cause over.
+                    unanchored)
+                             warn "core.hooksPath is relative and this repository has no working tree, so git resolves it against whatever directory the pulling process is in — there is no one place to install a chainer."
+                             warn "  run setup.sh from a working tree of this repository, or set an absolute core.hooksPath." ;;
                     unreadable)
-                             warn "$detail is set to a value that names no one hooks directory, so git will not reliably run the repo hook above."
+                             warn "$detail, so git will not reliably run the repo hook above."
                              # `--show-origin`, because `--get` prints one empty line for an
                              # empty value and nothing for an unset one — visually identical,
                              # so the operator's own check appeared to refute the warning.

@@ -339,6 +339,43 @@ case6d() {
     esac
 }
 
+# --- 6p. an exported GIT_WORK_TREE does not redirect jkb into another repository ----------
+# `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` outrank `-C`, so with `GIT_WORK_TREE` exported —
+# the standard bare-dotfiles shell recipe — `rev-parse --show-toplevel` answered somebody
+# else's tree and `install_git_hooks` created `.githooks/` INSIDE that unrelated repository,
+# reporting `dispatch=chained`, while the repo it was asked about kept a dead hook. jkb runs
+# inside other people's repositories and must not decorate them.
+#
+# The harness unsets both variables for every other case, which is why no fixture could see
+# this: it has to export them on purpose.
+case6p() {
+    local d="$work/envleak" out
+    mkdir -p "$d"
+    git_q init -q "$d/mine" >/dev/null 2>&1
+    git_q -C "$d/mine" commit -q --allow-empty -m init
+    git_q -C "$d/mine" config core.hooksPath .githooks
+    git_q init -q "$d/theirs" >/dev/null 2>&1
+    git_q -C "$d/theirs" commit -q --allow-empty -m init
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+
+    out="$(GIT_WORK_TREE="$d/theirs" install_git_hooks "$d/mine" "$d/src" 2>/dev/null)"
+
+    case "$out" in
+        *"chainer=installed $d/mine/.githooks/post-merge"*)
+            ok "an exported GIT_WORK_TREE does not move the chainer" ;;
+        *) fail "envleak: chainer" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ -z "$(ls -A "$d/theirs" | grep -v '^\.git$')" ] \
+        && ok "and nothing is created in the unrelated repository" \
+        || fail "envleak: polluted" "wrote: $(ls -A "$d/theirs" | grep -v '^\.git$' | tr '\n' ' ')"
+    # And the same for GIT_DIR, which splices another repo's config onto this one's tree.
+    out="$(GIT_DIR="$d/theirs/.git" install_git_hooks "$d/mine" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"$d/mine/.git/hooks/post-merge"*) ok "and an exported GIT_DIR does not move the repo hook" ;;
+        *) fail "envleak: gitdir" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
 # --- 6n. the override agrees with git's own answer, in every layout ------------------------
 # The oracle, not a snapshot. A round asserted that a relative `core.hooksPath` with no working
 # tree is unresolvable; git resolves it against the git dir and runs the hook, so the claim was
@@ -387,9 +424,12 @@ case6n() {
     git_q init -q --bare "$d/bare.git" >/dev/null 2>&1
     git_q -C "$d/bare.git" config core.hooksPath .githooks
     ( cd "$probe" && git_hooks_override "$d/bare.git" >/dev/null 2>&1 )
-    [ "$?" -eq 2 ] \
+    # Captured, because `[` consumes `$?`: the failure diagnostic said "got 1" whatever the
+    # subshell returned, pointing away from both the real status and the guessed path.
+    local rc=$?
+    [ "$rc" -eq 4 ] \
         && ok "and a relative one with no working tree is refused, not guessed at" \
-        || fail "oracle: bare" "expected rc 2, got $?"
+        || fail "oracle: bare" "expected rc 4 (unanchored), got $rc"
     ours="$(cd "$d/bare.git" && git rev-parse --path-format=absolute --git-path hooks/post-merge)"
     theirs="$(cd "$probe" && git --git-dir="$d/bare.git" rev-parse --path-format=absolute --git-path hooks/post-merge)"
     [ "$ours" != "$theirs" ] \
@@ -892,6 +932,6 @@ case9() {
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9
 
 finish

@@ -712,6 +712,13 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   "the chainer there is not hidden … that working tree will read dirty" beside `dispatch=dead`
   ("nothing runnable is at …"), about an empty directory in a clean tree: two contradictory
   statements in one report. `exposed` now needs both ownership and existence.
+- **jkb's own git calls strip `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`** (`_git`). Those
+  outrank `-C`, so with `GIT_WORK_TREE` exported — the standard bare-dotfiles shell recipe —
+  `--show-toplevel` answered somebody else's tree and `install_git_hooks` **created `.githooks/`
+  inside that unrelated repository**, reporting `dispatch=chained`, while the repo it was asked
+  about kept a dead hook. Measured. jkb runs inside other people's professional repositories and
+  must not decorate them — the same rule that keeps it from writing a git ref (D46) — and this
+  is a wrapper rather than a note at each call site because there are a dozen of them.
 - **A relative `core.hooksPath` is anchored at the working tree top — and with NO working tree
   it has no anchor at all.** Measured from three directories on git 2.51.1: git resolves it
   against the *invoking process's cwd*, so `git --git-dir=B rev-parse --git-path

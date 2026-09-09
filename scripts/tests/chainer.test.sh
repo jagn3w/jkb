@@ -477,7 +477,7 @@ case10d() {
     esac
     rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
     case "$rendered" in
-        *"names no one hooks directory"*) ok "and the rendering says so" ;;
+        *"cannot be expanded on this machine"*) ok "and the rendering names this cause" ;;
         *) fail "unreadable: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
     esac
 
@@ -729,13 +729,14 @@ case10i() {
     esac
 }
 
-# --- 10j. a relative core.hooksPath with no working tree resolves against the git dir -----
-# GIT'S OWN RULE, measured (git 2.51.1): `git rev-parse --git-path hooks/post-merge` in a bare
-# repo with `core.hooksPath = .githooks` answers `.githooks/post-merge`, and `git hook run
-# post-merge` executes it. A previous round called that unresolvable and reported
-# `dispatch=unreadable` — false about git, and worse in jkb: it then declined to install a
-# chainer at the one place git dispatches from, so the repo hook it had just installed really
-# never ran.
+# --- 10j. a relative core.hooksPath with no working tree has no anchor at all --------------
+# MEASURED FROM THREE DIRECTORIES on git 2.51.1: with no working tree git resolves a relative
+# value against the INVOKING PROCESS'S cwd — `git --git-dir=B rev-parse --git-path
+# hooks/post-merge` answers `<cwd>/.githooks/post-merge`, and `git hook run` executes whatever
+# copy is under that cwd. A round called the git dir "git's own rule" here, on a measurement
+# taken with the cwd SET TO the git dir, which cannot tell the two apart; jkb then installed a
+# chainer there and reported the good verdict while a pull in a linked worktree ran a path that
+# did not exist. There is nothing to resolve to, so jkb refuses and names the repair.
 case10j() {
     local d="$work/norelbase" out
     mkdir -p "$d"
@@ -760,8 +761,22 @@ case10j() {
         *) ok "a relative hooksPath with no working tree: no chainer is guessed at" ;;
     esac
     case "$out" in
-        *"dispatch=unreadable"*) ok "and the verdict says the repo hook will not reliably run" ;;
+        *"dispatch=unanchored"*) ok "and the verdict names the reason: there is no anchor" ;;
         *) fail "norelbase: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # The reason must not name a step that never ran. `undecided`'s text was written when a
+    # failed chainer install was its only producer, so this path — where no chainer is
+    # attempted at all — sent the operator hunting an install failure that did not happen.
+    case "$out" in
+        *"the chainer install failed"*)
+            fail "norelbase: wrong reason" "it blamed a chainer install that never ran" ;;
+        *"no working tree; nothing was decided"*) ok "and the exclude reason names this cause, not a chainer install" ;;
+        *) fail "norelbase: reason" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"whatever directory the pulling process is in"*"run setup.sh from a working tree"*)
+            ok "and the rendering states the cause and its repair" ;;
+        *) fail "norelbase: render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
     esac
     [ -z "$(ls -A "$d/b.git/.githooks" 2>/dev/null)" ] \
         && ok "and nothing was written where it might not be looked for" \
@@ -833,7 +848,7 @@ case10k() {
     # repo's report under this label — and both causes render through the same arm, so it
     # passed either way.
     case "$(printf '%s\n' "$empty_out" | render_git_hooks_report 2>&1)" in
-        *"names no one hooks directory"*"--show-origin"*) ok "and the operator is told why, with a check that can show it" ;;
+        *"set to the empty string"*"--show-origin"*) ok "and the operator is told why, with a check that can show it" ;;
         *) fail "empty: render" "$(printf '%s\n' "$empty_out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
     esac
 }
@@ -1243,7 +1258,8 @@ case14() {
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'
         'dispatch=dead /c|will NOT run the repo hook above'
-        'dispatch=unreadable core.hooksPath|names no one hooks directory'
+        'dispatch=unreadable core.hooksPath is empty|is empty, so git will not reliably run'
+        'dispatch=unanchored core.hooksPath|whatever directory the pulling process is in'
         'error=not a git repo|not a git repo; skipping hook install'
     )
     local entry ok_all=1 missing=""
