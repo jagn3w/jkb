@@ -718,9 +718,24 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   inside that unrelated repository**, reporting `dispatch=chained`, while the repo it was asked
   about kept a dead hook. Measured. jkb runs inside other people's professional repositories and
   must not decorate them — the same rule that keeps it from writing a git ref (D46) — and this
-  is a wrapper rather than a note at each of the six call sites. It stops at `lib.sh`'s
-  boundary on purpose: a **hook** must honour the environment git hands it, so `scripts/hooks/
-  post-merge` and the emitted chainer keep bare `git`.
+  is a wrapper rather than a note at each of the six call sites.
+  - **Both halves, because the Rust one has the larger blast radius.** `gitrepo::git_cmd` is the
+    same seam for the CLI: the shell installer decorates a repo with a `.githooks/` directory,
+    but `repo::main_root` feeding a redirected answer to `jkb task work` **creates a git worktree
+    inside somebody else's repository and rewrites its `.git/info/exclude`**. Every production
+    spawn in the crate is built there; a review found the claim stated as covered while only the
+    shell half was.
+  - **Only the three that select a REPOSITORY.** `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`
+    inject configuration and are deliberately left alone — this project's own dev container
+    carries `safe.directory` grants in them, and stripping those makes git refuse the checkout
+    outright. Pinned at both ends, so the list cannot be "tidied" into a blanket sweep.
+  - **It stops at hooks on purpose:** a hook must honour the environment git hands it — git sets
+    `GIT_DIR` when it runs one, and in a linked worktree that is the only way to reach the right
+    repository — so `scripts/hooks/post-merge` and the emitted chainer keep bare `git`.
+  - **The test harness needed the same sweep and had missed two.** `isolate_git` unset five
+    variables and left `GIT_CONFIG_PARAMETERS` and `GIT_COMMON_DIR`, both of which outrank the
+    empty configuration it builds — and the dev container exports the first. Its list is now
+    defined by a class rather than a count, after the prose's "all five" had already gone stale.
 - **A relative `core.hooksPath` is anchored at the working tree top — and with NO working tree
   it has no anchor at all.** Measured from three directories on git 2.51.1: git resolves it
   against the *invoking process's cwd*, so `git --git-dir=B rev-parse --git-path

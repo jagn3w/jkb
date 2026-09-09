@@ -16,13 +16,35 @@ use jkb_fsm::Fact;
 /// Branch names tried, in order, when a repo does not say which branch is its trunk.
 const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 
+/// `git -C <dir> <args…>`, with the caller's repository selection stripped out.
+///
+/// EVERY git spawn in this module is built here. `GIT_DIR`, `GIT_WORK_TREE` and
+/// `GIT_COMMON_DIR` outrank `-C`, so with `GIT_WORK_TREE` exported — the standard
+/// bare-dotfiles shell recipe — `rev-parse --show-toplevel` answers somebody else's tree.
+/// `repo::main_root` would then resolve that repository as "the repo", and `jkb task work`
+/// creates a worktree under it and adds `/.jkb/` to its `.git/info/exclude`. jkb runs inside
+/// other people's professional repositories and must not decorate them — the same rule that
+/// keeps it from writing a git ref (D46). `scripts/lib.sh::_git` is this rule's shell half.
+///
+/// Only the three that select a REPOSITORY. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
+/// configuration and are deliberately left alone: this project's own dev container uses them
+/// to carry `safe.directory` grants, and stripping those makes git refuse the checkout
+/// outright.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR");
+    cmd
+}
+
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
 /// common "this ref does not exist" case, which is a fact rather than a failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
@@ -182,10 +204,7 @@ pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
 fn git_run(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -967,10 +986,44 @@ pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_branch, deletions_only, is_dirty, key, trunk};
+    use super::{current_branch, deletions_only, git_cmd, is_dirty, key, trunk};
     use jkb_fsm::Fact;
     use std::path::Path;
     use std::process::Command;
+
+    /// Every git spawn in this module drops the caller's repository selection.
+    ///
+    /// Asserted on the built `Command` rather than by exporting the variables, because
+    /// `std::env::set_var` is process-global and would race every other test in this binary —
+    /// the assertion would then be flaky in exactly the direction that reads as a pass.
+    /// That git honours these over `-C` is git's own documented precedence, measured for the
+    /// shell half in `scripts/tests/git-hooks.test.sh::case6p`; what can drift here, and what
+    /// this pins, is whether jkb still asks it to.
+    #[test]
+    fn every_git_call_drops_the_callers_repository_selection() {
+        let cmd = git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for want in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] {
+            assert!(
+                removed.iter().any(|k| k == want),
+                "{want} is not removed; an exported one outranks `-C` and sends jkb into \
+                 another repository. removed: {removed:?}"
+            );
+        }
+        // Configuration injection is deliberately NOT stripped: the dev container carries
+        // `safe.directory` grants in `GIT_CONFIG_PARAMETERS`, and removing those makes git
+        // refuse the checkout. Pinned so the list is not "tidied" into a blanket sweep.
+        for keep in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
+            assert!(
+                !removed.iter().any(|k| k == keep),
+                "{keep} must not be stripped — it carries safe.directory grants"
+            );
+        }
+    }
 
     /// Build a throwaway repo exercising all three GitHub merge strategies plus an
     /// unmerged control. Each branch touches its own file so the merges do not conflict.

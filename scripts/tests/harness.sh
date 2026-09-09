@@ -106,16 +106,32 @@ trap _cleanup_workdir EXIT
 # isolate_git <home> — point git at an empty configuration, so a test measures the repos it
 # builds and nothing about the machine it runs on.
 #
-# All five matter, and the precedence order is why. GIT_CONFIG_GLOBAL *replaces*
-# `$HOME/.gitconfig`, and GIT_CONFIG_COUNT injects settings that outrank every file — so
-# exporting HOME alone isolates nothing when either is set, and an ambient `core.hooksPath`
-# then reddens this suite over a regression that does not exist. That is worse than a missed
-# defect here: check.sh is the gate `jkb task land` and the merge queue trust, so a false red
-# blocks a landing and the failure text points at innocent code.
+# The list is defined by a CLASS, not by a count: every variable that can outrank the empty
+# configuration this points git at, plus the three that select a repository. A count in the
+# prose ("all five") is a fact about the line below it that goes stale the first time somebody
+# extends it, and this one already had.
+#
+# The precedence order is why it matters. GIT_CONFIG_GLOBAL *replaces* `$HOME/.gitconfig`;
+# GIT_CONFIG_COUNT and GIT_CONFIG_PARAMETERS inject settings that outrank every file — so
+# exporting HOME alone isolates nothing when any of them is set, and an ambient
+# `core.hooksPath` then reddens this suite over a regression that does not exist. That is
+# worse than a missed defect here: check.sh is the gate `jkb task land` and the merge queue
+# trust, so a false red blocks a landing and the failure text points at innocent code.
+#
+# GIT_CONFIG_PARAMETERS is not hypothetical: this project's own dev container exports it, and
+# GIT_CONFIG_COUNT with it, to carry `safe.directory` grants.
 isolate_git() {
     mkdir -p "$1" || return 1
     export HOME="$1" GIT_CONFIG_NOSYSTEM=1
-    unset XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+    unset XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+          GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+    # KEY_<n>/VALUE_<n> are inert once COUNT is gone, but they are the machine's values and a
+    # later export of COUNT by anything under test would make them live again. Swept by
+    # pattern so the sweep cannot drift from however many the machine happens to set.
+    local v
+    for v in $(env | sed -n 's/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9][0-9]*\)=.*/\1/p'); do
+        unset "$v"
+    done
 }
 
 # git_q … — git with an identity, so `commit` works under the isolated config.

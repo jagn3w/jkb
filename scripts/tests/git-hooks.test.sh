@@ -377,11 +377,14 @@ case6p() {
 }
 
 # --- 6n. the override agrees with git's own answer, in every layout ------------------------
-# The oracle, not a snapshot. A round asserted that a relative `core.hooksPath` with no working
-# tree is unresolvable; git resolves it against the git dir and runs the hook, so the claim was
-# false and jkb stopped installing a chainer where git dispatches from. Asking git in each
-# layout is what makes that unrepeatable — including the two layouts nobody had measured, a
-# `.git` gitfile and a repo whose worktree has been removed.
+# The oracle, not a snapshot. Two rounds asserted opposite rules for a relative `core.hooksPath`
+# in a repository with no working tree, and BOTH were written into comments before either was
+# measured properly. What git actually does — measured from three directories on 2.51.1 — is
+# resolve it against the INVOKING PROCESS'S cwd, so there is no one place at all and jkb
+# refuses (rc 4, `dispatch=unanchored`). The earlier claim that it resolves against the git dir
+# came from a measurement taken with the cwd SET TO the git dir, which cannot tell the two
+# apart. Asking git in each layout is what makes that unrepeatable — including the layouts
+# nobody had measured: a `.git` gitfile, and a repo whose worktree has been removed.
 case6n() {
     local d="$work/oracle" dir ours theirs bad="" probe
     mkdir -p "$d" "$d/probe-cwd"
