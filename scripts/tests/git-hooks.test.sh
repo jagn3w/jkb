@@ -293,6 +293,73 @@ case6d() {
     esac
 }
 
+# --- 6e. an exclude file git can read, we can read -----------------------------------------
+# git trims one trailing CR from every ignore/exclude line, so a CRLF file is functional to
+# git. Ours did not, so on such a file it recognised neither its own block nor the pattern,
+# and appended a fresh one on every qualifying pull — unbounded growth in a file of the
+# user's rules. Also pins that the surviving lines keep their original endings: agreeing with
+# git about what a line MEANS is not licence to rewrite how it is spelled.
+case6e() {
+    local r="$work/crlf" chainer override got
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    override="$(git_hooks_override "$r")"
+    chainer="$override/post-merge"
+    mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
+    # OUR OWN BLOCK, written with CRLF endings — as a Windows editor would leave it after any
+    # visit to the file. Planting CRLF only on the user's lines does not exercise this: the
+    # block we then append has LF endings and matches on the next run either way, so the test
+    # passed with the trim reverted.
+    printf '# my rules\r\n*.log\r\n%s\r\n/.githooks/post-merge\r\n' "$(exclude_marker)" \
+        >"$r/.git/info/exclude"
+
+    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    if [ "$got" = "kept /.githooks/post-merge" ] \
+        && [ "$(grep -c 'githooks/post-merge' "$r/.git/info/exclude")" = "1" ]; then
+        ok "a CRLF exclude file: our own block is recognised, not appended a second time"
+    else
+        fail "crlf: duplicate" "said '$got'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    if [ "$(head -1 "$r/.git/info/exclude" | od -c | grep -c '\\r')" = "1" ]; then
+        ok "and the user's own line endings are left alone"
+    else
+        fail "crlf: rewritten" "the file's existing CRLF endings were changed"
+    fi
+    got="$(reconcile_exclude "$r" "$chainer" no)"
+    if [ "$got" = "retracted /.githooks/post-merge" ] \
+        && ! grep -q 'githooks/post-merge' "$r/.git/info/exclude"; then
+        ok "and a CRLF block is retracted, marker and all"
+    else
+        fail "crlf: retract" "said '$got'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    [ "$(grep -c '^\*\.log' "$r/.git/info/exclude")" = "1" ] \
+        && ok "and the user's rules survive the rewrite" \
+        || fail "crlf: lost" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+}
+
+# --- 6f. a working tree whose path contains glob metacharacters ---------------------------
+# The pattern is derived by matching the chainer against the toplevel in a `case`, and a `[`
+# or `*` in the path would be a glob if the operand were unquoted — silently taking the
+# "outside the working tree" arm and excluding nothing, in a repo that reads dirty for ever.
+case6f() {
+    local r="$work/od[d]*name" chainer override got
+    mkdir -p "$r"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    override="$(git_hooks_override "$r")"
+    chainer="$override/post-merge"
+    mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
+    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    [ "$got" = "added /.githooks/post-merge" ] \
+        && ok "a repo path with glob metacharacters: still excluded" \
+        || fail "glob: state" "got '$got'"
+    [ -z "$(git_q -C "$r" status --porcelain)" ] \
+        && ok "and the tree is clean" \
+        || fail "glob: dirty" "$(git_q -C "$r" status --porcelain | tr '\n' ' ')"
+}
+
 # --- 7. a hooks path outside the working tree is left alone -------------------------------
 # The ordinary case: an absolute core.hooksPath is nobody's working tree, so there is nothing
 # to hide and nothing should be written to .git/info/exclude.
@@ -348,6 +415,8 @@ case6
 case6b
 case6c
 case6d
+case6e
+case6f
 case7
 case8
 

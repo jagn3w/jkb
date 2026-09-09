@@ -256,12 +256,38 @@ exclude_marker() {
 
 exclude_known_markers="exclude_marker"
 
+# _exclude_line <raw line> — the line as GIT reads it.
+#
+# git trims one trailing CR from every line of an ignore/exclude file (`dir.c`), so a CRLF
+# file is perfectly functional to git and our own comparisons must agree with it. They did
+# not: on such a file nothing matched, so `reconcile_exclude` neither recognised its own block
+# nor saw the pattern at all, and appended a fresh one on EVERY qualifying pull — unbounded
+# growth in a file of the user's rules, which is the harm this whole reconciliation exists to
+# avoid. Comparisons are trimmed; what gets written back is the untrimmed original, so a CRLF
+# file is not silently converted.
+_exclude_line() { printf '%s' "${1%$'\r'}"; }
+
 # _is_exclude_marker <line> — is this one of the marker lines jkb has ever written?
 _is_exclude_marker() {
-    local line="$1" marker
+    local line marker
+    line="$(_exclude_line "$1")"
     for marker in $exclude_known_markers; do
         [ "$line" = "$("$marker")" ] && return 0
     done
+    return 1
+}
+
+# _exclude_mentions <file> <pattern> — does any line of <file> exclude <pattern>?
+#
+# Not `grep -qxF`: that is a second way of asking the question `_exclude_without_our_block`
+# already asks, and the two came apart on exactly the input where it matters. One reading
+# rule, applied by both.
+_exclude_mentions() {
+    local file="$1" pattern="$2" line
+    [ -f "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ "$(_exclude_line "$line")" = "$pattern" ] && return 0
+    done <"$file"
     return 1
 }
 
@@ -281,7 +307,8 @@ _exclude_without_our_block() {
     i=0
     while [ "$i" -lt "$n" ]; do
         if _is_exclude_marker "${lines[$i]}" \
-            && [ "$((i + 1))" -lt "$n" ] && [ "${lines[$((i + 1))]}" = "$pattern" ]; then
+            && [ "$((i + 1))" -lt "$n" ] \
+            && [ "$(_exclude_line "${lines[$((i + 1))]}")" = "$pattern" ]; then
             i=$((i + 2))
             found=0
             continue
@@ -348,7 +375,7 @@ reconcile_exclude() {
     fi
 
     # Not ours. Is it excluded anyway — by a rule the user wrote?
-    if [ -f "$exclude" ] && grep -qxF "$pattern" "$exclude"; then
+    if _exclude_mentions "$exclude" "$pattern"; then
         if [ "$want" = yes ]; then
             # Already hidden, so there is nothing to do and nothing to own.
             printf 'kept %s\n' "$pattern"
