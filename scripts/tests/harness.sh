@@ -2,7 +2,7 @@
 # check.sh's glob does not pick it up).
 #
 #   . "$(dirname "$0")/harness.sh"
-#   work="$(new_workdir)"
+#   new_workdir            # sets $work
 #   isolate_git "$work/home"
 #   ok / fail / skip
 #   finish
@@ -32,16 +32,29 @@ finish() {
     fi
 }
 
-# new_workdir — a temp directory removed on exit. `chmod` first: a case may make a directory
-# unwritable, and an interrupt before it restores the mode would leave `rm -rf` unable to
-# clean up.
+# new_workdir — create a temp directory and put its path in `$work`.
+#
+# It ASSIGNS rather than prints, and the EXIT trap is registered at file scope below rather
+# than inside the function. Both are the same correction. Written as `work="$(new_workdir)"`,
+# the body runs in a command-substitution subshell — so a `trap … EXIT` registered there fires
+# the instant the subshell ends, deleting the directory it had just printed, and the caller is
+# left with no cleanup at all. Neither half was visible: every case happens to `mkdir -p` its
+# own subdirectory first (at 755, not mktemp's 700), so the suites passed while each gate run
+# leaked a temp tree of git repos and linked worktrees. scripts/tests/harness.test.sh pins
+# both halves.
+work=""
 new_workdir() {
-    local d
-    d="$(mktemp -d)" || return 1
-    # shellcheck disable=SC2064  # expand $d now, not at trap time
-    trap "chmod -R u+rwx '$d' 2>/dev/null; rm -rf '$d'" EXIT
-    printf '%s\n' "$d"
+    work="$(mktemp -d)" || { echo "harness: mktemp -d failed" >&2; exit 1; }
 }
+
+# `chmod` first: a case may make a directory unwritable, and an interrupt before it restores
+# the mode would leave `rm -rf` unable to clean up.
+_cleanup_workdir() {
+    [ -n "$work" ] || return 0
+    chmod -R u+rwx "$work" 2>/dev/null
+    rm -rf "$work"
+}
+trap _cleanup_workdir EXIT
 
 # isolate_git <home> — point git at an empty configuration, so a test measures the repos it
 # builds and nothing about the machine it runs on.

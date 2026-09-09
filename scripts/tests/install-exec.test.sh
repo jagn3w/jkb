@@ -19,7 +19,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/tests/harness.sh
 . "$(dirname "$0")/harness.sh"
 
-work="$(new_workdir)"
+new_workdir
 
 # --- 1. a script survives being replaced, by a longer version, while it is running -------
 case1() {

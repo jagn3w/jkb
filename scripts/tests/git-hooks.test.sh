@@ -19,7 +19,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/tests/harness.sh
 . "$(dirname "$0")/harness.sh"
 
-work="$(new_workdir)"
+new_workdir
 isolate_git "$work/home"
 
 # Where git will actually run the post-merge hook from, as an absolute path.
