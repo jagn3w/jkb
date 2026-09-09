@@ -1072,23 +1072,31 @@ case10d() {
         || fail "wrapper: live" "bare git call(s): $(printf '%s' "$hits" | tr '\n' '|')"
 
     # And the check itself must fire. A guard nobody has watched fail is this directory's
-    # recurring defect, so every call site is reverted in turn and each must be reported.
+    # recurring defect, so EVERY call site is reverted in turn and each must be reported.
+    #
+    # The sites are DERIVED from the file, never listed here. A hand-written list went stale
+    # the moment two readers of `core.hooksPath` were merged into one function — the named
+    # command no longer existed, so a third of the coverage silently stopped being exercised.
+    # It only surfaced because the probe asserts its own premise ("the revert did not apply,
+    # so nothing was proven") rather than treating a no-op edit as a pass.
     probe="$work/wrapper-probe.sh"
-    local n=0 caught=0 target
-    for target in 'rev-parse --git-common-dir' 'config --get --path core.hooksPath' \
-                  'rev-parse --show-toplevel' 'worktree list --porcelain'; do
+    local n=0 caught=0 ln
+    for ln in $(grep -n '_git -C' "$lib" | grep -v '^[0-9]*:_git()' | cut -d: -f1); do
         n=$((n + 1))
-        sed "s|_git -C \"\$repo_root\" $target|git -C \"\$repo_root\" $target|" "$lib" >"$probe"
+        awk -v L="$ln" 'NR==L { sub(/_git -C/, "git -C") } { print }' "$lib" >"$probe"
         if cmp -s "$lib" "$probe"; then
-            fail "wrapper: probe" "the $target revert did not apply, so nothing was proven"
+            fail "wrapper: probe" "the revert at line $ln did not apply, so nothing was proven"
         elif [ -n "$(_bare_git_calls "$probe")" ]; then
             caught=$((caught + 1))
         else
-            fail "wrapper: missed" "a bare git call at '$target' was not detected"
+            fail "wrapper: missed" "a bare git call at line $ln was not detected"
         fi
     done
+    [ "$n" -ge 4 ] \
+        && ok "and there are $n wrapped call sites to check, not zero" \
+        || fail "wrapper: none" "found $n call sites; the derivation is broken, not the code"
     [ "$caught" -eq "$n" ] \
-        && ok "and it reports a revert at each of the $n call sites" \
+        && ok "and it reports a revert at every one of them" \
         || fail "wrapper: coverage" "caught $caught of $n"
 }
 
@@ -1227,6 +1235,37 @@ case10g() {
         *"dispatch=transient"*) ok "and the GIT_CONFIG_PARAMETERS form is caught too" ;;
         *) fail "injected: params" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
+    # AND IT MUST NOT RETRACT THE REAL BLOCK. Measured before this was fixed: the override
+    # refused the injected value while `git_hooks_exclude_pattern` read it separately and
+    # happily derived from it — answering `none`, which the funnel turns into `want=no`, which
+    # sweeps. So one environment variable retracted the exclude block for the repository's OWN
+    # chainer, leaving that file untracked, the tree dirty and `jkb task land` refusing it,
+    # unattended from the post-merge hook. Two readers of one fact, disagreeing.
+    local d2="$work/injected-keeps" out2
+    mkdir -p "$d2"
+    git_q init -q "$d2/r" >/dev/null 2>&1
+    git_q -C "$d2/r" commit -q --allow-empty -m init
+    git_q -C "$d2/r" config core.hooksPath .githooks   # relative, inside the tree: legitimately hidden
+    printf '#!/bin/sh
+echo hi
+' >"$d2/src"
+    install_git_hooks "$d2/r" "$d2/src" >/dev/null 2>&1
+    if grep -q '^/\.githooks/post-merge$' "$d2/r/.git/info/exclude" 2>/dev/null; then
+        ok "a normal run establishes the exclude block for the repository's own chainer"
+    else
+        fail "injected: premise2" "the fixture never got an exclude block, so the next assertion proves nothing"
+        return
+    fi
+    out2="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/elsewhere/hooks \
+            install_git_hooks "$d2/r" "$d2/src" 2>/dev/null)"
+    grep -q '^/\.githooks/post-merge$' "$d2/r/.git/info/exclude" 2>/dev/null \
+        && ok "and an injected core.hooksPath does not retract it" \
+        || fail "injected: retracted" "one environment variable swept the repository's own exclude block"
+    case "$out2" in
+        *"exclude-file=unchanged"*) ok "and the run truthfully reports the file was not touched" ;;
+        *) fail "injected: filefact" "got: $(printf '%s' "$out2" | tr '\n' '|')" ;;
+    esac
+
     # The premise: with no injection the same repo resolves normally, so the assertions above
     # are about the injection and not about something broken in the fixture.
     out="$(install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
@@ -1236,7 +1275,50 @@ case10g() {
     esac
 }
 
+# --- 10h. a git without --show-scope still resolves normally --------------------------------
+# `--show-scope` is git >= 2.26, and an older one exits 129 for the unknown option — which is
+# NOT "cannot expand the value". Folded together, every repo on such a git would report
+# `dispatch=unreadable` and jkb would stop installing chainers entirely. Nothing else exercises
+# the fallback, so without this case it is a branch no run ever takes.
+#
+# A shim on PATH rather than an old git, and it asserts the shim really refuses first: a shim
+# that quietly worked would make this case pass having tested the ordinary path twice.
+case10h() {
+    local d="$work/oldgit" out
+    mkdir -p "$d/bin"
+    printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do [ "$a" = "--show-scope" ] && { echo "error: unknown option" >&2; exit 129; }; done' \
+        "exec $(command -v git) \"\$@\"" >"$d/bin/git"
+    chmod 755 "$d/bin/git"
+
+    git_q init -q "$d/r" >/dev/null 2>&1
+    git_q -C "$d/r" commit -q --allow-empty -m init
+    git_q -C "$d/r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho hi\n' >"$d/src"
+
+    if PATH="$d/bin:$PATH" git config --show-scope --get user.name >/dev/null 2>&1; then
+        fail "oldgit: premise" "the shim accepted --show-scope, so the fallback was never taken"
+        return
+    fi
+    ok "the shim refuses --show-scope, as a git older than 2.26 does"
+
+    out="$(PATH="$d/bin:$PATH" install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=chained"*) ok "and jkb still resolves core.hooksPath and installs the chainer" ;;
+        *"unreadable"*) fail "oldgit: verdict" "an unknown OPTION was reported as an unreadable VALUE" ;;
+        *) fail "oldgit: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # The transient check simply goes undetected there — the behaviour before it existed —
+    # rather than becoming a confident wrong diagnosis.
+    out="$(PATH="$d/bin:$PATH" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+           GIT_CONFIG_VALUE_0="$d/r/injected" install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=transient"*) fail "oldgit: transient" "claimed a scope this git cannot report" ;;
+        *) ok "and an injected value is undetectable there rather than misdiagnosed" ;;
+    esac
+}
+
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h
 
 finish

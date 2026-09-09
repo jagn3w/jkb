@@ -117,6 +117,39 @@ _real_dir() {
     else printf '%s\n' "$1"; fi
 }
 
+# _hooks_path_read <repo_root> — the ONE read of `core.hooksPath`, with its scope.
+#
+# Prints `<scope><TAB><value>` and returns 0; returns 1 when the setting is genuinely absent,
+# and 2 when git will not expand it. Both consumers — `git_hooks_override`, which resolves it
+# to a directory, and `git_hooks_exclude_pattern`, which needs the raw string — go through
+# here, because they need DIFFERENT things from the SAME fact and reading it twice is how they
+# came to disagree about it.
+#
+# They did disagree, measurably: the override refused an environment-injected value while the
+# derivation happily used it, so the derivation had the last word and jkb RETRACTED the
+# legitimate exclude block for the repository's own chainer — leaving that file untracked, the
+# tree dirty and `jkb task land` refusing it, unattended from the post-merge hook.
+#
+# `--show-scope` is git >= 2.26; an older git exits 129 for the unknown option, which is not
+# "cannot expand", so the read is retried without it and the scope is reported `unknown`
+# rather than guessed. `|| rc=$?`, never a bare assignment: exit 1 here is the commonest case
+# and a bare one aborts an `set -e` shell.
+_hooks_path_read() {
+    local rc=0 scoped
+    scoped="$(_git -C "$1" config --show-scope --get --path core.hooksPath 2>/dev/null)" || rc=$?
+    case "$rc" in
+        0) printf '%s' "$scoped"; return 0 ;;
+        1) return 1 ;;
+    esac
+    rc=0
+    scoped="$(_git -C "$1" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
+    case "$rc" in
+        0) printf 'unknown\t%s' "$scoped"; return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
 # git_hooks_override <repo_root> — print the absolute `core.hooksPath` in effect for
 # <repo_root>, or nothing when there is none. Returns 0 for both of those — "no override" is
 # an answer, not a failure. Three OTHER codes each name a way the setting exists and yields no
@@ -163,36 +196,20 @@ git_hooks_override() {
     # case, `core.hooksPath` not set at all. This file's header promises every function
     # behaves the same with `set -e` on or off; that promise was being kept only by how the
     # one caller happens to spell the call. Same shape as the ERR-trap lesson in D50.
-    local rc=0 scoped scope=""
-    # `--show-scope`, because `_git` deliberately does NOT strip `GIT_CONFIG_COUNT`/
-    # `GIT_CONFIG_PARAMETERS` — those carry the `safe.directory` grants this project's own dev
-    # container needs, and stripping them makes git refuse the checkout outright. Git will
-    # simply say where the winning value came from, so the transient case is detected without
-    # removing anything and without a second model of git's precedence. Measured on 2.51.1:
-    # an env-injected or `-c` value reports scope `command`; a stored one reports
-    # `local`/`global`/`system`.
-    scoped="$(_git -C "$repo_root" config --show-scope --get --path core.hooksPath 2>/dev/null)" || rc=$?
+    local rc=0 scoped
+    scoped="$(_hooks_path_read "$repo_root")" || rc=$?
     case "$rc" in
-        0) scope="${scoped%%$'\t'*}"; configured="${scoped#*$'\t'}" ;;
+        0) ;;
         1) return 0 ;;      # genuinely not set
-        *)  # `--show-scope` is git >= 2.26. An older git exits 129 for the unknown option,
-            # which is NOT "cannot expand the value" — so retry without it before concluding
-            # anything. On such a git the transient case simply goes undetected, which is the
-            # behaviour before this check existed, rather than a confident wrong diagnosis.
-            rc=0
-            configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
-            case "$rc" in
-                0) ;;
-                1) return 0 ;;
-                *) return 2 ;;  # set, and git will not expand it
-            esac ;;
+        *) return 2 ;;      # set, and git will not expand it
     esac
     # A value from `command` scope is the CALLING PROCESS'S, not the repository's. A chainer
     # installed there is installed where the next `git pull` will not look, so this refuses
     # rather than reporting a good verdict for a hook nothing will run. Reachable unattended:
     # `git -c core.hooksPath=X pull` exports the setting into the hook environment, and the
     # hook runs setup.sh.
-    [ "$scope" = command ] && return 5
+    [ "${scoped%%$'\t'*}" = command ] && return 5
+    configured="${scoped#*$'\t'}"
     # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
     # printing nothing, `rev-parse --git-path hooks/post-merge` answers `/post-merge`, and
     # `git hook run post-merge` says "cannot find a hook named post-merge" — the repo hook is
@@ -448,7 +465,7 @@ _exposure_answer() {
 # here detects that; the failure is a pattern computed for one worktree's value, which is the
 # pre-existing behaviour rather than a new one.
 git_hooks_exclude_pattern() {
-    local repo_root="$1" configured rc rel line wt hit=""
+    local repo_root="$1" configured scoped rc rel line wt hit=""
     local tops="" main_top="" bare=0 rec=0
     # Every worktree's top, main first, and whether the main entry is BARE. Asked of the
     # repository through the porcelain rather than `--is-bare-repository` of `$repo_root`:
@@ -479,10 +496,19 @@ EOF
         printf 'undecided (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
-    # See git_hooks_override: `|| rc=$?`, because a bare assignment aborts under `set -e`
-    # before the next line can capture anything.
     rc=0
-    configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
+    scoped="$(_hooks_path_read "$repo_root")" || rc=$?
+    # The SAME refusal `git_hooks_override` makes, because it is the same fact. Reading the
+    # value separately is what let this function derive a pattern from an environment-injected
+    # path while the override was refusing it — and an empty answer here is turned into
+    # `want=no` by the caller, so the derivation swept away the block for the repository's own
+    # chainer. `undecided`, therefore: nothing about the repository's real hooks path was
+    # established, so nothing is retracted on the strength of it.
+    if [ "$rc" -eq 0 ] && [ "${scoped%%$'\t'*}" = command ]; then
+        printf 'undecided (core.hooksPath came from the environment, not from this repository)\n'
+        return 0
+    fi
+    configured="${scoped#*$'\t'}"
     case "$rc" in
         0) ;;
         1) printf 'none (no core.hooksPath, so nothing of ours is inside the tree)\n'; return 0 ;;
@@ -767,13 +793,16 @@ _reconcile_exclude_decide() {
     local -a lines=() out=() removed=() deduped=()
     local i n seen_keep=0 changed=0 probe_retracted=0 tidied=0
 
-    common="$(_git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || common=""
-    if [ -z "$common" ]; then
+    # THE SAME derivation the wrapper fingerprints, called rather than copied. Two copies of
+    # it would drift, and a wrapper measuring a different file from the one this body writes is
+    # a lie that reads exactly like the truth — it would report `unchanged` over a real write,
+    # which is the whole class `exclude-file=` was added to end.
+    exclude="$(_exclude_path "$repo_root")"
+    if [ -z "$exclude" ]; then
         printf 'exclude=none (not a git repository)\n'
         return 0
     fi
-    case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
-    exclude="$common/info/exclude"
+    common="${exclude%/info/exclude}"
 
     # An unrecognised `want` refuses. The fall-through was the `no` branch, which SWEEPS: a
     # caller typo, or a fifth word added at one site and forgotten here, silently retracted

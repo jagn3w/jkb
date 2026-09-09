@@ -834,6 +834,29 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   caller happens to spell the call (`… || override_rc=$?`, which disables errexit for the whole
   invocation). `|| rc=$?` at both, pinned by a case that asserts its own premise first — a
   fixture that happened to have a `core.hooksPath` would pass having tested nothing.
+- **One read of `core.hooksPath`, because two readers of one fact is how this file fails.**
+  `git_hooks_override` refuses an environment-injected value; `git_hooks_exclude_pattern` read
+  it separately and happily derived a pattern from it. The derivation has the last word by
+  design, and an empty answer becomes `want=no`, which sweeps — so **one environment variable
+  retracted the exclude block for the repository's own chainer**, leaving that file untracked,
+  the tree dirty and `jkb task land` refusing it, unattended from the post-merge hook. Measured.
+  `_hooks_path_read` is now the single read: it prints `<scope><TAB><value>` and both consumers
+  take what they need from it — the override resolves it to a directory, the derivation wants
+  the raw string — so the transient refusal cannot reach one and miss the other. Fixing only
+  the reader the defect surfaced in would have left the identical hole one call away, which is
+  this area's whole history.
+- **A derived list, because a hand-written one goes stale silently.** The `_git` enforcement
+  check reverted four *named* call sites to prove it fires; merging the two readers deleted one
+  of those names, and a third of the coverage would have stopped being exercised. It only
+  surfaced because the probe asserts its own premise — *"the revert did not apply, so nothing
+  was proven"* — instead of counting a no-op edit as a pass. It now derives every `_git -C`
+  line from the file itself and requires a non-zero count, so it cannot quietly check nothing.
+- **A branch no run takes is a branch that is not known to work.** `--show-scope` is git >= 2.26
+  and an older one exits **129** for the unknown option — which is not *"cannot expand the
+  value"*, and folded together every repo on such a git would report `dispatch=unreadable` and
+  jkb would stop installing chainers entirely. The fallback is exercised by a PATH shim that
+  refuses `--show-scope`, and the case asserts the shim really refuses first: a shim that
+  quietly worked would pass having tested the ordinary path twice.
 - **The shell-syntax gate is one function, not two copies of a file list.** `shell_sources` +
   `check_shell_syntax` live in lib.sh and CI calls them, because the hand-written copy in
   `check.sh` and the one in `ci.yml` drifted by a `*.md` skip within a commit of each other —
