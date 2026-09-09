@@ -361,6 +361,12 @@ case10() {
     grep -q 'direnv reload' "$chainer" \
         && ok "and their file was not touched" \
         || fail "life: clobbered" "the user's hook was overwritten"
+    # Exactly one exclude line: the retraction. Falling through to the "is anything else
+    # hiding it?" question after retracting our own block would add a second, contradictory
+    # line about the same pattern.
+    [ "$(printf '%s\n' "$out" | grep -c '^exclude=')" = "1" ] \
+        && ok "and says one thing about that pattern, not two" \
+        || fail "life: two exclude lines" "$(printf '%s\n' "$out" | grep '^exclude=' | tr '\n' '|')"
     case "$out" in
         *"dispatch=unknown"*) ok "and the verdict is unknown, not dead — a foreign chainer may dispatch" ;;
         *) fail "life: foreign verdict" "expected dispatch=unknown, got: $(printf '%s' "$out" | tr '\n' '|')" ;;

@@ -336,7 +336,7 @@ reconcile_exclude() {
     local repo_root="$1" path="$2" want="$3"
     local top common exclude pattern="" keep="" tmp line blockpat
     local -a lines=() out=() removed=()
-    local i n seen_keep=0 changed=0 probe=""
+    local i n seen_keep=0 changed=0 probe="" probe_retracted=0
 
     top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || top=""
     common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || common=""
@@ -372,6 +372,7 @@ reconcile_exclude() {
             else
                 # Wanted nowhere, or a duplicate of the one we want: drop both lines.
                 removed+=("$blockpat")
+                [ "$blockpat" = "$pattern" ] && probe_retracted=1
                 changed=1
             fi
             i=$((i + 2))
@@ -407,9 +408,18 @@ reconcile_exclude() {
             printf 'exclude=failed (cannot write %s)\n' "$exclude"
             return 0
         fi
-        for blockpat in "${removed[@]}"; do
-            printf 'exclude=retracted %s\n' "$blockpat"
-        done
+        # Guarded, and the membership test below is a flag rather than a second expansion.
+        # `"${arr[@]}"` on an EMPTY array under `set -u` is an unbound-variable error on bash
+        # before 4.4 — which is what macOS ships as /bin/bash — while being fine on the bash
+        # this was written under. setup.sh runs `set -euo pipefail` and the suites run
+        # `set -uo pipefail`, so the report would have died mid-line on a Mac. Not verified
+        # against 3.2 here (this machine has 5.2), which is exactly why the construct is
+        # avoided rather than reasoned about.
+        if [ "${#removed[@]}" -gt 0 ]; then
+            for blockpat in "${removed[@]}"; do
+                printf 'exclude=retracted %s\n' "$blockpat"
+            done
+        fi
     fi
 
     # Now the pattern this run is actually about.
@@ -456,9 +466,7 @@ reconcile_exclude() {
     fi
 
     # want=no. Our own block, if there was one, has already been reported `retracted`.
-    for blockpat in "${removed[@]}"; do
-        [ "$blockpat" = "$pattern" ] && return 0
-    done
+    [ "$probe_retracted" -eq 1 ] && return 0
     if _exclude_mentions "$exclude" "$pattern"; then
         # The harm this reconciliation exists to stop, in the one case it cannot repair:
         # something is hiding the file and jkb cannot prove it put it there, so it says so
