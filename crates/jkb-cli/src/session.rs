@@ -146,6 +146,11 @@ pub fn ensure_excluded(repo_root: &Path) -> Result<()> {
     // whose contents matter, and it must not be a reason to fail or to overwrite.
     let current = fs::read(&exclude).unwrap_or_default();
     let text = String::from_utf8_lossy(&current);
+    // A MARKED block, and its marker names this writer. `scripts/lib.sh`'s
+    // `reconcile_exclude` sweeps blocks in the same file, and sweeps only those bearing a
+    // marker in its own `exclude_known_markers` — so this marker must never be added to that
+    // list, or a `setup.sh` run would retract the rule that keeps every session worktree out
+    // of `git status`. `scripts/tests/git-hooks.test.sh` case6i pins that from the other side.
     let entry = format!("/{JKB_DIR}/");
     if text.lines().any(|l| l.trim() == entry) {
         return Ok(());

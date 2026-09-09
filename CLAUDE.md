@@ -635,12 +635,48 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   it is reported (`unowned`) and never deleted: the residual harm becomes visible with a
   remedy instead of silent and permanent. Reconciling only the *installed* path was not
   reconciliation either — moving `core.hooksPath` left the old block for ever, and unsetting it
-  returned before any reconciliation ran at all — so the desired state is now *exactly the
-  blocks jkb should own right now*, every other one is retracted whatever path it names, and
-  the no-override exits reconcile before returning. The file is rewritten through a temp file
-  whose **write status is checked**: `printf` to a full disk fails after emitting part of its
-  output, and dropping that status renamed a truncated file over every rule the user owns under
-  the word `retracted`.
+  returned before any reconciliation ran at all — so the desired state is *exactly the blocks
+  jkb should own right now*, every other one is retracted whatever path it names. The file is
+  rewritten through a temp file whose **write status is checked**: `printf` to a full disk fails
+  after emitting part of its output, and dropping that status renamed a truncated file over
+  every rule the user owns under the word `retracted`.
+- **The desired state is a pure function of facts every worktree shares, never of the worktree
+  that happens to be running** (`git_hooks_exclude_pattern`). `.git/info/exclude` lives in the
+  common dir and applies to every worktree at once, so a desired state derived from
+  `--show-toplevel` differs per run — and a sweep that *enforces* one turns that disagreement
+  into a flip-flop: a main-checkout run added the block, the next run from a `jkb task work`
+  session retracted it, and the main checkout read dirty in between, which is the state
+  `jkb task land` refuses. D36 makes that the normal case, not a corner one. So the pattern
+  comes from the **raw `core.hooksPath` string**, not from resolving a path and stripping a
+  toplevel back off it: a relative value is resolved by git against each worktree's own top, so
+  one anchored pattern is simultaneously right for all of them; an absolute one is hidden only
+  when it is inside the **main** checkout, because an anchored rule would otherwise hide a
+  same-named path in every other tree. The regression guard is an equality assertion — the same
+  answer from the checkout and from a linked worktree — not a behaviour snapshot.
+- **A jkb block is defined positively, so the bad shapes follow instead of being remembered**: a
+  known marker line immediately followed by a *pattern-shaped* line (non-empty, not itself a
+  marker, not a comment). A marker that heads nothing is an **orphan** — jkb's own line, inert
+  to git, removed and reported `tidied`. Without that definition the walk paired a marker with
+  the marker below it, computed the block's "pattern" as the marker's own text, retracted
+  **both** marker lines and left the real pattern bare — which jkb then reported `unowned` and
+  refused to touch for ever, the exact silent-and-permanent harm the ownership rule exists to
+  end, caused by the parser.
+- **jkb is not the only writer of marked blocks in that file, and each sweeps only its own.**
+  `session::ensure_excluded` writes `# jkb task sessions (git worktrees)` + `/.jkb/` from Rust;
+  it survives because its marker is not in `exclude_known_markers`, which was a fact enforced by
+  nobody until a test pinned it from the shell side and a comment stated it at both.
+- **`retracted` split by what happened to the file, not by why.** One word carried four causes
+  and the renderer stated a reason false on three of them; a de-duplicated copy of the block
+  being *kept* was reported `retracted` and then `kept`, two contradictory lines about one
+  pattern. Now `retracted` (jkb no longer stands behind hiding it — true of all three of its
+  causes), `deduplicated`, and `tidied`.
+- **The reconcile is below every arm, not inside one.** `install_git_hooks`'s arms set `want`
+  and a verdict and none of them returns, so a fifth arm added later cannot skip the
+  reconciliation — the property is structural rather than remembered. It had to be: the
+  chainer-install-failed arm returned early, and because that precondition is itself
+  persistent, "the next successful run reconciles it" never came. That arm's honest answer is
+  the third value `undecided`: nothing is known about *this* pattern, and nothing needed to be
+  known about the others.
 - **An exclude line is read the way git reads it** (`_exclude_line`): git trims one trailing CR,
   so a CRLF file is functional to git and our comparisons must agree. They did not, so on such a
   file jkb recognised neither its own block nor the pattern and appended a fresh one on every

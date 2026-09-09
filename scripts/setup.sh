@@ -28,6 +28,10 @@ do_extension=1
 do_service=1
 do_scaffold=1
 link_memory=0
+# Means "the watcher is actually running", not "the unit files were written". Wiring it to
+# the write alone left the summary claiming "watcher: running" after `launchctl load` or
+# `systemctl --user enable` had just failed and said so two lines earlier — four ways for one
+# line to lie, three of them still open.
 service_ok=1
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
@@ -86,8 +90,14 @@ elif [ -f "$db" ]; then
   say "existing KB detected ($db) — left untouched"
 else
   say "scaffold KB namespaces ($db)"
-  mkdir -p "$(dirname "$db")"
-  jkb --db "$db" ns mk repos tasks media references memory
+  # Wrapped for the same reason as the two steps below it. NOTHING before the git-hooks
+  # section may be fatal: the hook is what re-runs this script after a later pull, so a
+  # machine that dies here never installs it and no `git pull` will ever repair that. The
+  # rule used to live in no one place and had to be remembered by whoever added a step —
+  # `scripts/check.sh`'s `bash -n` pass is the gate that at least keeps these arms parseable.
+  if mkdir -p "$(dirname "$db")" && jkb --db "$db" ns mk repos tasks media references memory; then :; else
+    warn "could not scaffold the KB at $db — continuing to the git hooks."
+  fi
 fi
 
 # --- 3. VS Code extension ----------------------------------------------------
@@ -119,6 +129,7 @@ if [ "$do_service" -eq 1 ]; then
         launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
         if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
           warn "could not load $label; activate manually: launchctl load $plist"
+          service_ok=0
         fi
       done ;;
     Linux)
@@ -127,12 +138,15 @@ if [ "$do_service" -eq 1 ]; then
         for label in com.jkb.sync com.jkb.reap; do
           if systemctl --user enable --now "$label"; then echo "$label enabled (systemd)"; else
             warn "could not enable $label; activate manually: systemctl --user enable --now $label"
+            service_ok=0
           fi
         done
       else
         warn "systemctl not found; activate the printed units manually."
+        service_ok=0
       fi ;;
-    *) warn "unsupported OS for auto-activation; the units were written — activate them manually." ;;
+    *) warn "unsupported OS for auto-activation; the units were written — activate them manually."
+       service_ok=0 ;;
   esac
   else
     # A distinct variable, not `do_service=0`: that is the flag, and reusing it would make the

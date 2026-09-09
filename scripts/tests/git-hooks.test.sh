@@ -30,8 +30,6 @@ oracle_dir() {
     case "$d" in /*) ;; *) d="$dir/$d" ;; esac
     (cd "$d" && pwd -P)
 }
-# Falls back to the raw path when it does not exist — which is itself the answer under the
-# old rule, and makes the failure message say so instead of erroring on the `cd`.
 
 # A repo with one commit (worktrees need a born HEAD) plus a linked worktree.
 main="$work/main"
@@ -168,7 +166,7 @@ case6() {
         return
     fi
 
-    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
     if [ "$got" = "exclude=added /.githooks/post-merge" ]; then
         ok "a chainer inside the working tree: excluded locally"
     else
@@ -180,7 +178,7 @@ case6() {
         fail "exclude: dirty" "still dirty: $(git_q -C "$r" status --porcelain | tr '\n' ' ')"
     fi
     # Twice must not duplicate the line — setup.sh runs on every qualifying pull.
-    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
     if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
         && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
         ok "running it again adds nothing"
@@ -191,7 +189,7 @@ case6() {
     # And the reverse decision retracts it, leaving the user's own rules alone. Adding the
     # rule on the run that installs a chainer and never revisiting it is how a user who later
     # replaced that chainer with their own hook had it git-ignored for ever.
-    got="$(reconcile_exclude "$r" "$chainer" no)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
     if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
         && ! grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and asking for it to be gone retracts it"
@@ -232,7 +230,7 @@ case6c() {
     # Their rule, written by hand: the pattern with no marker line above it.
     printf '# things I do not want to see\n/.githooks/post-merge\n' >>"$r/.git/info/exclude"
 
-    got="$(reconcile_exclude "$r" "$chainer" no)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
     if [ "$got" = "exclude=unowned /.githooks/post-merge" ]; then
         ok "an unmarked exclude rule is reported as unowned"
     else
@@ -264,7 +262,7 @@ case6b() {
     # No trailing newline, exactly as a hand-edited file often is.
     printf '# my rules\n*.log' >"$r/.git/info/exclude"
 
-    reconcile_exclude "$r" "$chainer" yes >/dev/null
+    reconcile_exclude "$r" "/.githooks/post-merge" yes >/dev/null
 
     if [ "$(grep -c '^\*\.log$' "$r/.git/info/exclude")" = "1" ]; then
         ok "an exclude file with no trailing newline keeps its last rule"
@@ -285,11 +283,77 @@ case6b() {
 case6d() {
     local r="$work/bare.git" got
     git_q init -q --bare "$r" >/dev/null 2>&1
-    got="$(reconcile_exclude "$r" "$r/hooks/post-merge" yes 2>/dev/null)"
+    git_q -C "$r" config core.hooksPath hooks
+    got="$(git_hooks_exclude_pattern "$r" 2>/dev/null)"
     case "$got" in
-        "exclude=none ("*) ok "a repository with no working tree: nothing to exclude, and it says so" ;;
+        "none ("*) ok "a repository with no working tree: nothing to exclude, and it says so" ;;
         *) fail "bare: state" "expected a none state, got '$got'" ;;
     esac
+}
+
+# --- 6g. the desired state is the same from every worktree -------------------------------
+# THE regression guard for the sweep. `.git/info/exclude` lives in the common dir and applies
+# to every worktree at once, so a desired state computed from `--show-toplevel` differs per
+# run — and a sweep that enforces it flip-flops: a main-checkout run added the block, the next
+# run from a `jkb task work` session retracted it, and the main checkout read dirty in
+# between, which is the state `jkb task land` refuses. D36 makes that the normal case.
+#
+# So the pattern comes from the raw config string and the shared facts. Asserting the two
+# answers are byte-identical is what makes that structural rather than remembered: reverting
+# the helper to resolve against the current tree fails this immediately.
+case6g() {
+    local m="$work/shared" wt got_main got_wt
+    git_q init -q "$m" >/dev/null 2>&1
+    git_q -C "$m" commit -q --allow-empty -m init
+    wt="$work/shared-wt"
+    git_q -C "$m" worktree add -q "$wt" -b side >/dev/null 2>&1
+
+    # Relative: git resolves it inside EACH worktree's top, so one anchored pattern is right
+    # for all of them at once.
+    git_q -C "$m" config core.hooksPath .githooks
+    got_main="$(git_hooks_exclude_pattern "$m")"
+    got_wt="$(git_hooks_exclude_pattern "$wt")"
+    if [ "$got_main" = "pattern /.githooks/post-merge" ] && [ "$got_wt" = "$got_main" ]; then
+        ok "a relative core.hooksPath: the same pattern from the checkout and the worktree"
+    else
+        fail "shared: relative" "main='$got_main' worktree='$got_wt'"
+    fi
+
+    # Absolute, inside the main checkout: still one answer, and it is the main tree's.
+    git_q -C "$m" config core.hooksPath "$m/.githooks"
+    got_main="$(git_hooks_exclude_pattern "$m")"
+    got_wt="$(git_hooks_exclude_pattern "$wt")"
+    if [ "$got_main" = "pattern /.githooks/post-merge" ] && [ "$got_wt" = "$got_main" ]; then
+        ok "an absolute one inside the checkout: the same answer from both"
+    else
+        fail "shared: absolute" "main='$got_main' worktree='$got_wt'"
+    fi
+
+    # Absolute, inside a LINKED worktree only: not hidden, and the reason says why — an
+    # anchored rule would apply to every tree, including ones the path is not in.
+    git_q -C "$m" config core.hooksPath "$wt/.githooks"
+    got_main="$(git_hooks_exclude_pattern "$m")"
+    got_wt="$(git_hooks_exclude_pattern "$wt")"
+    case "$got_main" in
+        "none ("*) [ "$got_wt" = "$got_main" ] \
+            && ok "one inside a linked worktree only: not hidden, same answer from both" \
+            || fail "shared: linked" "main='$got_main' worktree='$got_wt'" ;;
+        *) fail "shared: linked" "expected a none state, got '$got_main'" ;;
+    esac
+
+    # And end to end: the block a main run adds must survive a worktree run.
+    git_q -C "$m" config core.hooksPath "$m/.githooks"
+    printf '#!/bin/sh\necho HOOK\n' >"$work/shared-src"
+    install_git_hooks "$m" "$work/shared-src" >/dev/null 2>&1
+    install_git_hooks "$wt" "$work/shared-src" >/dev/null 2>&1
+    if grep -qxF '/.githooks/post-merge' "$m/.git/info/exclude"; then
+        ok "and a run from the worktree does not retract what the checkout added"
+    else
+        fail "shared: flip" "the worktree run removed the block: $(tr '\n' '|' <"$m/.git/info/exclude")"
+    fi
+    [ -z "$(git_q -C "$m" status --porcelain)" ] \
+        && ok "so the main checkout is not left dirty by a session's pull" \
+        || fail "shared: dirty" "$(git_q -C "$m" status --porcelain | tr '\n' ' ')"
 }
 
 # --- 6e. an exclude file git can read, we can read -----------------------------------------
@@ -313,7 +377,7 @@ case6e() {
     printf '# my rules\r\n*.log\r\n%s\r\n/.githooks/post-merge\r\n' "$(exclude_marker)" \
         >"$r/.git/info/exclude"
 
-    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
     if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
         && [ "$(grep -c 'githooks/post-merge' "$r/.git/info/exclude")" = "1" ]; then
         ok "a CRLF exclude file: our own block is recognised, not appended a second time"
@@ -325,7 +389,7 @@ case6e() {
     else
         fail "crlf: rewritten" "the file's existing CRLF endings were changed"
     fi
-    got="$(reconcile_exclude "$r" "$chainer" no)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
     if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
         && ! grep -q 'githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and a CRLF block is retracted, marker and all"
@@ -335,6 +399,97 @@ case6e() {
     [ "$(grep -c '^\*\.log' "$r/.git/info/exclude")" = "1" ] \
         && ok "and the user's rules survive the rewrite" \
         || fail "crlf: lost" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+}
+
+# --- 6h. an orphaned marker is tidied, never paired with the next marker ------------------
+# The sweep's own must-fix. It paired a marker with the line after it without checking that
+# line was not itself a marker: the user deletes only the pattern line, leaving the comment;
+# the orphan is copied through and a fresh block appended below, giving marker/marker/pattern;
+# the next run reads the pair as a block whose "pattern" is the marker's own text, retracts
+# BOTH markers, prints `retracted # jkb: …`, and leaves the pattern bare — which jkb then
+# reports `unowned` and refuses to touch for ever. Reproduced before the fix.
+case6h() {
+    local r="$work/orphan" got ex
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
+    ex="$r/.git/info/exclude"
+    # The exact shape the old parser produced for itself: an orphan, then a real block.
+    printf '# my rules\n*.log\n%s\n%s\n/.githooks/post-merge\n' \
+        "$(exclude_marker)" "$(exclude_marker)" >"$ex"
+
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
+    case "$got" in
+        *"exclude=tidied"*) ok "an orphaned jkb marker is tidied away" ;;
+        *) fail "orphan: tidied" "got: $(printf '%s' "$got" | tr '\n' '|')" ;;
+    esac
+    case "$got" in
+        *"retracted # jkb"*) fail "orphan: paired" "it read a marker as a pattern and retracted it" ;;
+        *) ok "and never reported as a pattern" ;;
+    esac
+    [ "$(grep -c '^# jkb:' "$ex")" = "1" ] \
+        && ok "exactly one marker survives" \
+        || fail "orphan: count" "$(grep -c '^# jkb:' "$ex") markers: $(tr '\n' '|' <"$ex")"
+    # And it is directly above the pattern — a bare pattern is the harm, not a tidy file.
+    if [ "$(grep -A1 '^# jkb:' "$ex" | tail -1)" = "/.githooks/post-merge" ]; then
+        ok "and it still heads the block, so the pattern is not left bare"
+    else
+        fail "orphan: bare" "file: $(tr '\n' '|' <"$ex")"
+    fi
+    [ "$(grep -c '^\*\.log$' "$ex")" = "1" ] \
+        && ok "and the user's rules are untouched" \
+        || fail "orphan: user" "file: $(tr '\n' '|' <"$ex")"
+}
+
+# --- 6j. a duplicate of the block we are keeping is deduplicated, not retracted ------------
+# Reporting it as a retraction printed `retracted P` and then `kept P` — two contradictory
+# lines about one pattern — and a substring assertion looking for both could be satisfied by
+# the wrong lifecycle entirely.
+case6j() {
+    local r="$work/dupes" ex got
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    ex="$r/.git/info/exclude"
+    printf '%s\n/.githooks/post-merge\n%s\n/.githooks/post-merge\n' \
+        "$(exclude_marker)" "$(exclude_marker)" >>"$ex"
+
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
+    case "$got" in
+        *"exclude=deduplicated /.githooks/post-merge"*) ok "a duplicate block is deduplicated" ;;
+        *) fail "dupes: state" "got: $(printf '%s' "$got" | tr '\n' '|')" ;;
+    esac
+    case "$got" in
+        *"exclude=retracted"*) fail "dupes: retracted" "a copy of the kept block was called a retraction" ;;
+        *) ok "and not called a retraction" ;;
+    esac
+    case "$got" in
+        *"exclude=kept /.githooks/post-merge"*) ok "and the pattern is still kept" ;;
+        *) fail "dupes: kept" "got: $(printf '%s' "$got" | tr '\n' '|')" ;;
+    esac
+    [ "$(grep -c '^/\.githooks/post-merge$' "$ex")" = "1" ] \
+        && ok "exactly one copy survives" \
+        || fail "dupes: count" "$(grep -c '^/\.githooks/post-merge$' "$ex") copies"
+}
+
+# --- 6i. jkb sweeps only its OWN markers ---------------------------------------------------
+# `session::ensure_excluded` writes a different marked block into this same file for `/.jkb/`
+# from Rust. It survives only because its marker is not in `exclude_known_markers`, which
+# until now was a fact enforced by nobody.
+case6i() {
+    local r="$work/twowriters" ex
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    ex="$r/.git/info/exclude"
+    printf '# jkb task sessions (git worktrees)\n/.jkb/\n' >>"$ex"
+    # want=no with no pattern: the widest sweep there is.
+    reconcile_exclude "$r" "" no "(no core.hooksPath)" >/dev/null
+    if grep -qxF '/.jkb/' "$ex" && grep -qxF '# jkb task sessions (git worktrees)' "$ex"; then
+        ok "the sessions block another jkb writer owns survives the widest sweep"
+    else
+        fail "twowriters: eaten" "file: $(tr '\n' '|' <"$ex")"
+    fi
 }
 
 # --- 6f. a working tree whose path contains glob metacharacters ---------------------------
@@ -350,7 +505,7 @@ case6f() {
     override="$(git_hooks_override "$r")"
     chainer="$override/post-merge"
     mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
-    got="$(reconcile_exclude "$r" "$chainer" yes)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
     [ "$got" = "exclude=added /.githooks/post-merge" ] \
         && ok "a repo path with glob metacharacters: still excluded" \
         || fail "glob: state" "got '$got'"
@@ -369,7 +524,7 @@ case7() {
     # `git init` ships a commented default exclude file, so "unchanged" is the assertion,
     # not "empty".
     before="$(cat "$r/.git/info/exclude" 2>/dev/null)"
-    got="$(reconcile_exclude "$r" "$work/elsewhere/post-merge" yes)"
+    got="$(reconcile_exclude "$r" "" yes "(outside the working tree)")"
     after="$(cat "$r/.git/info/exclude" 2>/dev/null)"
     case "$got" in
         "exclude=none (outside the working tree"*) got_ok=1 ;;
@@ -414,6 +569,10 @@ case6
 case6b
 case6c
 case6d
+case6g
+case6h
+case6j
+case6i
 case6e
 case6f
 case7

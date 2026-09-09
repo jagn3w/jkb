@@ -204,11 +204,16 @@ case7() {
         fail "block: inode" "the hook kept inode $before — it was rewritten under any process running it"
     fi
 
-    # No core.hooksPath here, so git reads .git/hooks itself: no chainer, nothing to hide,
-    # and the verdict says the hook will run.
+    # No core.hooksPath here, so git reads .git/hooks itself: no chainer to install. There IS
+    # an exclude= line — the sweep runs on every path, which is what stops a block outliving
+    # the setting that created it — and it must report nothing to hide.
     case "$out" in
-        *chainer=*|*exclude=*) fail "block: extra" "reported a chainer with no core.hooksPath: $out" ;;
+        *chainer=*) fail "block: extra" "reported a chainer with no core.hooksPath: $out" ;;
         *) ok "with no core.hooksPath it installs only the repo hook" ;;
+    esac
+    case "$out" in
+        *"exclude=none (no core.hooksPath"*) ok "and says there is nothing of ours to hide" ;;
+        *) fail "block: exclude" "expected exclude=none (no core.hooksPath…), got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     case "$out" in
         *"dispatch=direct"*) ok "and the verdict is that git runs it directly" ;;
@@ -423,11 +428,16 @@ case10c() {
     else
         fail "sweep: marker" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
     fi
-    # A hook the user now writes at either old path must be visible to them.
+    # A hook the user now writes at an old path must be visible to them. Asserted against
+    # `check-ignore` on THAT path, not against `git status` being non-empty: step 2 left
+    # `.otherhooks/` untracked, so the porcelain output was already non-empty and the
+    # assertion could not have failed.
     mkdir -p "$r/.githooks"; printf '#!/bin/sh\ndirenv reload\n' >"$r/.githooks/post-merge"
-    [ -n "$(git_q -C "$r" status --porcelain)" ] \
-        && ok "so a hook they write at an old path is visible to git again" \
-        || fail "sweep: hidden" "the user's file is still hidden"
+    if git_q -C "$r" check-ignore -q .githooks/post-merge; then
+        fail "sweep: hidden" "a hook at the old path is still ignored"
+    else
+        ok "so a hook they write at an old path is visible to git again"
+    fi
 }
 
 # --- 10d. an unresolvable core.hooksPath is not reported as the good verdict ---------------
@@ -667,6 +677,51 @@ case11c() {
         || fail "seterrok: verdicts" "got $(printf '%s\n' "$out" | grep -c '^dispatch=') verdicts from 3 runs"
 }
 
+# --- 11d. a failed chainer install still sweeps the blocks it is not undecided about -------
+# MF3. The `want=skip` arm returned without reconciling at all, so a stale block for a path
+# that is no longer the chainer's survived for ever — and the failing precondition is itself
+# persistent, so "the next successful run reconciles it" never comes. A failed install decides
+# nothing about THIS pattern; it decides nothing about the others either, and they need no
+# decision. The reconcile now sits below every arm rather than inside one.
+case11d() {
+    local d="$work/skipsweep" r out
+    if [ "$(id -u)" = "0" ]; then
+        skip "an unwritable directory cannot be simulated as root"
+        return
+    fi
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    # A stale block from a hooksPath that is no longer in use.
+    printf '%s\n/.oldhooks/post-merge\n' "$(exclude_marker)" >>"$r/.git/info/exclude"
+    # A core.hooksPath INSIDE the tree — so there is a pattern, and `undecided` is reachable
+    # — whose directory exists but cannot be written, so install_chainer fails.
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks"; chmod 555 "$r/.githooks"
+
+    out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    chmod 755 "$r/.githooks"
+
+    case "$out" in
+        *"chainer=failed"*) ok "a chainer that cannot be installed is still reported failed" ;;
+        *) fail "skipsweep: chainer" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"exclude=retracted /.oldhooks/post-merge"*) ok "and the stale block is swept anyway" ;;
+        *) fail "skipsweep: sweep" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"nothing was decided about /.githooks/post-merge"*)
+            ok "while this run's own pattern is left undecided, not retracted" ;;
+        *) fail "skipsweep: undecided" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    grep -qxF '/.oldhooks/post-merge' "$r/.git/info/exclude" \
+        && fail "skipsweep: file" "the stale rule is still in the file" \
+        || ok "and it is gone from the file"
+}
+
 # --- 12. an exclusion that could not be written says so -----------------------------------
 # It used to return success with no output — a failed exclusion spelled exactly like "nothing
 # needed". The tree then read dirty, `jkb task land` refused it, and nothing attributed the
@@ -722,7 +777,7 @@ case12() {
 # one matters most: it rewrites a file full of the USER'S rules, so "it did not land" and "it
 # landed halfway" must be distinguishable, and only the first is acceptable.
 case12b() {
-    local d="$work/writefail" r got before_entries
+    local d="$work/writefail" r got before_entries before_inode
     if [ "$(id -u)" = "0" ]; then
         skip "unwritable paths cannot be simulated as root"
         return
@@ -736,7 +791,7 @@ case12b() {
     git_q -C "$r" config core.hooksPath .githooks
     mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
     rm -rf "$r/.git/info"; : >"$r/.git/info"
-    got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" yes 2>/dev/null)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes 2>/dev/null)"
     case "$got" in
         exclude=failed*) ok "an exclude directory that cannot be created is reported as failed" ;;
         *) fail "writefail: add" "expected a failed state, got '$got'" ;;
@@ -751,18 +806,24 @@ case12b() {
     git_q -C "$r" commit -q --allow-empty -m init
     git_q -C "$r" config core.hooksPath .githooks
     mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
-    reconcile_exclude "$r" "$r/.githooks/post-merge" yes >/dev/null
+    reconcile_exclude "$r" "/.githooks/post-merge" yes >/dev/null
     before_entries="$(entries_in "$r/.git/info")"
+    before_inode="$(inode_of "$r/.git/info/exclude")"
     chmod 444 "$r/.git/info/exclude"
-    got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" no 2>/dev/null)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" no 2>/dev/null)"
     chmod 644 "$r/.git/info/exclude"
     case "$got" in
         exclude=failed*) ok "a rewrite whose write fails is reported as failed, not retracted" ;;
         *) fail "writefail: rewrite" "expected a failed state, got '$got'" ;;
     esac
-    grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude" \
-        && ok "and the file still holds every rule it did" \
-        || fail "writefail: truncated" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    # NOT "the file still holds every rule": `cp -p` fills the temp with the old content, so
+    # a dropped status would `mv` that same content back and the file would look untouched
+    # either way. The state word is the assertion that can fail here, and it does — reverting
+    # the checked write reports `retracted` above. What is asserted instead is the property
+    # this fixture CAN establish: the destination was not replaced at all.
+    [ "$before_inode" = "$(inode_of "$r/.git/info/exclude")" ] \
+        && ok "and the destination was not replaced" \
+        || fail "writefail: replaced" "the exclude file was swapped despite the failed write"
     [ "$(entries_in "$r/.git/info")" = "$before_entries" ] \
         && ok "and no temp file survives that either" \
         || fail "writefail: rewrite temp" "left: $(entries_in "$r/.git/info" | tr '\n' ' ')"
@@ -773,10 +834,10 @@ case12b() {
     git_q -C "$r" commit -q --allow-empty -m init
     git_q -C "$r" config core.hooksPath .githooks
     mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
-    reconcile_exclude "$r" "$r/.githooks/post-merge" yes >/dev/null
+    reconcile_exclude "$r" "/.githooks/post-merge" yes >/dev/null
     before_entries="$(entries_in "$r/.git/info")"
     chmod 555 "$r/.git/info"
-    got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" no 2>/dev/null)"
+    got="$(reconcile_exclude "$r" "/.githooks/post-merge" no 2>/dev/null)"
     chmod 755 "$r/.git/info"
     case "$got" in
         exclude=failed*) ok "a retraction that cannot be written is reported as failed" ;;
@@ -841,6 +902,8 @@ case14() {
         'exclude=added /p|added to .git/info/exclude'
         'exclude=kept /p|already in .git/info/exclude'
         'exclude=retracted /p|dropped from .git/info/exclude'
+        'exclude=deduplicated /p|duplicate jkb entries for /p removed'
+        'exclude=tidied 1 orphaned marker(s)|1 orphaned marker(s) removed from .git/info/exclude'
         'exclude=unowned /p|cannot prove it wrote'
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'
@@ -894,6 +957,7 @@ case10e
 case11
 case11b
 case11c
+case11d
 case12
 case12b
 case13

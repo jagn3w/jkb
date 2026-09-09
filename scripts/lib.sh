@@ -266,6 +266,11 @@ install_chainer() {
 
 # exclude_marker — the comment line jkb writes above its own exclude pattern.
 #
+# It names its PURPOSE as well as its author, because jkb is not the only writer of marked
+# blocks in this file: `session::ensure_excluded` (crates/jkb-cli/src/session.rs) writes
+# `# jkb task sessions (git worktrees)` + `/.jkb/` from Rust. That block survives every sweep
+# here precisely because its marker is not in `exclude_known_markers` — never add it.
+#
 # Changing it means adding the outgoing text as the next `exclude_marker_vN` AND to
 # `exclude_known_markers`, exactly as `chainer_body_v1` does. Forgetting is not silent: the
 # old block stops being recognised, so it is reported as unowned rather than retracted.
@@ -310,92 +315,187 @@ _exclude_mentions() {
     return 1
 }
 
-# reconcile_exclude <repo_root> <chainer path, or empty> <want> — make `.git/info/exclude`
-# agree with the world, and print zero or more complete report lines:
+# git_hooks_exclude_pattern <repo_root> — the ONE exclude pattern jkb wants in this
+# repository, as `pattern <glob>` or `none <reason>`.
 #
-#   exclude=added <pattern>       we wrote our marked block
-#   exclude=kept <pattern>        a rule already excludes it (ours, or one the user wrote)
-#   exclude=retracted <pattern>   a block of ours was there and should not be; it is gone
-#   exclude=unowned <pattern>     a rule excludes it that jkb cannot prove it wrote — kept
-#   exclude=none <reason>         nothing to do
-#   exclude=failed <reason>       a write was attempted and did not land
+# THE RULE THIS FUNCTION EXISTS FOR: the desired state is a pure function of facts every
+# worktree shares — the raw `core.hooksPath` value, the common dir, the main checkout — and
+# never of the worktree that happens to be running. `.git/info/exclude` lives in the common
+# dir and applies to every worktree at once, so a desired state computed from
+# `--show-toplevel` differs per run, and a sweep that enforces it turns that disagreement
+# into a flip-flop: a main-checkout run added the block, the next run from a `jkb task work`
+# session retracted it, and the main checkout read dirty in between — which is exactly the
+# state `jkb task land` refuses. D36 makes that the normal case, not a corner one.
 #
-# The desired state is **exactly the blocks jkb should own right now** — one for <chainer
-# path> when <want> is `yes`, and none otherwise — so every OTHER marked block is retracted,
-# whatever path it names. Reconciling only the path being installed was not reconciliation: a
-# `core.hooksPath` changed from `.githooks` to `.otherhooks` left the first block for ever,
-# and unsetting it left both, so a hook the user later wrote at either path was invisible to
-# `git status` with nothing attributing that to jkb. That is the harm this function exists to
-# end, so the caller runs it on the no-override paths too rather than returning first.
+# So the pattern comes from the CONFIG STRING, not from resolving a path and stripping a
+# toplevel back off it. A relative `core.hooksPath` is resolved by git against each
+# worktree's own top (githooks(5)), so one anchored pattern is simultaneously right for all
+# of them. An absolute one is inside at most one tree, and is only hidden when that tree is
+# the main checkout: an anchored pattern applies to every worktree, so hiding a path that
+# exists only inside one linked session would hide any same-named path in all the others.
 #
-# Ownership is byte identity on the marked pair, the `chainer_body` lesson applied again: a
-# bare pattern may be a rule the user wrote, so it is reported and never deleted.
+# Residual, stated rather than detected: `extensions.worktreeConfig` can make
+# `core.hooksPath` genuinely per-worktree, and then no shared desired state exists. Nothing
+# here detects that; the failure is a pattern computed for one worktree's value, which is the
+# pre-existing behaviour rather than a new one.
+git_hooks_exclude_pattern() {
+    local repo_root="$1" configured rc main_top rel
+    # Bare-ness is a property of the repository, not of a worktree, so asking it here keeps
+    # the answer shared. There is no tree to hide anything in.
+    if [ "$(git -C "$repo_root" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+        printf 'none (a bare repository has no working tree)\n'
+        return 0
+    fi
+    configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
+    rc=$?
+    case "$rc" in
+        0) ;;
+        1) printf 'none (no core.hooksPath, so nothing of ours is inside the tree)\n'; return 0 ;;
+        *) printf 'none (core.hooksPath could not be read)\n'; return 0 ;;
+    esac
+    [ -n "$configured" ] || { printf 'none (core.hooksPath is empty)\n'; return 0; }
+
+    case "$configured" in
+        /*)
+            # Absolute: inside the main checkout, or nowhere we may anchor a pattern.
+            main_top="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null \
+                | sed -n '1s/^worktree //p')"
+            if [ -z "$main_top" ]; then
+                printf 'none (the main worktree could not be located)\n'
+                return 0
+            fi
+            main_top="$(_real_dir "$main_top")"
+            configured="$(_real_dir "$configured")"
+            case "$configured/" in
+                "$main_top"/*) rel="${configured#"$main_top"/}" ;;
+                *) printf 'none (core.hooksPath is not inside the main checkout, so an anchored rule would apply to every worktree)\n'
+                   return 0 ;;
+            esac
+            ;;
+        *)
+            rel="$configured"
+            while :; do case "$rel" in ./*) rel="${rel#./}" ;; *) break ;; esac; done
+            while :; do case "$rel" in */) rel="${rel%/}" ;; *) break ;; esac; done
+            case "/$rel/" in
+                */../*) printf 'none (core.hooksPath escapes the working tree)\n'; return 0 ;;
+            esac
+            ;;
+    esac
+    [ -n "$rel" ] || { printf 'none (core.hooksPath is the working tree itself)\n'; return 0; }
+    printf 'pattern /%s/post-merge\n' "$rel"
+}
+
+# _is_exclude_pattern_line <line> — can this line be the pattern half of a jkb block?
+#
+# Positive definition, so every bad shape follows from it instead of being a case to
+# remember: non-empty, not itself a marker, and not a comment. A marker paired with a marker
+# used to be read as a block whose "pattern" was the marker's own text — so jkb retracted
+# BOTH marker lines, printed `retracted # jkb: …`, and left a bare pattern it would then
+# report `unowned` and refuse to touch for ever. That is the silent-and-permanent harm the
+# marked-block rule exists to end, caused by the parser.
+_is_exclude_pattern_line() {
+    local line
+    line="$(_exclude_line "$1")"
+    [ -n "$line" ] || return 1
+    _is_exclude_marker "$line" && return 1
+    case "$line" in '#'*) return 1 ;; esac
+    return 0
+}
+
+# reconcile_exclude <repo_root> <pattern, or empty> <want> [reason] — make
+# `.git/info/exclude` agree with the desired state, printing complete report lines:
+#
+#   exclude=added <pattern>          we wrote our marked block
+#   exclude=kept <pattern>           a rule already excludes it (ours, or the user's)
+#   exclude=retracted <pattern>      a block of ours was there and should not be; it is gone
+#   exclude=deduplicated <pattern>   extra copies of the block we are keeping were removed
+#   exclude=tidied <n> marker(s)     orphaned jkb marker lines were removed
+#   exclude=unowned <pattern>        a rule excludes it that jkb cannot prove it wrote — kept
+#   exclude=none <reason>            nothing to do
+#   exclude=failed <reason>          a write was attempted and did not land
+#
+# <want> is three-valued. `yes` — we own this pattern and it must be excluded. `no` — nothing
+# of ours may hide it. `undecided` — the chainer install failed, so nothing is known about
+# THIS pattern; its block is left exactly as found. The sweep of every OTHER jkb block runs
+# on all three, because that sweep does not depend on the undecided fact: it is the condition,
+# and a condition must dominate every arm rather than have one that opts out.
+#
+# WHAT JKB SWEEPS is only blocks bearing a marker in `exclude_known_markers` — its own, by
+# byte identity. `session::ensure_excluded` (crates/jkb-cli/src/session.rs) writes a DIFFERENT
+# marked block into this same file for `/.jkb/`, and it survives untouched precisely because
+# its marker is not in that list. Every other line — bare patterns, other writers' blocks,
+# the user's comments — belongs to the user and is never removed.
 #
 # Always returns 0 — `failed` is a word, not an exit status (see the header's `set -e` rule).
 reconcile_exclude() {
-    local repo_root="$1" path="$2" want="$3"
-    local top common exclude pattern="" keep="" tmp line blockpat
-    local -a lines=() out=() removed=()
-    local i n seen_keep=0 changed=0 probe="" probe_retracted=0
+    local repo_root="$1" pattern="$2" want="$3" reason="${4:-}"
+    local common exclude tmp line nxt cur keep=""
+    local -a lines=() out=() removed=() deduped=()
+    local i n seen_keep=0 changed=0 probe_retracted=0 tidied=0
 
-    top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || top=""
     common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || common=""
-    if [ -z "$top" ] || [ -z "$common" ]; then
-        [ -z "$path" ] || printf 'exclude=none (not a git working tree)\n'
+    if [ -z "$common" ]; then
+        printf 'exclude=none (not a git repository)\n'
         return 0
     fi
     case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
     exclude="$common/info/exclude"
 
-    if [ -n "$path" ]; then
-        case "$path" in
-            "$top"/*) pattern="/${path#"$top"/}" ;;
-            *) probe="none (outside the working tree, so nothing is hidden)" ;;
-        esac
-    fi
-    [ "$want" = yes ] && keep="$pattern"
+    # `yes` and `undecided` both preserve this pattern's block; only `yes` may add or dedupe.
+    case "$want" in yes|undecided) keep="$pattern" ;; esac
 
-    # One walk decides everything: which blocks survive, which are retracted, and whether the
-    # one we want is already there. Reading and rewriting used to be separate passes with
-    # separate ideas of what "ours" meant.
     if [ -f "$exclude" ]; then
         while IFS= read -r line || [ -n "$line" ]; do lines+=("$line"); done <"$exclude"
     fi
     n=${#lines[@]}
     i=0
     while [ "$i" -lt "$n" ]; do
-        if _is_exclude_marker "${lines[$i]}" && [ "$((i + 1))" -lt "$n" ]; then
-            blockpat="$(_exclude_line "${lines[$((i + 1))]}")"
-            if [ -n "$keep" ] && [ "$blockpat" = "$keep" ] && [ "$seen_keep" -eq 0 ]; then
-                seen_keep=1
-                out+=("${lines[$i]}" "${lines[$((i + 1))]}")
-            else
-                # Wanted nowhere, or a duplicate of the one we want: drop both lines.
-                removed+=("$blockpat")
-                [ "$blockpat" = "$pattern" ] && probe_retracted=1
-                changed=1
+        cur="${lines[$i]}"
+        if _is_exclude_marker "$cur"; then
+            nxt=""
+            if [ "$((i + 1))" -lt "$n" ] && _is_exclude_pattern_line "${lines[$((i + 1))]}"; then
+                nxt="$(_exclude_line "${lines[$((i + 1))]}")"
             fi
-            i=$((i + 2))
+            if [ -n "$nxt" ]; then
+                if [ -n "$keep" ] && [ "$nxt" = "$keep" ]; then
+                    if [ "$seen_keep" -eq 0 ] || [ "$want" != yes ]; then
+                        seen_keep=1
+                        out+=("$cur" "${lines[$((i + 1))]}")
+                    else
+                        deduped+=("$nxt")
+                        changed=1
+                    fi
+                else
+                    removed+=("$nxt")
+                    [ "$nxt" = "$pattern" ] && probe_retracted=1
+                    changed=1
+                fi
+                i=$((i + 2))
+                continue
+            fi
+            # An orphaned marker: ours by byte identity, inert to git (it is a comment), and
+            # the seed of the mis-pairing above if it is left to meet a future block.
+            tidied=$((tidied + 1))
+            changed=1
+            i=$((i + 1))
             continue
         fi
-        out+=("${lines[$i]}")
+        out+=("$cur")
         i=$((i + 1))
     done
 
     if [ "$changed" -eq 1 ]; then
-        # Through a temp file: this is full of the USER'S rules and a partial in-place rewrite
-        # destroys them. `cp -p` first so the replacement inherits the destination's mode
-        # rather than mktemp's 600. Not `install_exec` — that installs an executable.
+        # Through a temp file: this holds the USER'S rules and a partial in-place rewrite
+        # destroys them. `cp -p` first so the replacement inherits the destination's mode.
         tmp="$exclude.jkb.$$"
         if ! cp -p "$exclude" "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             printf 'exclude=failed (cannot write %s)\n' "$exclude"
             return 0
         fi
-        # The write status is CHECKED. `printf` to a full disk or over a quota fails after
-        # emitting part of its output, and dropping that status renamed a truncated file over
-        # every rule the user owns — under the word `retracted`. `printf` is a simple command,
-        # so a failed redirection reaches `if !` (a `{ …; }` group would not).
+        # The write status is CHECKED: `printf` to a full disk fails after emitting part of
+        # its output, and dropping that status renamed a truncated file over every rule the
+        # user owns, under the word `retracted`.
         if [ "${#out[@]}" -eq 0 ]; then
             : >"$tmp" || { rm -f "$tmp"; printf 'exclude=failed (cannot write %s)\n' "$exclude"; return 0; }
         elif ! printf '%s\n' "${out[@]}" >"$tmp"; then
@@ -408,35 +508,27 @@ reconcile_exclude() {
             printf 'exclude=failed (cannot write %s)\n' "$exclude"
             return 0
         fi
-        # Guarded, and the membership test below is a flag rather than a second expansion.
-        # `"${arr[@]}"` on an EMPTY array under `set -u` is an unbound-variable error on bash
-        # before 4.4 — which is what macOS ships as /bin/bash — while being fine on the bash
-        # this was written under. setup.sh runs `set -euo pipefail` and the suites run
-        # `set -uo pipefail`, so the report would have died mid-line on a Mac. Not verified
-        # against 3.2 here (this machine has 5.2), which is exactly why the construct is
-        # avoided rather than reasoned about.
+        # Guarded: `"${arr[@]}"` on an EMPTY array under `set -u` is an unbound-variable error
+        # on bash before 4.4, which is what macOS ships as /bin/bash.
         if [ "${#removed[@]}" -gt 0 ]; then
-            for blockpat in "${removed[@]}"; do
-                printf 'exclude=retracted %s\n' "$blockpat"
-            done
+            for line in "${removed[@]}"; do printf 'exclude=retracted %s\n' "$line"; done
         fi
+        if [ "${#deduped[@]}" -gt 0 ]; then
+            for line in "${deduped[@]}"; do printf 'exclude=deduplicated %s\n' "$line"; done
+        fi
+        [ "$tidied" -eq 0 ] || printf 'exclude=tidied %s orphaned marker(s)\n' "$tidied"
     fi
 
-    # Now the pattern this run is actually about.
-    if [ -n "$probe" ]; then
-        printf 'exclude=%s\n' "$probe"
+    if [ -z "$pattern" ]; then
+        printf 'exclude=none %s\n' "${reason:-(nothing of ours is inside the tree)}"
         return 0
     fi
-    if [ -z "$pattern" ]; then
-        return 0                      # no override at all: the sweep above was the whole job
+    if [ "$want" = undecided ]; then
+        printf 'exclude=none (the chainer install failed; nothing was decided about %s)\n' "$pattern"
+        return 0
     fi
-    if [ -n "$keep" ]; then
-        if [ "$seen_keep" -eq 1 ]; then
-            printf 'exclude=kept %s\n' "$pattern"
-            return 0
-        fi
-        if _exclude_mentions "$exclude" "$pattern"; then
-            # Already hidden by a rule we did not write: nothing to do, and nothing to own.
+    if [ "$want" = yes ]; then
+        if [ "$seen_keep" -eq 1 ] || _exclude_mentions "$exclude" "$pattern"; then
             printf 'exclude=kept %s\n' "$pattern"
             return 0
         fi
@@ -445,18 +537,14 @@ reconcile_exclude() {
         # Separator first. An exclude file that does not end in a newline — hand-edited ones
         # often do not — would otherwise have its last rule fused with our marker (`*.log` +
         # `# jkb: …`), destroying a rule the user owns while our own pattern stayed inert,
-        # under a success message. `session::ensure_excluded` (crates/jkb-cli/src/session.rs)
-        # computes the same `sep` for the same reason — one rule with an implementation in
-        # each language.
+        # under a success message. `session::ensure_excluded` computes the same `sep` for the
+        # same reason — one rule with an implementation in each language.
         if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then
             printf '\n' >>"$exclude" 2>/dev/null \
                 || { printf 'exclude=failed (cannot write %s)\n' "$exclude"; return 0; }
         fi
-        # ONE simple command, not `{ exclude_marker; printf …; } >>"$exclude"`. When a
-        # redirection fails, bash reports it to `if !` for a simple command (and for a
-        # function call) but NOT for a group or a subshell — the group's status comes back 0
-        # and the failure is invisible. Written as a group, this arm printed `added` for a
-        # write that had just been refused.
+        # ONE simple command, not a `{ …; }` group: when a redirection fails, bash reports it
+        # to `if !` for a simple command and a function call, but NOT for a group or subshell.
         if ! printf '%s\n%s\n' "$(exclude_marker)" "$pattern" >>"$exclude" 2>/dev/null; then
             printf 'exclude=failed (cannot write %s)\n' "$exclude"
             return 0
@@ -465,12 +553,11 @@ reconcile_exclude() {
         return 0
     fi
 
-    # want=no. Our own block, if there was one, has already been reported `retracted`.
+    # want=no. Our own block, if there was one, was already reported `retracted`.
     [ "$probe_retracted" -eq 1 ] && return 0
     if _exclude_mentions "$exclude" "$pattern"; then
-        # The harm this reconciliation exists to stop, in the one case it cannot repair:
-        # something is hiding the file and jkb cannot prove it put it there, so it says so
-        # rather than deleting a rule that may be the user's.
+        # The one case this cannot repair: something hides the file and jkb cannot prove it
+        # put it there, so it says so rather than deleting a rule that may be the user's.
         printf 'exclude=unowned %s\n' "$pattern"
     else
         printf 'exclude=none (nothing is hiding it)\n'
@@ -482,8 +569,9 @@ reconcile_exclude() {
 #
 #   repo-hook=<path>          the hook, installed where git actually runs hooks from
 #   chainer=<outcome> <path>  installed | up-to-date | refreshed | foreign | failed
-#   exclude=<state> <detail>  added | kept | retracted | unowned | none | failed
-#   dispatch=<verdict> [path] direct | chained | unknown | dead
+#   exclude=<state> <detail>  added | kept | retracted | deduplicated | tidied | unowned |
+#                             none | failed  (repeatable: the sweep reports one line per block)
+#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while
@@ -494,8 +582,10 @@ reconcile_exclude() {
 # `dispatch=` is emitted on EVERY successful run and answers the only question this feature
 # exists for: will git run the repo hook? It is derived from the world rather than from the
 # chainer outcome word — `[ -x "$chainer" ]` — because `foreign` and `failed` each cover both
-# a file that will dispatch and one that will not. Three-valued on purpose: a foreign chainer
-# may dispatch perfectly well and we cannot know, so it is `unknown`, never `dead`.
+# a file that will dispatch and one that will not. `unknown` exists on purpose: a foreign
+# chainer may dispatch perfectly well and we cannot know, so it is never spelled `dead` —
+# and neither is `unreadable`, which is a `core.hooksPath` git itself will not resolve, so no
+# hook runs in the repository at all.
 #
 # `error=` means nothing was done, so it is never printed after another key. The chainer half
 # failing is not that: the repo hook WAS installed, and saying "skipping hook install" under a
@@ -506,8 +596,13 @@ reconcile_exclude() {
 # `--git-dir` left the whole gate green while every pull inside a worktree stopped running the
 # repo hook, and check.sh and ci.yml both justify the shell-test stage on that reachability.
 install_git_hooks() {
-    local repo_root="$1" hooks_src="$2" hooks_dir chainer outcome override want override_rc=0
+    local repo_root="$1" hooks_src="$2"
+    local hooks_dir chainer="" outcome override override_rc=0
+    local want=no verdict="" pat_line pattern="" pattern_reason=""
 
+    # The two `error=` arms stay AHEAD of the funnel below: `error=` means nothing was done,
+    # it is contractually the only line, and there is no exclude question to answer before a
+    # repo hook exists at all.
     hooks_dir="$(git_hooks_dir "$repo_root")" || { printf 'error=not a git repo\n'; return 1; }
     mkdir -p "$hooks_dir" || { printf 'error=cannot create %s\n' "$hooks_dir"; return 1; }
     # `install_exec`, never `cp`: the hook being replaced is very often the process that
@@ -516,69 +611,64 @@ install_git_hooks() {
         printf 'error=could not install %s/post-merge\n' "$hooks_dir"; return 1; }
     printf 'repo-hook=%s\n' "$hooks_dir/post-merge"
 
+    # --- plan: decide `want` and the dispatch verdict, and print the chainer line ----------
+    # Every arm here SETS variables; none of them returns. The reconcile below is not inside
+    # any of them, so a fifth arm added later cannot skip it — the property lives in the
+    # structure rather than in each arm's memory. It had to: the `chainer install failed` arm
+    # returned early, and a stale block therefore survived for ever whenever the failing
+    # precondition was itself persistent.
     override="$(git_hooks_override "$repo_root")" || override_rc=$?
-    if [ "${override_rc:-0}" -eq 2 ]; then
-        # Set, and git will not resolve it, so no hook runs in this repo at all.
-        reconcile_exclude "$repo_root" "" no
-        printf 'dispatch=unreadable core.hooksPath\n'
-        return 0
-    fi
-    # Every exit below still reconciles the exclude file. It used to return first, so a
-    # `core.hooksPath` that had been changed or unset left jkb's blocks behind for ever, and a
-    # hook the user later wrote at the old path was invisible to `git status`.
-    if [ -z "$override" ]; then
-        reconcile_exclude "$repo_root" "" no
-        printf 'dispatch=direct\n'
-        return 0
-    fi
-    chainer="$override/post-merge"
-    # `core.hooksPath` can legitimately point AT the directory git would have used anyway, and
-    # then there is nothing to chain to: the hook just installed IS the one git runs. Without
-    # this, `install_chainer` compares the repo hook against `chainer_body`, calls it foreign,
-    # and setup.sh warns that a file jkb wrote thirty microseconds earlier was not written by
-    # jkb — advising the user to check a dispatch line that would be a loop.
-    #
-    # Compared as RESOLVED directories: a trailing slash, a symlink or a `..` all name the
-    # same directory and made literal equality answer no, which put the alarming message back.
-    if [ "$(_real_dir "$override")" = "$(_real_dir "$hooks_dir")" ]; then
-        reconcile_exclude "$repo_root" "" no
-        printf 'dispatch=direct\n'
-        return 0
-    fi
-
-    if mkdir -p "$override" 2>/dev/null; then
-        outcome="$(install_chainer "$chainer")"
-        [ -n "$outcome" ] || outcome=failed
+    if [ "$override_rc" -eq 2 ]; then
+        verdict="unreadable core.hooksPath"
+    elif [ -z "$override" ]; then
+        verdict="direct"
+    elif [ "$(_real_dir "$override")" = "$(_real_dir "$hooks_dir")" ]; then
+        # `core.hooksPath` may legitimately point AT the directory git would have used anyway,
+        # and then there is nothing to chain to: the hook just installed IS the one git runs.
+        # Resolved directories, not literal strings — a trailing slash, a symlink and a `..`
+        # are three spellings of one directory, and literal equality put back the warning that
+        # jkb had not written its own hook.
+        verdict="direct"
     else
-        outcome=failed
+        chainer="$override/post-merge"
+        if mkdir -p "$override" 2>/dev/null; then
+            outcome="$(install_chainer "$chainer")"
+            [ -n "$outcome" ] || outcome=failed
+        else
+            outcome=failed
+        fi
+        printf 'chainer=%s %s\n' "$outcome" "$chainer"
+        case "$outcome" in
+            installed|up-to-date|refreshed) want=yes ;;
+            foreign) want=no ;;
+            # A failed install decides nothing about THIS pattern — the file there may be a
+            # chainer jkb wrote before the refresh failed — but it decides nothing about the
+            # other blocks either, and they need no decision.
+            *) want=undecided ;;
+        esac
+        # Derived from the world, not from the outcome word: `foreign` and `failed` each cover
+        # a file that will dispatch and one that will not. `-f` as well as `-x`, because a
+        # directory is executable to `test` and unrunnable to git.
+        if [ "$want" = yes ]; then
+            verdict="chained $chainer"
+        elif [ -f "$chainer" ] && [ -x "$chainer" ]; then
+            verdict="unknown $chainer"
+        else
+            verdict="dead $chainer"
+        fi
     fi
-    printf 'chainer=%s %s\n' "$outcome" "$chainer"
 
-    case "$outcome" in
-        installed|up-to-date|refreshed) want=yes ;;
-        foreign) want=no ;;
-        # A failed install decides nothing: the file at that path may be a chainer jkb wrote
-        # before the refresh failed, so both hiding it and revealing it would be a position
-        # taken on no evidence. The next successful run reconciles it.
-        *) want=skip ;;
+    # --- the funnel: unconditional, on every path above -----------------------------------
+    pat_line="$(git_hooks_exclude_pattern "$repo_root")"
+    case "$pat_line" in
+        "pattern "*) pattern="${pat_line#pattern }" ;;
+        *) pattern=""; pattern_reason="${pat_line#none }" ;;
     esac
-    if [ "$want" = skip ]; then
-        printf 'exclude=none (the chainer install failed; nothing was decided)\n'
-    else
-        reconcile_exclude "$repo_root" "$chainer" "$want"
-    fi
+    # Nothing to own means nothing to want, whatever the chainer did.
+    [ -n "$pattern" ] || want=no
+    reconcile_exclude "$repo_root" "$pattern" "$want" "$pattern_reason"
 
-    if [ "$want" = yes ]; then
-        printf 'dispatch=chained %s\n' "$chainer"
-    elif [ -f "$chainer" ] && [ -x "$chainer" ]; then
-        # `-f` as well as `-x`: a directory is executable to `test` and unrunnable to git, and
-        # a directory is exactly what sits there when a directory-style hook manager owns the
-        # path (see `install_exec`'s own refusal). Calling that `unknown` would report "this
-        # may well dispatch" about the one case that provably cannot.
-        printf 'dispatch=unknown %s\n' "$chainer"
-    else
-        printf 'dispatch=dead %s\n' "$chainer"
-    fi
+    printf 'dispatch=%s\n' "$verdict"
     return 0
 }
 
@@ -617,7 +707,14 @@ render_git_hooks_report() {
                 case "$state" in
                     added)      printf '  • excluded:   %s (inside the working tree; added to .git/info/exclude)\n' "$detail" ;;
                     kept)       printf '  • excluded:   %s (already in .git/info/exclude)\n' "$detail" ;;
-                    retracted)  printf '  • excluded:   %s dropped from .git/info/exclude (that chainer is not jkb'"'"'s to hide)\n' "$detail" ;;
+                    # One true sentence for all three causes — the chainer went foreign,
+                    # core.hooksPath moved, core.hooksPath was unset. The old parenthetical
+                    # named only the first and was false on the other two.
+                    retracted)  printf '  • excluded:   %s dropped from .git/info/exclude (jkb no longer stands behind hiding it)\n' "$detail" ;;
+                    # Not a retraction: extra copies of the block being KEPT. Reporting it as
+                    # one printed `retracted P` and `kept P` about the same pattern.
+                    deduplicated) printf '  • excluded:   duplicate jkb entries for %s removed\n' "$detail" ;;
+                    tidied)     printf '  • excluded:   %s removed from .git/info/exclude\n' "$detail" ;;
                     unowned)    warn "$detail is excluded by a rule in .git/info/exclude that jkb cannot prove it wrote."
                                 warn "  it is hiding that file from \`git status\` — remove the line yourself if you did not add it." ;;
                     none)       : ;;   # nothing to hide, and so nothing worth a line

@@ -9,6 +9,18 @@ cargo fmt --all -- --check
 echo "==> clippy (warnings are errors)"
 cargo clippy --all-targets --all-features -- -D warnings
 
+# Parse every shell file before running anything. The suites drive lib.sh's functions, but
+# NOTHING executes setup.sh — so a control-flow edit there (an unbalanced `if`, a stray `fi`)
+# reached the gate unchecked, and setup.sh is the file the post-merge hook runs unattended
+# after a pull. `bash -n` rather than shellcheck: it is always present, and this is the
+# syntax gate, not the lint.
+echo "==> shell syntax (scripts)"
+for f in "$(dirname "$0")"/*.sh "$(dirname "$0")"/tests/*.sh "$(dirname "$0")"/hooks/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *.md) continue ;; esac
+    bash -n "$f" || { echo "   $f does not parse" >&2; exit 1; }
+done
+
 # The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
 # reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
 echo "==> shell tests (scripts/tests)"
