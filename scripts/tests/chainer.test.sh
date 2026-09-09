@@ -477,7 +477,7 @@ case10d() {
     esac
     rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
     case "$rendered" in
-        *"git runs NO hooks in this repository"*) ok "and the rendering says so" ;;
+        *"names no usable hooks directory"*) ok "and the rendering says so" ;;
         *) fail "unreadable: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
     esac
 
@@ -729,25 +729,72 @@ case10i() {
     esac
 }
 
-# --- 10j. a relative core.hooksPath with no working tree is unreadable, not direct ---------
-# `git_hooks_override` returned "not set" when the setting IS set and holds a relative value it
-# could not resolve, so the run reported `dispatch=direct` — the best verdict, and the one the
-# renderer prints nothing for — about a repository whose repo hook git will never run. The
-# config read is three-valued for this reason; the toplevel resolution was not.
+# --- 10j. a relative core.hooksPath with no working tree resolves against the git dir -----
+# GIT'S OWN RULE, measured (git 2.51.1): `git rev-parse --git-path hooks/post-merge` in a bare
+# repo with `core.hooksPath = .githooks` answers `.githooks/post-merge`, and `git hook run
+# post-merge` executes it. A previous round called that unresolvable and reported
+# `dispatch=unreadable` — false about git, and worse in jkb: it then declined to install a
+# chainer at the one place git dispatches from, so the repo hook it had just installed really
+# never ran.
 case10j() {
-    local d="$work/norelbase" out
+    local d="$work/norelbase" out hook
     mkdir -p "$d"
     git_q init -q --bare "$d/b.git" >/dev/null 2>&1
     git_q -C "$d/b.git" config core.hooksPath .githooks
     printf '#!/bin/sh\necho HOOK\n' >"$d/src"
     out="$(install_git_hooks "$d/b.git" "$d/src" 2>/dev/null)"
+
     case "$out" in
-        *"dispatch=unreadable"*) ok "a relative hooksPath git cannot resolve is unreadable" ;;
-        *) fail "norelbase: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        *"chainer=installed"*) ok "a relative hooksPath with no working tree gets its chainer" ;;
+        *) fail "norelbase: chainer" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     case "$out" in
-        *"dispatch=direct"*) fail "norelbase: direct" "it reported the silent good verdict" ;;
-        *) ok "and not direct, which the renderer prints nothing for" ;;
+        *"dispatch=unreadable"*)
+            fail "norelbase: unreadable" "it called a path git resolves perfectly well unresolvable" ;;
+        *"dispatch=chained"*) ok "and the verdict says the repo hook will run" ;;
+        *) fail "norelbase: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # The oracle: where git itself says it will look.
+    hook="$(cd "$d/b.git" && git rev-parse --path-format=absolute --git-path hooks/post-merge)"
+    [ -x "$hook" ] \
+        && ok "and the chainer sits where git says it will look for it" \
+        || fail "norelbase: path" "git looks at $hook, which is not executable"
+}
+
+# --- 10k. core.hooksPath set to the empty string is not "not set" --------------------------
+# Measured: `config --get --path` exits 0 printing nothing, git resolves the hook to
+# `/post-merge`, and `git hook run post-merge` answers "cannot find a hook named post-merge" —
+# the repo hook is dead. Folded into "not set", the run reported `dispatch=direct`, which the
+# renderer prints nothing for: the post-merge automation silently off.
+case10k() {
+    local d="$work/emptyhooks" r out ex
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath ""
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    ex="$r/.git/info/exclude"
+    printf '%s\n/.githooks/post-merge\n' "$(exclude_marker)" >>"$ex"
+
+    out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=direct"*) fail "empty: direct" "it reported the silent good verdict for a dead hook" ;;
+        *"dispatch=unreadable"*) ok "an empty core.hooksPath is not reported as no override" ;;
+        *) fail "empty: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # THE MUST-FIX: a verdict that admits nothing was established must not sweep.
+    case "$out" in
+        *"exclude=retracted"*)
+            fail "empty: swept" "it retracted a block under a verdict saying nothing was established" ;;
+        *) ok "and does not sweep under a verdict that established nothing" ;;
+    esac
+    grep -qxF '/.githooks/post-merge' "$ex" \
+        && ok "so the block that was there is still there" \
+        || fail "empty: gone" "file: $(tr '\n' '|' <"$ex")"
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"names no usable hooks directory"*) ok "and the operator is told why" ;;
+        *) fail "empty: render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
     esac
 }
 
@@ -1011,7 +1058,7 @@ case12() {
     esac
     rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
     case "$rendered" in
-        *"could not update .git/info/exclude"*"as it was"*)
+        *"could not update .git/info/exclude"*"did not land"*)
             ok "and the rendering says only what is true of every failure" ;;
         *) fail "excludefail: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
     esac
@@ -1156,7 +1203,7 @@ case14() {
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'
         'dispatch=dead /c|will NOT run the repo hook above'
-        'dispatch=unreadable core.hooksPath|git runs NO hooks in this repository'
+        'dispatch=unreadable core.hooksPath|names no usable hooks directory'
         'error=not a git repo|not a git repo; skipping hook install'
     )
     local entry ok_all=1 missing=""
@@ -1275,6 +1322,6 @@ EOF
 }
 
 echo "==> scripts/lib.sh::install_chainer"
-run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case11 case11b case11c case11d case12 case12b case13 case14 case15
+run_cases case1 case1b case2 case3 case4 case5 case6 case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case11 case11b case11c case11d case12 case12b case13 case14 case15
 
 finish

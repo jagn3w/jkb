@@ -712,6 +712,21 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   "the chainer there is not hidden … that working tree will read dirty" beside `dispatch=dead`
   ("nothing runnable is at …"), about an empty directory in a clean tree: two contradictory
   statements in one report. `exposed` now needs both ownership and existence.
+- **git's own rule for a relative `core.hooksPath`, measured: it resolves against the working
+  tree top when there is one, and against the GIT DIR when there is not.** A round called the
+  second case unresolvable and reported `dispatch=unreadable` — false about git (`rev-parse
+  --git-path hooks/post-merge` answers it, and `git hook run post-merge` executes it) and worse
+  in jkb, which then declined to install a chainer at the one place git dispatches from, so the
+  repo hook it had just installed really never ran. `core.hooksPath` set to the **empty string**
+  is the opposite error: git resolves it to `/post-merge` and finds nothing, so the repo hook is
+  dead — and folding it into "not set" reported `dispatch=direct`, the verdict the renderer
+  prints nothing for. Both were settled by running git, not by reading the code.
+- **A verdict that admits nothing was established must not also sweep.** The `unreadable` branch
+  left `want` at its `no` default, and `no` retracts — so one run printed `exclude=retracted …`
+  beside `dispatch=unreadable`, two lines making opposite epistemic claims about one path, after
+  which the chainer read untracked and the next resolvable run put the block back. That is the
+  flip-flop the worktree-invariant derivation exists to prevent, reintroduced through the
+  destructive half.
 - **A guard belongs where it can see the failure it was written for.** The refusal for an
   unrecognised intent went into `reconcile_exclude` — and the caller's own default turned an
   unknown derivation word into `pattern=""`, which the funnel collapses to a perfectly

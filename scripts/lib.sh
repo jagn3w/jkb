@@ -85,7 +85,9 @@ git_hooks_dir() {
     common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 1
     [ -n "$common" ] || return 1
     case "$common" in /*) ;; *) common="$repo_root/$common" ;; esac
-    printf '%s\n' "$common/hooks"
+    # `--git-common-dir` answers `.` in a bare repo, which made every reported path read
+    # `<repo>/./hooks/post-merge`.
+    printf '%s\n' "$(_real_dir "$common")/hooks"
 }
 
 # _real_dir <path> — a directory's physical path, or the path itself when it does not exist.
@@ -132,18 +134,35 @@ git_hooks_override() {
         1) return 0 ;;      # genuinely not set
         *) return 2 ;;      # set to something git will not resolve
     esac
-    [ -n "$configured" ] || return 0
+    # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
+    # printing nothing, `rev-parse --git-path hooks/post-merge` answers `/post-merge`, and
+    # `git hook run post-merge` says "cannot find a hook named post-merge" — the repo hook is
+    # dead. Folded into "not set", the caller reported `dispatch=direct`, which the renderer
+    # prints nothing for: the D34 post-merge automation silently off, which is the exact harm
+    # `dispatch` was made many-valued to surface.
+    [ -n "$configured" ] || return 2
     case "$configured" in
         /*) ;;
         *)
-            # rc 2, not 0. Reaching here means `core.hooksPath` IS set and holds a relative
-            # value we could not resolve — an unestablished answer, which `|| return 0` spelled
-            # as "genuinely not set" and the caller then reported `dispatch=direct`: the best
-            # verdict, rendered silently, about a repository whose repo hook git will never
-            # run. The config read three lines up is three-valued for this reason; the
-            # toplevel resolution was not.
-            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 2
-            [ -n "$top" ] || return 2
+            # GIT'S OWN RULE, measured rather than assumed (git 2.51.1): a relative value
+            # resolves against the working tree top when there IS one, and against the git dir
+            # when there is not — `git rev-parse --git-path hooks/post-merge` in a bare repo
+            # with `core.hooksPath = .githooks` answers `.githooks/post-merge`, and
+            # `git hook run post-merge` executes it.
+            #
+            # A previous round called the no-toplevel case unresolvable and returned rc 2. That
+            # was false about git and harmful in jkb: the run said "git will not resolve it, so
+            # git runs NO hooks in this repository" about a path git resolves perfectly well,
+            # and — worse than the wording — jkb then declined to install a chainer at the one
+            # place git dispatches from, so the repo hook it had just installed really never
+            # ran, and nothing was done about it.
+            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || top=""
+            if [ -z "$top" ]; then
+                top="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 2
+                [ -n "$top" ] || return 2
+                case "$top" in /*) ;; *) top="$repo_root/$top" ;; esac
+                top="$(_real_dir "$top")"   # `--git-common-dir` answers `.` in a bare repo
+            fi
             configured="$top/$configured"
             ;;
     esac
@@ -790,6 +809,15 @@ install_git_hooks() {
     # precondition was itself persistent.
     override="$(git_hooks_override "$repo_root")" || override_rc=$?
     if [ "$override_rc" -eq 2 ]; then
+        # `want=unknown`, not the `no` default this branch used to leave in place. `no`
+        # SWEEPS, so a run that has just said it established nothing printed
+        # `exclude=retracted …` beside `dispatch=unreadable` — two lines making opposite
+        # epistemic claims about one path, after which the chainer read untracked and the next
+        # resolvable run put the block back: the flip-flop the worktree-invariant derivation
+        # exists to prevent, reintroduced through the destructive half. The sibling rc-2 cause
+        # is already right because the derivation answers `undecided` for it; this branch
+        # bypasses the derivation, so it carries the fact itself.
+        want=unknown
         verdict="unreadable core.hooksPath"
     elif [ -z "$override" ]; then
         verdict="direct"
@@ -953,8 +981,14 @@ render_git_hooks_report() {
                     # chainer may be nowhere near a working tree) and vacuous for a refusal
                     # that never opened the file. A false diagnosis handed to an operator on
                     # an unattended pull is worse than a vaguer true one.
+                    # Scoped to the STEP, because `failed` is a per-step word and this
+                    # function reports several lines per run. `reconcile_exclude` can retract
+                    # (committed by `mv`) and then fail the append, so a whole-file claim of
+                    # "nothing was changed" printed directly beneath `retracted …` — two lines
+                    # about one file stating opposite facts. It is also untrue of a partial
+                    # append, which writes to the user's file with no rollback.
                     failed)     warn "could not update .git/info/exclude $detail"
-                                warn "  nothing was changed, so whatever jkb meant to hide or unhide is as it was." ;;
+                                warn "  that step did not land; anything reported above it did." ;;
                     *)          warn "unrecognised exclude state: $line" ;;
                 esac ;;
             dispatch=*)
@@ -964,8 +998,13 @@ render_git_hooks_report() {
                     direct|chained) : ;;
                     unknown) warn "  if $detail does not exec \"\$(git rev-parse --git-common-dir)/hooks/post-merge\", the repo hook never runs." ;;
                     dead)    warn "core.hooksPath is set and nothing runnable is at $detail — git will NOT run the repo hook above." ;;
+                    # True of both causes that reach here: a value git cannot expand (it
+                    # fatals), and a value set to the empty string (git resolves it to
+                    # `/post-merge` and finds nothing). It used to also cover a relative path
+                    # in a repo with no working tree, which git resolves perfectly well — the
+                    # sentence was false there and its own suggested check contradicted it.
                     unreadable)
-                             warn "$detail is set to something git will not resolve, so git runs NO hooks in this repository."
+                             warn "$detail is set to a value that names no usable hooks directory, so git will not run the repo hook above."
                              warn "  check it with: git config --get --path core.hooksPath" ;;
                     *)       warn "unrecognised dispatch verdict: $line" ;;
                 esac ;;
