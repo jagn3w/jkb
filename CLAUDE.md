@@ -845,6 +845,17 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   the raw string — so the transient refusal cannot reach one and miss the other. Fixing only
   the reader the defect surfaced in would have left the identical hole one call away, which is
   this area's whole history.
+- **Three repository-aware spawns, one rule, pinned at each of them.** Asking *who else
+  implements this rule* found two production spawns that were not git and resolved a repository
+  from the environment anyway: `pr::gh` — `gh` finds the repo through git, so a leaked
+  `GIT_WORK_TREE` has it asking GitHub about **an unrelated repository's pull requests**, and
+  `close-merged` then closes tasks on that answer — and `session::run_gate`, whose verdict
+  decides a landing and which would be verifying a different checkout. `gitrepo::
+  scrub_repo_selection` is the rule; `git_cmd`, `gh_cmd` and `gate_cmd` are its three callers.
+  **A test of the primitive is not the claim** (the `install_exec` lesson again): with the
+  scrub deleted from `gh_cmd` and from `gate_cmd`, a test of `scrub_repo_selection` alone was
+  perfectly green, so each call site builds its `Command` in a named function and each has its
+  own assertion. Four mutations, one per site plus the blanket-strip guard, all caught.
 - **The measurement itself had the defect it was added to prevent.** `_exclude_fingerprint`
   folded *could not measure* into `absent`, and two failures compare equal — so with `cksum`
   unavailable jkb reported `exclude-file=unchanged` **over a real write**. Measured with a

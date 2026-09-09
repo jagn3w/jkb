@@ -246,10 +246,23 @@ enum Staleness {
 /// Deliberately shells out rather than speaking HTTP: `gh` already holds the user's
 /// authentication, and adding an HTTP client plus a token story to `jkb-cli` for one query is a
 /// dependency and a secret this tool does not otherwise need.
+/// Build the `gh` invocation for `dir`.
+///
+/// Separate from [`gh`] so the scrubbing below is pinned at THIS call site: a test of
+/// `scrub_repo_selection` alone stayed green with this line deleted.
+fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("gh");
+    cmd.args(args).current_dir(dir);
+    // `gh` finds the repository through git, so `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`
+    // outrank `current_dir` here exactly as they do for git itself. Left in, an exported one
+    // makes this ask GitHub about an unrelated repository's pull requests — and
+    // `close-merged` closes tasks on the answer.
+    crate::gitrepo::scrub_repo_selection(&mut cmd);
+    cmd
+}
+
 fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("gh")
-        .args(args)
-        .current_dir(dir)
+    let out = gh_cmd(dir, args)
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -278,6 +291,14 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The `gh` spawn drops the caller's repository selection.
+    ///
+    /// Pinned HERE, at the call site, not only where the rule is defined: with the scrub line
+    /// deleted from this file, a test of `scrub_repo_selection` alone was perfectly green.
+    #[test]
+    fn the_gh_spawn_does_not_inherit_a_repository_selection() {
+        crate::gitrepo::assert_scrubbed("gh", &super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]));
+    }
     use super::{spent, Discovery, PullRequest, Staleness};
     use jkb_fsm::Fact;
 

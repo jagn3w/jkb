@@ -32,13 +32,55 @@ const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 /// outright.
 fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR");
+    cmd.arg("-C").arg(dir).args(args);
+    scrub_repo_selection(&mut cmd);
     cmd
+}
+
+/// Remove the environment variables that select a repository, so the working directory decides
+/// which one.
+///
+/// The rule lives here rather than at each call site, because it has three of them in three
+/// modules: this module's git spawns, [`crate::pr`]'s `gh` (which resolves the repository
+/// through git exactly as git does, so a leak makes it ask GitHub about somebody else's pull
+/// requests — and `close-merged` then closes tasks on that answer), and [`crate::session`]'s
+/// gate runner (whose verdict decides a landing). Anything else that shells out to a
+/// repository-aware tool belongs here too.
+///
+/// Only the three that select a REPOSITORY. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
+/// configuration and are deliberately left alone: this project's own dev container carries
+/// `safe.directory` grants in them, and stripping those makes git refuse the checkout.
+pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+}
+
+/// The variables [`scrub_repo_selection`] removes — so each call site's test names the same
+/// list as the rule, instead of restating it and drifting.
+#[cfg(test)]
+pub(crate) const REPO_SELECTION_VARS: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+
+/// Assert that `cmd` will not inherit the caller's repository selection.
+///
+/// Shared by the tests at all three call sites: what must be pinned is that each SPAWN is
+/// scrubbed, not that the scrubbing function works. Removing the call from `gh` or from the
+/// gate runner left a test of the primitive perfectly green — the same lesson `install_exec`
+/// already carries, that a test of the primitive is not the claim.
+#[cfg(test)]
+pub(crate) fn assert_scrubbed(what: &str, cmd: &Command) {
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    for want in REPO_SELECTION_VARS {
+        assert!(
+            removed.iter().any(|k| k == want),
+            "{what}: {want} is not removed; an exported one outranks the working directory \
+             and points the tool at another repository. removed: {removed:?}"
+        );
+    }
 }
 
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
@@ -991,6 +1033,25 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
+    /// Configuration injection is deliberately NOT stripped: the dev container carries
+    /// `safe.directory` grants in `GIT_CONFIG_PARAMETERS`, and removing those makes git refuse
+    /// the checkout. Pinned so the list is not "tidied" into a blanket sweep.
+    #[test]
+    fn config_injection_is_left_alone() {
+        let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for keep in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
+            assert!(
+                !removed.iter().any(|k| k == keep),
+                "{keep} must not be stripped — it carries safe.directory grants"
+            );
+        }
+    }
+
     /// Every git spawn in this module drops the caller's repository selection.
     ///
     /// Asserted on the built `Command` rather than by exporting the variables, because
@@ -1001,28 +1062,10 @@ mod tests {
     /// this pins, is whether jkb still asks it to.
     #[test]
     fn every_git_call_drops_the_callers_repository_selection() {
-        let cmd = git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]);
-        let removed: Vec<String> = cmd
-            .get_envs()
-            .filter(|(_, v)| v.is_none())
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
-        for want in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] {
-            assert!(
-                removed.iter().any(|k| k == want),
-                "{want} is not removed; an exported one outranks `-C` and sends jkb into \
-                 another repository. removed: {removed:?}"
-            );
-        }
-        // Configuration injection is deliberately NOT stripped: the dev container carries
-        // `safe.directory` grants in `GIT_CONFIG_PARAMETERS`, and removing those makes git
-        // refuse the checkout. Pinned so the list is not "tidied" into a blanket sweep.
-        for keep in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
-            assert!(
-                !removed.iter().any(|k| k == keep),
-                "{keep} must not be stripped — it carries safe.directory grants"
-            );
-        }
+        super::assert_scrubbed(
+            "git",
+            &git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]),
+        );
     }
 
     /// Build a throwaway repo exercising all three GitHub merge strategies plus an

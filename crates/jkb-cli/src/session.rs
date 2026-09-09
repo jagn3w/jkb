@@ -440,9 +440,21 @@ pub fn resolve_gate(
 ///
 /// # Errors
 /// Returns an error if the shell cannot be executed at all.
-pub fn run_gate(dir: &Path, cmd: &str, capture: bool) -> Result<(bool, Option<String>)> {
+/// Build the gate invocation for `dir`.
+///
+/// Separate from [`run_gate`] so the scrubbing below is pinned at THIS call site.
+fn gate_cmd(dir: &Path, cmd: &str) -> std::process::Command {
     let mut command = std::process::Command::new("sh");
     command.arg("-c").arg(cmd).current_dir(dir);
+    // The gate must judge the directory it was handed. An inherited `GIT_DIR` outranks the cwd
+    // for every git call the gate makes, so a leaked one has it verifying a different checkout
+    // and reporting that as this session's verdict.
+    crate::gitrepo::scrub_repo_selection(&mut command);
+    command
+}
+
+pub fn run_gate(dir: &Path, cmd: &str, capture: bool) -> Result<(bool, Option<String>)> {
+    let mut command = gate_cmd(dir, cmd);
     if capture {
         let out = command
             .output()
@@ -459,6 +471,14 @@ pub fn run_gate(dir: &Path, cmd: &str, capture: bool) -> Result<(bool, Option<St
 
 #[cfg(test)]
 mod tests {
+    /// The `gate` spawn drops the caller's repository selection.
+    ///
+    /// Pinned HERE, at the call site, not only where the rule is defined: with the scrub line
+    /// deleted from this file, a test of `scrub_repo_selection` alone was perfectly green.
+    #[test]
+    fn the_gate_spawn_does_not_inherit_a_repository_selection() {
+        crate::gitrepo::assert_scrubbed("gate", &super::gate_cmd(std::path::Path::new("/somewhere"), "true"));
+    }
     use super::{branch_for, mint_name, name_from_branch, LandLock};
 
     #[test]
