@@ -107,6 +107,7 @@ jobs:
           ./.container/egress-status.sh --self-test
           ./.container/fetch-extensions.sh --self-test
           ./.container/verify.sh --self-test
+          ./.container/bwrap-probe.sh --self-test
           # Ran in scripts/check.sh and NOWHERE in CI until check-config.sh started comparing the
           # two lists — the exact drift that check exists to catch, found on its first run.
           ./scripts/link-claude-memory.sh --self-test
@@ -212,72 +213,28 @@ jobs:
       # different containers.
       - name: The container is what it claims to be
         run: ./.container/mutate-verify.sh --control
-
-      # WHY BUBBLEWRAP CAN OR CANNOT START. The first real run answered D52 task 1.3 with a FAIL:
-      # `bubblewrap cannot create namespaces`. That is the nested sandbox's mechanism, so it needs
-      # a cause and not a skip — the seccomp profile IS applied by the flags above (docker errors
-      # on a missing profile file), so something else is refusing.
+      # WHY BUBBLEWRAP CAN OR CANNOT START. `verify.sh` reports THAT the nested sandbox cannot
+      # start; this reports WHY, by removing one security flag at a time from the container that
+      # ships and re-measuring. It is a diagnostic, so it runs on failure too and asserts nothing.
       #
-      # This step DELIBERATELY assembles its own docker flags, which the diagnostic below does not:
-      # varying the flags IS the experiment. [2] is exactly what the container ships, so if [3]
-      # succeeds where [2] fails the cause is AppArmor — Ubuntu 24.04 (which ubuntu-latest is)
-      # restricts unprivileged user namespaces by default, and the design's own measurement was
-      # taken on 26.04. Reported, never acted on automatically: `apparmor=unconfined` is a real
-      # weakening of the container and is a decision, not a fix to apply because a probe suggested it.
+      # ONE COMMAND, because this used to be four hand-spelled `docker run` arms here. They were a
+      # second copy of the shipped security configuration and they drifted from it in every review
+      # round they survived: an arm claiming to be "what the container ships" while missing a flag
+      # it ships, a probe weaker than verify.sh's own, and a header and an arm's comment
+      # contradicting each other about which arm was the real one. `--ladder` subtracts from the
+      # control, so the top rung IS the shipped container and no rung can lose a flag by omission
+      # — and it can be run by hand on any Docker host, which YAML never could.
       - name: Why bubblewrap can or cannot start (the discriminator, task 1.3)
         if: always()
         run: |
-          echo "--- runner facts ---"; uname -a
+          echo "--- runner facts ---"
           for s in kernel.unprivileged_userns_clone user.max_user_namespaces \
                    kernel.apparmor_restrict_unprivileged_userns; do
             printf '%s = %s\n' "$s" "$(sysctl -n $s 2>&1 || true)"
           done
-          SEC=.container/seccomp-bwrap.json
-          # --entrypoint bash, deliberately. The first version of this probe kept the image's
-          # entrypoint, which refuses to boot when egress is unbounded -- and these arms grant no
-          # NET_ADMIN, so all three printed the refusal and bwrap never ran. Three identical
-          # outputs that discriminated nothing, in the experiment written to settle the question.
-          # The entrypoint is an unrelated moving part here: bwrap's namespace creation depends on
-          # the kernel, seccomp, AppArmor and capabilities, not on what PID 1 is.
-          probe() { # probe <label> <extra docker args...>
-            local label="$1"; shift
-            local out
-            # `|| true`, because GitHub runs an unqualified `run:` block as `bash -e {0}` and a
-            # BARE assignment from a failing command substitution is a simple command -- errexit
-            # fires and the step dies. The inner bwrap invocation always exits 0 (it is `&&/||`),
-            # so the only way this returns non-zero is docker refusing to START the container,
-            # which is exactly what arm [3] does when the profile is not loaded. The step would
-            # then abort after arms [1] and [2], never printing the third arm's message, and turn
-            # the job red for a fact about the machine -- from a step that is purely diagnostic.
-            # The `*)` arm below exists precisely for that case and was unreachable for its most
-            # likely cause.
-            out="$(docker run --rm --entrypoint bash "$@" jkb-dev -c \
-                    'bwrap --new-session --die-with-parent --bind / / --unshare-net /bin/true \
-                       && echo BWRAP-OK || echo BWRAP-FAILED' 2>&1)" || true
-            # AN ARM THAT DID NOT RUN SAYS SO, rather than being read as a result. This is the
-            # whole lesson of the previous version: "no BWRAP-OK in the output" and "the probe
-            # never executed" are different facts and must not print the same way.
-            case "$out" in
-              *BWRAP-OK*)     printf '%-30s OK\n' "$label" ;;
-              *BWRAP-FAILED*) printf '%-30s FAILED\n' "$label"
-                              printf '%s\n' "$out" | grep -v BWRAP- | sed 's/^/      /' | tail -3 ;;
-              *)              printf '%-30s DID NOT RUN - this arm measured NOTHING:\n' "$label"
-                              printf '%s\n' "$out" | sed 's/^/      /' | tail -5 ;;
-            esac
-          }
-          probe "[1] stock docker"        --user vscode
-          probe "[2] + seccomp"           --user vscode --security-opt seccomp=$SEC
-          # The SHIPPED remedy, not `unconfined`: that is what run.sh passes and what has to work.
-          # Arm [2] is the broken state (docker-default), so [2] FAILED with [3] OK is the fix
-          # demonstrated rather than argued.
-          probe "[3] + the container's own AppArmor profile" --user vscode --security-opt seccomp=$SEC \
-                                         --security-opt apparmor=jkb-dev
+          echo
+          ./.container/mutate-verify.sh --ladder
 
-      # WHAT THE MEMORY LINKER ACTUALLY SAYS. The other FAIL was `auto-memory is not linked (state:
-      # unlinked)`, and the preamble runs the linker with its output sent to /dev/null, so the run
-      # reported the state without the reason. Re-running it verbosely in the SAME container the
-      # control uses is the whole diagnostic — and it goes through `--shell` rather than a
-      # hand-assembled `docker run` precisely because this one is not an experiment about flags.
       - name: What the memory linker actually says
         if: always()
         run: |

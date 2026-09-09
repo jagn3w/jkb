@@ -10,6 +10,127 @@
 # container.json permits // comments; strip them the way the spec's parsers do.
 dc_strip() { sed 's://.*$::' "$1"; }
 
+# Dev Containers' variable syntax, with ONE deliberate difference: an unset ${localEnv:VAR} is a
+# hard error here, where Dev Containers substitutes the empty string. That default is how
+# `source=${localEnv:HOME}/repos` quietly becomes `source=/repos` — a different host directory,
+# mounted into the container, with nothing to notice it. A boundary must not be able to move
+# because a variable was not set.
+#
+# It RETURNS 1 rather than calling `die`, which is run.sh's and does not exist here: lib.sh is
+# sourced by scripts with and without `set -e`, so a helper that exits would take a caller's shell
+# down with it. run.sh wraps its calls with `|| die`.
+dc_subst() { # dc_subst <string> <repo-root>
+    local s="$1" root="$2" var val
+    s="${s//\$\{localWorkspaceFolderBasename\}/$(basename "$root")}"
+    s="${s//\$\{localWorkspaceFolder\}/$root}"
+    while [[ "$s" =~ \$\{localEnv:([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+        var="${BASH_REMATCH[1]}"
+        if [ -z "${!var+set}" ]; then
+            printf 'container.json references ${localEnv:%s}, which is not set\n' "$var" >&2
+            return 1
+        fi
+        val="${!var}"
+        s="${s//\$\{localEnv:$var\}/$val}"
+    done
+    printf '%s' "$s"
+}
+
+# THE DOCKER SECURITY FLAGS THE CONTAINER DECLARES, substituted, one argument per line (D52.6).
+#
+# container.json's `runArgs` is the declaration; run.sh has always derived from it, and
+# mutate-verify.sh's HEALTHY re-typed it by hand. That is what let commit 8266a2b add
+# `systempaths=unconfined` to the declaration while the harness went on starting — and certifying —
+# a container without it, under a step named "The container is what it claims to be". It had
+# silently omitted `--pids-limit 4096` since the day that was declared, which nobody had noticed at
+# all.
+#
+# So the control's flags are READ from the declaration. `--user` comes with it (dc_remote_user)
+# because it is the same kind of fact and run.sh already derives it: bubblewrap cannot create a
+# namespace as root, so a harness running as a different user from the real container is not a
+# control either. What mutate-verify.sh still spells by hand is only its own scratch binds, which
+# are deliberately NOT container.json's mounts.
+# EMPTY IS A REFUSAL, AND IT LIVES HERE rather than in a caller. A `while` loop that never runs its
+# body exits 0, so an absent or unreadable `runArgs` used to leave this function reporting success
+# with no output — and run.sh's `|| die` therefore could not fire, so the launcher that starts the
+# container people attach to would build a `docker run` line with no seccomp profile, no
+# `systempaths=unconfined`, no `NET_ADMIN` and no pid limit, and say nothing was wrong.
+# mutate-verify.sh refused that state and run.sh did not, which is a rule two callers had to
+# remember and one did. There is no legitimate empty here: `runArgs` IS this container's security
+# configuration.
+#
+# The jq is read through `$( )` too, so "container.json does not parse" and "it declares no
+# runArgs" arrive as different messages instead of as one empty stream — inside the very function
+# the rule above is written over. (A malformed container.json also empties the mount and env
+# readers, and there is still no single `jq empty` above `docker_args`' dispatch to catch all
+# three at once; that is filed, not fixed here.)
+dc_run_args() { # dc_run_args <container.json> <repo-root>  -> one docker argument per line
+    local raw line sub
+    [ -r "$1" ] || { printf 'container.json is not readable: %s\n' "$1" >&2; return 1; }
+    raw="$(dc_strip "$1" | jq -r '(.runArgs // [])[]' 2>/dev/null)" \
+        || { printf 'container.json does not parse: %s\n' "$1" >&2; return 1; }
+    if [ -z "$raw" ]; then
+        printf 'container.json declares no runArgs: %s\n' "$1" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        sub="$(dc_subst "$line" "$2")" || return 1
+        printf '%s\n' "$sub"
+    done <<<"$raw"
+}
+
+# The environment the container declares, substituted, one `KEY=VALUE` per line.
+#
+# It is on the DECLARATION side of the line that decides what a control container must copy. The
+# control copies everything that is a property of the declaration — `runArgs`, `remoteUser`,
+# `containerEnv` — and supplies its own only for what is a property of the HOST'S DATA, which is
+# the mount sources: the real ~/repos and ~/.jkb become the harness's scratch binds. `containerEnv`
+# names container paths, never host ones, so there is nothing about it for a harness to substitute.
+#
+# Unlike runArgs, empty is legitimate: a container may declare no environment. Unreadable is not.
+dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY=VALUE per line
+    local raw line sub
+    [ -r "$1" ] || { printf 'container.json is not readable: %s\n' "$1" >&2; return 1; }
+    raw="$(dc_strip "$1" | jq -r '(.containerEnv // {}) | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)" \
+        || { printf 'container.json does not parse: %s\n' "$1" >&2; return 1; }
+    [ -n "$raw" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        sub="$(dc_subst "$line" "$2")" || return 1
+        printf '%s\n' "$sub"
+    done <<<"$raw"
+}
+
+# READ A REFUSING PRODUCER THROUGH `$( )`, NEVER THROUGH `< <( )`. `dc_subst`, `dc_run_args`,
+# `dc_container_env` and run.sh's `docker_args` all REFUSE — that is the whole point of the unset-${localEnv:…} error
+# above — and bash discards a process substitution's exit status, so a refusal inside one kills
+# only the subshell while the reading loop keeps whatever was emitted before it. These producers
+# emit as they go, so what the caller is left holding is not nothing (which every caller checks
+# for) but a TRUNCATED list: a container started without the mounts or the security flags it
+# declares, a fingerprint taken over half a declaration, a control certified without the flag it
+# was assembled to carry. Command substitution propagates the status; check-config.sh fails the
+# gate on a `< <(` reading any of the three, so this is a rule the checker keeps rather than one
+# each call site has to remember.
+
+# The user the container runs as, or empty when it declares none.
+dc_remote_user() { # dc_remote_user <container.json>
+    # REFUSES IN ITS OWN RIGHT, like dc_container_env beside it. This was a bare pipe with both
+    # errors suppressed, which refuses only because every caller happens to set `pipefail` -- and
+    # THIS FILE SETS NO SHELL OPTIONS, so that is a rule every present and future caller has to
+    # remember, in a reader whose empty output is a legitimate answer ("declares no remoteUser").
+    # Sourced into a shell without pipefail it answered 0-with-no-output for a file it could not
+    # read, i.e. "could not tell" spelled exactly like "declares nothing".
+    #
+    # (The claim first written here -- that verify.sh's refusal branch was already unreachable --
+    # was WRONG: verify.sh sets pipefail too. What is true is that nothing in the reader made it
+    # so, and the two siblings that do this explicitly are the ones to match.)
+    [ -r "$1" ] || { printf 'container.json is not readable: %s\n' "$1" >&2; return 1; }
+    local out
+    out="$(dc_strip "$1" | jq -r '.remoteUser // empty' 2>/dev/null)" \
+        || { printf 'container.json does not parse: %s\n' "$1" >&2; return 1; }
+    printf '%s' "$out"
+}
+
 # Every mount point the container declares, one per line, sorted.
 #
 # The devcontainer spec allows a mount as either a comma-separated string or an object, and the

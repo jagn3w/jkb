@@ -15,6 +15,24 @@ bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 echo "==> container config"
 command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0; }
 
+# THE `probe …` INVOCATIONS IN ci.yml, one per line, with `\`-continuations joined.
+#
+# ci.yml's bubblewrap ladder spells its flags in shell inside a `run:` block, and its arms are
+# multi-line. A guard that greps the raw file cannot tell a flag ON an invocation from the same
+# text in a comment, a label or an array assignment — which is exactly how the AppArmor-profile
+# guard below came to read an assignment and stop establishing anything. Comment lines are dropped
+# first, so a flag named in prose is never mistaken for one that is passed.
+# COMMENT-STRIPPING, DEFINED BEFORE ANY USE. Bash resolves a function at call time, so using one
+# above its definition is not a syntax error — it is an empty result, and an extraction that reads
+# nothing looks exactly like a subject with nothing to find. That has now happened three times in
+# this file with this very function, each caught only because the guard using it was pinned against
+# an empty read. It lives at the TOP so the next guard cannot repeat it -- being first is the whole
+# protection. A textual use-before-define check was considered and rejected: it cannot tell a
+# top-level call from a call inside a function body (bash resolves at call time, so a helper naming
+# a helper defined below it is correct), so it would redden this gate for correct code, which is
+# the harm the pin below is written against.
+dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
+
 # Sourced HERE rather than 80 lines down, so this file has one copy of the comment-stripping rule
 # instead of a verbatim `strip()` beside the `dc_strip()` it later sources — two halves of one file
 # parsing the same input through two copies that can disagree.
@@ -29,22 +47,110 @@ for want in '"remoteUser": "vscode"' '--cap-add=NET_ADMIN'; do
     else bad "container.json no longer declares $want"; fi
 done
 
-# The seccomp profile is asserted as a FLAG/VALUE PAIR in runArgs, not as a string present
-# somewhere in the file. Grepping for the value alone passed when the `--security-opt` flag was
-# deleted and the value left orphaned — Docker would then apply its default profile, bubblewrap
-# would fail, and the config still read as declaring a profile. Found by mutate-config.sh.
-if jq -e --arg v "seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json" \
-      '[.runArgs // [] | to_entries[] | select(.value == "--security-opt") | .key]
-       | any(. as $i | ($ARGS.named.v) == ($in_args[$i+1] // ""))' \
-      --argjson in_args "$(jq -c '.runArgs // []' <<<"$dc")" <<<"$dc" >/dev/null 2>&1; then
+# THE ONE EXTRACTION of "which values does runArgs pair with --security-opt". This was spelled
+# three times within seventy lines — two near-verbatim jq `to_entries|any` blocks and this
+# `range/select` — in the file that fails the build when `dc_require_apparmor_profile` or
+# `dc_apparmor_mediates` gains a second definition. The next `--security-opt` the container
+# declares would have needed a fourth spelling.
+#
+# ADJACENCY, not membership: an orphaned value reads as a declaration and applies nothing. Delete
+# the `--security-opt` flag and leave `seccomp=…` behind, and Docker applies its DEFAULT profile —
+# whose `mount` denial is what bubblewrap dies on — while the file still reads as declaring one.
+# Found by mutate-config.sh, which is why this is a pair check and not a grep for the value.
+declared_pairs="$(jq -r '[.runArgs // [] | .[]] as $a
+                         | range(0; ($a | length))
+                         | select($a[.] == "--security-opt")
+                         | $a[.+1] // empty' <<<"$dc" 2>/dev/null)"
+n_declared="$(printf '%s\n' "$declared_pairs" | grep -c . || true)"
+if [ "$n_declared" -eq 0 ]; then
+    bad "no --security-opt pairs could be read out of container.json's runArgs — every check over them below would pass having compared nothing"
+fi
+declares_security_opt() { printf '%s\n' "$declared_pairs" | grep -qxF -- "$1"; }
+
+# WHAT IS DECLARED is a different question from what the control carries, and both are asked. This
+# one goes red when the profile is removed from container.json; the control guard below cannot,
+# because a declaration-less file passes it vacuously (the control would derive nothing to be
+# missing). Sharing the extraction was the fix; merging the questions would have deleted a check.
+if declares_security_opt "seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json"; then
     ok "runArgs pairs --security-opt with the seccomp profile"
 else
     bad "container.json does not pair --security-opt with seccomp=\${localWorkspaceFolder}/.container/seccomp-bwrap.json — Docker would apply its default profile and bubblewrap could not start"
 fi
 
+# `systempaths=unconfined` is the second half of what bubblewrap needs, and it is separate from
+# seccomp: Docker's masked /proc paths are SUBMOUNTS, so /proc is not "fully visible" and the
+# kernel refuses a fresh proc mount inside a user namespace whatever the syscall filter allows.
+# Without it the nested sandbox cannot start at all, and because the posture fails closed that
+# surfaces as Bash erroring rather than as anything naming this flag.
+if declares_security_opt "systempaths=unconfined"; then
+    ok "runArgs pairs --security-opt with systempaths=unconfined"
+else
+    bad "container.json does not pair --security-opt with systempaths=unconfined — Docker's masked /proc paths would make the kernel refuse bubblewrap's proc mount, so Claude Code's nested sandbox could not start"
+fi
+
 # Non-root is load-bearing (root cannot create a mount namespace in a container), so a
 # `"remoteUser": "root"` would break the nested sandbox while looking like a simplification.
 if grep -q '"remoteUser": *"root"' <<<"$dc"; then bad "remoteUser is root — the nested sandbox cannot start"; fi
+
+# THE CONTROL RUNS WHAT THE DECLARATION DECLARES — and this is no longer checked here, because
+# there is no longer anything to check (D54.1).
+#
+# mutate-verify.sh used to re-derive its control's flags from container.json with the same readers
+# run.sh uses, one file apart, and two guards lived here to keep the copies agreeing: a per-reader
+# contiguous-block comparison, and a pin that no fourth reader could join the assembly without
+# joining the table. Between them they produced five findings and three must-fixes across four
+# review rounds — the comparison covered only the security-opt pairs, then only the runArgs third;
+# the pin read a hand-picked source region, then matched only one spelling of its argument. Each
+# fix was right and the next round found the next hole, because a guard over two copies cannot be
+# complete: it has to enumerate what to compare, and whatever it fails to enumerate reads as
+# agreement.
+#
+# The control asks `run.sh --print-args --posture` now. One derivation, no agreement to guard, so
+# these are deleted rather than corrected a fourth time. What replaces them is not a better static
+# check but different evidence, in two places that already existed:
+#
+#   * verify.sh asserts the DECLARATION'S EFFECTS from inside the running container — the /proc
+#     unmask, the user, the environment — deriving each from container.json rather than from the
+#     control's flag list. CI runs it on every push through `mutate-verify.sh --control`, so a
+#     control that drifts from the declaration on any reader is red in the harness's own control.
+#   * run.sh refuses to print a partial or empty assembly and mutate-verify.sh refuses an empty
+#     one, so a truncated read cannot be certified as a container.
+#
+# What is still checked here about that script is its expectation strings (further down): those
+# name lines verify.sh must print, and a stale one is MISSED-for-ever on a harness that needs
+# Docker and therefore cannot run in this gate.
+root="$(cd "$here/.." && pwd)"
+
+# THE POSTURE HALF OMITS THE INSTANCE HALF (D54.1). This is the one property keeping the harness's
+# containers off the real ~/repos and ~/.jkb -- mutate-verify.sh appends `--print-args --posture`
+# straight into the control, so an instance flag leaking into it means every mutation runs
+# bind-mounting the LIVE knowledge base and colliding on the live container's name. It was argued
+# in a comment ("A mode cannot fail that way") and checked nowhere.
+#
+# ASKED BY RUNNING BOTH HALVES, not by reading docker_args' source. The property is about what the
+# program emits; its `[ "$half" != posture ]` gates are one way to implement that and a third
+# emission site outside a gate would satisfy any grep over them.
+#
+# BOTH DIRECTIONS, because the negative alone is vacuous: a docker_args that emitted no mounts at
+# all would pass "posture carries none" while silently breaking the launcher. So the `all` half
+# must carry each instance flag and the `posture` half must carry none of it -- the contrasting
+# case that makes the check discriminate rather than merely not-fail.
+INSTANCE_FLAGS='^--name$|^--detach$|^--workdir$|^--mount$'
+pa_all="$("$here/run.sh" --print-args "$root" 2>/dev/null)" || pa_all=""
+pa_posture="$("$here/run.sh" --print-args --posture "$root" 2>/dev/null)" || pa_posture=""
+if [ -z "$pa_all" ] || [ -z "$pa_posture" ]; then
+    bad "run.sh --print-args produced nothing for one or both halves — nothing establishes that the control the harness derives omits this host's mounts"
+else
+    n_all="$(grep -cE "$INSTANCE_FLAGS" <<<"$pa_all" || true)"
+    leaked="$(grep -E "$INSTANCE_FLAGS" <<<"$pa_posture" | sort -u | tr '\n' ' ' || true)"
+    if [ "$n_all" -eq 0 ]; then
+        bad "run.sh --print-args emits no instance flag at all — the launcher would start a container with no name, no workdir and no mounts, and the posture check below would pass having compared nothing"
+    elif [ -n "$leaked" ]; then
+        bad "run.sh --print-args --posture carries instance flag(s) the harness must not inherit: $leaked — mutate-verify.sh appends this to its control, so every mutation would bind-mount the real ~/.jkb"
+    else
+        ok "the posture half carries none of the $n_all instance arguments the full half does"
+    fi
+fi
 
 # The whole point of the profile: these must be unconditionally allowed. Checked against the
 # generator's own list so the two cannot drift.
@@ -275,7 +381,6 @@ fi
 # and is asserted non-empty and complete below, where adding a caller needs no edit at all.
 # Shell comments, removed. Two guards below need it and had one copy between them; a second
 # spelling of "what is a comment" is a second answer to the question they both ask.
-dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
 # THE SETUP MARKER IS NO LONGER GUARDED HERE, because it is no longer spelled twice (D52.5). This
 # compared run.sh's and setup.sh's spellings of the marker path, justified by a comment reading
@@ -458,17 +563,14 @@ else
     done
     # (That the profile is GENERATED rather than hand-maintained is asserted below, by the derived
     # check over every generator -- not here, where it would be a second rule about one of them.)
-    # ci.yml names the profile in its bubblewrap probe and cannot source shell to derive it.
-    # ANCHORED ON THE INVOCATION, not on a mention of the name. `apparmor=jkb-dev` also appeared in
-    # the probe's LABEL, so changing the actual `--security-opt` flag to `apparmor=unconfined` left
-    # this guard green -- arm [3] then measured unconfined, and the headline "[2] FAILED with [3]
-    # OK" stopped demonstrating the profile and quietly demonstrated that switching AppArmor off
-    # works. The mutation rewrote every occurrence at once, so it reported CAUGHT either way and
-    # could never establish which one the guard reads. The label no longer contains the string.
-    if ! grep -qF -e "--security-opt apparmor=$aa_name" "$here/../.github/workflows/ci.yml" 2>/dev/null; then
-        bad "ci.yml does not name the profile the file declares ($aa_name) — its bubblewrap probe would test a profile nothing loads"
-        aa_ok=0
-    fi
+    #
+    # THAT ci.yml NAMES THIS PROFILE IS NO LONGER A QUESTION. It used to spell the flag out in four
+    # hand-written bubblewrap arms, and the guard for it -- "every probe invocation names the
+    # declared profile" -- had to be made true twice, because the name first appeared only in an
+    # arm's LABEL and then moved into a shared array a `grep -F` matched at the ASSIGNMENT. Both
+    # times an arm claiming to be the shipped configuration was measuring something else while the
+    # gate stayed green. ci.yml runs `mutate-verify.sh --ladder` now, whose rungs are the control
+    # minus a named flag, so no file outside run.sh spells the profile at all (D54.3).
     [ "$aa_ok" -eq 1 ] && ok "the AppArmor profile is docker-default with only \`mount\` relaxed ($aa_name)"
 fi
 
@@ -844,6 +946,57 @@ if [ -f "$here/../ui/vscode/package.json" ]; then
     else
         bad "ui/vscode/package.json no longer yields a publisher.name — verify.sh would silently stop checking that the jkb explorer is installed"
     fi
+fi
+
+# A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process
+# substitution's exit status, so a refusal inside one kills the subshell alone and the reading loop
+# keeps whatever was emitted before it. `dc_subst` refuses on an unset ${localEnv:…} precisely so a
+# boundary cannot move because a variable was not set, and the readers built on it carry that
+# refusal outward. They all emit as they go, so the caller is left holding not nothing — which
+# every caller checks for — but a TRUNCATED list: a container started without some of the mounts or
+# security flags it declares, a fingerprint over half a declaration, a control certified without a
+# flag it was assembled to carry.
+#
+# AN ALLOWLIST, NOT A LIST OF PRODUCERS, and the direction is the whole point. This was a
+# hand-maintained list of four names, and its own comment recorded that `dc_container_env` had
+# "joined it late" after run.sh read its environment through the forbidden shape and a three-name
+# list could not see it. A list of things to REFUSE fails open: the next producer nobody adds is
+# unguarded, silently, which is how `dc_mount_specs` sat in run.sh's own mount loop — the security
+# boundary — unseen by the guard written for exactly that. Naming what is SAFE fails closed
+# instead: a producer nobody classified turns this gate red, which is a minute's work and an
+# obvious message, rather than a hole.
+#
+# What is safe is a plain text filter reading a file or a string: it has no refusal to lose, and
+# a caller that cares about its status is not using a loop like this. Anything that reads the
+# DECLARATION -- every `dc_*`, `docker_args`, `assembled_args`, or a script invoked for one of its
+# --print modes -- is not on this list and must go through `$( )`.
+procsub_safe='jq|sed|awk|grep|cat|printf|echo|sort|tr|find|ls|comm|diff'
+# Comment-stripped per file, so the file name and line number survive for the message -- and so
+# that a comment QUOTING the forbidden shape (this block does, twice) is not itself a finding.
+procsub=""; procsub_scanned=0; procsub_seen=0
+for f in "$here"/*.sh; do
+    stripped="$(dc_strip_comments "$f")" || continue
+    [ -n "$stripped" ] || continue
+    procsub_scanned=$((procsub_scanned+1))
+    all="$(printf '%s\n' "$stripped" | grep -nE '< <\(' || true)"
+    [ -n "$all" ] && procsub_seen=$((procsub_seen + $(printf '%s\n' "$all" | grep -c .)))
+    hits="$(printf '%s\n' "$all" | grep -vE "< <\([[:space:]]*($procsub_safe)[[:space:]]" | grep . || true)"
+    [ -n "$hits" ] && procsub="$procsub $(basename "$f"):$(printf '%s' "$hits" | cut -d: -f1 | tr '\n' ',')"
+done
+procsub="$(printf '%s' "$procsub" | sed 's/^ *//')"
+# PINNED AGAINST HAVING READ NOTHING. "No producer is read unsafely" and "the scan found no files"
+# are the same value here — an empty `procsub` — and this guard's whole subject is that a check can
+# pass having observed nothing. So the count in the `ok` line comes from what was READ, and zero
+# files read is a failure rather than a clean report.
+if [ "$procsub_scanned" -eq 0 ]; then
+    bad "no .container script could be read to check its process substitutions — this check certified nothing"
+elif [ -z "$procsub" ]; then
+    ok "every process substitution reads a plain text filter, never a producer that can refuse ($procsub_seen in $procsub_scanned files)"
+else
+    # THE MESSAGE MUST NOT SPELL THE SHAPE IT LOOKS FOR. Written out, this line matched the guard's
+    # own scan of this file -- a check reporting itself, which reads as a real finding and cannot be
+    # cleared by fixing anything.
+    bad "a producer that can refuse is read through a process substitution, which discards its refusal and leaves a truncated list: $(tr '\n' ' ' <<<"$procsub") — read it through a command substitution instead, or add it to procsub_safe if it genuinely cannot refuse"
 fi
 
 for s in "$here"/*.sh; do

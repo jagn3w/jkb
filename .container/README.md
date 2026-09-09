@@ -447,6 +447,148 @@ plain dotfiles with identical TCC status differing only in the posture.
 Use `auto-mode.sh sandboxed` for this, **never** `printenv CLAUDE_CODE_SANDBOXED`: that variable was
 **unset** throughout the measurement above. It had been this repo's recommended test.
 
+One half of it **is** now established, negatively and then positively: the nested sandbox was not
+running at all, because `bwrap` could not mount `/proc` — see the section below.
+
+That was invisible for as long as it was because of a **probe that could not fail**, which is this
+directory's recurring defect and not, as first written here, an absent one. `verify.sh` did run
+`bwrap`, and printed `ok  bubblewrap can create its namespaces (nested sandbox can start)` — but
+the invocation omitted `--proc /proc`, so it stopped one step short of the refusal. Namespace
+creation and the proc mount are separate kernel checks with separate causes; passing the first
+says nothing about the second, and the message claimed the second. The probe now mounts `proc`,
+its `ok` line claims only what it establishes, and both flags the mechanism depends on
+(`seccomp=…`, `systempaths=unconfined`) are watched failing by `mutate-verify.sh`.
+
+## `/proc` has to be unmasked, and on Linux that is an unfinished trade
+
+Docker masks a dozen `/proc` and `/sys` paths by mounting over them. Those masks are *submounts*,
+which makes `/proc` not "fully visible", and the kernel then refuses a fresh `proc` mount inside a
+non-initial user namespace (`mount_too_revealing()`). So `bwrap` fails with `Can't mount proc on
+/newroot/proc`, and because the posture sets `failIfUnavailable: true`, Bash **errors** rather than
+running unconfined. `container.json` therefore passes `--security-opt systempaths=unconfined`.
+Measured with a negative control, one flag apart: with it the nested proc mount succeeds, without it
+it is denied.
+
+**Necessity was measured on both platforms, and the first measurement here was WRONG.** This
+section previously said the flag was inert on macOS — that ten paths were unmasked and nothing was
+bought. That came from a probe omitting `--unshare-pid`, which is the one flag that triggers the
+refusal. Re-measured with Claude Code's actual invocation, in a container with the masks in place.
+
+**The rows are NOT cumulative, and rows 1-3 share a base that is NOT Claude Code's full shape.**
+Reading them as a ladder says the wrong flag is the trigger — row 3 would appear to cancel row 2's
+refusal and row 4 to restore it. Rows 1-3 are `--bind / / --proc /proc --unshare-net` plus the flags
+each row names; row 4 is the full invocation `bwrap-probe.sh` runs, which additionally carries
+`--new-session --die-with-parent --dev /dev`.
+
+| invocation | masks present | unmask applied |
+|---|---|---|
+| `--bind / / --proc /proc --unshare-net` — this is exactly what the old probe ran | OK | OK |
+| that `+ --unshare-pid` | **`Can't mount proc on /newroot/proc`** | OK |
+| that `+ --unshare-user --cap-drop ALL` | OK | OK |
+| Claude Code's full shape (see `bwrap-probe.sh`) | **`Can't mount proc on /newroot/proc`** | OK |
+
+So the flag is **load-bearing on macOS exactly as on Linux**, and the error in that table is the
+one that motivated it. `--unshare-pid` is the trigger: the kernel refuses a fresh procfs for a NEW
+pid namespace while the existing `/proc` is not fully visible, and docker's MaskedPaths are
+submounts, so it is not. Do **not** make the flag host-conditional; a task proposing that was filed
+on the wrong measurement and has been cancelled.
+
+**How the wrong answer survived two review rounds, because the shape repeats.** The harness reported
+`MISSED` for the mutation that drops this flag. That was a TRUE report — the guard could not fire —
+and it was read as a fact about the host, because the weak probe agreed with the wrong reading. A
+mechanism was then added to silence it, and when that was rejected the redesign was justified by the
+same false premise. An alarm that is explained away twice is usually correct.
+
+**This table is the only copy.** `.container/bwrap-probe.sh` runs Claude Code's invocation and
+points here rather than restating the measurement; `verify.sh` and CI both call that script rather
+than each keeping a probe. The retracted claim above survived for a while precisely because it was
+written in three places and corrected in one — a measurement in a script comment is a claim nothing
+re-establishes, so measurements live here, dated, once (D54.5). What the script's own header keeps
+is the one fact that makes a simpler probe wrong: drop `--unshare-pid` and it passes in exactly the
+state the flag exists to fix. `bwrap-probe.sh --self-test` asserts that flag is present and that the
+two rungs differ by the proc mount alone, and `./scripts/check.sh` runs it.
+
+**Why bubblewrap can or cannot start on a given host** is answered by
+`./.container/mutate-verify.sh --ladder`, which re-measures with one security flag removed at a
+time, starting from the container that ships. CI runs it as its diagnostic step. It replaced four
+hand-written `docker run` arms in `ci.yml` that were a second copy of the shipped configuration and
+drifted from it in every review round they survived.
+
+**What the flag costs is unchanged by the correction above, and this section lost it once.** The
+commit that fixed the measurement replaced this whole passage and deleted the enumeration, the host
+table and the follow-ups with it — 92 lines removed against 26 added, and its message never said so.
+Restored here. Correcting a claim is not licence to drop the analysis around it, and a security
+document quietly losing its residual is a worse defect than the wrong sentence that prompted the
+edit.
+
+Docker has no selective unmask, and the flag is broader than its name: `systempaths=unconfined`
+clears **both** `MaskedPaths` and `ReadonlyPaths`. Concretely it re-exposes
+
+- **masked (were mounted over):** `/proc/acpi`, `/proc/asound`, `/proc/interrupts`, `/proc/kcore`,
+  `/proc/keys`, `/proc/latency_stats`, `/proc/sched_debug`, `/proc/scsi`, `/proc/timer_list`,
+  `/proc/timer_stats`, `/sys/devices/virtual/powercap`, `/sys/firmware`, and one
+  `/sys/devices/system/cpu/cpuN/thermal_throttle` per CPU that has one
+- **read-only (were mounted `ro`), now writable:** `/proc/bus`, `/proc/fs`, `/proc/irq`,
+  `/proc/sys`, `/proc/sysrq-trigger`
+
+**That list is a snapshot of somebody else's moving list, and it is deliberately not counted.** It
+is `defaultLinuxMaskedPaths()` in moby's `daemon/pkg/oci/defaults.go`, read at `d5370d34d328`
+(2026-04-27). `/proc/interrupts` and the `thermal_throttle` files were added by advisory
+[GHSA-6fw5-f8r9-fgfm](https://github.com/moby/moby/security/advisories/GHSA-6fw5-f8r9-fgfm) and
+powercap by [GHSA-jq35-85cj-fj4p](https://github.com/moby/moby/security/advisories/GHSA-jq35-85cj-fj4p),
+so a daemon older than those masks *fewer* paths and your residual is correspondingly **smaller**
+— the direction it is safe to be wrong in. This section used to state the length ("4 of the 11",
+"the other 7", "all 11") and each of those was a second copy of the list: when `/proc/interrupts`
+was dropped in an edit, three sentences of arithmetic silently agreed with the shorter list. Paths
+are named here and never counted. Making it derived instead of copied is follow-up 6 below.
+
+The read-only half is covered by DAC and not by the mask being gone: writing any of it is root-only
+and the container is not root. So what is actually traded away is *information*, from the first
+list. Every path on it is treated here as exposed: an earlier version subtracted the ones it
+asserted were mode `0400` (`kcore`, `keys`, `timer_list`, `sched_debug`), which was a third copy of
+a fact — this time a kernel fact, asserted from memory, varying by version, and subtracting in the
+**unsafe** direction. Measuring it is follow-up 3. Three host classes:
+
+| host | compensating layer | residual |
+|---|---|---|
+| macOS / Docker Desktop | none, but the exposed host is the LinuxKit VM, not your machine | small |
+| Linux **with** AppArmor | `apparmor-jkb-dev` re-denies *read* on `/proc/kcore`, `/sys/firmware/**` and `/sys/devices/virtual/powercap/**`, and on `/proc/sysrq-trigger` from the read-only list | everything else on the masked list — `/proc/acpi`, `/proc/asound`, `/proc/interrupts`, `/proc/keys`, `/proc/latency_stats`, `/proc/sched_debug`, `/proc/scsi`, `/proc/timer_list`, `/proc/timer_stats`, `thermal_throttle`. The `deny /sys/[^f]*/** wklx` rule is **write-only**, so it does not cover `thermal_throttle` |
+| Linux **without** AppArmor (SELinux, or no LSM) | **none** | the whole masked list, against the real host — `powercap` and the `interrupts`/`thermal_throttle` pair each carrying a published side channel (PLATYPUS, and GHSA-6fw5-f8r9-fgfm respectively) |
+
+**The third row is the unfinished part, and it matters more as Linux becomes the main platform.**
+How it should be fixed, in order of leverage:
+
+1. **Upstream, which removes the trade entirely.** If `bwrap` bind-mounted `/proc` instead of
+   fresh-mounting it, no flag would be needed. That invocation belongs to
+   `@anthropic-ai/sandbox-runtime`, not to us, so this is a report to file rather than a patch.
+2. **Fail closed on the uncompensated cell.** On Linux, masks off *and* no LSM profile mediating
+   should refuse to start, the same shape as the egress boot gate — a container that cannot honour
+   the boundary should say so rather than run and look identical to one that can. macOS is accepted
+   explicitly, because the host there is the VM.
+3. **Report which layer is in force.** When masks are off, `verify.sh` should say whether
+   `apparmor-jkb-dev`, some other LSM, or nothing is compensating. An unstated residual is
+   indistinguishable from coverage.
+4. **Restore the discriminator the flag cost.** The mask is what made the AppArmor profile testable
+   — docker-default's denials otherwise overlap what DAC already restricts to root, so a denial
+   proves nothing. Half of the replacement has landed: `verify.sh`'s `bwrap` probe now mounts
+   `proc`, and `docker-default` denies `mount`, so on an AppArmor host a pass separates this
+   profile from the stock one. It does not separate *this* profile from `apparmor=unconfined`,
+   which also passes. The other half is the `(enforce)` mode, which `verify.sh` still reads out of
+   `/proc/self/attr/apparmor/current` and then discards with a `sed`.
+5. **Check whether podman's `--security-opt unmask=` helps.** Reasoned dead — any surviving mask
+   should still trip the kernel check — but unverified, and it needs a Linux box with podman. If it
+   works it is strictly better than all-or-nothing.
+6. **Vendor the masked-path list instead of copying it.** The enumeration above is a hand copy of a
+   list upstream changes by security advisory, and it has already drifted once — losing
+   `/proc/interrupts` in an edit, with three counted sentences agreeing with the shorter list. The
+   structurally right home is the vendored-artifact framework this repo already has
+   (`generate-*.sh` + `check-drift.sh`, which is what keeps the seccomp profile honest): a
+   `generate-masked-paths.sh` extracting the slice from `defaults.go`, drift-checked in CI, with
+   the README pointing at the artifact. Deliberately **not** done in the fix round that found the
+   drift: a `sed` over Go source is exactly the extraction that silently truncates — the failure
+   `check-config.sh` documents for the seccomp generator — so it needs its own emptiness and
+   named-member pins and its own mutations. A must-fix in prose is fixed in prose.
+
 ## On a Linux host
 
 Better, mostly: no VM, so bind mounts are native and the IO penalty above disappears. Two things

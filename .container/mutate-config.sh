@@ -144,6 +144,11 @@ run "remoteUser becomes root" "remoteUser is root"
 seed; jq_dc '.runArgs |= map(select(. != "--security-opt"))'
 run "the --security-opt flag is dropped, leaving its value orphaned" "--security-opt"
 
+# ONE THING: drops only the systempaths VALUE, so the seccomp pair still holds and this can only
+# be the new assertion failing. Dropping the flag (above) breaks both, which establishes neither.
+seed; jq_dc '.runArgs |= map(select(. != "systempaths=unconfined"))'
+run "the /proc unmask is dropped, so bubblewrap could not mount proc" "systempaths=unconfined"
+
 seed; sub_dc '"--cap-add=NET_ADMIN",' ''
 run "NET_ADMIN is dropped" "no longer declares --cap-add=NET_ADMIN"
 
@@ -412,24 +417,21 @@ run "a generator is deleted, orphaning its artifact" "outside the drift check"
 seed; bash -c 'rm -f "$1"/generate-*.sh' _ "$work/t/.container"
 run "every generator is deleted" "no generate-*.sh found"
 
-seed; python3 - "$work/t/.github/workflows/ci.yml" <<'PYX'
+# THE DECLARATION'S OWN SHAPE. What the CONTROL carries is no longer asserted here: the control
+# asks run.sh for it (D54.1), so there is one derivation and the five mutations that used to break
+# the comparison between two of them have gone with the comparison. What is left is the
+# declaration itself -- the pairing of `--security-opt` with each value it introduces.
+seed; python3 - "$work/t/.container/container.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-# ONLY THE FLAG OCCURRENCE, and the count is asserted. The guard reads
-# `--security-opt apparmor=<name>`; the string used to appear in the probe's LABEL too, so
-# rewriting every occurrence could not establish which one the guard was reading -- and the guard
-# was in fact satisfied by the label, leaving arm [3] free to measure `apparmor=unconfined` while
-# check-config.sh reported the profile correctly named. The label no longer carries the string, and
-# this assertion is what stops it coming back silently.
-n = s.count("apparmor=jkb-dev")
-assert n == 1, ("apparmor=jkb-dev appears %d times in ci.yml; this mutation can no longer "
-                "establish which occurrence the guard reads" % n)
-out = s.replace("--security-opt apparmor=jkb-dev", "--security-opt apparmor=jkb-container", 1)
+out = s.replace('"--security-opt",', '"--ignored-opt",')
 assert out != s, "mutation target absent"
 open(p, 'w').write(out)
 PYX
-run "CI probes a profile nothing loads" "does not name the profile the file declares"
+run "container.json declares no --security-opt pair at all" "no --security-opt pairs could be read"
 
+seed; printf '#!/usr/bin/env bash\nexit 0\n' > "$work/t/.container/mutate-verify.sh"
+chmod +x "$work/t/.container/mutate-verify.sh"
 # THE VERIFY GUARD MUST SEE THE CALL, not a mention of the name (D51.8). The previous mutation
 # replaced EVERY occurrence of the token, which rewrote run.sh's three failure messages too — so it
 # never established which occurrence the guard reads, and the guard was in fact reading those
@@ -686,16 +688,21 @@ run "mutate-verify's run-line shape changes" "this check just certified nothing"
 
 # THE CALL SHAPE OF dc_require_apparmor_profile. The helper ends in `exit 1`, which stops nothing
 # when it is called inside a command substitution -- so the empty name it refuses reaches docker as
-# `apparmor=`, i.e. docker-default. This is that call written the way it was actually written, in
-# the file that actually did it.
-seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
+# `apparmor=`, i.e. docker-default, whose `mount` denial is what the profile exists to lift.
+#
+# RE-AIMED AT run.sh. It used to break mutate-verify.sh, which made the same call; under D54.1 that
+# script asks run.sh for its flags and makes no AppArmor decision at all, so the only caller left
+# is `assembled_args`. A mutation whose target has moved reports NO-OP, not a passing guard -- this
+# harness refuses an unmutated tree -- which is how this was found rather than silently lost.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '''    aa_name="$(dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")" || exit 1
-    AA_ARGS=(--security-opt "apparmor=$aa_name")'''
+old = '''    prof="$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")" || return 1
+    [ -n "$prof" ] || return 1
+    printf '%s\\n' --security-opt "apparmor=$prof"'''
 assert s.count(old) == 1, "mutation target absent"
 open(p, 'w').write(s.replace(old,
-    '''    AA_ARGS=(--security-opt "apparmor=$(dc_require_apparmor_profile "$REPO/.container/apparmor-jkb-dev")")'''))
+    '''    printf '%s\\n' --security-opt "apparmor=$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")"'''))
 PYX
 run "a caller swallows dc_require_apparmor_profile's refusal" "cannot stop the script"
 
@@ -712,6 +719,101 @@ open(p, 'w').write(s.replace(old,
 PYX
 run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparmor_mediates"
 
+# A REFUSING PRODUCER READ BACK THROUGH A PROCESS SUBSTITUTION, which is how all three consumers
+# were written before the rule was stated. BOTH files, because the guard globs $here/*.sh and a
+# pattern that only ever matched one of them would look identical to one that covers them all.
+#
+# The offending text is BUILT rather than written out: check-config.sh scans every *.sh in the
+# directory, this harness among them, and it cannot tell a shell command from the same characters
+# sitting inside a python payload. Spelling it here would make the guard fail on a healthy tree —
+# so it is `PS`, and re-inlining it is what would turn the gate red.
+PS='< <'
+seed; python3 - "$work/t/.container/run.sh" "$PS" <<'PYX'
+import sys
+p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
+old = ('ARGS_OUT="$(assembled_args "$repo")" || die "container.json could not be read; '
+       'refusing to start a container from a partial declaration"\n'
+       'while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"')
+assert old in s, "mutation target absent"
+new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "$repo")' % ps
+open(p, 'w').write(s.replace(old, new, 1))
+PYX
+run "run.sh reads its assembly through a process substitution again" "which discards its refusal"
+
+seed; python3 - "$work/t/.container/mutate-verify.sh" "$PS" <<'PYX'
+import sys
+p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
+old = '_pa="$("$REPO/.container/run.sh" --print-args --posture "$REPO")" || {'
+assert old in s, "mutation target absent"
+i = s.index(old)
+j = s.index('while IFS= read -r _l', i)
+k = s.index('\n', j)
+new = ('while IFS= read -r _l; do [ -n "$_l" ] && POSTURE+=("$_l"); done '
+       '%s("$REPO/.container/run.sh" --print-args --posture "$REPO")' % ps)
+open(p, 'w').write(s[:i] + new + s[k:])
+PYX
+run "the control reads run.sh's assembly through a process substitution again" "which discards its refusal"
+
+# THE PRODUCER THE OLD GUARD COULD NOT SEE. It kept a hand-written list of four producer names to
+# REFUSE, and its own comment recorded that one had "joined it late" after a reader escaped it --
+# so `dc_mount_specs`, read exactly that way inside run.sh's mount loop, was invisible to the guard
+# written for it. The mount list is the security boundary; a jq that failed part way would have
+# left the container started with SOME of its mounts. It is an allowlist now, so a producer nobody
+# classified turns the gate red instead of going unwatched, and this is that direction watched.
+seed; python3 - "$work/t/.container/run.sh" "$PS" <<'PYX'
+import sys
+p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
+old = ('        specs="$(dc_mount_specs "$cfg")" || die "container.json\'s mounts could not be read"\n')
+assert old in s, "mutation target absent"
+s = s.replace(old, "", 1)
+old2 = '        done <<<"$specs"'
+assert old2 in s, "mutation target absent"
+open(p, 'w').write(s.replace(old2, '        done %s(dc_mount_specs "$cfg")' % ps, 1))
+PYX
+run "a declaration reader nobody classified is read through a process substitution" "which discards its refusal"
+
+# ...AND THAT GUARD PASSING HAVING READ NOTHING. "No producer is read unsafely" and "the scan found
+# no files" are the same empty value, in a check whose entire subject is a guard that certifies
+# without observing. The comment stripper it reads through is the one moving part, so that is what
+# is broken here.
+seed; python3 - "$work/t/.container/check-config.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' \"$1\"; }"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "dc_strip_comments() { return 1; }", 1))
+PYX
+run "the process-substitution scan reads no files at all" "certified nothing"
+
+# THE POSTURE HALF LEAKING AN INSTANCE FLAG, which is the one property keeping the harness's
+# containers off the real ~/repos and ~/.jkb. A third emission site outside docker_args' two
+# `[ "$half" != posture ]` gates is how it goes -- and it is why the guard RUNS the program instead
+# of grepping those gates, which any such site would satisfy.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '    local user\n    user="$(dc_remote_user "$cfg")"'
+assert old in s, "mutation target absent"
+leak = '    printf \'%s\\n\' "--mount" "source=$HOME/.jkb,target=/home/vscode/.jkb,type=bind"\n'
+open(p, 'w').write(s.replace(old, leak + old, 1))
+PYX
+run "the posture half leaks a mount the harness would inherit" "instance flag(s) the harness must not inherit"
+
+# ...AND THE VACUOUS DIRECTION. A docker_args emitting no instance flags at all passes "posture
+# carries none" while breaking the launcher, so the guard also asserts the full half CARRIES them.
+# That contrasting case is what makes it discriminate rather than merely not-fail.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index('    [ "$half" = posture ] || printf ')
+j = s.index('\n', i) + 1
+s = s[:i] + '    :\n' + s[j:]
+i = s.index('    if [ "$half" != posture ]; then')
+j = s.index('    fi\n', i) + len('    fi\n')
+open(p, 'w').write(s[:i] + s[j:])
+PYX
+run "run.sh stops emitting any instance flag" "emits no instance flag at all"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -724,7 +826,7 @@ run "a second AppArmor-mediates predicate appears" "instead of calling dc_apparm
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=65
+PINNED_BAD_SITES=71
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
