@@ -346,32 +346,55 @@ case6d() {
 # layout is what makes that unrepeatable — including the two layouts nobody had measured, a
 # `.git` gitfile and a repo whose worktree has been removed.
 case6n() {
-    local d="$work/oracle" label dir ours theirs bad=""
-    mkdir -p "$d"
-    git_q init -q --bare "$d/bare.git" >/dev/null 2>&1
-    git_q -C "$d/bare.git" config core.hooksPath .githooks
+    local d="$work/oracle" dir ours theirs bad="" probe
+    mkdir -p "$d" "$d/probe-cwd"
+    probe="$d/probe-cwd"                       # a cwd that is none of the repos below
+
     git_q init -q "$d/norm" >/dev/null 2>&1
     git_q -C "$d/norm" commit -q --allow-empty -m init
     git_q -C "$d/norm" config core.hooksPath .githooks
     git_q -C "$d/norm" worktree add -q "$d/wt" -b side >/dev/null 2>&1
+    # repo_root, the git dir and the cwd are three different directories here. Without one
+    # such fixture the oracle cannot fail: with repo_root == git dir == cwd, a mutant that
+    # ignores git and resolves against `$repo_root` agrees with it everywhere.
     git_q init -q --separate-git-dir="$d/gitdir" "$d/sep" >/dev/null 2>&1
     git_q -C "$d/sep" commit -q --allow-empty -m init
     git_q -C "$d/sep" config core.hooksPath .githooks
 
-    for dir in "$d/bare.git" "$d/norm" "$d/wt" "$d/sep"; do
-        ours="$(git_hooks_override "$dir" 2>/dev/null)/post-merge"
+    # Only repos WITH a working tree are oracled: for a relative value git anchors on the
+    # invoking process's cwd, so with no working tree there is no fixed answer to compare to
+    # (see the refusal asserted below).
+    for dir in "$d/norm" "$d/wt" "$d/sep"; do
+        ours="$(cd "$probe" && git_hooks_override "$dir" 2>/dev/null)/post-merge"
         theirs="$(cd "$dir" && git rev-parse --path-format=absolute --git-path hooks/post-merge 2>/dev/null)"
         [ "$ours" = "$theirs" ] || bad="$bad [$dir ours=$ours git=$theirs]"
     done
-    # And once more with a worktree removed behind git's back.
-    rm -rf "$d/wt"
-    ours="$(git_hooks_override "$d/norm" 2>/dev/null)/post-merge"
+    rm -rf "$d/wt"                              # a worktree removed behind git's back
+    ours="$(cd "$probe" && git_hooks_override "$d/norm" 2>/dev/null)/post-merge"
     theirs="$(cd "$d/norm" && git rev-parse --path-format=absolute --git-path hooks/post-merge 2>/dev/null)"
     [ "$ours" = "$theirs" ] || bad="$bad [pruned ours=$ours git=$theirs]"
 
     [ -z "$bad" ] \
-        && ok "core.hooksPath resolves the way git resolves it, in every layout" \
+        && ok "core.hooksPath resolves the way git resolves it, asked from an unrelated cwd" \
         || fail "oracle" "disagreed:$bad"
+
+    # And the case git has no fixed answer for. Measured on git 2.51.1 from three cwds: with
+    # no working tree a relative value resolves against the invoking process's directory, so
+    # `git --git-dir=B rev-parse --git-path hooks/post-merge` answers `<cwd>/.githooks/…` and
+    # `git hook run` executes whatever copy is under that cwd. A round called the git dir
+    # "git's rule" here, on a measurement taken with the cwd set to the git dir — which cannot
+    # tell the two apart. There is nothing to resolve to, so jkb refuses rather than guessing.
+    git_q init -q --bare "$d/bare.git" >/dev/null 2>&1
+    git_q -C "$d/bare.git" config core.hooksPath .githooks
+    ( cd "$probe" && git_hooks_override "$d/bare.git" >/dev/null 2>&1 )
+    [ "$?" -eq 2 ] \
+        && ok "and a relative one with no working tree is refused, not guessed at" \
+        || fail "oracle: bare" "expected rc 2, got $?"
+    ours="$(cd "$d/bare.git" && git rev-parse --path-format=absolute --git-path hooks/post-merge)"
+    theirs="$(cd "$probe" && git --git-dir="$d/bare.git" rev-parse --path-format=absolute --git-path hooks/post-merge)"
+    [ "$ours" != "$theirs" ] \
+        && ok "because git's own answer there moves with the caller's directory" \
+        || fail "oracle: premise" "git gave one answer from two cwds: $ours"
 }
 
 # --- 6g. the desired state is the same from every worktree -------------------------------

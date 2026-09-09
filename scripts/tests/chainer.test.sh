@@ -477,7 +477,7 @@ case10d() {
     esac
     rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
     case "$rendered" in
-        *"names no usable hooks directory"*) ok "and the rendering says so" ;;
+        *"names no one hooks directory"*) ok "and the rendering says so" ;;
         *) fail "unreadable: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
     esac
 
@@ -737,28 +737,41 @@ case10i() {
 # chainer at the one place git dispatches from, so the repo hook it had just installed really
 # never ran.
 case10j() {
-    local d="$work/norelbase" out hook
+    local d="$work/norelbase" out
     mkdir -p "$d"
     git_q init -q --bare "$d/b.git" >/dev/null 2>&1
     git_q -C "$d/b.git" config core.hooksPath .githooks
     printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    # A live block a worktree run would have added, plus a stale sibling. Leaving `want` at
+    # its `no` default here retracts the live one — so the same configuration answers two ways
+    # depending on which directory setup.sh was pointed at, which is the flip-flop the
+    # derivation exists to prevent. The stale one must still go.
+    printf '%s\n/.githooks/post-merge\n%s\n/.old/post-merge\n' \
+        "$(exclude_marker)" "$(exclude_marker)" >>"$d/b.git/info/exclude"
     out="$(install_git_hooks "$d/b.git" "$d/src" 2>/dev/null)"
 
+    # Measured from three cwds on git 2.51.1: with no working tree a relative value follows
+    # the invoking process's directory, so there is no one place to install a chainer. jkb
+    # guessed the git dir for one round — on a measurement taken with the cwd set to the git
+    # dir, which cannot tell the two apart — and reported the good verdict while a `git pull`
+    # in a linked worktree ran a path that did not exist.
     case "$out" in
-        *"chainer=installed"*) ok "a relative hooksPath with no working tree gets its chainer" ;;
-        *) fail "norelbase: chainer" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        *chainer=*) fail "norelbase: guessed" "it installed a chainer at a path git does not fix" ;;
+        *) ok "a relative hooksPath with no working tree: no chainer is guessed at" ;;
     esac
     case "$out" in
-        *"dispatch=unreadable"*)
-            fail "norelbase: unreadable" "it called a path git resolves perfectly well unresolvable" ;;
-        *"dispatch=chained"*) ok "and the verdict says the repo hook will run" ;;
+        *"dispatch=unreadable"*) ok "and the verdict says the repo hook will not reliably run" ;;
         *) fail "norelbase: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
-    # The oracle: where git itself says it will look.
-    hook="$(cd "$d/b.git" && git rev-parse --path-format=absolute --git-path hooks/post-merge)"
-    [ -x "$hook" ] \
-        && ok "and the chainer sits where git says it will look for it" \
-        || fail "norelbase: path" "git looks at $hook, which is not executable"
+    [ -z "$(ls -A "$d/b.git/.githooks" 2>/dev/null)" ] \
+        && ok "and nothing was written where it might not be looked for" \
+        || fail "norelbase: wrote" "$(ls -A "$d/b.git/.githooks" | tr '\n' ' ')"
+    grep -qxF '/.githooks/post-merge' "$d/b.git/info/exclude" \
+        && ok "a block a worktree run added survives a run against the bare dir" \
+        || fail "norelbase: flip" "it retracted the block: $(tr '\n' '|' <"$d/b.git/info/exclude")"
+    grep -qxF '/.old/post-merge' "$d/b.git/info/exclude" \
+        && fail "norelbase: stale" "the stale sibling survived" \
+        || ok "while the stale sibling is still swept"
 }
 
 # --- 10k. core.hooksPath set to the empty string is not "not set" --------------------------
@@ -767,7 +780,7 @@ case10j() {
 # the repo hook is dead. Folded into "not set", the run reported `dispatch=direct`, which the
 # renderer prints nothing for: the post-merge automation silently off.
 case10k() {
-    local d="$work/emptyhooks" r out ex
+    local d="$work/emptyhooks" r out empty_out ex
     mkdir -p "$d"
     r="$d/repo"
     git_q init -q "$r" >/dev/null 2>&1
@@ -778,6 +791,7 @@ case10k() {
     printf '%s\n/.githooks/post-merge\n' "$(exclude_marker)" >>"$ex"
 
     out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    empty_out="$out"          # the sibling block below reassigns `out`
     case "$out" in
         *"dispatch=direct"*) fail "empty: direct" "it reported the silent good verdict for a dead hook" ;;
         *"dispatch=unreadable"*) ok "an empty core.hooksPath is not reported as no override" ;;
@@ -815,9 +829,12 @@ case10k() {
             && ok "and its block is left exactly where it was" \
             || fail "unexp: swept" "the block was retracted under an unestablished answer"
     fi
-    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
-        *"names no usable hooks directory"*) ok "and the operator is told why" ;;
-        *) fail "empty: render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+    # `$empty_out`, not `$out`: the sibling block reassigned it, so this asserted the OTHER
+    # repo's report under this label — and both causes render through the same arm, so it
+    # passed either way.
+    case "$(printf '%s\n' "$empty_out" | render_git_hooks_report 2>&1)" in
+        *"names no one hooks directory"*"--show-origin"*) ok "and the operator is told why, with a check that can show it" ;;
+        *) fail "empty: render" "$(printf '%s\n' "$empty_out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
     esac
 }
 
@@ -1226,7 +1243,7 @@ case14() {
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'
         'dispatch=dead /c|will NOT run the repo hook above'
-        'dispatch=unreadable core.hooksPath|names no usable hooks directory'
+        'dispatch=unreadable core.hooksPath|names no one hooks directory'
         'error=not a git repo|not a git repo; skipping hook install'
     )
     local entry ok_all=1 missing=""

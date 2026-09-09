@@ -99,8 +99,11 @@ _real_dir() {
 
 # git_hooks_override <repo_root> — print the absolute `core.hooksPath` in effect for
 # <repo_root>, or nothing when there is none. Returns 0 for both of those — "no override" is
-# an answer, not a failure — and **2** when the setting exists and git will not resolve it,
-# which is neither.
+# an answer, not a failure — and **2** when the setting exists and yields no one hooks
+# directory, which is neither. Three causes reach rc 2: a value git cannot expand (`~someuser`
+# for an absent account), a value set to the empty string (git resolves it to `/post-merge`
+# and finds nothing), and a RELATIVE value in a repository with no working tree, where git
+# anchors it on the invoking process's current directory and so there is no one place at all.
 #
 # Both halves are corrections of a cwd-scoped read, and both fail silently:
 #
@@ -144,25 +147,22 @@ git_hooks_override() {
     case "$configured" in
         /*) ;;
         *)
-            # GIT'S OWN RULE, measured rather than assumed (git 2.51.1): a relative value
-            # resolves against the working tree top when there IS one, and against the git dir
-            # when there is not — `git rev-parse --git-path hooks/post-merge` in a bare repo
-            # with `core.hooksPath = .githooks` answers `.githooks/post-merge`, and
-            # `git hook run post-merge` executes it.
+            # A relative value is anchored at the WORKING TREE TOP. With no working tree there
+            # is no anchor at all: git resolves it against the invoking process's current
+            # directory, so `git --git-dir=B rev-parse --git-path hooks/post-merge` answers
+            # `<cwd>/.githooks/post-merge` and `git hook run post-merge` executes whatever
+            # copy is under the cwd it happens to be run from. Measured on git 2.51.1 from
+            # three different directories.
             #
-            # A previous round called the no-toplevel case unresolvable and returned rc 2. That
-            # was false about git and harmful in jkb: the run said "git will not resolve it, so
-            # git runs NO hooks in this repository" about a path git resolves perfectly well,
-            # and — worse than the wording — jkb then declined to install a chainer at the one
-            # place git dispatches from, so the repo hook it had just installed really never
-            # ran, and nothing was done about it.
-            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || top=""
-            if [ -z "$top" ]; then
-                top="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 2
-                [ -n "$top" ] || return 2
-                case "$top" in /*) ;; *) top="$repo_root/$top" ;; esac
-                top="$(_real_dir "$top")"   # `--git-common-dir` answers `.` in a bare repo
-            fi
+            # A previous round called the git dir "git's own rule" for that case, on a
+            # measurement taken with the cwd SET TO the git dir — which cannot tell the two
+            # apart. jkb then installed a chainer there and reported the good verdict, while a
+            # `git pull` in a linked worktree ran `<worktree>/.githooks/post-merge`, which did
+            # not exist. There is nothing to resolve to, so rc 2 and say so; running setup.sh
+            # against a worktree instead resolves normally and installs the chainer where that
+            # worktree's pulls will find it.
+            top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || return 2
+            [ -n "$top" ] || return 2
             configured="$top/$configured"
             ;;
     esac
@@ -554,6 +554,34 @@ _is_exclude_pattern_line() {
     return 0
 }
 
+# _exclude_write <file> [line…] — replace <file> with the given lines, atomically.
+#
+# THE ONLY writer of `.git/info/exclude` in this file, used by the sweep and by the append
+# alike. The append used to go straight in with two `>>` redirections — a separator newline,
+# then marker+pattern — which is two writes with no rollback: a disk that fills between them
+# leaves the user's file with a stray newline and half a marker line, under a report saying
+# the step did not land. Through here that report is true of every failure.
+#
+# `cp -p` first so the replacement inherits the destination's mode rather than a fresh file's,
+# and the write status is CHECKED — `printf` to a full disk fails after emitting part of its
+# output, and dropping that status once renamed a truncated file over every rule the user owns
+# under the word `retracted`.
+_exclude_write() {
+    local file="$1" tmp
+    shift
+    tmp="$file.jkb.$$"
+    if [ -e "$file" ]; then
+        cp -p "$file" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    fi
+    if [ "$#" -eq 0 ]; then
+        : >"$tmp" || { rm -f "$tmp"; return 1; }
+    elif ! printf '%s\n' "$@" >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
 # reconcile_exclude <repo_root> <pattern, or empty> <want> [reason] — make
 # `.git/info/exclude` agree with the desired state, printing complete report lines:
 #
@@ -670,24 +698,7 @@ reconcile_exclude() {
     if [ "$changed" -eq 1 ]; then
         # Through a temp file: this holds the USER'S rules and a partial in-place rewrite
         # destroys them. `cp -p` first so the replacement inherits the destination's mode.
-        tmp="$exclude.jkb.$$"
-        if ! cp -p "$exclude" "$tmp" 2>/dev/null; then
-            rm -f "$tmp"
-            printf 'exclude=failed (cannot write %s)\n' "$exclude"
-            return 0
-        fi
-        # The write status is CHECKED: `printf` to a full disk fails after emitting part of
-        # its output, and dropping that status renamed a truncated file over every rule the
-        # user owns, under the word `retracted`.
-        if [ "${#out[@]}" -eq 0 ]; then
-            : >"$tmp" || { rm -f "$tmp"; printf 'exclude=failed (cannot write %s)\n' "$exclude"; return 0; }
-        elif ! printf '%s\n' "${out[@]}" >"$tmp"; then
-            rm -f "$tmp"
-            printf 'exclude=failed (cannot write %s)\n' "$exclude"
-            return 0
-        fi
-        if ! mv -f "$tmp" "$exclude"; then
-            rm -f "$tmp"
+        if ! _exclude_write "$exclude" ${out[@]+"${out[@]}"}; then
             printf 'exclude=failed (cannot write %s)\n' "$exclude"
             return 0
         fi
@@ -720,18 +731,19 @@ reconcile_exclude() {
         fi
         mkdir -p "$common/info" 2>/dev/null \
             || { printf 'exclude=failed (cannot create %s/info)\n' "$common"; return 0; }
-        # Separator first. An exclude file that does not end in a newline — hand-edited ones
-        # often do not — would otherwise have its last rule fused with our marker (`*.log` +
-        # `# jkb: …`), destroying a rule the user owns while our own pattern stayed inert,
-        # under a success message. `session::ensure_excluded` computes the same `sep` for the
-        # same reason — one rule with an implementation in each language.
-        if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then
-            printf '\n' >>"$exclude" 2>/dev/null \
-                || { printf 'exclude=failed (cannot write %s)\n' "$exclude"; return 0; }
-        fi
-        # ONE simple command, not a `{ …; }` group: when a redirection fails, bash reports it
-        # to `if !` for a simple command and a function call, but NOT for a group or subshell.
-        if ! printf '%s\n%s\n' "$(exclude_marker)" "$pattern" >>"$exclude" 2>/dev/null; then
+        # Appended through the SAME atomic rewrite the sweep uses, not with `>>`. Two direct
+        # appends — a separator newline, then marker+pattern — are two writes with no rollback,
+        # so a disk that fills between them leaves the user's file with a stray newline and
+        # half a marker line, under a report claiming the step did not land. One write path
+        # means the claim is true of every failure, and the separator special case disappears:
+        # the file is rebuilt from lines that each end in one.
+        #
+        # (That special case existed because an exclude file not ending in a newline — a
+        # hand-edited one often does not — had its last rule fused with our marker. Rebuilding
+        # cannot produce that. `session::ensure_excluded` still appends and still needs its own
+        # `sep`; the rule is one rule, with an implementation in each language.)
+        out+=("$(exclude_marker)" "$pattern")
+        if ! _exclude_write "$exclude" "${out[@]}"; then
             printf 'exclude=failed (cannot write %s)\n' "$exclude"
             return 0
         fi
@@ -809,17 +821,23 @@ install_git_hooks() {
     # precondition was itself persistent.
     override="$(git_hooks_override "$repo_root")" || override_rc=$?
     if [ "$override_rc" -eq 2 ]; then
-        # This branch decides the VERDICT only, and leaves `want` to the derivation in the
-        # funnel below — because rc 2 covers two causes that differ on exactly the question
-        # `want` answers. A value git cannot expand establishes nothing, and the derivation
-        # says `undecided` for it, which the funnel maps to `want=unknown`: touch nothing. An
-        # EMPTY value establishes a great deal — nothing of ours is anywhere — and the
-        # derivation says `none (core.hooksPath is empty)`, which maps to `want=no`, so a
-        # stale block is swept, which is the whole point of the sweep.
+        # `undecided` — nothing is known about THIS pattern — because that is the one thing
+        # this branch does know: no chainer was attempted, so jkb cannot say whether its own
+        # is at the derived path. The derivation still has the last word through the funnel
+        # below, and the three causes that reach rc 2 then land where they should:
         #
-        # Setting `want=unknown` here would be right for the first and wrong for the second,
-        # stranding a stale block for ever: round 4's original harm, restored while fixing
-        # round 12's. One fact, one source.
+        #   unexpandable value  derivation says `undecided …` → want=unknown → touch nothing
+        #   empty value         derivation says `none …`, no pattern → want=no → sweep, which
+        #                       is right: nothing of ours is anywhere
+        #   relative, no tree   derivation still yields a pattern (it is correct inside every
+        #                       worktree of a bare repo), and `undecided` keeps that block
+        #                       while sweeping the others
+        #
+        # Leaving `want` at its `no` default made the third sweep the block a run from a
+        # worktree had just added — the same configuration answering two ways depending on
+        # which directory setup.sh was pointed at, which is the flip-flop the whole derivation
+        # exists to prevent.
+        want=undecided
         verdict="unreadable core.hooksPath"
     elif [ -z "$override" ]; then
         verdict="direct"
@@ -1006,8 +1024,11 @@ render_git_hooks_report() {
                     # in a repo with no working tree, which git resolves perfectly well — the
                     # sentence was false there and its own suggested check contradicted it.
                     unreadable)
-                             warn "$detail is set to a value that names no usable hooks directory, so git will not run the repo hook above."
-                             warn "  check it with: git config --get --path core.hooksPath" ;;
+                             warn "$detail is set to a value that names no one hooks directory, so git will not reliably run the repo hook above."
+                             # `--show-origin`, because `--get` prints one empty line for an
+                             # empty value and nothing for an unset one — visually identical,
+                             # so the operator's own check appeared to refute the warning.
+                             warn "  check it with: git config --show-origin --get core.hooksPath" ;;
                     *)       warn "unrecognised dispatch verdict: $line" ;;
                 esac ;;
             error=*) warn "$rest; skipping hook install" ;;
