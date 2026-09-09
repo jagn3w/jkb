@@ -787,6 +787,53 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   unconditional and the state unreachable the day it was added. Its test asserted only that
   `exposed` was *absent*, which passes just as well when it can never appear; the positive half
   is what catches it.
+- **A per-step line may not describe the file; exactly one line does, and it is measured.**
+  Three consecutive must-fixes in `render_git_hooks_report` were one shape — an arm asserting a
+  run-level fact it could not see — and each was fixed by rewording that arm. The third made it
+  plain that rewording is the wrong unit of repair: `exclude=undecided` has **two producers with
+  opposite file semantics** (`want=unknown` returns early and touches nothing; `want=undecided`
+  runs the sweep first), so no wording of that arm could ever have been right. It printed
+  *"nothing in .git/info/exclude was changed"* directly beneath *"X dropped from
+  .git/info/exclude"* — two lines about one file stating opposite facts, unattended, from the
+  post-merge hook. The cause is that the wire protocol had **no scope axis**: some states are
+  per-step events, some are per-pattern verdicts, and *did this run change the file?* is neither.
+  `reconcile_exclude` is now a wrapper that fingerprints the file either side of the decision and
+  emits `exclude-file=changed|unchanged` **below every arm**, so the dozen `return 0`s in the
+  decision body cannot skip it — structural, like `install_git_hooks`' own funnel. It is measured
+  rather than bookkept (`cksum`, with `absent` as a distinct value) because a write some future
+  arm forgets to record is exactly the class of lie this seam keeps producing: *a claim about a
+  file is asked of the file*. Every whole-file sentence is gone from the per-pattern arms, and
+  both real values of the new key render **nothing** — the mutations are already itemised by
+  their own lines, and silence is not a claim. Rejected: a fourth rewording; a stateful renderer
+  (re-derives the producer's fact from a proxy, and makes output depend on line order); splitting
+  the report word (fixes one word, leaves the class); folding the fact into each terminal
+  detail (moves the per-arm memory burden one seam over).
+- **An environment-injected `core.hooksPath` is refused, and git is asked rather than stripped.**
+  `_git` deliberately does not strip `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`: they carry the
+  `safe.directory` grants this project's own dev container needs, and stripping them makes git
+  refuse the checkout outright. But an injected value is the **calling process's**, not the
+  repository's — and measured, jkb installed its chainer at the injected path, added an exclude
+  rule for it, and reported `dispatch=chained`, the good verdict, while the repository's own
+  hooksPath kept no chainer at all, so no later pull ran one. Reachable unattended, since
+  `git -c core.hooksPath=X pull` exports the setting into the hook environment and the hook runs
+  setup.sh. `git config --show-scope` reports such a value as scope `command` (measured on
+  2.51.1), so the transient case is **detected by asking git** — no stripping, no second model of
+  git's precedence — and refused as `dispatch=transient` with the repair. `--show-scope` is git
+  >= 2.26; an older git exits 129 for the unknown option, which is not *"cannot expand"*, so the
+  read is retried without it and the case simply goes undetected rather than misdiagnosed.
+- **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
+  `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
+  there is no fifth code today — so a mutation collapsing them stayed green and nothing could
+  tell an honest catch-all from one absorbing a future code into a **definite** `unanchored`
+  verdict whose remedy would be false of it. `_override_verdict`/`_override_why` can be called
+  with a status that does not exist yet, and the test does.
+- **Both readers of `core.hooksPath` died under `set -e`.** A bare `x="$(cmd)"` is a simple
+  command, so a non-zero substitution aborts the shell — and exit 1 there is the **commonest**
+  case, the setting not being present at all. `lib.sh`'s header promises every function behaves
+  the same with `set -e` on or off; that promise was being kept only by how the one production
+  caller happens to spell the call (`… || override_rc=$?`, which disables errexit for the whole
+  invocation). `|| rc=$?` at both, pinned by a case that asserts its own premise first — a
+  fixture that happened to have a `core.hooksPath` would pass having tested nothing.
 - **The shell-syntax gate is one function, not two copies of a file list.** `shell_sources` +
   `check_shell_syntax` live in lib.sh and CI calls them, because the hand-written copy in
   `check.sh` and the one in `ci.yml` drifted by a `*.md` skip within a commit of each other —

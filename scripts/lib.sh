@@ -126,6 +126,8 @@ _real_dir() {
 #   3  it is set to the empty string (git resolves it to `/post-merge` and finds nothing)
 #   4  it is relative and this repository has no working tree, so git anchors it on the
 #      INVOKING PROCESS'S current directory and there is no one place at all
+#   5  it came from the ENVIRONMENT (`GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`) or `-c`, so
+#      it belongs to the calling process and not to the repository
 #
 # One code for all three sent the operator a check that prints a perfectly normal value for
 # code 4, which is the same failure `--show-origin` was introduced to fix for code 3.
@@ -156,12 +158,41 @@ git_hooks_override() {
     # second into the first reported the BEST verdict (`dispatch=direct`, rendered silently)
     # for a repo in which git cannot resolve its hooks path at all. `dispatch` is three-valued
     # exactly so an unestablished answer is not spelled as the good one.
-    configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
-    case "$?" in
-        0) ;;
+    # `|| rc=$?`, never a bare assignment. A bare `x="$(cmd)"` is a simple command, so under
+    # `set -e` a non-zero substitution aborts the shell — and exit 1 here is the COMMONEST
+    # case, `core.hooksPath` not set at all. This file's header promises every function
+    # behaves the same with `set -e` on or off; that promise was being kept only by how the
+    # one caller happens to spell the call. Same shape as the ERR-trap lesson in D50.
+    local rc=0 scoped scope=""
+    # `--show-scope`, because `_git` deliberately does NOT strip `GIT_CONFIG_COUNT`/
+    # `GIT_CONFIG_PARAMETERS` — those carry the `safe.directory` grants this project's own dev
+    # container needs, and stripping them makes git refuse the checkout outright. Git will
+    # simply say where the winning value came from, so the transient case is detected without
+    # removing anything and without a second model of git's precedence. Measured on 2.51.1:
+    # an env-injected or `-c` value reports scope `command`; a stored one reports
+    # `local`/`global`/`system`.
+    scoped="$(_git -C "$repo_root" config --show-scope --get --path core.hooksPath 2>/dev/null)" || rc=$?
+    case "$rc" in
+        0) scope="${scoped%%$'\t'*}"; configured="${scoped#*$'\t'}" ;;
         1) return 0 ;;      # genuinely not set
-        *) return 2 ;;      # set, and git will not expand it
+        *)  # `--show-scope` is git >= 2.26. An older git exits 129 for the unknown option,
+            # which is NOT "cannot expand the value" — so retry without it before concluding
+            # anything. On such a git the transient case simply goes undetected, which is the
+            # behaviour before this check existed, rather than a confident wrong diagnosis.
+            rc=0
+            configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
+            case "$rc" in
+                0) ;;
+                1) return 0 ;;
+                *) return 2 ;;  # set, and git will not expand it
+            esac ;;
     esac
+    # A value from `command` scope is the CALLING PROCESS'S, not the repository's. A chainer
+    # installed there is installed where the next `git pull` will not look, so this refuses
+    # rather than reporting a good verdict for a hook nothing will run. Reachable unattended:
+    # `git -c core.hooksPath=X pull` exports the setting into the hook environment, and the
+    # hook runs setup.sh.
+    [ "$scope" = command ] && return 5
     # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
     # printing nothing, `rev-parse --git-path hooks/post-merge` answers `/post-merge`, and
     # `git hook run post-merge` says "cannot find a hook named post-merge" — the repo hook is
@@ -448,8 +479,10 @@ EOF
         printf 'undecided (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
-    configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
-    rc=$?
+    # See git_hooks_override: `|| rc=$?`, because a bare assignment aborts under `set -e`
+    # before the next line can capture anything.
+    rc=0
+    configured="$(_git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
     case "$rc" in
         0) ;;
         1) printf 'none (no core.hooksPath, so nothing of ours is inside the tree)\n'; return 0 ;;
@@ -607,7 +640,7 @@ _exclude_write() {
     mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
-# reconcile_exclude <repo_root> <pattern, or empty> <want> [reason] — make
+# reconcile_exclude <repo_root> <pattern, or empty> <want> [empty_report] [undecided_reason] — make
 # `.git/info/exclude` agree with the desired state, printing complete report lines:
 #
 #   exclude=added <pattern>          we wrote our marked block
@@ -617,7 +650,7 @@ _exclude_write() {
 #   exclude=tidied <n> marker(s)     orphaned jkb marker lines were removed
 #   exclude=unowned <pattern>        a rule excludes it that jkb cannot prove it wrote — kept
 #   exclude=exposed <reason>         ours IS inside a working tree and cannot be hidden there
-#   exclude=undecided <reason>       nothing could be established; nothing was changed
+#   exclude=undecided <reason>       nothing was decided about THIS pattern
 #   exclude=none <reason>            nothing to do
 #   exclude=failed <reason>          a write was attempted and did not land — or was refused
 #                                    before anything was read or written, which is the same
@@ -640,8 +673,95 @@ _exclude_write() {
 # its marker is not in that list. Every other line — bare patterns, other writers' blocks,
 # the user's comments — belongs to the user and is never removed.
 #
+# THE SCOPE RULE. Every line above describes only its own STEP or its own PATTERN. Exactly one
+# line describes the FILE, and it is emitted once per run, below every arm:
+#
+#   exclude-file=changed | unchanged  whether `.git/info/exclude` differs from before this run
+#
+# That key exists because three separate must-fixes were one shape: a per-pattern or per-step
+# arm asserting a run-level fact it could not see. The clincher is that the report word
+# `undecided` has TWO producers with opposite file semantics — `want=unknown` returns early and
+# touches nothing, `want=undecided` runs the sweep first — so no wording of that arm could ever
+# have been right. Rewording removed one false sentence and left the vacuum that invited it.
+#
+# It is measured, not bookkept: the wrapper fingerprints the file either side of the decision,
+# so a write that some future arm forgets to record is still reported truthfully. Same rule as
+# `dispatch=` — a claim about a file is asked of the file.
+#
 # Always returns 0 — `failed` is a word, not an exit status (see the header's `set -e` rule).
 reconcile_exclude() {
+    local repo_root="$1" before after path
+    path="$(_exclude_path "$1")"
+    before="$(_exclude_fingerprint "$path")"
+    # Contractually rc 0, so this wrapper behaves identically with `set -e` on or off.
+    _reconcile_exclude_decide "$@"
+    after="$(_exclude_fingerprint "$path")"
+    # Below every arm, not inside one: the decision body has a dozen `return 0`s and none of
+    # them can skip this. The property is structural, exactly as `install_git_hooks`' own
+    # funnel is, so a new arm cannot forget to report what it did to the file.
+    if [ "$before" = "$after" ]; then
+        printf 'exclude-file=unchanged\n'
+    else
+        printf 'exclude-file=changed\n'
+    fi
+    return 0
+}
+
+# _override_verdict <rc> / _override_why <rc> — how `git_hooks_override`'s refusal codes are
+# reported. Extracted from `install_git_hooks` so the mapping can be CALLED with a status that
+# does not exist yet: inline, the `*)` arm was behaviourally identical to `4)` — there is no
+# fifth code today — so no test could tell an honest catch-all from an absorbing one, and a
+# mutation reverting it stayed green.
+#
+# `*)` names an unrecognised status rather than absorbing it into a definite `unanchored`,
+# whose remedy is about working trees and would be false of whatever the new code means. That
+# is this project's house rule in miniature: an unestablished answer is never spelled as a
+# definite one. The number is carried so a new code is diagnosable rather than anonymous.
+_override_verdict() {
+    case "$1" in
+        2) printf 'unreadable core.hooksPath cannot be expanded on this machine' ;;
+        3) printf 'unreadable core.hooksPath is set to the empty string' ;;
+        4) printf 'unanchored core.hooksPath' ;;
+        5) printf 'transient core.hooksPath' ;;
+        *) printf 'unreadable core.hooksPath could not be resolved (unrecognised status %s)' "$1" ;;
+    esac
+}
+
+_override_why() {
+    case "$1" in
+        2) printf 'core.hooksPath cannot be expanded' ;;
+        3) printf 'core.hooksPath is empty' ;;
+        4) printf 'core.hooksPath is relative and this repository has no working tree' ;;
+        5) printf 'core.hooksPath came from the environment, not from this repository' ;;
+        *) printf 'core.hooksPath could not be resolved' ;;
+    esac
+}
+
+# _exclude_path <repo_root> — where `.git/info/exclude` is, or empty outside a repository.
+#
+# One derivation shared by the wrapper and the decision body. Two copies would drift, and the
+# wrapper fingerprinting a different file from the one the body writes is a lie that reads
+# exactly like the truth.
+_exclude_path() {
+    local common
+    common="$(_git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || common=""
+    [ -n "$common" ] || return 0
+    case "$common" in /*) ;; *) common="$1/$common" ;; esac
+    printf '%s/info/exclude' "$common"
+}
+
+# _exclude_fingerprint <path> — a value that changes whenever the file's CONTENT does.
+#
+# Existence is part of it: `absent` is a distinct fingerprint, so creating or removing the file
+# both register. `cksum` is POSIX and the failure is consumed by `||`, so this is `set -e`-safe
+# and needs no bash 4.
+_exclude_fingerprint() {
+    [ -n "$1" ] || { printf 'no-repo'; return 0; }
+    cksum <"$1" 2>/dev/null || printf 'absent'
+}
+
+# The decision half — everything the wrapper above measures. Its report words are unchanged.
+_reconcile_exclude_decide() {
     local repo_root="$1" pattern="$2" want="$3" empty_report="${4:-}" why="${5:-the chainer install failed}"
     local common exclude tmp line nxt cur keep=""
     local -a lines=() out=() removed=() deduped=()
@@ -801,7 +921,7 @@ reconcile_exclude() {
 #                             PROVEN absence, `exposed` means ours IS in a working tree and jkb
 #                             is declining to hide it, and `undecided` means jkb could not
 #                             establish anything and therefore changed nothing.
-#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored
+#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored | transient
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while
@@ -872,14 +992,8 @@ install_git_hooks() {
         # used to word `undecided` as "the chainer install failed" — its only producer when
         # that text was written — so this path, where no chainer is attempted at all, reported
         # a step that never ran, on the exact configuration the refusal exists for.
-        case "$override_rc" in
-            2) verdict="unreadable core.hooksPath cannot be expanded on this machine"
-               undecided_why="core.hooksPath cannot be expanded" ;;
-            3) verdict="unreadable core.hooksPath is set to the empty string"
-               undecided_why="core.hooksPath is empty" ;;
-            *) verdict="unanchored core.hooksPath"
-               undecided_why="core.hooksPath is relative and this repository has no working tree" ;;
-        esac
+        verdict="$(_override_verdict "$override_rc")"
+        undecided_why="$(_override_why "$override_rc")"
     elif [ -z "$override" ]; then
         verdict="direct"
     elif [ "$(_real_dir "$override")" = "$(_real_dir "$hooks_dir")" ]; then
@@ -1032,8 +1146,20 @@ render_git_hooks_report() {
                     unowned)    warn "$detail is excluded by a rule in .git/info/exclude that jkb cannot prove it wrote."
                                 warn "  it is hiding that file from \`git status\` — remove the line yourself if you did not add it." ;;
                     none)       : ;;   # nothing to hide, and so nothing worth a line
-                    undecided)  warn "could not work out what to hide from git: $detail"
-                                warn "  nothing in .git/info/exclude was changed." ;;
+                    # ONE line, and it is a claim about this pattern only. The second line
+                    # used to say "nothing in .git/info/exclude was changed" — which is false
+                    # whenever `want=undecided`, because that want still sweeps every OTHER
+                    # jkb block and writes the file. It printed directly beneath
+                    # `excluded: X dropped from .git/info/exclude`: two lines about one file
+                    # stating opposite facts, unattended, from the post-merge hook.
+                    #
+                    # No wording could have been right. This report word has two producers
+                    # with opposite file semantics (`want=unknown` touches nothing;
+                    # `want=undecided` sweeps first), so the fact belongs to `exclude-file=`,
+                    # which is measured. The remedy still reaches the reader: producer one
+                    # always emits `chainer=failed` beside this, producer two always emits
+                    # `dispatch=unreadable|unanchored`, and both of those carry one.
+                    undecided)  warn "could not work out what to hide from git: $detail" ;;
                     exposed)    warn "the chainer there is not hidden from git: $detail"
                                 warn "  that working tree will read dirty, and \`jkb task land\` refuses a dirty target." ;;
                     # Only what is true of EVERY `failed`. The second line used to name the
@@ -1051,6 +1177,18 @@ render_git_hooks_report() {
                     failed)     warn "could not update .git/info/exclude $detail"
                                 warn "  that step did not land; anything reported above it did." ;;
                     *)          warn "unrecognised exclude state: $line" ;;
+                esac ;;
+            # The ONLY line that describes the file. Both values render nothing: every
+            # mutation is already itemised by its own `retracted`/`added`/`tidied` line, and
+            # silence is not a claim — the same reason `dispatch=direct|chained` print
+            # nothing. It exists so that no OTHER arm has to guess, and so that a reassurance,
+            # if one is ever wanted again, has exactly one legal home where it is true by
+            # measurement. The default arm warns, so a third value added at the producer
+            # surfaces instead of vanishing.
+            exclude-file=*)
+                case "$state" in
+                    changed|unchanged) : ;;
+                    *) warn "unrecognised exclude-file state: $line" ;;
                 esac ;;
             dispatch=*)
                 case "$state" in
@@ -1070,6 +1208,13 @@ render_git_hooks_report() {
                     # this cause prints a perfectly normal `.githooks` and appears to refute
                     # the warning — the same failure `--show-origin` was introduced to fix one
                     # cause over.
+                    # Its own arm and its own repair. The value is real and git will use it
+                    # for THIS process, so "cannot be expanded" would be false; what is wrong
+                    # is that it does not belong to the repository, and a chainer installed
+                    # there is one no later pull consults.
+                    transient)
+                             warn "core.hooksPath is set by the environment (GIT_CONFIG_COUNT/GIT_CONFIG_PARAMETERS) or \`-c\`, not by this repository — a chainer installed there is not where later pulls will look."
+                             warn "  re-run setup.sh without that setting in the environment, or store it with: git config core.hooksPath <path>" ;;
                     unanchored)
                              warn "core.hooksPath is relative and this repository has no working tree, so git resolves it against whatever directory the pulling process is in — there is no one place to install a chainer."
                              warn "  run setup.sh from a working tree of this repository, or set an absolute core.hooksPath." ;;

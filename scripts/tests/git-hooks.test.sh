@@ -167,7 +167,8 @@ case6() {
     fi
 
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
-    if [ "$got" = "exclude=added /.githooks/post-merge" ]; then
+    if [ "$got" = "exclude=added /.githooks/post-merge
+exclude-file=changed" ]; then
         ok "a chainer inside the working tree: excluded locally"
     else
         fail "exclude: pattern" "expected 'exclude=added /.githooks/post-merge', got '$got'"
@@ -179,7 +180,8 @@ case6() {
     fi
     # Twice must not duplicate the line — setup.sh runs on every qualifying pull.
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
-    if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=kept /.githooks/post-merge
+exclude-file=unchanged" ] \
         && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
         ok "running it again adds nothing"
     else
@@ -190,7 +192,8 @@ case6() {
     # rule on the run that installs a chainer and never revisiting it is how a user who later
     # replaced that chainer with their own hook had it git-ignored for ever.
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
-    if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=retracted /.githooks/post-merge
+exclude-file=changed" ] \
         && ! grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and asking for it to be gone retracts it"
     else
@@ -231,7 +234,8 @@ case6c() {
     printf '# things I do not want to see\n/.githooks/post-merge\n' >>"$r/.git/info/exclude"
 
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
-    if [ "$got" = "exclude=unowned /.githooks/post-merge" ]; then
+    if [ "$got" = "exclude=unowned /.githooks/post-merge
+exclude-file=unchanged" ]; then
         ok "an unmarked exclude rule is reported as unowned"
     else
         fail "unowned: state" "expected 'exclude=unowned /.githooks/post-merge', got '$got'"
@@ -535,7 +539,8 @@ case6e() {
         >"$r/.git/info/exclude"
 
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
-    if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=kept /.githooks/post-merge
+exclude-file=unchanged" ] \
         && [ "$(grep -c 'githooks/post-merge' "$r/.git/info/exclude")" = "1" ]; then
         ok "a CRLF exclude file: our own block is recognised, not appended a second time"
     else
@@ -547,7 +552,8 @@ case6e() {
         fail "crlf: rewritten" "the file's existing CRLF endings were changed"
     fi
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
-    if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=retracted /.githooks/post-merge
+exclude-file=changed" ] \
         && ! grep -q 'githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and a CRLF block is retracted, marker and all"
     else
@@ -817,7 +823,8 @@ case6f() {
     chainer="$override/post-merge"
     mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
-    [ "$got" = "exclude=added /.githooks/post-merge" ] \
+    [ "$got" = "exclude=added /.githooks/post-merge
+exclude-file=changed" ] \
         && ok "and it is excluded" \
         || fail "glob: state" "got '$got'"
     [ -z "$(git_q -C "$r" status --porcelain)" ] \
@@ -934,7 +941,302 @@ case9() {
     fi
 }
 
+# --- 10. exclude-file= is measured against the file, in every arm ---------------------------
+# THE ORACLE, not a snapshot. Three consecutive must-fixes were one shape: a per-pattern or
+# per-step render arm asserting a run-level fact it could not see. The clincher is that the
+# report word `undecided` has two producers with OPPOSITE file semantics — `want=unknown`
+# returns early and touches nothing, `want=undecided` runs the sweep first — so no wording of
+# that arm could ever have been right.
+#
+# So the test measures the file itself, either side of the call, and requires the emitted word
+# to agree with its own measurement in EVERY arm. It enumerates the wants rather than checking
+# one, because "fixed at the arm the reviewer found" is exactly how this defect survived three
+# rounds. A hardcoded `changed` fails the untouched cells; a hardcoded `unchanged` fails the
+# sweeping ones; a deleted emission fails all of them.
+case10() {
+    local d="$work/filefact" r want got line before after claimed measured
+    for want in yes no undecided unknown bogus; do
+        r="$d/$want"
+        mkdir -p "$r"
+        git_q init -q "$r" >/dev/null 2>&1
+        git_q -C "$r" commit -q --allow-empty -m init
+        # A jkb block for a DIFFERENT pattern, so the sweep has something to remove and the
+        # arms genuinely differ in what they do to the file.
+        { exclude_marker; printf '/stale/post-merge\n'; } >>"$r/.git/info/exclude"
+
+        before="$(cksum <"$r/.git/info/exclude")"
+        got="$(reconcile_exclude "$r" "/.githooks/post-merge" "$want" 2>/dev/null)"
+        after="$(cksum <"$r/.git/info/exclude")"
+
+        claimed=""
+        while IFS= read -r line; do
+            case "$line" in exclude-file=*) claimed="${line#exclude-file=}" ;; esac
+        done <<EOF
+$got
+EOF
+        [ "$before" = "$after" ] && measured=unchanged || measured=changed
+
+        if [ -z "$claimed" ]; then
+            fail "filefact: $want" "no exclude-file= line; the run-level fact was not reported"
+        elif [ "$claimed" = "$measured" ]; then
+            ok "want=$want reports exclude-file=$measured, which is what happened to the file"
+        else
+            fail "filefact: $want" "claimed $claimed, the file was $measured"
+        fi
+    done
+}
+
+# --- 10b. the reproduced contradiction, and the shape of its fix ---------------------------
+# The exact fixture from the review: a bare repo with a relative core.hooksPath (so jkb refuses
+# to anchor a chainer and reports `undecided`) plus a pre-existing jkb block for another
+# pattern (so the sweep still runs and rewrites the file). It used to render
+#
+#   • excluded:   /old/post-merge dropped from .git/info/exclude …
+#   warning:   nothing in .git/info/exclude was changed.
+#
+# two lines about one file stating opposite facts, unattended, from the post-merge hook.
+#
+# Asserted POSITIVELY — the `undecided` warning must be exactly one line — not as a denylist of
+# the old sentence. Asserting a sentence's absence passes just as well when the arm can never
+# fire, which is how the `exposed` downgrade stayed unreachable for a round.
+case10b() {
+    local d="$work/contradiction" out rendered n
+    mkdir -p "$d"
+    git_q init -q --bare "$d/bare.git" >/dev/null 2>&1
+    git_q -C "$d/bare.git" config core.hooksPath .githooks
+    mkdir -p "$d/bare.git/info"
+    { exclude_marker; printf '/old/post-merge\n'; } >>"$d/bare.git/info/exclude"
+    printf '#!/bin/sh\necho hi\n' >"$d/src"
+
+    out="$(install_git_hooks "$d/bare.git" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"exclude=retracted /old/post-merge"*) ok "the sweep still runs under an undecided want" ;;
+        *) fail "contradiction: sweep" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"exclude-file=changed"*) ok "and the run says so, because the file really was rewritten" ;;
+        *) fail "contradiction: fact" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    # The ARM IN ISOLATION, and its whole output — not a count of one phrase inside it.
+    # Counting the phrase was the first version of this assertion and it could not fail:
+    # restoring the false second line adds a DIFFERENT sentence, so the phrase count stays 1.
+    # Feeding the renderer one line and pinning everything it emits is what makes any extra
+    # claim about the file a failure, whatever words it is dressed in.
+    n="$(printf 'exclude=undecided (a reason)\n' | render_git_hooks_report 2>&1 | wc -l | tr -d ' ')"
+    [ "$n" -eq 1 ] \
+        && ok "and the undecided arm emits one line: a claim about the pattern, not the file" \
+        || fail "contradiction: arm" "the undecided arm emitted $n lines; only exclude-file= may describe the file"
+    # The remedy must still reach the reader — it rides on dispatch=, not on the dropped line.
+    case "$rendered" in
+        *"run setup.sh from a working tree"*) ok "and the repair is still printed, via dispatch=" ;;
+        *) fail "contradiction: remedy" "$(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 10c. a value the renderer has no arm for surfaces --------------------------------------
+# Every other key here carries this pin. Without it a third value added at the producer falls
+# into a silent default, which for a security-adjacent report is indistinguishable from the
+# state it was meant to describe.
+case10c() {
+    local out
+    out="$(printf 'exclude-file=bogus\n' | render_git_hooks_report 2>&1)"
+    case "$out" in
+        *"unrecognised exclude-file state"*) ok "an unknown exclude-file value is warned about" ;;
+        *) fail "filefact: default" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    out="$(printf 'exclude-file=changed\nexclude-file=unchanged\n' | render_git_hooks_report 2>&1)"
+    [ -z "$out" ] \
+        && ok "and the two real values render nothing — the itemised lines already said it" \
+        || fail "filefact: quiet" "expected silence, got: $(printf '%s' "$out" | tr '\n' '|')"
+}
+
+# --- 10d. every git call in lib.sh goes through the wrapper ---------------------------------
+# The header states this rule and, until now, nothing enforced it: four of the six call sites
+# could be reverted to bare `git` with both suites green. That is precisely how the chainer's
+# dispatch was once reverted to `--git-dir` while the whole gate stayed green.
+#
+# Anchored on `git -C`, which is the shape EVERY call in this file uses and the shape a
+# regression takes. Deliberately not a command-position match: lib.sh legitimately names
+# `git rev-parse` inside a warning string and inside the two emitted chainer heredocs, and a
+# matcher that has to reason about quoting is a second parser to get wrong. The bound is
+# stated rather than hidden — a new call written without `-C` is not caught, and there is no
+# such call today.
+case10d() {
+    local lib hits probe
+    lib="$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
+    hits="$(_bare_git_calls "$lib")"
+    [ -z "$hits" ] \
+        && ok "no bare git -C outside the wrapper" \
+        || fail "wrapper: live" "bare git call(s): $(printf '%s' "$hits" | tr '\n' '|')"
+
+    # And the check itself must fire. A guard nobody has watched fail is this directory's
+    # recurring defect, so every call site is reverted in turn and each must be reported.
+    probe="$work/wrapper-probe.sh"
+    local n=0 caught=0 target
+    for target in 'rev-parse --git-common-dir' 'config --get --path core.hooksPath' \
+                  'rev-parse --show-toplevel' 'worktree list --porcelain'; do
+        n=$((n + 1))
+        sed "s|_git -C \"\$repo_root\" $target|git -C \"\$repo_root\" $target|" "$lib" >"$probe"
+        if cmp -s "$lib" "$probe"; then
+            fail "wrapper: probe" "the $target revert did not apply, so nothing was proven"
+        elif [ -n "$(_bare_git_calls "$probe")" ]; then
+            caught=$((caught + 1))
+        else
+            fail "wrapper: missed" "a bare git call at '$target' was not detected"
+        fi
+    done
+    [ "$caught" -eq "$n" ] \
+        && ok "and it reports a revert at each of the $n call sites" \
+        || fail "wrapper: coverage" "caught $caught of $n"
+}
+
+# Bare `git -C` outside the emitted chainer heredocs and outside `_git`'s own definition.
+_bare_git_calls() {
+    awk '
+        /<<'"'"'CHAIN'"'"'/ { h = 1; next }
+        h && /^CHAIN$/       { h = 0; next }
+        h                    { next }
+        /^_git\(\)/          { next }
+        /(^|[^_[:alnum:]])git[ \t]+-C/ { printf "%d: %s\n", NR, $0 }
+    ' "$1"
+}
+
+# --- 10e. the config readers survive `set -e` on their own ---------------------------------
+# lib.sh's header promises every function behaves the same with `set -e` on or off. Both
+# readers of `core.hooksPath` broke it: a bare `x="$(cmd)"` is a simple command, so a non-zero
+# substitution aborts the shell — and exit 1 there is the COMMONEST case, the setting not being
+# present at all. It was masked because the one production caller writes `… || override_rc=$?`,
+# which disables errexit for the whole call; a second caller spelled the ordinary way would
+# have killed setup.sh outright on any machine without the setting.
+#
+# Run in a `bash -euo pipefail` child, because the suites cannot be sourced under `set -e`
+# (`fail` increments and continues by design). The premise is asserted first: if the fixture
+# ever had a `core.hooksPath`, git would exit 0 and this case would pass having tested nothing.
+case10e() {
+    local d="$work/errexit" lib
+    lib="$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
+    mkdir -p "$d"
+    git_q init -q "$d/r" >/dev/null 2>&1
+
+    if git_q -C "$d/r" config --get core.hooksPath >/dev/null 2>&1; then
+        fail "errexit: premise" "the fixture has a core.hooksPath, so the failing read never happens"
+        return
+    fi
+    ok "the fixture genuinely has no core.hooksPath, so the read really does exit non-zero"
+
+    if bash -euo pipefail -c '. "$1"; git_hooks_override "$2" >/dev/null' _ "$lib" "$d/r"; then
+        ok "and git_hooks_override returns rather than killing an errexit shell"
+    else
+        fail "errexit: override" "the shell died (exit $?) reading an absent core.hooksPath"
+    fi
+    if bash -euo pipefail -c '. "$1"; git_hooks_exclude_pattern "$2" >/dev/null' _ "$lib" "$d/r"; then
+        ok "and so does git_hooks_exclude_pattern"
+    else
+        fail "errexit: pattern" "the shell died (exit $?) reading an absent core.hooksPath"
+    fi
+}
+
+# --- 10f. an unrecognised refusal status is named, never absorbed --------------------------
+# Callable with a status that does not exist yet, which is the whole reason the mapping was
+# lifted out of `install_git_hooks`: inline, `*)` and `4)` were behaviourally identical (there
+# is no fifth code today), so a mutation collapsing them stayed green and no test could tell an
+# honest catch-all from one that hands a future code a confident, wrong remedy.
+case10f() {
+    local v w
+    for rc in 2 3 4; do
+        v="$(_override_verdict "$rc")"
+        case "$v" in
+            unreadable*|unanchored*) ;;
+            *) fail "verdict: $rc" "unexpected verdict '$v'" ; return ;;
+        esac
+    done
+    ok "each known refusal status maps to a verdict the renderer has an arm for"
+
+    v="$(_override_verdict 9)"
+    w="$(_override_why 9)"
+    case "$v" in
+        *"unrecognised status 9"*) ok "an unknown status says so, and carries its number" ;;
+        "unanchored"*) fail "verdict: absorb" "status 9 was absorbed into a definite '$v'" ;;
+        *) fail "verdict: unknown" "got '$v'" ;;
+    esac
+    case "$w" in
+        *"could not be resolved"*) ok "and its exclude reason claims nothing it cannot know" ;;
+        *"no working tree"*) fail "why: absorb" "status 9 borrowed the unanchored reason" ;;
+        *) fail "why: unknown" "got '$w'" ;;
+    esac
+    # The verdict must route to an arm that exists, or the operator gets the renderer's
+    # "unrecognised dispatch verdict" instead of a diagnosis.
+    case "$(printf 'dispatch=%s\n' "$v" | render_git_hooks_report 2>&1)" in
+        *"unrecognised dispatch verdict"*) fail "verdict: arm" "no render arm for '$v'" ;;
+        *"could not be resolved"*) ok "and the rendering names the cause it actually observed" ;;
+        *) fail "verdict: render" "unexpected rendering of '$v'" ;;
+    esac
+}
+
+# --- 10g. an environment-injected core.hooksPath is refused, not installed into -------------
+# `_git` strips the three variables that select a REPOSITORY but deliberately not the two that
+# inject CONFIGURATION: `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` carry the `safe.directory`
+# grants this project's dev container needs, and stripping those makes git refuse the checkout.
+# So the transient case is detected instead, by asking git which scope the value came from.
+#
+# Measured without the refusal: jkb installs the chainer at the INJECTED path, adds an exclude
+# rule for it, and reports `dispatch=chained` — the good verdict — while the repository's own
+# core.hooksPath has no chainer, so no later pull runs one. Reachable unattended, because
+# `git -c core.hooksPath=X pull` exports the setting into the hook environment and the hook
+# runs setup.sh.
+case10g() {
+    local d="$work/injected" out
+    mkdir -p "$d"
+    git_q init -q "$d/r" >/dev/null 2>&1
+    git_q -C "$d/r" commit -q --allow-empty -m init
+    git_q -C "$d/r" config core.hooksPath "$d/r/persistent"
+    printf '#!/bin/sh\necho hi\n' >"$d/src"
+
+    out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$d/r/injected" \
+           install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+
+    case "$out" in
+        *"dispatch=transient"*) ok "an environment-injected core.hooksPath is reported transient" ;;
+        *"dispatch=chained"*)   fail "injected: verdict" "reported the GOOD verdict for a transient path" ;;
+        *) fail "injected: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ -e "$d/r/injected" ] \
+        && fail "injected: wrote" "a chainer was installed at the injected path" \
+        || ok "and nothing is installed at the path the environment named"
+    # The exclude file must not gain a rule for a path jkb declined to own.
+    case "$out" in
+        *"exclude=added"*) fail "injected: exclude" "an exclude rule was written for the injected path" ;;
+        *) ok "and no exclude rule is written for it" ;;
+    esac
+    # The rendering, not just the wire report: without its own arm the verdict falls into the
+    # renderer's "unrecognised dispatch verdict" default, so the operator is told the report is
+    # broken rather than what is wrong with their configuration.
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"unrecognised dispatch verdict"*)
+            fail "injected: arm" "transient has no render arm" ;;
+        *"set by the environment"*"re-run setup.sh without that setting"*)
+            ok "and the rendering names the cause and a repair the operator can take" ;;
+        *) fail "injected: render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+    esac
+    # And the same via GIT_CONFIG_PARAMETERS, which is the form `git -c` exports into a hook.
+    out="$(GIT_CONFIG_PARAMETERS="'core.hooksPath=$d/r/injected2'" \
+           install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=transient"*) ok "and the GIT_CONFIG_PARAMETERS form is caught too" ;;
+        *) fail "injected: params" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # The premise: with no injection the same repo resolves normally, so the assertions above
+    # are about the injection and not about something broken in the fixture.
+    out="$(install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=chained"*) ok "while the repository's own core.hooksPath still resolves normally" ;;
+        *) fail "injected: premise" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g
 
 finish
