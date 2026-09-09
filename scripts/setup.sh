@@ -28,6 +28,7 @@ do_extension=1
 do_service=1
 do_scaffold=1
 link_memory=0
+service_ok=1
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -102,7 +103,12 @@ fi
 # --- 4. file-sync watcher service -------------------------------------------
 if [ "$do_service" -eq 1 ]; then
   say "install + activate background services (file sync, worktree reaper)"
-  jkb --db "$db" service install
+  # Wrapped, like the extension step above it. A bare statement under `set -euo pipefail`
+  # ends the script here — so a unit that could not be written (an uncreatable
+  # ~/.config/systemd/user, a full disk, no HOME in the post-merge hook's environment) took
+  # the git-hook section below with it, and the repo kept whatever stale or missing
+  # post-merge hook it had. The hooks are the one section a partial setup must still reach.
+  if jkb --db "$db" service install; then
   # BOTH units `service install` writes. The reaper is what finishes a landing whose session
   # could not archive its own worktree, so a unit that is written and never loaded means those
   # worktrees accumulate for ever — visible only as `jkb doctor` output nobody reads.
@@ -128,6 +134,12 @@ if [ "$do_service" -eq 1 ]; then
       fi ;;
     *) warn "unsupported OS for auto-activation; the units were written — activate them manually." ;;
   esac
+  else
+    # A distinct variable, not `do_service=0`: that is the flag, and reusing it would make the
+    # summary below report a failure as "--no-service" — the user's choice, which it was not.
+    service_ok=0
+    warn "could not write the service units — continuing to the git hooks."
+  fi
 else
   warn "skipping watcher service (--no-service)"
 fi
@@ -172,6 +184,6 @@ echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
 if [ "$do_extension" -eq 1 ]; then
   echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
 fi
-if [ "$do_service" -eq 1 ]; then
+if [ "$do_service" -eq 1 ] && [ "$service_ok" -eq 1 ]; then
   echo "  • watcher:    running; file edits under mounts auto-sync"
 fi

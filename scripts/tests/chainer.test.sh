@@ -373,6 +373,122 @@ case10() {
     esac
 }
 
+# --- 10c. the sweep: a block is reconciled wherever core.hooksPath goes next ---------------
+# Reconciling only the path being installed was not reconciliation. Change `core.hooksPath`
+# and the old block stayed for ever; unset it and the early return meant no `exclude=` line
+# was emitted at all, so nothing was ever retracted. A hook the user later wrote at either
+# old path was then invisible to `git status` with nothing attributing that to jkb — which is
+# the harm the whole function exists to end.
+case10c() {
+    local d="$work/sweep" r out
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+
+    git_q -C "$r" config core.hooksPath .githooks
+    install_git_hooks "$r" "$d/src" >/dev/null
+
+    # Moved.
+    git_q -C "$r" config core.hooksPath .otherhooks
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"exclude=retracted /.githooks/post-merge"*) ok "moving core.hooksPath retracts the old block" ;;
+        *) fail "sweep: move" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *"exclude=added /.otherhooks/post-merge"*) ok "and adds the new one" ;;
+        *) fail "sweep: new" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "0" ] \
+        && ok "and the old pattern is gone from the file" \
+        || fail "sweep: stale" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+
+    # Unset entirely: git reads .git/hooks itself, so nothing of ours should remain.
+    git_q -C "$r" config --unset core.hooksPath
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"exclude=retracted /.otherhooks/post-merge"*) ok "unsetting it retracts the last block too" ;;
+        *) fail "sweep: unset" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    if ! grep -q '^# jkb:' "$r/.git/info/exclude"; then
+        ok "and no marker of ours is left in the file"
+    else
+        fail "sweep: marker" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    # A hook the user now writes at either old path must be visible to them.
+    mkdir -p "$r/.githooks"; printf '#!/bin/sh\ndirenv reload\n' >"$r/.githooks/post-merge"
+    [ -n "$(git_q -C "$r" status --porcelain)" ] \
+        && ok "so a hook they write at an old path is visible to git again" \
+        || fail "sweep: hidden" "the user's file is still hidden"
+}
+
+# --- 10d. an unresolvable core.hooksPath is not reported as the good verdict ---------------
+# `git config --get` exits 1 for "not set" and 128 for "set to something I cannot expand" —
+# a `~someuser/hooks` for an account absent on this machine, the ordinary state of a shared
+# ~/.gitconfig. Folding the second into the first reported `dispatch=direct`, which the
+# renderer prints nothing for: a clean bill of health for a repo in which git resolves no
+# hooks path at all.
+case10d() {
+    local d="$work/unreadable" r out rendered user
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    user="jkb-no-such-account-$$"
+    git_q -C "$r" config core.hooksPath "~$user/hooks"
+    if git -C "$r" config --get --path core.hooksPath >/dev/null 2>&1; then
+        skip "this git expands ~$user without failing"
+        return
+    fi
+
+    out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=unreadable"*) ok "a core.hooksPath git cannot resolve: reported unreadable" ;;
+        *) fail "unreadable: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"dispatch=direct"*) fail "unreadable: direct" "reported the good verdict for a repo git runs no hooks in" ;;
+        *) ok "and not as direct, which is rendered silently" ;;
+    esac
+    rendered="$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *"git runs NO hooks in this repository"*) ok "and the rendering says so" ;;
+        *) fail "unreadable: render" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 10e. the same directory, spelled differently -----------------------------------------
+# "core.hooksPath points at git's own hooks directory" was literal string equality, so a
+# trailing slash — or a symlink, or a `..` — put back the message this guard was added to
+# remove: jkb calling the hook it wrote microseconds earlier foreign, and warning that the
+# repo hook may never run, about a configuration whose true verdict is `direct`.
+case10e() {
+    local d="$work/spelling" r out
+    mkdir -p "$d"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    for spelling in trailing-slash dotdot; do
+        r="$d/$spelling"
+        git_q init -q "$r" >/dev/null 2>&1
+        git_q -C "$r" commit -q --allow-empty -m init
+        case "$spelling" in
+            trailing-slash) git_q -C "$r" config core.hooksPath "$(git_hooks_dir "$r")/" ;;
+            dotdot)         git_q -C "$r" config core.hooksPath "$(git_hooks_dir "$r")/../hooks" ;;
+        esac
+        out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+        case "$out" in
+            *"dispatch=direct"*) ok "core.hooksPath as $spelling: still direct" ;;
+            *) fail "spelling: $spelling" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+        case "$out" in
+            *chainer=foreign*) fail "spelling: $spelling foreign" "it called its own hook foreign" ;;
+            *) ok "and it does not call its own hook foreign" ;;
+        esac
+    done
+}
+
 # --- 11. the report survives `set -e`, and never claims a hook was skipped -----------------
 # Two findings. The report used to reach setup.sh only because the call happened to be
 # written `… || true`, which disables `set -e` for the whole function body; without it the
@@ -512,6 +628,39 @@ case11b() {
     esac
 }
 
+# --- 11c. the SUCCESS path under `set -e` too ---------------------------------------------
+# case11 and case11b both make `install_chainer` fail, so `install_git_hooks` takes
+# `want=skip` and never calls `reconcile_exclude` at all — including its retraction, which
+# `cp -p`s and `mv`s over a file of the user's rules and is the newest, most write-dangerous
+# code here. The parity case11's own comment claims ("covered here rather than assumed") did
+# not cover it.
+case11c() {
+    local d="$work/seterrok" r out
+    mkdir -p "$d"
+    r="$d/repo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+
+    out="$(bash -euo pipefail -c '
+        . "$1/scripts/lib.sh"
+        install_git_hooks "$2" "$3"                       # install + add
+        install_git_hooks "$2" "$3"                       # up-to-date + kept
+        printf "#!/bin/sh\ndirenv reload\n" >"$2/.githooks/post-merge"
+        install_git_hooks "$2" "$3"                       # foreign + RETRACTION
+    ' _ "$repo_root" "$r" "$d/src" 2>/dev/null)"
+
+    case "$out" in
+        *"exclude=added"*"exclude=kept"*"exclude=retracted"*)
+            ok "the whole lifecycle runs to completion under set -euo pipefail" ;;
+        *) fail "seterrok: lifecycle" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    [ "$(printf '%s\n' "$out" | grep -c '^dispatch=')" = "3" ] \
+        && ok "and every run emits its verdict rather than dying part-way" \
+        || fail "seterrok: verdicts" "got $(printf '%s\n' "$out" | grep -c '^dispatch=') verdicts from 3 runs"
+}
+
 # --- 12. an exclusion that could not be written says so -----------------------------------
 # It used to return success with no output — a failed exclusion spelled exactly like "nothing
 # needed". The tree then read dirty, `jkb task land` refused it, and nothing attributed the
@@ -567,7 +716,7 @@ case12() {
 # one matters most: it rewrites a file full of the USER'S rules, so "it did not land" and "it
 # landed halfway" must be distinguishable, and only the first is acceptable.
 case12b() {
-    local d="$work/writefail" r got
+    local d="$work/writefail" r got before_entries
     if [ "$(id -u)" = "0" ]; then
         skip "unwritable paths cannot be simulated as root"
         return
@@ -583,22 +732,48 @@ case12b() {
     rm -rf "$r/.git/info"; : >"$r/.git/info"
     got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" yes 2>/dev/null)"
     case "$got" in
-        failed*) ok "an exclude directory that cannot be created is reported as failed" ;;
+        exclude=failed*) ok "an exclude directory that cannot be created is reported as failed" ;;
         *) fail "writefail: add" "expected a failed state, got '$got'" ;;
     esac
 
-    # retract side: our block is there, and the directory it must write through is read-only.
+    # retract side, the write itself: the directory is writable and the FILE is not, so
+    # `cp -p` succeeds and hands the temp its 444 mode, and the `printf` that fills it fails.
+    # That is the exact line whose status used to be dropped — a partial write (a full disk,
+    # a quota) was renamed over every rule the user owns, under the word `retracted`.
+    r="$d/rofile"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
+    reconcile_exclude "$r" "$r/.githooks/post-merge" yes >/dev/null
+    before_entries="$(entries_in "$r/.git/info")"
+    chmod 444 "$r/.git/info/exclude"
+    got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" no 2>/dev/null)"
+    chmod 644 "$r/.git/info/exclude"
+    case "$got" in
+        exclude=failed*) ok "a rewrite whose write fails is reported as failed, not retracted" ;;
+        *) fail "writefail: rewrite" "expected a failed state, got '$got'" ;;
+    esac
+    grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude" \
+        && ok "and the file still holds every rule it did" \
+        || fail "writefail: truncated" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    [ "$(entries_in "$r/.git/info")" = "$before_entries" ] \
+        && ok "and no temp file survives that either" \
+        || fail "writefail: rewrite temp" "left: $(entries_in "$r/.git/info" | tr '\n' ' ')"
+
+    # retract side, the copy: our block is there, and the directory is read-only.
     r="$d/roinfo"
     git_q init -q "$r" >/dev/null 2>&1
     git_q -C "$r" commit -q --allow-empty -m init
     git_q -C "$r" config core.hooksPath .githooks
     mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
     reconcile_exclude "$r" "$r/.githooks/post-merge" yes >/dev/null
+    before_entries="$(entries_in "$r/.git/info")"
     chmod 555 "$r/.git/info"
     got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" no 2>/dev/null)"
     chmod 755 "$r/.git/info"
     case "$got" in
-        failed*) ok "a retraction that cannot be written is reported as failed" ;;
+        exclude=failed*) ok "a retraction that cannot be written is reported as failed" ;;
         *) fail "writefail: retract" "expected a failed state, got '$got'" ;;
     esac
     if grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
@@ -606,9 +781,12 @@ case12b() {
     else
         fail "writefail: partial" "the file was rewritten anyway: $(tr '\n' '|' <"$r/.git/info/exclude")"
     fi
-    [ -z "$(ls "$r/.git/info" | grep -F 'exclude.jkb.')" ] \
+    # The directory's WHOLE contents, not a search for the template `reconcile_exclude`
+    # happens to use — an assertion that knows the temp name passes however many files are
+    # stranded once the name changes. harness.sh:88 records this exact lesson.
+    [ "$(entries_in "$r/.git/info")" = "$before_entries" ] \
         && ok "and no temp file is left beside it" \
-        || fail "writefail: temp" "left: $(ls "$r/.git/info" | tr '\n' ' ')"
+        || fail "writefail: temp" "before: $(printf '%s' "$before_entries" | tr '\n' ' ')/ after: $(entries_in "$r/.git/info" | tr '\n' ' ')"
 }
 
 # --- 13. a key with no render arm is not swallowed ----------------------------------------
@@ -661,6 +839,7 @@ case14() {
         'exclude=failed (cannot write /e)|could not update .git/info/exclude'
         'dispatch=unknown /c|the repo hook never runs'
         'dispatch=dead /c|will NOT run the repo hook above'
+        'dispatch=unreadable core.hooksPath|git runs NO hooks in this repository'
         'error=not a git repo|not a git repo; skipping hook install'
     )
     local entry ok_all=1 missing=""
@@ -677,14 +856,17 @@ case14() {
         || fail "render: table" "no distinctive output for:$missing"
 
     # The two silent verdicts are silent ON PURPOSE — the lines above them already said the
-    # hook will run — so assert the silence rather than leaving it unstated.
+    # hook will run — so assert the silence rather than leaving it unstated. Its OWN
+    # accumulators: sharing the pair above meant one table failure also fired a second,
+    # bogus "expected silence" failure listing arms that had behaved exactly as required.
+    local quiet_ok=1 noisy=""
     for line in 'dispatch=direct' 'dispatch=chained /c' 'exclude=none (nothing is hiding it)'; do
         rendered="$(printf '%s\n' "$line" | render_git_hooks_report 2>&1)"
-        [ -z "$rendered" ] || { ok_all=0; missing="$missing [$line said '$rendered']"; }
+        [ -z "$rendered" ] || { quiet_ok=0; noisy="$noisy [$line said '$rendered']"; }
     done
-    [ "$ok_all" = 1 ] \
+    [ "$quiet_ok" = 1 ] \
         && ok "and the states with nothing to report say nothing" \
-        || fail "render: silence" "expected silence:$missing"
+        || fail "render: silence" "expected silence:$noisy"
 }
 
 echo "==> scripts/lib.sh::install_chainer"
@@ -700,8 +882,12 @@ case8
 case9
 case10
 case10b
+case10c
+case10d
+case10e
 case11
 case11b
+case11c
 case12
 case12b
 case13

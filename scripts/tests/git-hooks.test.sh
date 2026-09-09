@@ -32,7 +32,6 @@ oracle_dir() {
 }
 # Falls back to the raw path when it does not exist — which is itself the answer under the
 # old rule, and makes the failure message say so instead of erroring on the `cd`.
-abs_dir() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"; }
 
 # A repo with one commit (worktrees need a born HEAD) plus a linked worktree.
 main="$work/main"
@@ -170,10 +169,10 @@ case6() {
     fi
 
     got="$(reconcile_exclude "$r" "$chainer" yes)"
-    if [ "$got" = "added /.githooks/post-merge" ]; then
+    if [ "$got" = "exclude=added /.githooks/post-merge" ]; then
         ok "a chainer inside the working tree: excluded locally"
     else
-        fail "exclude: pattern" "expected 'added /.githooks/post-merge', got '$got'"
+        fail "exclude: pattern" "expected 'exclude=added /.githooks/post-merge', got '$got'"
     fi
     if [ -z "$(git_q -C "$r" status --porcelain)" ]; then
         ok "the working tree is clean again, so a session can land"
@@ -182,7 +181,7 @@ case6() {
     fi
     # Twice must not duplicate the line — setup.sh runs on every qualifying pull.
     got="$(reconcile_exclude "$r" "$chainer" yes)"
-    if [ "$got" = "kept /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
         && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
         ok "running it again adds nothing"
     else
@@ -193,7 +192,7 @@ case6() {
     # rule on the run that installs a chainer and never revisiting it is how a user who later
     # replaced that chainer with their own hook had it git-ignored for ever.
     got="$(reconcile_exclude "$r" "$chainer" no)"
-    if [ "$got" = "retracted /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
         && ! grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and asking for it to be gone retracts it"
     else
@@ -234,10 +233,10 @@ case6c() {
     printf '# things I do not want to see\n/.githooks/post-merge\n' >>"$r/.git/info/exclude"
 
     got="$(reconcile_exclude "$r" "$chainer" no)"
-    if [ "$got" = "unowned /.githooks/post-merge" ]; then
+    if [ "$got" = "exclude=unowned /.githooks/post-merge" ]; then
         ok "an unmarked exclude rule is reported as unowned"
     else
-        fail "unowned: state" "expected 'unowned /.githooks/post-merge', got '$got'"
+        fail "unowned: state" "expected 'exclude=unowned /.githooks/post-merge', got '$got'"
     fi
     if grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and is left exactly where the user put it"
@@ -288,7 +287,7 @@ case6d() {
     git_q init -q --bare "$r" >/dev/null 2>&1
     got="$(reconcile_exclude "$r" "$r/hooks/post-merge" yes 2>/dev/null)"
     case "$got" in
-        "none ("*) ok "a repository with no working tree: nothing to exclude, and it says so" ;;
+        "exclude=none ("*) ok "a repository with no working tree: nothing to exclude, and it says so" ;;
         *) fail "bare: state" "expected a none state, got '$got'" ;;
     esac
 }
@@ -315,7 +314,7 @@ case6e() {
         >"$r/.git/info/exclude"
 
     got="$(reconcile_exclude "$r" "$chainer" yes)"
-    if [ "$got" = "kept /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=kept /.githooks/post-merge" ] \
         && [ "$(grep -c 'githooks/post-merge' "$r/.git/info/exclude")" = "1" ]; then
         ok "a CRLF exclude file: our own block is recognised, not appended a second time"
     else
@@ -327,7 +326,7 @@ case6e() {
         fail "crlf: rewritten" "the file's existing CRLF endings were changed"
     fi
     got="$(reconcile_exclude "$r" "$chainer" no)"
-    if [ "$got" = "retracted /.githooks/post-merge" ] \
+    if [ "$got" = "exclude=retracted /.githooks/post-merge" ] \
         && ! grep -q 'githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and a CRLF block is retracted, marker and all"
     else
@@ -352,7 +351,7 @@ case6f() {
     chainer="$override/post-merge"
     mkdir -p "$override"; printf '#!/bin/sh\nexit 0\n' >"$chainer"
     got="$(reconcile_exclude "$r" "$chainer" yes)"
-    [ "$got" = "added /.githooks/post-merge" ] \
+    [ "$got" = "exclude=added /.githooks/post-merge" ] \
         && ok "a repo path with glob metacharacters: still excluded" \
         || fail "glob: state" "got '$got'"
     [ -z "$(git_q -C "$r" status --porcelain)" ] \
@@ -373,7 +372,7 @@ case7() {
     got="$(reconcile_exclude "$r" "$work/elsewhere/post-merge" yes)"
     after="$(cat "$r/.git/info/exclude" 2>/dev/null)"
     case "$got" in
-        "none (outside the working tree"*) got_ok=1 ;;
+        "exclude=none (outside the working tree"*) got_ok=1 ;;
         *) got_ok=0 ;;
     esac
     if [ "$got_ok" = 1 ] && [ "$before" = "$after" ]; then

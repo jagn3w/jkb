@@ -44,7 +44,25 @@ finish() {
 # both halves.
 work=""
 new_workdir() {
-    work="$(mktemp -d)" || { echo "harness: mktemp -d failed" >&2; exit 1; }
+    local d
+    d="$(mktemp -d)" || { echo "harness: mktemp -d failed" >&2; exit 1; }
+    # PHYSICAL path. `mktemp -d` returns the logical one, and on macOS `$TMPDIR` lives under
+    # /var, a symlink to /private/var — while `git rev-parse --show-toplevel`, which
+    # `git_hooks_override` and `reconcile_exclude` both call, returns the physical one. A case
+    # that builds an expected path out of `$work` and compares it to git's answer then fails
+    # on every Mac, and because a failed premise `return`s, the rest of that case silently
+    # stops running: 13 assertions vanished from one case alone. check.sh is the gate
+    # `jkb task land` and the merge queue trust, so a false red there blocks a landing and
+    # points at innocent code.
+    work="$(cd "$d" && pwd -P)" || { echo "harness: cannot resolve $d" >&2; exit 1; }
+}
+
+# abs_dir <path> — a directory's physical path, or the path itself if it does not exist.
+#
+# Here rather than in one suite: `$work` is already physical, but a case that asks git for a
+# path and compares it to one it built still needs both sides resolved the same way.
+abs_dir() {
+    if [ -d "$1" ]; then (cd "$1" && pwd -P); else printf '%s\n' "$1"; fi
 }
 
 # `chmod` first: a case may make a directory unwritable, and an interrupt before it restores

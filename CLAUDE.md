@@ -622,7 +622,8 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   `jkb task work` session read dirty and `jkb task land` refuse it — and deleting it did not
   help, since the next pull recreates it. `.git/info/exclude` is the local, unpushed write D36
   already sanctions for `.jkb/`; editing someone's tracked `.gitignore` is not.
-- **The exclude rule is reconciled on every run, and ownership is byte identity again.** It was
+- **The exclude rule is reconciled on every run — every block of ours, not just the one for the
+  path being installed — and ownership is byte identity again.** It was
   written once, on the run that installed a chainer, and never revisited — so a user who later
   replaced that chainer with their own hook had it git-ignored **for ever**: the next run said
   `chainer=foreign`, left the rule in place, and `git status` went silent with nothing
@@ -632,7 +633,28 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   jkb writes a **marked two-line block** and retracts only that exact adjacent pair — the
   `chainer_body` lesson applied a second time. A bare pattern may be a rule the user wrote, so
   it is reported (`unowned`) and never deleted: the residual harm becomes visible with a
-  remedy instead of silent and permanent.
+  remedy instead of silent and permanent. Reconciling only the *installed* path was not
+  reconciliation either — moving `core.hooksPath` left the old block for ever, and unsetting it
+  returned before any reconciliation ran at all — so the desired state is now *exactly the
+  blocks jkb should own right now*, every other one is retracted whatever path it names, and
+  the no-override exits reconcile before returning. The file is rewritten through a temp file
+  whose **write status is checked**: `printf` to a full disk fails after emitting part of its
+  output, and dropping that status renamed a truncated file over every rule the user owns under
+  the word `retracted`.
+- **An exclude line is read the way git reads it** (`_exclude_line`): git trims one trailing CR,
+  so a CRLF file is functional to git and our comparisons must agree. They did not, so on such a
+  file jkb recognised neither its own block nor the pattern and appended a fresh one on every
+  qualifying pull. What is written back is the untrimmed original — agreeing about what a line
+  *means* is not licence to rewrite how it is spelled.
+- **A verdict is derived from the world, and every question about a path resolves it first.**
+  `dispatch=` is `[ -f ] && [ -x ]` on the chainer (a directory is executable to `test` and
+  unrunnable to git), and "does `core.hooksPath` point at git's own hooks directory?" compares
+  `pwd -P` results, because a trailing slash, a symlink and a `..` are three spellings of one
+  directory and literal equality put back the alarming message the guard was added to remove.
+  `git_hooks_override` now separates `git config --get`'s exit 1 (*not set*) from anything else
+  (*set to something git will not resolve* — a `~someuser/` for an absent account), which is the
+  fourth verdict `unreadable`: folding it into "not set" reported `direct`, the verdict the
+  renderer prints nothing for, about a repo in which git runs no hooks at all.
 - **`install_git_hooks` reports STATES, not actions, and ends in a verdict.** Three findings
   were one shape: while each key named something jkb *did*, every state that arises from **not**
   acting had no key, no render arm and no test — a stale exclude rule, an exclusion attempted
