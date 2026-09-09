@@ -702,7 +702,8 @@ _exclude_write() {
 # THE SCOPE RULE. Every line above describes only its own STEP or its own PATTERN. Exactly one
 # line describes the FILE, and it is emitted once per run, below every arm:
 #
-#   exclude-file=changed | unchanged  whether `.git/info/exclude` differs from before this run
+#   exclude-file=changed | unchanged | unknown   whether `.git/info/exclude` differs from
+#                                     before this run; `unknown` when it could not be measured
 #
 # That key exists because three separate must-fixes were one shape: a per-pattern or per-step
 # arm asserting a run-level fact it could not see. The clincher is that the report word
@@ -716,16 +717,21 @@ _exclude_write() {
 #
 # Always returns 0 — `failed` is a word, not an exit status (see the header's `set -e` rule).
 reconcile_exclude() {
-    local repo_root="$1" before after path
+    local repo_root="$1" before after path brc=0 arc=0
     path="$(_exclude_path "$1")"
-    before="$(_exclude_fingerprint "$path")"
+    before="$(_exclude_fingerprint "$path")" || brc=$?
     # Contractually rc 0, so this wrapper behaves identically with `set -e` on or off.
     _reconcile_exclude_decide "$@"
-    after="$(_exclude_fingerprint "$path")"
+    after="$(_exclude_fingerprint "$path")" || arc=$?
     # Below every arm, not inside one: the decision body has a dozen `return 0`s and none of
     # them can skip this. The property is structural, exactly as `install_git_hooks`' own
     # funnel is, so a new arm cannot forget to report what it did to the file.
-    if [ "$before" = "$after" ]; then
+    #
+    # Three-valued, because either measurement can fail and a comparison of two failures is
+    # not evidence of anything. `unknown` is never spelled `unchanged`.
+    if [ "$brc" -ne 0 ] || [ "$arc" -ne 0 ]; then
+        printf 'exclude-file=unknown\n'
+    elif [ "$before" = "$after" ]; then
         printf 'exclude-file=unchanged\n'
     else
         printf 'exclude-file=changed\n'
@@ -779,11 +785,19 @@ _exclude_path() {
 # _exclude_fingerprint <path> — a value that changes whenever the file's CONTENT does.
 #
 # Existence is part of it: `absent` is a distinct fingerprint, so creating or removing the file
-# both register. `cksum` is POSIX and the failure is consumed by `||`, so this is `set -e`-safe
-# and needs no bash 4.
+# both register — that is an ESTABLISHED state, and it returns 0.
+#
+# It returns **1 when it could not measure**: the path exists but cannot be read, or `cksum`
+# will not run. That is not the same as `absent`, and folding the two together is the defect
+# this whole key exists to prevent, reintroduced inside its own measurement. Measured: with
+# `cksum` unavailable both calls answered `absent`, they compared equal, and jkb reported
+# `exclude-file=unchanged` over a real write — the false reassurance, one level down.
+#
+# `set -e`-safe: every failure is consumed by `||` or by an explicit `return`.
 _exclude_fingerprint() {
     [ -n "$1" ] || { printf 'no-repo'; return 0; }
-    cksum <"$1" 2>/dev/null || printf 'absent'
+    [ -e "$1" ] || { printf 'absent'; return 0; }
+    cksum <"$1" 2>/dev/null || return 1
 }
 
 # The decision half — everything the wrapper above measures. Its report words are unchanged.
@@ -1217,6 +1231,10 @@ render_git_hooks_report() {
             exclude-file=*)
                 case "$state" in
                     changed|unchanged) : ;;
+                    # The one value worth a line. Silence here would say "nothing to report
+                    # about the file", which is exactly what could not be established — and
+                    # the itemised lines above may or may not have landed.
+                    unknown) warn "could not tell whether .git/info/exclude changed — check it by hand if a line above says one was added or dropped." ;;
                     *) warn "unrecognised exclude-file state: $line" ;;
                 esac ;;
             dispatch=*)

@@ -1318,7 +1318,54 @@ case10h() {
     esac
 }
 
+# --- 10i. an unmeasurable file is `unknown`, never `unchanged` -----------------------------
+# The false-reassurance defect one level down, inside the primitive added to prevent it.
+# `_exclude_fingerprint` folded "could not measure" into "absent"; two failures compare equal,
+# so with `cksum` unavailable jkb reported `exclude-file=unchanged` OVER A REAL WRITE. Measured
+# with a cksum that exits 127 on PATH.
+#
+# `absent` stays a real, established answer with rc 0 — creating or removing the file must
+# still register — so the case pins both halves, or "return 1 always" would pass it.
+case10i() {
+    local d="$work/nocksum" out
+    mkdir -p "$d/bin"
+    printf '#!/bin/sh\nexit 127\n' >"$d/bin/cksum"
+    chmod 755 "$d/bin/cksum"
+
+    git_q init -q "$d/r" >/dev/null 2>&1
+    git_q -C "$d/r" commit -q --allow-empty -m init
+    git_q -C "$d/r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho hi\n' >"$d/src"
+
+    if PATH="$d/bin:$PATH" cksum </dev/null >/dev/null 2>&1; then
+        fail "nocksum: premise" "the shim did not break cksum, so nothing was tested"
+        return
+    fi
+    ok "the shim breaks cksum, so the fingerprint genuinely cannot be taken"
+
+    out="$(PATH="$d/bin:$PATH" install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"exclude-file=unknown"*)   ok "and an unmeasurable file is reported unknown" ;;
+        *"exclude-file=unchanged"*) fail "nocksum: false" "reported unchanged over a write it could not measure" ;;
+        *) fail "nocksum: state" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"unrecognised exclude-file state"*) fail "nocksum: arm" "unknown has no render arm" ;;
+        *"could not tell whether"*) ok "and the operator is told, rather than reassured" ;;
+        *) fail "nocksum: render" "the unknown state rendered nothing at all" ;;
+    esac
+
+    # The other half: an ABSENT file is an established answer, not an unmeasurable one, so
+    # creating it still reports `changed`. Without this, `return 1` everywhere would pass above.
+    rm -f "$d/r/.git/info/exclude"
+    out="$(install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"exclude-file=changed"*) ok "while creating an absent exclude file still reports changed" ;;
+        *) fail "nocksum: absent" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i
 
 finish

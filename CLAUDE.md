@@ -845,6 +845,14 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   the raw string — so the transient refusal cannot reach one and miss the other. Fixing only
   the reader the defect surfaced in would have left the identical hole one call away, which is
   this area's whole history.
+- **The measurement itself had the defect it was added to prevent.** `_exclude_fingerprint`
+  folded *could not measure* into `absent`, and two failures compare equal — so with `cksum`
+  unavailable jkb reported `exclude-file=unchanged` **over a real write**. Measured with a
+  `cksum` that exits 127 on PATH. It is three-valued now: `absent` stays an established answer
+  (creating or removing the file must register), an unreadable path or an unrunnable `cksum`
+  returns non-zero, and the wrapper emits `unknown`, which the renderer warns about rather than
+  passing over in silence. Silence there would say *nothing to report about the file*, which is
+  exactly what could not be established.
 - **A derived list, because a hand-written one goes stale silently.** The `_git` enforcement
   check reverted four *named* call sites to prove it fires; merging the two readers deleted one
   of those names, and a third of the coverage would have stopped being exercised. It only
