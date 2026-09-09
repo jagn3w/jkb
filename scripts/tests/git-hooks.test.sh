@@ -279,6 +279,20 @@ case6b() {
     fi
 }
 
+# --- 6d. a repository with no working tree ------------------------------------------------
+# `reconcile_exclude` asks for the toplevel first, and a bare repo has none. Without a case
+# the arm is unreachable-in-practice code that reads as a safeguard; with one it is a stated
+# answer. Nothing can be hidden from a `git status` that cannot be run.
+case6d() {
+    local r="$work/bare.git" got
+    git_q init -q --bare "$r" >/dev/null 2>&1
+    got="$(reconcile_exclude "$r" "$r/hooks/post-merge" yes 2>/dev/null)"
+    case "$got" in
+        "none ("*) ok "a repository with no working tree: nothing to exclude, and it says so" ;;
+        *) fail "bare: state" "expected a none state, got '$got'" ;;
+    esac
+}
+
 # --- 7. a hooks path outside the working tree is left alone -------------------------------
 # The ordinary case: an absolute core.hooksPath is nobody's working tree, so there is nothing
 # to hide and nothing should be written to .git/info/exclude.
@@ -333,6 +347,7 @@ case5
 case6
 case6b
 case6c
+case6d
 case7
 case8
 

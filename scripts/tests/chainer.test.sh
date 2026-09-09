@@ -430,6 +430,45 @@ case11() {
     esac
 }
 
+# --- 10b. the two verdicts the world can contradict ---------------------------------------
+# `dispatch=` is derived from what is actually at the chainer path, and both of these were
+# wrong when first written. `core.hooksPath` pointing at the directory git would have used
+# anyway is not a chainer situation — the hook just installed is the one git runs — and
+# reporting it as `foreign` warns that a file jkb wrote seconds earlier was not written by
+# jkb. And `[ -x ]` is true of a DIRECTORY, so a directory-style hook manager's `post-merge/`
+# was called `unknown` ("this may well dispatch") when it is the one case that provably
+# cannot.
+case10b() {
+    local d="$work/verdicts" r out
+    mkdir -p "$d"
+
+    r="$d/selfpath"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+    git_q -C "$r" config core.hooksPath "$(git_hooks_dir "$r")"
+    out="$(install_git_hooks "$r" "$d/src")"
+    case "$out" in
+        *"dispatch=direct"*) ok "core.hooksPath aimed at git's own hooks directory: direct" ;;
+        *) fail "verdict: selfpath" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    case "$out" in
+        *chainer=*) fail "verdict: selfpath chainer" "it reported a chainer against the hook it had just installed" ;;
+        *) ok "and no chainer is claimed against the hook it just installed" ;;
+    esac
+
+    r="$d/dirchainer"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks/post-merge"      # a directory-style hook manager owns the path
+    out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    case "$out" in
+        *"dispatch=dead"*) ok "a directory where the chainer goes: dead, not unknown" ;;
+        *) fail "verdict: dirchainer" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
 # --- 11b. the override directory itself cannot be created ---------------------------------
 # Concern 4's own reproduction (`core.hooksPath=/etc/githooks-nope`, a root-owned parent).
 # This arm printed `error=cannot create …` AFTER `repo-hook=`, and setup.sh renders `error=`
@@ -478,7 +517,7 @@ case11b() {
 # needed". The tree then read dirty, `jkb task land` refused it, and nothing attributed the
 # dirt to jkb. `Unknown` is never spelled `no`, and neither is `failed`.
 case12() {
-    local d="$work/excludefail" r out rendered
+    local d="$work/excludefail" r out out2 rendered
     if [ "$(id -u)" = "0" ]; then
         skip "an unwritable file cannot be simulated as root"
         return
@@ -495,6 +534,21 @@ case12() {
     out="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
     chmod 644 "$r/.git/info/exclude"
 
+    # And again with content and NO trailing newline, so the write that fails is the separator
+    # rather than the block — a different arm, and the one that would otherwise fuse the
+    # user's last rule with our marker if it silently carried on.
+    printf '# my rules\n*.log' >"$r/.git/info/exclude"
+    chmod 444 "$r/.git/info/exclude"
+    out2="$(install_git_hooks "$r" "$d/src" 2>/dev/null)"
+    chmod 644 "$r/.git/info/exclude"
+    case "$out2" in
+        *"exclude=failed"*) ok "and so is one whose separator cannot be written" ;;
+        *) fail "excludefail: separator" "got: $(printf '%s' "$out2" | tr '\n' '|')" ;;
+    esac
+    [ "$(cat "$r/.git/info/exclude")" = "$(printf '# my rules\n*.log')" ] \
+        && ok "and the user's rules are exactly as they were" \
+        || fail "excludefail: damaged" "file is now: $(tr '\n' '|' <"$r/.git/info/exclude")"
+
     case "$out" in
         *"exclude=failed"*) ok "an exclude file that cannot be written is reported as failed" ;;
         *) fail "excludefail: state" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
@@ -507,20 +561,130 @@ case12() {
     esac
 }
 
+# --- 12b. the other two write failures, on both sides of the reconciliation ---------------
+# The add side has a second failure (the `.git/info` directory itself) and the retract side
+# has its own (the temp copy it rewrites through). Both were arms nothing drove. The retract
+# one matters most: it rewrites a file full of the USER'S rules, so "it did not land" and "it
+# landed halfway" must be distinguishable, and only the first is acceptable.
+case12b() {
+    local d="$work/writefail" r got
+    if [ "$(id -u)" = "0" ]; then
+        skip "unwritable paths cannot be simulated as root"
+        return
+    fi
+    mkdir -p "$d"
+
+    # add side: .git/info is not a directory, so it cannot be created or written into.
+    r="$d/noinfo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
+    rm -rf "$r/.git/info"; : >"$r/.git/info"
+    got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" yes 2>/dev/null)"
+    case "$got" in
+        failed*) ok "an exclude directory that cannot be created is reported as failed" ;;
+        *) fail "writefail: add" "expected a failed state, got '$got'" ;;
+    esac
+
+    # retract side: our block is there, and the directory it must write through is read-only.
+    r="$d/roinfo"
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    git_q -C "$r" config core.hooksPath .githooks
+    mkdir -p "$r/.githooks"; printf '#!/bin/sh\nexit 0\n' >"$r/.githooks/post-merge"
+    reconcile_exclude "$r" "$r/.githooks/post-merge" yes >/dev/null
+    chmod 555 "$r/.git/info"
+    got="$(reconcile_exclude "$r" "$r/.githooks/post-merge" no 2>/dev/null)"
+    chmod 755 "$r/.git/info"
+    case "$got" in
+        failed*) ok "a retraction that cannot be written is reported as failed" ;;
+        *) fail "writefail: retract" "expected a failed state, got '$got'" ;;
+    esac
+    if grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
+        ok "and the rule is left whole rather than half-removed"
+    else
+        fail "writefail: partial" "the file was rewritten anyway: $(tr '\n' '|' <"$r/.git/info/exclude")"
+    fi
+    [ -z "$(ls "$r/.git/info" | grep -F 'exclude.jkb.')" ] \
+        && ok "and no temp file is left beside it" \
+        || fail "writefail: temp" "left: $(ls "$r/.git/info" | tr '\n' ' ')"
+}
+
 # --- 13. a key with no render arm is not swallowed ----------------------------------------
 # The default arms. A key added to the producer without an arm here used to vanish, which is
 # how an `error=` line contradicting the line above it stayed invisible for three passes.
 case13() {
-    local rendered
-    rendered="$(printf 'invented=1\nchainer=sideways /x\n' | render_git_hooks_report 2>&1)"
-    case "$rendered" in
-        *"unrecognised report line: invented=1"*) ok "an unknown key is warned about, not swallowed" ;;
-        *) fail "render: unknown key" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
-    esac
-    case "$rendered" in
-        *"unrecognised chainer outcome"*) ok "and so is an unknown value of a known key" ;;
-        *) fail "render: unknown value" "rendered: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
-    esac
+    local rendered entry line want ok_all=1 missing=""
+    # EVERY default arm, one per key. Covering only the outer one left three inner arms that
+    # could be deleted with the suites green — which is the shape of the defect this whole
+    # change is about, reintroduced in the guard against it.
+    local -a table=(
+        'invented=1|unrecognised report line: invented=1'
+        'chainer=sideways /x|unrecognised chainer outcome'
+        'exclude=sideways /x|unrecognised exclude state'
+        'dispatch=sideways /x|unrecognised dispatch verdict'
+    )
+    for entry in "${table[@]}"; do
+        line="${entry%%|*}"; want="${entry#*|}"
+        rendered="$(printf '%s\n' "$line" | render_git_hooks_report 2>&1)"
+        case "$rendered" in
+            *"$want"*) ;;
+            *) ok_all=0; missing="$missing [$line -> '$rendered']" ;;
+        esac
+    done
+    [ "$ok_all" = 1 ] \
+        && ok "an unknown key or value is warned about on every arm, not swallowed" \
+        || fail "render: defaults" "swallowed:$missing"
+}
+
+# --- 14. every state in the protocol renders something that names it ----------------------
+# The producer emits states the end-to-end cases above cannot all reach in one run — a `kept`
+# rule, an `unowned` one, an `error=`. An arm nothing drives is a branch wearing the costume
+# of a safeguard, and the whole reason both halves moved into lib.sh was that setup.sh's arms
+# were reachable from nothing. Driven as a table so the closed protocol and the closed set of
+# render arms are asserted to be the same set.
+case14() {
+    local line want rendered
+    # Each entry is `<report line>|<a phrase only that arm produces>`.
+    local -a table=(
+        'repo-hook=/r/.git/hooks/post-merge|repo hook:  /r/.git/hooks/post-merge'
+        'chainer=installed /c|core.hooksPath is set, so this is required'
+        'chainer=up-to-date /c|(up to date)'
+        'chainer=refreshed /c|(refreshed)'
+        'chainer=foreign /c|was not written by jkb'
+        'chainer=failed /c|could not install the chainer at /c'
+        'exclude=added /p|added to .git/info/exclude'
+        'exclude=kept /p|already in .git/info/exclude'
+        'exclude=retracted /p|dropped from .git/info/exclude'
+        'exclude=unowned /p|cannot prove it wrote'
+        'exclude=failed (cannot write /e)|could not update .git/info/exclude'
+        'dispatch=unknown /c|the repo hook never runs'
+        'dispatch=dead /c|will NOT run the repo hook above'
+        'error=not a git repo|not a git repo; skipping hook install'
+    )
+    local entry ok_all=1 missing=""
+    for entry in "${table[@]}"; do
+        line="${entry%%|*}"; want="${entry#*|}"
+        rendered="$(printf '%s\n' "$line" | render_git_hooks_report 2>&1)"
+        case "$rendered" in
+            *"$want"*) ;;
+            *) ok_all=0; missing="$missing [$line -> '$rendered']" ;;
+        esac
+    done
+    [ "$ok_all" = 1 ] \
+        && ok "every state the producer can emit has a render arm that names it" \
+        || fail "render: table" "no distinctive output for:$missing"
+
+    # The two silent verdicts are silent ON PURPOSE — the lines above them already said the
+    # hook will run — so assert the silence rather than leaving it unstated.
+    for line in 'dispatch=direct' 'dispatch=chained /c' 'exclude=none (nothing is hiding it)'; do
+        rendered="$(printf '%s\n' "$line" | render_git_hooks_report 2>&1)"
+        [ -z "$rendered" ] || { ok_all=0; missing="$missing [$line said '$rendered']"; }
+    done
+    [ "$ok_all" = 1 ] \
+        && ok "and the states with nothing to report say nothing" \
+        || fail "render: silence" "expected silence:$missing"
 }
 
 echo "==> scripts/lib.sh::install_chainer"
@@ -535,9 +699,12 @@ case7
 case8
 case9
 case10
+case10b
 case11
 case11b
 case12
+case12b
 case13
+case14
 
 finish

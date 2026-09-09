@@ -433,6 +433,15 @@ install_git_hooks() {
         return 0
     fi
     chainer="$override/post-merge"
+    # `core.hooksPath` can legitimately point AT the directory git would have used anyway, and
+    # then there is nothing to chain to: the hook just installed IS the one git runs. Without
+    # this, `install_chainer` compares the repo hook against `chainer_body`, calls it foreign,
+    # and setup.sh warns that a file jkb wrote thirty microseconds earlier was not written by
+    # jkb — advising the user to check a dispatch line that would be a loop.
+    if [ "$chainer" = "$hooks_dir/post-merge" ]; then
+        printf 'dispatch=direct\n'
+        return 0
+    fi
 
     if mkdir -p "$override" 2>/dev/null; then
         outcome="$(install_chainer "$chainer")"
@@ -458,7 +467,11 @@ install_git_hooks() {
 
     if [ "$want" = yes ]; then
         printf 'dispatch=chained %s\n' "$chainer"
-    elif [ -x "$chainer" ]; then
+    elif [ -f "$chainer" ] && [ -x "$chainer" ]; then
+        # `-f` as well as `-x`: a directory is executable to `test` and unrunnable to git, and
+        # a directory is exactly what sits there when a directory-style hook manager owns the
+        # path (see `install_exec`'s own refusal). Calling that `unknown` would report "this
+        # may well dispatch" about the one case that provably cannot.
         printf 'dispatch=unknown %s\n' "$chainer"
     else
         printf 'dispatch=dead %s\n' "$chainer"
