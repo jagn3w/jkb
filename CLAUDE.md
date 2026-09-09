@@ -656,13 +656,41 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   read from the porcelain's own `bare` attribute, not from `--is-bare-repository` of the
   directory this run was handed: in a bare-repo-plus-worktrees layout that answers `false` from
   the worktree, and the bare git dir then became the "main checkout".
+- **A fact that disqualifies one branch is asked on that branch.** Bare-ness was asked at the
+  top of `git_hooks_exclude_pattern` and returned for the whole function — but it means only
+  "there is no main checkout to anchor an ABSOLUTE path against". A *relative* `core.hooksPath`
+  needs no main checkout at all: it resolves inside each linked worktree, so in a
+  bare-repo-plus-worktrees layout the top-level gate dropped a working exclusion and made jkb
+  **retract the block it had written itself**, leaving the worktree it had just written the
+  chainer into reading dirty. The test for that layout drove only the absolute case, which is
+  why it stayed green.
 - **Declining to hide something is not the same as having nothing to hide, and only one of them
   is silent.** An absolute `core.hooksPath` inside a *linked* worktree cannot be excluded — an
   anchored rule applies to every tree at once — but the chainer really is an untracked file in a
   real tree, so it is `exposed` and the renderer warns, naming the tree and that `jkb task land`
   refuses a dirty target. Reported as `none`, which renders nothing, that tree read dirty for
   ever with nothing attributing the file to jkb: the very failure the exclusion exists to
-  prevent, reached by the mechanism meant to prevent it.
+  prevent, reached by the mechanism meant to prevent it. It is also a claim about **jkb's own**
+  file, so only the caller — which knows the chainer outcome — may make it: derived from the
+  path alone it warned, on every unattended pull, that jkb's chainer was dirtying a tree, about
+  a file the user wrote and jkb had refused to touch three lines earlier.
+- **setup.sh's closing summary is rendered from lib.sh, like the hook report before it.** It
+  produced a finding in three consecutive review rounds — the watcher line claiming "running"
+  after activation had failed and said so, the roots line asserting five roots the scaffold had
+  just failed to create, the extension line telling you to reload for a build never made — and
+  every one was invisible to a green gate, because nothing executes setup.sh. Each section now
+  reports a **state word** (`created|untouched|skipped|failed`, …) rather than a boolean: a
+  boolean could not tell "skipped by flag" from "an existing KB was left untouched", and the
+  two arms that create nothing now name the command that repairs it instead of asserting the
+  roots — "re-run setup.sh" was not a remedy, since the failure leaves the db file behind and
+  the re-run takes the *left untouched* arm.
+- **The shell-syntax gate is one function, not two copies of a file list.** `shell_sources` +
+  `check_shell_syntax` live in lib.sh and CI calls them, because the hand-written copy in
+  `check.sh` and the one in `ci.yml` drifted by a `*.md` skip within a commit of each other —
+  green locally, red in CI, on one tree. It selects by **shebang**, not by a two-extension
+  denylist (`scripts/hooks/post-merge` has no `.sh`, and the next `.txt` beside a hook would
+  have been fed to `bash -n`), and **finding no files is a failure**: every unmatched glob was
+  swallowed, so a broken gate printed its header and then "All checks passed".
 - **A jkb block is defined positively, so the bad shapes follow instead of being remembered**: a
   known marker line immediately followed by a *pattern-shaped* line (non-empty, not itself a
   marker, not a comment). A marker that heads nothing is an **orphan** — jkb's own line, inert

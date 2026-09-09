@@ -4,21 +4,18 @@
 set -euo pipefail
 
 # Parse every shell file in the repo before running anything. NOTHING executes setup.sh, so a
-# control-flow edit there (an unbalanced `if`, a stray `fi`) reached the gate unchecked — and
-# setup.sh is what the post-merge hook runs unattended after a pull. The same is true of the
-# PreToolUse hooks and the container scripts, and there it is sharper: bash exits 2 on a syntax
-# error, and a PreToolUse hook exiting 2 reads as DENY, so a broken hook does not fail open the
-# way its own header promises — it blocks every Bash tool call for everyone after a pull.
-# `bash -n`, not shellcheck: always present, and this is the syntax gate rather than the lint.
-# CI runs the identical loop first, for the same reasons.
+# control-flow edit there reached the gate unchecked — and setup.sh is what the post-merge hook
+# runs unattended after a pull. The same is true of the PreToolUse hooks, and there it is
+# sharper: bash exits 2 on a syntax error, and a PreToolUse hook exiting 2 reads as DENY, so a
+# broken hook does not fail open the way its header promises — it blocks every Bash tool call
+# for everyone after a pull. First, because it needs no toolchain and takes a second.
+#
+# The list and the loop both live in lib.sh, so CI runs this exact code rather than a second
+# hand-written copy of it — the two copies had already drifted by a `*.md` skip.
 echo "==> shell syntax"
-root="$(cd "$(dirname "$0")/.." && pwd)"
-for f in "$root"/scripts/*.sh "$root"/scripts/tests/*.sh "$root"/scripts/hooks/* \
-         "$root"/.claude/hooks/* "$root"/.container/*.sh; do
-    [ -f "$f" ] || continue
-    case "$f" in *.md|*.json) continue ;; esac
-    bash -n "$f" || { echo "   $f does not parse" >&2; exit 1; }
-done
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
+check_shell_syntax "$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "==> rustfmt (check)"
 cargo fmt --all -- --check

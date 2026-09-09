@@ -370,11 +370,6 @@ EOF
         printf 'none (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
-    if [ "$bare" -eq 1 ]; then
-        printf 'none (a bare repository has no working tree of its own)\n'
-        return 0
-    fi
-
     configured="$(git -C "$repo_root" config --get --path core.hooksPath 2>/dev/null)"
     rc=$?
     case "$rc" in
@@ -387,6 +382,25 @@ EOF
     case "$configured" in
         /*)
             configured="$(_real_dir "$configured")"
+            # Bare-ness disqualifies THIS branch only, and that is the whole of what it means
+            # here: a bare repository has no checkout to anchor an absolute path against, so
+            # `$main_top` is the bare git dir. Asked at the top of the function it answered for
+            # every branch — and a RELATIVE `core.hooksPath` in a bare-repo-plus-worktrees
+            # layout needs no main checkout at all. It resolves inside each linked worktree,
+            # exactly as it does anywhere else, so returning `none` there dropped a working
+            # exclusion and made jkb retract the block it had written itself.
+            if [ "$bare" -eq 1 ]; then
+                # Skip the main entry: `worktree list` reports the bare git dir as a record,
+                # and it is not a working tree — naming it as one told the user their chainer
+                # was inside a tree that does not exist.
+                hit="$(_worktree_containing "$configured" "$tops" "$main_top")" || hit=""
+                if [ -n "$hit" ]; then
+                    printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
+                else
+                    printf 'none (core.hooksPath is outside every working tree, so nothing of ours is hidden)\n'
+                fi
+                return 0
+            fi
             if [ "$configured" = "$main_top" ]; then
                 rel=""
             else
@@ -399,17 +413,9 @@ EOF
                         # ever with nothing attributing the file to jkb. An anchored rule
                         # applies to every tree at once, so hiding it is not available; being
                         # quiet about it is not the same trade.
-                        # No "skip the main worktree" guard: this arm is only reached when
-                        # `$configured` did NOT match `"$main_top"/*`, so main can never
-                        # match here either. A guard that cannot fire is a second model of
-                        # the world rather than defence in depth — and a mutation removing
-                        # it left every suite green, which is how it was noticed.
-                        while IFS= read -r wt; do
-                            [ -n "$wt" ] || continue
-                            case "$configured/" in "$wt"/*) hit="$wt" ;; esac
-                        done <<EOF2
-$tops
-EOF2
+                        # No skip: this arm is reached only when `$configured` did NOT
+                        # match `"$main_top"/*`, so main cannot match here either.
+                        hit="$(_worktree_containing "$configured" "$tops" "")" || hit=""
                         if [ -n "$hit" ]; then
                             printf 'exposed (the chainer is inside the worktree at %s; an anchored rule would hide that path in every worktree, so it is left visible)\n' "$hit"
                         else
@@ -427,6 +433,24 @@ EOF2
     # An empty `rel` is the tree root, which is a real place to hide something, not a reason
     # to give up: `core.hooksPath = .` puts the chainer at `<root>/post-merge`.
     printf 'pattern /%s\n' "${rel:+$rel/}post-merge"
+}
+
+# _worktree_containing <absolute dir> <tops, newline-separated> <skip, or empty> — print the
+# working tree that contains <absolute dir>, if any.
+#
+# A `read` loop, never `for x in $tops`: that word-splits on spaces, and a checkout under
+# `~/My Projects/` is not exotic. One implementation because there are two callers — the bare
+# and non-bare branches — and two would be two ideas of what "contains" means.
+_worktree_containing() {
+    local dir="$1" tops="$2" skip="$3" wt
+    while IFS= read -r wt; do
+        [ -n "$wt" ] || continue
+        [ -n "$skip" ] && [ "$wt" = "$skip" ] && continue
+        case "$dir/" in "$wt"/*) printf '%s' "$wt"; return 0 ;; esac
+    done <<EOF
+$tops
+EOF
+    return 1
 }
 
 # _normalize_rel <relative path> — the path as a clean sequence of segments, or non-zero if
@@ -650,7 +674,9 @@ reconcile_exclude() {
 #   repo-hook=<path>          the hook, installed where git actually runs hooks from
 #   chainer=<outcome> <path>  installed | up-to-date | refreshed | foreign | failed
 #   exclude=<state> <detail>  added | kept | retracted | deduplicated | tidied | unowned |
-#                             none | failed  (repeatable: the sweep reports one line per block)
+#                             exposed | none | failed  (repeatable: the sweep reports one line
+#                             per block). `exposed` and `none` differ in one thing: `exposed`
+#                             means ours IS in a working tree and jkb is declining to hide it.
 #   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
@@ -749,6 +775,17 @@ install_git_hooks() {
     esac
     # Nothing to own means nothing to want, whatever the chainer did.
     [ -n "$pattern" ] || want=no
+    # `exposed` says "the chainer jkb installed is visible in that tree". The derivation knows
+    # only the path, so it cannot tell that jkb installed nothing there — and for a `foreign`
+    # chainer this warned, on every unattended pull, that jkb's file was dirtying a tree,
+    # about a file the user wrote and jkb had refused to touch three lines earlier. It is a
+    # claim about OUR file, so only the caller, which knows the outcome, may make it.
+    case "$pat_line" in
+        "exposed "*)
+            [ "$want" = yes ] \
+                || pattern_reason="none (the file at that path is not one jkb wrote)"
+            ;;
+    esac
     reconcile_exclude "$repo_root" "$pattern" "$want" "$pattern_reason"
 
     printf 'dispatch=%s\n' "$verdict"
@@ -824,4 +861,120 @@ render_git_hooks_report() {
             *) warn "unrecognised report line: $line" ;;
         esac
     done
+}
+
+# --- what setup.sh finished with ----------------------------------------------------------
+# render_setup_summary — turn setup.sh's closing `key=state [detail]` report on stdin into the
+# lines a person reads.
+#
+# Here, not inline in setup.sh, for the third time and the same reason: NOTHING executes
+# setup.sh, so an arm written there is reachable from no test. That is not a hypothetical cost
+# — the summary has now produced a finding in three consecutive review rounds (the watcher line
+# claiming "running" after activation failed, the roots line asserting roots the scaffold had
+# just failed to create, the extension line telling you to reload for a build that was never
+# made), and each was invisible to a green gate. `install_git_hooks` and
+# `render_git_hooks_report` moved here for exactly this; the summary is the last block that
+# had not.
+#
+# The protocol, closed:
+#
+#   jkb=<path>                 where the binary is
+#   database=<path>            the db this run used
+#   scaffold=<state> [detail]  created | untouched | skipped | failed
+#   extension=<state>          installed | skipped | failed
+#   watcher=<state>            running | skipped | failed
+#
+# Every `case` has a default arm that warns, so a state added to the producer with no arm here
+# surfaces at runtime instead of vanishing.
+render_setup_summary() {
+    local line rest state detail
+    while IFS= read -r line; do
+        rest="${line#*=}"
+        state="${rest%% *}"
+        case "$rest" in *' '*) detail="${rest#* }" ;; *) detail="" ;; esac
+        case "$line" in
+            jkb=*)      printf '  • jkb:        %s\n' "$rest" ;;
+            database=*) printf '  • database:   %s\n' "$rest" ;;
+            scaffold=*)
+                case "$state" in
+                    created)   printf '  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)\n' ;;
+                    # NOT an assertion that the roots exist. The database was already there, so
+                    # this run created nothing and checked nothing — and the previous wording
+                    # asserted five roots for a KB some other command may have made with one.
+                    untouched) printf '  • roots:      not verified (an existing KB was left untouched)\n'
+                               printf '                run: jkb --db %s ns mk repos tasks media references memory\n' "$detail" ;;
+                    skipped)   printf '  • roots:      skipped (--no-scaffold)\n' ;;
+                    # The remedy is the command that repairs it, not "re-run setup.sh": the
+                    # failure leaves the db file behind, so a re-run takes the `existing KB —
+                    # left untouched` arm and never retries.
+                    failed)    printf '  • roots:      NOT created — run: jkb --db %s ns mk repos tasks media references memory\n' "$detail" ;;
+                    *)         warn "unrecognised scaffold state: $line" ;;
+                esac ;;
+            extension=*)
+                case "$state" in
+                    installed) printf '  • extension:  reload VS Code ('"'"'Developer: Reload Window'"'"') to activate\n' ;;
+                    skipped)   printf '  • extension:  skipped (--no-extension)\n' ;;
+                    failed)    printf '  • extension:  NOT installed; see the warnings above\n' ;;
+                    *)         warn "unrecognised extension state: $line" ;;
+                esac ;;
+            watcher=*)
+                case "$state" in
+                    running) printf '  • watcher:    running; file edits under mounts auto-sync\n' ;;
+                    skipped) printf '  • watcher:    skipped (--no-service)\n' ;;
+                    failed)  printf '  • watcher:    NOT running; see the warnings above to activate it\n' ;;
+                    *)       warn "unrecognised watcher state: $line" ;;
+                esac ;;
+            '') : ;;
+            *) warn "unrecognised summary line: $line" ;;
+        esac
+    done
+}
+
+# --- the repo's shell -----------------------------------------------------------------------
+# shell_sources — every shell file in the repo, one per line.
+#
+# ONE list, because it is consumed by `scripts/check.sh` and by `.github/workflows/ci.yml` and
+# a hand-written copy in each drifted the moment one gained a `*.md` skip the other lacked:
+# green locally, red in CI, on the same tree. CI sources this file and calls the function.
+#
+# A shebang test, not a denylist of extensions: `scripts/hooks/post-merge` has no `.sh`, and
+# `*.md|*.json` only names the two non-shell things that happen to be there today — the next
+# `.txt` dropped into `.claude/hooks/` would be handed to `bash -n` and reported as a syntax
+# error it does not have.
+shell_sources() {
+    local root="$1" f head
+    for f in "$root"/scripts/*.sh "$root"/scripts/tests/*.sh "$root"/scripts/hooks/* \
+             "$root"/.claude/hooks/* "$root"/.container/*.sh; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            *.sh) printf '%s\n' "$f"; continue ;;
+        esac
+        IFS= read -r head <"$f" || head=""
+        case "$head" in
+            '#!'*sh|'#!'*sh\ *) printf '%s\n' "$f" ;;
+        esac
+    done
+}
+
+# check_shell_syntax <repo root> — parse every shell file; fail if any does not, or if none
+# was found.
+#
+# "None was found" is a failure, not a fact about the machine: the list is a fixed repo layout,
+# so an empty match means the gate is broken. Unmatched globs were swallowed by the `[ -f ]`
+# guard, so a zero-coverage run printed its header and then "All checks passed" — the vacuity
+# the shell-tests stage grew a counter for, in the same file, one stage below.
+check_shell_syntax() {
+    local root="$1" f n=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        bash -n "$f" || { echo "   $f does not parse" >&2; return 1; }
+        n=$((n + 1))
+    done <<EOF
+$(shell_sources "$root")
+EOF
+    if [ "$n" -eq 0 ]; then
+        echo "   (no shell files found — this gate is broken, not idle)" >&2
+        return 1
+    fi
+    echo "   $n shell file(s) parse"
 }

@@ -28,12 +28,15 @@ do_extension=1
 do_service=1
 do_scaffold=1
 link_memory=0
-# Means "the watcher is actually running", not "the unit files were written". Wiring it to
-# the write alone left the summary claiming "watcher: running" after `launchctl load` or
-# `systemctl --user enable` had just failed and said so two lines earlier — four ways for one
-# line to lie, three of them still open.
-scaffold_ok=1
-service_ok=1
+# One state word per section, rendered at the end by `render_setup_summary` in lib.sh. Each
+# means what actually happened, not what was attempted: `watcher=running` is set to `failed`
+# by every arm that reports a failed or absent activation, not just by a failed write, and
+# `scaffold` distinguishes "skipped by flag" from "an existing KB was left untouched" from
+# "creating them failed" — a boolean could not, and the summary asserted five roots in two of
+# the three.
+scaffold_state=created
+extension_state=installed
+watcher_state=running
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -86,8 +89,10 @@ echo "installed: $(command -v jkb) ($(jkb --version))"
 # shared/cloud-synced path). The DB + migrations are created on first open; `_sys/`
 # comes from the migrations, these are the reserved semantic roots (design D32).
 if [ "$do_scaffold" -eq 0 ]; then
+  scaffold_state=skipped
   warn "skipping KB scaffold (--no-scaffold)"
 elif [ -f "$db" ]; then
+  scaffold_state=untouched
   say "existing KB detected ($db) — left untouched"
 else
   say "scaffold KB namespaces ($db)"
@@ -100,7 +105,7 @@ else
   # machine whose `cargo install` fails has nothing working to repair anyway. On the
   # unattended pull path the hook is already installed from an earlier run, so it survives.
   if mkdir -p "$(dirname "$db")" && jkb --db "$db" ns mk repos tasks media references memory; then :; else
-    scaffold_ok=0
+    scaffold_state=failed
     warn "could not scaffold the KB at $db — continuing to the git hooks."
   fi
 fi
@@ -109,9 +114,11 @@ fi
 if [ "$do_extension" -eq 1 ]; then
   say "build + install VS Code extension"
   if "$repo_root/scripts/install-extension.sh"; then :; else
+    extension_state=failed
     warn "extension install skipped/failed (VS Code or pnpm missing?) — continuing."
   fi
 else
+  extension_state=skipped
   warn "skipping VS Code extension (--no-extension)"
 fi
 
@@ -134,7 +141,7 @@ if [ "$do_service" -eq 1 ]; then
         launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
         if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
           warn "could not load $label; activate manually: launchctl load $plist"
-          service_ok=0
+          watcher_state=failed
         fi
       done ;;
     Linux)
@@ -143,26 +150,27 @@ if [ "$do_service" -eq 1 ]; then
         for label in com.jkb.sync com.jkb.reap; do
           if systemctl --user enable --now "$label"; then echo "$label enabled (systemd)"; else
             warn "could not enable $label; activate manually: systemctl --user enable --now $label"
-            service_ok=0
+            watcher_state=failed
           fi
         done
       else
         warn "systemctl not found; activate the printed units manually."
-        service_ok=0
+        watcher_state=failed
       fi ;;
     # Reachable only after `jkb service install` succeeded, and that refuses any platform but
     # macOS and Linux — so "unsupported OS" was the wrong diagnosis for the one state that
     # gets here: `uname` said something the two arms above did not recognise.
     *) warn "unrecognised platform '$(uname -s)'; the units were written — activate them manually."
-       service_ok=0 ;;
+       watcher_state=failed ;;
   esac
   else
     # A distinct variable, not `do_service=0`: that is the flag, and reusing it would make the
     # summary below report a failure as "--no-service" — the user's choice, which it was not.
-    service_ok=0
+    watcher_state=failed
     warn "could not write the service units — continuing to the git hooks."
   fi
 else
+  watcher_state=skipped
   warn "skipping watcher service (--no-service)"
 fi
 
@@ -186,6 +194,11 @@ if [ -f "$hooks_src" ]; then
   # for the report arriving. `install_git_hooks` is itself `set -e`-safe (see lib.sh's header)
   # — it used to depend on an incidental `|| true` right here for that.
   render_git_hooks_report < <(install_git_hooks "$repo_root" "$hooks_src")
+else
+  # A header followed by nothing reads exactly like a stage that ran — the vacuity this file
+  # and check.sh have both grown guards against. This is the one stage a partial setup must
+  # reach, so it may not be the one that disappears quietly.
+  warn "no hook source at $hooks_src — the post-merge hook was NOT installed."
 fi
 
 # --- shared claude memory (opt-in) -------------------------------------------
@@ -196,29 +209,14 @@ if [ "$link_memory" -eq 1 ]; then
 fi
 
 say "setup complete"
-echo "  • jkb:        $(command -v jkb)"
-echo "  • database:   $db"
-# Gated for the same reason as the watcher line below: making the scaffold non-fatal turned
-# this into an assertion that could be printed one screen after warning it had failed. `set -e`
-# used to keep it honest by killing the script.
-if [ "$scaffold_ok" -eq 1 ]; then
-  echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
-else
-  echo "  • roots:      NOT created — re-run setup.sh once the KB at $db is reachable"
-fi
-# `if`, not `[ … ] && echo`. `set -e` does NOT exit here — it exempts every command in an
-# `&&` list but the last — but the list's status is still non-zero, and as the final statement
-# that becomes the script's own. So `setup.sh --no-service` exited 1, and the post-merge hook's
-# `|| echo "setup.sh failed"` would have believed it.
-if [ "$do_extension" -eq 1 ]; then
-  echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
-fi
-if [ "$do_service" -eq 0 ]; then
-  echo "  • watcher:    skipped (--no-service)"
-elif [ "$service_ok" -eq 1 ]; then
-  echo "  • watcher:    running; file edits under mounts auto-sync"
-else
-  # The distinction `service_ok` exists for only reaches the reader if the negative outcome is
-  # printed too — silence in both cases is what made the flag invisible.
-  echo "  • watcher:    NOT running; see the warnings above to activate it"
-fi
+# The report, rendered by lib.sh so the arms are reachable from a test. Inline, this block
+# produced a finding in three consecutive review rounds and every one of them was invisible to
+# a green gate. `< <(…)`, not a pipe: a process substitution's status is never checked, so
+# nothing here can fail the script at its last statement.
+render_setup_summary < <(
+  printf 'jkb=%s\n' "$(command -v jkb)"
+  printf 'database=%s\n' "$db"
+  printf 'scaffold=%s %s\n' "$scaffold_state" "$db"
+  printf 'extension=%s\n' "$extension_state"
+  printf 'watcher=%s\n' "$watcher_state"
+)

@@ -21,19 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # First, because it needs no toolchain and takes a second. `scripts/check.sh` runs the
-      # IDENTICAL loop, also first — the two must stay one rule, so neither can be green while
-      # the other is red on the same tree. A broken PreToolUse hook is the sharp case: bash
-      # exits 2 on a syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not
-      # fail open the way its header promises.
+      # The SAME code check.sh runs, not a second copy of the list: the two hand-written
+      # copies drifted by a `*.md` skip within one commit of each other — green locally, red
+      # here, on the same tree. A broken PreToolUse hook is the sharp case: bash exits 2 on a
+      # syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not fail open
+      # the way its header promises.
       - name: shell syntax
-        run: |
-          for f in scripts/*.sh scripts/tests/*.sh scripts/hooks/* \
-                   .claude/hooks/* .container/*.sh; do
-            [ -f "$f" ] || continue
-            case "$f" in *.md|*.json) continue ;; esac
-            bash -n "$f" || { echo "$f does not parse" >&2; exit 1; }
-          done
+        run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
 
       # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
       # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no

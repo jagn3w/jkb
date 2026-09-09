@@ -505,6 +505,45 @@ case10e() {
     done
 }
 
+# --- 10f. `exposed` is a claim about OUR file, so a foreign chainer may not make it ---------
+# The derivation knows only the path, so it cannot tell that jkb installed nothing there. For
+# a `foreign` chainer it warned — on every unattended pull — that jkb's chainer was dirtying a
+# tree, about a file the user wrote and jkb had refused to touch three lines earlier. It also
+# took the opposite position from the pattern branch, which for `foreign` sets want=no and
+# stays silent.
+case10f() {
+    local d="$work/foreignexposed" m out
+    mkdir -p "$d"
+    m="$d/main"
+    git_q init -q "$m" >/dev/null 2>&1
+    git_q -C "$m" commit -q --allow-empty -m init
+    git_q -C "$m" worktree add -q "$d/wt" -b side >/dev/null 2>&1
+    mkdir -p "$d/wt/.githooks"
+    printf '#!/bin/sh\n# my own hook\ndirenv reload\n' >"$d/wt/.githooks/post-merge"
+    git_q -C "$m" config core.hooksPath "$d/wt/.githooks"
+    printf '#!/bin/sh\necho HOOK\n' >"$d/src"
+
+    out="$(install_git_hooks "$m" "$d/src")"
+    case "$out" in
+        *"chainer=foreign"*) ok "a foreign chainer in a linked worktree is reported foreign" ;;
+        *) fail "foreignexposed: premise" "got: $(printf '%s' "$out" | tr '\n' '|')"; return ;;
+    esac
+    case "$out" in
+        *"exclude=exposed"*)
+            fail "foreignexposed: claim" "jkb claimed its own chainer is exposed, about a file it refused to touch" ;;
+        *) ok "and jkb does not claim the file there is one it installed" ;;
+    esac
+    # And the same run must not warn about a tree it did not dirty.
+    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
+        *"chainer jkb installed is not hidden"*)
+            fail "foreignexposed: render" "it warned about jkb's chainer dirtying the tree" ;;
+        *) ok "nor warn about dirtying a tree with it" ;;
+    esac
+    grep -q 'direnv reload' "$d/wt/.githooks/post-merge" \
+        && ok "and the user's hook is untouched" \
+        || fail "foreignexposed: clobbered" "the user's hook was overwritten"
+}
+
 # --- 11. the report survives `set -e`, and never claims a hook was skipped -----------------
 # Two findings. The report used to reach setup.sh only because the call happened to be
 # written `… || true`, which disables `set -e` for the whole function body; without it the
@@ -939,6 +978,74 @@ case14() {
         || fail "render: silence" "expected silence:$noisy"
 }
 
+# --- 15. setup.sh's closing summary says what happened, in every state --------------------
+# It sits in lib.sh for the third time and the same reason: NOTHING executes setup.sh, so an
+# arm written there is reachable from no test. That is a measured cost, not a hypothetical —
+# the summary produced a finding in three consecutive review rounds (the watcher line claiming
+# "running" after activation had failed and said so; the roots line asserting five roots the
+# scaffold had just failed to create; the extension line telling you to reload for a build
+# that was never made), each invisible to a green gate.
+case15() {
+    local entry line want rendered ok_all=1 bad=""
+    local -a table=(
+        'jkb=/usr/local/bin/jkb|jkb:        /usr/local/bin/jkb'
+        'database=/h/.jkb/jkb.db|database:   /h/.jkb/jkb.db'
+        'scaffold=created /db|roots:      repos/ tasks/ media/ references/ memory/'
+        'scaffold=untouched /db|not verified'
+        'scaffold=skipped /db|skipped (--no-scaffold)'
+        'scaffold=failed /db|NOT created'
+        'extension=installed|reload VS Code'
+        'extension=skipped|skipped (--no-extension)'
+        'extension=failed|NOT installed'
+        'watcher=running|running; file edits'
+        'watcher=skipped|skipped (--no-service)'
+        'watcher=failed|NOT running'
+    )
+    for entry in "${table[@]}"; do
+        line="${entry%%|*}"; want="${entry#*|}"
+        rendered="$(printf '%s\n' "$line" | render_setup_summary 2>&1)"
+        case "$rendered" in
+            *"$want"*) ;;
+            *) ok_all=0; bad="$bad [$line -> '$rendered']" ;;
+        esac
+    done
+    [ "$ok_all" = 1 ] \
+        && ok "every state setup.sh can report renders something that names it" \
+        || fail "summary: table" "wrong:$bad"
+
+    # The two arms that must NOT assert what they cannot know. `untouched` created nothing and
+    # checked nothing, and `failed` left the db file behind — so "re-run setup.sh" takes the
+    # `existing KB — left untouched` arm and repairs nothing. Both must name the command that
+    # does.
+    for line in 'scaffold=untouched /h/kb.db' 'scaffold=failed /h/kb.db'; do
+        rendered="$(printf '%s\n' "$line" | render_setup_summary 2>&1)"
+        case "$rendered" in
+            *"ns mk repos tasks media references memory"*) ;;
+            *) ok_all=0; bad="$bad [$line gave no repair command]" ;;
+        esac
+        case "$rendered" in
+            *"repos/ tasks/ media/ references/ memory/ (+ _sys/)"*)
+                ok_all=0; bad="$bad [$line asserted the roots exist]" ;;
+        esac
+    done
+    [ "$ok_all" = 1 ] \
+        && ok "and the two that created nothing name the repair instead of asserting roots" \
+        || fail "summary: honesty" "wrong:$bad"
+
+    # Default arms, as everywhere else in this protocol.
+    local defaults_ok=1 noisy=""
+    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways'; do
+        rendered="$(printf '%s\n' "$line" | render_setup_summary 2>&1)"
+        case "$rendered" in
+            *unrecognised*) ;;
+            *) defaults_ok=0; noisy="$noisy [$line -> '$rendered']" ;;
+        esac
+    done
+    [ "$defaults_ok" = 1 ] \
+        && ok "and an unknown key or state is warned about, not swallowed" \
+        || fail "summary: defaults" "swallowed:$noisy"
+}
+
 echo "==> scripts/lib.sh::install_chainer"
 case1
 case1b
@@ -955,6 +1062,7 @@ case10b
 case10c
 case10d
 case10e
+case10f
 case11
 case11b
 case11c
@@ -963,5 +1071,6 @@ case12
 case12b
 case13
 case14
+case15
 
 finish
