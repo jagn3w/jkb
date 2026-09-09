@@ -479,7 +479,7 @@ case6m() {
     # BOTH arms, because a list of one is not a register of arms — the next person adding a
     # fifth `none`/`undecided` arm reads this as the place they are enumerated, adds nothing,
     # and the suite stays green.
-    local arm got bad=""
+    local arm got bad="" checked=0
     mkdir -p "$work/not-a-repo"                       # worktree list cannot answer
     local unresolvable="$work/unresolvable"           # config --get cannot answer
     git_q init -q "$unresolvable" >/dev/null 2>&1
@@ -493,14 +493,19 @@ case6m() {
             continue
         fi
         got="$(git_hooks_exclude_pattern "$arm" 2>/dev/null)"
+        checked=$((checked + 1))
         case "$got" in
             "undecided "*) ;;
             *) bad="$bad [$arm -> '$got']" ;;
         esac
     done
-    [ -z "$bad" ] \
-        && ok "every arm that means git would not answer says undecided, not proven absence" \
-        || fail "undecided: arms" "wrong:$bad"
+    # The count is in the message: one arm can legitimately skip (a git that resolves
+    # `~nosuchuser` without failing), and "every arm" read as a claim about all of them while
+    # the loop might have checked one. A loop whose arms can all skip reports success having
+    # checked nothing.
+    [ -z "$bad" ] && [ "$checked" -gt 0 ] \
+        && ok "$checked arm(s) that mean git would not answer say undecided, not proven absence" \
+        || fail "undecided: arms" "checked=$checked wrong:$bad"
 
     # `unknown` — the DERIVATION could not answer — leaves every block exactly as it was.
     # Distinct from `undecided`, which says only that THIS pattern is undecided and must still

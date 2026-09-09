@@ -541,7 +541,9 @@ _is_exclude_pattern_line() {
 #   exclude=exposed <reason>         ours IS inside a working tree and cannot be hidden there
 #   exclude=undecided <reason>       nothing could be established; nothing was changed
 #   exclude=none <reason>            nothing to do
-#   exclude=failed <reason>          a write was attempted and did not land
+#   exclude=failed <reason>          a write was attempted and did not land — or was refused
+#                                    before anything was read or written, which is the same
+#                                    thing from the caller's side: the file is as it was
 #
 # <want> is four-valued, because there are two different unknowns here and sharing one word
 # for them cost a stranded block. `yes` — we own this pattern and it must be excluded. `no` —
