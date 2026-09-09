@@ -401,6 +401,49 @@ case6e() {
         || fail "crlf: lost" "file: $(tr '\n' '|' <"$r/.git/info/exclude")"
 }
 
+# --- 6k. every spelling of core.hooksPath normalizes to what git actually matches ---------
+# A pair of prefix strips left `.`, `a/.`, `a//b`, `.//x` and `hooks/./x` as
+# `/./post-merge`, `/a/./post-merge`, `/a//b/post-merge` … — patterns git does not match. It
+# destroys nothing, so nothing failed loudly: the chainer simply stayed visible and the tree
+# read dirty for ever, which is the exact failure the exclusion exists to prevent.
+case6k() {
+    local r="$work/spellings" entry v want got ok_all=1 bad=""
+    git_q init -q "$r" >/dev/null 2>&1
+    git_q -C "$r" commit -q --allow-empty -m init
+    local -a table=(
+        '.githooks|pattern /.githooks/post-merge'
+        './githooks|pattern /githooks/post-merge'
+        'githooks/|pattern /githooks/post-merge'
+        '.|pattern /post-merge'
+        './|pattern /post-merge'
+        'a//b|pattern /a/b/post-merge'
+        'a/.|pattern /a/post-merge'
+        './/.githooks|pattern /.githooks/post-merge'
+        'hooks/./x|pattern /hooks/x/post-merge'
+        '..|none'
+        'x/../y|none'
+    )
+    for entry in "${table[@]}"; do
+        v="${entry%%|*}"; want="${entry#*|}"
+        git_q -C "$r" config core.hooksPath "$v"
+        got="$(git_hooks_exclude_pattern "$r")"
+        case "$want" in
+            none) case "$got" in "none ("*) ;; *) ok_all=0; bad="$bad [$v -> '$got']" ;; esac ;;
+            *) [ "$got" = "$want" ] || { ok_all=0; bad="$bad [$v -> '$got' want '$want']"; } ;;
+        esac
+    done
+    [ "$ok_all" = 1 ] \
+        && ok "every core.hooksPath spelling normalizes to one git would match" \
+        || fail "spellings" "wrong:$bad"
+
+    # An absolute value naming the tree root itself: the same answer, by the other branch.
+    git_q -C "$r" config core.hooksPath "$(cd "$r" && pwd -P)"
+    got="$(git_hooks_exclude_pattern "$r")"
+    [ "$got" = "pattern /post-merge" ] \
+        && ok "and an absolute path naming the tree root is the tree root, not itself" \
+        || fail "spellings: root" "got '$got'"
+}
+
 # --- 6h. an orphaned marker is tidied, never paired with the next marker ------------------
 # The sweep's own must-fix. It paired a marker with the line after it without checking that
 # line was not itself a marker: the user deletes only the pattern line, leaving the comment;
@@ -570,6 +613,7 @@ case6b
 case6c
 case6d
 case6g
+case6k
 case6h
 case6j
 case6i

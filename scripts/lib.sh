@@ -366,23 +366,46 @@ git_hooks_exclude_pattern() {
             fi
             main_top="$(_real_dir "$main_top")"
             configured="$(_real_dir "$configured")"
-            case "$configured/" in
-                "$main_top"/*) rel="${configured#"$main_top"/}" ;;
-                *) printf 'none (core.hooksPath is not inside the main checkout, so an anchored rule would apply to every worktree)\n'
-                   return 0 ;;
-            esac
+            if [ "$configured" = "$main_top" ]; then
+                rel=""
+            else
+                case "$configured/" in
+                    "$main_top"/*) rel="${configured#"$main_top"/}" ;;
+                    *) printf 'none (core.hooksPath is not inside the main checkout, so an anchored rule would apply to every worktree)\n'
+                       return 0 ;;
+                esac
+            fi
             ;;
         *)
-            rel="$configured"
-            while :; do case "$rel" in ./*) rel="${rel#./}" ;; *) break ;; esac; done
-            while :; do case "$rel" in */) rel="${rel%/}" ;; *) break ;; esac; done
-            case "/$rel/" in
-                */../*) printf 'none (core.hooksPath escapes the working tree)\n'; return 0 ;;
-            esac
+            rel="$(_normalize_rel "$configured")" \
+                || { printf 'none (core.hooksPath escapes the working tree)\n'; return 0; }
             ;;
     esac
-    [ -n "$rel" ] || { printf 'none (core.hooksPath is the working tree itself)\n'; return 0; }
-    printf 'pattern /%s/post-merge\n' "$rel"
+    # An empty `rel` is the tree root, which is a real place to hide something, not a reason
+    # to give up: `core.hooksPath = .` puts the chainer at `<root>/post-merge`.
+    printf 'pattern /%s\n' "${rel:+$rel/}post-merge"
+}
+
+# _normalize_rel <relative path> — the path as a clean sequence of segments, or non-zero if
+# it escapes the tree. Empty output means "the tree root itself".
+#
+# Segment-wise, not a couple of prefix strips: `.`, `a/.`, `a//b`, `.//x` and `hooks/./x` are
+# all legal `core.hooksPath` values that a pair of strips turns into `/./post-merge`,
+# `/a/./post-merge`, `/a//b/post-merge` … — patterns git does not match. Nothing is destroyed,
+# but the chainer stays visible and the tree reads dirty for ever, which is the whole failure
+# this exclusion exists to prevent, arrived at quietly.
+_normalize_rel() {
+    local rest="$1" out="" seg
+    while [ -n "$rest" ]; do
+        seg="${rest%%/*}"
+        case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+        case "$seg" in
+            ''|.) continue ;;
+            ..) return 1 ;;
+        esac
+        out="${out:+$out/}$seg"
+    done
+    printf '%s' "$out"
 }
 
 # _is_exclude_pattern_line <line> — can this line be the pattern half of a jkb block?
