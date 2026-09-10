@@ -407,7 +407,7 @@ conventions every session is expected to know.
 - **Every spawn in the crate is now gated by ONE allowlist, keyed on (file, function).**
   Per-site pinning was the previous state of the art and it was not enough: it says nothing about
   the next file. `no_spawn_in_the_crate_resolves_a_repository_unscrubbed` walks every `.rs` under
-  the crate and requires each `Command::new` to sit in a named scrubbing constructor or in an
+  the crate root (skipping `target/`) and requires each `Command::new` to sit in a named scrubbing constructor or in an
   explicit `NOT_REPO_AWARE` list with its reason — so a new spawn forces the decision when it is
   written. Three rules it had to learn, each from something it missed:
   **test code counts** (its first version cut each file at `mod tests`, which is exactly where
@@ -416,7 +416,16 @@ conventions every session is expected to know.
   `deep/er` and `mergecommit`, and move its HEAD; measured, then measured again against the fix);
   **exempt by location, not by name** (keyed on the bare name `git_cmd`, a new module copying the
   idiom was exempt on arrival, and two files already spell it that way); and **every spawn is
-  classified**, so "not repository-aware" is a recorded decision rather than an omission. Its own
+  classified**, so "not repository-aware" is a recorded decision rather than an omission.
+  Two more it learned the round after: **an unrecognized declaration is not the previous
+  function** — a three-prefix list missed `pub(super) fn`, so `enclosing` kept the name above it
+  and an unscrubbed `gh` spawn written immediately after `gh_cmd` inherited its exemption
+  (measured; that is exempt-on-arrival reproduced inside the mechanism against it, and an unknown
+  spelled as a definite answer inside the rule that forbids it) — and **an exemption's named test
+  must exist**, since `src/archive.rs` was exempted on a comment naming a test that was nowhere
+  in the crate, so deleting that fixture's scrub left everything green. The comment is
+  machine-checked now. It also scans CODE rather than text (`code_only` blanks comments and
+  literals), because a `Command::new(` that rustfmt had split across lines was invisible to it. Its own
   allowlist error — keying `tests/sessions.rs` on the delegate rather than the spawn site — was
   caught by the guard on first run.
 - **Three repository-aware spawns, one rule, pinned at each of them.** Asking *who else

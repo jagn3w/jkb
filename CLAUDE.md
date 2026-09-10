@@ -246,8 +246,8 @@ cost to learn, and which alternatives were rejected and why.
 
 | Read this | Before you touch | Why it exists |
 |---|---|---|
-| [docs/git-hooks-installer.md](docs/git-hooks-installer.md) | `scripts/lib.sh`, `scripts/setup.sh`, `scripts/hooks/post-merge`, `crates/jkb-cli/src/gitrepo.rs` | The longest defect cluster in the repo. Seventeen review rounds on one installer, and nearly every lesson generalizes. |
-| [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `crates/jkb-fsm`, `crates/jkb-cli/src/{session,repo,archive,pr}.rs`, `scripts/merge-queue.sh` | Subtasks and containment (D34/D35), per-task worktrees (D36), the checkable state machine and transition log (D48), review-gated landing (D38), the design gate (D28). |
+| [docs/git-hooks-installer.md](docs/git-hooks-installer.md) | `scripts/lib.sh`, `scripts/setup.sh`, `scripts/hooks/post-merge`, and the repository-selection scrub in `gitrepo.rs`/`pr.rs`/`session.rs` | The longest defect cluster in the repo. Seventeen review rounds on one installer, and nearly every lesson generalizes. |
+| [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `crates/jkb-fsm`, `crates/jkb-cli/src/{gitrepo,session,repo,archive,pr}.rs`, `scripts/merge-queue.sh` | Subtasks and containment (D34/D35), per-task worktrees (D36), the checkable state machine and transition log (D48), review-gated landing (D38), the design gate (D28). |
 | [docs/sandbox-and-container.md](docs/sandbox-and-container.md) | `scripts/auto-mode*`, `.container/` | The unattended-agent boundary (D48) and the container nested inside it (D49), plus the egress firewall and its verdict (D50/D51). |
 | [docs/namespaces-and-sync.md](docs/namespaces-and-sync.md) | `jkb-sync`, `jkb-core`'s namespace/item/undo code | The namespace layout (D32), typed namespaces (D33), investigations (Dmem), and the file-sync data-loss cluster (D45/D39/D40/D42/D47). |
 | [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |
@@ -255,6 +255,10 @@ cost to learn, and which alternatives were rejected and why.
 
 Three rules about this set, because a split decision record fails in predictable ways:
 
+- **A file can appear in two rows, and then both govern.** `gitrepo.rs` is the clearest case:
+  its merge-detection and branch-ref rules are in `task-lifecycle.md`, its repository-selection
+  scrub is in `git-hooks-installer.md`. The rows name the *subject*, not an owner — read the row
+  whose subject you are changing.
 - **A decision is recorded in exactly one of these files.** If a change spans two subjects,
   write it where the *code* lives and cross-reference from the other, rather than describing it
   twice — two copies of a rule is the defect this whole record keeps rediscovering.

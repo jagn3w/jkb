@@ -1948,36 +1948,45 @@ mod tests {
         }
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            // The three that SELECT A REPOSITORY, which outrank `-C`: with `GIT_DIR`/
-            // `GIT_WORK_TREE` exported this fixture would init, add and commit into the
-            // developer's unrelated repository. See `gitrepo::scrub_repo_selection`.
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            // The developer's global config signs commits and sets core.hooksPath; either would
-            // fail this fixture for reasons that have nothing to do with archiving.
-            // ...and the env-injected form of configuration, which OUTRANKS the files
-            // neutralized on the next two lines — so pointing those at /dev/null is not
-            // isolation on its own. `GIT_CONFIG_COUNT` gates every `GIT_CONFIG_KEY_<n>` pair,
-            // so dropping it disables them all without naming an unbounded set. Wider than
-            // `gitrepo::scrub_repo_selection` on purpose: production keeps config injection
-            // because the dev container's `safe.directory` grants live there, and a fixture
-            // must not inherit configuration it did not choose.
-            .env_remove("GIT_CONFIG_COUNT")
+    /// The ONE builder for this fixture's git spawns, so the scrub is in a function that can
+    /// be handed to a test rather than repeated inline where nothing observes it.
+    fn fixture_git(dir: &Path, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(dir).args(args);
+        // Selection, through the shared rule rather than a second copy of the list: with
+        // `GIT_DIR`/`GIT_WORK_TREE` exported this fixture would init, add and commit into the
+        // developer's unrelated repository — measured for `gitrepo.rs`'s siblings.
+        crate::gitrepo::scrub_repo_selection(&mut cmd);
+        // ...and configuration, which is WIDER than production's scrub on purpose: production
+        // keeps `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` because the dev container's
+        // `safe.directory` grants live there, while a fixture must not inherit configuration it
+        // did not choose. The env-injected form outranks the files pointed at /dev/null below,
+        // so those alone are not isolation. This machine signs commits and sets core.hooksPath.
+        cmd.env_remove("GIT_CONFIG_COUNT")
             .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("git runs");
+            .env("GIT_COMMITTER_EMAIL", "t@t");
+        cmd
+    }
+
+    /// The SCRUBBERS entry for this fixture named a test that existed nowhere in the crate, so
+    /// the exemption was granted and nothing checked it — deleting the scrub left the suite
+    /// green. A claimed pin that does not exist is worse than no claim, because the guard reads
+    /// as covered; the same round fixed that for one sibling and left this one live.
+    #[test]
+    fn the_archive_fixture_does_not_reach_another_repository() {
+        crate::gitrepo::assert_scrubbed(
+            "archive fixture",
+            &fixture_git(Path::new("/somewhere"), &["status"]),
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = fixture_git(dir, args).output().expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }

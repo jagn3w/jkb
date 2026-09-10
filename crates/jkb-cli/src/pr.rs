@@ -250,6 +250,22 @@ enum Staleness {
 ///
 /// Separate from [`gh`] so the scrubbing below is pinned at THIS call site: a test of
 /// `scrub_repo_selection` alone stayed green with this line deleted.
+/// The variables that select a repository FOR GH, which git's three do not cover.
+///
+/// `gh` finds the repository through git, so `scrub_repo_selection` is necessary — and not
+/// sufficient. `GH_REPO` names an `[HOST/]OWNER/REPO` outright and takes precedence over the
+/// repository discovered from the working directory, so with one leaked `jkb task close-merged`
+/// asks GitHub about another repository's pull requests, and closes tasks on that answer if the
+/// number happens to exist there and be MERGED. That is verbatim the harm this spawn's scrub
+/// exists to prevent, through a door the git list does not cover, in the direction D34.4
+/// forbids — a wrong close buries work in flight.
+///
+/// **Not verified against the tool here**: `gh` is not installed in this sandbox, so this rests
+/// on gh's documented environment rather than on a measurement, which this project's own rule
+/// says to check with `gh help environment`. Removing them is safe either way — jkb always
+/// means the repository it is standing in — so the unverified direction costs nothing.
+const GH_SELECTION_VARS: &[&str] = &["GH_REPO", "GH_HOST"];
+
 fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("gh");
     cmd.args(args).current_dir(dir);
@@ -258,6 +274,9 @@ fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
     // makes this ask GitHub about an unrelated repository's pull requests — and
     // `close-merged` closes tasks on the answer.
     crate::gitrepo::scrub_repo_selection(&mut cmd);
+    for var in GH_SELECTION_VARS {
+        cmd.env_remove(var);
+    }
     cmd
 }
 
@@ -295,10 +314,22 @@ mod tests {
     /// deleted from this file, a test of `scrub_repo_selection` alone was perfectly green.
     #[test]
     fn the_gh_spawn_does_not_inherit_a_repository_selection() {
-        crate::gitrepo::assert_scrubbed(
-            "gh",
-            &super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]),
-        );
+        let cmd = super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]);
+        crate::gitrepo::assert_scrubbed("gh", &cmd);
+        // ...and gh's OWN selectors, which git's three do not cover.
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for want in super::GH_SELECTION_VARS {
+            assert!(
+                removed.iter().any(|k| k == want),
+                "gh: {want} is not removed; it names a repository outright and outranks the \
+                 working directory, so close-merged would answer about another repo. \
+                 removed: {removed:?}"
+            );
+        }
     }
     use super::{spent, Discovery, PullRequest, Staleness};
     use jkb_fsm::Fact;

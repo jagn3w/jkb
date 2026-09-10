@@ -184,10 +184,10 @@ EOF
     # the scope skip above exists to ignore, so an old git would install the chainer at
     # `-c core.hooksPath=X`, write an exclude rule for it and report `dispatch=chained`, while
     # the repository's own path kept none. `--local`/`--global`/`--system` predate `--show-scope`
-    # by a decade and `--worktree` by seven years, so this is the same question on every git
-    # rather than a degraded answer on an old one. An unsupported or unusable `--worktree` just
-    # fails and is skipped; where the extension is off git makes it an alias for `--local`,
-    # which is the same answer again.
+    # by a decade, so this is the same question on every git rather than a degraded answer on an
+    # old one. (An earlier version of this paragraph went on to say that "an unsupported or
+    # unusable `--worktree` just fails and is skipped". It did not — see directly below, which
+    # is the correction; the claim is deleted rather than left standing above its own refutation.)
     #
     # `--worktree` is a DISTINCT scope only when `extensions.worktreeConfig` is on. With it off
     # git aliases it to `--local`, already asked — and, measured on 2.51.1, it hard-fails 128
@@ -204,10 +204,18 @@ EOF
     # "the repository stores none", which the caller renders as `dispatch=direct` and prints
     # nothing for, while git itself resolves the hook and jkb writes no chainer. The two
     # branches of this one function have to answer the same question about the same repository.
-    local scope out found2=1 value2="" wtc=""
-    wtc="$(_git -C "$1" config --bool extensions.worktreeConfig 2>/dev/null)" || wtc=false
+    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0
+    # `--local`, because `extensions.worktreeConfig` is a LOCAL-ONLY repository extension: git
+    # stores it per repository, so a global one — or a `-c` on the command line, which this
+    # function refuses for `core.hooksPath` three lines up — is not this repository's answer.
+    # Read with full precedence, a stray global `true` sends the loop into `git config
+    # --worktree`, which then exits 128 in any repo with more than one working tree and collapses
+    # the whole read to `dispatch=unreadable` with no chainer written. The flag deciding HOW to
+    # read must come from the same place as the value.
+    wtc="$(_git -C "$1" config --local --bool extensions.worktreeConfig 2>/dev/null)" || wtc=false
     for scope in system global local worktree; do
         if [ "$scope" = worktree ] && [ "$wtc" != true ]; then continue; fi
+        asked=$((asked + 1))
         rc=0
         out="$(_git -C "$1" config --"$scope" --includes --get-all --path core.hooksPath 2>/dev/null)" || rc=$?
         # Measured on git 2.51.1: 1 is "not set in this scope", 128 is "set, and git will not
@@ -217,7 +225,14 @@ EOF
         # caller renders as `dispatch=direct` and prints nothing for.
         case "$rc" in
             0) ;;
-            1|129) continue ;;
+            1) continue ;;
+            # 129 is an unknown OPTION — a fact about this git, not about the value. It is how a
+            # git predating `--worktree` answers, and it is ALSO how one predating `--includes`
+            # would answer: absorbed into "not set in this scope", every scope reads empty and a
+            # repo with a stored `core.hooksPath` gets `dispatch=direct`, which prints nothing.
+            # So it is counted: all four scopes refusing means the read failed, not that nothing
+            # is stored.
+            129) unsupported=$((unsupported + 1)); continue ;;
             *) return 2 ;;
         esac
         # Last entry within a scope wins, as git itself resolves it. Command substitution has
@@ -227,6 +242,11 @@ EOF
         value2="${out##*$'\n'}"
         found2=0
     done
+    # Every scope we asked refused the options: we did not establish "stores none", we failed to
+    # ask. Spelling that as "not set" is the one answer the caller renders silently.
+    if [ "$found2" -ne 0 ] && [ "$asked" -gt 0 ] && [ "$unsupported" -eq "$asked" ]; then
+        return 2
+    fi
     [ "$found2" -eq 0 ] || return 1
     printf '%s' "$value2"
     return 0

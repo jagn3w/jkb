@@ -50,11 +50,18 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 #
 # `pwd -P` on both sides because a symlink, a trailing slash and a `..` are three spellings of
 # one directory — the rule `git_hooks_dir` needed in lib.sh, where literal equality DID produce
-# a false alarm. Stated honestly: it is DEFENSIVE here, not demonstrated. Five layouts were
-# tried on Linux (plain, symlinked checkout, linked worktree, submodule, and a `.git` symlinked
-# to a detached git dir) and removing it changed no answer in any of them, because git hands a
-# hook an already-resolved `GIT_DIR`. It is kept for the platform this box cannot reproduce,
-# where the temp or home path is itself a symlink (macOS `/tmp` -> `/private/tmp`).
+# a false alarm. It is LOAD-BEARING here too, and an earlier round of this comment said the
+# opposite on a bad measurement, which is worth recording because the bad measurement looked
+# fine. Nine layouts were tried and all of them entered the checkout with `git -C <path>` —
+# which NORMALISES $PWD to the physical path before running the hook. That erased the one
+# variable being tested, so removing `pwd -P` changed no answer and the comment concluded it
+# was merely defensive.
+#
+# Enter the link the way a person does — `cd ~/repos/x && git pull` — and the hook gets the
+# SYMLINK path in $PWD while `--show-toplevel` answers the physical one. Measured: without
+# `pwd -P` the hook then prints "belongs to a different repository" and skips setup.sh and
+# close-merged, permanently, for anyone whose checkout is reached through a link (`~/repos` a
+# symlink, macOS `/tmp` -> `/private/tmp`). Pinned by case10l step 4, which now `cd`s in.
 # `--git-common-dir` rather than `--path-format=absolute --git-common-dir`. `--path-format` is
 # a much later addition than `--git-common-dir` (not verified here to a version, which is why it
 # is avoided rather than relied on): on a git without it rev-parse exits non-zero, the hook
@@ -78,6 +85,21 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
 }
 hook_common="$(common_of "")" || exit 0
 root_common="$(common_of "$repo_root")" || root_common=""
+
+# ...and an answer we could not obtain is not the answer "a different repository". A checkout
+# set up with `core.worktree` has NO `.git` entry of its own, so discovering from `$repo_root`
+# with the environment scrubbed fails — `root_common` comes back empty and the comparison below
+# read that as foreign, refusing a perfectly ordinary checkout and disabling the D34 automation
+# there permanently. Measured, with a bare-ish git dir outside the tree.
+#
+# The repository being merged knows the answer: `core.worktree` is IT DECLARING this working
+# tree. Asked in the hook's own environment, so it is that repository's config, not the caller's.
+declared="$(git config --path core.worktree 2>/dev/null)" || declared=""
+if [ -n "$declared" ] && [ -d "$declared" ] &&
+   [ "$(cd "$declared" 2>/dev/null && pwd -P)" = "$(cd "$repo_root" 2>/dev/null && pwd -P)" ]; then
+    root_common="$hook_common"
+fi
+
 if [ "$hook_common" != "$root_common" ]; then
     echo "jkb: this merge is about $hook_common, but the working tree here is $repo_root," >&2
     echo "jkb: which belongs to a different repository — GIT_DIR or GIT_WORK_TREE is set in" >&2

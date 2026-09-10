@@ -1196,17 +1196,17 @@ mod tests {
         }
     }
 
-    /// Every git spawn in this module is BUILT BY `git_cmd`, checked against the source.
-    ///
-    /// The behavioural test below observes `git_cmd` only, so reverting `git()` or `git_run()`
-    /// to a bare `Command::new("git")` left the whole suite green while the doc claimed every
-    /// spawn is built there — the same shape as `scripts/lib.sh`'s `_git`, which needed the
-    /// same kind of check. Production spawns only: the fixtures below deliberately build their
-    /// own, and scrub by hand.
-    /// ...and NO OTHER SPAWN IN THE CRATE — production or test — resolves a repository from
+    /// NO SPAWN IN THE CRATE — production or test — resolves a repository from
     /// the environment without going through a scrubbing constructor.
     ///
-    /// Three rules this guard had to learn, each from a defect it had missed:
+    /// It began as a check that every git spawn in THIS MODULE is built by `git_cmd` — added
+    /// because the behavioural test observes `git_cmd` only, so reverting `git()` to a bare
+    /// `Command::new("git")` left the suite green while the doc claimed otherwise. That check
+    /// is now a special case of this one and has been retired; its distinctive premise (this
+    /// file holds exactly one production git spawn, so an empty result is not a broken walk)
+    /// is asserted below.
+    ///
+    /// Four rules it had to learn, each from a defect it had missed:
     ///
     /// 1. **Test code counts.** The first version cut every file at its `mod tests`, so it could
     ///    not see that this module's OWN four fixtures scrubbed nothing. Measured: with
@@ -1228,7 +1228,7 @@ mod tests {
             ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
             ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
             ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
-            ("src/archive.rs", "git"),      // the_archive_fixture_does_not_reach_another_repository
+            ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
             // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
             // the spawn is, since that is what the scan can see.
             ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
@@ -1241,9 +1241,43 @@ mod tests {
             "spawns a shell purely to own a pid; it is never asked about a repository",
         )];
 
+        /// The function a declaration line declares, or `UNPARSED` when the line declares one
+        /// in a shape this scan does not model. `None` when it is not a declaration at all.
+        ///
+        /// Qualifiers are enumerated rather than guessed at, and anything else before `fn`
+        /// makes the answer `UNPARSED` — the honest third value.
+        const UNPARSED: &str = "<unparsed declaration>";
+        fn declared_fn(trimmed: &str) -> Option<&str> {
+            // `fn` must be a whole token: `fn foo`, never `fn(u8) -> u8` (a fn-pointer type).
+            let at = trimmed
+                .match_indices("fn ")
+                .find(|(i, _)| *i == 0 || trimmed.as_bytes()[i - 1] == b' ')?;
+            let before = &trimmed[..at.0];
+            let known = before.split_whitespace().all(|tok| {
+                matches!(
+                    tok,
+                    "pub" | "const" | "async" | "unsafe" | "extern" | "default"
+                ) || tok.starts_with("pub(")
+                    || (tok.starts_with('"') && tok.ends_with('"'))
+            });
+            if !known {
+                return Some(UNPARSED);
+            }
+            let rest = &trimmed[at.0 + 3..];
+            let name = rest.split(['(', '<']).next().unwrap_or(rest).trim();
+            if name.is_empty() {
+                Some(UNPARSED)
+            } else {
+                Some(name)
+            }
+        }
+
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<std::path::PathBuf> = Vec::new();
-        let mut stack = vec![root.join("src"), root.join("tests")];
+        // The CRATE ROOT, so the claim "every .rs under the crate" is true — a `build.rs` git
+        // spawn was outside a `src/` + `tests/` walk while the doc said coverage was complete.
+        // `target/` is skipped: it holds generated sources that are not ours to classify.
+        let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -1251,6 +1285,9 @@ mod tests {
             for e in entries.flatten() {
                 let path = e.path();
                 if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
                     stack.push(path);
                 } else if path.extension().is_some_and(|x| x == "rs") {
                     files.push(path);
@@ -1286,12 +1323,21 @@ mod tests {
             let mut enclosing = "<no enclosing fn>";
             for (i, line) in scanned.lines().enumerate() {
                 let trimmed = line.trim_start();
-                if let Some(rest) = trimmed
-                    .strip_prefix("pub fn ")
-                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
-                    .or_else(|| trimmed.strip_prefix("fn "))
-                {
-                    enclosing = rest.split(['(', '<']).next().unwrap_or(rest);
+                // AN UNRECOGNIZED DECLARATION IS NOT THE PREVIOUS FUNCTION. A three-prefix list
+                // (`pub fn`/`pub(crate) fn`/`fn`) did not match `pub(super) fn`, so `enclosing`
+                // kept the name above it — and an unscrubbed `gh` spawn written immediately
+                // after `gh_cmd` inherited `gh_cmd`'s exemption and passed. Measured. That is
+                // exempt-on-arrival reproduced inside the mechanism that exists to stop it, and
+                // it is this project's central rule broken in its own enforcement: an unknown
+                // must never be spelled as a definite answer.
+                //
+                // So a line is classified in three ways, not two: not a declaration (carry on),
+                // a declaration whose name we parsed, or a declaration in a shape we do not
+                // model — which becomes a sentinel no allowlist entry can equal, so the spawn
+                // below it is REPORTED rather than exempted. Adding a spelling is then a
+                // failing test, never a silent hole.
+                if let Some(name) = declared_fn(trimmed) {
+                    enclosing = name;
                 }
                 if !line.contains("Command::new(") {
                     continue;
@@ -1315,59 +1361,70 @@ mod tests {
             found >= 6,
             "found {found} spawns; the scan is broken, not the code"
         );
+
+        // EVERY EXEMPTION NAMES A TEST, AND THAT TEST EXISTS. `src/archive.rs` was exempted on
+        // a trailing comment naming `the_archive_fixture_does_not_reach_another_repository`,
+        // which existed nowhere in the crate — so that fixture was exempt by location with
+        // nothing observing it, and deleting its scrub left the whole suite green. That is the
+        // "a claimed pin that does not exist is worse than no claim" defect, granted BY the
+        // allowlist whose doc asserts each entry is separately checked. So the comment is the
+        // machine-checked part now and cannot rot into a false claim.
+        let all_src: String = files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .collect();
+        let mut unpinned: Vec<String> = Vec::new();
+        let mut in_list = false;
+        let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
+        for line in self_src.lines() {
+            if line.contains("const SCRUBBERS") {
+                in_list = true;
+                continue;
+            }
+            if in_list {
+                if line.trim() == "];" {
+                    break;
+                }
+                let Some((entry, named)) = line.split_once("// ") else {
+                    continue;
+                };
+                if !entry.trim_start().starts_with('(') {
+                    continue;
+                }
+                let named = named.trim();
+                if !all_src.contains(&format!("fn {named}(")) {
+                    unpinned.push(format!("{} names `{named}`", entry.trim()));
+                }
+            }
+        }
+        assert!(
+            !unpinned.is_empty() || SCRUBBERS.len() >= 6,
+            "the SCRUBBERS block was not found in this file, so its entries were not checked"
+        );
+        assert!(
+            unpinned.is_empty(),
+            "a SCRUBBERS entry grants an exemption while naming a test that does not exist, so \
+             nothing checks that constructor actually scrubs: {unpinned:?}"
+        );
+
+        // The retired per-module check's distinctive premise: this file holds exactly ONE
+        // production git spawn, in `git_cmd`. It is what makes an empty `stray` above mean
+        // "nothing bypasses" rather than "the slice was wrong" for the file that matters most.
+        let self_prod = match self_src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(cut) => &self_src[..cut],
+            None => panic!("this module has a `mod tests`, which marks the end of production code"),
+        };
+        assert_eq!(
+            super::code_only(self_prod).matches("Command::new(").count(),
+            1,
+            "expected exactly one production git spawn in gitrepo.rs (in `git_cmd`); the scan is \
+             looking at the wrong slice or the spawn has been respelled"
+        );
         assert!(
             stray.is_empty(),
             "a tool is spawned outside any scrubbing constructor, so it inherits the caller's \
              repository selection and may act on an unrelated repository. Route it through one \
              of {SCRUBBERS:?}, or list it in NOT_REPO_AWARE with the reason: {stray:?}"
-        );
-    }
-
-    #[test]
-    fn no_production_git_spawn_bypasses_git_cmd() {
-        let src = include_str!("gitrepo.rs");
-        // The TEST MODULE, not the first `#[cfg(test)]` — which is a const near the top of this
-        // file, so slicing there scanned almost nothing and the check passed a mutation that
-        // reverted `git()` to a bare spawn. A guard that cannot fire, in the guard written to
-        // stop a guard that could not fire.
-        let cut = src
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("this module has a `mod tests`, which marks the end of production code");
-        // BY LOCATION, not by line shape. The previous version exempted any line spelling
-        // `let mut cmd = Command::new` — which is the module's own idiom, shared verbatim by
-        // `git_cmd`, `gh_cmd` and `gate_cmd` — so the next helper written the same way was
-        // exempt the moment it was added, which is exactly the edit this guard exists to
-        // catch. The question is *which function is this spawn in*, so that is what it asks:
-        // the nearest `fn` declaration above each spawn must be `git_cmd`.
-        let production = &src[..cut];
-        let mut enclosing = "<no enclosing fn>";
-        let mut stray: Vec<(usize, &str)> = Vec::new();
-        for (i, line) in production.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed
-                .strip_prefix("pub fn ")
-                .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
-                .or_else(|| trimmed.strip_prefix("fn "))
-            {
-                enclosing = rest.split(['(', '<']).next().unwrap_or(rest);
-            }
-            if line.contains("Command::new(\"git\")") && enclosing != "git_cmd" {
-                stray.push((i + 1, line));
-            }
-        }
-        assert!(
-            stray.is_empty(),
-            "git is spawned outside `git_cmd`, so that spawn inherits the caller's repository \
-             selection: {stray:?}"
-        );
-        // ...and it must still find the one legitimate spawn, or the walk above is broken and
-        // an empty `stray` means nothing. Same rule as `check_shell_syntax`: finding nothing
-        // is a failure, not a quiet pass.
-        assert_eq!(
-            production.matches("Command::new(\"git\")").count(),
-            1,
-            "expected exactly one production git spawn (in `git_cmd`); the guard is looking at \
-             the wrong slice or the spawn has been respelled"
         );
     }
 

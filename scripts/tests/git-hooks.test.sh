@@ -1539,23 +1539,69 @@ case10l() {
         fail "hookenv: wt-setup" "could not create a linked worktree"
     fi
 
-    # 4. Reached through a SYMLINK. NOT a pin on `pwd -P`, which an earlier version of this
-    #    comment claimed: `git -C <symlink>` normalises $PWD to the physical path before the
-    #    hook runs, so removing `pwd -P` passes here — measured, along with four other layouts.
-    #    What it pins is narrower and still worth having: the guard must not FALSELY REFUSE on
-    #    a checkout whose path runs through a link, which would disable the D34 automation
-    #    silently for that user. `pwd -P`'s own status is stated honestly at its definition.
+    # 4. Reached through a SYMLINK — and ENTERED the way a user enters one. This is the pin on
+    #    `pwd -P`, and it took two goes to make it one.
+    #
+    #    `git -C <symlink>` NORMALISES $PWD to the physical path before running the hook, so a
+    #    fixture written that way is a byte-identical repeat of case 1: measured, `pwd -P` could
+    #    be deleted from `common_of` with the whole suite green. Worse than a missing pin, that
+    #    reading was then written into two comments as "defensive, not demonstrated", inviting a
+    #    later round to delete it.
+    #
+    #    `cd` into the link, as `cd ~/repos/x && git pull` does, and the hook gets the SYMLINK
+    #    path in $PWD while `--show-toplevel` answers the physical one — so the two `common_of`
+    #    calls name one directory by two spellings. Measured: without `pwd -P` the hook prints
+    #    "belongs to a different repository" and skips setup.sh and close-merged, permanently,
+    #    for anyone whose checkout is reached through a link (`~/repos` a symlink, or macOS
+    #    `/tmp` -> `/private/tmp`). A measurement whose variable you did not vary is not a
+    #    measurement, and `git -C` was varying it back.
     _hookenv_build linked
     if ln -s "$d/linked" "$d/vialink" 2>/dev/null && [ -d "$d/vialink" ]; then
-        out="$(git_q -C "$d/vialink" merge --no-edit feature 2>&1)"
+        out="$(cd "$d/vialink" && git_q merge --no-edit feature 2>&1)"
         case "$out" in
             *"belongs to a different repository"*)
                 fail "hookenv: symlink" "the guard fired on a checkout reached through a symlink" ;;
-            *"running setup.sh"*) ok "and a checkout reached through a symlink is the ordinary case" ;;
+            *"running setup.sh"*) ok "and a checkout ENTERED through a symlink is the ordinary case" ;;
             *) fail "hookenv: sym" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
         esac
     else
         fail "hookenv: sym-setup" "could not create a symlink"
+    fi
+
+    # 5. A checkout that has NO `.git` of its own, declared by `core.worktree` from a git dir
+    #    outside it. `common_of "$repo_root"` scrubs the environment and then discovers from
+    #    there — and finds nothing, so it returned empty, which the comparison read as "a
+    #    different repository". Measured: an ordinary checkout in this layout was REFUSED, and
+    #    an answer that could not be obtained is not the answer "foreign". The repository being
+    #    merged declares the tree, so it is asked.
+    local gd="$d/detached" wt="$d/dtree"
+    mkdir -p "$wt/scripts"
+    git_q init -q --bare "$gd" >/dev/null 2>&1
+    git_q -C "$gd" config core.bare false
+    git_q -C "$gd" config core.worktree "$wt"
+    printf 'seed\n' >"$wt/seed"
+    printf '#!/bin/sh\necho "SETUP-RAN-IN:detached"\n' >"$wt/scripts/setup.sh"
+    chmod +x "$wt/scripts/setup.sh"
+    (
+        cd "$wt" && export GIT_DIR="$gd"
+        git_q add -A && git_q commit -qm seed
+        mkdir -p crates && printf 'x\n' >crates/x.rs
+        git_q add -A && git_q commit -qm crates
+        git_q branch -q feature && git_q reset -q --hard HEAD~1
+    ) >/dev/null 2>&1
+    cp "$hook" "$gd/hooks/post-merge"
+    chmod +x "$gd/hooks/post-merge"
+    if [ -e "$wt/.git" ]; then
+        fail "hookenv: cw-premise" "the fixture has a .git entry, so it is not the layout named"
+    else
+        out="$(cd "$wt" && GIT_DIR="$gd" git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"belongs to a different repository"*)
+                fail "hookenv: coreworktree" "a declared working tree was refused as foreign" ;;
+            *"running setup.sh"*)
+                ok "and a core.worktree checkout with no .git of its own is the ordinary case" ;;
+            *) fail "hookenv: cw" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
     fi
 }
 
@@ -1612,6 +1658,11 @@ case10m() {
         [ "$rc" = 0 ] && [ "$v" = /wt ] \
             && ok "and with worktreeConfig on, --worktree wins as git resolves it" \
             || fail "oldscope: wtc" "rc=$rc value='$v'"
+    else
+        # A dropped premise is a dropped assertion, and the case still reported green — the
+        # failure mode the two sub-cases above already guard against.
+        fail "oldscope: wtc-premise" "could not set a --worktree core.hooksPath, so the arm that \
+reads it was never exercised"
     fi
 
     # An included file is the same question, and a scope flag turns includes off by default.
