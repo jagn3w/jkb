@@ -209,7 +209,18 @@ EOF
     # "the repository stores none", which the caller renders as `dispatch=direct` and prints
     # nothing for, while git itself resolves the hook and jkb writes no chainer. The two
     # branches of this one function have to answer the same question about the same repository.
-    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0 unprobeable=0
+    # `broken` is THREE-VALUED, and one variable rather than two on purpose. It was a pair —
+    # `broken` plus `unprobeable` — and a pair has a state neither arm means: a lower scope
+    # setting `unprobeable=1` and a higher one then setting `broken=1` for a genuinely
+    # unexpandable winner left the stale 1 standing, and the read returned 6 ("this machine
+    # could not be asked") for a value git itself refuses. That is the wrong fact and the wrong
+    # remedy — the exact class this file keeps producing — and it was reachable because two
+    # flags must be assigned TOGETHER at five sites and one of them assigned only one. One
+    # variable makes each arm a single write, so the stale combination cannot be spelled.
+    #   0  this scope answered; nothing is broken
+    #   1  git will not expand the value this scope resolves  -> rc 2
+    #   2  jkb could not build the probe to find out          -> rc 6
+    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0
     local raw last probe
     # `--local`, because `extensions.worktreeConfig` is a LOCAL-ONLY repository extension: git
     # stores it per repository, so a global one — or a `-c` on the command line, which this
@@ -230,7 +241,7 @@ EOF
         # Anything else is unestablished and must not be spelled as "stores none", which the
         # caller renders as `dispatch=direct` and prints nothing for.
         case "$rc" in
-            0) broken=0; unprobeable=0 ;;
+            0) broken=0 ;;
             1) continue ;;
             # 129 is an unknown OPTION — a fact about this git, not about the value. It is how a
             # git predating `--worktree` answers, and it is ALSO how one predating `--includes`
@@ -278,14 +289,13 @@ EOF
                 # with a remedy (`--show-origin`) that prints a perfectly ordinary path. `setup.sh`
                 # runs unattended from `post-merge`, so the warning is all anyone sees.
                 probe="$(mktemp "${TMPDIR:-/tmp}/.jkb-hookspath.XXXXXX")" \
-                    || { unprobeable=1; broken=1; continue; }
+                    || { broken=2; continue; }
                 if ! _git config --file "$probe" core.hooksPath "$last" 2>/dev/null; then
-                    rm -f "$probe"; unprobeable=1; broken=1; continue
+                    rm -f "$probe"; broken=2; continue
                 fi
                 if out="$(_git config --file "$probe" --path --get core.hooksPath 2>/dev/null)"; then
                     rm -f "$probe"
                     broken=0
-                    unprobeable=0
                 else
                     rm -f "$probe"
                     # THIS scope's answer is the unexpandable one, so a lower scope's value is
@@ -315,10 +325,13 @@ EOF
     fi
     # A break at the highest-precedence scope that answered: git would fail here too — unless
     # what broke was OUR probe rather than git's expansion, which is a different fact (6).
-    if [ "$broken" -ne 0 ]; then
-        [ "$unprobeable" -eq 0 ] || return 6
-        return 2
-    fi
+    # Read from the ONE variable the loop wrote, so the last scope to break is the one answered
+    # for; a second flag read alongside it is what let a lower scope's failure win.
+    case "$broken" in
+        0) ;;
+        2) return 6 ;;
+        *) return 2 ;;
+    esac
     [ "$found2" -eq 0 ] || return 1
     printf '%s' "$value2"
     return 0
@@ -1500,13 +1513,6 @@ render_git_hooks_report() {
                     # and appears to refute the warning, with nothing pointing at the git binary.
                     # Measured under the all-refusing shim. A refusal must name a remedy that is
                     # true of the thing refused, and the thing refused here is the git.
-                    # Its own arm for its own remedy, again: this one is about the MACHINE, not
-                    # the git and not the value. jkb could not create the temporary file the
-                    # expansion probe needs, so it never found out whether git would expand the
-                    # value — and `--show-origin` would print a perfectly ordinary path here too.
-                    unprobeable)
-                             warn "$detail, so jkb could not tell where git will look for hooks."
-                             warn "  jkb could not create a temporary file (\$TMPDIR is ${TMPDIR:-/tmp}); free space or point TMPDIR at a writable directory and re-run." ;;
                     unaskable)
                              warn "$detail, so jkb could not tell where git will look for hooks."
                              # ONE remedy, because the other one was false. It used to end "or
@@ -1517,6 +1523,15 @@ render_git_hooks_report() {
                              # a short one: the operator disproves the half they can test and
                              # stops trusting the half they cannot.
                              warn "  this git is too old to report where core.hooksPath is set (it needs --show-scope, or per-scope --includes); upgrade git — setting core.hooksPath will not change this answer." ;;
+                    # Its own arm for its own remedy, again — and this one is about the MACHINE,
+                    # not the git and not the value. jkb could not create the temporary file the
+                    # expansion probe needs, so it never found out whether git would expand the
+                    # value, and `--show-origin` would print a perfectly ordinary path here too.
+                    # It sits BELOW `unaskable` because the six lines above belong to that arm:
+                    # inserted between them and it, this arm wore code 5's rationale.
+                    unprobeable)
+                             warn "$detail, so jkb could not tell where git will look for hooks."
+                             warn "  jkb could not create a temporary file (\$TMPDIR is ${TMPDIR:-/tmp}); free space or point TMPDIR at a writable directory and re-run." ;;
                     *)       warn "unrecognised dispatch verdict: $line" ;;
                 esac ;;
             error=*) warn "$rest; skipping hook install" ;;

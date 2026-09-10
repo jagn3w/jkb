@@ -284,7 +284,13 @@ case "$verdict" in
         # 2.51.1: with `core.bare` cleared first, the declaration takes and the next pull is the
         # ordinary case. It is printed only when the repository IS bare, because telling anyone
         # else to unset a flag they never set is noise a remedy cannot afford.
-        if [ "$(git config --bool core.bare 2>/dev/null)" = true ]; then
+        # `--local`, for the same reason the declaration twenty lines up is read that way. A
+        # bare read answers from `-c`, `GIT_CONFIG_COUNT`, `--global` and the environment — the
+        # caller's channels, every one — and this line decides what the operator is told to run.
+        # `git init --bare` writes `bare = true` into `$GIT_DIR/config`, so the layout this is
+        # printed for is exactly the one `--local` sees; case14 runs the printed remedy against
+        # a real bare repository, which is what says so rather than this comment.
+        if [ "$(git config --local --bool core.bare 2>/dev/null)" = true ]; then
             echo "jkb:   git --git-dir=$(shq "$hook_common") config core.bare false" >&2
         fi
         echo "jkb:   git --git-dir=$(shq "$hook_common") config core.worktree $(shq "$repo_root")" >&2

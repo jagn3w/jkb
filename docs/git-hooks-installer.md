@@ -314,6 +314,26 @@ conventions every session is expected to know.
   no chainer written, and a remedy pointing at `--show-origin`, which prints a perfectly ordinary
   path. `setup.sh` runs unattended from `post-merge`, so the warning is all anyone sees. Six
   refusal codes now: 1 unset, 2 the value, 3 empty, 4 unanchored, 5 this GIT, 6 this MACHINE.
+- **…and it must not OUTLIVE the scope that raised it.** Round 24, found in this file's own
+  self-review. Codes 2 and 6 were carried in two flags — `broken` and `unprobeable` — which have
+  a fourth state neither arm means: set at a low scope, `unprobeable` survived a *higher* scope
+  breaking for the ordinary reason, and the read answered "jkb could not create a temporary file"
+  about a value that had been tested and had failed. Wrong fact, wrong remedy, and the operator
+  is told to free disk space over a broken `~someuser/` path. Reachable in three scopes at once,
+  and pinned by `case10m`, which fails on the pre-fix code with exactly that message. **Two
+  flags that must be assigned together at five sites are one variable**, so the fix is a
+  three-valued `broken` (0 fine / 1 the value / 2 the probe): each arm becomes a single write and
+  the stale combination cannot be spelled. The same shape as the `root_common` sentinel in
+  `post-merge` — a state space with one more state than the code has names for.
+- **A repository whose EFFECTIVE `core.hooksPath` is unexpandable fails the RAW scope read too.**
+  Measured on 2.51.1 while building that test: with `hooksPath = ~nosuchuser42/hooks` winning in
+  `$GIT_DIR/config`, `git config --local --get-all core.hooksPath` — no `--path` — exits 128,
+  because git expands the repository's own value during setup. The same read against `--global`
+  returns the value raw. So the re-ask-raw arm can never reach the probe for a broken *local*
+  winner; it lands on "git will not expand this" one line earlier, which is the right answer for
+  it (`rev-parse --git-path` fatals too) and worth knowing before writing a fixture that assumes
+  otherwise. A losing broken value inside the local scope is unaffected — the winner is good, so
+  setup succeeds and the raw read returns both lines.
 - **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
   `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
   there is no fifth code today — so a mutation collapsing them stayed green and nothing could

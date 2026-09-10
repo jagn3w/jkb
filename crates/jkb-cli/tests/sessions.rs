@@ -114,7 +114,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 #[test]
 fn the_fixture_isolation_covers_selection_and_config() {
     let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
-    common::assert_isolated("Fixture::jkb", &cmd);
+    common::assert_isolated("the sessions git fixture", &cmd);
 }
 
 /// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into

@@ -2177,7 +2177,7 @@ echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude
 #     recipe — read as "the repository stores none", which renders as `dispatch=direct` and
 #     prints NOTHING, while git itself resolves the hook perfectly well.
 case10m() {
-    local d="$work/oldscope" rc v
+    local d="$work/oldscope" rc v n rcs rcr rcg
     mkdir -p "$d/bin"
     printf '%s\n' '#!/bin/sh' \
         'for a in "$@"; do [ "$a" = "--show-scope" ] && exit 129; done' \
@@ -2364,6 +2364,79 @@ this tested nothing"
         && ok "and a probe this machine cannot build is code 6, not 'git will not expand it'" \
         || fail "oldscope: unprobeable" "rc=$rc value='$v' — want 6; a temp-file failure is not \
 a verdict about the value"
+
+    # ...and 6 must not OUTLIVE the scope that raised it. The two facts were carried in two
+    # flags, and a lower scope's probe failure stayed set while a HIGHER scope went on to find a
+    # value git genuinely refuses: the read then answered 6 — "jkb could not create a temporary
+    # file" — about a value that had in fact been tested and had failed. Wrong fact, wrong
+    # remedy, and the operator is told to free disk space over a broken `~someuser/` path.
+    #
+    # Driven with a COUNTING `mktemp` shim, because the failure is per-call while `TMPDIR` is
+    # not. TRACED, arm by arm, rather than assumed — the first description of this fixture named
+    # the wrong decisive scope:
+    #
+    #   --system (via GIT_CONFIG_SYSTEM)  128, raw re-ask OK, probe 1 -> mktemp FAILS   "no temp file"
+    #   --global                          128, raw re-ask OK, probe 2 -> git refuses it  a real break
+    #   --local                           128, and the RAW re-ask fatals too             a real break
+    #
+    # The last line is why `--system` had to be the unprobeable one and is worth stating: a
+    # repository whose EFFECTIVE `core.hooksPath` git cannot expand fails the raw re-ask as well,
+    # because git expands that value during repository setup — so `--local` can never reach the
+    # probe, and it is the highest-precedence break here. Which is the point. The stale flag was
+    # set two scopes below and outlived BOTH breaks above it, and neither of those breaks is
+    # about a temporary file. The answer must be 2; `$d/mktemp.n` says both probe arms were
+    # reached, since a fixture where only one scope probes cannot see a stale flag at all.
+    : >"$work/home/.gitconfig"
+    git_q config --global user.email t@example.com
+    git_q config --global user.name "Test"
+    # The repository first, THEN the unexpandable values: `git init` copies the template hooks
+    # and fails outright once a global `core.hooksPath` it cannot expand is in place, which left
+    # the repo uncreated and every premise below reading a non-repository. Observed here.
+    git_q init -q "$d/r5" >/dev/null 2>&1
+    printf '[core]\n\thooksPath = ~nosuchuser42/hooks\n' >"$d/sys.cfg"
+    printf '[core]\n\thooksPath = ~nosuchuser42/hooks\n' >>"$work/home/.gitconfig"
+    cat >"$d/bin/mktemp" <<SHIM
+#!/bin/sh
+n=\$(cat "$d/mktemp.n" 2>/dev/null || echo 0)
+n=\$((n + 1))
+printf %s "\$n" >"$d/mktemp.n"
+[ "\$n" = 1 ] && exit 1
+exec $(command -v mktemp) "\$@"
+SHIM
+    chmod 755 "$d/bin/mktemp"
+    rm -f "$d/mktemp.n"
+    # Each status into its OWN variable before either is tested: `[ "$rcs" -ne 128 ]` sets `$?`
+    # itself, so a second test reading `$?` reads the FIRST TEST's result and the premise passes
+    # on whatever the second command did. Written that way once, in this very block.
+    GIT_CONFIG_SYSTEM="$d/sys.cfg" git_q -C "$d/r5" config --system --includes --get-all --path \
+        core.hooksPath >/dev/null 2>&1
+    rcs=$?
+    GIT_CONFIG_SYSTEM="$d/sys.cfg" git_q -C "$d/r5" config --system --includes --get-all \
+        core.hooksPath >/dev/null 2>&1
+    rcr=$?
+    GIT_CONFIG_SYSTEM="$d/sys.cfg" git_q -C "$d/r5" config --global --includes --get-all --path \
+        core.hooksPath >/dev/null 2>&1
+    rcg=$?
+    if [ "$rcs" -ne 128 ] || [ "$rcr" -ne 0 ] || [ "$rcg" -ne 128 ]; then
+        fail "oldscope: stale-premise" "both scopes must reach the probe arm for this case to \
+mean anything (system path=$rcs raw=$rcr, global path=$rcg)"
+    else
+        rc=0
+        v="$(GIT_CONFIG_SYSTEM="$d/sys.cfg" PATH="$d/bin:$PATH" _hooks_path_read "$d/r5" 2>/dev/null)" \
+            || rc=$?
+        n="$(cat "$d/mktemp.n" 2>/dev/null || echo 0)"
+        if [ "$n" -lt 2 ]; then
+            fail "oldscope: stale-probes" "the probe was attempted $n time(s), so one scope never \
+reached it and no flag could have gone stale"
+        else
+            [ "$rc" = 2 ] \
+                && ok "and a lower scope's unbuildable probe does not outlive it: the winner git \
+refuses is still code 2" \
+                || fail "oldscope: stale" "rc=$rc value='$v' — want 2; 6 means the earlier scope's \
+'no temp file' answered for a value that WAS tested and failed"
+        fi
+    fi
+    rm -f "$d/bin/mktemp" "$d/mktemp.n" "$d/sys.cfg"
     : >"$work/home/.gitconfig"
     git_q config --global user.email t@example.com
     git_q config --global user.name "Test"
