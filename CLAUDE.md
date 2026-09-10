@@ -108,8 +108,11 @@ implementation checklist and the **source of truth for what's done**.
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
   (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
   they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
-  `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
-  `inspect-dep.sh` (read a dep's extracted registry source).
+  `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `check.sh`,
+  `test-count.sh`, `inspect-dep.sh` (read a dep's extracted registry source). `check.sh` was
+  missing from this list AND from the behaviour — it called `cargo` without sourcing the
+  toolchain, so in any non-interactive shell the gate this file tells you to run before every
+  commit exited 127 at its first cargo line and nothing after the shell-syntax step ran.
 - **Fresh-machine setup:** `./scripts/setup.sh` is the one-shot, idempotent installer —
   `cargo install`s the `jkb` binary, scaffolds the standard KB roots via `jkb ns mk repos
   tasks media references memory`, builds+installs the VS Code extension (`install-extension.sh`),
@@ -233,7 +236,12 @@ Raw `cargo build|test|clippy|fmt|check` is denied by a PreToolUse hook
 ```
 
 `check.sh` skips `cargo-deny` gracefully when it is not installed
-(`cargo install cargo-deny`). Update `tasks.md` checkboxes (`[x]` done, `[~]` partial +
+(`cargo install cargo-deny`). Everything else in it is mandatory and fails loudly — but note
+that it stops at the FIRST failing gate, so a step that cannot run in your environment hides
+every step after it. `--all-features` pulls `ort-sys`, which downloads a prebuilt binary, so in
+a network-restricted sandbox clippy cannot complete and neither can anything below it; lint the
+reachable part with `./scripts/clippy.sh -p <crate>` per crate and say which crate you could not
+cover, rather than reporting a gate that stopped early as green. Update `tasks.md` checkboxes (`[x]` done, `[~]` partial +
 inline note, `[ ]` todo) as each item lands.
 
 ## Where the rest lives

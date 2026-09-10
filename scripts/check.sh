@@ -17,6 +17,25 @@ echo "==> shell syntax"
 . "$(dirname "$0")/lib.sh"
 check_shell_syntax "$(cd "$(dirname "$0")/.." && pwd)"
 
+# The toolchain, the same way every other cargo wrapper here gets it. THIS SCRIPT DID NOT, and
+# it is the one CLAUDE.md names as the gate to run before every commit: in a non-interactive
+# shell — an agent's, a hook's, a `sh -c` — `cargo` is not on PATH, so line 21 exited 127 with
+# `cargo: command not found` and NOTHING after the shell-syntax step ran. Not rustfmt, not
+# clippy, not the shell tests, not `cargo test`, not cargo-deny, not the ui build. Measured: two
+# review rounds were reported green over a `clippy -D warnings` that was already failing, which
+# is precisely the "a header followed by nothing reads exactly like a gate that ran" failure
+# this file's own comments were written to prevent — one step earlier than they were looking.
+#
+# Sourced only when present, because CI images install rust system-wide and this must not become
+# a hard dependency. Written as an `if` rather than `[ -f … ] && source …`: measured, the `&&`
+# form is safe under `set -e` here (a non-final command in an `&&` list is exempt), but it is
+# safe by a rule you have to know and stops being safe the moment it is the last line of a
+# block. The `if` needs no such argument.
+if [ -f ~/.cargo/env ]; then
+    # shellcheck disable=SC1090
+    source ~/.cargo/env
+fi
+
 echo "==> rustfmt (check)"
 cargo fmt --all -- --check
 
