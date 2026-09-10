@@ -43,7 +43,17 @@ new_workdir
 # every spelling above, both the six it must find and three it must not — because a detector
 # nothing tests is the same silent exemption one level up.
 _first_cargo_line() {
+    # The env-assignment pattern is built at run time so it can name both quote characters
+    # without fighting the shell over the single one. A QUOTED value with a space in it —
+    # `RUSTFLAGS="-C link-arg=-s" cargo build`, which is how anyone sets more than one flag —
+    # is not `[^[:space:]]*`, so the unquoted-only version stopped stripping there and the
+    # line fell out as "mentions cargo, invokes nothing": silently exempt, the exact failure
+    # case0 exists for. `env` joins the leading keywords for the same reason.
     awk '
+        BEGIN {
+            q = sprintf("%c", 39)
+            envre = "^[A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|" q "[^" q "]*" q "|[^[:space:]]*)[[:space:]]+"
+        }
         /^[[:space:]]*#/ { next }
         {
             line = $0
@@ -52,12 +62,10 @@ _first_cargo_line() {
             for (i = 1; i <= n; i++) {
                 p = parts[i]
                 sub(/^[[:space:]]+/, "", p)
-                while (p ~ /^(if|then|do|else|elif|exec|time)[[:space:]]/) {
+                while (p ~ /^(if|then|do|else|elif|exec|time|env)[[:space:]]/) {
                     sub(/^[A-Za-z]+[[:space:]]+/, "", p)
                 }
-                while (p ~ /^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+/) {
-                    sub(/^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+/, "", p)
-                }
+                while (p ~ envre) { sub(envre, "", p) }
                 if (p ~ /^cargo([[:space:]]|$)/) { print NR; exit }
             }
         }' "$1"
@@ -78,6 +86,8 @@ case0() {
     cat >"$probe" <<'FORMS'
 ( cd "$repo" && cargo install --path x )
 RUSTFLAGS=-x cargo build
+RUSTFLAGS="-C link-arg=-s" cargo build
+env CARGO_TERM_COLOR=always cargo test
 exec cargo test
 if cargo build; then
 (cd "$r" && cargo fmt)
@@ -86,22 +96,22 @@ echo "install it with: cargo install --path crates/jkb-cli"
 if ! command -v cargo >/dev/null 2>&1; then
 echo "(build the crate first so cargo extracts its source)" >&2
 FORMS
-    # Lines 1-6 are invocations; 7-9 mention cargo and invoke nothing. Asked one line at a
+    # Lines 1-8 are invocations; 9-11 mention cargo and invoke nothing. Asked one line at a
     # time, because `_first_cargo_line` stops at the first hit and would otherwise report only
-    # line 1 whatever the other eight do.
+    # line 1 whatever the other ten do.
     want_hit=""; want_miss=""
     n=0
     while IFS= read -r line; do
         n=$((n + 1))
         printf '%s\n' "$line" >"$work/one.sh"
         hit="$(_first_cargo_line "$work/one.sh")"
-        if [ "$n" -le 6 ]; then
+        if [ "$n" -le 8 ]; then
             [ -n "$hit" ] || want_hit="$want_hit $n"
         else
             [ -z "$hit" ] || want_miss="$want_miss $n"
         fi
     done <"$probe"
-    [ "$n" -eq 9 ] || fail "toolchain: forms-premise" "read $n form(s), expected 9"
+    [ "$n" -eq 11 ] || fail "toolchain: forms-premise" "read $n form(s), expected 11"
     if [ -n "$want_hit" ]; then
         fail "toolchain: forms-miss" "these real invocation spellings are not seen as cargo \
 calls, so a script using one is silently exempted:$want_hit"
