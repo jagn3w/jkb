@@ -83,6 +83,150 @@ pub(crate) fn assert_scrubbed(what: &str, cmd: &Command) {
     }
 }
 
+/// Blank every comment and string literal, so a source-scanning test sees code and not text.
+///
+/// **There is a second Rust scanner in this crate** — `commands::tests::string_literals`, which
+/// EXTRACTS literals rather than blanking them, for a check about what the binary prints. They
+/// are not one function today, and that is a known cost rather than an oversight: unifying them
+/// means rewriting a passing check in a file this change does not otherwise touch. Two scanners
+/// that must both be right about Rust's syntax is exactly the drift shape this project warns
+/// about, so it is written down here. (Noted while doing this: `string_literals` does NOT handle
+/// raw strings, so `r#"…"#` fragments for it — harmless for its purpose, and the reason this
+/// one does handle them is that a raw string mentioning `Command::new(` would otherwise be
+/// reported as an unscrubbed spawn.)
+///
+/// Returns `src` with every comment and string literal blanked to spaces, newlines preserved so
+/// line numbers survive. Handles line and (nested) block comments, ordinary strings with escapes
+/// and line continuations, raw strings (`r"…"`, `r#"…"#`, `br#"…"#`), and char literals — a char
+/// literal may hold a quote (`'"'`) while a lifetime never closes, so the latter falls through
+/// as ordinary text.
+///
+/// It exists because a scan of raw LINES cannot see a spawn whose call is split by rustfmt:
+///
+/// ```ignore
+/// let mut c = Command::new(
+///     "git",
+/// );
+/// ```
+///
+/// Measured — that form evaded the spawn guard below, while a block comment and a closure did
+/// not. Matching code rather than text also retires the guard's previous special cases (skip
+/// lines starting with `//`, skip lines containing an escaped quote), which existed only to stop
+/// the guard's own source from matching itself.
+#[cfg(test)]
+pub(crate) fn code_only(src: &str) -> String {
+    let c: Vec<char> = src.chars().collect();
+    let mut out: Vec<char> = vec![' '; c.len()];
+    let mut i = 0;
+    // Blank `c[a..b]`, keeping newlines so every line number is preserved.
+    let blank = |out: &mut Vec<char>, a: usize, b: usize| {
+        for k in a..b.min(c.len()) {
+            if c[k] == '\n' {
+                out[k] = '\n';
+            }
+        }
+    };
+    while i < c.len() {
+        // A raw string, possibly byte-prefixed. Checked before the ordinary cases because its
+        // body may contain anything, quotes included.
+        let mut j = i;
+        if c[j] == 'b' {
+            j += 1;
+        }
+        if c.get(j) == Some(&'r') {
+            let mut hashes = 0;
+            let mut k = j + 1;
+            while c.get(k) == Some(&'#') {
+                hashes += 1;
+                k += 1;
+            }
+            let starts_token = i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_');
+            if c.get(k) == Some(&'"') && starts_token {
+                let start = i;
+                i = k + 1;
+                loop {
+                    if i >= c.len() {
+                        break;
+                    }
+                    if c[i] == '"' {
+                        let mut h = 0;
+                        let mut m = i + 1;
+                        while h < hashes && c.get(m) == Some(&'#') {
+                            h += 1;
+                            m += 1;
+                        }
+                        if h == hashes {
+                            i = m;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+                continue;
+            }
+        }
+        match c[i] {
+            '/' if c.get(i + 1) == Some(&'/') => {
+                let start = i;
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                let start = i;
+                let mut depth = 1usize;
+                i += 2;
+                while i < c.len() && depth > 0 {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                blank(&mut out, start, i);
+            }
+            '\'' => {
+                let mut j = i + 1 + usize::from(c.get(i + 1) == Some(&'\\'));
+                j += 1;
+                if c.get(j) == Some(&'\'') {
+                    blank(&mut out, i, j + 1);
+                    i = j + 1;
+                } else {
+                    out[i] = c[i];
+                    i += 1;
+                }
+            }
+            '"' => {
+                let start = i;
+                i += 1;
+                while i < c.len() {
+                    if c[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+            }
+            ch => {
+                out[i] = ch;
+                i += 1;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
 /// common "this ref does not exist" case, which is a fact rather than a failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
@@ -1133,8 +1277,14 @@ mod tests {
                 .unwrap_or(path)
                 .display()
                 .to_string();
+            // CODE, not text. A raw-line scan cannot see a call rustfmt has split across lines
+            // (measured: that form evaded this guard, while a block comment and a closure did
+            // not), and it needed two special cases — skip `//` lines, skip lines carrying an
+            // escaped quote — that existed only to stop the guard's own source matching itself.
+            // Blanking comments and literals removes the blind spot and both special cases.
+            let scanned = super::code_only(&src);
             let mut enclosing = "<no enclosing fn>";
-            for (i, line) in src.lines().enumerate() {
+            for (i, line) in scanned.lines().enumerate() {
                 let trimmed = line.trim_start();
                 if let Some(rest) = trimmed
                     .strip_prefix("pub fn ")
@@ -1143,13 +1293,7 @@ mod tests {
                 {
                     enclosing = rest.split(['(', '<']).next().unwrap_or(rest);
                 }
-                // A doc comment or a Rust string mentioning the call is not a call. THIS
-                // function's own body is full of both, and once test code is in scope they
-                // would otherwise all count as spawns and inflate the floor below.
-                if trimmed.starts_with("//") || line.contains("\\\"") {
-                    continue;
-                }
-                if !line.contains("Command::new(\"") {
+                if !line.contains("Command::new(") {
                     continue;
                 }
                 found += 1;
