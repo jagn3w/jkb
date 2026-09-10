@@ -1665,6 +1665,35 @@ case10l() {
     else
         fail "hookenv: rel-premise" "git does not resolve the relative form here, so this tested nothing"
     fi
+
+    # 8. `GIT_COMMON_DIR` disables `core.worktree` — git takes the CWD as the toplevel while
+    #    `git config` still reports the declaration (measured on 2.51.1). A round that read the
+    #    arm above as "is it set at all" therefore let a leak at one repository build ANOTHER
+    #    checkout: end to end, theirs/scripts/setup.sh ran for a merge in mine. The premise is
+    #    checked first, so a git that stops ignoring the declaration reports "tested nothing"
+    #    rather than passing silently.
+    mkdir -p "$d/decl"
+    # Step 2 redirected a merge INTO theirs: git wrote the files before the hook refused, so
+    # `crates/x.rs` is sitting there untracked and this merge would abort before reaching the
+    # hook at all. Cleaned, or the case tests git's overwrite check instead of the guard.
+    git_q -C "$d/theirs" clean -qfd >/dev/null 2>&1 || :
+    git_q -C "$d/mine" config core.worktree "$d/decl"
+    git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)"
+    if [ "$(cd "$d/theirs" && GIT_DIR="$d/mine/.git" GIT_COMMON_DIR="$d/mine/.git" \
+            git_q rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$d/theirs" && pwd -P)" ]; then
+        out="$(cd "$d/theirs" && GIT_DIR="$d/mine/.git" GIT_COMMON_DIR="$d/mine/.git" \
+               git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:$(cd "$d/theirs" && pwd -P)"*)
+                fail "hookenv: commondir" "a declaration git IGNORED licensed building theirs" ;;
+            *"belongs to a different repository"*)
+                ok "and a declaration git ignored does not license a foreign checkout" ;;
+            *) fail "hookenv: cd" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: cd-premise" "GIT_COMMON_DIR no longer disables core.worktree, so this tested nothing"
+    fi
+    git_q -C "$d/mine" config --unset core.worktree 2>/dev/null || :
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"

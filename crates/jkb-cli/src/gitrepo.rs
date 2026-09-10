@@ -115,116 +115,151 @@ pub(crate) fn assert_scrubbed(what: &str, cmd: &Command) {
 /// the guard's own source from matching itself.
 #[cfg(test)]
 pub(crate) fn code_only(src: &str) -> String {
-    let c: Vec<char> = src.chars().collect();
-    let mut out: Vec<char> = vec![' '; c.len()];
-    let mut i = 0;
-    // Blank `c[a..b]`, keeping newlines so every line number is preserved.
-    let blank = |out: &mut Vec<char>, a: usize, b: usize| {
-        for k in a..b.min(c.len()) {
-            if c[k] == '\n' {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out: Vec<char> = vec![' '; chars.len()];
+    let mut at = 0usize;
+    while at < chars.len() {
+        // A raw string first: its body may contain anything, quotes and `*/` included.
+        if let Some(end) = lex::raw_string_end(&chars, at) {
+            lex::blank_span(&chars, &mut out, at, end);
+            at = end;
+            continue;
+        }
+        let end = match chars[at] {
+            '/' if chars.get(at + 1) == Some(&'/') => lex::line_comment_end(&chars, at),
+            '/' if chars.get(at + 1) == Some(&'*') => lex::block_comment_end(&chars, at),
+            '"' => lex::string_end(&chars, at),
+            '\'' => {
+                // A quote that opens a LIFETIME, not a literal, is ordinary code.
+                let Some(end) = lex::char_literal_end(&chars, at) else {
+                    out[at] = chars[at];
+                    at += 1;
+                    continue;
+                };
+                end
+            }
+            ch => {
+                out[at] = ch;
+                at += 1;
+                continue;
+            }
+        };
+        lex::blank_span(&chars, &mut out, at, end);
+        at = end;
+    }
+    out.into_iter().collect()
+}
+
+#[cfg(test)]
+mod lex {
+    //! `code_only`'s scanners, one per literal form. Split out of a single 107-line function
+    //! that clippy refused on both length and six single-character bindings at once; each half
+    //! is now named after the thing it skips, and the index arithmetic that made the short
+    //! names tempting is confined to one scanner apiece.
+
+    /// Blank `src[from..to]` in `out`, keeping newlines so every line number is preserved.
+    pub(super) fn blank_span(src: &[char], out: &mut [char], from: usize, to: usize) {
+        for k in from..to.min(src.len()) {
+            if src[k] == '\n' {
                 out[k] = '\n';
             }
         }
-    };
-    while i < c.len() {
-        // A raw string, possibly byte-prefixed. Checked before the ordinary cases because its
-        // body may contain anything, quotes included.
-        let mut j = i;
-        if c[j] == 'b' {
-            j += 1;
+    }
+
+    /// If a raw string (`r"…"`, `r#"…"#`, `br#"…"#`) opens at `start`, the index just past its
+    /// close — or past the end of input when it never closes, which is what the single-pass
+    /// scanner did before and keeps an unterminated literal from being re-scanned as code.
+    ///
+    /// `starts_token` is why an `r` inside an identifier (`var"` never happens, but `for r#x`
+    /// and `let br = …` do) is not read as a literal opener.
+    pub(super) fn raw_string_end(src: &[char], start: usize) -> Option<usize> {
+        let mut open = start;
+        if src[open] == 'b' {
+            open += 1;
         }
-        if c.get(j) == Some(&'r') {
-            let mut hashes = 0;
-            let mut k = j + 1;
-            while c.get(k) == Some(&'#') {
-                hashes += 1;
-                k += 1;
-            }
-            let starts_token = i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_');
-            if c.get(k) == Some(&'"') && starts_token {
-                let start = i;
-                i = k + 1;
-                loop {
-                    if i >= c.len() {
-                        break;
-                    }
-                    if c[i] == '"' {
-                        let mut h = 0;
-                        let mut m = i + 1;
-                        while h < hashes && c.get(m) == Some(&'#') {
-                            h += 1;
-                            m += 1;
-                        }
-                        if h == hashes {
-                            i = m;
-                            break;
-                        }
-                    }
-                    i += 1;
+        if src.get(open) != Some(&'r') {
+            return None;
+        }
+        let mut hashes = 0usize;
+        let mut probe = open + 1;
+        while src.get(probe) == Some(&'#') {
+            hashes += 1;
+            probe += 1;
+        }
+        let starts_token =
+            start == 0 || !(src[start - 1].is_alphanumeric() || src[start - 1] == '_');
+        if src.get(probe) != Some(&'"') || !starts_token {
+            return None;
+        }
+        let mut pos = probe + 1;
+        while pos < src.len() {
+            if src[pos] == '"' {
+                let mut seen = 0usize;
+                let mut after = pos + 1;
+                while seen < hashes && src.get(after) == Some(&'#') {
+                    seen += 1;
+                    after += 1;
                 }
-                blank(&mut out, start, i);
+                if seen == hashes {
+                    return Some(after);
+                }
+            }
+            pos += 1;
+        }
+        Some(src.len())
+    }
+
+    /// The index just past the block comment opening at `start`, honouring nesting.
+    pub(super) fn block_comment_end(src: &[char], start: usize) -> usize {
+        let mut depth = 1usize;
+        let mut pos = start + 2;
+        while pos < src.len() && depth > 0 {
+            if src[pos] == '/' && src.get(pos + 1) == Some(&'*') {
+                depth += 1;
+                pos += 2;
+            } else if src[pos] == '*' && src.get(pos + 1) == Some(&'/') {
+                depth -= 1;
+                pos += 2;
+            } else {
+                pos += 1;
+            }
+        }
+        pos
+    }
+
+    /// The index just past the line comment opening at `start` (its newline is not consumed).
+    pub(super) fn line_comment_end(src: &[char], start: usize) -> usize {
+        let mut pos = start;
+        while pos < src.len() && src[pos] != '\n' {
+            pos += 1;
+        }
+        pos
+    }
+
+    /// The index just past the ordinary string literal opening at `start`.
+    pub(super) fn string_end(src: &[char], start: usize) -> usize {
+        let mut pos = start + 1;
+        while pos < src.len() {
+            if src[pos] == '\\' {
+                pos += 2;
                 continue;
             }
+            if src[pos] == '"' {
+                pos += 1;
+                break;
+            }
+            pos += 1;
         }
-        match c[i] {
-            '/' if c.get(i + 1) == Some(&'/') => {
-                let start = i;
-                while i < c.len() && c[i] != '\n' {
-                    i += 1;
-                }
-                blank(&mut out, start, i);
-            }
-            '/' if c.get(i + 1) == Some(&'*') => {
-                let start = i;
-                let mut depth = 1usize;
-                i += 2;
-                while i < c.len() && depth > 0 {
-                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                blank(&mut out, start, i);
-            }
-            '\'' => {
-                let mut j = i + 1 + usize::from(c.get(i + 1) == Some(&'\\'));
-                j += 1;
-                if c.get(j) == Some(&'\'') {
-                    blank(&mut out, i, j + 1);
-                    i = j + 1;
-                } else {
-                    out[i] = c[i];
-                    i += 1;
-                }
-            }
-            '"' => {
-                let start = i;
-                i += 1;
-                while i < c.len() {
-                    if c[i] == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if c[i] == '"' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                blank(&mut out, start, i);
-            }
-            ch => {
-                out[i] = ch;
-                i += 1;
-            }
-        }
+        pos
     }
-    out.into_iter().collect()
+
+    /// The index just past a char literal opening at `start`, or `None` when the quote opens a
+    /// LIFETIME instead — `'a` never closes, so it has to fall through as ordinary text while
+    /// `'"'` must not.
+    pub(super) fn char_literal_end(src: &[char], start: usize) -> Option<usize> {
+        let close = start + 2 + usize::from(src.get(start + 1) == Some(&'\\'));
+        (src.get(close) == Some(&'\'')).then_some(close + 1)
+    }
 }
 
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
@@ -1196,6 +1231,164 @@ mod tests {
         }
     }
 
+    /// The function a declaration line declares, or `UNPARSED` when the line declares one
+    /// in a shape this scan does not model. `None` when it is not a declaration at all.
+    ///
+    /// Qualifiers are enumerated rather than guessed at, and anything else before `fn`
+    /// makes the answer `UNPARSED` — the honest third value.
+    const UNPARSED: &str = "<unparsed declaration>";
+    fn declared_fn(trimmed: &str) -> Option<&str> {
+        // `fn` must be a whole token: `fn foo`, never `fn(u8) -> u8` (a fn-pointer type).
+        let at = trimmed
+            .match_indices("fn ")
+            .find(|(i, _)| *i == 0 || trimmed.as_bytes()[i - 1] == b' ')?;
+        let before = &trimmed[..at.0];
+        let known = before.split_whitespace().all(|tok| {
+            matches!(
+                tok,
+                "pub" | "const" | "async" | "unsafe" | "extern" | "default"
+            ) || tok.starts_with("pub(")
+                || (tok.starts_with('"') && tok.ends_with('"'))
+        });
+        if !known {
+            return Some(UNPARSED);
+        }
+        let rest = &trimmed[at.0 + 3..];
+        let name = rest.split(['(', '<']).next().unwrap_or(rest).trim();
+        if name.is_empty() {
+            Some(UNPARSED)
+        } else {
+            Some(name)
+        }
+    }
+
+    /// EVERY EXEMPTION NAMES A TEST, AND THAT TEST EXISTS — lifted out of the guard above so
+    /// the guard stays readable and this stays one question. `src/archive.rs` was exempted on
+    /// a trailing comment naming `the_archive_fixture_does_not_reach_another_repository`,
+    /// which existed nowhere in the crate — so that fixture was exempt by location with
+    /// nothing observing it, and deleting its scrub left the whole suite green. That is the
+    /// "a claimed pin that does not exist is worse than no claim" defect, granted BY the
+    /// allowlist whose doc asserts each entry is separately checked. So the comment is the
+    /// machine-checked part now and cannot rot into a false claim.
+    fn every_exemption_names_a_test_that_observes_it(
+        root: &Path,
+        files: &[std::path::PathBuf],
+        scrubbers: &[(&str, &str)],
+    ) {
+        let all_src: String = files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .collect();
+        let code_src = super::code_only(&all_src);
+        let mut unpinned: Vec<String> = Vec::new();
+        let mut parsed = 0usize;
+        let mut in_list = false;
+        let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
+        for line in self_src.lines() {
+            if line.contains("const SCRUBBERS") {
+                in_list = true;
+                continue;
+            }
+            if !in_list {
+                continue;
+            }
+            if line.trim() == "];" {
+                break;
+            }
+            // An ENTRY line, whatever it carries — counted before the comment is looked for, so
+            // that an entry written without one is a failure rather than a silent skip. Written
+            // the other way round (find the comment, then check the entry), a comment-less entry
+            // `continue`d and its exemption was granted with no named test at all: the archive.rs
+            // defect this check exists to close, one shape over.
+            if !line.trim_start().starts_with('(') {
+                continue;
+            }
+            parsed += 1;
+            let Some((_, named)) = line.split_once("// ") else {
+                unpinned.push(format!("{} names no test at all", line.trim()));
+                continue;
+            };
+            let named = named.trim();
+            // CODE, not text — the same rule the spawn scan above had to learn, and it matters
+            // more here: these tests carry long comment blocks that name the very constructor
+            // they are vouching for, so a prose scan would accept a test that only TALKS about
+            // it. `code_only` blanks in place, so indices into it are indices into `all_src`.
+            let Some(at) = code_src.find(&format!("fn {named}(")) else {
+                unpinned.push(format!(
+                    "{} names `{named}`, which is not a function here",
+                    line.trim()
+                ));
+                continue;
+            };
+            // ...and the named test must OBSERVE the constructor it is named beside. Existing
+            // somewhere in the crate is not evidence about this entry — a test could be named
+            // here and assert something else entirely, which is the same "reads as pinned and
+            // is not" shape one level up.
+            //
+            // The body ends at the first closing brace AT THE FUNCTION'S OWN INDENTATION, which
+            // is DERIVED rather than assumed. `\n    }` was hard-coded, on the assumption that
+            // every test here sits inside `mod tests`; `tests/sessions.rs` holds its tests at
+            // top level, so the pattern matched the first brace NESTED inside the function
+            // instead. Measured on `the_fixture_isolation_covers_selection_and_config`: the
+            // body stopped at its inner `for … { … }`, six characters short of the real end.
+            // Harmless there only because the constructor is called on the line above it — a
+            // constructor used after that block would have been reported missing when it is
+            // not, and the `map_or(body, …)` fallback fails the other way, handing `contains`
+            // the rest of the crate so that it is true of almost anything. So both are gone:
+            // the indentation is read off the declaration, and a body with no end is a failure.
+            let line_start = code_src[..at].rfind('\n').map_or(0, |i| i + 1);
+            let indent: String = code_src[line_start..at]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let Some(end) = code_src[at..].find(&format!("\n{indent}}}")) else {
+                unpinned.push(format!(
+                    "{} names `{named}`, whose body has no end at its own indentation",
+                    line.trim()
+                ));
+                continue;
+            };
+            let body = &code_src[at..at + end];
+            // An entry whose constructor cannot be read is a failure too. `map_or("", …)` plus
+            // an `is_empty` skip granted the exemption with nothing checked — the same silent
+            // skip the comment-less entry above had to be turned into a failure.
+            let Some(ctor) = line
+                .split_once(", \"")
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(n, _)| n)
+                .filter(|n| !n.is_empty())
+            else {
+                unpinned.push(format!(
+                    "{} names no constructor we could read",
+                    line.trim()
+                ));
+                continue;
+            };
+            if !body.contains(ctor) {
+                unpinned.push(format!(
+                    "{} names `{named}`, which never mentions `{ctor}` in code",
+                    line.trim()
+                ));
+            }
+        }
+        // The premise, measured rather than asserted from a constant: `scrubbers.len() >= 6` was
+        // `6 >= 6` on a const array of six, so it could not fail whatever the parse did — a
+        // guard that cannot fire, inside the guard against guards that cannot fire. Renaming the
+        // const or reformatting the block would have left it examining zero entries and passing.
+        assert_eq!(
+            parsed,
+            scrubbers.len(),
+            "the SCRUBBERS parse found {parsed} entries but the list holds {}; the block moved, \
+             was renamed or was reformatted, so its entries were not the ones checked",
+            scrubbers.len()
+        );
+        assert!(
+            unpinned.is_empty(),
+            "a SCRUBBERS entry grants an exemption while naming no test, a test that does not \
+             exist, or one that never mentions the constructor it exempts: {unpinned:?}"
+        );
+    }
+
     /// NO SPAWN IN THE CRATE — production or test — resolves a repository from
     /// the environment without going through a scrubbing constructor.
     ///
@@ -1240,37 +1433,6 @@ mod tests {
             "a_reaped_child_is_established_dead",
             "spawns a shell purely to own a pid; it is never asked about a repository",
         )];
-
-        /// The function a declaration line declares, or `UNPARSED` when the line declares one
-        /// in a shape this scan does not model. `None` when it is not a declaration at all.
-        ///
-        /// Qualifiers are enumerated rather than guessed at, and anything else before `fn`
-        /// makes the answer `UNPARSED` — the honest third value.
-        const UNPARSED: &str = "<unparsed declaration>";
-        fn declared_fn(trimmed: &str) -> Option<&str> {
-            // `fn` must be a whole token: `fn foo`, never `fn(u8) -> u8` (a fn-pointer type).
-            let at = trimmed
-                .match_indices("fn ")
-                .find(|(i, _)| *i == 0 || trimmed.as_bytes()[i - 1] == b' ')?;
-            let before = &trimmed[..at.0];
-            let known = before.split_whitespace().all(|tok| {
-                matches!(
-                    tok,
-                    "pub" | "const" | "async" | "unsafe" | "extern" | "default"
-                ) || tok.starts_with("pub(")
-                    || (tok.starts_with('"') && tok.ends_with('"'))
-            });
-            if !known {
-                return Some(UNPARSED);
-            }
-            let rest = &trimmed[at.0 + 3..];
-            let name = rest.split(['(', '<']).next().unwrap_or(rest).trim();
-            if name.is_empty() {
-                Some(UNPARSED)
-            } else {
-                Some(name)
-            }
-        }
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<std::path::PathBuf> = Vec::new();
@@ -1362,87 +1524,9 @@ mod tests {
             "found {found} spawns; the scan is broken, not the code"
         );
 
-        // EVERY EXEMPTION NAMES A TEST, AND THAT TEST EXISTS. `src/archive.rs` was exempted on
-        // a trailing comment naming `the_archive_fixture_does_not_reach_another_repository`,
-        // which existed nowhere in the crate — so that fixture was exempt by location with
-        // nothing observing it, and deleting its scrub left the whole suite green. That is the
-        // "a claimed pin that does not exist is worse than no claim" defect, granted BY the
-        // allowlist whose doc asserts each entry is separately checked. So the comment is the
-        // machine-checked part now and cannot rot into a false claim.
-        let all_src: String = files
-            .iter()
-            .filter_map(|f| std::fs::read_to_string(f).ok())
-            .collect();
-        let mut unpinned: Vec<String> = Vec::new();
-        let mut parsed = 0usize;
-        let mut in_list = false;
+        every_exemption_names_a_test_that_observes_it(root, &files, SCRUBBERS);
+
         let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
-        for line in self_src.lines() {
-            if line.contains("const SCRUBBERS") {
-                in_list = true;
-                continue;
-            }
-            if !in_list {
-                continue;
-            }
-            if line.trim() == "];" {
-                break;
-            }
-            // An ENTRY line, whatever it carries — counted before the comment is looked for, so
-            // that an entry written without one is a failure rather than a silent skip. Written
-            // the other way round (find the comment, then check the entry), a comment-less entry
-            // `continue`d and its exemption was granted with no named test at all: the archive.rs
-            // defect this check exists to close, one shape over.
-            if !line.trim_start().starts_with('(') {
-                continue;
-            }
-            parsed += 1;
-            let Some((_, named)) = line.split_once("// ") else {
-                unpinned.push(format!("{} names no test at all", line.trim()));
-                continue;
-            };
-            let named = named.trim();
-            let Some(at) = all_src.find(&format!("fn {named}(")) else {
-                unpinned.push(format!(
-                    "{} names `{named}`, which is not a function here",
-                    line.trim()
-                ));
-                continue;
-            };
-            // ...and the named test must OBSERVE the constructor it is named beside. Existing
-            // somewhere in the crate is not evidence about this entry — a test could be named
-            // here and assert something else entirely, which is the same "reads as pinned and
-            // is not" shape one level up. The body is scanned to its closing brace at test
-            // indentation, which is where every test in this crate ends.
-            let body = &all_src[at..];
-            let body = body.find("\n    }").map_or(body, |e| &body[..e]);
-            let ctor = line
-                .split_once(", \"")
-                .and_then(|(_, r)| r.split_once('"'))
-                .map_or("", |(n, _)| n);
-            if !ctor.is_empty() && !body.contains(ctor) {
-                unpinned.push(format!(
-                    "{} names `{named}`, which never mentions `{ctor}`",
-                    line.trim()
-                ));
-            }
-        }
-        // The premise, measured rather than asserted from a constant: `SCRUBBERS.len() >= 6` was
-        // `6 >= 6` on a const array of six, so it could not fail whatever the parse did — a
-        // guard that cannot fire, inside the guard against guards that cannot fire. Renaming the
-        // const or reformatting the block would have left it examining zero entries and passing.
-        assert_eq!(
-            parsed,
-            SCRUBBERS.len(),
-            "the SCRUBBERS parse found {parsed} entries but the list holds {}; the block moved, \
-             was renamed or was reformatted, so its entries were not the ones checked",
-            SCRUBBERS.len()
-        );
-        assert!(
-            unpinned.is_empty(),
-            "a SCRUBBERS entry grants an exemption while naming no test, a test that does not \
-             exist, or one that never mentions the constructor it exempts: {unpinned:?}"
-        );
 
         // The retired per-module check's distinctive premise: this file holds exactly ONE
         // production git spawn, in `git_cmd`. It is what makes an empty `stray` above mean

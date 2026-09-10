@@ -101,21 +101,37 @@ root_common="$(common_of "$repo_root")" || root_common=""
 # plus a `core.worktree` naming that same foreign tree took the arm and built it, so the arm
 # re-opened the hole it sits above. With `GIT_WORK_TREE` set, git did not use `core.worktree`,
 # so it says nothing about the tree we are actually standing in.
-# ASKED OF GIT'S OWN RESOLUTION, not by resolving the path again. `core.worktree` may be
-# "absolute or relative to the path to the .git directory" (git-config(5)) — resolving a relative
-# one against the HOOK'S CWD refused a repository using git's documented form, which is the same
-# false refusal this arm exists to end, one layout over. Measured.
+# ...and the declaration has to NAME THE TREE WE ARE STANDING IN. "Set to something" is not the
+# same question. A previous round reasoned that it was — `$repo_root` came from `--show-toplevel`
+# in this environment, so git must have resolved the toplevel THROUGH `core.worktree` — and that
+# argument has a documented exception it did not survive: with `GIT_COMMON_DIR` set, git IGNORES
+# `core.worktree` and takes the cwd as the toplevel, while `git config` still reports the value.
+# Measured on 2.51.1, and then end to end: `GIT_DIR`+`GIT_COMMON_DIR` leaked at one repository
+# while standing in another ran the OTHER checkout's setup.sh — the whole harm this guard exists
+# to prevent, through the arm above it.
 #
-# There is nothing to resolve. `$repo_root` came from `--show-toplevel` in this same environment;
-# with `GIT_WORK_TREE` unset, git resolved that toplevel THROUGH `core.worktree`, so a repository
-# that declares one has already told us `$repo_root` is its tree. Only the existence of the
-# declaration is in question, and git answers that.
+# So the comparison is back, and it asks about the relationship rather than about the selectors:
+# whatever variable disables `core.worktree` next, a declaration that does not name `$repo_root`
+# stops explaining why `$repo_root` looked foreign. Enumerating the selectors would have closed
+# `GIT_COMMON_DIR` and left the next one open.
+#
+# The relative form is resolved the way git documents it: "absolute or relative to the path to
+# the .git directory" (git-config(5)) — NOT to the hook's cwd, which refused a repository using
+# git's documented form, and not to the common dir. Measured: with `GIT_DIR=<d>/adm/gd` and
+# `core.worktree=../../rtree`, git's toplevel is `<d>/rtree` from any cwd, which is
+# `--absolute-git-dir` joined with the declaration.
 declared=""
 if [ -z "${GIT_WORK_TREE:-}" ]; then
     declared="$(git config core.worktree 2>/dev/null)" || declared=""
 fi
 if [ -n "$declared" ]; then
-    root_common="$hook_common"
+    gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
+    case "$declared" in /*) ;; *) declared="$gitdir/$declared" ;; esac
+    if [ -n "$gitdir" ] && [ -d "$declared" ] &&
+       [ "$(cd "$declared" 2>/dev/null && pwd -P)" = "$(cd "$repo_root" 2>/dev/null && pwd -P)" ]
+    then
+        root_common="$hook_common"
+    fi
 fi
 # What this arm buys, stated precisely because half of it is missing: setup.sh runs, so the
 # binary, the extension and the service are refreshed. Its HOOK section is not — measured,

@@ -272,8 +272,9 @@ EOF
 
 # git_hooks_override <repo_root> — print the absolute `core.hooksPath` in effect for
 # <repo_root>, or nothing when there is none. Returns 0 for both of those — "no override" is
-# an answer, not a failure. Three OTHER codes each name a way the setting exists and yields no
-# one hooks directory, because they need three different sentences and three different repairs:
+# an answer, not a failure. The OTHER codes each name a way the setting yields no one hooks
+# directory, and each is its own code because each needs its own sentence and its own repair —
+# codes 2, 3 and 4 are ways the VALUE is unusable, code 5 is this git being unable to say:
 #
 #   2  git will not expand it (`~someuser` for an account this machine does not have)
 #   3  it is set to the empty string (git resolves it to `/post-merge` and finds nothing)
@@ -283,8 +284,9 @@ EOF
 #      the repository's own value was established — a fact about the GIT, not about the value,
 #      and the two need different remedies
 #
-# One code for all three sent the operator a check that prints a perfectly normal value for
-# code 4, which is the same failure `--show-origin` was introduced to fix for code 3.
+# One code for all of them sent the operator a check that prints a perfectly normal value for
+# code 4, which is the same failure `--show-origin` was introduced to fix for code 3 — and the
+# same reason code 5 is not code 2: `--show-origin` prints something perfectly normal there too.
 #
 # Both halves are corrections of a cwd-scoped read, and both fail silently:
 #
@@ -1179,7 +1181,7 @@ install_git_hooks() {
         # `undecided` — nothing is known about THIS pattern — because that is the one thing
         # this branch does know: no chainer was attempted, so jkb cannot say whether its own
         # is at the derived path. The derivation still has the last word through the funnel
-        # below, and the three causes that reach rc 2 then land where they should:
+        # below, and every cause that reaches this branch then lands where it should:
         #
         #   unexpandable value  derivation says `undecided …` → want=unknown → touch nothing
         #   empty value         derivation says `none …`, no pattern → want=no → sweep, which
@@ -1187,6 +1189,9 @@ install_git_hooks() {
         #   relative, no tree   derivation still yields a pattern (it is correct inside every
         #                       worktree of a bare repo), and `undecided` keeps that block
         #                       while sweeping the others
+        #   unaskable git (5)   `_hooks_path_read` refuses there too, so the derivation says
+        #                       `undecided …` → want=unknown → touch nothing, which is the
+        #                       only honest move when the value was never established
         #
         # Leaving `want` at its `no` default made the third sweep the block a run from a
         # worktree had just added — the same configuration answering two ways depending on
