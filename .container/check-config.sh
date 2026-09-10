@@ -430,6 +430,32 @@ else
     bad "the Dockerfile does not set ENTRYPOINT to entrypoint.sh — docker start would come up with no firewall"
 fi
 
+# THE REAPER PATH IS SPELLED IN TWO FILES THAT CANNOT SHARE A VARIABLE. The Dockerfile asserts it
+# exists at BUILD time (`test -x`), entrypoint.sh EXECS it to become a PID 1 that reaps -- without
+# which `sleep` is PID 1, never wait()s, and every orphan reparented to it is a zombie for ever
+# (3941 of them on a 28h-old container, thirteen PIDs short of --pids-limit). Move tini's install
+# -- to /usr/local/bin, say, where every other privileged binary in this image is deliberately put
+# root-owned -- update one spelling and not the other, and the BUILD STILL PASSES: every route into
+# the container then dies at `exec: not found`, exit 127, and run.sh's settle() reports `gone`, so
+# the failure blames the egress boundary and sends the reader to audit something that is fine.
+# Neither self-test can catch it: entrypoint.sh's runs through the injected stub and never
+# exercises the default. Same shape as the ENTRYPOINT guard above.
+#
+# BOTH EXTRACTIONS ARE PINNED AGAINST EMPTY AND AGAINST MORE THAN ONE MATCH -- a sed that silently
+# matched nothing would leave this comparing "" with "" and printing its ok, which is this
+# directory's recurring defect rather than a hypothetical one.
+df_reaper="$(sed -n 's/^.*test -x[[:space:]][[:space:]]*\([^[:space:]\\]*\).*$/\1/p' "$here/Dockerfile")"
+ep_reaper="$(sed -n 's/^exec "\${JKB_REAPER:-\([^}]*\)}".*$/\1/p' "$here/entrypoint.sh")"
+if [ "$(printf '%s\n' "$df_reaper" | grep -c .)" -ne 1 ]; then
+    bad "the Dockerfile no longer asserts exactly one reaper path with \`test -x\` (found: ${df_reaper:-none}) — a missing reaper would surface only as the container failing to start"
+elif [ "$(printf '%s\n' "$ep_reaper" | grep -c .)" -ne 1 ]; then
+    bad "entrypoint.sh no longer hands over through exactly one \`exec \"\${JKB_REAPER:-<path>}\"\` (found: ${ep_reaper:-none}) — PID 1 would not reap"
+elif [ "$df_reaper" != "$ep_reaper" ]; then
+    bad "the Dockerfile and entrypoint.sh spell the reaper differently ($df_reaper vs $ep_reaper) — the build would pass and the container would fail to start"
+else
+    ok "the reaper the Dockerfile asserts is the one entrypoint.sh execs ($df_reaper)"
+fi
+
 # THE VERDICT PATH IS NO LONGER GUARDED HERE, because it is no longer duplicated (D52.5). This
 # carried a check that init-firewall.sh, entrypoint.sh and verify.sh all named /run/jkb-egress-verdict
 # identically, justified by a comment reading "three different processes [that] cannot share a

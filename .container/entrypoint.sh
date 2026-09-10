@@ -80,16 +80,40 @@ exit 0
 STUB
         chmod +x "$t/bin/sudo"
     }
+    # THE REAPER STUB. The real one is tini, which does not exist on a macOS host, so the exec
+    # that hands over PID 1 is path-injected. The stub is transparent — it drops the `--` and
+    # execs the command — so every assertion below still reads the command's own output, and it
+    # records that it ran so that "the reaper was skipped entirely" is distinguishable from "the
+    # command ran". Without that marker this stub would turn the reaper into something the test
+    # cannot see, which is how the bare `exec "$@"` went unnoticed in the first place.
+    mkdir -p "$t/bin"
+    cat >"$t/bin/reaper" <<'STUB'
+#!/bin/sh
+echo reaped >>"$JKB_REAPER_LOG"
+[ "$1" = "--" ] && shift
+exec "$@"
+STUB
+    chmod +x "$t/bin/reaper"
+    export JKB_REAPER_LOG="$t/reaped"
+
     run_ep() { # run_ep [accept]
         rm -f "$t/verdict"
         JKB_EGRESS_VERDICT="$t/verdict" JKB_EGRESS_ACCEPT_UNFILTERED="${1:-0}" \
+            JKB_REAPER="$t/bin/reaper" \
             PATH="$t/bin:$PATH" bash "$0" echo BECAME-THE-COMMAND 2>"$t/err"
     }
     export JKB_EGRESS_VERDICT="$t/verdict"
 
     stub allowlisted "allowlist raised"
+    rm -f "$t/reaped"
     eq "an allowlisted kernel execs the command"    "$(run_ep)" "BECAME-THE-COMMAND"
     eq "...and says nothing on stderr"              "$(wc -c <"$t/err" | tr -d ' ')" "0"
+    # THE HANDOVER GOES THROUGH A REAPER. `sleep` as PID 1 never wait()s, so every orphan
+    # reparented to it stayed a zombie for ever — 3941 of them, thirteen PIDs short of the
+    # container's limit. The command running proves nothing about this on its own: a bare
+    # `exec "$@"` satisfies every other assertion here, which is exactly why it survived.
+    eq "...and hands over THROUGH the reaper, not straight to the command" \
+       "$(cat "$t/reaped" 2>/dev/null)" "reaped"
 
     # A blanket deny is SAFE but not working: no allowlist, so nothing but DNS and loopback. Staying
     # up is the point — this is the state you need to attach to in order to repair it.
@@ -187,4 +211,33 @@ case "$state" in
         ;;
 esac
 
-exec "$@"
+# PID 1 MUST REAP, AND `sleep` CANNOT. This script is the image's ENTRYPOINT and nothing in here
+# runs a program, so run.sh keeps the container alive by passing `sleep infinity` as the command —
+# which a bare `exec "$@"` would make the PID 1 of this namespace. A process whose parent exits is
+# reparented to PID 1, and PID 1 must wait() on it or it stays a zombie for ever; `sleep` never
+# wait()s. The leak is therefore unbounded, and it is not a corner case: it is one zombie per
+# sandboxed Bash call (the zombies are bwrap/bash/sh/touch), so it tracks agent activity and an
+# unattended session walks into it unaided. Measured on a container 28 hours old: 3941 zombies of
+# 3968 tasks, and 4083 of container.json's 4096 PIDs spent — thirteen from a container that cannot
+# fork at all, which is not a slow degradation but every build, shell and tool call failing at once.
+#
+# WHY NOT `--init`. Docker's own tini does exactly this job, and it is the wrong shape HERE: it
+# becomes PID 1 *wrapping* this script, so PID 1's argv is `/sbin/docker-init -- …/entrypoint.sh
+# sleep infinity` for the whole life of the container. run.sh's `settle()` reads `ps -o args= -p 1`
+# and treats a match of `*entrypoint.sh*` as "the entrypoint has not finished yet" — so under
+# `--init` it never settles, exhausts its 120s budget and fails every create and start. Probing
+# PID 1's children instead would have a race of its own: there is a window in which tini has not
+# yet forked, and `settle_step` deliberately does not retry an unreadable probe.
+#
+# Exec'ing tini FROM here keeps PID 1's argv meaningful, which is what settle() actually reads:
+# while this script runs PID 1 is `entrypoint.sh sleep infinity` (waiting), and the moment it
+# hands over PID 1 is `tini -- sleep infinity` (settled, and reaping). No window, no new probe,
+# and settle_step is unchanged. `-s` is not passed: tini reaps unconditionally when it IS PID 1.
+#
+# The egress boot gate above is untouched — it has already run and can still have refused.
+#
+# Path-injected for the self-test, like JKB_EGRESS_VERDICT and JKB_INET6_PATH: this line is the
+# one thing in here that cannot run on a macOS host otherwise. The DEFAULT is not exercised by
+# that test, deliberately — a stub would only prove the stub — so the Dockerfile asserts
+# `test -x /usr/bin/tini` at build time and the two halves together cover the path.
+exec "${JKB_REAPER:-/usr/bin/tini}" -- "$@"

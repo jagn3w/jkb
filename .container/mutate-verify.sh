@@ -609,6 +609,42 @@ mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/s
 run "blanket passwordless root is restored" "may run more than the firewall and the egress probe as root" \
     "${HEALTHY[@]}"
 
+# A PID 1 THAT NEVER wait()s. Replacing /usr/bin/tini with an init that runs the command and
+# observes its exit through waitid(WNOWAIT) -- which leaves that child, and every orphan this
+# process adopts, a zombie -- removes exactly the property the handover exists to supply, and
+# nothing else: firewall, mounts, entrypoint, sudoers and user are all untouched.
+#
+# THE TWO OBVIOUS MUTATIONS BOTH FAIL TO MUTATE, which is why this one is written in C.
+#   * NOT `--init`: docker-init IS tini, so under it PID 1 genuinely reaps and the assertion
+#     correctly passes. The row would print MISSED and read as a guard that cannot fire -- this
+#     directory's recurring defect, added by the very harness meant to detect it.
+#   * NOT a bare `exec "$@"` in entrypoint.sh either: `run()` executes `bash -c "$SUBJECT"`, so
+#     PID 1's command here is BASH, and bash as PID 1 reaps (it waitpid(-1)s in waitchld). The
+#     leak belongs to `sleep`, which run.sh passes and this harness never does.
+#
+# C rather than a shell or perl stand-in: build-essential is a dependency the Dockerfile already
+# installs, and `waitid(..., WNOWAIT)` makes "observes the exit without reaping it" literal in one
+# line rather than something to be inferred from /proc polling. The exit-propagation check inside
+# the RUN turns "compiled but wrong" into BUILD-FAILED -- which `run()` reports as SKIPPED rather
+# than testing the base image -- instead of into a MISSED blaming a healthy guard.
+NO_REAP_B64="$(base64 <<'C' | tr -d '\n'
+#include <sys/wait.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    siginfo_t si; pid_t child;
+    if (argc > 1 && strcmp(argv[1], "--") == 0) { argv++; argc--; }
+    if (argc < 2) return 127;
+    if ((child = fork()) == 0) { execvp(argv[1], argv + 1); _exit(127); }
+    while (waitid(P_PID, child, &si, WEXITED | WNOWAIT) != 0) {}
+    return si.si_code == CLD_EXITED ? si.si_status : 128 + si.si_status;
+}
+C
+)"
+mutant jkb-dev-no-reaper "printf %s '$NO_REAP_B64' | base64 -d > /tmp/noreap.c && gcc -O0 -o /usr/bin/tini /tmp/noreap.c && { /usr/bin/tini -- sh -c 'exit 7'; [ \"\$?\" -eq 7 ]; }"
+run "PID 1 never wait()s (tini replaced by an init that observes its child with WNOWAIT)" "PID 1 does not reap" \
+    "${HEALTHY[@]}"
+
 # The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher
 # is matching something that is present when nothing is wrong — which is precisely the defect
 # this file exists to detect in verify.sh, and it had it too.

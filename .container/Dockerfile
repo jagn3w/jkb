@@ -18,12 +18,16 @@ FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 # that survives if the nested sandbox ever fails to start.
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        bubblewrap socat ripgrep jq \
+        bubblewrap socat ripgrep jq tini \
         build-essential pkg-config libssl-dev ca-certificates curl git \
         iptables ipset dnsutils \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs \
     && corepack enable \
+    # entrypoint.sh execs this ABSOLUTE path to become a PID 1 that reaps. If the package ever
+    # stops putting it here the container would fail to start at all, with the cause one exec
+    # deep -- so it fails the BUILD instead, the way the sudoers `visudo -c` check does.
+    && test -x /usr/bin/tini \
     && rm -rf /var/lib/apt/lists/*
 
 # The firewall script is installed INTO THE IMAGE, root-owned, and sudoers grants exactly that one

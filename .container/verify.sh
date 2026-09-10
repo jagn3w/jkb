@@ -112,6 +112,33 @@ missing_extensions() { # missing_extensions <declared, one per line> <installed,
     printf '%s' "$out"
 }
 
+# WHAT AN ORPHAN'S FATE MEANS. Pure, taking its observations as arguments, for the reason
+# settle_step is (D52.4): the arm that matters most here is the one no healthy container can
+# reach, and a decision reachable only by running a container is a decision nothing in the gate
+# checks. Gathering the observations needs /proc; judging them does not.
+#
+# THE PROPERTY IS MEASURED, NOT THE NAME. `--init` makes PID 1 `docker-init`, which IS tini and
+# DOES reap, so "PID 1 is /usr/bin/tini" would fail a correct container; and "PID 1 is not sleep"
+# would pass any non-reaping program that is not sleep. What leaked was that PID 1 did not wait()
+# on what it adopted, so that is what is asked. A zombie is removed from /proc by nothing but a
+# wait, so `reaped` cannot be produced by a PID 1 that does not reap: no false pass exists.
+#
+# Everything that is not an observation of reaping is its own verdict and none of them is `ok` --
+# an unobtainable measurement must never be spelled as a definite answer.
+reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
+    [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
+    # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
+    # does not reap, so this arm is not noise on the machine this assertion exists for.
+    [ -n "$2" ] || { printf 'fork-failed'; return; }
+    [ -n "$3" ] || { printf 'vanished'; return; }
+    [ "$3" = 1 ] || { printf 'not-adopted'; return; }
+    case "$4" in
+        gone) printf 'reaped' ;;
+        Z)    printf 'not-reaped' ;;
+        *)    printf 'never-exited' ;;
+    esac
+}
+
 # --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
 #
 # It is the one part of the mount boundary that widens by a TYPO rather than by an edit anyone
@@ -172,6 +199,27 @@ if [ "$SELF_TEST" = yes ]; then
     st2 "the dot in an id is literal, not a wildcard" \
         "$(missing_extensions "anthropic.claude-code@2.1.250" "anthropicXclaude-code")" " anthropic.claude-code"
 
+    # Assertion 1b's judgement. Only ONE of these six arms is reachable in a healthy container, so
+    # without this the other five are unreachable code in a change whose whole subject is a check
+    # that could not fire. A literal table, not a re-derivation of the conditions.
+    echo "==> verify.sh self-test: reaper_verdict"
+    st2 "a reaped orphan is the only ok arm" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 gone)" "reaped"
+    st2 "docker-init reaps too — the verdict is the property, not the name" \
+        "$(reaper_verdict '/sbin/docker-init -- /usr/local/bin/entrypoint.sh sleep infinity' 42 1 gone)" "reaped"
+    st2 "a lingering zombie is the leak itself" \
+        "$(reaper_verdict 'sleep infinity' 42 1 Z)" "not-reaped"
+    st2 "an unreadable PID 1 establishes nothing" \
+        "$(reaper_verdict '' 42 1 gone)" "pid1-unreadable"
+    st2 "a failed fork establishes nothing (and is the leak's own symptom)" \
+        "$(reaper_verdict 'sleep infinity' '' '' '')" "fork-failed"
+    st2 "an orphan that vanished before it was observed establishes nothing" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 '' '')" "vanished"
+    st2 "an orphan a subreaper took establishes nothing about PID 1" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 77 gone)" "not-adopted"
+    st2 "an orphan still running was never there to be reaped" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 S)" "never-exited"
+
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
     printf '\033[32mverify.sh self-test passed\033[0m\n'
@@ -220,6 +268,61 @@ fi
 # 1. Non-root. Load-bearing, not hygiene: root in a container cannot create a mount namespace
 #    directly even with seccomp relaxed, so bubblewrap fails and the nested sandbox with it.
 assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo yes || echo no)"
+
+# 1b. PID 1 REAPS WHAT IT ADOPTS. run.sh keeps this container alive with `sleep infinity`, and a
+#     bare `exec "$@"` in entrypoint.sh made THAT PID 1 -- `sleep` never wait()s, so every orphan
+#     reparented to it stayed a zombie for ever: 3941 of them on a 28h-old container, thirteen
+#     PIDs short of --pids-limit, i.e. thirteen from a container that cannot fork at all.
+#
+#     WHY IT IS ASSERTED HERE AND NOT ONLY AT BUILD. The fix is an IMAGE change, and nothing else
+#     observes the running container: `config_hash` covers the derived docker arguments and the
+#     seccomp profile's content, not entrypoint.sh or the Dockerfile, and the container.json edit
+#     that carried the fix was comment-only, which `dc_strip` removes before it is hashed. So
+#     `run.sh` without `--build` finds the args-hash and the image id both matching, starts the
+#     PRE-TINI container, settle() reads `sleep infinity` and returns settled, and the run reports
+#     "running and attachable" while the leak continues. This is the assertion that goes red there.
+#     The self-test proves the SCRIPT execs its reaper and the Dockerfile proves tini existed AT
+#     BUILD TIME; neither is an observation of the container you are about to attach to.
+pid1_argv=""
+while IFS= read -r -d '' w; do pid1_argv="$pid1_argv$w "; done </proc/1/cmdline 2>/dev/null
+pid1_argv="${pid1_argv% }"
+
+# stdout, stderr AND stdin are redirected or the command substitution below waits for the orphan
+# too, and this blocks for its whole life instead of returning its pid.
+orphan="$( ( sleep 1 >/dev/null 2>&1 </dev/null & echo $! ) 2>/dev/null )"
+[ "${orphan:-0}" -gt 0 ] 2>/dev/null || orphan=""
+
+# "<state> <ppid>", or non-zero once the process is gone. The comm check is what stops a pid
+# RECYCLED between two reads from being mistaken for our orphan -- at 4000 PIDs in flight that is
+# not a hypothetical. Builtins only: on the container this exists for, fork may be failing.
+pstat() { # pstat <pid> -> "<state> <ppid>"
+    local l rest st pp
+    IFS= read -r l <"/proc/$1/stat" 2>/dev/null || return 1
+    case "$l" in *"(sleep) "*) ;; *) return 1 ;; esac
+    rest="${l##*) }"          # strip through comm, leaving "<state> <ppid> ..."
+    st="${rest%% *}"; rest="${rest#* }"; pp="${rest%% *}"
+    printf '%s %s' "$st" "$pp"
+}
+
+adopted=""; final=""
+if [ -n "$orphan" ] && s="$(pstat "$orphan")"; then
+    adopted="${s#* }"
+    i=0
+    while [ "$i" -lt 60 ]; do          # 6s, well past the orphan's 1s life
+        if s="$(pstat "$orphan")"; then final="${s%% *}"; else final=gone; break; fi
+        sleep 0.1; i=$((i+1))
+    done
+fi
+
+case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
+    reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted has been a zombie for 6s (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    fork-failed)     bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
+    pid1-unreadable) bad "could not establish whether PID 1 reaps: /proc/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
+    not-adopted)     bad "could not establish whether PID 1 reaps: the test orphan was adopted by pid $adopted rather than PID 1, so a subreaper is in the way (PID 1 is: $pid1_argv)" ;;
+    vanished)        bad "could not establish whether PID 1 reaps: the test orphan could not be observed at all after being spawned (PID 1 is: $pid1_argv)" ;;
+    never-exited)    bad "could not establish whether PID 1 reaps: the test orphan is still in state '$final' after 6s, so it never exited to be reaped (PID 1 is: $pid1_argv)" ;;
+esac
 
 # 2. THE NESTED SANDBOX'S MECHANISM, measured by the one probe (D54.3).
 #
