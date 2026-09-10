@@ -103,6 +103,36 @@ fn git(dir: &Path, args: &[&str]) -> String {
     run_git(git_cmd(dir, args), args)
 }
 
+/// The isolation really covers BOTH halves — selection and configuration.
+///
+/// It was exempted in `gitrepo.rs`'s crate-wide spawn guard on a comment saying it was pinned
+/// by a test of its own, and it was not: deleting its `env_remove` calls left everything green.
+/// A claimed pin that does not exist is worse than no claim, because the guard reads as covered.
+#[test]
+fn the_fixture_isolation_covers_selection_and_config() {
+    let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    for want in [
+        // Selection: outranks `-C`, so a leak sends the fixture at another repository.
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        // Configuration: outranks the files pointed at /dev/null below, so an exported
+        // `commit.gpgsign` reddens the gate over a fact about somebody's shell.
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        assert!(
+            removed.iter().any(|k| k == want),
+            "{want} is not removed from the fixture environment; removed: {removed:?}"
+        );
+    }
+}
+
 /// Neutralize every route by which the developer's shell reaches a `git` this fixture runs —
 /// directly, or inside the `jkb` binary it spawns.
 ///

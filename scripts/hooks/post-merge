@@ -14,10 +14,17 @@ set -uo pipefail
 
 # A HOOK HONOURS THE ENVIRONMENT GIT HANDS IT, and every git call here is therefore bare.
 #
-# Git runs a hook with the cwd at the working tree it resolved and `GIT_DIR` naming the
-# repository the merge was about (measured: `GIT_DIR=<repo>/.git`, `GIT_WORK_TREE=.`). That
-# `GIT_DIR` is the only pointer to the history this merge touched, so stripping it is not a
-# safety measure — it is losing the subject. A previous round stripped it and MEASURED the
+# Git runs a hook with the cwd at the working tree it resolved. What it puts in the environment
+# DEPENDS ON THE LAYOUT — measured on 2.51.1, all three:
+#
+#   ordinary checkout    GIT_DIR unset, GIT_WORK_TREE unset      (cwd alone is enough)
+#   linked worktree      GIT_DIR=<repo>/.git/worktrees/<name>    (GIT_WORK_TREE unset)
+#   GIT_WORK_TREE leaked GIT_DIR=<repo>/.git, GIT_WORK_TREE=.
+#
+# So `GIT_DIR` is not always set — but wherever it IS set it names the repository the merge was
+# about, and in the third row it is the ONLY pointer to it. Stripping it there is not a safety
+# measure, it is losing the subject. (An earlier version of this comment stated the third row
+# as though it were all three: one layout measured, three asserted.) A previous round stripped it and MEASURED the
 # result: `ORIG_HEAD` stopped resolving, the `HEAD^..HEAD` fallback answered about the wrong
 # repository, `changed` came back empty, and a pull that changed `crates/` printed "no
 # build-affecting changes pulled" — the exact failure the strip was written to prevent, caused

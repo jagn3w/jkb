@@ -208,11 +208,12 @@ case_isolate() {
 
     # And the effect that matters: git must see no injected core.hooksPath afterwards.
     #
-    # ONE ROUTE PER ASSERTION, because the two are not interchangeable. `GIT_CONFIG_COUNT` gates
-    # every `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` pair, so a version that unset only the count would
-    # satisfy an injection made that way — this assertion named the KEY/VALUE sweep and could
-    # not tell whether it had happened. `GIT_CONFIG_PARAMETERS` is gated by nothing, so it is
-    # the route that pins its own unset. Both are checked, and each dies on its own omission.
+    # One assertion per injection ROUTE. Stated precisely, because the obvious claim is false:
+    # neither of these dies on its own omission — `isolate: vars` above catches a missing unset
+    # first, since it reads the variables directly. What they add is the FILE-based routes no
+    # variable check can see (measured: dropping `isolate_git`'s HOME redirect leaves
+    # `isolate: vars` green and fails both), and the third assertion below is the one that
+    # discriminates the KEY_<n>/VALUE_<n> sweep specifically.
     _isolate_sees() {   # _isolate_sees <label> <env-prefix…> -- runs git after isolate_git
         local label="$1"; shift
         got="$(env "$@" bash -c '. "$1" >/dev/null 2>&1; isolate_git "$2/$3" >/dev/null 2>&1
@@ -255,6 +256,29 @@ case_isolate() {
         || fail "isolate: revive" "a swept pair came back live: core.hooksPath=$got"
 }
 
-run_cases case1 case2 case2b case2c case2d case3 case4 case_isolate
+# --- orphan detection sees a case whose name is not `case<digit>` ---------------------------
+# The pattern `run_cases` derives defined cases with was `case[0-9][0-9a-z]*`, and `case_isolate`
+# — the only such name in these four suites — fell outside it, so deleting it from a runner's
+# argument list left the gate green with a BSD-sed portability pin gone. Widening it fixed that
+# and pinned NOTHING: reverting the pattern was green again. This is the pin, and it is written
+# against the shape rather than against the one name, so the next `case_`-prefixed case is
+# covered without anyone remembering.
+case_orphanname() {
+    local out rc=0 lib
+    lib="$(cd "$(dirname "$0")" && pwd)/harness.sh"
+    out="$(
+        bash -c '. "$1" >/dev/null 2>&1
+                 case1() { :; }
+                 case_a_named_one() { :; }
+                 run_cases case1' _ "$lib" 2>&1
+    )" || rc=$?
+    case "$out" in
+        *"case_a_named_one"*)
+            ok "a defined-but-unrun case is reported whatever its name is spelled like" ;;
+        *)  fail "orphanname" "run_cases did not report case_a_named_one (rc=$rc, said '$out')" ;;
+    esac
+}
+
+run_cases case1 case2 case2b case2c case2d case3 case4 case_orphanname case_isolate
 
 finish

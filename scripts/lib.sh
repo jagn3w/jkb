@@ -151,11 +151,15 @@ _real_dir() {
 # those entries answers both correctly with no warning at all: nothing stored reads as
 # `dispatch=direct`, and a stored value gets its chainer refreshed as usual.
 #
-# `--show-scope` is git >= 2.26; an older git exits 129 for the unknown option, which is not
-# "cannot expand", so the read is retried without it — there the injected value is
-# indistinguishable and is used, which is the behaviour before this existed rather than a
-# confident wrong one. `|| rc=$?`, never a bare assignment: exit 1 here is the commonest case
-# and a bare one aborts an `set -e` shell.
+# `--show-scope` is git >= 2.26. An older git exits 129 for the unknown option, which is not
+# "cannot expand", so the read falls back to asking each STORED scope BY NAME — never to a
+# plain `--get`, which reports the winner and so hands back precisely the environment-injected
+# value the scope skip exists to ignore. (It did: chainer installed at the injected path,
+# exclude rule written for it, `dispatch=chained` reported, while the repository's own path
+# kept none.) Same answer on every git, not a degraded one on an old git.
+#
+# `|| rc=$?`, never a bare assignment: exit 1 here is the commonest case and a bare one aborts
+# an `set -e` shell.
 _hooks_path_read() {
     local rc=0 scoped line found=1 value=""
     scoped="$(_git -C "$1" config --show-scope --get-all --path core.hooksPath 2>/dev/null)" || rc=$?
@@ -184,10 +188,28 @@ EOF
     # rather than a degraded answer on an old one. An unsupported or unusable `--worktree` just
     # fails and is skipped; where the extension is off git makes it an alias for `--local`,
     # which is the same answer again.
-    local scope out found2=1 value2=""
+    #
+    # `--worktree` is a DISTINCT scope only when `extensions.worktreeConfig` is on. With it off
+    # git aliases it to `--local`, already asked — and, measured on 2.51.1, it hard-fails 128
+    # ("cannot be used with multiple working trees") in any repo with more than one working
+    # tree, which D36 makes the NORMAL state: this checkout has four. Read unconditionally, that
+    # layout fact reached the `*)` arm below as "cannot be expanded", discarded the good value
+    # `--local` had already found, wrote no chainer, and sent the operator to
+    # `--show-origin --get core.hooksPath`, which prints a perfectly normal path — the
+    # self-refuting remedy `--show-origin` exists to avoid.
+    #
+    # `--includes` because a scope flag turns include resolution OFF by default, while
+    # `--show-scope --get-all` above leaves it ON. Without it a `core.hooksPath` reached through
+    # `[include] path = …` or `includeIf` — the standard split-gitconfig recipe — reads as
+    # "the repository stores none", which the caller renders as `dispatch=direct` and prints
+    # nothing for, while git itself resolves the hook and jkb writes no chainer. The two
+    # branches of this one function have to answer the same question about the same repository.
+    local scope out found2=1 value2="" wtc=""
+    wtc="$(_git -C "$1" config --bool extensions.worktreeConfig 2>/dev/null)" || wtc=false
     for scope in system global local worktree; do
+        if [ "$scope" = worktree ] && [ "$wtc" != true ]; then continue; fi
         rc=0
-        out="$(_git -C "$1" config --"$scope" --get-all --path core.hooksPath 2>/dev/null)" || rc=$?
+        out="$(_git -C "$1" config --"$scope" --includes --get-all --path core.hooksPath 2>/dev/null)" || rc=$?
         # Measured on git 2.51.1: 1 is "not set in this scope", 128 is "set, and git will not
         # expand it" (`~someuser/` for an absent account). 129 is an unknown OPTION, which is
         # how a git predating `--worktree` answers — a fact about the git, not about the value.

@@ -1539,10 +1539,12 @@ case10l() {
         fail "hookenv: wt-setup" "could not create a linked worktree"
     fi
 
-    # 4. Reached through a SYMLINK, which is the axis `pwd -P` exists for: --git-common-dir
-    #    answers the relative `.git`, and each side anchors it at the directory it was asked
-    #    from, so the two sides must still name one directory. A false refusal here disables
-    #    the D34 automation silently for anyone whose checkout path runs through a link.
+    # 4. Reached through a SYMLINK. NOT a pin on `pwd -P`, which an earlier version of this
+    #    comment claimed: `git -C <symlink>` normalises $PWD to the physical path before the
+    #    hook runs, so removing `pwd -P` passes here — measured, along with four other layouts.
+    #    What it pins is narrower and still worth having: the guard must not FALSELY REFUSE on
+    #    a checkout whose path runs through a link, which would disable the D34 automation
+    #    silently for that user. `pwd -P`'s own status is stated honestly at its definition.
     _hookenv_build linked
     if ln -s "$d/linked" "$d/vialink" 2>/dev/null && [ -d "$d/vialink" ]; then
         out="$(git_q -C "$d/vialink" merge --no-edit feature 2>&1)"
@@ -1558,6 +1560,70 @@ case10l() {
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l
+# --- 10m. the old-git fallback answers the same question --show-scope does -----------------
+# Two ways the per-scope fallback disagreed with the `--show-scope` branch about ONE repository,
+# both silent and both permanent, and neither reachable from any other case.
+#
+#   * `--worktree` is a distinct scope only with `extensions.worktreeConfig` on. Off, git
+#     aliases it to `--local` — and hard-fails 128 in any repo with MORE THAN ONE working tree,
+#     which D36 makes the normal state (this checkout has four). Read unconditionally, that
+#     layout fact became "cannot be expanded", threw away the value `--local` had found, and
+#     wrote no chainer.
+#   * A scope flag turns include resolution OFF, while `--show-scope --get-all` leaves it on.
+#     So a `core.hooksPath` reached through `[include] path =` — the standard split-gitconfig
+#     recipe — read as "the repository stores none", which renders as `dispatch=direct` and
+#     prints NOTHING, while git itself resolves the hook perfectly well.
+case10m() {
+    local d="$work/oldscope" rc v
+    mkdir -p "$d/bin"
+    printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do [ "$a" = "--show-scope" ] && exit 129; done' \
+        "exec $(command -v git) \"\$@\"" >"$d/bin/git"
+    chmod 755 "$d/bin/git"
+    # The premise: the shim really refuses, or every case below tests the modern path twice.
+    PATH="$d/bin:$PATH" git config --show-scope --get-all core.hooksPath >/dev/null 2>&1
+    [ "$?" -eq 129 ] || { fail "oldscope: premise" "the shim did not refuse --show-scope"; return; }
+
+    ask() { rc=0; v="$(PATH="$d/bin:$PATH" _hooks_path_read "$1" 2>/dev/null)" || rc=$?; }
+
+    git_q init -q "$d/r" >/dev/null 2>&1
+    git_q -C "$d/r" commit -q --allow-empty -m init
+    git_q -C "$d/r" config core.hooksPath .githooks
+    ask "$d/r"
+    [ "$rc" = 0 ] && [ "$v" = .githooks ] \
+        && ok "the fallback reads a stored core.hooksPath" \
+        || fail "oldscope: base" "rc=$rc value='$v'"
+
+    # A SECOND working tree, and nothing else changed.
+    git_q -C "$d/r" worktree add -q "$d/w2" -b w2 >/dev/null 2>&1
+    if [ -d "$d/w2" ]; then
+        ask "$d/r"
+        [ "$rc" = 0 ] && [ "$v" = .githooks ] \
+            && ok "and a second working tree does not turn a layout fact into 'cannot expand'" \
+            || fail "oldscope: worktree" "rc=$rc value='$v' — --worktree's 128 was read as the value's"
+    else
+        fail "oldscope: wt-setup" "could not add a second worktree"
+    fi
+
+    # ...and with the extension ON, --worktree is a real scope and must WIN.
+    git_q -C "$d/r" config extensions.worktreeConfig true
+    if git_q -C "$d/r" config --worktree core.hooksPath /wt 2>/dev/null; then
+        ask "$d/r"
+        [ "$rc" = 0 ] && [ "$v" = /wt ] \
+            && ok "and with worktreeConfig on, --worktree wins as git resolves it" \
+            || fail "oldscope: wtc" "rc=$rc value='$v'"
+    fi
+
+    # An included file is the same question, and a scope flag turns includes off by default.
+    git_q init -q "$d/r2" >/dev/null 2>&1
+    printf '[core]\n\thooksPath = /from-include\n' >"$work/home/inc.cfg"
+    printf '[include]\n\tpath = %s/inc.cfg\n' "$work/home" >>"$work/home/.gitconfig"
+    ask "$d/r2"
+    [ "$rc" = 0 ] && [ "$v" = /from-include ] \
+        && ok "and a core.hooksPath reached through [include] is found, not reported absent" \
+        || fail "oldscope: includes" "rc=$rc value='$v' — --includes is missing from the scoped read"
+}
+
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
 
 finish

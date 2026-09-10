@@ -1059,23 +1059,44 @@ mod tests {
     /// spawn is built there — the same shape as `scripts/lib.sh`'s `_git`, which needed the
     /// same kind of check. Production spawns only: the fixtures below deliberately build their
     /// own, and scrub by hand.
-    /// ...and NO OTHER FILE in the crate spawns a repository-aware tool outside a scrubbing
-    /// constructor.
+    /// ...and NO OTHER SPAWN IN THE CRATE — production or test — resolves a repository from
+    /// the environment without going through a scrubbing constructor.
     ///
-    /// The guard below reads one file, so it says nothing about the next one. Three spawns
-    /// already had to be found by asking *who else implements this rule* — `git_cmd`, `pr::gh`
-    /// (a leaked `GIT_WORK_TREE` has `gh` reporting on an unrelated repository's pull requests)
-    /// and `session::run_gate` (whose verdict decides a landing) — and each was pinned only at
-    /// its own site, so a FOURTH in a new file is covered by nothing. This is the crate-wide
-    /// choke point: every production `Command::new` must sit in a constructor named here, and
-    /// each of those is separately asserted to scrub. Adding a spawn therefore forces the
-    /// decision at the moment it is added, rather than at the moment somebody notices.
+    /// Three rules this guard had to learn, each from a defect it had missed:
+    ///
+    /// 1. **Test code counts.** The first version cut every file at its `mod tests`, so it could
+    ///    not see that this module's OWN four fixtures scrubbed nothing. Measured: with
+    ///    `GIT_DIR`/`GIT_WORK_TREE` exported and a dirty checkout at the other end, running
+    ///    `gitrepo::tests` commits into that repository, creates branches `deep/er` and
+    ///    `mergecommit` in it, and moves its HEAD. A guard that exempts the half where the
+    ///    damage was is not a guard.
+    /// 2. **Exempt by LOCATION, not by name.** Keyed on the bare name `git_cmd`, a new module
+    ///    copying the idiom — name included, which is the likeliest way a fifth spawn gets
+    ///    written, since two files already spell it that way — was exempt on arrival.
+    /// 3. **Every spawn is classified.** A program that does not resolve a repository is listed
+    ///    too, with its reason, so adding one forces the decision either way rather than
+    ///    defaulting to silence.
     #[test]
-    fn no_production_spawn_in_the_crate_bypasses_a_scrubbing_constructor() {
-        // Constructors whose scrub is pinned by a test of its own — `git_cmd` by the guard
-        // below and the behavioural test above it, `gh_cmd` in pr.rs, `gate_cmd` in
-        // session.rs, `isolate_git_env` by the fixtures it builds.
-        const SCRUBBERS: &[&str] = &["git_cmd", "gh_cmd", "gate_cmd", "isolate_git_env"];
+    fn no_spawn_in_the_crate_resolves_a_repository_unscrubbed() {
+        /// `(file, fn)` — each of these is separately asserted to scrub, by the test named.
+        const SCRUBBERS: &[(&str, &str)] = &[
+            ("src/gitrepo.rs", "git_cmd"), // every_git_call_drops_the_callers_repository_selection
+            ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
+            ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
+            ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
+            ("src/archive.rs", "git"),      // the_archive_fixture_does_not_reach_another_repository
+            // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
+            // the spawn is, since that is what the scan can see.
+            ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
+        ];
+        /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
+        /// is a decision rather than an omission.
+        const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[(
+            "src/owner.rs",
+            "a_reaped_child_is_established_dead",
+            "spawns a shell purely to own a pid; it is never asked about a repository",
+        )];
+
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         let mut stack = vec![root.join("src"), root.join("tests")];
@@ -1107,14 +1128,13 @@ mod tests {
             let Ok(src) = std::fs::read_to_string(path) else {
                 continue;
             };
-            // Production half only, by the same rule as the guard below. A file with no test
-            // module is production throughout.
-            let prod = match src.find("\n#[cfg(test)]\nmod tests {") {
-                Some(cut) => &src[..cut],
-                None => &src[..],
-            };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
             let mut enclosing = "<no enclosing fn>";
-            for (i, line) in prod.lines().enumerate() {
+            for (i, line) in src.lines().enumerate() {
                 let trimmed = line.trim_start();
                 if let Some(rest) = trimmed
                     .strip_prefix("pub fn ")
@@ -1123,24 +1143,39 @@ mod tests {
                 {
                     enclosing = rest.split(['(', '<']).next().unwrap_or(rest);
                 }
-                if line.contains("Command::new(") {
-                    found += 1;
-                    if !SCRUBBERS.contains(&enclosing) {
-                        let name = path.strip_prefix(root).unwrap_or(path).display();
-                        stray.push(format!("{name}:{} in `{enclosing}`", i + 1));
-                    }
+                // A doc comment or a Rust string mentioning the call is not a call. THIS
+                // function's own body is full of both, and once test code is in scope they
+                // would otherwise all count as spawns and inflate the floor below.
+                if trimmed.starts_with("//") || line.contains("\\\"") {
+                    continue;
                 }
+                if !line.contains("Command::new(\"") {
+                    continue;
+                }
+                found += 1;
+                let here = (rel.as_str(), enclosing);
+                if SCRUBBERS.iter().any(|&(f, n)| f == here.0 && n == here.1) {
+                    continue;
+                }
+                if let Some(&(_, _, why)) = NOT_REPO_AWARE
+                    .iter()
+                    .find(|&&(f, n, _)| f == here.0 && n == here.1)
+                {
+                    let _ = why;
+                    continue;
+                }
+                stray.push(format!("{rel}:{} in `{enclosing}`", i + 1));
             }
         }
         assert!(
-            found >= 4,
-            "found {found} production spawns; the scan is broken, not the code"
+            found >= 6,
+            "found {found} spawns; the scan is broken, not the code"
         );
         assert!(
             stray.is_empty(),
-            "a repository-aware tool is spawned outside a scrubbing constructor ({SCRUBBERS:?}), \
-             so it inherits the caller's repository selection and may act on an unrelated \
-             repository: {stray:?}"
+            "a tool is spawned outside any scrubbing constructor, so it inherits the caller's \
+             repository selection and may act on an unrelated repository. Route it through one \
+             of {SCRUBBERS:?}, or list it in NOT_REPO_AWARE with the reason: {stray:?}"
         );
     }
 
@@ -1208,25 +1243,54 @@ mod tests {
         );
     }
 
+    /// The ONE builder for every git spawn in this test module.
+    ///
+    /// The fixtures used to neutralize the developer's git CONFIG and not the three variables
+    /// that SELECT a repository — and those outrank `-C`. Measured on this branch: with
+    /// `GIT_DIR`/`GIT_WORK_TREE` exported (the bare-dotfiles shell recipe), running these tests
+    /// commits into the developer's unrelated repository, creates branches `deep/er` and
+    /// `mergecommit` in it, and moves its HEAD off `main`. That is `./scripts/check.sh` — the
+    /// gate `jkb task land` and the merge queue trust — writing to somebody else's repo.
+    ///
+    /// The identical incident had already been fixed in `tests/sessions.rs` and `archive.rs`
+    /// and left live HERE, in the file that hosts the guard against it, under a doc comment
+    /// claiming these fixtures "scrub by hand". One builder, so there is nothing to remember.
+    fn fixture_git(at: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(at).args(args);
+        // Selection — the half that was missing.
+        super::scrub_repo_selection(&mut cmd);
+        // ...and configuration. Wider than production's scrub, deliberately: production keeps
+        // `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` because the dev container's
+        // `safe.directory` grants live there, while a fixture must not inherit configuration
+        // it did not choose. This machine sets `core.hooksPath` globally and signs commits.
+        cmd.env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t");
+        cmd
+    }
+
+    /// `fixture_git` really scrubs — the SCRUBBERS entry above claims it, so something must
+    /// check it. Reverting the `scrub_repo_selection` call inside it fails here, and (measured)
+    /// also lets `gitrepo::tests` commit into an unrelated dirty repository.
+    #[test]
+    fn the_test_fixtures_do_not_reach_another_repository() {
+        super::assert_scrubbed(
+            "gitrepo fixture",
+            &fixture_git(Path::new("/somewhere"), &["status"]),
+        );
+    }
+
     /// Build a throwaway repo exercising all three GitHub merge strategies plus an
     /// unmerged control. Each branch touches its own file so the merges do not conflict.
     fn fixture(dir: &Path) {
         let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                // Neutralize the developer's git config wholesale. This machine sets
-                // core.hooksPath globally and signs commits; either would make the fixture
-                // fail for reasons that have nothing to do with merge detection.
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .unwrap();
+            let ok = fixture_git(dir, args).output().unwrap();
             assert!(ok.status.success(), "git {args:?}: {ok:?}");
         };
         run(&["init", "-q", "-b", "main"]);
@@ -1299,14 +1363,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         fixture(&dir);
         let run = |at: &Path, args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(at)
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .unwrap();
+            let ok = fixture_git(at, args).output().unwrap();
             assert!(ok.status.success(), "git {args:?}: {ok:?}");
         };
         run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
@@ -1353,14 +1410,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         fixture(&dir);
         let run = |at: &Path, args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(at)
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .unwrap();
+            let ok = fixture_git(at, args).output().unwrap();
             assert!(ok.status.success(), "git {args:?}: {ok:?}");
         };
         run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
@@ -1578,13 +1628,8 @@ mod tests {
         // A linked worktree, then its `.git` file removed — a part-way `git worktree remove`.
         let wt = root.join(".jkb/work/x");
         std::fs::create_dir_all(wt.parent().expect("parent")).expect("mkdir");
-        let add = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["worktree", "add", "-q", "--detach"])
+        let add = fixture_git(root, &["worktree", "add", "-q", "--detach"])
             .arg(&wt)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .expect("git worktree add");
         assert!(add.status.success(), "{add:?}");

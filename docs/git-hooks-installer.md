@@ -172,9 +172,19 @@ conventions every session is expected to know.
     inject configuration and are deliberately left alone — this project's own dev container
     carries `safe.directory` grants in them, and stripping those makes git refuse the checkout
     outright. Pinned at both ends, so the list cannot be "tidied" into a blanket sweep.
-  - **It stops at hooks on purpose:** a hook must honour the environment git hands it — git sets
-    `GIT_DIR` when it runs one, and in a linked worktree that is the only way to reach the right
-    repository — so `scripts/hooks/post-merge` and the emitted chainer keep bare `git`.
+  - **It stops at hooks on purpose**, and the REASON has been stated wrongly twice, so it is
+    written out here once. Not *"in a linked worktree `GIT_DIR` is the only way to reach the
+    right repository"* — that is false, git chdirs to the working tree top before running a hook
+    and cwd discovery answers the same. It is that **wherever `GIT_DIR` is set, it names which
+    repository the merge was about**, and the hook has no other way to know. Measured on 2.51.1,
+    all three layouts: an ordinary checkout leaves it unset, a linked worktree sets it to
+    `<repo>/.git/worktrees/<name>`, and a leaked `GIT_WORK_TREE` sets it to `<repo>/.git` with
+    `GIT_WORK_TREE=.` — and in that last one it is the only pointer there is. A round scrubbed
+    it anyway and MEASURED the result: `ORIG_HEAD` stopped resolving, and a pull touching
+    `crates/` printed *"no build-affecting changes pulled"*, the exact failure the scrub was
+    written to prevent. So `scripts/hooks/post-merge` and the emitted chainer keep bare `git`,
+    and the hook detects a redirected working tree instead of fighting it — it cannot win, since
+    `--show-toplevel` names the redirected tree either way.
   - **The test harness needed the same sweep and had missed two.** `isolate_git` unset five
     variables and left `GIT_CONFIG_PARAMETERS` and `GIT_COMMON_DIR`, both of which outrank the
     empty configuration it builds — and the dev container exports the first. Its list is now
@@ -312,8 +322,12 @@ conventions every session is expected to know.
   linked worktree `GIT_DIR` is the only way to reach the right repository"* — it is not; git
   chdirs to the working tree top first, so cwd discovery answers the same), and correcting a
   reason was mistaken for correcting a conclusion. Scrubbed, the hook was measurably WORSE:
-  git runs a hook with cwd at the working tree it resolved and `GIT_DIR` naming the repository
-  the merge was about, so stripping it discards the only pointer to the merged history —
+  git runs a hook with cwd at the working tree it resolved, and what it puts in the environment
+  depends on the layout (measured, all three: ordinary checkout sets neither variable; a linked
+  worktree sets `GIT_DIR` to `<repo>/.git/worktrees/<name>`; a leaked `GIT_WORK_TREE` sets
+  `GIT_DIR=<repo>/.git` and `GIT_WORK_TREE=.`). Wherever it IS set it names the repository the
+  merge was about, and in the third layout it is the only pointer there is, so stripping it
+  discards the merged history —
   `ORIG_HEAD` stopped resolving, the `HEAD^..HEAD` fallback answered about the wrong
   repository, and a pull touching `crates/` printed *"no build-affecting changes pulled"*, the
   exact sentence the strip was written to prevent. Measured end to end, both arms, one fixture.
@@ -390,6 +404,21 @@ conventions every session is expected to know.
   nothing under `sed --posix`, i.e. on macOS, which is where this project is developed — so the
   isolation silently did not happen on one of its two platforms, and no case covered it either
   way. A `case` glob now, with a harness case that asserts git really sees no injected value.
+- **Every spawn in the crate is now gated by ONE allowlist, keyed on (file, function).**
+  Per-site pinning was the previous state of the art and it was not enough: it says nothing about
+  the next file. `no_spawn_in_the_crate_resolves_a_repository_unscrubbed` walks every `.rs` under
+  the crate and requires each `Command::new` to sit in a named scrubbing constructor or in an
+  explicit `NOT_REPO_AWARE` list with its reason — so a new spawn forces the decision when it is
+  written. Three rules it had to learn, each from something it missed:
+  **test code counts** (its first version cut each file at `mod tests`, which is exactly where
+  the live damage was — `gitrepo.rs`'s own four fixtures scrubbed nothing, and with a dirty
+  checkout at the other end of a leaked `GIT_WORK_TREE` they commit into it, create branches
+  `deep/er` and `mergecommit`, and move its HEAD; measured, then measured again against the fix);
+  **exempt by location, not by name** (keyed on the bare name `git_cmd`, a new module copying the
+  idiom was exempt on arrival, and two files already spell it that way); and **every spawn is
+  classified**, so "not repository-aware" is a recorded decision rather than an omission. Its own
+  allowlist error — keying `tests/sessions.rs` on the delegate rather than the spawn site — was
+  caught by the guard on first run.
 - **Three repository-aware spawns, one rule, pinned at each of them.** Asking *who else
   implements this rule* found two production spawns that were not git and resolved a repository
   from the environment anyway: `pr::gh` — `gh` finds the repo through git, so a leaked
