@@ -83,7 +83,7 @@ is unavailable to decide, leave the task un-tagged and move on.
 
 Each change **owns one `D<N>` number** with sub-decisions `D<N>.1`, `D<N>.2` (like D26.x,
 D27.x). Continue the repo's global sequence — find the current max with
-`grep -rho 'D[0-9]\+' openspec CLAUDE.md | sort -t D -k2 -n | tail -1`. Format each block so an
+`grep -rho 'D[0-9]\+' openspec CLAUDE.md docs | sort -t D -k2 -n | tail -1`. Format each block so an
 implementer can grep it by uid:
 
 ```

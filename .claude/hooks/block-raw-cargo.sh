@@ -23,7 +23,7 @@ esac
 if printf '%s' "$cmd" \
   | grep -qE '(^|[;&|(){}])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?(build|test|clippy|fmt|check)([[:space:]]|$)'; then
   cat <<'JSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Don't run cargo directly in this repo — use the ./scripts wrappers (they self-source ~/.cargo/env, pin the toolchain, and gate lints): ./scripts/build.sh, ./scripts/test.sh, ./scripts/clippy.sh, ./scripts/fix.sh (fmt+check), ./scripts/test-count.sh. They pass args through, e.g. ./scripts/test.sh -p jkb-core needs_review. (cargo install/run/add/tree/deny are still fine.)"}}
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Don't run cargo directly in this repo — use the ./scripts wrappers (they self-source ~/.cargo/env, pin the toolchain, and gate lints): ./scripts/build.sh, ./scripts/test.sh, ./scripts/clippy.sh, ./scripts/fix.sh (fmt+check), ./scripts/test-count.sh. They pass args through, e.g. ./scripts/test.sh -p jkb-core needs_review. ./scripts/check.sh runs the whole gate and takes no arguments. (cargo install/run/add/tree/deny are still fine.)"}}
 JSON
 fi
 exit 0
