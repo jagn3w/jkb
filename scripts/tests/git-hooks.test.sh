@@ -1180,6 +1180,41 @@ case10f() {
         && ok "every refusal status maps to a verdict the renderer really has an arm for" \
         || fail "verdict: arms" "no render arm for status(es):$bad"
 
+    # AND THE REMEDY MUST REACH THE OPERATOR, TRUE. An arm existing is not the claim; case10f's
+    # loop above passed the whole time code 5 rendered through `unreadable`'s arm and told the
+    # operator to run `git config --show-origin --get core.hooksPath` — which, on the very git
+    # that could not be asked, prints a perfectly normal `file:.git/config<TAB>.githooks` and
+    # appears to refute the warning. So this drives the WHOLE path: a real repository, a git
+    # that refuses every scope option, `install_git_hooks`, and the rendered report a person
+    # actually reads.
+    local d5="$work/unaskable" report5 rendered5
+    mkdir -p "$d5/bin"
+    git_q init -q "$d5/r" >/dev/null 2>&1
+    git_q -C "$d5/r" commit -q --allow-empty -m init
+    git_q -C "$d5/r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho hi\n' >"$d5/src"
+    printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do case "$a" in --show-scope|--includes) exit 129;; esac; done' \
+        "exec $(command -v git) \"\$@\"" >"$d5/bin/git"
+    chmod 755 "$d5/bin/git"
+    report5="$(PATH="$d5/bin:$PATH" install_git_hooks "$d5/r" "$d5/src" 2>/dev/null)"
+    case "$report5" in
+        *"dispatch=unaskable"*)
+            ok "a git that cannot be asked reports its own dispatch word, not unreadable" ;;
+        *"dispatch=unreadable"*)
+            fail "unaskable: word" "code 5 still reports as unreadable, sharing code 2's sentence" ;;
+        *) fail "unaskable: premise" "got: $(printf '%s' "$report5" | tr '\n' '|')" ;;
+    esac
+    rendered5="$(printf '%s\n' "$report5" | render_git_hooks_report 2>&1)"
+    case "$rendered5" in
+        *"--show-origin"*)
+            fail "unaskable: remedy" \
+                 "the repair line tells the operator to run a command that prints a normal value here" ;;
+        *"upgrade git"*)
+            ok "and its repair line names the git, which is the thing that refused" ;;
+        *) fail "unaskable: render" "got: $(printf '%s' "$rendered5" | tr '\n' '|')" ;;
+    esac
+
     v="$(_override_verdict 9)"
     w="$(_override_why 9)"
     case "$v" in
@@ -1633,7 +1668,9 @@ case10l() {
     # 7. `core.worktree` may be "absolute or relative to the path to the .git directory"
     #    (git-config(5)). Resolving a relative one against the HOOK'S CWD refused a repository
     #    using git's documented form — the same false refusal step 5 exists to end, one layout
-    #    over. Nothing is resolved now: `--show-toplevel` already went through the declaration.
+    #    over. It IS resolved now, against the git directory as git-config(5) documents — the
+    #    round that wrote "nothing is resolved now: `--show-toplevel` already went through the
+    #    declaration" was wrong, and step 8 below is the layout that disproves it.
     local rgd="$d/adm/gd" rwt="$d/rtree"
     mkdir -p "$d/adm" "$rwt/scripts"
     git_q init -q --bare "$rgd" >/dev/null 2>&1
@@ -1821,6 +1858,46 @@ reads it was never exercised"
     else
         fail "oldscope: losing-premise" "git does not resolve the fixture's hooksPath, so this tested nothing"
     fi
+    # RESTORED. `$work/home/.gitconfig` is shared by every case after this one, and an
+    # unexpandable global `core.hooksPath` left behind makes them all read rc 2 — a fixture that
+    # silently rewrites its successors' premise. The `[include]` case below depends on this
+    # being clean, and found it the hard way.
+    : >"$work/home/.gitconfig"
+    git_q config --global user.email t@example.com
+    git_q config --global user.name "Test"
+
+    # ...and a broken value that LOSES INSIDE ONE SCOPE is the same question again. `--path`
+    # expands every value it returns, not just the winning one, so a single bad line anywhere in
+    # a file failed the whole scope — including the split-config recipe `--includes` exists for:
+    # a shared `~/.gitconfig` with an `[include]` whose file corrects it. Measured on 2.51.1:
+    # `rev-parse --git-path` answers the good path, so git resolves it and will run hooks there.
+    printf '[core]\n\thooksPath = ~nosuchuser42/hooks\n[include]\n\tpath = work.cfg\n' \
+        >>"$work/home/.gitconfig"
+    printf '[core]\n\thooksPath = %s/goodhooks\n' "$d" >"$work/home/work.cfg"
+    mkdir -p "$d/goodhooks"
+    git_q init -q "$d/r4" >/dev/null 2>&1
+    if [ "$(git_q -C "$d/r4" rev-parse --git-path hooks/post-merge 2>&1)" = "$d/goodhooks/post-merge" ]; then
+        ask "$d/r4"
+        [ "$rc" = 0 ] && [ "$v" = "$d/goodhooks" ] \
+            && ok "and a broken value LOSING INSIDE a scope does not abort it either" \
+            || fail "oldscope: inscope" "rc=$rc value='$v' — want $d/goodhooks, as git resolves it"
+    else
+        fail "oldscope: inscope-premise" "git does not resolve the included hooksPath, so this tested nothing"
+    fi
+
+    # ...but when the scope's OWN WINNER is the unexpandable one, git fails and so must we.
+    printf '[core]\n\thooksPath = ~nosuchuser42/hooks\n' >>"$work/home/work.cfg"
+    if git_q -C "$d/r4" rev-parse --git-path hooks/post-merge >/dev/null 2>&1; then
+        fail "oldscope: winner-premise" "git expands the fixture's winning value, so this tested nothing"
+    else
+        ask "$d/r4"
+        [ "$rc" = 2 ] \
+            && ok "and a winner git itself will not expand is still refused, with code 2" \
+            || fail "oldscope: winner" "rc=$rc value='$v' — git refuses this value; we must too"
+    fi
+    : >"$work/home/.gitconfig"
+    git_q config --global user.email t@example.com
+    git_q config --global user.name "Test"
 }
 
 run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m

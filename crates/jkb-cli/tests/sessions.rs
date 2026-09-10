@@ -17,6 +17,9 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+mod common;
+use common::isolate_git_env;
+
 /// A scratch repo plus a database kept *outside* it — a db file inside the repo would show
 /// up as an untracked change and make every land refuse a dirty tree.
 struct Fixture {
@@ -131,39 +134,6 @@ fn the_fixture_isolation_covers_selection_and_config() {
             "{want} is not removed from the fixture environment; removed: {removed:?}"
         );
     }
-}
-
-/// Neutralize every route by which the developer's shell reaches a `git` this fixture runs —
-/// directly, or inside the `jkb` binary it spawns.
-///
-/// ONE function, because two spawn sites each remembering the list is how one of them came to
-/// remember only half of it. It is deliberately WIDER than [`gitrepo::scrub_repo_selection`],
-/// which strips repository selection and leaves configuration injection alone on purpose (this
-/// project's dev container carries its `safe.directory` grants there). Production must not
-/// discard a grant it needs; a fixture must not inherit configuration it did not choose. Two
-/// rules, not drift.
-fn isolate_git_env(cmd: &mut Command) {
-    // Selection: these outrank `-C`. Measured — with `GIT_DIR`/`GIT_WORK_TREE` exported, the
-    // bare-dotfiles shell recipe, `git -C <tmpdir> init` re-inits the OTHER repository and
-    // creates nothing here, and the `add`/`commit` that follow land a commit in it. That is
-    // `./scripts/check.sh` — the gate `jkb task land` and the merge queue trust — writing to a
-    // repository the developer merely happens to have configured.
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        // Configuration: the env-injected form OUTRANKS the files neutralized below, so
-        // pointing those at /dev/null is not isolation on its own. `GIT_CONFIG_COUNT` gates
-        // every `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` pair, so dropping it disables them all
-        // without naming an unbounded set. An exported `commit.gpgsign` or `core.hooksPath`
-        // would otherwise redden the gate over a fact about somebody's shell.
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t");
 }
 
 /// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into
@@ -3439,4 +3409,25 @@ fn a_parent_with_an_open_subtask_is_refused_before_the_graft() {
         "the session was disposed of before the refusal"
     );
     assert_eq!(f.status_of(&parent), "in_progress");
+}
+
+/// `Fixture::jkb` must not hand the developer's repository selection to the `jkb` it spawns.
+/// Named at THIS call site: deleting the `isolate_git_env` line inside `Fixture::jkb` left the
+/// entire suite green, including the crate-wide spawn guard, which could not see a spawn built
+/// with `cargo_bin`.
+#[test]
+fn the_session_fixture_jkb_does_not_inherit_a_repository() {
+    let fx = Fixture::new();
+    let cmd = fx.jkb();
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    for want in common::MUST_DROP {
+        assert!(
+            removed.iter().any(|k| k == want),
+            "{want} is not removed from Fixture::jkb; removed: {removed:?}"
+        );
+    }
 }

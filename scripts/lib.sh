@@ -133,8 +133,12 @@ _real_dir() {
 # _hooks_path_read <repo_root> — the ONE read of `core.hooksPath`, and it reads the
 # REPOSITORY'S OWN value.
 #
-# Prints the value and returns 0; returns 1 when the repository stores none, and 2 when git
-# will not expand it. Both consumers — `git_hooks_override`, which resolves it to a directory,
+# Prints the value and returns 0; returns 1 when the repository stores none, 2 when git will not
+# expand the value this repository would actually use, and 5 when THIS GIT could not be asked at
+# all (it answered 129, unknown option, to every scope) — which is a fact about the binary, not
+# about the value, and carries a different remedy. Listed here and not only at the arm that
+# returns it: the header is what a reader consults, and one that stopped at 2 told them a 5
+# could not happen. Both consumers — `git_hooks_override`, which resolves it to a directory,
 # and `git_hooks_exclude_pattern`, which needs the raw string — go through here, because they
 # need DIFFERENT things from the SAME fact and reading it twice is how they came to disagree
 # about it. They did, measurably: the override refused an environment-injected value while the
@@ -204,7 +208,7 @@ EOF
     # "the repository stores none", which the caller renders as `dispatch=direct` and prints
     # nothing for, while git itself resolves the hook and jkb writes no chainer. The two
     # branches of this one function have to answer the same question about the same repository.
-    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0
+    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0 raw last probe
     # `--local`, because `extensions.worktreeConfig` is a LOCAL-ONLY repository extension: git
     # stores it per repository, so a global one — or a `-c` on the command line, which this
     # function refuses for `core.hooksPath` three lines up — is not this repository's answer.
@@ -233,17 +237,41 @@ EOF
             # So it is counted: all four scopes refusing means the read failed, not that nothing
             # is stored.
             129) unsupported=$((unsupported + 1)); continue ;;
-            # 128 is "set HERE, and git will not expand it" — a fact about THIS scope, not about
-            # the repository's answer. Returned immediately, a broken value in a LOSING scope
-            # (a `~someuser/` in a shared ~/.gitconfig, the ordinary state of dotfiles) aborted
-            # the whole read, so a repository whose own `core.hooksPath` git resolves and RUNS
-            # was reported `dispatch=unreadable` with no chainer written. Measured: `git hook run
-            # post-merge` printed the hook's output while this function returned 2.
+            # 128 is "git will not expand SOMETHING in this scope" — which is not the same as
+            # "this scope's answer is unusable". `--path` expands EVERY value it returns, not
+            # just the winning one, so ONE broken line anywhere in the file fails the whole
+            # read. Measured on 2.51.1 with the split-config recipe `--includes` exists for:
+            # `~/.gitconfig` carrying `hooksPath = ~nosuchuser42/hooks` and then an
+            # `[include]` whose file sets a good one. `rev-parse --git-path hooks/post-merge`
+            # answers `/good/hooks/post-merge` — git resolves it and will run hooks there —
+            # while this scope read exits 128 and the repository was reported
+            # `dispatch=unreadable` with no chainer. The losing-scope fix one round ago named
+            # this same harm one scope out and left it standing one scope in.
             #
-            # So it is remembered, not returned, and the LAST word wins — which is how git
-            # resolves precedence. A value at a higher-precedence scope clears it (above); a
-            # break at a higher-precedence scope invalidates a value found lower down, because
-            # that is the value git would have tried to expand.
+            # So the scope is re-asked RAW, and only its LAST value — the one git would
+            # actually use from here — is put back to git for expansion. Broken lines that are
+            # not the scope's answer are as irrelevant as a broken value in a losing scope.
+            128)
+                raw="$(_git -C "$1" config --"$scope" --includes --get-all core.hooksPath 2>/dev/null)" \
+                    || { broken=1; continue; }
+                # The scope's winner, by the same last-entry-wins rule used below.
+                last="${raw##*$'\n'}"
+                # Asked of GIT, not modelled: `~/` and `~user/` differ only by whether the
+                # account exists on THIS machine, which is not a thing to reimplement. A
+                # one-key file is the narrowest way to ask about exactly one value.
+                probe="$(mktemp "${TMPDIR:-/tmp}/.jkb-hookspath.XXXXXX")" || { broken=1; continue; }
+                printf '[core]\n\thooksPath = %s\n' "$last" >"$probe"
+                if out="$(_git config --file "$probe" --path --get core.hooksPath 2>/dev/null)"; then
+                    rm -f "$probe"
+                    broken=0
+                else
+                    rm -f "$probe"
+                    # THIS scope's answer is the unexpandable one, so a lower scope's value is
+                    # not what git would use either.
+                    broken=1
+                    continue
+                fi
+                ;;
             *) broken=1; continue ;;
         esac
         # Last entry within a scope wins, as git itself resolves it. Command substitution has
@@ -897,7 +925,7 @@ _override_verdict() {
         2) printf 'unreadable core.hooksPath cannot be expanded on this machine' ;;
         3) printf 'unreadable core.hooksPath is set to the empty string' ;;
         4) printf 'unanchored core.hooksPath' ;;
-        5) printf 'unreadable core.hooksPath could not be read from this git' ;;
+        5) printf 'unaskable core.hooksPath could not be read from this git' ;;
         *) printf 'unreadable core.hooksPath could not be resolved (unrecognised status %s)' "$1" ;;
     esac
 }
@@ -1128,7 +1156,7 @@ _reconcile_exclude_decide() {
 #                             differs from before this run. The ONLY line that describes the
 #                             file; every other line describes one step or one pattern. Emitted
 #                             once per run by `reconcile_exclude`, below every arm.
-#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored
+#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored | unaskable
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while
@@ -1436,6 +1464,16 @@ render_git_hooks_report() {
                              # empty value and nothing for an unset one — visually identical,
                              # so the operator's own check appeared to refute the warning.
                              warn "  check it with: git config --show-origin --get core.hooksPath" ;;
+                    # Its own arm, because the REMEDY differs — which is the whole reason code 5
+                    # is not code 2. Sharing `unreadable`'s sentence sent the operator to
+                    # `git config --show-origin --get core.hooksPath`, which on the very git
+                    # that cannot be asked prints a perfectly normal `file:.git/config .githooks`
+                    # and appears to refute the warning, with nothing pointing at the git binary.
+                    # Measured under the all-refusing shim. A refusal must name a remedy that is
+                    # true of the thing refused, and the thing refused here is the git.
+                    unaskable)
+                             warn "$detail, so jkb could not tell where git will look for hooks."
+                             warn "  this git is too old to report where core.hooksPath is set (it needs --show-scope, or per-scope --includes); upgrade git, or set core.hooksPath yourself and re-run." ;;
                     *)       warn "unrecognised dispatch verdict: $line" ;;
                 esac ;;
             error=*) warn "$rest; skipping hook install" ;;

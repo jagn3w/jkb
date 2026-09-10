@@ -349,11 +349,46 @@ conventions every session is expected to know.
     each side, relative answers anchored at the directory they were ASKED FROM, compared with
     `pwd -P`) and stops with a named reason when it does not. Verified by disabling the guard:
     an unrelated repository's `setup.sh` executes.
+  - **And a checkout that CANNOT answer is the hard half — three rounds live here.** A
+    `core.worktree` checkout has no `.git` entry of its own, so asking `$repo_root` with the
+    environment scrubbed finds no repository at all, `root_common` comes back empty, and the
+    comparison above read that as foreign: a perfectly ordinary checkout refused, with the D34
+    automation permanently off there. The repository being merged knows the answer, because
+    `core.worktree` is *it declaring this working tree* — so a declaration naming `$repo_root`
+    restores it. Each round narrowed what "naming" means, and every narrowing was a measurement:
+
+    | Round | The arm said | What it cost |
+    |---|---|---|
+    | 19 | declared and `-d`, resolved against the hook's cwd | a git-documented **relative** declaration was refused — git anchors it on the **git directory**, not the cwd |
+    | 20 | declared at all (the comparison dropped) | `GIT_COMMON_DIR` makes git **ignore** `core.worktree` while `git config` still reports it, so a leak at one repository **built another checkout** — the whole harm, through the arm above it |
+    | 21 | declared, resolved against `--git-dir`, and equal to `$repo_root`; and `GIT_WORK_TREE` unset | holds both ways: the relative form is accepted, the ignored declaration is not |
+
+    The shape of the mistake was the same twice: a fix for a **false refusal** opened a **false
+    acceptance**, and vice versa. Both directions have to be re-measured after any change here.
+    The `GIT_WORK_TREE` condition is separate and also load-bearing — `core.worktree` is the
+    *repository's* answer and `GIT_WORK_TREE` the *caller's*, and when the caller has overridden
+    it the declaration says nothing about the tree we are standing in.
+
+    Two things this arm does NOT buy, stated because half of it is missing: `setup.sh` runs, so
+    the binary, extension and service refresh, but its **hook** section does not —
+    `install_git_hooks` reports `error=not a git repo` in this layout, because `_git` scrubs
+    `GIT_DIR` and the tree has no `.git` to discover from. That message is false and the
+    installer needs its own answer to "which repository is this?"; it is filed rather than
+    bolted on, since the scrub it would have to relax is the one keeping jkb out of other
+    people's repositories.
   - **A fixture must not decide for itself what environment git produces.** The test that
     passed the broken version built the INVERSE of git's own layout — cwd in the right repo,
     `GIT_DIR` naming the foreign one — under which scrubbing can only look like a win. It
-    drives a real merge now and reads what the hook prints, in three layouts: ordinary,
-    redirected, and inside a linked worktree.
+    drives a real merge now and reads what the hook prints, in eight layouts: ordinary,
+    redirected, linked worktree, entered through a symlink, `core.worktree`, declared-vs-
+    redirected, relative `core.worktree`, and `GIT_COMMON_DIR`.
+  - **You cannot shim `git` inside a hook, and a test that tries measures nothing.** git
+    prepends its own `GIT_EXEC_PATH` — which contains a real `git` binary — to `PATH` before
+    running a hook, so a stub earlier on `PATH` is never reached and the case silently exercises
+    the real git and passes whatever the hook does. Measured: a hook printing `command -v git`
+    answers `/usr/local/libexec/git-core/git`. To test this hook against a git that lacks an
+    option, run the script DIRECTLY with the stub on `PATH`; a `git merge` run will not do it.
+    This was found by drawing the false conclusion first.
   - **And running it caught a bug in the fix it has since replaced**: `env` execs a binary
     while `command` is a shell builtin, so `env … command git` failed every call and the hook
     exited at its first one, silently, because the next token is `|| exit 0`.

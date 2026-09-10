@@ -1262,6 +1262,11 @@ case14() {
         'dispatch=dead /c|will NOT run the repo hook above'
         'dispatch=unreadable core.hooksPath is empty|is empty, so git will not reliably run'
         'dispatch=unanchored core.hooksPath|whatever directory the pulling process is in'
+        # Its own row because it is its own remedy: `unaskable` is "this git could not be
+        # asked", where `--show-origin` prints a perfectly normal value and only a newer git
+        # helps. Sharing `unreadable`'s row would have re-asserted exactly the confusion the
+        # separate code exists to end.
+        'dispatch=unaskable core.hooksPath could not be read from this git|upgrade git'
         'exclude-file=unknown|could not tell whether .git/info/exclude changed'
         'error=not a git repo|not a git repo; skipping hook install'
     )

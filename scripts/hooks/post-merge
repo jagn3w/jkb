@@ -125,7 +125,25 @@ if [ -z "${GIT_WORK_TREE:-}" ]; then
     declared="$(git config core.worktree 2>/dev/null)" || declared=""
 fi
 if [ -n "$declared" ]; then
-    gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
+    # `--git-dir` and absolutise it here, NOT `--absolute-git-dir` — the same reasoning this file
+    # already applies to `--path-format=absolute` sixty lines up, and it was missing here.
+    # `--absolute-git-dir` is a much later addition than `--git-dir`: on a git without it
+    # rev-parse exits non-zero, `gitdir` is empty, this arm can never fire, and a `core.worktree`
+    # checkout is refused as foreign on EVERY pull, with the D34 automation silently off there.
+    #
+    # MEASURED, both forms, against a git shimmed to refuse `--absolute-git-dir`: the old form
+    # printed "belongs to a different repository" for a checkout git resolves perfectly well;
+    # this one proceeds. Note the shim has to be applied to a DIRECT run of this script — git
+    # prepends its own `GIT_EXEC_PATH` (which holds a real `git`) to PATH before running a hook,
+    # so a PATH shim never reaches one, and a `git merge` run of this test silently measures the
+    # unshimmed git and reports success either way. That false negative was observed first.
+    gitdir="$(git rev-parse --git-dir 2>/dev/null)" || gitdir=""
+    case "$gitdir" in
+        "") ;;
+        /*) ;;
+        # Relative to the CWD, which is where it was asked, exactly as in `common_of`.
+        *) gitdir="$PWD/$gitdir" ;;
+    esac
     case "$declared" in /*) ;; *) declared="$gitdir/$declared" ;; esac
     if [ -n "$gitdir" ] && [ -d "$declared" ] &&
        [ "$(cd "$declared" 2>/dev/null && pwd -P)" = "$(cd "$repo_root" 2>/dev/null && pwd -P)" ]

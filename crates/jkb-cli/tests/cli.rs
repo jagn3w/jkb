@@ -12,10 +12,18 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+mod common;
+use common::isolate_git_env;
+
 /// A `jkb` invocation against database `db`.
 fn jkb(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("jkb").unwrap();
     cmd.arg("--db").arg(db);
+    // jkb spawns git, and these tests inherit the developer's shell, so an exported `GIT_DIR`
+    // reached every one of those spawns through this process. This fixture had NO isolation at
+    // all — invisible to the crate-wide guard, which keyed on `Command::new(` while this builds
+    // its process with `cargo_bin`. Pinned by `the_cli_fixture_does_not_inherit_a_repository`.
+    isolate_git_env(&mut cmd);
     // Pin the host these tests' owner ids are compared against. A `host:<pid>` owner is only
     // probed for liveness on the host that issued it — a pid means nothing without one, and
     // `~/.jkb` is shared across the container boundary on purpose — so `host:1234` has to name
@@ -2874,4 +2882,24 @@ fn sync_keeps_two_tasks_files_in_one_directory_apart() {
         !after.contains("do it"),
         "design.md was given tasks.md's items: {after}"
     );
+}
+
+/// The fixture above must not hand the developer's repository selection to the `jkb` it spawns,
+/// and thence to every `git` that `jkb` spawns. Named at THIS call site, not at
+/// `isolate_git_env`: a test of the helper alone stayed green with the call deleted.
+#[test]
+fn the_cli_fixture_does_not_inherit_a_repository() {
+    let tmp = TempDir::new().unwrap();
+    let cmd = jkb(&tmp.path().join("x.db"));
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    for want in common::MUST_DROP {
+        assert!(
+            removed.iter().any(|k| k == want),
+            "{want} is not removed from the cli fixture; removed: {removed:?}"
+        );
+    }
 }

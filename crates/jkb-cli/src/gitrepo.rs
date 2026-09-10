@@ -1231,6 +1231,41 @@ mod tests {
         }
     }
 
+    /// How a process gets BUILT here — every spelling, because the guard is about the
+    /// spawn and not about one way of writing it. Keyed on `Command::new(` alone, the
+    /// three `Command::cargo_bin("jkb")` fixtures were invisible: deleting the
+    /// `isolate_git_env` line from `Fixture::jkb` left this guard and the whole suite
+    /// green, while the doc above claimed NO SPAWN IN THE CRATE goes unscrubbed. Measured.
+    const SPAWN_FORMS: &[&str] = &["Command::new(", "cargo_bin("];
+
+    /// `(file, fn)` — each of these is separately asserted to scrub, by the test named.
+    const SCRUBBERS: &[(&str, &str)] = &[
+        ("src/gitrepo.rs", "git_cmd"), // every_git_call_drops_the_callers_repository_selection
+        ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
+        ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
+        ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
+        ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
+        // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
+        // the spawn is, since that is what the scan can see.
+        ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
+        ("tests/sessions.rs", "jkb"),     // the_session_fixture_jkb_does_not_inherit_a_repository
+        ("tests/cli.rs", "jkb"),          // the_cli_fixture_does_not_inherit_a_repository
+    ];
+    /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
+    /// is a decision rather than an omission.
+    const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[
+        (
+            "src/owner.rs",
+            "a_reaped_child_is_established_dead",
+            "spawns a shell purely to own a pid; it is never asked about a repository",
+        ),
+        (
+            "tests/cli.rs",
+            "help_advertises_the_mcp_subcommand",
+            "runs `jkb --help`, which prints usage and never resolves a repository",
+        ),
+    ];
+
     /// The function a declaration line declares, or `UNPARSED` when the line declares one
     /// in a shape this scan does not model. `None` when it is not a declaration at all.
     ///
@@ -1280,12 +1315,22 @@ mod tests {
             .filter_map(|f| std::fs::read_to_string(f).ok())
             .collect();
         let code_src = super::code_only(&all_src);
+        // Assembled, never written whole: see the anchor below.
+        let marker = ["const ", "SCRUBBERS"].concat();
         let mut unpinned: Vec<String> = Vec::new();
-        let mut parsed = 0usize;
+        let mut parsed: Vec<(String, String)> = Vec::new();
         let mut in_list = false;
         let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
         for line in self_src.lines() {
-            if line.contains("const SCRUBBERS") {
+            // THE DECLARATION, and the needle is ASSEMBLED AT RUN TIME so that this line
+            // cannot be it. The scan sits 130 lines above the const it reads, and a literal
+            // `line.contains("const SCRUBBERS")` matched its OWN source first — it found the
+            // right entries only because nothing in between happened to trim to `];` or start
+            // with `(`, and one `vec![…];` in this function ended the scan on the wrong list.
+            // Adding `&& line.contains("= &[")` did NOT fix it: that predicate is also true of
+            // the line spelling it. Measured, both ways. A marker no line of this scanner can
+            // contain is the only version of the anchor that is not about this scanner.
+            if line.contains(&marker) && line.contains("= &[") {
                 in_list = true;
                 continue;
             }
@@ -1303,7 +1348,20 @@ mod tests {
             if !line.trim_start().starts_with('(') {
                 continue;
             }
-            parsed += 1;
+            // The (file, fn) pair this line declares, so the premise below can be about
+            // IDENTITY rather than arity — a count matches for any six lines at all.
+            let pair = line
+                .trim()
+                .trim_start_matches('(')
+                .split_once(')')
+                .map_or("", |(inner, _)| inner);
+            let mut halves = pair
+                .split(',')
+                .map(|h| h.trim().trim_matches('"').to_owned());
+            parsed.push((
+                halves.next().unwrap_or_default(),
+                halves.next().unwrap_or_default(),
+            ));
             let Some((_, named)) = line.split_once("// ") else {
                 unpinned.push(format!("{} names no test at all", line.trim()));
                 continue;
@@ -1371,16 +1429,19 @@ mod tests {
                 ));
             }
         }
-        // The premise, measured rather than asserted from a constant: `scrubbers.len() >= 6` was
-        // `6 >= 6` on a const array of six, so it could not fail whatever the parse did — a
-        // guard that cannot fire, inside the guard against guards that cannot fire. Renaming the
-        // const or reformatting the block would have left it examining zero entries and passing.
+        // The premise, and it is about IDENTITY. `scrubbers.len() >= 6` was `6 >= 6` on a const
+        // array of six, so it could not fail whatever the parse did; counting what was parsed
+        // instead fixed the arity but still said nothing about WHICH six lines were read — any
+        // six would have satisfied it, including six from a different list that happened to sit
+        // where the scan landed. The pairs the scan reads must BE the pairs the compiler saw.
+        let declared: Vec<(String, String)> = scrubbers
+            .iter()
+            .map(|(f, c)| ((*f).to_owned(), (*c).to_owned()))
+            .collect();
         assert_eq!(
-            parsed,
-            scrubbers.len(),
-            "the SCRUBBERS parse found {parsed} entries but the list holds {}; the block moved, \
-             was renamed or was reformatted, so its entries were not the ones checked",
-            scrubbers.len()
+            parsed, declared,
+            "the SCRUBBERS parse did not read the list the compiler saw; the block moved, was \
+             renamed or was reformatted, so the entries checked were not its entries"
         );
         assert!(
             unpinned.is_empty(),
@@ -1415,25 +1476,6 @@ mod tests {
     ///    defaulting to silence.
     #[test]
     fn no_spawn_in_the_crate_resolves_a_repository_unscrubbed() {
-        /// `(file, fn)` — each of these is separately asserted to scrub, by the test named.
-        const SCRUBBERS: &[(&str, &str)] = &[
-            ("src/gitrepo.rs", "git_cmd"), // every_git_call_drops_the_callers_repository_selection
-            ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
-            ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
-            ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
-            ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
-            // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
-            // the spawn is, since that is what the scan can see.
-            ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
-        ];
-        /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
-        /// is a decision rather than an omission.
-        const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[(
-            "src/owner.rs",
-            "a_reaped_child_is_established_dead",
-            "spawns a shell purely to own a pid; it is never asked about a repository",
-        )];
-
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         // The CRATE ROOT, so the claim "every .rs under the crate" is true — a `build.rs` git
@@ -1501,7 +1543,7 @@ mod tests {
                 if let Some(name) = declared_fn(trimmed) {
                     enclosing = name;
                 }
-                if !line.contains("Command::new(") {
+                if !SPAWN_FORMS.iter().any(|f| line.contains(f)) {
                     continue;
                 }
                 found += 1;
@@ -1536,7 +1578,10 @@ mod tests {
             None => panic!("this module has a `mod tests`, which marks the end of production code"),
         };
         assert_eq!(
-            super::code_only(self_prod).matches("Command::new(").count(),
+            SPAWN_FORMS
+                .iter()
+                .map(|f| super::code_only(self_prod).matches(f).count())
+                .sum::<usize>(),
             1,
             "expected exactly one production git spawn in gitrepo.rs (in `git_cmd`); the scan is \
              looking at the wrong slice or the spawn has been respelled"
