@@ -259,8 +259,19 @@ EOF
                 # Asked of GIT, not modelled: `~/` and `~user/` differ only by whether the
                 # account exists on THIS machine, which is not a thing to reimplement. A
                 # one-key file is the narrowest way to ask about exactly one value.
+                #
+                # git WRITES the probe as well as reading it, because config values are not
+                # plain text and hand-writing `hooksPath = $last` corrupts them. Measured on
+                # 2.51.1, `printf` into the file: `/a/b#c` and `/a/b;c` came back truncated at
+                # the comment character, leading whitespace was eaten, and `/a/back\slash`
+                # exited 128 — a value git resolves perfectly well, reported by THIS arm as
+                # unexpandable, which is the exact defect the arm exists to remove. `git config
+                # --file <f> <key> <value>` quotes on the way in (`hooksPath = "/a/b#c"`), and
+                # all six round-tripped, tilde expansion included.
                 probe="$(mktemp "${TMPDIR:-/tmp}/.jkb-hookspath.XXXXXX")" || { broken=1; continue; }
-                printf '[core]\n\thooksPath = %s\n' "$last" >"$probe"
+                if ! _git config --file "$probe" core.hooksPath "$last" 2>/dev/null; then
+                    rm -f "$probe"; broken=1; continue
+                fi
                 if out="$(_git config --file "$probe" --path --get core.hooksPath 2>/dev/null)"; then
                     rm -f "$probe"
                     broken=0

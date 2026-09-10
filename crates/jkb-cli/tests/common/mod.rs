@@ -8,13 +8,9 @@
 
 use std::process::Command;
 
-/// Strip the caller's repository selection and configuration from a spawn.
-///
-/// Every `git` this process reaches — directly, or through a `jkb` that spawns its own — must
-/// resolve the repository from its arguments and nothing else.
-///
 /// Neutralize every route by which the developer's shell reaches a `git` this fixture runs —
-/// directly, or inside the `jkb` binary it spawns.
+/// directly, or inside the `jkb` binary it spawns. Such a `git` must resolve its repository
+/// from its arguments and nothing else.
 ///
 /// ONE function, because two spawn sites each remembering the list is how one of them came to
 /// remember only half of it. It is deliberately WIDER than `gitrepo::scrub_repo_selection`,

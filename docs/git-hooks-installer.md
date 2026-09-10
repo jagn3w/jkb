@@ -289,6 +289,24 @@ conventions every session is expected to know.
   verdict the renderer prints nothing for. A 129 is counted now, and all scopes refusing returns
   "unestablished" rather than "stores none". Left as written, this paragraph told the next reader
   a 129 could not happen — from the file `CLAUDE.md` sends them to *before* touching `lib.sh`.
+- **`--path` expands EVERY value a scope returns, not just the winner.** So one broken line
+  anywhere in a file failed the whole scope read — including the split-config recipe
+  `--includes` exists for: a shared `~/.gitconfig` carrying `hooksPath = ~nosuchuser42/hooks`
+  plus an `[include]` whose file corrects it. Measured on 2.51.1, `rev-parse --git-path
+  hooks/post-merge` answers the good path — git resolves it and will run hooks there — while
+  the scope read exited 128 and jkb reported `dispatch=unreadable` and wrote no chainer. The
+  round-21 fix named this exact harm one scope *out* and left it standing one scope *in*. So a
+  128 now re-asks the scope **raw** and puts only its last value — the one git would use from
+  here — back to git for expansion.
+- **That probe must be written by git, not printed into a file.** A git config file is not plain
+  text, and the first version of the probe used `printf '[core]\n\thooksPath = %s\n'`.
+  Measured on 2.51.1: `/a/b#c` and `/a/b;c` came back **truncated at the comment character** —
+  silently, handing the caller a shorter path that exists nowhere — leading whitespace was
+  eaten, and `/a/back\slash` exited **128**, reporting as unexpandable a value git resolves
+  perfectly well, which is the very defect this arm was added to remove. `git config --file <f>
+  <key> <value>` quotes on the way in (`hooksPath = "/a/b#c"`) and all six test values
+  round-tripped, tilde expansion included. The general form: **when the question is "what does
+  git make of this value", git writes the fixture too.**
 - **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
   `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
   there is no fifth code today — so a mutation collapsing them stayed green and nothing could
@@ -391,10 +409,30 @@ conventions every session is expected to know.
     more round anyway, because the round-20 scar is precisely a confident argument that an arm
     could not misfire.
 
-    `unestablished` now gets its own sentence and a one-line remedy (`config core.worktree`),
-    which resolves the bare-dotfiles false refusal without pretending to decide the undecidable:
-    inside `unestablished`, the legitimate dotfiles layout and a leak into a directory no
-    repository owns are indistinguishable from the repository's own records, so neither is built.
+    `unestablished` now gets its own sentence and a remedy, which resolves the bare-dotfiles
+    false refusal without pretending to decide the undecidable: inside `unestablished`, the
+    legitimate dotfiles layout and a leak into a directory no repository owns are
+    indistinguishable from the repository's own records, so neither is built.
+
+    **A remedy is a claim, so it is executed and not read.** Round 22 shipped that remedy checked
+    only by a substring match for `config core.worktree`, and it was wrong twice over. Step 11b
+    now lifts every `jkb:   ` line out of the refusal, **runs** it, and requires the next pull to
+    reach the ordinary case and build that very tree:
+
+    - **It did not work on a bare repository** — the exact layout it is printed for. `git config
+      core.worktree` on a repo with `core.bare = true` warns "core.bare and core.worktree do not
+      make sense" and then fails `unable to set up work tree using invalid config`. Measured on
+      2.51.1: with `core.bare` cleared first, the declaration takes and the next pull is the
+      ordinary case, so the hook now prints that line too — and only when the repository *is*
+      bare, because a remedy cannot afford a line most readers should ignore.
+    - **It did not parse when the path had a space.** The remedy is a command and is now shell-
+      quoted as one; the step's fixture tree is called `dot home` for that reason.
+
+    The step drops `GIT_WORK_TREE` when it runs the remedy, which measures the other half of the
+    message: the arm requires the caller not to have overridden the work tree, so the
+    parenthetical "prefer that declaration to an exported `GIT_WORK_TREE`" is not advice but a
+    precondition. That is also the one user-visible cost of keeping the `GIT_WORK_TREE`
+    predicate, and it is named where the user reads it.
 
     **A closed question was looked for and does not exist.** `git worktree list --porcelain` was
     the best candidate — it answers from the repository's records and ignores `GIT_WORK_TREE` and

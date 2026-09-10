@@ -209,11 +209,27 @@ case "$verdict" in
     # the scrubbed ask — a `safe.directory` refusal, a leaked `GIT_CEILING_DIRECTORIES` — now
     # degrades to this honest skip rather than to that accusation.
     unestablished)
+        # The remedy is a COMMAND, so it is quoted like one. A repository path containing a
+        # space — `~/Library/Application Support/...`, a Windows-ish share, any of a dozen
+        # ordinary Mac locations — turned the printed line into `config core.worktree /a b`,
+        # which git reads as a value plus a stray argument and rejects. A remedy that does not
+        # parse is not a remedy, and this refusal's whole worth is that it names one.
+        shq() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
         echo "jkb: could not establish which repository the checkout at $repo_root belongs to:" >&2
         echo "jkb: it has no .git of its own, and the repository this merge is about does not" >&2
         echo "jkb: declare it. Skipping setup.sh rather than guessing. To enable jkb here, tell" >&2
         echo "jkb: the repository which tree is its own:" >&2
-        echo "jkb:   git --git-dir=$hook_common config core.worktree $repo_root" >&2
+        # A BARE repository refuses `core.worktree` outright — "core.bare and core.worktree do
+        # not make sense", then "fatal: unable to set up work tree using invalid config" — and
+        # the bare-dotfiles layout is the exact layout this refusal is written for, so the one
+        # remedy it named did not work anywhere it was most likely to be read. Measured on
+        # 2.51.1: with `core.bare` cleared first, the declaration takes and the next pull is the
+        # ordinary case. It is printed only when the repository IS bare, because telling anyone
+        # else to unset a flag they never set is noise a remedy cannot afford.
+        if [ "$(git config --bool core.bare 2>/dev/null)" = true ]; then
+            echo "jkb:   git --git-dir=$(shq "$hook_common") config core.bare false" >&2
+        fi
+        echo "jkb:   git --git-dir=$(shq "$hook_common") config core.worktree $(shq "$repo_root")" >&2
         echo "jkb: (and prefer that declaration to an exported GIT_WORK_TREE)." >&2
         exit 0 ;;
 esac

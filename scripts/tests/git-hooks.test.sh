@@ -1790,7 +1790,10 @@ case10l() {
     #     so the scrubbed ask establishes nothing. This must not be spelled as "belongs to a
     #     different repository" — that sentence is false of it, and the remedy it implies would
     #     break the layout. It is the defect this round's design pass was asked to resolve.
-    local bgd="$d/dotfiles.git" btree="$d/dothome"
+    # The tree carries a SPACE on purpose: the refusal below prints a COMMAND, and an
+    # unquoted `core.worktree $repo_root` splits there into a value plus a stray argument
+    # git rejects. Step 11b runs the printed line, so the quoting is measured and not read.
+    local bgd="$d/dotfiles.git" btree="$d/dot home"
     mkdir -p "$btree/scripts"
     git_q init -q --bare "$bgd" >/dev/null 2>&1
     printf 'seed\n' >"$btree/seed"
@@ -1825,6 +1828,43 @@ case10l() {
         *"SETUP-RAN-IN:"*) fail "hookenv: dotbuild" "it built a tree no repository vouches for" ;;
         *) ok "and it builds nothing, because nothing vouches for that tree" ;;
     esac
+
+    # 11b. ...and the remedy must WORK, not merely appear. "Names the remedy" as a substring
+    #      check passes on a line that does not parse, which is what an unquoted path with a
+    #      space produces. So the printed line is taken from the output and RUN, and the next
+    #      pull must reach the ordinary path and build THIS tree.
+    #
+    #      It is run with `GIT_WORK_TREE` dropped, which is the other half of what the message
+    #      says: while the arm requires the caller not to have overridden the work tree, a
+    #      declaration alone does not re-enable the layout. That parenthetical is therefore
+    #      load-bearing, and this step is what would notice if it stopped being true.
+    #      EVERY remedy line is run, in order, not just the first: on a bare repository the
+    #      declaration needs `core.bare` cleared ahead of it, and a check that took line one
+    #      would have called the incomplete remedy good.
+    local remedy ranall=1
+    remedy="$(printf '%s\n' "$out" | sed -n 's/^jkb:   //p')"
+    if [ -z "$remedy" ]; then
+        fail "hookenv: dotremedy-premise" "the refusal printed no remedy line to run"
+    elif ! ( while IFS= read -r line; do
+                 [ -n "$line" ] || continue
+                 eval "env -u GIT_DIR -u GIT_WORK_TREE $line" || exit 1
+             done <<<"$remedy" ) >/dev/null 2>&1; then
+        fail "hookenv: dotremedy-run" "a printed remedy line does not run: \
+$(printf '%s' "$remedy" | tr '\n' '|')"
+    else
+        : "$ranall"
+        ( cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q reset -q --hard HEAD~1 ) \
+            >/dev/null 2>&1
+        out="$(cd "$btree" && GIT_DIR="$bgd" git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:$btree"*)
+                ok "and after the remedy it is the ordinary case, building that very tree" ;;
+            *"could not establish"*|*"belongs to a different repository"*)
+                fail "hookenv: dotremedy-effect" "the remedy ran and changed nothing: \
+$(printf '%s' "$out" | tr '\n' '|')" ;;
+            *) fail "hookenv: dotremedy-other" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    fi
 
     # 12/13. Two layouts that WORK today and nothing pinned — which is how a plausible
     #        "improvement" removes them. The round-22 design pass evaluated replacing the two
@@ -2035,6 +2075,32 @@ reads it was never exercised"
         [ "$rc" = 2 ] \
             && ok "and a winner git itself will not expand is still refused, with code 2" \
             || fail "oldscope: winner" "rc=$rc value='$v' — git refuses this value; we must too"
+    fi
+    : >"$work/home/.gitconfig"
+    git_q config --global user.email t@example.com
+    git_q config --global user.name "Test"
+
+    # ...and the winner must come back INTACT. The arm above re-asks the scope raw and puts its
+    # winning value back to git for expansion; the first version wrote that probe with `printf`,
+    # and a git config file is not plain text. Measured on 2.51.1: `#` and `;` truncated the
+    # value at the comment character, leading whitespace vanished, and a backslash exited 128 —
+    # reporting as unexpandable a value git resolves perfectly well, which is the very defect
+    # this arm exists to remove. The fixture uses `#` because that one fails SILENTLY, handing
+    # the caller a shorter path that exists nowhere; the backslash at least failed loudly.
+    local hashdir="$d/ho#oks"
+    mkdir -p "$hashdir"
+    printf '[core]\n\thooksPath = ~nosuchuser42/hooks\n[include]\n\tpath = work2.cfg\n' \
+        >>"$work/home/.gitconfig"
+    : >"$work/home/work2.cfg"
+    git_q config --file "$work/home/work2.cfg" core.hooksPath "$hashdir"
+    if [ "$(git_q -C "$d/r4" rev-parse --git-path hooks/post-merge 2>&1)" = "$hashdir/post-merge" ]; then
+        ask "$d/r4"
+        [ "$rc" = 0 ] && [ "$v" = "$hashdir" ] \
+            && ok "and the scope's winner survives the expansion probe byte-for-byte" \
+            || fail "oldscope: fidelity" "rc=$rc value='$v' — want '$hashdir'; the probe file mangled it"
+    else
+        fail "oldscope: fidelity-premise" "git does not resolve the fixture's '#' hooksPath, so \
+this tested nothing"
     fi
     : >"$work/home/.gitconfig"
     git_q config --global user.email t@example.com
