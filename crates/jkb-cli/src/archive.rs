@@ -1961,6 +1961,15 @@ mod tests {
             .env_remove("GIT_COMMON_DIR")
             // The developer's global config signs commits and sets core.hooksPath; either would
             // fail this fixture for reasons that have nothing to do with archiving.
+            // ...and the env-injected form of configuration, which OUTRANKS the files
+            // neutralized on the next two lines — so pointing those at /dev/null is not
+            // isolation on its own. `GIT_CONFIG_COUNT` gates every `GIT_CONFIG_KEY_<n>` pair,
+            // so dropping it disables them all without naming an unbounded set. Wider than
+            // `gitrepo::scrub_repo_selection` on purpose: production keeps config injection
+            // because the dev container's `safe.directory` grants live there, and a fixture
+            // must not inherit configuration it did not choose.
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "t")

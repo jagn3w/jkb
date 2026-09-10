@@ -817,10 +817,18 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   hooksPath kept no chainer at all, so no later pull ran one. Reachable unattended, since
   `git -c core.hooksPath=X pull` exports the setting into the hook environment and the hook runs
   setup.sh. `git config --show-scope` reports such a value as scope `command` (measured on
-  2.51.1), so the transient case is **detected by asking git** — no stripping, no second model of
-  git's precedence — and refused as `dispatch=transient` with the repair. `--show-scope` is git
-  >= 2.26; an older git exits 129 for the unknown option, which is not *"cannot expand"*, so the
-  read is retried without it and the case simply goes undetected rather than misdiagnosed.
+  2.51.1), so the case is **detected by asking git** — no stripping, no second model of git's
+  precedence. The first fix REFUSED it (`dispatch=transient`) and that was worse than the bug for
+  the common case: a healthy repo pulled with `-c` printed three warnings and advised storing a
+  value it had already stored, and a repo storing none was advised to set one, which kills
+  `.git/hooks` dispatch outright. **`--get-all`, skipping `command` scope**, answers both with no
+  warning at all — nothing stored reads as `direct`, a stored value gets its chainer refreshed —
+  and the verdict word, its `why`, its render arm and its refusal code all stopped existing.
+  Below git 2.26 there is no `--show-scope`, and falling back to `--get` reinstated the whole bug
+  there (measured: chainer installed at the injected path, exclude rule written for it,
+  `dispatch=chained` reported). So the fallback asks each STORED scope by name —
+  `--system`/`--global`/`--local`/`--worktree`, which predate `--show-scope` by a decade — rather
+  than asking for the winner. Same answer on every git, not a degraded one on an old git.
 - **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
   `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
   there is no fifth code today — so a mutation collapsing them stayed green and nothing could
@@ -840,8 +848,8 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   design, and an empty answer becomes `want=no`, which sweeps — so **one environment variable
   retracted the exclude block for the repository's own chainer**, leaving that file untracked,
   the tree dirty and `jkb task land` refusing it, unattended from the post-merge hook. Measured.
-  `_hooks_path_read` is now the single read: it prints `<scope><TAB><value>` and both consumers
-  take what they need from it — the override resolves it to a directory, the derivation wants
+  `_hooks_path_read` is now the single read: it prints the repository's own value — the last
+  entry that is not `command` scope — and both consumers take what they need from it — the override resolves it to a directory, the derivation wants
   the raw string — so the transient refusal cannot reach one and miss the other. Fixing only
   the reader the defect surfaced in would have left the identical hole one call away, which is
   this area's whole history.
@@ -856,16 +864,79 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   answers both with no warning at all: nothing stored reads as `direct`, a stored value gets its
   chainer refreshed. A verdict word, a `why`, a render arm and a refusal code all stopped
   existing.
-- **The hook was exempted on a claim that turned out to be false.** *"A hook must honour the
-  `GIT_DIR` git hands it — in a linked worktree that is the only way to reach the right
-  repository"* is wrong: git chdirs to the working tree top before running a hook (githooks(5)),
-  so discovery from the cwd gives the same answer with the variables set or unset, measured in
-  that layout. Left exempt, `GIT_WORK_TREE` made `scripts/hooks/post-merge` resolve a FOREIGN
-  tree and then report *"no build-affecting changes pulled"* after a pull that changed
-  `crates/` — the binary, the extension and the hooks unrefreshed for ever, under a message
-  provably false on the hook's own computation. **And running it caught a bug in the fix**:
-  `env` execs a binary while `command` is a shell builtin, so `env … command git` failed every
-  call and the hook exited at its first one, silently, because the next token is `|| exit 0`.
+- **The hook keeps the environment git hands it — and the round that took it away MEASURED a
+  fix that measurement then contradicted.** The exemption's stated reason was wrong (*"in a
+  linked worktree `GIT_DIR` is the only way to reach the right repository"* — it is not; git
+  chdirs to the working tree top first, so cwd discovery answers the same), and correcting a
+  reason was mistaken for correcting a conclusion. Scrubbed, the hook was measurably WORSE:
+  git runs a hook with cwd at the working tree it resolved and `GIT_DIR` naming the repository
+  the merge was about, so stripping it discards the only pointer to the merged history —
+  `ORIG_HEAD` stopped resolving, the `HEAD^..HEAD` fallback answered about the wrong
+  repository, and a pull touching `crates/` printed *"no build-affecting changes pulled"*, the
+  exact sentence the strip was written to prevent. Measured end to end, both arms, one fixture.
+  - **It could never have helped either.** `--show-toplevel` answers the redirected tree with
+    the variables set OR unset: with `GIT_DIR` set and `GIT_WORK_TREE` unset git regards the
+    **cwd** as the work-tree top, and git has already chdir'd to the redirected one. So there
+    is nothing to win by stripping, only the subject to lose.
+  - **What the redirection really costs is the CHECKOUT, and that is detected, not fought.**
+    `repo_root` may be an unrelated repository's, and running its `setup.sh` is the harm the
+    whole repository-selection rule exists to prevent. The hook asks git whether the checkout
+    at `$repo_root` belongs to the repository the merge was about (`--git-common-dir` from
+    each side, relative answers anchored at the directory they were ASKED FROM, compared with
+    `pwd -P`) and stops with a named reason when it does not. Verified by disabling the guard:
+    an unrelated repository's `setup.sh` executes.
+  - **A fixture must not decide for itself what environment git produces.** The test that
+    passed the broken version built the INVERSE of git's own layout — cwd in the right repo,
+    `GIT_DIR` naming the foreign one — under which scrubbing can only look like a win. It
+    drives a real merge now and reads what the hook prints, in three layouts: ordinary,
+    redirected, and inside a linked worktree.
+  - **And running it caught a bug in the fix it has since replaced**: `env` execs a binary
+    while `command` is a shell builtin, so `env … command git` failed every call and the hook
+    exited at its first one, silently, because the next token is `|| exit 0`.
+- **An assertion whose only discriminator is a token no producer can emit is not an assertion.**
+  `case10h`'s last check failed on `dispatch=transient` — deleted from every producer by the same
+  commit — so its `*)` arm ran unconditionally and reported `ok` while the old-git path was
+  measurably installing the chainer at an injected value. The repair was not to reword it: the
+  fallback was fixed so the property is *true*, and then asserted positively (the chainer lands at
+  the repository's `.githooks`, and nothing exists at the injected path). Same shape as the
+  `--no-review` lesson: a check satisfied by the absence of something is satisfied by everything.
+- **A guard's exemption is by LOCATION, never by line shape.** `no_production_git_spawn_bypasses_
+  git_cmd` exempted any line spelling `let mut cmd = Command::new` — which is the module's own
+  idiom, shared verbatim by `git_cmd`, `gh_cmd` and `gate_cmd` — so the next helper written that
+  way was exempt the moment it was added, which is the edit the guard exists to catch. It asks
+  which function encloses each spawn now, and asserts it still finds the one legitimate spawn, so
+  an empty result cannot mean the walk is broken.
+- **"Both directions" must have no names it cannot see.** `run_cases` derives orphaned cases with
+  `case[0-9][0-9a-z]*` — `case` then a DIGIT — and `case_isolate` was the one name in four suites
+  outside it. Deleting it from a runner's argument list, precisely the edit that check exists to
+  catch, left the gate green with a BSD-sed portability pin gone. Widened to admit `_`, so a case
+  cannot fall outside it by being spelled reasonably.
+- **A test fixture's isolation is WIDER than production's scrub, and that is two rules, not
+  drift.** `gitrepo::scrub_repo_selection` strips repository selection and deliberately leaves
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` alone (the dev container's `safe.directory` grants
+  live there). A fixture must not inherit configuration it did not choose: env-injected config
+  OUTRANKS the files, so `GIT_CONFIG_GLOBAL=/dev/null` is not isolation on its own, and an
+  exported `commit.gpgsign` reddened `./scripts/check.sh` with `gpg: signing failed`. Measured
+  both ways. One helper (`isolate_git_env`), because the file had two spawn sites and one of them
+  had already remembered only half the list.
+- **A closed vocabulary is derived from its renderer, or a new word gets no coverage silently.**
+  `case14` asserted "the protocol and the render arms are the same set" from a HAND-WRITTEN table
+  — so a state added to `render_git_hooks_report` with no row was an arm nothing drove, invisible
+  because a shorter table passes just as happily. Derived from the renderer's own nested `case`
+  arms, it found two uncovered arms on its first run (`exclude-file=changed`/`unchanged`, silent
+  by design and in neither list). The silence list is now one array used by both assertions:
+  written twice, a state added to one copy is "covered" while nothing asserts its silence.
+- **A mutation that lands in a comment proves nothing, and looks exactly like a passing guard.**
+  Checking `isolate_git`'s two unsets, the mutation replaced the first occurrence of each name in
+  the file — which was the header comment — so both runs reported MISSED for guards that were
+  fine. Target the line, then assert the mutation applied. (The reviewer's own rule, one level
+  down: *a mutation changes exactly one thing*.)
+- **Two assertions are not redundant if one sees a route the other cannot.** `case_isolate`'s
+  single git-level check was satisfied by the `GIT_CONFIG_COUNT` unset above it — git reads no
+  `KEY_<n>` without the count — so it could not tell whether the sweep it named had happened. It
+  is one assertion per injection ROUTE now (`count`, and `PARAMETERS`, which nothing gates), and
+  the pair earns its place against the variable check: dropping `isolate_git`'s `HOME` redirect —
+  a FILE-based leak no variable check can see — leaves `isolate: vars` green and fails both.
 - **A test fixture that mutates the developer's other repository.** `crates/jkb-cli/tests/
   sessions.rs` scrubbed ambient git CONFIG and not the three variables that select a
   REPOSITORY, so with `GIT_WORK_TREE` exported `git -C <tmpdir> init` re-inits the other repo,

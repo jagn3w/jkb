@@ -262,17 +262,15 @@ fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
 }
 
 fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = gh_cmd(dir, args)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "`gh` is not installed, so a pull request cannot be checked from here — \
+    let out = gh_cmd(dir, args).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "`gh` is not installed, so a pull request cannot be checked from here — \
                  install it (`brew install gh`) or close the task by hand"
-                    .to_owned()
-            } else {
-                format!("could not run `gh`: {e}")
-            }
-        })?;
+                .to_owned()
+        } else {
+            format!("could not run `gh`: {e}")
+        }
+    })?;
     if !out.status.success() {
         // Collapsed to one line. `gh`'s own messages are multi-line — the unauthenticated one is
         // two sentences on two lines — and this string is carried as a *reason* into a report
@@ -297,7 +295,10 @@ mod tests {
     /// deleted from this file, a test of `scrub_repo_selection` alone was perfectly green.
     #[test]
     fn the_gh_spawn_does_not_inherit_a_repository_selection() {
-        crate::gitrepo::assert_scrubbed("gh", &super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]));
+        crate::gitrepo::assert_scrubbed(
+            "gh",
+            &super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]),
+        );
     }
     use super::{spent, Discovery, PullRequest, Staleness};
     use jkb_fsm::Fact;

@@ -1069,16 +1069,41 @@ mod tests {
         let cut = src
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("this module has a `mod tests`, which marks the end of production code");
-        let stray: Vec<(usize, &str)> = src[..cut]
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| l.contains("Command::new(\"git\")"))
-            .filter(|(_, l)| !l.contains("let mut cmd = Command::new"))
-            .collect();
+        // BY LOCATION, not by line shape. The previous version exempted any line spelling
+        // `let mut cmd = Command::new` — which is the module's own idiom, shared verbatim by
+        // `git_cmd`, `gh_cmd` and `gate_cmd` — so the next helper written the same way was
+        // exempt the moment it was added, which is exactly the edit this guard exists to
+        // catch. The question is *which function is this spawn in*, so that is what it asks:
+        // the nearest `fn` declaration above each spawn must be `git_cmd`.
+        let production = &src[..cut];
+        let mut enclosing = "<no enclosing fn>";
+        let mut stray: Vec<(usize, &str)> = Vec::new();
+        for (i, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+            {
+                enclosing = rest.split(['(', '<']).next().unwrap_or(rest);
+            }
+            if line.contains("Command::new(\"git\")") && enclosing != "git_cmd" {
+                stray.push((i + 1, line));
+            }
+        }
         assert!(
             stray.is_empty(),
             "git is spawned outside `git_cmd`, so that spawn inherits the caller's repository \
              selection: {stray:?}"
+        );
+        // ...and it must still find the one legitimate spawn, or the walk above is broken and
+        // an empty `stray` means nothing. Same rule as `check_shell_syntax`: finding nothing
+        // is a failure, not a quiet pass.
+        assert_eq!(
+            production.matches("Command::new(\"git\")").count(),
+            1,
+            "expected exactly one production git spawn (in `git_cmd`); the guard is looking at \
+             the wrong slice or the spawn has been respelled"
         );
     }
 

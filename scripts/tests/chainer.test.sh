@@ -1239,7 +1239,8 @@ case13() {
 # were reachable from nothing. Driven as a table so the closed protocol and the closed set of
 # render arms are asserted to be the same set.
 case14() {
-    local line want rendered
+    local line want rendered lib_path
+    lib_path="$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib.sh"
     # Each entry is `<report line>|<a phrase only that arm produces>`.
     local -a table=(
         'repo-hook=/r/.git/hooks/post-merge|repo hook:  /r/.git/hooks/post-merge'
@@ -1281,14 +1282,70 @@ case14() {
     # hook will run — so assert the silence rather than leaving it unstated. Its OWN
     # accumulators: sharing the pair above meant one table failure also fired a second,
     # bogus "expected silence" failure listing arms that had behaved exactly as required.
+    #
+    # ONE list, used by the silence assertion and by the coverage assertion below it. Written
+    # twice, a state added to one copy would be "covered" while nothing asserted its silence.
+    local -a quiet=(
+        'dispatch=direct'
+        'dispatch=chained /c'
+        'exclude=none (nothing is hiding it)'
+        # Both real values of exclude-file render nothing on purpose: the mutations are already
+        # itemised by their own lines, and silence is not a claim. Only `unknown` gets a line.
+        'exclude-file=changed'
+        'exclude-file=unchanged'
+    )
     local quiet_ok=1 noisy=""
-    for line in 'dispatch=direct' 'dispatch=chained /c' 'exclude=none (nothing is hiding it)'; do
+    for line in "${quiet[@]}"; do
         rendered="$(printf '%s\n' "$line" | render_git_hooks_report 2>&1)"
         [ -z "$rendered" ] || { quiet_ok=0; noisy="$noisy [$line said '$rendered']"; }
     done
     [ "$quiet_ok" = 1 ] \
         && ok "and the states with nothing to report say nothing" \
         || fail "render: silence" "expected silence:$noisy"
+
+    # ...AND THE TABLE IS THE WHOLE SET. Both lists above are hand-written, so a state word
+    # added to the renderer with no row here is a render arm nothing drives — the exact thing
+    # this case exists to prevent, one level up, and invisible because a shorter table passes
+    # just as happily. So the set is DERIVED from the renderer's own nested `case` arms and
+    # every one must appear in the table or in the silence list. `*)` arms are skipped: they
+    # are the catch-alls case13 drives.
+    local -a declared=()
+    local key state
+    while IFS=' ' read -r key state; do
+        [ -n "$state" ] || continue
+        declared+=("$key=$state")
+    done <<EOF
+$(awk '/^render_git_hooks_report\(\) \{/ { inside = 1 }
+       !inside { next }
+       /^\}/ { exit }
+       /^            [a-z-]+=\*\)/ { key = $0; sub(/^ +/, "", key); sub(/=\*\).*/, "", key); next }
+       key && /^                    [a-z|-]+\)/ {
+           arm = $0; sub(/^ +/, "", arm); sub(/\).*/, "", arm)
+           n = split(arm, alts, "|")
+           for (i = 1; i <= n; i++) if (alts[i] != "*") print key, alts[i]
+       }
+       /^                esac ;;/ { key = "" }' "$lib_path")
+EOF
+    [ "${#declared[@]}" -ge 12 ] \
+        && ok "the renderer's state vocabulary is derived from it, and has ${#declared[@]} entries" \
+        || fail "render: derived" "derived ${#declared[@]} states; the derivation is broken, not the code"
+
+    local want covered uncovered=""
+    for want in "${declared[@]}"; do
+        covered=0
+        for entry in "${table[@]}"; do
+            case "${entry%%|*}" in "$want"|"$want "*) covered=1; break ;; esac
+        done
+        if [ "$covered" = 0 ]; then
+            for line in "${quiet[@]}"; do
+                case "$line" in "$want"|"$want "*) covered=1; break ;; esac
+            done
+        fi
+        [ "$covered" = 1 ] || uncovered="$uncovered $want"
+    done
+    [ -z "$uncovered" ] \
+        && ok "and every state the renderer declares is driven by one of the two lists" \
+        || fail "render: uncovered" "render arms no row drives:$uncovered"
 }
 
 # --- 15. setup.sh's closing summary says what happened, in every state --------------------

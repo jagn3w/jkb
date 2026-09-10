@@ -1340,14 +1340,24 @@ case10h() {
         *"unreadable"*) fail "oldgit: verdict" "an unknown OPTION was reported as an unreadable VALUE" ;;
         *) fail "oldgit: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
-    # The transient check simply goes undetected there — the behaviour before it existed —
-    # rather than becoming a confident wrong diagnosis.
+    # AN ASSERTION WHOSE ONLY DISCRIMINATOR IS A TOKEN NO PRODUCER CAN EMIT IS NOT AN ASSERTION.
+    # This used to fail on `dispatch=transient` — deleted from lib.sh by the same commit — so
+    # the `*)` arm ran unconditionally and reported `ok` while the old-git path was measurably
+    # installing the chainer at the injected value. It asserts the property positively now: the
+    # scoped fallback ignores an injected `core.hooksPath` exactly as `--show-scope` does, so
+    # the chainer lands at the REPOSITORY'S `.githooks` and `dispatch=` names that path.
     out="$(PATH="$d/bin:$PATH" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
            GIT_CONFIG_VALUE_0="$d/r/injected" install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
     case "$out" in
-        *"dispatch=transient"*) fail "oldgit: transient" "claimed a scope this git cannot report" ;;
-        *) ok "and an injected value is undetectable there rather than misdiagnosed" ;;
+        *"$d/r/injected"*)
+            fail "oldgit: injected" "an injected core.hooksPath was serviced: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        *"dispatch=chained $d/r/.githooks/post-merge"*)
+            ok "and an injected core.hooksPath is ignored there too, not just on a modern git" ;;
+        *) fail "oldgit: injected" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
+    [ -f "$d/r/injected/post-merge" ] \
+        && fail "oldgit: wrote" "a chainer was written at the injected path" \
+        || ok "and nothing was written at the injected path"
 }
 
 # --- 10i. an unmeasurable file is `unknown`, never `unchanged` -----------------------------
@@ -1449,41 +1459,85 @@ case10k() {
         || fail "header: stale" "keys the header never mentions:$missing"
 }
 
-# --- 10l. the post-merge hook resolves ITS repository, not the environment's ---------------
-# The hook was exempted from the env scrub on the argument that a hook must honour the `GIT_DIR`
-# git hands it. Measured: false. Git chdirs to the working tree top before running a hook
-# (githooks(5)), so discovery from the cwd finds the right repository — the same answer with the
-# variables set or unset, including in a linked worktree. With `GIT_WORK_TREE` exported the hook
-# resolved a FOREIGN tree and then reported "no build-affecting changes pulled" after a pull that
-# changed crates/, leaving the binary, the extension and the hooks unrefreshed for ever.
+# --- 10l. the post-merge hook, driven by a real merge -------------------------------------
+# THE FIXTURE MUST NOT DECIDE FOR ITSELF WHAT ENVIRONMENT GIT PRODUCES. The first version of
+# this case built one by hand — cwd in the right repo, `GIT_DIR` naming the foreign one — which
+# is the INVERSE of what git does, and under that inversion scrubbing the environment can only
+# look like a win. Measured, git runs a hook with the cwd at the working tree it resolved and
+# `GIT_DIR` naming the repository the merge was about (`GIT_WORK_TREE=.`). So the scrub the case
+# was green for could not fix `--show-toplevel` at all, and DID lose the only pointer to the
+# merged history: `ORIG_HEAD` stopped resolving and a merge touching `crates/` printed "no
+# build-affecting changes pulled" — the exact failure the scrub was written to prevent.
 #
-# Nothing covered this file at all. It also caught a bug in the fix: `env` execs a binary and
-# `command` is a shell builtin, so `env … command git` failed every call and the hook exited at
-# its first one, silently, because the next token is `|| exit 0`.
+# So this drives an actual merge and reads what the hook actually prints. Three layouts, and the
+# middle one is the harm: without the guard an unrelated repository's setup.sh executes.
 case10l() {
-    local d="$work/hookenv" hook mine theirs got
+    local d="$work/hookenv" hook out
     hook="$(cd "$(dirname "$0")/../.." && pwd)/scripts/hooks/post-merge"
-    mkdir -p "$d"
-    mine="$d/mine"; theirs="$d/theirs"
-    git_q init -q "$mine" >/dev/null 2>&1
-    git_q -C "$mine" commit -q --allow-empty -m init
-    git_q init -q "$theirs" >/dev/null 2>&1
-    git_q -C "$theirs" commit -q --allow-empty -m init
-
     [ -x "$hook" ] || { fail "hookenv: missing" "no hook at $hook"; return; }
+    mkdir -p "$d"
 
-    # The hook's own resolution, run the way git runs it: cwd at the working tree top.
-    got="$(cd "$mine" && GIT_WORK_TREE="$theirs" GIT_DIR="$theirs/.git" \
-           bash -c 'eval "$(sed -n "/^git() {/p" "$1")"; git rev-parse --show-toplevel' _ "$hook")"
-    [ "$got" = "$(cd "$mine" && pwd -P)" ] \
-        && ok "the hook resolves its own repository with GIT_WORK_TREE exported elsewhere" \
-        || fail "hookenv: root" "resolved '$got', not $mine"
+    # build <name> — a repo with a `crates/` change on `feature`, a setup.sh that announces
+    # which checkout ran it, and the real hook installed.
+    _hookenv_build() {
+        local r="$d/$1"
+        mkdir -p "$r/scripts"
+        git_q init -q "$r" >/dev/null 2>&1
+        printf 'seed\n' >"$r/seed"
+        printf '#!/bin/sh\necho "SETUP-RAN-IN:%s"\n' "$1" >"$r/scripts/setup.sh"
+        chmod +x "$r/scripts/setup.sh"
+        git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm seed >/dev/null
+        mkdir -p "$r/crates"; printf 'x\n' >"$r/crates/x.rs"
+        git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm crates >/dev/null
+        git_q -C "$r" branch -q feature 2>/dev/null
+        git_q -C "$r" reset -q --hard HEAD~1
+        cp "$hook" "$r/.git/hooks/post-merge"; chmod +x "$r/.git/hooks/post-merge"
+    }
+    _hookenv_build mine
+    _hookenv_build theirs
 
-    # And the wrapper must actually run git, not die on a builtin `env` cannot exec.
-    got="$(cd "$mine" && bash -c 'eval "$(sed -n "/^git() {/p" "$1")"; git rev-parse --show-toplevel' _ "$hook" 2>&1)"
-    [ "$got" = "$(cd "$mine" && pwd -P)" ] \
-        && ok "and the wrapper resolves to the real git rather than failing every call" \
-        || fail "hookenv: wrapper" "got '$got'"
+    # 1. The ordinary layout: the hook must SEE the crates/ change. This is what the scrub broke.
+    out="$(git_q -C "$d/mine" merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"running setup.sh"*"SETUP-RAN-IN:mine"*)
+            ok "a merge touching crates/ runs setup.sh in its own checkout" ;;
+        *"no build-affecting changes pulled"*)
+            fail "hookenv: blind" "the hook missed a crates/ change — it lost ORIG_HEAD" ;;
+        *) fail "hookenv: plain" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+
+    # 2. `GIT_WORK_TREE` exported at an unrelated repo — the bare-dotfiles shell recipe. git
+    #    chdirs THERE, so `--show-toplevel` names it however the environment is treated; the
+    #    only safe move is to notice and stop. Building somebody else's checkout is the harm
+    #    the whole repository-selection rule exists to prevent.
+    git_q -C "$d/mine" reset -q --hard HEAD~0 >/dev/null 2>&1
+    git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)"
+    out="$(GIT_WORK_TREE="$d/theirs" git_q -C "$d/mine" merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"SETUP-RAN-IN:theirs"*)
+            fail "hookenv: foreign" "the hook built an unrelated repository's checkout" ;;
+        *"belongs to a different repository"*)
+            ok "a redirected working tree is detected and named, and nothing is built" ;;
+        *) fail "hookenv: redirect" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+
+    # 3. A linked worktree must stay ORDINARY — the common dir is shared, so the guard in 2
+    #    must not fire here. This is the layout every `jkb task work` session runs in.
+    # From `feature~1`, or the worktree starts AT feature (step 2's merge advanced mine) and
+    # the merge below is "Already up to date" — a case that exercises no hook at all.
+    git_q -C "$d/mine" worktree add -q "$d/wt" -b wtb \
+        "$(git_q -C "$d/mine" rev-parse feature~1)" >/dev/null 2>&1
+    if [ -d "$d/wt" ]; then
+        out="$(git_q -C "$d/wt" merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"belongs to a different repository"*)
+                fail "hookenv: worktree" "the guard fired inside a linked worktree" ;;
+            *"running setup.sh"*) ok "and a linked worktree is treated as the ordinary case" ;;
+            *) fail "hookenv: wt" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: wt-setup" "could not create a linked worktree"
+    fi
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"

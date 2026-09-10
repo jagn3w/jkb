@@ -477,7 +477,10 @@ mod tests {
     /// deleted from this file, a test of `scrub_repo_selection` alone was perfectly green.
     #[test]
     fn the_gate_spawn_does_not_inherit_a_repository_selection() {
-        crate::gitrepo::assert_scrubbed("gate", &super::gate_cmd(std::path::Path::new("/somewhere"), "true"));
+        crate::gitrepo::assert_scrubbed(
+            "gate",
+            &super::gate_cmd(std::path::Path::new("/somewhere"), "true"),
+        );
     }
     use super::{branch_for, mint_name, name_from_branch, LandLock};
 

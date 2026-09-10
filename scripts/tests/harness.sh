@@ -31,6 +31,13 @@ skip() { printf '  skip %s\n' "$1"; }
 # BOTH directions. A name with no body is the bug above; a body no name calls is the same
 # class the other way round — a case that looks like coverage, runs never, and can rot into
 # something that would fail if it were run. Neither is catchable by `finish`.
+#
+# The orphan half is only as wide as its pattern, and `case[0-9][0-9a-z]*` — `case` then a
+# DIGIT — silently excluded `case_isolate`, the one name in these four suites that does not
+# start with a number. Deleting it from a runner's argument list, which is exactly the edit
+# this check exists to catch, left the gate green with a BSD-sed portability pin gone. A
+# pattern claiming "both directions" must not have names it cannot see, so it admits `_` in
+# both positions: a future case cannot fall outside it by being spelled reasonably.
 run_cases() {
     local c defined missing="" orphaned=""
     for c in "$@"; do
@@ -39,7 +46,7 @@ run_cases() {
     while IFS= read -r defined; do
         case " $* " in *" $defined "*) ;; *) orphaned="$orphaned $defined" ;; esac
     done <<EOF
-$(declare -F | sed -n 's/^declare -f \(case[0-9][0-9a-z]*\)$/\1/p')
+$(declare -F | sed -n 's/^declare -f \(case[0-9_][0-9a-z_]*\)$/\1/p')
 EOF
     if [ -n "$missing" ] || [ -n "$orphaned" ]; then
         [ -z "$missing" ]  || echo "the runner names cases that do not exist:$missing" >&2

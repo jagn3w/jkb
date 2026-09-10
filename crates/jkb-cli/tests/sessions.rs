@@ -46,19 +46,14 @@ impl Fixture {
     /// `git` subprocesses jkb itself spawns.
     fn jkb(&self) -> Command {
         let mut cmd = Command::cargo_bin("jkb").unwrap();
-        cmd.arg("--db")
-            .arg(&self.db)
-            .current_dir(&self.repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
-            // probed for liveness on the host that issued it, so an unpinned name makes every
-            // claim fixture `Unknown` and nothing is ever reclaimed.
-            .env("HOSTNAME", "host")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t");
+        cmd.arg("--db").arg(&self.db).current_dir(&self.repo);
+        // The same isolation the fixture's own git calls get: jkb spawns git, so the
+        // developer's shell reaches it through this process just as directly.
+        isolate_git_env(&mut cmd);
+        // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
+        // probed for liveness on the host that issued it, so an unpinned name makes every
+        // claim fixture `Unknown` and nothing is ever reclaimed.
+        cmd.env("HOSTNAME", "host");
         cmd
     }
 
@@ -108,29 +103,45 @@ fn git(dir: &Path, args: &[&str]) -> String {
     run_git(git_cmd(dir, args), args)
 }
 
-/// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into
-/// running against different configuration.
-fn git_cmd(dir: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(args)
-        // The three that SELECT A REPOSITORY, which outrank `-C`. Measured: with
-        // `GIT_DIR`/`GIT_WORK_TREE` exported — the bare-dotfiles shell recipe — `git -C
-        // <tmpdir> init` re-inits the OTHER repository and creates nothing here, and the
-        // `add`/`commit` below then land a commit in it. `./scripts/check.sh` is the gate
-        // `jkb task land` and the merge queue trust, so it must not mutate a repository the
-        // developer merely happens to have configured. `gitrepo::scrub_repo_selection` is the
-        // same rule for production; this is a separate crate and cannot reach it.
-        .env_remove("GIT_DIR")
+/// Neutralize every route by which the developer's shell reaches a `git` this fixture runs —
+/// directly, or inside the `jkb` binary it spawns.
+///
+/// ONE function, because two spawn sites each remembering the list is how one of them came to
+/// remember only half of it. It is deliberately WIDER than [`gitrepo::scrub_repo_selection`],
+/// which strips repository selection and leaves configuration injection alone on purpose (this
+/// project's dev container carries its `safe.directory` grants there). Production must not
+/// discard a grant it needs; a fixture must not inherit configuration it did not choose. Two
+/// rules, not drift.
+fn isolate_git_env(cmd: &mut Command) {
+    // Selection: these outrank `-C`. Measured — with `GIT_DIR`/`GIT_WORK_TREE` exported, the
+    // bare-dotfiles shell recipe, `git -C <tmpdir> init` re-inits the OTHER repository and
+    // creates nothing here, and the `add`/`commit` that follow land a commit in it. That is
+    // `./scripts/check.sh` — the gate `jkb task land` and the merge queue trust — writing to a
+    // repository the developer merely happens to have configured.
+    cmd.env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
+        // Configuration: the env-injected form OUTRANKS the files neutralized below, so
+        // pointing those at /dev/null is not isolation on its own. `GIT_CONFIG_COUNT` gates
+        // every `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` pair, so dropping it disables them all
+        // without naming an unbounded set. An exported `commit.gpgsign` or `core.hooksPath`
+        // would otherwise redden the gate over a fact about somebody's shell.
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@t");
+}
+
+/// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into
+/// running against different configuration.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    isolate_git_env(&mut cmd);
     cmd
 }
 

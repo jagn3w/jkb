@@ -12,23 +12,61 @@
 # replaces, so every step is best-effort and reports rather than exits non-zero.
 set -uo pipefail
 
-# `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` outrank everything else, so with one exported —
-# the standard bare-dotfiles shell recipe — this resolved a FOREIGN tree and the hook then
-# reported "no build-affecting changes pulled" after a pull that changed crates/, leaving the
-# binary, the extension and the hooks unrefreshed for ever. Measured on git 2.51.1.
+# A HOOK HONOURS THE ENVIRONMENT GIT HANDS IT, and every git call here is therefore bare.
 #
-# Safe to strip in a hook, which an earlier round wrongly claimed it was not: git chdirs to the
-# working tree top before running one (githooks(5)), so discovery from the cwd finds the right
-# repository — including in a linked worktree, where it returns the same answer with the
-# variables set or unset. Measured, in that layout, before this line was written.
-# No `command git` here: `env` execs a BINARY, and `command` is a shell builtin, so that
-# spelling made every call fail and the hook exit at its first one — silently, since the very
-# next line is `|| exit 0`. `env` does not inherit shell functions, so plain `git` resolves to
-# the real one on PATH and cannot recurse. Found by running the hook, not by reading it.
-git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git "$@"; }
+# Git runs a hook with the cwd at the working tree it resolved and `GIT_DIR` naming the
+# repository the merge was about (measured: `GIT_DIR=<repo>/.git`, `GIT_WORK_TREE=.`). That
+# `GIT_DIR` is the only pointer to the history this merge touched, so stripping it is not a
+# safety measure — it is losing the subject. A previous round stripped it and MEASURED the
+# result: `ORIG_HEAD` stopped resolving, the `HEAD^..HEAD` fallback answered about the wrong
+# repository, `changed` came back empty, and a pull that changed `crates/` printed "no
+# build-affecting changes pulled" — the exact failure the strip was written to prevent, caused
+# by the strip.
+#
+# Stripping cannot help in any case either, which is the other half of why it is gone:
+# `--show-toplevel` answers the redirected tree with the variables set OR unset (with `GIT_DIR`
+# set and `GIT_WORK_TREE` unset, git regards the CWD as the work-tree top, and git already
+# chdir'd there). So the redirection is detected below rather than fought.
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ -n "$repo_root" ] || exit 0
+
+# ...and the one thing the environment CAN get wrong is which checkout to build. With
+# `GIT_WORK_TREE` exported — the standard bare-dotfiles shell recipe — the merge is about this
+# repository while `--show-toplevel` names an unrelated one, and running THAT checkout's
+# setup.sh is the harm the whole repository-selection rule exists to prevent: jkb runs inside
+# other people's professional repositories and must not build them.
+#
+# Asked of git, not of the variables: whether the checkout at $repo_root belongs to the
+# repository this merge was about. Both answers are resolved with `pwd -P` because a symlink,
+# a trailing slash and a `..` are three spellings of one directory. Best-effort, like
+# everything here: a question git will not answer stops the hook rather than failing the merge.
+# `--git-common-dir` rather than `--path-format=absolute --git-common-dir`, which is git 2.31+:
+# an older git would exit non-zero, the hook would `exit 0`, and the D34 automation would be
+# silently off. A relative answer is anchored at the directory it was ASKED FROM, never at the
+# cwd — the two differ here by construction, which is the whole point of the comparison.
+common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; no arg asks as git
+    local d="${1:-}" c                    # handed us. Prints an absolute, symlink-resolved path.
+    if [ -n "$d" ]; then
+        c="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+             git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    else
+        d="$PWD"
+        c="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+    fi
+    [ -n "$c" ] || return 1
+    case "$c" in /*) ;; *) c="$d/$c" ;; esac
+    [ -d "$c" ] || return 1
+    (cd "$c" 2>/dev/null && pwd -P)
+}
+hook_common="$(common_of "")" || exit 0
+root_common="$(common_of "$repo_root")" || root_common=""
+if [ "$hook_common" != "$root_common" ]; then
+    echo "jkb: this merge is about $hook_common, but the working tree here is $repo_root," >&2
+    echo "jkb: which belongs to a different repository — GIT_DIR or GIT_WORK_TREE is set in" >&2
+    echo "jkb: your environment. Skipping, rather than building somebody else's checkout." >&2
+    exit 0
+fi
 
 # `post-merge` runs with $1 = 1 when the merge was a squash. ORIG_HEAD is the pre-merge tip
 # either way, so it is the honest range for "what did this pull bring in".

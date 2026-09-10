@@ -42,11 +42,20 @@ _JKB_LIB_SELF="${BASH_SOURCE[0]}"
 # the same rule that keeps it from writing a git ref (D46). A wrapper rather than a note at
 # each of the six call sites, because the next one added would forget.
 #
-# It stops at this file's boundary, deliberately. A HOOK must honour the environment git hands
-# it — git sets `GIT_DIR` when it runs one, and in a linked worktree that is the only way to
-# reach the right repository — so `scripts/hooks/post-merge` and the `chainer_body` heredoc use
-# bare `git` on purpose. Routing those through `_git` for consistency would break them. Every
-# caller HERE passes `-C "$repo_root"`, so stripping the inherited selection loses nothing.
+# It stops at this file's boundary, deliberately, and the REASON matters because it has been
+# stated wrongly twice. A HOOK must honour the environment git hands it — not because a linked
+# worktree needs `GIT_DIR` (it does not; git chdirs to the working tree top first, so discovery
+# from the cwd answers the same), but because `GIT_DIR` is the only thing naming WHICH
+# REPOSITORY the merge was about. A round stripped it on the worktree argument and measured the
+# result: `ORIG_HEAD` stopped resolving, and a pull that changed `crates/` reported "no
+# build-affecting changes pulled" — the failure the strip was written to prevent, caused by the
+# strip. So `scripts/hooks/post-merge` and the `chainer_body` heredoc use bare `git`, and the
+# hook detects a redirected working tree instead of fighting it (it cannot win: with `GIT_DIR`
+# set and `GIT_WORK_TREE` unset, git regards the CWD as the work-tree top, and git has already
+# chdir'd to the redirected one).
+#
+# Every caller HERE passes `-C "$repo_root"`, so stripping the inherited selection loses
+# nothing: this file is asked ABOUT a repository, a hook is run BY one.
 _git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git "$@"; }
 
 # install_exec <dest> — install stdin as an executable file at <dest>, ATOMICALLY.
@@ -166,13 +175,39 @@ EOF
         return 0
     fi
     [ "$rc" -eq 1 ] && return 1
-    rc=0
-    scoped="$(_git -C "$1" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
-    case "$rc" in
-        0) printf '%s' "$scoped"; return 0 ;;
-        1) return 1 ;;
-        *) return 2 ;;
-    esac
+    # No `--show-scope` (git < 2.26). Ask each STORED scope by name instead of falling back to
+    # `--get`, which reports the WINNER — i.e. hands back exactly the environment-injected value
+    # the scope skip above exists to ignore, so an old git would install the chainer at
+    # `-c core.hooksPath=X`, write an exclude rule for it and report `dispatch=chained`, while
+    # the repository's own path kept none. `--local`/`--global`/`--system` predate `--show-scope`
+    # by a decade and `--worktree` by seven years, so this is the same question on every git
+    # rather than a degraded answer on an old one. An unsupported or unusable `--worktree` just
+    # fails and is skipped; where the extension is off git makes it an alias for `--local`,
+    # which is the same answer again.
+    local scope out found2=1 value2=""
+    for scope in system global local worktree; do
+        rc=0
+        out="$(_git -C "$1" config --"$scope" --get-all --path core.hooksPath 2>/dev/null)" || rc=$?
+        # Measured on git 2.51.1: 1 is "not set in this scope", 128 is "set, and git will not
+        # expand it" (`~someuser/` for an absent account). 129 is an unknown OPTION, which is
+        # how a git predating `--worktree` answers — a fact about the git, not about the value.
+        # Anything else is unestablished and must not be spelled as "stores none", which the
+        # caller renders as `dispatch=direct` and prints nothing for.
+        case "$rc" in
+            0) ;;
+            1|129) continue ;;
+            *) return 2 ;;
+        esac
+        # Last entry within a scope wins, as git itself resolves it. Command substitution has
+        # already eaten the trailing newline, so a single empty value arrives as "" — which is
+        # `core.hooksPath` set to the empty string, a state `git_hooks_override` reports as
+        # rc 3 and must not be confused with "no value here".
+        value2="${out##*$'\n'}"
+        found2=0
+    done
+    [ "$found2" -eq 0 ] || return 1
+    printf '%s' "$value2"
+    return 0
 }
 
 # git_hooks_override <repo_root> — print the absolute `core.hooksPath` in effect for
@@ -775,10 +810,17 @@ _override_verdict() {
         # arms of unrelated `case "$rc"` blocks and `_override_why`'s duplicate arms, and the
         # test consuming it passed anyway — a derived list that derives the wrong thing is no
         # better than the stale hand-written one it replaced.
+        #
+        # The arm pattern is deliberately loose about LAYOUT and strict about POSITION: any
+        # indentation, and no requirement that `printf` share the line. Pinned to eight spaces
+        # plus a same-line `printf`, a reindented or wrapped arm dropped silently out of the
+        # list — and a status missing from the list is a status nothing checks has a render
+        # arm, which is the whole point of deriving it. The `case` line below it is what makes
+        # the position unambiguous: only the arms of this one `case` are at this depth.
         awk '/^_override_verdict\(\) \{/ { inside = 1; next }
-             inside && /^\}/            { exit }
-             inside && /^        [0-9]+\) printf/ {
-                 sub(/^ +/, ""); sub(/\).*/, ""); print
+             inside && /^\}/             { exit }
+             inside && /^[[:space:]]*[0-9]+\)/ {
+                 sub(/^[[:space:]]*/, ""); sub(/\).*/, ""); print
              }' "$_JKB_LIB_SELF"
         return 0
     fi

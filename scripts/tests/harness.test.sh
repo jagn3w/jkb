@@ -207,16 +207,35 @@ case_isolate() {
         || fail "isolate: vars" "got: $got"
 
     # And the effect that matters: git must see no injected core.hooksPath afterwards.
-    got="$(
-        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/injected \
-        bash -c '. "$1" >/dev/null 2>&1; isolate_git "$2/home2" >/dev/null 2>&1
-                 git init -q "$2/r" 2>/dev/null
-                 git -C "$2/r" config --get core.hooksPath 2>/dev/null || printf "<none>"' \
-             _ "$lib" "$d"
-    )"
-    [ "$got" = "<none>" ] \
-        && ok "and git in an isolated suite sees no injected core.hooksPath" \
-        || fail "isolate: git" "git still reports core.hooksPath=$got"
+    #
+    # ONE ROUTE PER ASSERTION, because the two are not interchangeable. `GIT_CONFIG_COUNT` gates
+    # every `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` pair, so a version that unset only the count would
+    # satisfy an injection made that way — this assertion named the KEY/VALUE sweep and could
+    # not tell whether it had happened. `GIT_CONFIG_PARAMETERS` is gated by nothing, so it is
+    # the route that pins its own unset. Both are checked, and each dies on its own omission.
+    _isolate_sees() {   # _isolate_sees <label> <env-prefix…> -- runs git after isolate_git
+        local label="$1"; shift
+        got="$(env "$@" bash -c '. "$1" >/dev/null 2>&1; isolate_git "$2/$3" >/dev/null 2>&1
+                 git init -q "$2/r-$3" 2>/dev/null
+                 git -C "$2/r-$3" config --get core.hooksPath 2>/dev/null || printf "<none>"' \
+             _ "$lib" "$d" "$label")"
+        [ "$got" = "<none>" ] \
+            && ok "and git sees no core.hooksPath injected via $label" \
+            || fail "isolate: $label" "git still reports core.hooksPath=$got"
+    }
+    _isolate_sees count GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+        GIT_CONFIG_VALUE_0=/injected
+    _isolate_sees params GIT_CONFIG_PARAMETERS="'core.hooksPath=/injected2'"
+
+    # The KEY_<n>/VALUE_<n> sweep itself is NOT observable through git once the count is gone —
+    # git reads no pair without it — so the first assertion above is what pins it, by looking at
+    # the variables. Stated rather than left as a gap: it is hygiene for a subprocess that sets
+    # its own count, not a second lock on the same door.
+    #
+    # Nor are these two a restatement of that first assertion, which was the doubt about the
+    # single one they replace. Measured: dropping `isolate_git`'s HOME redirect — a FILE-based
+    # leak, invisible to any check that reads variables — leaves `isolate: vars` green and
+    # fails both of these. The variable check pins the variable routes; these pin the effect.
 }
 
 run_cases case1 case2 case2b case2c case2d case3 case4 case_isolate
