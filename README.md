@@ -348,8 +348,10 @@ jkb is a Cargo workspace of small crates under `crates/`, plus a **pnpm** worksp
   give each one its own database.
 - **Design docs and review history are not in the clone.** `openspec/` (the design
   decisions `CLAUDE.md` points at) and `.codereviews/` are gitignored — they are local
-  working state, not published artefacts. References to them in `CLAUDE.md` will dangle on
-  a fresh clone; the code and its comments are the authority.
+  working state, not published artefacts. References to them in `CLAUDE.md` and under
+  `docs/` will dangle on a fresh clone; the code and its comments are the authority. What
+  *is* committed is the decision record itself: `CLAUDE.md` for the conventions every
+  contributor needs, and `docs/` for the per-subject history behind them.
 
 ## Development
 
@@ -375,4 +377,5 @@ Conventions: no `unsafe` (workspace `unsafe_code = "deny"`, with one scoped exce
 for the sqlite-vec FFI registration in `jkb-index`), clippy `pedantic`, errors via
 `thiserror` (libraries) / `anyhow` (the CLI edge), all SQL parameterized, all writes
 through the single writer-actor and the changelog. See `CLAUDE.md` for the full
-architecture and ways-of-working.
+architecture and ways-of-working, and the `docs/` set it indexes for the reasoning behind
+any one subsystem.

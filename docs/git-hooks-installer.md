@@ -1,0 +1,519 @@
+# The setup.sh git-hooks installer — the longest-running defect cluster in this repo
+
+`install_git_hooks`, the global chainer, `core.hooksPath`, and `.git/info/exclude`.
+This grew out of D34's post-merge hook and became its own subject: seventeen review
+rounds, and nearly every lesson generalizes. **Read this before touching
+`scripts/lib.sh`, `scripts/setup.sh` or `scripts/hooks/post-merge`.**
+
+Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the
+conventions every session is expected to know.
+
+- **`scripts/hooks/post-merge`** (installed by `setup.sh`) runs `setup.sh` when the pull
+  touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
+  the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
+  `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
+- **A hook goes in `--git-common-dir`, never `--git-dir`** (`scripts/lib.sh`'s `git_hooks_dir`).
+  In a linked worktree the latter is `<repo>/.git/worktrees/<name>`, which holds no hooks — git
+  resolves `hooks/` against the common dir. Since D36 puts *every* `jkb task work` session in a
+  worktree, the old rule meant a `setup.sh` run from a session installed the hook where nothing
+  would ever run it, printed success, and left the stale one in place; the chainer's dispatch
+  line had the same bug, so a pull in a worktree found no repo hook either way. The oracle is
+  `git rev-parse --git-path hooks/post-merge` — what git itself will execute — and
+  `scripts/tests/git-hooks.test.sh` asserts against it rather than a hand-written path.
+  Because `setup.sh` never clobbers a chainer it did not write, it now *refreshes* one it did:
+  a chainer installed under the old rule would otherwise stay broken for ever.
+- **Every git question in the installer is asked of `$repo_root`, never of the cwd**
+  (`git_hooks_override`). A bare `git config --get core.hooksPath` answers for whatever
+  repository the caller is standing in: run from another project it wrote jkb's chainer into
+  *that* project, and run from outside jkb while jkb sets the key it wrote no chainer at all —
+  the dead-repo-hook failure the chainer exists to prevent, under a success message. A relative
+  value belongs to git's base too (githooks(5): git chdirs to the worktree top before running a
+  hook), so leaving `mkdir -p` to resolve it put the chainer one directory per subdirectory you
+  happened to run from. Same shape as the `--git-dir` bug one bullet up, which is why both rules
+  now live in `lib.sh` rather than at the call site.
+- **Every file `setup.sh` installs is written atomically** — `scripts/lib.sh`'s `install_exec`
+  (temp file + `mv`), and `jkb_cli::atomic::write` for `jkb service install`'s units. The loop above
+  is why: the hook runs `setup.sh`, and `setup.sh` installs *that hook*. `cp` rewrites the
+  target inode in place, and bash reads a script lazily **by byte offset** — so a hook replaced
+  mid-run by one of a different length resumes at an offset that no longer means what it meant
+  and executes whatever fragment it lands on. It cost one fictional error (`post-merge: line
+  35: i: command not found`, on a line blank in both versions) and could as easily have skipped
+  `jkb task close-merged` silently. It fires only on pulls that change the hook's **length** —
+  i.e. exactly the pulls that update the hook, when nobody is watching. `mv` is a rename: it
+  swaps the directory entry and leaves the running process's inode alone. Pinned by
+  `scripts/tests/install-exec.test.sh`, which `check.sh` and CI both run.
+- **The chainer is replaced only when jkb wrote every byte of it** (`lib.sh`'s
+  `install_chainer`, four outcomes: `installed`/`up-to-date`/`refreshed`/`foreign`). Ownership
+  is byte equality against a body jkb actually emits — `chainer_body`, or a frozen `_vN` of a
+  body it used to emit — never a marker inside the file. The first attempt grepped for the
+  chainer's own comment line, which is a *proxy* for the claim rather than the claim: a user
+  who adds a line to jkb's chainer still matches it, so the refresh arm replaced their file
+  unattended on an ordinary `git pull`, with no backup and the same message as the intended
+  upgrade. Byte equality cannot be satisfied by a file jkb did not write, so `foreign` is the
+  safe default and nothing is overwritten to find out. Changing `chainer_body` means moving the
+  outgoing body to the next `chainer_body_vN`; forgetting is not silent — the old chainer stops
+  being recognised and is reported, never clobbered.
+- **The body and the install arms live in `lib.sh`, not inline in `setup.sh`.** While they were
+  a heredoc plus three inline arms nothing could execute them: reverting the chainer's dispatch
+  to `--git-dir` left the whole gate green while every pull inside a worktree silently stopped
+  running the repo hook — and `check.sh` and `ci.yml` both justify the shell-test stage on
+  exactly the claim that these installs are unreachable from a Rust test. They were unreachable
+  from everything. `scripts/tests/chainer.test.sh` drives all four outcomes and runs the
+  installed chainer in both a plain checkout and a worktree.
+- **A hooks path inside the working tree is excluded locally** (`reconcile_exclude`). A
+  relative `core.hooksPath` resolves inside the tree, so the untracked chainer made every
+  `jkb task work` session read dirty and `jkb task land` refuse it — and deleting it did not
+  help, since the next pull recreates it. `.git/info/exclude` is the local, unpushed write D36
+  already sanctions for `.jkb/`; editing someone's tracked `.gitignore` is not.
+- **The exclude rule is reconciled on every run — every block of ours, not just the one for the
+  path being installed — and ownership is byte identity again.** It was
+  written once, on the run that installed a chainer, and never revisited — so a user who later
+  replaced that chainer with their own hook had it git-ignored **for ever**: the next run said
+  `chainer=foreign`, left the rule in place, and `git status` went silent with nothing
+  attributing it to jkb. `reconcile_exclude <repo> <path> yes|no` now makes the file agree with
+  the chainer outcome in both directions, which is one rule rather than two, because excluding
+  a `foreign` chainer and refusing to touch it are opposite positions on the same question.
+  jkb writes a **marked two-line block** and retracts only that exact adjacent pair — the
+  `chainer_body` lesson applied a second time. A bare pattern may be a rule the user wrote, so
+  it is reported (`unowned`) and never deleted: the residual harm becomes visible with a
+  remedy instead of silent and permanent. Reconciling only the *installed* path was not
+  reconciliation either — moving `core.hooksPath` left the old block for ever, and unsetting it
+  returned before any reconciliation ran at all — so the desired state is *exactly the blocks
+  jkb should own right now*, every other one is retracted whatever path it names. The file is
+  rewritten through a temp file whose **write status is checked**: `printf` to a full disk fails
+  after emitting part of its output, and dropping that status renamed a truncated file over
+  every rule the user owns under the word `retracted`.
+- **The desired state is a pure function of facts every worktree shares, never of the worktree
+  that happens to be running** (`git_hooks_exclude_pattern`). `.git/info/exclude` lives in the
+  common dir and applies to every worktree at once, so a desired state derived from
+  `--show-toplevel` differs per run — and a sweep that *enforces* one turns that disagreement
+  into a flip-flop: a main-checkout run added the block, the next run from a `jkb task work`
+  session retracted it, and the main checkout read dirty in between, which is the state
+  `jkb task land` refuses. D36 makes that the normal case, not a corner one. So the pattern
+  comes from the **raw `core.hooksPath` string**, not from resolving a path and stripping a
+  toplevel back off it: a relative value is resolved by git against each worktree's own top, so
+  one anchored pattern is simultaneously right for all of them; an absolute one is hidden only
+  when it is inside the **main** checkout, because an anchored rule would otherwise hide a
+  same-named path in every other tree. The regression guard is an equality assertion — the same
+  answer from the checkout and from a linked worktree — not a behaviour snapshot. Bare-ness is
+  read from the porcelain's own `bare` attribute, not from `--is-bare-repository` of the
+  directory this run was handed: in a bare-repo-plus-worktrees layout that answers `false` from
+  the worktree, and the bare git dir then became the "main checkout".
+- **A fact that disqualifies one branch is asked on that branch.** Bare-ness was asked at the
+  top of `git_hooks_exclude_pattern` and returned for the whole function — but it means only
+  "there is no main checkout to anchor an ABSOLUTE path against". A *relative* `core.hooksPath`
+  needs no main checkout at all: it resolves inside each linked worktree, so in a
+  bare-repo-plus-worktrees layout the top-level gate dropped a working exclusion and made jkb
+  **retract the block it had written itself**, leaving the worktree it had just written the
+  chainer into reading dirty. The test for that layout drove only the absolute case, which is
+  why it stayed green.
+- **Declining to hide something is not the same as having nothing to hide, and only one of them
+  is silent.** An absolute `core.hooksPath` inside a *linked* worktree cannot be excluded — an
+  anchored rule applies to every tree at once — but the chainer really is an untracked file in a
+  real tree, so it is `exposed` and the renderer warns, naming the tree and that `jkb task land`
+  refuses a dirty target. Reported as `none`, which renders nothing, that tree read dirty for
+  ever with nothing attributing the file to jkb: the very failure the exclusion exists to
+  prevent, reached by the mechanism meant to prevent it. It is also a claim about **jkb's own**
+  file, so only the caller — which knows the chainer outcome — may make it: derived from the
+  path alone it warned, on every unattended pull, that jkb's chainer was dirtying a tree, about
+  a file the user wrote and jkb had refused to touch three lines earlier.
+- **setup.sh's closing summary is rendered from lib.sh, like the hook report before it.** It
+  produced a finding in three consecutive review rounds — the watcher line claiming "running"
+  after activation had failed and said so, the roots line asserting five roots the scaffold had
+  just failed to create, the extension line telling you to reload for a build never made — and
+  every one was invisible to a green gate, because nothing executes setup.sh. Each section now
+  reports a **state word** (`created|untouched|skipped|failed`, …) rather than a boolean: a
+  boolean could not tell "skipped by flag" from "an existing KB was left untouched", and the
+  two arms that create nothing now name the command that repairs it instead of asserting the
+  roots — "re-run setup.sh" was not a remedy, since the failure leaves the db file behind and
+  the re-run takes the *left untouched* arm.
+- **The test runner refuses a case name that is not a function.** `finish` asks only whether
+  the FILE asserted anything, so with a hundred passing assertions beside them two deleted case
+  bodies cost nothing: bash printed `case6g: command not found` on stderr and the suite exited
+  0. Two regression pins — the cross-worktree agreement set and the whole CRLF exclude set, both
+  for bugs shipped once already — went that way with the gate green. `run_cases` checks
+  `declare -F` first, which is the harness's own stated failure mode closed one level down.
+- **An answer git refused to give is `undecided`, never `none` — in EVERY arm that means it.**
+  `none` is *proven absence* and the caller turns it into `want=no`, so a transient
+  `worktree list` or `config --get` failure swept jkb's own block away and reported "jkb no
+  longer stands behind hiding it": false, jkb could not check. Both run unattended from the
+  post-merge hook. Fixing one arm and leaving its sibling — whose message already said "could
+  not be listed" while its answer claimed proven absence — is the shape this area keeps
+  producing, and is why the test enumerates the arms rather than checking one.
+- **Three-valued means three values, and two different unknowns need two words.** This one
+  function collapsed a `Fact` three rounds running. `ours` was a boolean, so a chainer install
+  that FAILED counted as proven not-jkb's — the run asserted "the file at that path is not one
+  jkb wrote" about a file jkb had written, and dropped the dirty-worktree warning with it,
+  three lines below a comment saying that file may well be one jkb wrote. And `want=undecided`
+  carried two unrelated unknowns: *nothing is decided about this pattern* (sweep the others)
+  and *the derivation could not answer* (touch nothing). Sharing the word made a failed chainer
+  install with a decidably-empty pattern skip the sweep and strand a stale block permanently.
+  They are `undecided` and `unknown` now, and `ours` is `yes|no|unknown`.
+- **A claim about a file is asked of the file.** `dispatch=` had that rule written down —
+  derived from the world, not from the outcome word — and its sibling claim did not use it. An
+  install that fails before creating anything leaves the path EMPTY, and `exposed` then said
+  "the chainer there is not hidden … that working tree will read dirty" beside `dispatch=dead`
+  ("nothing runnable is at …"), about an empty directory in a clean tree: two contradictory
+  statements in one report. `exposed` now needs both ownership and existence.
+- **jkb's own git calls strip `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`** (`_git`). Those
+  outrank `-C`, so with `GIT_WORK_TREE` exported — the standard bare-dotfiles shell recipe —
+  `--show-toplevel` answered somebody else's tree and `install_git_hooks` **created `.githooks/`
+  inside that unrelated repository**, reporting `dispatch=chained`, while the repo it was asked
+  about kept a dead hook. Measured. jkb runs inside other people's professional repositories and
+  must not decorate them — the same rule that keeps it from writing a git ref (D46) — and this
+  is a wrapper rather than a note at each of the six call sites.
+  - **Both halves, because the Rust one has the larger blast radius.** `gitrepo::git_cmd` is the
+    same seam for the CLI: the shell installer decorates a repo with a `.githooks/` directory,
+    but `repo::main_root` feeding a redirected answer to `jkb task work` **creates a git worktree
+    inside somebody else's repository and rewrites its `.git/info/exclude`**. Every production
+    spawn in the crate is built there; a review found the claim stated as covered while only the
+    shell half was.
+  - **Only the three that select a REPOSITORY.** `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`
+    inject configuration and are deliberately left alone — this project's own dev container
+    carries `safe.directory` grants in them, and stripping those makes git refuse the checkout
+    outright. Pinned at both ends, so the list cannot be "tidied" into a blanket sweep.
+  - **It stops at hooks on purpose:** a hook must honour the environment git hands it — git sets
+    `GIT_DIR` when it runs one, and in a linked worktree that is the only way to reach the right
+    repository — so `scripts/hooks/post-merge` and the emitted chainer keep bare `git`.
+  - **The test harness needed the same sweep and had missed two.** `isolate_git` unset five
+    variables and left `GIT_CONFIG_PARAMETERS` and `GIT_COMMON_DIR`, both of which outrank the
+    empty configuration it builds — and the dev container exports the first. Its list is now
+    defined by a class rather than a count, after the prose's "all five" had already gone stale.
+- **A relative `core.hooksPath` is anchored at the working tree top — and with NO working tree
+  it has no anchor at all.** Measured from three directories on git 2.51.1: git resolves it
+  against the *invoking process's cwd*, so `git --git-dir=B rev-parse --git-path
+  hooks/post-merge` answers `<cwd>/.githooks/post-merge` and `git hook run` executes whatever
+  copy is under that cwd. A round claimed the git dir as "git's own rule" for that case — on a
+  measurement taken with the cwd **set to** the git dir, which cannot tell the two apart — and
+  jkb then installed a chainer there and reported the good verdict, while a `git pull` in a
+  linked worktree ran a path that did not exist. There is nothing to resolve to, so jkb refuses
+  and says so; running setup.sh against a worktree resolves normally. **A measurement whose
+  variable you did not vary is not a measurement**, and the test that would have caught it had
+  the same flaw: every fixture made repo_root, the git dir and the cwd one directory, so a
+  mutant that ignored git entirely agreed with the oracle everywhere.
+- **`core.hooksPath` set to the empty string** is the opposite error: git resolves it to
+  `/post-merge` and finds nothing, so the repo hook is dead — and folding it into "not set"
+  reported `dispatch=direct`, the verdict the renderer prints nothing for. Its remedy line asks
+  for `--show-origin`, because `--get` prints one empty line for an empty value and nothing for
+  an unset one: the operator's own check appeared to refute the warning.
+- **A verdict that admits nothing was established must not also sweep.** The `unreadable` branch
+  left `want` at its `no` default, and `no` retracts — so one run printed `exclude=retracted …`
+  beside `dispatch=unreadable`, two lines making opposite epistemic claims about one path, after
+  which the chainer read untracked and the next resolvable run put the block back. That is the
+  flip-flop the worktree-invariant derivation exists to prevent, reintroduced through the
+  destructive half. The verdict must not decide it either: `unreadable` covers three causes that
+  differ on exactly the question the sweep asks, so the branch says `undecided` (no chainer was
+  attempted, so nothing is known about *this* pattern) and lets the derivation have the last
+  word — an unexpandable value establishes nothing, an empty one establishes that nothing of
+  ours is anywhere, and a treeless relative one still yields a pattern that is right inside
+  every worktree.
+- **One writer for `.git/info/exclude`.** The append was two `>>` redirections with no
+  rollback, so a disk filling between the separator and the block left a stray newline and half
+  a marker line under a report saying the step did not land. Both paths go through
+  `_exclude_write` now, which also retires the separator special case — a rebuilt file cannot
+  fuse the user's last rule with our marker.
+- **A guard belongs where it can see the failure it was written for.** The refusal for an
+  unrecognised intent went into `reconcile_exclude` — and the caller's own default turned an
+  unknown derivation word into `pattern=""`, which the funnel collapses to a perfectly
+  recognised `want=no`, so the callee's guard never ran: the sweep retracted jkb's block and
+  the renderer warned about the unknown word *after* the file had changed. Both ends now
+  default to touching nothing.
+- **The one consumer that can destroy the user's file refuses an input it does not recognise.**
+  `reconcile_exclude`'s `want` had no default arm and fell through to the branch that SWEEPS,
+  so a typo — or a fifth word added at the caller and forgotten at the callee, which is
+  precisely the edit that introduced `unknown` — would retract every block jkb owns and then
+  print a line the renderer reads as "nothing was changed". Every *renderer* in that file
+  already had a warning default; the destructive consumer had none.
+- **A claim about jkb's own file is gated on ownership, not on a variable that means something
+  else.** The `exposed` downgrade read `want`, which the pattern-empty rule collapses to `no`
+  two lines later — and an exposed line is by definition pattern-empty, so the downgrade was
+  unconditional and the state unreachable the day it was added. Its test asserted only that
+  `exposed` was *absent*, which passes just as well when it can never appear; the positive half
+  is what catches it.
+- **A per-step line may not describe the file; exactly one line does, and it is measured.**
+  Three consecutive must-fixes in `render_git_hooks_report` were one shape — an arm asserting a
+  run-level fact it could not see — and each was fixed by rewording that arm. The third made it
+  plain that rewording is the wrong unit of repair: `exclude=undecided` has **two producers with
+  opposite file semantics** (`want=unknown` returns early and touches nothing; `want=undecided`
+  runs the sweep first), so no wording of that arm could ever have been right. It printed
+  *"nothing in .git/info/exclude was changed"* directly beneath *"X dropped from
+  .git/info/exclude"* — two lines about one file stating opposite facts, unattended, from the
+  post-merge hook. The cause is that the wire protocol had **no scope axis**: some states are
+  per-step events, some are per-pattern verdicts, and *did this run change the file?* is neither.
+  `reconcile_exclude` is now a wrapper that fingerprints the file either side of the decision and
+  emits `exclude-file=changed|unchanged` **below every arm**, so the dozen `return 0`s in the
+  decision body cannot skip it — structural, like `install_git_hooks`' own funnel. It is measured
+  rather than bookkept (`cksum`, with `absent` as a distinct value) because a write some future
+  arm forgets to record is exactly the class of lie this seam keeps producing: *a claim about a
+  file is asked of the file*. Every whole-file sentence is gone from the per-pattern arms, and
+  both real values of the new key render **nothing** — the mutations are already itemised by
+  their own lines, and silence is not a claim. Rejected: a fourth rewording; a stateful renderer
+  (re-derives the producer's fact from a proxy, and makes output depend on line order); splitting
+  the report word (fixes one word, leaves the class); folding the fact into each terminal
+  detail (moves the per-arm memory burden one seam over).
+- **An environment-injected `core.hooksPath` is refused, and git is asked rather than stripped.**
+  `_git` deliberately does not strip `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`: they carry the
+  `safe.directory` grants this project's own dev container needs, and stripping them makes git
+  refuse the checkout outright. But an injected value is the **calling process's**, not the
+  repository's — and measured, jkb installed its chainer at the injected path, added an exclude
+  rule for it, and reported `dispatch=chained`, the good verdict, while the repository's own
+  hooksPath kept no chainer at all, so no later pull ran one. Reachable unattended, since
+  `git -c core.hooksPath=X pull` exports the setting into the hook environment and the hook runs
+  setup.sh. `git config --show-scope` reports such a value as scope `command` (measured on
+  2.51.1), so the case is **detected by asking git** — no stripping, no second model of git's
+  precedence. The first fix REFUSED it (`dispatch=transient`) and that was worse than the bug for
+  the common case: a healthy repo pulled with `-c` printed three warnings and advised storing a
+  value it had already stored, and a repo storing none was advised to set one, which kills
+  `.git/hooks` dispatch outright. **`--get-all`, skipping `command` scope**, answers both with no
+  warning at all — nothing stored reads as `direct`, a stored value gets its chainer refreshed —
+  and the verdict word, its `why`, its render arm and its refusal code all stopped existing.
+  Below git 2.26 there is no `--show-scope`, and falling back to `--get` reinstated the whole bug
+  there (measured: chainer installed at the injected path, exclude rule written for it,
+  `dispatch=chained` reported). So the fallback asks each STORED scope by name —
+  `--system`/`--global`/`--local`/`--worktree`, which predate `--show-scope` by a decade — rather
+  than asking for the winner. Same answer on every git, not a degraded one on an old git.
+- **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
+  `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
+  there is no fifth code today — so a mutation collapsing them stayed green and nothing could
+  tell an honest catch-all from one absorbing a future code into a **definite** `unanchored`
+  verdict whose remedy would be false of it. `_override_verdict`/`_override_why` can be called
+  with a status that does not exist yet, and the test does.
+- **Both readers of `core.hooksPath` died under `set -e`.** A bare `x="$(cmd)"` is a simple
+  command, so a non-zero substitution aborts the shell — and exit 1 there is the **commonest**
+  case, the setting not being present at all. `lib.sh`'s header promises every function behaves
+  the same with `set -e` on or off; that promise was being kept only by how the one production
+  caller happens to spell the call (`… || override_rc=$?`, which disables errexit for the whole
+  invocation). `|| rc=$?` at both, pinned by a case that asserts its own premise first — a
+  fixture that happened to have a `core.hooksPath` would pass having tested nothing.
+- **One read of `core.hooksPath`, because two readers of one fact is how this file fails.**
+  `git_hooks_override` refuses an environment-injected value; `git_hooks_exclude_pattern` read
+  it separately and happily derived a pattern from it. The derivation has the last word by
+  design, and an empty answer becomes `want=no`, which sweeps — so **one environment variable
+  retracted the exclude block for the repository's own chainer**, leaving that file untracked,
+  the tree dirty and `jkb task land` refusing it, unattended from the post-merge hook. Measured.
+  `_hooks_path_read` is now the single read: it prints the repository's own value — the last
+  entry that is not `command` scope — and both consumers take what they need from it — the override resolves it to a directory, the derivation wants
+  the raw string — so the transient refusal cannot reach one and miss the other. Fixing only
+  the reader the defect surfaced in would have left the identical hole one call away, which is
+  this area's whole history.
+- **The repository's own `core.hooksPath` is read, not the winning one.** `--get` reports
+  whichever scope wins, and `-c core.hooksPath=X` — or `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`,
+  which `git pull` exports into the hook environment — beats everything stored. Measured: jkb
+  installed its chainer at the injected path, wrote an exclude rule for it, and reported
+  `dispatch=chained` while the repository's own path kept none. The first fix REFUSED, and was
+  worse than the bug for the common case: a healthy repo pulled with `-c` printed three warnings
+  and advised storing a value it had already stored, and a repo storing none was advised to set
+  one — which kills `.git/hooks` dispatch outright. `--get-all` plus skipping `command` scope
+  answers both with no warning at all: nothing stored reads as `direct`, a stored value gets its
+  chainer refreshed. A verdict word, a `why`, a render arm and a refusal code all stopped
+  existing.
+- **The hook keeps the environment git hands it — and the round that took it away MEASURED a
+  fix that measurement then contradicted.** The exemption's stated reason was wrong (*"in a
+  linked worktree `GIT_DIR` is the only way to reach the right repository"* — it is not; git
+  chdirs to the working tree top first, so cwd discovery answers the same), and correcting a
+  reason was mistaken for correcting a conclusion. Scrubbed, the hook was measurably WORSE:
+  git runs a hook with cwd at the working tree it resolved and `GIT_DIR` naming the repository
+  the merge was about, so stripping it discards the only pointer to the merged history —
+  `ORIG_HEAD` stopped resolving, the `HEAD^..HEAD` fallback answered about the wrong
+  repository, and a pull touching `crates/` printed *"no build-affecting changes pulled"*, the
+  exact sentence the strip was written to prevent. Measured end to end, both arms, one fixture.
+  - **It could never have helped either.** `--show-toplevel` answers the redirected tree with
+    the variables set OR unset: with `GIT_DIR` set and `GIT_WORK_TREE` unset git regards the
+    **cwd** as the work-tree top, and git has already chdir'd to the redirected one. So there
+    is nothing to win by stripping, only the subject to lose.
+  - **What the redirection really costs is the CHECKOUT, and that is detected, not fought.**
+    `repo_root` may be an unrelated repository's, and running its `setup.sh` is the harm the
+    whole repository-selection rule exists to prevent. The hook asks git whether the checkout
+    at `$repo_root` belongs to the repository the merge was about (`--git-common-dir` from
+    each side, relative answers anchored at the directory they were ASKED FROM, compared with
+    `pwd -P`) and stops with a named reason when it does not. Verified by disabling the guard:
+    an unrelated repository's `setup.sh` executes.
+  - **A fixture must not decide for itself what environment git produces.** The test that
+    passed the broken version built the INVERSE of git's own layout — cwd in the right repo,
+    `GIT_DIR` naming the foreign one — under which scrubbing can only look like a win. It
+    drives a real merge now and reads what the hook prints, in three layouts: ordinary,
+    redirected, and inside a linked worktree.
+  - **And running it caught a bug in the fix it has since replaced**: `env` execs a binary
+    while `command` is a shell builtin, so `env … command git` failed every call and the hook
+    exited at its first one, silently, because the next token is `|| exit 0`.
+- **An assertion whose only discriminator is a token no producer can emit is not an assertion.**
+  `case10h`'s last check failed on `dispatch=transient` — deleted from every producer by the same
+  commit — so its `*)` arm ran unconditionally and reported `ok` while the old-git path was
+  measurably installing the chainer at an injected value. The repair was not to reword it: the
+  fallback was fixed so the property is *true*, and then asserted positively (the chainer lands at
+  the repository's `.githooks`, and nothing exists at the injected path). Same shape as the
+  `--no-review` lesson: a check satisfied by the absence of something is satisfied by everything.
+- **A guard's exemption is by LOCATION, never by line shape.** `no_production_git_spawn_bypasses_
+  git_cmd` exempted any line spelling `let mut cmd = Command::new` — which is the module's own
+  idiom, shared verbatim by `git_cmd`, `gh_cmd` and `gate_cmd` — so the next helper written that
+  way was exempt the moment it was added, which is the edit the guard exists to catch. It asks
+  which function encloses each spawn now, and asserts it still finds the one legitimate spawn, so
+  an empty result cannot mean the walk is broken.
+- **"Both directions" must have no names it cannot see.** `run_cases` derives orphaned cases with
+  `case[0-9][0-9a-z]*` — `case` then a DIGIT — and `case_isolate` was the one name in four suites
+  outside it. Deleting it from a runner's argument list, precisely the edit that check exists to
+  catch, left the gate green with a BSD-sed portability pin gone. Widened to admit `_`, so a case
+  cannot fall outside it by being spelled reasonably.
+- **A test fixture's isolation is WIDER than production's scrub, and that is two rules, not
+  drift.** `gitrepo::scrub_repo_selection` strips repository selection and deliberately leaves
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` alone (the dev container's `safe.directory` grants
+  live there). A fixture must not inherit configuration it did not choose: env-injected config
+  OUTRANKS the files, so `GIT_CONFIG_GLOBAL=/dev/null` is not isolation on its own, and an
+  exported `commit.gpgsign` reddened `./scripts/check.sh` with `gpg: signing failed`. Measured
+  both ways. One helper (`isolate_git_env`), because the file had two spawn sites and one of them
+  had already remembered only half the list.
+- **A closed vocabulary is derived from its renderer, or a new word gets no coverage silently.**
+  `case14` asserted "the protocol and the render arms are the same set" from a HAND-WRITTEN table
+  — so a state added to `render_git_hooks_report` with no row was an arm nothing drove, invisible
+  because a shorter table passes just as happily. Derived from the renderer's own nested `case`
+  arms, it found two uncovered arms on its first run (`exclude-file=changed`/`unchanged`, silent
+  by design and in neither list). The silence list is now one array used by both assertions:
+  written twice, a state added to one copy is "covered" while nothing asserts its silence.
+- **A mutation that lands in a comment proves nothing, and looks exactly like a passing guard.**
+  Checking `isolate_git`'s two unsets, the mutation replaced the first occurrence of each name in
+  the file — which was the header comment — so both runs reported MISSED for guards that were
+  fine. Target the line, then assert the mutation applied. (The reviewer's own rule, one level
+  down: *a mutation changes exactly one thing*.)
+- **Two assertions are not redundant if one sees a route the other cannot.** `case_isolate`'s
+  single git-level check was satisfied by the `GIT_CONFIG_COUNT` unset above it — git reads no
+  `KEY_<n>` without the count — so it could not tell whether the sweep it named had happened. It
+  is one assertion per injection ROUTE now (`count`, and `PARAMETERS`, which nothing gates), and
+  the pair earns its place against the variable check: dropping `isolate_git`'s `HOME` redirect —
+  a FILE-based leak no variable check can see — leaves `isolate: vars` green and fails both.
+- **A test fixture that mutates the developer's other repository.** `crates/jkb-cli/tests/
+  sessions.rs` scrubbed ambient git CONFIG and not the three variables that select a
+  REPOSITORY, so with `GIT_WORK_TREE` exported `git -C <tmpdir> init` re-inits the other repo,
+  creates nothing in the tmpdir, and the `add`/`commit` that follow land a commit in it. That is
+  `./scripts/check.sh` — the gate `jkb task land` and the merge queue trust — writing to a repo
+  the developer merely happens to have configured.
+- **`\|` in a BRE is a GNU extension.** `isolate_git`'s sweep of `GIT_CONFIG_KEY_<n>` matched
+  nothing under `sed --posix`, i.e. on macOS, which is where this project is developed — so the
+  isolation silently did not happen on one of its two platforms, and no case covered it either
+  way. A `case` glob now, with a harness case that asserts git really sees no injected value.
+- **Three repository-aware spawns, one rule, pinned at each of them.** Asking *who else
+  implements this rule* found two production spawns that were not git and resolved a repository
+  from the environment anyway: `pr::gh` — `gh` finds the repo through git, so a leaked
+  `GIT_WORK_TREE` has it asking GitHub about **an unrelated repository's pull requests**, and
+  `close-merged` then closes tasks on that answer — and `session::run_gate`, whose verdict
+  decides a landing and which would be verifying a different checkout. `gitrepo::
+  scrub_repo_selection` is the rule; `git_cmd`, `gh_cmd` and `gate_cmd` are its three callers.
+  **A test of the primitive is not the claim** (the `install_exec` lesson again): with the
+  scrub deleted from `gh_cmd` and from `gate_cmd`, a test of `scrub_repo_selection` alone was
+  perfectly green, so each call site builds its `Command` in a named function and each has its
+  own assertion. Four mutations, one per site plus the blanket-strip guard, all caught.
+- **The measurement itself had the defect it was added to prevent.** `_exclude_fingerprint`
+  folded *could not measure* into `absent`, and two failures compare equal — so with `cksum`
+  unavailable jkb reported `exclude-file=unchanged` **over a real write**. Measured with a
+  `cksum` that exits 127 on PATH. It is three-valued now: `absent` stays an established answer
+  (creating or removing the file must register), an unreadable path or an unrunnable `cksum`
+  returns non-zero, and the wrapper emits `unknown`, which the renderer warns about rather than
+  passing over in silence. Silence there would say *nothing to report about the file*, which is
+  exactly what could not be established.
+- **A derived list, because a hand-written one goes stale silently.** The `_git` enforcement
+  check reverted four *named* call sites to prove it fires; merging the two readers deleted one
+  of those names, and a third of the coverage would have stopped being exercised. It only
+  surfaced because the probe asserts its own premise — *"the revert did not apply, so nothing
+  was proven"* — instead of counting a no-op edit as a pass. It now derives every `_git -C`
+  line from the file itself and requires a non-zero count, so it cannot quietly check nothing.
+- **A branch no run takes is a branch that is not known to work.** `--show-scope` is git >= 2.26
+  and an older one exits **129** for the unknown option — which is not *"cannot expand the
+  value"*, and folded together every repo on such a git would report `dispatch=unreadable` and
+  jkb would stop installing chainers entirely. The fallback is exercised by a PATH shim that
+  refuses `--show-scope`, and the case asserts the shim really refuses first: a shim that
+  quietly worked would pass having tested the ordinary path twice.
+- **The shell-syntax gate is one function, not two copies of a file list.** `shell_sources` +
+  `check_shell_syntax` live in lib.sh and CI calls them, because the hand-written copy in
+  `check.sh` and the one in `ci.yml` drifted by a `*.md` skip within a commit of each other —
+  green locally, red in CI, on one tree. It selects by **shebang**, not by a two-extension
+  denylist (`scripts/hooks/post-merge` has no `.sh`, and the next `.txt` beside a hook would
+  have been fed to `bash -n`), and **finding no files is a failure**: every unmatched glob was
+  swallowed, so a broken gate printed its header and then "All checks passed".
+- **A jkb block is defined positively, so the bad shapes follow instead of being remembered**: a
+  known marker line immediately followed by a *pattern-shaped* line (non-empty, not itself a
+  marker, not a comment). A marker that heads nothing is an **orphan** — jkb's own line, inert
+  to git, removed and reported `tidied`. Without that definition the walk paired a marker with
+  the marker below it, computed the block's "pattern" as the marker's own text, retracted
+  **both** marker lines and left the real pattern bare — which jkb then reported `unowned` and
+  refused to touch for ever, the exact silent-and-permanent harm the ownership rule exists to
+  end, caused by the parser.
+- **jkb is not the only writer of marked blocks in that file, and each sweeps only its own.**
+  `session::ensure_excluded` writes `# jkb task sessions (git worktrees)` + `/.jkb/` from Rust;
+  it survives because its marker is not in `exclude_known_markers`, which was a fact enforced by
+  nobody until a test pinned it from the shell side and a comment stated it at both.
+- **`retracted` split by what happened to the file, not by why.** One word carried four causes
+  and the renderer stated a reason false on three of them; a de-duplicated copy of the block
+  being *kept* was reported `retracted` and then `kept`, two contradictory lines about one
+  pattern. Now `retracted` (jkb no longer stands behind hiding it — true of all three of its
+  causes), `deduplicated`, and `tidied`.
+- **The reconcile is below every arm, not inside one.** `install_git_hooks`'s arms set `want`
+  and a verdict and none of them returns, so a fifth arm added later cannot skip the
+  reconciliation — the property is structural rather than remembered. It had to be: the
+  chainer-install-failed arm returned early, and because that precondition is itself
+  persistent, "the next successful run reconciles it" never came. That arm's honest answer is
+  the third value `undecided`: nothing is known about *this* pattern, and nothing needed to be
+  known about the others.
+- **An exclude line is read the way git reads it** (`_exclude_line`): git trims one trailing CR,
+  so a CRLF file is functional to git and our comparisons must agree. They did not, so on such a
+  file jkb recognised neither its own block nor the pattern and appended a fresh one on every
+  qualifying pull. What is written back is the untrimmed original — agreeing about what a line
+  *means* is not licence to rewrite how it is spelled.
+- **A verdict is derived from the world, and every question about a path resolves it first.**
+  `dispatch=` is `[ -f ] && [ -x ]` on the chainer (a directory is executable to `test` and
+  unrunnable to git), and "does `core.hooksPath` point at git's own hooks directory?" compares
+  `pwd -P` results, because a trailing slash, a symlink and a `..` are three spellings of one
+  directory and literal equality put back the alarming message the guard was added to remove.
+  `git_hooks_override` now separates `git config --get`'s exit 1 (*not set*) from anything else
+  (*set to something git will not resolve* — a `~someuser/` for an absent account), which is the
+  fourth verdict `unreadable`: folding it into "not set" reported `direct`, the verdict the
+  renderer prints nothing for, about a repo in which git runs no hooks at all.
+- **`install_git_hooks` reports STATES, not actions, and ends in a verdict.** Three findings
+  were one shape: while each key named something jkb *did*, every state that arises from **not**
+  acting had no key, no render arm and no test — a stale exclude rule, an exclusion attempted
+  and failed, a hook installed where git will never run it. So `chainer=`/`exclude=` carry a
+  state word with its evidence, and `dispatch=direct|chained|unknown|dead` is emitted on every
+  successful run, answering the one question the feature exists for. It is derived from the
+  world (`[ -x "$chainer" ]`), not from the outcome word, because `foreign` and `failed` each
+  cover a file that will dispatch and one that will not — and it is three-valued because a
+  foreign chainer may dispatch perfectly well and we cannot know, so it is `unknown`, never
+  `dead`. `error=` now means *nothing was done* and is always the sole line: it used to follow
+  `repo-hook=`, so setup.sh printed "repo hook: …" and then "skipping hook install".
+- **Both halves of the seam live in `lib.sh` — the installer AND `render_git_hooks_report`.**
+  Moving only the installer drew the boundary one level too low: nothing runs setup.sh, so its
+  `case` arms were reachable from no test, and two findings sat in them with the gate green
+  while the tests re-parsed the protocol themselves. Every `case` in the renderer has a default
+  arm that **warns**, so a key added to the producer with no arm surfaces instead of vanishing.
+  setup.sh is one line: `render_git_hooks_report < <(install_git_hooks …)`.
+- **Every function in `lib.sh` behaves the same with `set -e` on or off**, and a reporter says
+  `failed` in words rather than in its exit status. The report used to reach setup.sh only
+  because the call happened to be written `… || true`, which disables `set -e` for the whole
+  function body; without it the subshell died inside `install_chainer` and setup.sh printed the
+  repo hook and **nothing else**, while `core.hooksPath` was set and that hook was dead. The
+  suites cannot be sourced under `set -e` (`fail` increments and continues by design), so one
+  case runs the installer in a `bash -euo pipefail` child instead.
+- **A redirection that fails on a `{ …; }` group is not reported to `if !`** — only on a simple
+  command or a function call, where bash returns non-zero as expected. Written as a group, the
+  exclude append printed `added` for a write that had just been refused: the very defect the
+  `failed` state exists to report, reintroduced inside its own fix. Found by running the new
+  test, not by reading it.
+- **An append to `.git/info/exclude` writes its separator first.** A file not ending in a
+  newline — a hand-edited one usually does not — had its last rule fused with ours (`*.log` +
+  `/.githooks/post-merge`), destroying a rule the user owns while our own pattern stayed inert,
+  under a success message. `session::ensure_excluded` computes the same `sep`: one rule, an
+  implementation in each language, and the shell copy was written without consulting the Rust
+  one.
+- **A caller of the atomic write is pinned by the destination's INODE, not by its content.**
+  The primitive having a test is not the claim; the mutation that matters is at a call site,
+  and a rename and an in-place rewrite leave identical content. Replacing `install_exec` at
+  `install_git_hooks`' own call with `cp && chmod 755` — exactly the code this change exists to
+  remove — left all four suites green, as did the same swap at the three `install_chainer`
+  arms. `harness.sh`'s `inode_of` makes the assertion one line, and `lib.sh`'s header states
+  that `install_exec` is the only function permitted to write an executable destination.
+  `service::install` was the same gap in Rust and had no way to be tested at all: it derived
+  its destinations from `$HOME`, so `install_units(manager, units)` now takes them as an
+  argument — the split `commands::install_into` already made, for the same reason.
+- **The atomic write is one seam, `jkb_cli::atomic::write`**, used by `service::install` and by
+  `commands::write_all`. The shell half was fixed first, the service unit second, and the
+  `~/.claude/{workflows,commands}` assets were still truncating in place — on a path setup.sh
+  itself triggers, since a pull runs the hook, which runs setup.sh, which reinstalls the binary,
+  whose next invocation reconciles that bundle, and a running `/task-swarm` or `/review` reads
+  those files. Three installers, one rule, so it is not a rule each new installer must remember.
