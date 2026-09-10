@@ -388,6 +388,7 @@ conventions every session is expected to know.
     | 20 | declared at all (the comparison dropped) | `GIT_COMMON_DIR` makes git **ignore** `core.worktree` while `git config` still reports it, so a leak at one repository **built another checkout** — the whole harm, through the arm above it |
     | 21 | declared, resolved against `--git-dir`, and equal to `$repo_root`; and `GIT_WORK_TREE` unset | holds both ways: the relative form is accepted, the ignored declaration is not |
     | 22 | *nothing about the arm's predicates changed* — the arm was **confined** | the oscillation stopped being possible, rather than being patched again |
+    | 23 | declared **in one of the two files git honours**, and equal to `$repo_root`; the `GIT_WORK_TREE` condition **deleted** | the bare read believed the caller (five forgery vectors built a foreign tree), and the deleted condition made the printed remedy inert for every user of the layout it is printed for |
 
     **Round 22 is the one worth reading, because it is not another predicate.** A design pass
     asked why three locally-correct, individually-measured fixes each opened the opposite
@@ -452,9 +453,72 @@ conventions every session is expected to know.
 
     The shape of the mistake was the same twice: a fix for a **false refusal** opened a **false
     acceptance**, and vice versa. Both directions have to be re-measured after any change here.
-    The `GIT_WORK_TREE` condition is separate and also load-bearing — `core.worktree` is the
+
+    **Round 23 — SUPERSEDED, and this is the paragraph that was wrong.** It used to end: "The
+    `GIT_WORK_TREE` condition is separate and also load-bearing — `core.worktree` is the
     *repository's* answer and `GIT_WORK_TREE` the *caller's*, and when the caller has overridden
-    it the declaration says nothing about the tree we are standing in.
+    it the declaration says nothing about the tree we are standing in." Measured false in both
+    directions. The declaration says exactly the needed thing about the tree we stand in — it
+    equals `$repo_root`, which is the whole test — and removing the condition changes no harmful
+    outcome, because every harmful case lands in `elsewhere`, which the arm cannot reach.
+
+    What the condition actually did was make the printed remedy **inert for every real user of
+    the layout the refusal is written for**. The canonical alias is `git --git-dir=D
+    --work-tree=T`, and measured on 2.51.1 the flag form and `export GIT_WORK_TREE=T` are
+    **byte-identical inside the hook** — git rewrites both to `GIT_WORK_TREE=.` after chdir'ing
+    to the tree. So the user read a refusal, ran the remedy it named, and got the same refusal on
+    the next pull, for ever, with its sentence "the repository does not declare it" now false.
+    Nobody sets up bare dotfiles and then stops using the alias.
+
+    The test agreed with the hook instead of testing it: step 11b **dropped `GIT_WORK_TREE`** for
+    the post-remedy pull, on the strength of that same paragraph. It keeps the alias now, and so
+    does the new flag-form step.
+
+    **The rule that replaced it is one fact, not a predicate.** Git honours `core.worktree` for
+    work-tree resolution from exactly two files — `$GIT_DIR/config`, and `$GIT_DIR/config.worktree`
+    when `$GIT_DIR/config` itself enables `extensions.worktreeConfig` — and from nowhere else:
+
+    | declaration in | git honours it | bare `git config core.worktree` returns it |
+    |---|---|---|
+    | `$GIT_DIR/config` | yes | yes |
+    | `$GIT_DIR/config.worktree` (extension on locally) | yes | yes (via `--worktree`) |
+    | `$GIT_DIR/config` via `[include]` | **no** | yes |
+    | `--global` / `--system` / `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` | **no** | yes |
+    | `-c` / `GIT_CONFIG_COUNT` / `GIT_CONFIG_PARAMETERS` | **no** | yes |
+
+    Four rows where a bare read diverges from git's own honouring, and **every one of them is
+    caller-reachable**. Measured end-to-end against a prey directory holding a marker `setup.sh`:
+    `-c core.worktree=`, `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`, `GIT_CONFIG_PARAMETERS`, a
+    `--global` declaration and `GIT_CONFIG_GLOBAL` **all made the hook run setup.sh in a
+    directory no repository owns**. Five for five, against the arm whose comment read "so it is
+    that repository's config and not the caller's".
+
+    So the arm reads from git's honouring set, which is not a curated list — it is defined as
+    "wherever git would honour it", and measured to coincide. The caller-reachable channels are
+    exactly the channels git's own setup ignores, which is one fact covering all of them,
+    including channels not yet invented at command scope. The scoped read cannot be forged:
+    all six vectors read back empty, and the only handles that move the local scope — `GIT_DIR`,
+    `GIT_COMMON_DIR` — move `hook_common` *with* it, so the declaration always comes from the
+    repository the verdict is about. The caller cannot split the two.
+
+    **`-c core.worktree` is not a second redirect, and saying so would mis-explain the fix.**
+    Measured: git ignores a command-scope `core.worktree` for resolution, so the toplevel is
+    never redirected by it. The redirect is the cwd; the `-c` only supplies the forged
+    *testimony* that makes the hook accept it. Which is precisely why "read only what git
+    honours" closes it exactly, rather than approximately.
+
+    **Do not harmonize this read with `_hooks_path_read`.** That function walks
+    system/global/local/worktree *with* `--includes`, and it is right to, because git honours
+    `core.hooksPath` from every stored scope that way. The shared rule is "read the key from
+    exactly the places git will honour it"; the two keys differ in where that is, so the two
+    reads must differ. `case10l` step 17 pins it — the one plausible future edit that re-opens
+    the forge while looking like consistency.
+
+    `--worktree` is git 2.20, later than this file's 2.5 floor, and unlike `--absolute-git-dir`
+    it **degrades correctly**: measured against a git shimmed to refuse it, the local-declaration
+    layout still builds and the `config.worktree` layout skips — which is what that old git
+    honours too, since a git predating the extension ignores `config.worktree` itself. The read
+    mirrors the running git at every age.
 
     Two things this arm does NOT buy, stated because half of it is missing: `setup.sh` runs, so
     the binary, extension and service refresh, but its **hook** section does not —

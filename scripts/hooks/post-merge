@@ -20,6 +20,17 @@ set -uo pipefail
 #   ordinary checkout    GIT_DIR unset, GIT_WORK_TREE unset      (cwd alone is enough)
 #   linked worktree      GIT_DIR=<repo>/.git/worktrees/<name>    (GIT_WORK_TREE unset)
 #   GIT_WORK_TREE leaked GIT_DIR=<repo>/.git, GIT_WORK_TREE=.
+#   --work-tree=T FLAG   GIT_DIR=D, GIT_WORK_TREE=.              BYTE-IDENTICAL to the row above
+#   --separate-git-dir   GIT_DIR=<abs gitdir>                    (GIT_WORK_TREE unset)
+#   submodule            GIT_DIR=<super>/.git/modules/<name>     (GIT_WORK_TREE unset)
+#   GIT_COMMON_DIR set   passed through VERBATIM, and it disables core.worktree
+#
+# Two rows that are not layouts and matter anyway. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`
+# reach a hook in ORDINARY pulls — this project's own dev container injects four `safe.directory`
+# grants that way — so their presence is not an attack signature and nothing here may treat it as
+# one. And the fourth row is why the round-23 remedy works: the flag spelling of the dotfiles
+# alias, which is the canonical one, is indistinguishable from the exported spelling once git has
+# chdir'd, so a guard keyed on `GIT_WORK_TREE` cannot tell a user's alias from a leak.
 #
 # So `GIT_DIR` is not always set — but wherever it IS set it names the repository the merge was
 # about, and in the third row it is the ONLY pointer to it. Stripping it there is not a safety
@@ -128,24 +139,63 @@ else
     # ...because an answer we could not obtain is not the answer "a different repository". A
     # checkout set up with `core.worktree` has NO `.git` entry of its own, so discovering from
     # `$repo_root` with the environment scrubbed fails. The repository being merged knows the
-    # answer, though: `core.worktree` is IT DECLARING this working tree. Asked in the hook's own
-    # environment, so it is that repository's config and not the caller's.
+    # answer, though: `core.worktree` is IT DECLARING this working tree.
     #
-    # ...but ONLY when the caller has not overridden the work tree. `core.worktree` and
-    # `GIT_WORK_TREE` answer the same question — where this repository's files are — and the
-    # config one is the REPOSITORY'S answer while the environment one is the CALLER'S, which is
-    # the distinction this whole guard is built on.
+    # READ FROM EXACTLY THE FILES GIT READS WHEN IT DECIDES THE SAME THING.
     #
-    # Belt and braces now, and deliberately kept: the attack that motivated this condition (a
-    # leaked `GIT_WORK_TREE` plus a `core.worktree` naming that same foreign checkout) lands in
-    # `elsewhere`, which the arm can no longer reach. It is retained for one round rather than
-    # dropped in the same change that restructures the branch — the round-20 scar is precisely a
-    # confident argument that an arm could not misfire. `case10l` step 9 pins the confinement
-    # itself, so dropping this condition later is a measured decision rather than a hopeful one.
+    # That is the whole rule, and it is not a curated list of scopes — it is git's own honouring
+    # set, measured to coincide. Git honours `core.worktree` for work-tree resolution from
+    # `$GIT_DIR/config`, and from `$GIT_DIR/config.worktree` when `$GIT_DIR/config` ITSELF turns
+    # on `extensions.worktreeConfig`. Nowhere else: not `--global`, not `--system`, not `-c`, not
+    # `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, not through `[include]` — measured, all six.
+    #
+    # A bare `git config core.worktree` reads ALL of those. So the previous round's arm believed
+    # a declaration git itself would not honour, and every one of those channels is the caller's:
+    # measured end-to-end against a prey directory holding a marker `setup.sh`, `-c
+    # core.worktree=`, `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`, `GIT_CONFIG_PARAMETERS`, a `--global`
+    # declaration and `GIT_CONFIG_GLOBAL` ALL made this hook run setup.sh in a directory no
+    # repository owns. Five for five, against the arm whose comment said it was reading "that
+    # repository's config and not the caller's".
+    #
+    # The scoped read cannot be forged: measured, all six read back empty, and the only handles
+    # that move the local scope — `GIT_DIR`, `GIT_COMMON_DIR` — move `hook_common` WITH it, so
+    # the declaration always comes from the very repository the verdict is about. The caller
+    # cannot split the two.
+    #
+    # NOT the walk `_hooks_path_read` does in lib.sh, and the difference is the rule rather than
+    # an exception to it: git honours `core.hooksPath` from every stored scope, with precedence
+    # and includes, so lib.sh must walk all four and skip only command scope. The keys differ in
+    # WHERE git honours them, so the reads differ. A later round "harmonising" these two — adding
+    # `--global` or `--includes` here for consistency — re-opens the forge; `case10l` pins it.
+    #
+    # `--worktree` is git 2.20, later than this file's 2.5 floor, and it DEGRADES CORRECTLY:
+    # measured against a git shimmed to refuse it, the local-declaration layout still builds and
+    # the `config.worktree` layout skips — which is what that old git honours too, since a git
+    # predating the extension ignores `config.worktree` itself. The read mirrors the running git
+    # at every age, which is why it is safe here and `--absolute-git-dir` was not.
+    #
+    # There is no `GIT_WORK_TREE` condition any more, and its removal is the point rather than a
+    # simplification. It was written to stop the caller's word being taken for the repository's
+    # — a job the scoped read now does completely — and measured, the only arm-reachable case it
+    # blocked was "the caller redirected to exactly the tree this repository declares", which is
+    # a CORRECT accept. What it actually did was make the printed remedy inert for everyone
+    # whose alias sets the work tree, which is every user of the layout the refusal is written
+    # for: `git --git-dir=D --work-tree=T` and `export GIT_WORK_TREE=T` are BYTE-IDENTICAL inside
+    # the hook (git rewrites both to `GIT_WORK_TREE=.` after chdir'ing), so the user ran the
+    # remedy, nothing changed, and the same refusal reprinted for ever with a sentence that had
+    # become false. Every harmful `GIT_WORK_TREE` case lands in `elsewhere`, which the arm cannot
+    # reach, or fails the equality below.
     declared=""
-    if [ -z "${GIT_WORK_TREE:-}" ]; then
-        declared="$(git config core.worktree 2>/dev/null)" || declared=""
+    wtc="$(git config --local --bool extensions.worktreeConfig 2>/dev/null)" || wtc=""
+    if [ "$wtc" = true ]; then
+        declared="$(git config --worktree core.worktree 2>/dev/null)" || declared=""
     fi
+    if [ -z "$declared" ]; then
+        declared="$(git config --local core.worktree 2>/dev/null)" || declared=""
+    fi
+    # Kept as read, because `$declared` is resolved to an absolute path below and the refusal
+    # wants to show the operator the line that is actually in their config file.
+    declared_raw="$declared"
     if [ -n "$declared" ]; then
         # `--git-dir` and absolutise it here, NOT `--absolute-git-dir` — the same reasoning this
         # file applies to `--path-format=absolute` sixty lines up. `--absolute-git-dir` is a much
@@ -219,6 +269,14 @@ case "$verdict" in
         echo "jkb: it has no .git of its own, and the repository this merge is about does not" >&2
         echo "jkb: declare it. Skipping setup.sh rather than guessing. To enable jkb here, tell" >&2
         echo "jkb: the repository which tree is its own:" >&2
+        # ...and if it declares a DIFFERENT tree, say which. The remedy below would silently
+        # overwrite that declaration, and the difference between "not set up yet" and "set up,
+        # pointing somewhere else" is exactly the difference between a chore and a leak. Without
+        # this line the user confirms the leak by following the instructions.
+        if [ -n "$declared_raw" ]; then
+            echo "jkb: (it declares $declared_raw, which is not this tree — check that before" >&2
+            echo "jkb:  overwriting it; the command below replaces that declaration.)" >&2
+        fi
         # A BARE repository refuses `core.worktree` outright — "core.bare and core.worktree do
         # not make sense", then "fatal: unable to set up work tree using invalid config" — and
         # the bare-dotfiles layout is the exact layout this refusal is written for, so the one
@@ -230,7 +288,12 @@ case "$verdict" in
             echo "jkb:   git --git-dir=$(shq "$hook_common") config core.bare false" >&2
         fi
         echo "jkb:   git --git-dir=$(shq "$hook_common") config core.worktree $(shq "$repo_root")" >&2
-        echo "jkb: (and prefer that declaration to an exported GIT_WORK_TREE)." >&2
+        # NOT "prefer that declaration to an exported GIT_WORK_TREE". That sentence named a
+        # precondition which the scoped read removed: the alias may go on setting the work tree,
+        # by flag or by variable, and the declaration is what jkb trusts either way. Measured —
+        # both dotfiles spellings build on the next pull WITH THE ALIAS UNCHANGED.
+        echo "jkb: (your alias may keep setting the work tree; the declaration is what jkb" >&2
+        echo "jkb:  trusts, and it is the repository's own answer rather than the caller's.)" >&2
         exit 0 ;;
 esac
 

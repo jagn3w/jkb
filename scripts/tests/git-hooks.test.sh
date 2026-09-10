@@ -1774,16 +1774,22 @@ case10l() {
     #    anyway. That is the difference between testing the belt and testing the braces — and
     #    the round-20 defect was precisely an arm reaching a verdict that was never in doubt.
     #
-    #    The hook is copied and the `GIT_WORK_TREE` guard stripped from the copy, so the arm's
-    #    condition is genuinely gone rather than merely unexercised. If this passes, that
-    #    condition is belt-and-braces and can be dropped as a measured decision.
+    #    The hook is copied and the arm made MAXIMALLY PERMISSIVE in the copy: `declared` is
+    #    seeded with `$repo_root`, so its declaration read always succeeds and its equality
+    #    always holds. An arm that accepts unconditionally must STILL not change an established
+    #    verdict — that is the invariant, stated as a mutation.
+    #
+    #    This replaced a sed that neutered the arm's `GIT_WORK_TREE` predicate. That predicate
+    #    is gone (round 22 read the declaration from the scopes git honours instead, which
+    #    closes the forge the predicate was gesturing at), and a mutation whose target no longer
+    #    exists is a test of nothing — this one caught its own obsolescence through the premise
+    #    check below, which is why the premise check is here. The seed is also the better
+    #    mutation: it tests the CONFINEMENT rather than the absence of one predicate, so it
+    #    survives any future rewording of the arm's internals.
     local stripped="$d/post-merge.unconfined"
-    # Leading whitespace tolerated, so this still strips the guard if the block is ever
-    # re-indented — and so the pre-round-22 shape, where the guard sat at column 0, is a
-    # fixture this case can actually be run against.
-    sed 's/^\( *\)if \[ -z "${GIT_WORK_TREE:-}" \]; then$/\1if true; then/' "$hook" >"$stripped"
-    if ! grep -q 'if true; then' "$stripped"; then
-        fail "hookenv: strip-premise" "the GIT_WORK_TREE guard was not stripped, so this tested nothing"
+    sed 's/^\( *\)declared=""$/\1declared="$repo_root"/' "$hook" >"$stripped"
+    if ! grep -q 'declared="\$repo_root"' "$stripped"; then
+        fail "hookenv: strip-premise" "the arm was not made permissive, so this tested nothing"
     else
         git_q -C "$d/theirs" clean -qfd >/dev/null 2>&1 || :
         git_q -C "$d/mine" config core.worktree "$d/theirs"
@@ -1794,7 +1800,7 @@ case10l() {
         case "$out" in
             *"SETUP-RAN-IN:$(cd "$d/theirs" && pwd -P)"*)
                 fail "hookenv: confinement" \
-                     "with its predicate removed the arm overrode an ESTABLISHED verdict and built theirs" ;;
+                     "an unconditionally-accepting arm overrode an ESTABLISHED verdict and built theirs" ;;
             *"belongs to a different repository"*)
                 ok "and the arm cannot reach an established verdict even with its guard removed" ;;
             *) fail "hookenv: conf" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
@@ -1853,10 +1859,13 @@ case10l() {
     #      space produces. So the printed line is taken from the output and RUN, and the next
     #      pull must reach the ordinary path and build THIS tree.
     #
-    #      It is run with `GIT_WORK_TREE` dropped, which is the other half of what the message
-    #      says: while the arm requires the caller not to have overridden the work tree, a
-    #      declaration alone does not re-enable the layout. That parenthetical is therefore
-    #      load-bearing, and this step is what would notice if it stopped being true.
+    #      THE ALIAS IS KEPT THROUGHOUT, and that is the correction round 22 needed. This step
+    #      used to drop `GIT_WORK_TREE` for the post-remedy pull, on the reasoning that the
+    #      message's parenthetical made it a precondition. It made the step agree with the hook
+    #      instead of testing it: with the drop in place the remedy appeared to work, while for
+    #      every real user of this layout — whose alias sets the work tree on every command —
+    #      it did nothing at all, for ever. Nobody sets up bare dotfiles and then stops using
+    #      the alias.
     #      EVERY remedy line is run, in order, not just the first: on a bare repository the
     #      declaration needs `core.bare` cleared ahead of it, and a check that took line one
     #      would have called the incomplete remedy good.
@@ -1864,9 +1873,10 @@ case10l() {
     remedy="$(printf '%s\n' "$out" | sed -n 's/^jkb:   //p')"
     if [ -z "$remedy" ]; then
         fail "hookenv: dotremedy-premise" "the refusal printed no remedy line to run"
-    elif ! ( while IFS= read -r line; do
+    elif ! ( export GIT_DIR="$bgd" GIT_WORK_TREE="$btree"
+             while IFS= read -r line; do
                  [ -n "$line" ] || continue
-                 eval "env -u GIT_DIR -u GIT_WORK_TREE $line" || exit 1
+                 eval "$line" || exit 1
              done <<<"$remedy" ) >/dev/null 2>&1; then
         fail "hookenv: dotremedy-run" "a printed remedy line does not run: \
 $(printf '%s' "$remedy" | tr '\n' '|')"
@@ -1874,7 +1884,7 @@ $(printf '%s' "$remedy" | tr '\n' '|')"
         : "$ranall"
         ( cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q reset -q --hard HEAD~1 ) \
             >/dev/null 2>&1
-        out="$(cd "$btree" && GIT_DIR="$bgd" git_q merge --no-edit feature 2>&1)"
+        out="$(cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q merge --no-edit feature 2>&1)"
         case "$out" in
             *"SETUP-RAN-IN:$btree"*)
                 ok "and after the remedy it is the ordinary case, building that very tree" ;;
@@ -1930,6 +1940,197 @@ $(printf '%s' "$out" | tr '\n' '|')" ;;
         esac
     else
         fail "hookenv: sub-premise" "the submodule fixture did not build, so this tested nothing"
+    fi
+
+    # 14. THE FLAG SPELLING of the dotfiles alias — `git --git-dir=D --work-tree=T` — which is
+    #     the canonical recipe, and which nothing here drove. Inside the hook it is BYTE-
+    #     IDENTICAL to the exported form (measured: git rewrites both to `GIT_WORK_TREE=.`
+    #     after chdir'ing to the tree), so this is not a second code path — it is a second way
+    #     for a user to arrive, and the round-22 must-fix was that the printed remedy did
+    #     nothing for either of them. Driven separately anyway, because "identical inside the
+    #     hook" is a measurement that can stop being true, and because the alias is what the
+    #     step keeps constant across the remedy.
+    local fgd="$d/flag.git" ftree="$d/flagtree"
+    mkdir -p "$ftree"
+    git_q init -q --bare "$fgd" >/dev/null 2>&1
+    ( cd "$ftree" && export GIT_DIR="$fgd" GIT_WORK_TREE="$ftree"
+      printf 'seed\n' >seed
+      mkdir -p scripts
+      printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+          >scripts/setup.sh
+      chmod +x scripts/setup.sh
+      git_q add -A && git_q commit -qm seed
+      mkdir -p crates && printf 'x\n' >crates/x.rs
+      git_q add -A && git_q commit -qm crates
+      git_q branch -q feature && git_q reset -q --hard HEAD~1 ) >/dev/null 2>&1
+    cp "$hook" "$fgd/hooks/post-merge"; chmod +x "$fgd/hooks/post-merge"
+    out="$(cd "$ftree" && git_q --git-dir="$fgd" --work-tree="$ftree" merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"could not establish which repository"*)
+            local fremedy
+            fremedy="$(printf '%s\n' "$out" | sed -n 's/^jkb:   //p')"
+            if [ -z "$fremedy" ]; then
+                fail "hookenv: flag-premise" "the refusal printed no remedy line"
+            elif ! ( while IFS= read -r line; do
+                         [ -n "$line" ] || continue
+                         eval "$line" || exit 1
+                     done <<<"$fremedy" ) >/dev/null 2>&1; then
+                fail "hookenv: flag-run" "a remedy line does not run: $(printf '%s' "$fremedy" | tr '\n' '|')"
+            else
+                ( cd "$ftree" && git_q --git-dir="$fgd" --work-tree="$ftree" reset -q --hard HEAD~1 ) \
+                    >/dev/null 2>&1
+                # THE SAME ALIAS. A user of this layout does not stop using it because jkb
+                # printed something; if the remedy only works once they change how they invoke
+                # git, it has not worked.
+                out="$(cd "$ftree" && git_q --git-dir="$fgd" --work-tree="$ftree" \
+                       merge --no-edit feature 2>&1)"
+                case "$out" in
+                    *"SETUP-RAN-IN:$(cd "$ftree" && pwd -P)"*)
+                        ok "and the --work-tree spelling is fixed by the remedy too, alias unchanged" ;;
+                    *"could not establish"*)
+                        fail "hookenv: flag-effect" "the remedy ran and the flag form still \
+refuses, for ever: $(printf '%s' "$out" | tr '\n' '|')" ;;
+                    *) fail "hookenv: flag-other" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+                esac
+            fi ;;
+        *"SETUP-RAN-IN:"*) fail "hookenv: flag-accept" "an undeclared flag-form tree was built" ;;
+        *) fail "hookenv: flag" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+
+    # 15. FORGED TESTIMONY. The arm asks the repository whether it declares this tree; a bare
+    #     `git config core.worktree` also answers from `-c`, `GIT_CONFIG_COUNT`, `--global` and
+    #     `GIT_CONFIG_GLOBAL`, all of which are the CALLER. Measured against the pre-fix hook:
+    #     five vectors, five builds of a marker `setup.sh` in a directory no repository owns.
+    #
+    #     Note what the caller is doing here: git does NOT redirect the work tree for a
+    #     command-scope `core.worktree` (measured — the toplevel is unchanged). The redirect is
+    #     the cwd; the `-c` only supplies the forged declaration that makes the hook accept it.
+    #
+    #     The prey directory is pre-populated with its marker BEFORE the merge, because a
+    #     fast-forward does not rewrite unchanged paths and a fixture that writes it afterwards
+    #     silently tests nothing.
+    #     AND THE PREY IS REBUILT BETWEEN SPELLINGS. It is not tidiness: the first successful
+    #     forge checks `crates/x.rs` OUT INTO the prey directory, and the next merge then dies
+    #     with "untracked working tree files would be overwritten by merge" BEFORE the hook
+    #     runs. Measured — with one shared prey, only the first of the four spellings ever
+    #     reached the code under test and the other three reported clean having tested nothing,
+    #     which is this suite's own recurring defect committed inside the case against it.
+    local prey="$d/prey" forged="" reached=0
+    _hookenv_prey() {
+        rm -rf "$prey"
+        mkdir -p "$prey/scripts"
+        printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+            >"$prey/scripts/setup.sh"
+        chmod +x "$prey/scripts/setup.sh"
+    }
+    for spelling in dashc envcount envparams global; do
+        _hookenv_prey
+        git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)" >/dev/null 2>&1
+        case "$spelling" in
+            dashc)     out="$(cd "$prey" && git_q --git-dir="$d/mine/.git" \
+                              -c core.worktree="$prey" merge --no-edit feature 2>&1)" ;;
+            envcount)  out="$(cd "$prey" && GIT_DIR="$d/mine/.git" GIT_CONFIG_COUNT=1 \
+                              GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0="$prey" \
+                              git_q merge --no-edit feature 2>&1)" ;;
+            envparams) out="$(cd "$prey" && GIT_DIR="$d/mine/.git" \
+                              GIT_CONFIG_PARAMETERS="'core.worktree'='$prey'" \
+                              git_q merge --no-edit feature 2>&1)" ;;
+            global)    printf '[core]\n\tworktree = %s\n' "$prey" >>"$work/home/.gitconfig"
+                       out="$(cd "$prey" && GIT_DIR="$d/mine/.git" git_q merge --no-edit feature 2>&1)"
+                       : >"$work/home/.gitconfig"
+                       git_q config --global user.email t@example.com
+                       git_q config --global user.name "Test" ;;
+        esac
+        # The hook must have RUN. Without this, a merge that aborted before reaching it — the
+        # untracked-file abort above, a fixture typo, anything — reads as "did not build",
+        # which is the answer this step is looking for.
+        case "$out" in
+            *"jkb: "*) reached=$((reached + 1)) ;;
+        esac
+        case "$out" in
+            *"SETUP-RAN-IN:$(cd "$prey" && pwd -P)"*) forged="$forged $spelling" ;;
+        esac
+    done
+    _hookenv_prey
+    git_q -C "$d/mine" reset -q --hard feature >/dev/null 2>&1
+    if [ "$reached" -ne 4 ]; then
+        fail "hookenv: forged-premise" "the hook ran for only $reached of the 4 forge spellings, \
+so the rest tested nothing"
+    elif [ -n "$forged" ]; then
+        fail "hookenv: forged" "the caller forged a declaration and jkb built a tree no \
+repository owns, via:$forged"
+    else
+        ok "and a declaration the CALLER supplied is not the repository declaring anything"
+    fi
+
+    # 16. `config.worktree`, which git honours when the LOCAL file turns the extension on. It
+    #     is the second of the two files git reads for this key, so the arm reads it — and
+    #     without a case that branch is dead code wearing the costume of completeness.
+    local wgd="$d/wtc.git" wtree="$d/wtctree"
+    mkdir -p "$wtree"
+    git_q init -q --bare "$wgd" >/dev/null 2>&1
+    ( cd "$wtree" && export GIT_DIR="$wgd" GIT_WORK_TREE="$wtree"
+      printf 'seed\n' >seed
+      mkdir -p scripts
+      printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+          >scripts/setup.sh
+      chmod +x scripts/setup.sh
+      git_q add -A && git_q commit -qm seed
+      mkdir -p crates && printf 'x\n' >crates/x.rs
+      git_q add -A && git_q commit -qm crates
+      git_q branch -q feature && git_q reset -q --hard HEAD~1 ) >/dev/null 2>&1
+    git_q --git-dir="$wgd" config core.bare false
+    git_q --git-dir="$wgd" config extensions.worktreeConfig true
+    if git_q --git-dir="$wgd" config --worktree core.worktree "$wtree" 2>/dev/null; then
+        cp "$hook" "$wgd/hooks/post-merge"; chmod +x "$wgd/hooks/post-merge"
+        out="$(cd "$wtree" && GIT_DIR="$wgd" git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:$(cd "$wtree" && pwd -P)"*)
+                ok "and a declaration in config.worktree is the repository's answer too" ;;
+            *) fail "hookenv: wtcdecl" "a config.worktree declaration was not honoured: \
+$(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: wtc-premise" "this git will not set a --worktree value, so this tested nothing"
+    fi
+
+    # 17. ...and an INCLUDED declaration must skip, because git itself ignores it for work-tree
+    #     resolution — measured, `rev-parse --show-toplevel` is not redirected by a
+    #     `core.worktree` reached through `[include]`. This is the one plausible future edit
+    #     that re-opens the forge while looking like consistency: `_hooks_path_read` in lib.sh
+    #     reads `core.hooksPath` WITH `--includes`, because git honours that key that way. The
+    #     rule is "read it from where git honours it", and the two keys differ.
+    local igd="$d/inc.git" itree="$d/inctree"
+    mkdir -p "$itree"
+    git_q init -q --bare "$igd" >/dev/null 2>&1
+    ( cd "$itree" && export GIT_DIR="$igd" GIT_WORK_TREE="$itree"
+      printf 'seed\n' >seed
+      mkdir -p scripts
+      printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+          >scripts/setup.sh
+      chmod +x scripts/setup.sh
+      git_q add -A && git_q commit -qm seed
+      mkdir -p crates && printf 'x\n' >crates/x.rs
+      git_q add -A && git_q commit -qm crates
+      git_q branch -q feature && git_q reset -q --hard HEAD~1 ) >/dev/null 2>&1
+    git_q --git-dir="$igd" config core.bare false
+    printf '[core]\n\tworktree = %s\n' "$itree" >"$d/inc.cfg"
+    git_q --git-dir="$igd" config include.path "$d/inc.cfg"
+    cp "$hook" "$igd/hooks/post-merge"; chmod +x "$igd/hooks/post-merge"
+    if [ "$(cd "$itree" && GIT_DIR="$igd" git_q config --includes --get core.worktree 2>/dev/null)" \
+         = "$itree" ]; then
+        out="$(cd "$itree" && GIT_DIR="$igd" GIT_WORK_TREE="$itree" git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:"*)
+                fail "hookenv: included" "an INCLUDED core.worktree was believed, but git does \
+not honour one — the read has drifted onto scopes git ignores" ;;
+            *"could not establish"*)
+                ok "and an included declaration is not one, because git does not honour it either" ;;
+            *) fail "hookenv: inc" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: inc-premise" "the include fixture does not carry the value, so this \
+tested nothing"
     fi
 }
 
