@@ -236,6 +236,23 @@ case_isolate() {
     # single one they replace. Measured: dropping `isolate_git`'s HOME redirect — a FILE-based
     # leak, invisible to any check that reads variables — leaves `isolate: vars` green and
     # fails both of these. The variable check pins the variable routes; these pin the effect.
+
+    # ...and THIS is the one that drives the KEY_<n>/VALUE_<n> sweep, by putting the count back
+    # afterwards — the sweep's own stated scenario ("a later export of COUNT by anything under
+    # test would make them live again"). Without it the pair is inert to git and no assertion
+    # here could tell a working sweep from a deleted one; with it, git reads KEY_0 again unless
+    # the sweep really removed it. This is the BSD-sed regression's own pin.
+    got="$(
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/injected \
+        bash -c '. "$1" >/dev/null 2>&1; isolate_git "$2/home3" >/dev/null 2>&1
+                 export GIT_CONFIG_COUNT=1
+                 git init -q "$2/r-revive" 2>/dev/null
+                 git -C "$2/r-revive" config --get core.hooksPath 2>/dev/null || printf "<none>"' \
+             _ "$lib" "$d"
+    )"
+    [ "$got" = "<none>" ] \
+        && ok "and the KEY_<n>/VALUE_<n> sweep survives the count being re-exported afterwards" \
+        || fail "isolate: revive" "a swept pair came back live: core.hooksPath=$got"
 }
 
 run_cases case1 case2 case2b case2c case2d case3 case4 case_isolate

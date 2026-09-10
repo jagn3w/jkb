@@ -819,8 +819,10 @@ _override_verdict() {
         # the position unambiguous: only the arms of this one `case` are at this depth.
         awk '/^_override_verdict\(\) \{/ { inside = 1; next }
              inside && /^\}/             { exit }
-             inside && /^[[:space:]]*[0-9]+\)/ {
-                 sub(/^[[:space:]]*/, ""); sub(/\).*/, ""); print
+             inside && /^[[:space:]]*[0-9|]+\)/ {
+                 arm = $0; sub(/^[[:space:]]*/, "", arm); sub(/\).*/, "", arm)
+                 n = split(arm, alts, "|")
+                 for (i = 1; i <= n; i++) print alts[i]
              }' "$_JKB_LIB_SELF"
         return 0
     fi
