@@ -1484,7 +1484,14 @@ case10l() {
         mkdir -p "$r/scripts"
         git_q init -q "$r" >/dev/null 2>&1
         printf 'seed\n' >"$r/seed"
-        printf '#!/bin/sh\necho "SETUP-RAN-IN:%s"\n' "$1" >"$r/scripts/setup.sh"
+        # THE MARKER IS RESOLVED AT RUN TIME, not baked in at build time. Baked in, step 6's
+        # fixture destroyed it: setting `core.worktree=$d/theirs` on `mine` and then running
+        # `reset --hard` checks MINE's tree out INTO theirs, overwriting theirs/scripts/setup.sh
+        # with mine's copy — so `SETUP-RAN-IN:theirs` could never be printed by anything, the arm
+        # naming the harm was dead, and the case caught its regression only through the catch-all
+        # and reported the wrong diagnosis. `dirname $0` cannot be relabelled by a checkout.
+        printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+            >"$r/scripts/setup.sh"
         chmod +x "$r/scripts/setup.sh"
         git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm seed >/dev/null
         mkdir -p "$r/crates"; printf 'x\n' >"$r/crates/x.rs"
@@ -1499,7 +1506,7 @@ case10l() {
     # 1. The ordinary layout: the hook must SEE the crates/ change. This is what the scrub broke.
     out="$(git_q -C "$d/mine" merge --no-edit feature 2>&1)"
     case "$out" in
-        *"running setup.sh"*"SETUP-RAN-IN:mine"*)
+        *"running setup.sh"*"SETUP-RAN-IN:$(cd "$d/mine" && pwd -P)"*)
             ok "a merge touching crates/ runs setup.sh in its own checkout" ;;
         *"no build-affecting changes pulled"*)
             fail "hookenv: blind" "the hook missed a crates/ change — it lost ORIG_HEAD" ;;
@@ -1514,7 +1521,7 @@ case10l() {
     git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)"
     out="$(GIT_WORK_TREE="$d/theirs" git_q -C "$d/mine" merge --no-edit feature 2>&1)"
     case "$out" in
-        *"SETUP-RAN-IN:theirs"*)
+        *"SETUP-RAN-IN:$(cd "$d/theirs" && pwd -P)"*)
             fail "hookenv: foreign" "the hook built an unrelated repository's checkout" ;;
         *"belongs to a different repository"*)
             ok "a redirected working tree is detected and named, and nothing is built" ;;
@@ -1580,7 +1587,8 @@ case10l() {
     git_q -C "$gd" config core.bare false
     git_q -C "$gd" config core.worktree "$wt"
     printf 'seed\n' >"$wt/seed"
-    printf '#!/bin/sh\necho "SETUP-RAN-IN:detached"\n' >"$wt/scripts/setup.sh"
+    printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+        >"$wt/scripts/setup.sh"
     chmod +x "$wt/scripts/setup.sh"
     (
         cd "$wt" && export GIT_DIR="$gd"
@@ -1614,13 +1622,49 @@ case10l() {
     git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)"
     out="$(GIT_WORK_TREE="$d/theirs" git_q -C "$d/mine" merge --no-edit feature 2>&1)"
     case "$out" in
-        *"SETUP-RAN-IN:theirs"*)
+        *"SETUP-RAN-IN:$(cd "$d/theirs" && pwd -P)"*)
             fail "hookenv: declared-redirect" "a declared tree let a REDIRECTED one through" ;;
         *"belongs to a different repository"*)
             ok "and a declared working tree does not license a redirected one" ;;
         *) fail "hookenv: dr" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     git_q -C "$d/mine" config --unset core.worktree 2>/dev/null || :
+
+    # 7. `core.worktree` may be "absolute or relative to the path to the .git directory"
+    #    (git-config(5)). Resolving a relative one against the HOOK'S CWD refused a repository
+    #    using git's documented form — the same false refusal step 5 exists to end, one layout
+    #    over. Nothing is resolved now: `--show-toplevel` already went through the declaration.
+    local rgd="$d/adm/gd" rwt="$d/rtree"
+    mkdir -p "$d/adm" "$rwt/scripts"
+    git_q init -q --bare "$rgd" >/dev/null 2>&1
+    git_q -C "$rgd" config core.bare false
+    git_q -C "$rgd" config core.worktree "../../rtree"
+    printf 'seed\n' >"$rwt/seed"
+    printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+        >"$rwt/scripts/setup.sh"
+    chmod +x "$rwt/scripts/setup.sh"
+    (
+        cd "$rwt" && export GIT_DIR="$rgd"
+        git_q add -A && git_q commit -qm seed
+        mkdir -p crates && printf 'x\n' >crates/x.rs
+        git_q add -A && git_q commit -qm crates
+        git_q branch -q feature && git_q reset -q --hard HEAD~1
+    ) >/dev/null 2>&1
+    cp "$hook" "$rgd/hooks/post-merge"
+    chmod +x "$rgd/hooks/post-merge"
+    if [ "$(cd "$rwt" && GIT_DIR="$rgd" git_q rev-parse --show-toplevel 2>/dev/null)" \
+         = "$(cd "$rwt" && pwd -P)" ]; then
+        out="$(cd "$rwt" && GIT_DIR="$rgd" git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"belongs to a different repository"*)
+                fail "hookenv: relworktree" "a RELATIVE core.worktree was refused as foreign" ;;
+            *"running setup.sh"*)
+                ok "and git's relative core.worktree form is the ordinary case too" ;;
+            *) fail "hookenv: rel" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: rel-premise" "git does not resolve the relative form here, so this tested nothing"
+    fi
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
@@ -1683,6 +1727,20 @@ case10m() {
 reads it was never exercised"
     fi
 
+    # The extension is LOCAL-ONLY, and reading it with full precedence had no pin: deleting
+    # `--local` left every suite green. A GLOBAL `extensions.worktreeConfig = true` is not this
+    # repository's answer, and acting on it sends the loop into `git config --worktree`, which
+    # then exits 128 in any repo with more than one working tree and collapses the whole read.
+    git_q -C "$d/r" config --unset extensions.worktreeConfig 2>/dev/null || :
+    git_q -C "$d/r" config --unset --worktree core.hooksPath 2>/dev/null || :
+    git_q -C "$d/r" config core.hooksPath .githooks
+    printf '[extensions]\n\tworktreeConfig = true\n' >>"$work/home/.gitconfig"
+    ask "$d/r"
+    [ "$rc" = 0 ] && [ "$v" = .githooks ] \
+        && ok "and a GLOBAL worktreeConfig is not read as this repository's extension" \
+        || fail "oldscope: wtc-scope" "rc=$rc value='$v' — the extension was read with full precedence"
+    printf '[extensions]\n\tworktreeConfig = false\n' >>"$work/home/.gitconfig"
+
     # An included file is the same question, and a scope flag turns includes off by default.
     git_q init -q "$d/r2" >/dev/null 2>&1
     printf '[core]\n\thooksPath = /from-include\n' >"$work/home/inc.cfg"
@@ -1706,9 +1764,33 @@ reads it was never exercised"
         fail "oldscope: nopremise" "the shim did not refuse --includes, so this case tested nothing"
     else
         ask "$d/r"
-        [ "$rc" = 2 ] \
-            && ok "and a git that refuses every option reads as unestablished, not as 'stores none'" \
-            || fail "oldscope: allrefused" "rc=$rc value='$v' — a failed read was spelled as an absent value"
+        # rc 5, its OWN code: "this git could not be asked" is a different fact from "this value
+        # cannot be expanded" (rc 2) and needs a different remedy — `--show-origin` would print
+        # something perfectly normal here, and the only fix is a newer git.
+        [ "$rc" = 5 ] \
+            && ok "and a git that refuses every option reads as unestablished, with its own code" \
+            || fail "oldscope: allrefused" "rc=$rc value='$v' — want 5 (unaskable git), not 2 (unexpandable value)"
+    fi
+
+    # A LOSING scope that cannot expand must not abort the read. `~someuser/` for an account
+    # absent on this machine is the ordinary state of a shared ~/.gitconfig, and returning on it
+    # reported `dispatch=unreadable` for a repository whose own hooksPath git resolves AND RUNS —
+    # measured, `git hook run post-merge` printed the hook's output while this returned 2. The
+    # oracle is git itself, so both directions are checked against `rev-parse --git-path`.
+    printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do [ "$a" = "--show-scope" ] && exit 129; done' \
+        "exec $(command -v git) \"\$@\"" >"$d/bin/git"
+    chmod 755 "$d/bin/git"
+    git_q init -q "$d/r3" >/dev/null 2>&1
+    git_q -C "$d/r3" config core.hooksPath .githooks
+    printf '[core]\n\thooksPath = ~nosuchuser42/hooks\n' >>"$work/home/.gitconfig"
+    if [ "$(git_q -C "$d/r3" rev-parse --git-path hooks/post-merge 2>&1)" = ".githooks/post-merge" ]; then
+        ask "$d/r3"
+        [ "$rc" = 0 ] && [ "$v" = .githooks ] \
+            && ok "and a broken value in a LOSING scope does not abort a read git itself resolves" \
+            || fail "oldscope: losing" "rc=$rc value='$v' — git resolves this repo's hooksPath, we did not"
+    else
+        fail "oldscope: losing-premise" "git does not resolve the fixture's hooksPath, so this tested nothing"
     fi
 }
 

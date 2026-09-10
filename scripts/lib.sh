@@ -204,7 +204,7 @@ EOF
     # "the repository stores none", which the caller renders as `dispatch=direct` and prints
     # nothing for, while git itself resolves the hook and jkb writes no chainer. The two
     # branches of this one function have to answer the same question about the same repository.
-    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0
+    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0
     # `--local`, because `extensions.worktreeConfig` is a LOCAL-ONLY repository extension: git
     # stores it per repository, so a global one — or a `-c` on the command line, which this
     # function refuses for `core.hooksPath` three lines up — is not this repository's answer.
@@ -224,7 +224,7 @@ EOF
         # Anything else is unestablished and must not be spelled as "stores none", which the
         # caller renders as `dispatch=direct` and prints nothing for.
         case "$rc" in
-            0) ;;
+            0) broken=0 ;;
             1) continue ;;
             # 129 is an unknown OPTION — a fact about this git, not about the value. It is how a
             # git predating `--worktree` answers, and it is ALSO how one predating `--includes`
@@ -233,7 +233,18 @@ EOF
             # So it is counted: all four scopes refusing means the read failed, not that nothing
             # is stored.
             129) unsupported=$((unsupported + 1)); continue ;;
-            *) return 2 ;;
+            # 128 is "set HERE, and git will not expand it" — a fact about THIS scope, not about
+            # the repository's answer. Returned immediately, a broken value in a LOSING scope
+            # (a `~someuser/` in a shared ~/.gitconfig, the ordinary state of dotfiles) aborted
+            # the whole read, so a repository whose own `core.hooksPath` git resolves and RUNS
+            # was reported `dispatch=unreadable` with no chainer written. Measured: `git hook run
+            # post-merge` printed the hook's output while this function returned 2.
+            #
+            # So it is remembered, not returned, and the LAST word wins — which is how git
+            # resolves precedence. A value at a higher-precedence scope clears it (above); a
+            # break at a higher-precedence scope invalidates a value found lower down, because
+            # that is the value git would have tried to expand.
+            *) broken=1; continue ;;
         esac
         # Last entry within a scope wins, as git itself resolves it. Command substitution has
         # already eaten the trailing newline, so a single empty value arrives as "" — which is
@@ -244,9 +255,16 @@ EOF
     done
     # Every scope we asked refused the options: we did not establish "stores none", we failed to
     # ask. Spelling that as "not set" is the one answer the caller renders silently.
+    # rc 5, not 2. Both are "unestablished", but they are different facts with different
+    # remedies: 2 is a VALUE this machine cannot expand (`~someuser/` for an absent account),
+    # whose refusal sends the operator to `--show-origin` to find it; 5 is a GIT too old to be
+    # asked, where `--show-origin` would print something perfectly normal and the only remedy is
+    # a newer git. A refusal must name a remedy that is true of the thing refused.
     if [ "$found2" -ne 0 ] && [ "$asked" -gt 0 ] && [ "$unsupported" -eq "$asked" ]; then
-        return 2
+        return 5
     fi
+    # A break at the highest-precedence scope that answered: git would fail here too.
+    [ "$broken" -eq 0 ] || return 2
     [ "$found2" -eq 0 ] || return 1
     printf '%s' "$value2"
     return 0
@@ -261,6 +279,9 @@ EOF
 #   3  it is set to the empty string (git resolves it to `/post-merge` and finds nothing)
 #   4  it is relative and this repository has no working tree, so git anchors it on the
 #      INVOKING PROCESS'S current directory and there is no one place at all
+#   5  this git answered 129 (unknown option) to every scope we could ask, so nothing about
+#      the repository's own value was established — a fact about the GIT, not about the value,
+#      and the two need different remedies
 #
 # One code for all three sent the operator a check that prints a perfectly normal value for
 # code 4, which is the same failure `--show-origin` was introduced to fix for code 3.
@@ -301,6 +322,7 @@ git_hooks_override() {
     case "$rc" in
         0) ;;
         1) return 0 ;;      # the repository stores none
+        5) return 5 ;;      # this git could not be asked at all (see `_hooks_path_read`)
         *) return 2 ;;      # set, and git will not expand it
     esac
     # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
@@ -873,6 +895,7 @@ _override_verdict() {
         2) printf 'unreadable core.hooksPath cannot be expanded on this machine' ;;
         3) printf 'unreadable core.hooksPath is set to the empty string' ;;
         4) printf 'unanchored core.hooksPath' ;;
+        5) printf 'unreadable core.hooksPath could not be read from this git' ;;
         *) printf 'unreadable core.hooksPath could not be resolved (unrecognised status %s)' "$1" ;;
     esac
 }
@@ -882,6 +905,7 @@ _override_why() {
         2) printf 'core.hooksPath cannot be expanded' ;;
         3) printf 'core.hooksPath is empty' ;;
         4) printf 'core.hooksPath is relative and this repository has no working tree' ;;
+        5) printf 'this git is too old to report where core.hooksPath is set' ;;
         *) printf 'core.hooksPath could not be resolved' ;;
     esac
 }

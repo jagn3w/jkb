@@ -280,8 +280,15 @@ conventions every session is expected to know.
   Below git 2.26 there is no `--show-scope`, and falling back to `--get` reinstated the whole bug
   there (measured: chainer installed at the injected path, exclude rule written for it,
   `dispatch=chained` reported). So the fallback asks each STORED scope by name —
-  `--system`/`--global`/`--local`/`--worktree`, which predate `--show-scope` by a decade — rather
-  than asking for the winner. Same answer on every git, not a degraded one on an old git.
+  `--system`/`--global`/`--local`/`--worktree` — rather than asking for the winner.
+  **Superseded in part, and the correction matters more than the claim.** That bullet used to end
+  "which predate `--show-scope` by a decade. Same answer on every git, not a degraded one on an
+  old git." `--worktree` is not in the decade-old group, and an old enough git answers **129** to
+  a scope flag it does not know — which was then absorbed into "not set in this scope", so every
+  scope read empty and a repo with a stored `core.hooksPath` got `dispatch=direct`, the one
+  verdict the renderer prints nothing for. A 129 is counted now, and all scopes refusing returns
+  "unestablished" rather than "stores none". Left as written, this paragraph told the next reader
+  a 129 could not happen — from the file `CLAUDE.md` sends them to *before* touching `lib.sh`.
 - **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
   `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
   there is no fifth code today — so a mutation collapsing them stayed green and nothing could

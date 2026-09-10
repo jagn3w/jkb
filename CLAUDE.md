@@ -253,7 +253,7 @@ cost to learn, and which alternatives were rejected and why.
 | [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |
 | [docs/ui-and-review.md](docs/ui-and-review.md) | `ui/`, `.claude/workflows/code-review.js` | The explorer is a CLI client, never a bespoke backend (D31); our reviewer returns structured findings (D37). |
 
-Three rules about this set, because a split decision record fails in predictable ways:
+Some rules about this set, because a split decision record fails in predictable ways:
 
 - **A file can appear in two rows, and then both govern.** `gitrepo.rs` is the clearest case:
   its merge-detection and branch-ref rules are in `task-lifecycle.md`, its repository-selection

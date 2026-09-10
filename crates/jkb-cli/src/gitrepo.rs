@@ -1206,7 +1206,7 @@ mod tests {
     /// file holds exactly one production git spawn, so an empty result is not a broken walk)
     /// is asserted below.
     ///
-    /// Four rules it had to learn, each from a defect it had missed:
+    /// The rules it had to learn, each from a defect it had missed:
     ///
     /// 1. **Test code counts.** The first version cut every file at its `mod tests`, so it could
     ///    not see that this module's OWN four fixtures scrubbed nothing. Measured: with
@@ -1374,6 +1374,7 @@ mod tests {
             .filter_map(|f| std::fs::read_to_string(f).ok())
             .collect();
         let mut unpinned: Vec<String> = Vec::new();
+        let mut parsed = 0usize;
         let mut in_list = false;
         let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
         for line in self_src.lines() {
@@ -1381,30 +1382,66 @@ mod tests {
                 in_list = true;
                 continue;
             }
-            if in_list {
-                if line.trim() == "];" {
-                    break;
-                }
-                let Some((entry, named)) = line.split_once("// ") else {
-                    continue;
-                };
-                if !entry.trim_start().starts_with('(') {
-                    continue;
-                }
-                let named = named.trim();
-                if !all_src.contains(&format!("fn {named}(")) {
-                    unpinned.push(format!("{} names `{named}`", entry.trim()));
-                }
+            if !in_list {
+                continue;
+            }
+            if line.trim() == "];" {
+                break;
+            }
+            // An ENTRY line, whatever it carries — counted before the comment is looked for, so
+            // that an entry written without one is a failure rather than a silent skip. Written
+            // the other way round (find the comment, then check the entry), a comment-less entry
+            // `continue`d and its exemption was granted with no named test at all: the archive.rs
+            // defect this check exists to close, one shape over.
+            if !line.trim_start().starts_with('(') {
+                continue;
+            }
+            parsed += 1;
+            let Some((_, named)) = line.split_once("// ") else {
+                unpinned.push(format!("{} names no test at all", line.trim()));
+                continue;
+            };
+            let named = named.trim();
+            let Some(at) = all_src.find(&format!("fn {named}(")) else {
+                unpinned.push(format!(
+                    "{} names `{named}`, which is not a function here",
+                    line.trim()
+                ));
+                continue;
+            };
+            // ...and the named test must OBSERVE the constructor it is named beside. Existing
+            // somewhere in the crate is not evidence about this entry — a test could be named
+            // here and assert something else entirely, which is the same "reads as pinned and
+            // is not" shape one level up. The body is scanned to its closing brace at test
+            // indentation, which is where every test in this crate ends.
+            let body = &all_src[at..];
+            let body = body.find("\n    }").map_or(body, |e| &body[..e]);
+            let ctor = line
+                .split_once(", \"")
+                .and_then(|(_, r)| r.split_once('"'))
+                .map_or("", |(n, _)| n);
+            if !ctor.is_empty() && !body.contains(ctor) {
+                unpinned.push(format!(
+                    "{} names `{named}`, which never mentions `{ctor}`",
+                    line.trim()
+                ));
             }
         }
-        assert!(
-            !unpinned.is_empty() || SCRUBBERS.len() >= 6,
-            "the SCRUBBERS block was not found in this file, so its entries were not checked"
+        // The premise, measured rather than asserted from a constant: `SCRUBBERS.len() >= 6` was
+        // `6 >= 6` on a const array of six, so it could not fail whatever the parse did — a
+        // guard that cannot fire, inside the guard against guards that cannot fire. Renaming the
+        // const or reformatting the block would have left it examining zero entries and passing.
+        assert_eq!(
+            parsed,
+            SCRUBBERS.len(),
+            "the SCRUBBERS parse found {parsed} entries but the list holds {}; the block moved, \
+             was renamed or was reformatted, so its entries were not the ones checked",
+            SCRUBBERS.len()
         );
         assert!(
             unpinned.is_empty(),
-            "a SCRUBBERS entry grants an exemption while naming a test that does not exist, so \
-             nothing checks that constructor actually scrubs: {unpinned:?}"
+            "a SCRUBBERS entry grants an exemption while naming no test, a test that does not \
+             exist, or one that never mentions the constructor it exempts: {unpinned:?}"
         );
 
         // The retired per-module check's distinctive premise: this file holds exactly ONE

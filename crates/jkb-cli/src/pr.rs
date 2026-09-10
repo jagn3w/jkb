@@ -241,15 +241,6 @@ enum Staleness {
     Undecidable(String),
 }
 
-/// Run `gh` in `dir`, returning stdout or a sentence explaining why we could not ask.
-///
-/// Deliberately shells out rather than speaking HTTP: `gh` already holds the user's
-/// authentication, and adding an HTTP client plus a token story to `jkb-cli` for one query is a
-/// dependency and a secret this tool does not otherwise need.
-/// Build the `gh` invocation for `dir`.
-///
-/// Separate from [`gh`] so the scrubbing below is pinned at THIS call site: a test of
-/// `scrub_repo_selection` alone stayed green with this line deleted.
 /// The variables that select a repository FOR GH, which git's three do not cover.
 ///
 /// `gh` finds the repository through git, so `scrub_repo_selection` is necessary — and not
@@ -260,12 +251,22 @@ enum Staleness {
 /// exists to prevent, through a door the git list does not cover, in the direction D34.4
 /// forbids — a wrong close buries work in flight.
 ///
-/// **Not verified against the tool here**: `gh` is not installed in this sandbox, so this rests
+/// `GH_HOST` is here for the same reason one step out: it selects the GitHub *instance*, so a
+/// leaked one sends the query to another host, where the pull-request number either does not
+/// exist (a refusal, harmless) or names somebody else's PR entirely (a wrong close). Weaker than
+/// the `GH_REPO` case and argued rather than measured, which is why it is said out loud instead
+/// of being carried along by the name of the list.
+///
+/// **Not verified against the tool here**: `gh` is not installed in this sandbox, so both rest
 /// on gh's documented environment rather than on a measurement, which this project's own rule
 /// says to check with `gh help environment`. Removing them is safe either way — jkb always
 /// means the repository it is standing in — so the unverified direction costs nothing.
 const GH_SELECTION_VARS: &[&str] = &["GH_REPO", "GH_HOST"];
 
+/// Build the `gh` invocation for `dir`.
+///
+/// Separate from [`gh`] so the scrubbing below is pinned at THIS call site: a test of
+/// `scrub_repo_selection` alone stayed green with this line deleted.
 fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("gh");
     cmd.args(args).current_dir(dir);
@@ -280,6 +281,11 @@ fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// Run `gh` in `dir`, returning stdout or a sentence explaining why we could not ask.
+///
+/// Deliberately shells out rather than speaking HTTP: `gh` already holds the user's
+/// authentication, and adding an HTTP client plus a token story to `jkb-cli` for one query is a
+/// dependency and a secret this tool does not otherwise need.
 fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = gh_cmd(dir, args).output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -322,7 +328,14 @@ mod tests {
             .filter(|(_, v)| v.is_none())
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
-        for want in super::GH_SELECTION_VARS {
+        // NAMED LITERALLY, not read from the constant this is guarding. Iterating
+        // `GH_SELECTION_VARS` meant both loops shrank together: editing the const to
+        // `&["GH_REPO"]` — the likeliest edit, since GH_HOST rests on unverified documentation —
+        // reopened the hole with the test green, and `&[]` asserted nothing at all while
+        // production removed nothing. `REPO_SELECTION_VARS` two functions away is a SEPARATE
+        // expectation list from the `.env_remove` calls it checks, which is exactly why deleting
+        // one of those calls is caught. Same rule here.
+        for want in ["GH_REPO", "GH_HOST"] {
             assert!(
                 removed.iter().any(|k| k == want),
                 "gh: {want} is not removed; it names a repository outright and outranks the \
