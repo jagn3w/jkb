@@ -1846,6 +1846,34 @@ case10l() {
         *) fail "hookenv: dot" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
 
+    # 11a. ...and chore 2 must still RUN. "Skipping setup.sh" is what the refusal says, and for
+    #      a while it was not what the hook did: one `exit 0` took `jkb task close-merged` with
+    #      it, which needs only the repository the merge was about — never in doubt here, since
+    #      `$hook_common` named it. A stub `jkb` on PATH is enough to see it, and unlike a `git`
+    #      stub it actually reaches the hook: git prepends its own `GIT_EXEC_PATH` (which holds
+    #      a real `git`) but nothing shadows `jkb`.
+    local jbin="$d/jkbbin"
+    mkdir -p "$jbin"
+    printf '%s\n' '#!/bin/sh' 'echo "JKB-RAN:$*"' >"$jbin/jkb"
+    chmod +x "$jbin/jkb"
+    ( cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q reset -q --hard HEAD~1 ) \
+        >/dev/null 2>&1
+    git_q --git-dir="$bgd" config --unset core.worktree 2>/dev/null || :
+    local out11
+    out11="$(cd "$btree" && PATH="$jbin:$PATH" GIT_DIR="$bgd" GIT_WORK_TREE="$btree" \
+             git_q merge --no-edit feature 2>&1)"
+    case "$out11" in
+        *"could not establish"*)
+            case "$out11" in
+                *"JKB-RAN:task close-merged"*)
+                    ok "and an unestablished tree still closes merged tasks, which need no tree" ;;
+                *) fail "hookenv: closemerged" "one exit took close-merged with it; the refusal \
+says it skips setup.sh and it skipped both" ;;
+            esac ;;
+        *) fail "hookenv: closemerged-premise" "the fixture no longer reaches the unestablished \
+verdict: $(printf '%s' "$out11" | tr '\n' '|')" ;;
+    esac
+
     # 11. ...and the same verdict must still SKIP. The two cases inside "unestablished" — this
     #     legitimate one and a leak into a directory no repository owns — are indistinguishable
     #     from the repository's own records, so the honest move is to build neither.

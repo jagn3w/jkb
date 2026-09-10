@@ -294,7 +294,18 @@ case "$verdict" in
         # both dotfiles spellings build on the next pull WITH THE ALIAS UNCHANGED.
         echo "jkb: (your alias may keep setting the work tree; the declaration is what jkb" >&2
         echo "jkb:  trusts, and it is the repository's own answer rather than the caller's.)" >&2
-        exit 0 ;;
+        # NOT `exit 0`. The sentence above says "Skipping setup.sh", and that is exactly what
+        # this skips — chore 2, `jkb task close-merged`, is a different question with a
+        # different answer. It needs only the repository the merge was ABOUT, which is not in
+        # doubt here: `$hook_common` named it, and `close-merged` scopes itself to the
+        # repository it is run from. What is unestablished is which TREE this is, and the tree
+        # is what setup.sh would build.
+        #
+        # `elsewhere` still exits, because there the cwd belongs to a DIFFERENT repository and
+        # `close-merged` would scope itself to that one — closing tasks against the wrong repo
+        # key, quietly. Two verdicts, two answers; the one thing they must not share is a
+        # blanket `exit`.
+        skip_setup=1 ;;
 esac
 
 # `post-merge` runs with $1 = 1 when the merge was a squash. ORIG_HEAD is the pre-merge tip
@@ -307,7 +318,9 @@ changed="$(git diff --name-only "$range" 2>/dev/null)"
 # setup.sh installs the binary (crates/), the extension (ui/) and the service (scripts/).
 # A pull touching only openspec/ or docs cannot affect any of them, and a full cargo
 # install is ~1-2 minutes we should not spend on every pull.
-if [ -x "$repo_root/scripts/setup.sh" ] &&
+if [ "${skip_setup:-0}" = 1 ]; then
+    :   # already said why, above — and said it in one sentence rather than two verdicts' worth
+elif [ -x "$repo_root/scripts/setup.sh" ] &&
    printf '%s\n' "$changed" | grep -qE '^(crates/|ui/|scripts/|Cargo\.(toml|lock)$)'; then
     echo "jkb: pulled changes touch crates/ ui/ or scripts/ — running setup.sh"
     "$repo_root/scripts/setup.sh" || echo "jkb: setup.sh failed (continuing; re-run by hand)"

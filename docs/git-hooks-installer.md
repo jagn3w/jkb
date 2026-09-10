@@ -520,6 +520,14 @@ conventions every session is expected to know.
     honours too, since a git predating the extension ignores `config.worktree` itself. The read
     mirrors the running git at every age.
 
+    **One `exit` served two chores, and only one of them was in doubt.** The refusal says
+    "Skipping setup.sh", and for a while it also skipped `jkb task close-merged` — which needs
+    only the repository the merge was ABOUT, and that was never in doubt: `$hook_common` named
+    it. What is unestablished is which *tree* this is, and the tree is what `setup.sh` builds.
+    `elsewhere` still exits on both, because there the cwd belongs to a different repository and
+    `close-merged` would scope itself to *that* one, closing tasks against the wrong repo key.
+    Two verdicts, two answers; what they must not share is a blanket `exit`.
+
     Two things this arm does NOT buy, stated because half of it is missing: `setup.sh` runs, so
     the binary, extension and service refresh, but its **hook** section does not —
     `install_git_hooks` reports `error=not a git repo` in this layout, because `_git` scrubs
