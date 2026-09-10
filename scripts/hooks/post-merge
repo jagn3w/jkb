@@ -12,6 +12,21 @@
 # replaces, so every step is best-effort and reports rather than exits non-zero.
 set -uo pipefail
 
+# `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` outrank everything else, so with one exported —
+# the standard bare-dotfiles shell recipe — this resolved a FOREIGN tree and the hook then
+# reported "no build-affecting changes pulled" after a pull that changed crates/, leaving the
+# binary, the extension and the hooks unrefreshed for ever. Measured on git 2.51.1.
+#
+# Safe to strip in a hook, which an earlier round wrongly claimed it was not: git chdirs to the
+# working tree top before running one (githooks(5)), so discovery from the cwd finds the right
+# repository — including in a linked worktree, where it returns the same answer with the
+# variables set or unset. Measured, in that layout, before this line was written.
+# No `command git` here: `env` execs a BINARY, and `command` is a shell builtin, so that
+# spelling made every call fail and the hook exit at its first one — silently, since the very
+# next line is `|| exit 0`. `env` does not inherit shell functions, so plain `git` resolves to
+# the real one on PATH and cannot recurse. Found by running the hook, not by reading it.
+git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git "$@"; }
+
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ -n "$repo_root" ] || exit 0
 

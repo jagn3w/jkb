@@ -845,6 +845,37 @@ landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle
   the raw string — so the transient refusal cannot reach one and miss the other. Fixing only
   the reader the defect surfaced in would have left the identical hole one call away, which is
   this area's whole history.
+- **The repository's own `core.hooksPath` is read, not the winning one.** `--get` reports
+  whichever scope wins, and `-c core.hooksPath=X` — or `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`,
+  which `git pull` exports into the hook environment — beats everything stored. Measured: jkb
+  installed its chainer at the injected path, wrote an exclude rule for it, and reported
+  `dispatch=chained` while the repository's own path kept none. The first fix REFUSED, and was
+  worse than the bug for the common case: a healthy repo pulled with `-c` printed three warnings
+  and advised storing a value it had already stored, and a repo storing none was advised to set
+  one — which kills `.git/hooks` dispatch outright. `--get-all` plus skipping `command` scope
+  answers both with no warning at all: nothing stored reads as `direct`, a stored value gets its
+  chainer refreshed. A verdict word, a `why`, a render arm and a refusal code all stopped
+  existing.
+- **The hook was exempted on a claim that turned out to be false.** *"A hook must honour the
+  `GIT_DIR` git hands it — in a linked worktree that is the only way to reach the right
+  repository"* is wrong: git chdirs to the working tree top before running a hook (githooks(5)),
+  so discovery from the cwd gives the same answer with the variables set or unset, measured in
+  that layout. Left exempt, `GIT_WORK_TREE` made `scripts/hooks/post-merge` resolve a FOREIGN
+  tree and then report *"no build-affecting changes pulled"* after a pull that changed
+  `crates/` — the binary, the extension and the hooks unrefreshed for ever, under a message
+  provably false on the hook's own computation. **And running it caught a bug in the fix**:
+  `env` execs a binary while `command` is a shell builtin, so `env … command git` failed every
+  call and the hook exited at its first one, silently, because the next token is `|| exit 0`.
+- **A test fixture that mutates the developer's other repository.** `crates/jkb-cli/tests/
+  sessions.rs` scrubbed ambient git CONFIG and not the three variables that select a
+  REPOSITORY, so with `GIT_WORK_TREE` exported `git -C <tmpdir> init` re-inits the other repo,
+  creates nothing in the tmpdir, and the `add`/`commit` that follow land a commit in it. That is
+  `./scripts/check.sh` — the gate `jkb task land` and the merge queue trust — writing to a repo
+  the developer merely happens to have configured.
+- **`\|` in a BRE is a GNU extension.** `isolate_git`'s sweep of `GIT_CONFIG_KEY_<n>` matched
+  nothing under `sed --posix`, i.e. on macOS, which is where this project is developed — so the
+  isolation silently did not happen on one of its two platforms, and no case covered it either
+  way. A `case` glob now, with a harness case that asserts git really sees no injected value.
 - **Three repository-aware spawns, one rule, pinned at each of them.** Asking *who else
   implements this rule* found two production spawns that were not git and resolved a repository
   from the environment anyway: `pr::gh` — `gh` finds the repo through git, so a leaked

@@ -185,6 +185,40 @@ EOF
 }
 
 echo "==> scripts/tests/harness.sh"
-run_cases case1 case2 case2b case2c case2d case3 case4
+# --- isolate_git really isolates -----------------------------------------------------------
+# It had no case at all, and its `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` sweep used `\|` alternation —
+# a GNU BRE extension, so on BSD/macOS sed it matched nothing and unset nothing, silently, on
+# the platform this project is developed on. The variables are live: this project's dev
+# container exports `GIT_CONFIG_COUNT` to carry `safe.directory` grants.
+case_isolate() {
+    local d="$work/iso" lib got
+    lib="$(cd "$(dirname "$0")" && pwd)/harness.sh"
+    mkdir -p "$d"
+    got="$(
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/injected \
+        GIT_CONFIG_PARAMETERS="'core.hooksPath=/injected2'" GIT_COMMON_DIR=/elsewhere \
+        bash -c '. "$1" >/dev/null 2>&1; isolate_git "$2/home" >/dev/null 2>&1
+                 printf "count=[%s] key=[%s] value=[%s] params=[%s] common=[%s]" \
+                        "${GIT_CONFIG_COUNT-}" "${GIT_CONFIG_KEY_0-}" "${GIT_CONFIG_VALUE_0-}" \
+                        "${GIT_CONFIG_PARAMETERS-}" "${GIT_COMMON_DIR-}"' _ "$lib" "$d"
+    )"
+    [ "$got" = "count=[] key=[] value=[] params=[] common=[]" ] \
+        && ok "isolate_git unsets every variable that can outrank the empty configuration" \
+        || fail "isolate: vars" "got: $got"
+
+    # And the effect that matters: git must see no injected core.hooksPath afterwards.
+    got="$(
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/injected \
+        bash -c '. "$1" >/dev/null 2>&1; isolate_git "$2/home2" >/dev/null 2>&1
+                 git init -q "$2/r" 2>/dev/null
+                 git -C "$2/r" config --get core.hooksPath 2>/dev/null || printf "<none>"' \
+             _ "$lib" "$d"
+    )"
+    [ "$got" = "<none>" ] \
+        && ok "and git in an isolated suite sees no injected core.hooksPath" \
+        || fail "isolate: git" "git still reports core.hooksPath=$got"
+}
+
+run_cases case1 case2 case2b case2c case2d case3 case4 case_isolate
 
 finish

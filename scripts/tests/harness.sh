@@ -128,9 +128,15 @@ isolate_git() {
     # KEY_<n>/VALUE_<n> are inert once COUNT is gone, but they are the machine's values and a
     # later export of COUNT by anything under test would make them live again. Swept by
     # pattern so the sweep cannot drift from however many the machine happens to set.
-    local v
-    for v in $(env | sed -n 's/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9][0-9]*\)=.*/\1/p'); do
-        unset "$v"
+    # A `case` glob, not sed: `\|` alternation in a BRE is a GNU extension, so the expression
+    # this replaced matched NOTHING on BSD/macOS sed — silently sweeping nothing on the very
+    # platform this project is developed on. Measured with `sed --posix`.
+    local line v
+    for line in $(env); do
+        v="${line%%=*}"
+        case "$v" in
+            GIT_CONFIG_KEY_*|GIT_CONFIG_VALUE_*) unset "$v" ;;
+        esac
     done
 }
 

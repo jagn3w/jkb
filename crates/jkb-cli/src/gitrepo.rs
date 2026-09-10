@@ -1052,6 +1052,36 @@ mod tests {
         }
     }
 
+    /// Every git spawn in this module is BUILT BY `git_cmd`, checked against the source.
+    ///
+    /// The behavioural test below observes `git_cmd` only, so reverting `git()` or `git_run()`
+    /// to a bare `Command::new("git")` left the whole suite green while the doc claimed every
+    /// spawn is built there — the same shape as `scripts/lib.sh`'s `_git`, which needed the
+    /// same kind of check. Production spawns only: the fixtures below deliberately build their
+    /// own, and scrub by hand.
+    #[test]
+    fn no_production_git_spawn_bypasses_git_cmd() {
+        let src = include_str!("gitrepo.rs");
+        // The TEST MODULE, not the first `#[cfg(test)]` — which is a const near the top of this
+        // file, so slicing there scanned almost nothing and the check passed a mutation that
+        // reverted `git()` to a bare spawn. A guard that cannot fire, in the guard written to
+        // stop a guard that could not fire.
+        let cut = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("this module has a `mod tests`, which marks the end of production code");
+        let stray: Vec<(usize, &str)> = src[..cut]
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("Command::new(\"git\")"))
+            .filter(|(_, l)| !l.contains("let mut cmd = Command::new"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "git is spawned outside `git_cmd`, so that spawn inherits the caller's repository \
+             selection: {stray:?}"
+        );
+    }
+
     /// Every git spawn in this module drops the caller's repository selection.
     ///
     /// Asserted on the built `Command` rather than by exporting the variables, because

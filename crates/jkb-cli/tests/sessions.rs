@@ -115,6 +115,16 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     cmd.arg("-C")
         .arg(dir)
         .args(args)
+        // The three that SELECT A REPOSITORY, which outrank `-C`. Measured: with
+        // `GIT_DIR`/`GIT_WORK_TREE` exported — the bare-dotfiles shell recipe — `git -C
+        // <tmpdir> init` re-inits the OTHER repository and creates nothing here, and the
+        // `add`/`commit` below then land a commit in it. `./scripts/check.sh` is the gate
+        // `jkb task land` and the merge queue trust, so it must not mutate a repository the
+        // developer merely happens to have configured. `gitrepo::scrub_repo_selection` is the
+        // same rule for production; this is a separate crate and cannot reach it.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "t")

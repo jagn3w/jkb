@@ -25,6 +25,10 @@
 # `render_git_hooks_report` is here, and two copies of one line drift.
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
+# This file's own path, so `_override_statuses` can derive a list from the source rather than
+# from a copy of it kept beside the test.
+_JKB_LIB_SELF="${BASH_SOURCE[0]}"
+
 # _git … — git, with the caller's repository selection stripped out.
 #
 # EVERY git call in this file goes through it. `GIT_DIR`, `GIT_WORK_TREE` and
@@ -117,34 +121,55 @@ _real_dir() {
     else printf '%s\n' "$1"; fi
 }
 
-# _hooks_path_read <repo_root> — the ONE read of `core.hooksPath`, with its scope.
+# _hooks_path_read <repo_root> — the ONE read of `core.hooksPath`, and it reads the
+# REPOSITORY'S OWN value.
 #
-# Prints `<scope><TAB><value>` and returns 0; returns 1 when the setting is genuinely absent,
-# and 2 when git will not expand it. Both consumers — `git_hooks_override`, which resolves it
-# to a directory, and `git_hooks_exclude_pattern`, which needs the raw string — go through
-# here, because they need DIFFERENT things from the SAME fact and reading it twice is how they
-# came to disagree about it.
-#
-# They did disagree, measurably: the override refused an environment-injected value while the
+# Prints the value and returns 0; returns 1 when the repository stores none, and 2 when git
+# will not expand it. Both consumers — `git_hooks_override`, which resolves it to a directory,
+# and `git_hooks_exclude_pattern`, which needs the raw string — go through here, because they
+# need DIFFERENT things from the SAME fact and reading it twice is how they came to disagree
+# about it. They did, measurably: the override refused an environment-injected value while the
 # derivation happily used it, so the derivation had the last word and jkb RETRACTED the
-# legitimate exclude block for the repository's own chainer — leaving that file untracked, the
-# tree dirty and `jkb task land` refusing it, unattended from the post-merge hook.
+# legitimate exclude block for the repository's own chainer.
+#
+# **`--get-all`, and `command` scope is skipped.** `--get` reports only the WINNING value, and
+# a `-c core.hooksPath=X` on the command line — or `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`,
+# which `git pull` exports into the hook environment — wins over everything stored. That value
+# is the calling process's, not the repository's, and a chainer belongs where the NEXT pull
+# will look. Reading only the winner meant a healthy repo pulled with `-c core.hooksPath=…`
+# printed three warnings and advised storing a value it had already stored; a repo storing
+# none was told to set one, which would have killed `.git/hooks` dispatch outright. Skipping
+# those entries answers both correctly with no warning at all: nothing stored reads as
+# `dispatch=direct`, and a stored value gets its chainer refreshed as usual.
 #
 # `--show-scope` is git >= 2.26; an older git exits 129 for the unknown option, which is not
-# "cannot expand", so the read is retried without it and the scope is reported `unknown`
-# rather than guessed. `|| rc=$?`, never a bare assignment: exit 1 here is the commonest case
+# "cannot expand", so the read is retried without it — there the injected value is
+# indistinguishable and is used, which is the behaviour before this existed rather than a
+# confident wrong one. `|| rc=$?`, never a bare assignment: exit 1 here is the commonest case
 # and a bare one aborts an `set -e` shell.
 _hooks_path_read() {
-    local rc=0 scoped
-    scoped="$(_git -C "$1" config --show-scope --get --path core.hooksPath 2>/dev/null)" || rc=$?
-    case "$rc" in
-        0) printf '%s' "$scoped"; return 0 ;;
-        1) return 1 ;;
-    esac
+    local rc=0 scoped line found=1 value=""
+    scoped="$(_git -C "$1" config --show-scope --get-all --path core.hooksPath 2>/dev/null)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        # Precedence order, lowest first, `command` last — so the last entry that is not
+        # `command` is the repository's own winning value.
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "${line%%$'\t'*}" in command) continue ;; esac
+            value="${line#*$'\t'}"
+            found=0
+        done <<EOF
+$scoped
+EOF
+        [ "$found" -eq 0 ] || return 1
+        printf '%s' "$value"
+        return 0
+    fi
+    [ "$rc" -eq 1 ] && return 1
     rc=0
     scoped="$(_git -C "$1" config --get --path core.hooksPath 2>/dev/null)" || rc=$?
     case "$rc" in
-        0) printf 'unknown\t%s' "$scoped"; return 0 ;;
+        0) printf '%s' "$scoped"; return 0 ;;
         1) return 1 ;;
         *) return 2 ;;
     esac
@@ -159,8 +184,6 @@ _hooks_path_read() {
 #   3  it is set to the empty string (git resolves it to `/post-merge` and finds nothing)
 #   4  it is relative and this repository has no working tree, so git anchors it on the
 #      INVOKING PROCESS'S current directory and there is no one place at all
-#   5  it came from the ENVIRONMENT (`GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`) or `-c`, so
-#      it belongs to the calling process and not to the repository
 #
 # One code for all three sent the operator a check that prints a perfectly normal value for
 # code 4, which is the same failure `--show-origin` was introduced to fix for code 3.
@@ -196,20 +219,13 @@ git_hooks_override() {
     # case, `core.hooksPath` not set at all. This file's header promises every function
     # behaves the same with `set -e` on or off; that promise was being kept only by how the
     # one caller happens to spell the call. Same shape as the ERR-trap lesson in D50.
-    local rc=0 scoped
-    scoped="$(_hooks_path_read "$repo_root")" || rc=$?
+    local rc=0
+    configured="$(_hooks_path_read "$repo_root")" || rc=$?
     case "$rc" in
         0) ;;
-        1) return 0 ;;      # genuinely not set
+        1) return 0 ;;      # the repository stores none
         *) return 2 ;;      # set, and git will not expand it
     esac
-    # A value from `command` scope is the CALLING PROCESS'S, not the repository's. A chainer
-    # installed there is installed where the next `git pull` will not look, so this refuses
-    # rather than reporting a good verdict for a hook nothing will run. Reachable unattended:
-    # `git -c core.hooksPath=X pull` exports the setting into the hook environment, and the
-    # hook runs setup.sh.
-    [ "${scoped%%$'\t'*}" = command ] && return 5
-    configured="${scoped#*$'\t'}"
     # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
     # printing nothing, `rev-parse --git-path hooks/post-merge` answers `/post-merge`, and
     # `git hook run post-merge` says "cannot find a hook named post-merge" — the repo hook is
@@ -496,19 +512,13 @@ EOF
         printf 'undecided (the repository'"'"'s worktrees could not be listed)\n'
         return 0
     fi
+    # The SAME read `git_hooks_override` makes, because it is the same fact — including its
+    # skip of `command` scope. Reading it separately is what let this function derive a pattern
+    # from an environment-injected path while the override refused it; an empty answer here
+    # becomes `want=no` at the caller, so the derivation swept away the block for the
+    # repository's own chainer.
     rc=0
-    scoped="$(_hooks_path_read "$repo_root")" || rc=$?
-    # The SAME refusal `git_hooks_override` makes, because it is the same fact. Reading the
-    # value separately is what let this function derive a pattern from an environment-injected
-    # path while the override was refusing it — and an empty answer here is turned into
-    # `want=no` by the caller, so the derivation swept away the block for the repository's own
-    # chainer. `undecided`, therefore: nothing about the repository's real hooks path was
-    # established, so nothing is retracted on the strength of it.
-    if [ "$rc" -eq 0 ] && [ "${scoped%%$'\t'*}" = command ]; then
-        printf 'undecided (core.hooksPath came from the environment, not from this repository)\n'
-        return 0
-    fi
-    configured="${scoped#*$'\t'}"
+    configured="$(_hooks_path_read "$repo_root")" || rc=$?
     case "$rc" in
         0) ;;
         1) printf 'none (no core.hooksPath, so nothing of ours is inside the tree)\n'; return 0 ;;
@@ -717,8 +727,9 @@ _exclude_write() {
 #
 # Always returns 0 — `failed` is a word, not an exit status (see the header's `set -e` rule).
 reconcile_exclude() {
-    local repo_root="$1" before after path brc=0 arc=0
-    path="$(_exclude_path "$1")"
+    local repo_root="$1" before after path brc=0 arc=0 prc=0
+    path="$(_exclude_path "$1")" || prc=$?
+    [ "$prc" -eq 0 ] || brc=1     # could not even locate the file: nothing is established
     before="$(_exclude_fingerprint "$path")" || brc=$?
     # Contractually rc 0, so this wrapper behaves identically with `set -e` on or off.
     _reconcile_exclude_decide "$@"
@@ -749,12 +760,33 @@ reconcile_exclude() {
 # whose remedy is about working trees and would be false of whatever the new code means. That
 # is this project's house rule in miniature: an unestablished answer is never spelled as a
 # definite one. The number is carried so a new code is diagnosable rather than anonymous.
+# _override_statuses — the refusal codes `_override_verdict` maps, derived from its own `case`.
+#
+# Derived so a test cannot enumerate a stale list: the hand-written one omitted the status added
+# by the very commit that added it.
+_override_statuses() {
+    _override_verdict --list
+}
+
 _override_verdict() {
+    if [ "$1" = --list ]; then
+        # Every numeric arm of THIS function's own case, in order. Scoped to the function by
+        # awk rather than grepped file-wide: a file-wide pattern also matched the `0)`/`1)`
+        # arms of unrelated `case "$rc"` blocks and `_override_why`'s duplicate arms, and the
+        # test consuming it passed anyway — a derived list that derives the wrong thing is no
+        # better than the stale hand-written one it replaced.
+        awk '/^_override_verdict\(\) \{/ { inside = 1; next }
+             inside && /^\}/            { exit }
+             inside && /^        [0-9]+\) printf/ {
+                 sub(/^ +/, ""); sub(/\).*/, ""); print
+             }' "$_JKB_LIB_SELF"
+        return 0
+    fi
+
     case "$1" in
         2) printf 'unreadable core.hooksPath cannot be expanded on this machine' ;;
         3) printf 'unreadable core.hooksPath is set to the empty string' ;;
         4) printf 'unanchored core.hooksPath' ;;
-        5) printf 'transient core.hooksPath' ;;
         *) printf 'unreadable core.hooksPath could not be resolved (unrecognised status %s)' "$1" ;;
     esac
 }
@@ -764,7 +796,6 @@ _override_why() {
         2) printf 'core.hooksPath cannot be expanded' ;;
         3) printf 'core.hooksPath is empty' ;;
         4) printf 'core.hooksPath is relative and this repository has no working tree' ;;
-        5) printf 'core.hooksPath came from the environment, not from this repository' ;;
         *) printf 'core.hooksPath could not be resolved' ;;
     esac
 }
@@ -775,9 +806,17 @@ _override_why() {
 # wrapper fingerprinting a different file from the one the body writes is a lie that reads
 # exactly like the truth.
 _exclude_path() {
-    local common
-    common="$(_git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || common=""
-    [ -n "$common" ] || return 0
+    local common rc=0
+    common="$(_git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$common" ]; then
+        # 128 is git's own "not a git repository" — an ESTABLISHED answer, and the one the
+        # caller turns into `exclude=none`. Anything else (127: no git on PATH; a signal; a
+        # broken object store) means we could not ask, which is a different fact: spelled the
+        # same, a transient failure made both fingerprints `no-repo`, they compared equal, and
+        # the run reported `exclude-file=unchanged` over whatever it had just done.
+        [ "$rc" -eq 128 ] && return 0
+        return 1
+    fi
     case "$common" in /*) ;; *) common="$1/$common" ;; esac
     printf '%s/info/exclude' "$common"
 }
@@ -797,7 +836,11 @@ _exclude_path() {
 _exclude_fingerprint() {
     [ -n "$1" ] || { printf 'no-repo'; return 0; }
     [ -e "$1" ] || { printf 'absent'; return 0; }
-    cksum <"$1" 2>/dev/null || return 1
+    # GROUPED. `cksum <"$1" 2>/dev/null` redirects cksum's stderr, but a failure to OPEN the
+    # file is reported by the shell before cksum runs, so an unreadable exclude file leaked two
+    # raw `bash: …: Permission denied` lines per run into setup.sh's output. The group's
+    # redirection covers the open as well.
+    { cksum <"$1"; } 2>/dev/null || return 1
 }
 
 # The decision half — everything the wrapper above measures. Its report words are unchanged.
@@ -811,7 +854,12 @@ _reconcile_exclude_decide() {
     # it would drift, and a wrapper measuring a different file from the one this body writes is
     # a lie that reads exactly like the truth — it would report `unchanged` over a real write,
     # which is the whole class `exclude-file=` was added to end.
-    exclude="$(_exclude_path "$repo_root")"
+    local prc=0
+    exclude="$(_exclude_path "$repo_root")" || prc=$?
+    if [ "$prc" -ne 0 ]; then
+        printf 'exclude=failed (could not locate .git/info/exclude)\n'
+        return 0
+    fi
     if [ -z "$exclude" ]; then
         printf 'exclude=none (not a git repository)\n'
         return 0
@@ -964,7 +1012,11 @@ _reconcile_exclude_decide() {
 #                             PROVEN absence, `exposed` means ours IS in a working tree and jkb
 #                             is declining to hide it, and `undecided` means jkb could not
 #                             establish anything and therefore changed nothing.
-#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored | transient
+#   exclude-file=<state>      changed | unchanged | unknown — whether `.git/info/exclude`
+#                             differs from before this run. The ONLY line that describes the
+#                             file; every other line describes one step or one pattern. Emitted
+#                             once per run by `reconcile_exclude`, below every arm.
+#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while
@@ -1199,9 +1251,14 @@ render_git_hooks_report() {
                     # No wording could have been right. This report word has two producers
                     # with opposite file semantics (`want=unknown` touches nothing;
                     # `want=undecided` sweeps first), so the fact belongs to `exclude-file=`,
-                    # which is measured. The remedy still reaches the reader: producer one
-                    # always emits `chainer=failed` beside this, producer two always emits
-                    # `dispatch=unreadable|unanchored`, and both of those carry one.
+                    # which is measured.
+                    #
+                    # A remedy usually rides on a sibling key — `chainer=failed` for one
+                    # producer, `dispatch=unreadable|unanchored` for another. NOT ALWAYS: a
+                    # derivation that could not list the worktrees emits this beside a
+                    # perfectly healthy `dispatch=chained`, which renders nothing, so this line
+                    # is on its own. It is why the reason is carried in `$detail` rather than
+                    # left to a neighbour: the sentence has to stand alone.
                     undecided)  warn "could not work out what to hide from git: $detail" ;;
                     exposed)    warn "the chainer there is not hidden from git: $detail"
                                 warn "  that working tree will read dirty, and \`jkb task land\` refuses a dirty target." ;;
@@ -1255,13 +1312,6 @@ render_git_hooks_report() {
                     # this cause prints a perfectly normal `.githooks` and appears to refute
                     # the warning — the same failure `--show-origin` was introduced to fix one
                     # cause over.
-                    # Its own arm and its own repair. The value is real and git will use it
-                    # for THIS process, so "cannot be expanded" would be false; what is wrong
-                    # is that it does not belong to the repository, and a chainer installed
-                    # there is one no later pull consults.
-                    transient)
-                             warn "core.hooksPath is set by the environment (GIT_CONFIG_COUNT/GIT_CONFIG_PARAMETERS) or \`-c\`, not by this repository — a chainer installed there is not where later pulls will look."
-                             warn "  re-run setup.sh without that setting in the environment, or store it with: git config core.hooksPath <path>" ;;
                     unanchored)
                              warn "core.hooksPath is relative and this repository has no working tree, so git resolves it against whatever directory the pulling process is in — there is no one place to install a chainer."
                              warn "  run setup.sh from a working tree of this repository, or set an absolute core.hooksPath." ;;

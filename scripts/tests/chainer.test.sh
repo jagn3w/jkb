@@ -1217,6 +1217,7 @@ case13() {
         'chainer=sideways /x|unrecognised chainer outcome'
         'exclude=sideways /x|unrecognised exclude state'
         'dispatch=sideways /x|unrecognised dispatch verdict'
+        'exclude-file=sideways|unrecognised exclude-file state'
     )
     for entry in "${table[@]}"; do
         line="${entry%%|*}"; want="${entry#*|}"
@@ -1260,6 +1261,7 @@ case14() {
         'dispatch=dead /c|will NOT run the repo hook above'
         'dispatch=unreadable core.hooksPath is empty|is empty, so git will not reliably run'
         'dispatch=unanchored core.hooksPath|whatever directory the pulling process is in'
+        'exclude-file=unknown|could not tell whether .git/info/exclude changed'
         'error=not a git repo|not a git repo; skipping hook install'
     )
     local entry ok_all=1 missing=""

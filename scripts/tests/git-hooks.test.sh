@@ -167,11 +167,12 @@ case6() {
     fi
 
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" yes)"
-    if [ "$got" = "exclude=added /.githooks/post-merge
-exclude-file=changed" ]; then
+    local want="exclude=added /.githooks/post-merge
+exclude-file=changed"
+    if [ "$got" = "$want" ]; then
         ok "a chainer inside the working tree: excluded locally"
     else
-        fail "exclude: pattern" "expected 'exclude=added /.githooks/post-merge', got '$got'"
+        fail "exclude: pattern" "expected '$(printf '%s' "$want" | tr '\n' '|')', got '$(printf '%s' "$got" | tr '\n' '|')'"
     fi
     if [ -z "$(git_q -C "$r" status --porcelain)" ]; then
         ok "the working tree is clean again, so a session can land"
@@ -185,7 +186,7 @@ exclude-file=unchanged" ] \
         && [ "$(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude")" = "1" ]; then
         ok "running it again adds nothing"
     else
-        fail "exclude: idempotence" "second run printed '$got' and the pattern appears $(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude") time(s)"
+        fail "exclude: idempotence" "second run printed '$(printf '%s' "$got" | tr '\n' '|')' and the pattern appears $(grep -c '^/\.githooks/post-merge$' "$r/.git/info/exclude") time(s)"
     fi
 
     # And the reverse decision retracts it, leaving the user's own rules alone. Adding the
@@ -197,7 +198,7 @@ exclude-file=changed" ] \
         && ! grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and asking for it to be gone retracts it"
     else
-        fail "exclude: retract" "printed '$got'; file still: $(tr '\n' '|' <"$r/.git/info/exclude")"
+        fail "exclude: retract" "printed '$(printf '%s' "$got" | tr '\n' '|')'; file still: $(tr '\n' '|' <"$r/.git/info/exclude")"
     fi
     if [ -n "$(git_q -C "$r" status --porcelain)" ]; then
         ok "so the file it was hiding is visible to git again"
@@ -234,11 +235,12 @@ case6c() {
     printf '# things I do not want to see\n/.githooks/post-merge\n' >>"$r/.git/info/exclude"
 
     got="$(reconcile_exclude "$r" "/.githooks/post-merge" no)"
-    if [ "$got" = "exclude=unowned /.githooks/post-merge
-exclude-file=unchanged" ]; then
+    local want="exclude=unowned /.githooks/post-merge
+exclude-file=unchanged"
+    if [ "$got" = "$want" ]; then
         ok "an unmarked exclude rule is reported as unowned"
     else
-        fail "unowned: state" "expected 'exclude=unowned /.githooks/post-merge', got '$got'"
+        fail "unowned: state" "expected '$(printf '%s' "$want" | tr '\n' '|')', got '$(printf '%s' "$got" | tr '\n' '|')'"
     fi
     if grep -qxF '/.githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and is left exactly where the user put it"
@@ -544,7 +546,7 @@ exclude-file=unchanged" ] \
         && [ "$(grep -c 'githooks/post-merge' "$r/.git/info/exclude")" = "1" ]; then
         ok "a CRLF exclude file: our own block is recognised, not appended a second time"
     else
-        fail "crlf: duplicate" "said '$got'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+        fail "crlf: duplicate" "said '$(printf '%s' "$got" | tr '\n' '|')'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
     fi
     if [ "$(head -1 "$r/.git/info/exclude" | od -c | grep -c '\\r')" = "1" ]; then
         ok "and the user's own line endings are left alone"
@@ -557,7 +559,7 @@ exclude-file=changed" ] \
         && ! grep -q 'githooks/post-merge' "$r/.git/info/exclude"; then
         ok "and a CRLF block is retracted, marker and all"
     else
-        fail "crlf: retract" "said '$got'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
+        fail "crlf: retract" "said '$(printf '%s' "$got" | tr '\n' '|')'; file: $(tr '\n' '|' <"$r/.git/info/exclude")"
     fi
     [ "$(grep -c '^\*\.log' "$r/.git/info/exclude")" = "1" ] \
         && ok "and the user's rules survive the rewrite" \
@@ -826,7 +828,7 @@ case6f() {
     [ "$got" = "exclude=added /.githooks/post-merge
 exclude-file=changed" ] \
         && ok "and it is excluded" \
-        || fail "glob: state" "got '$got'"
+        || fail "glob: state" "got '$(printf '%s' "$got" | tr '\n' '|')'"
     [ -z "$(git_q -C "$r" status --porcelain)" ] \
         && ok "and the tree is clean" \
         || fail "glob: dirty" "$(git_q -C "$r" status --porcelain | tr '\n' ' ')"
@@ -1152,15 +1154,31 @@ case10e() {
 # is no fifth code today), so a mutation collapsing them stayed green and no test could tell an
 # honest catch-all from one that hands a future code a confident, wrong remedy.
 case10f() {
-    local v w
-    for rc in 2 3 4; do
+    local v w rc bad=""
+    # ASKS THE RENDERER. The first version matched the verdict WORD against a prefix pattern
+    # (`unreadable*|unanchored*`), which is not the property it claims: `unreadableX` matches it
+    # and has no render arm, and that mutation left this suite green. The renderer's own default
+    # is the oracle for "is there an arm".
+    #
+    # The status list is derived from the function rather than written out beside it: two
+    # hand-written lists that must agree is how the previous version came to omit a status
+    # inside the very commit that added one.
+    local n=0
+    for rc in $(_override_statuses); do
+        n=$((n + 1))
         v="$(_override_verdict "$rc")"
-        case "$v" in
-            unreadable*|unanchored*) ;;
-            *) fail "verdict: $rc" "unexpected verdict '$v'" ; return ;;
+        case "$(printf 'dispatch=%s\n' "$v" | render_git_hooks_report 2>&1)" in
+            *"unrecognised dispatch verdict"*) bad="$bad $rc" ;;
         esac
     done
-    ok "each known refusal status maps to a verdict the renderer has an arm for"
+    # A derived list that derives NOTHING passes a loop over it vacuously — the same lesson as
+    # `check_shell_syntax`, where finding no files had to become a failure rather than idle.
+    [ "$n" -ge 3 ] \
+        && ok "the refusal statuses are derived from the function, and there are $n of them" \
+        || fail "verdict: derived" "derived $n statuses; the derivation is broken, not the code"
+    [ -z "$bad" ] \
+        && ok "every refusal status maps to a verdict the renderer really has an arm for" \
+        || fail "verdict: arms" "no render arm for status(es):$bad"
 
     v="$(_override_verdict 9)"
     w="$(_override_why 9)"
@@ -1183,95 +1201,102 @@ case10f() {
     esac
 }
 
-# --- 10g. an environment-injected core.hooksPath is refused, not installed into -------------
+# --- 10g. an environment-injected core.hooksPath is IGNORED, and the stored one serviced ----
 # `_git` strips the three variables that select a REPOSITORY but deliberately not the two that
 # inject CONFIGURATION: `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` carry the `safe.directory`
 # grants this project's dev container needs, and stripping those makes git refuse the checkout.
-# So the transient case is detected instead, by asking git which scope the value came from.
 #
-# Measured without the refusal: jkb installs the chainer at the INJECTED path, adds an exclude
-# rule for it, and reports `dispatch=chained` — the good verdict — while the repository's own
-# core.hooksPath has no chainer, so no later pull runs one. Reachable unattended, because
-# `git -c core.hooksPath=X pull` exports the setting into the hook environment and the hook
-# runs setup.sh.
+# So the read skips `command` scope instead. `--get` reports only the WINNING value, and a
+# `git -c core.hooksPath=X pull` — which exports the setting into the hook environment, and the
+# hook runs setup.sh — wins over everything stored. Measured before this: jkb installed its
+# chainer at the injected path, added an exclude rule for it, and reported `dispatch=chained`,
+# while the repository's own hooksPath kept none, so no later pull ran one.
+#
+# Refusing was the first fix and was worse than this one: a healthy repo pulled with `-c`
+# printed three warnings and advised storing a value it had already stored, and a repo storing
+# none was advised to set one — which would have killed `.git/hooks` dispatch outright.
 case10g() {
     local d="$work/injected" out
     mkdir -p "$d"
     git_q init -q "$d/r" >/dev/null 2>&1
     git_q -C "$d/r" commit -q --allow-empty -m init
-    git_q -C "$d/r" config core.hooksPath "$d/r/persistent"
+    git_q -C "$d/r" config core.hooksPath .stored
     printf '#!/bin/sh\necho hi\n' >"$d/src"
 
     out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$d/r/injected" \
            install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
 
     case "$out" in
-        *"dispatch=transient"*) ok "an environment-injected core.hooksPath is reported transient" ;;
-        *"dispatch=chained"*)   fail "injected: verdict" "reported the GOOD verdict for a transient path" ;;
-        *) fail "injected: verdict" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        *"chainer=installed $d/r/.stored/post-merge"*)
+            ok "an injected core.hooksPath is ignored and the STORED path is serviced" ;;
+        *) fail "injected: stored" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
     [ -e "$d/r/injected" ] \
         && fail "injected: wrote" "a chainer was installed at the injected path" \
         || ok "and nothing is installed at the path the environment named"
-    # The exclude file must not gain a rule for a path jkb declined to own.
     case "$out" in
-        *"exclude=added"*) fail "injected: exclude" "an exclude rule was written for the injected path" ;;
-        *) ok "and no exclude rule is written for it" ;;
+        *"exclude=added /.stored/post-merge"*) ok "and the exclude rule names the stored path" ;;
+        *"/injected/"*) fail "injected: exclude" "an exclude rule was written for the injected path" ;;
+        *) fail "injected: exclude" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
-    # The rendering, not just the wire report: without its own arm the verdict falls into the
-    # renderer's "unrecognised dispatch verdict" default, so the operator is told the report is
-    # broken rather than what is wrong with their configuration.
-    case "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1)" in
-        *"unrecognised dispatch verdict"*)
-            fail "injected: arm" "transient has no render arm" ;;
-        *"set by the environment"*"re-run setup.sh without that setting"*)
-            ok "and the rendering names the cause and a repair the operator can take" ;;
-        *) fail "injected: render" "$(printf '%s\n' "$out" | render_git_hooks_report 2>&1 | tr '\n' '|')" ;;
+
+    # A repo that stores NOTHING must stay silent under an injection: it is healthy, git reads
+    # `.git/hooks` itself, and there is nothing to report. This is the case the first fix got
+    # loudly wrong — three warnings and a remedy that, followed, kills `.git/hooks` dispatch.
+    local d2="$work/injected-none" out2 rendered
+    mkdir -p "$d2"
+    git_q init -q "$d2/r" >/dev/null 2>&1
+    git_q -C "$d2/r" commit -q --allow-empty -m init
+    printf '#!/bin/sh\necho hi\n' >"$d2/src"
+    out2="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$d2/r/injected" \
+            install_git_hooks "$d2/r" "$d2/src" 2>/dev/null)"
+    case "$out2" in
+        *"dispatch=direct"*) ok "a repo storing no core.hooksPath reads as direct under an injection" ;;
+        *) fail "injected: direct" "got: $(printf '%s' "$out2" | tr '\n' '|')" ;;
     esac
-    # And the same via GIT_CONFIG_PARAMETERS, which is the form `git -c` exports into a hook.
-    out="$(GIT_CONFIG_PARAMETERS="'core.hooksPath=$d/r/injected2'" \
-           install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
-    case "$out" in
-        *"dispatch=transient"*) ok "and the GIT_CONFIG_PARAMETERS form is caught too" ;;
-        *) fail "injected: params" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    rendered="$(printf '%s\n' "$out2" | render_git_hooks_report 2>&1)"
+    case "$rendered" in
+        *warning*) fail "injected: quiet" "warned about a healthy repo: $(printf '%s' "$rendered" | tr '\n' '|')" ;;
+        *) ok "and nothing is warned about, because nothing is wrong" ;;
     esac
+    [ -e "$d2/r/injected" ] \
+        && fail "injected: wrote2" "installed into the injected path with nothing stored" \
+        || ok "and again nothing is written where the environment pointed"
+
     # AND IT MUST NOT RETRACT THE REAL BLOCK. Measured before this was fixed: the override
     # refused the injected value while `git_hooks_exclude_pattern` read it separately and
     # happily derived from it — answering `none`, which the funnel turns into `want=no`, which
     # sweeps. So one environment variable retracted the exclude block for the repository's OWN
     # chainer, leaving that file untracked, the tree dirty and `jkb task land` refusing it,
     # unattended from the post-merge hook. Two readers of one fact, disagreeing.
-    local d2="$work/injected-keeps" out2
-    mkdir -p "$d2"
-    git_q init -q "$d2/r" >/dev/null 2>&1
-    git_q -C "$d2/r" commit -q --allow-empty -m init
-    git_q -C "$d2/r" config core.hooksPath .githooks   # relative, inside the tree: legitimately hidden
-    printf '#!/bin/sh
-echo hi
-' >"$d2/src"
-    install_git_hooks "$d2/r" "$d2/src" >/dev/null 2>&1
-    if grep -q '^/\.githooks/post-merge$' "$d2/r/.git/info/exclude" 2>/dev/null; then
+    local d3="$work/injected-keeps" out3
+    mkdir -p "$d3"
+    git_q init -q "$d3/r" >/dev/null 2>&1
+    git_q -C "$d3/r" commit -q --allow-empty -m init
+    git_q -C "$d3/r" config core.hooksPath .githooks
+    printf '#!/bin/sh\necho hi\n' >"$d3/src"
+    install_git_hooks "$d3/r" "$d3/src" >/dev/null 2>&1
+    if grep -q '^/\.githooks/post-merge$' "$d3/r/.git/info/exclude" 2>/dev/null; then
         ok "a normal run establishes the exclude block for the repository's own chainer"
     else
-        fail "injected: premise2" "the fixture never got an exclude block, so the next assertion proves nothing"
+        fail "injected: premise" "the fixture never got an exclude block, so the next assertion proves nothing"
         return
     fi
-    out2="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/elsewhere/hooks \
-            install_git_hooks "$d2/r" "$d2/src" 2>/dev/null)"
-    grep -q '^/\.githooks/post-merge$' "$d2/r/.git/info/exclude" 2>/dev/null \
+    out3="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/elsewhere/hooks \
+            install_git_hooks "$d3/r" "$d3/src" 2>/dev/null)"
+    grep -q '^/\.githooks/post-merge$' "$d3/r/.git/info/exclude" 2>/dev/null \
         && ok "and an injected core.hooksPath does not retract it" \
         || fail "injected: retracted" "one environment variable swept the repository's own exclude block"
-    case "$out2" in
+    case "$out3" in
         *"exclude-file=unchanged"*) ok "and the run truthfully reports the file was not touched" ;;
-        *) fail "injected: filefact" "got: $(printf '%s' "$out2" | tr '\n' '|')" ;;
+        *) fail "injected: filefact" "got: $(printf '%s' "$out3" | tr '\n' '|')" ;;
     esac
-
-    # The premise: with no injection the same repo resolves normally, so the assertions above
-    # are about the injection and not about something broken in the fixture.
-    out="$(install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
-    case "$out" in
-        *"dispatch=chained"*) ok "while the repository's own core.hooksPath still resolves normally" ;;
-        *) fail "injected: premise" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    # The GIT_CONFIG_PARAMETERS form is what `git -c` actually exports into a hook.
+    out3="$(GIT_CONFIG_PARAMETERS="'core.hooksPath=/elsewhere/hooks'" \
+            install_git_hooks "$d3/r" "$d3/src" 2>/dev/null)"
+    case "$out3" in
+        *"$d3/r/.githooks/post-merge"*) ok "and the GIT_CONFIG_PARAMETERS form is ignored too" ;;
+        *) fail "injected: params" "got: $(printf '%s' "$out3" | tr '\n' '|')" ;;
     esac
 }
 
@@ -1284,7 +1309,7 @@ echo hi
 # A shim on PATH rather than an old git, and it asserts the shim really refuses first: a shim
 # that quietly worked would make this case pass having tested the ordinary path twice.
 case10h() {
-    local d="$work/oldgit" out
+    local d="$work/oldgit" out rc
     mkdir -p "$d/bin"
     printf '%s\n' '#!/bin/sh' \
         'for a in "$@"; do [ "$a" = "--show-scope" ] && { echo "error: unknown option" >&2; exit 129; }; done' \
@@ -1296,11 +1321,18 @@ case10h() {
     git_q -C "$d/r" config core.hooksPath .githooks
     printf '#!/bin/sh\necho hi\n' >"$d/src"
 
-    if PATH="$d/bin:$PATH" git config --show-scope --get user.name >/dev/null 2>&1; then
-        fail "oldgit: premise" "the shim accepted --show-scope, so the fallback was never taken"
+    # The premise must observe the SHIM, not an unset key: the first version asked
+    # `--show-scope --get user.name`, which exits 1 under `isolate_git` because the key is
+    # absent — so deleting the shim's refusal left this passing, and the case then exercised the
+    # modern path twice, which its own comment says it exists to prevent. 129 is what git gives
+    # for an unknown option, and it is distinguishable from every other outcome here.
+    PATH="$d/bin:$PATH" git config --show-scope --get-all core.hooksPath >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -ne 129 ]; then
+        fail "oldgit: premise" "the shim did not refuse --show-scope (exit $rc), so the fallback was never taken"
         return
     fi
-    ok "the shim refuses --show-scope, as a git older than 2.26 does"
+    ok "the shim refuses --show-scope with git's own exit 129, as a git older than 2.26 does"
 
     out="$(PATH="$d/bin:$PATH" install_git_hooks "$d/r" "$d/src" 2>/dev/null)"
     case "$out" in
@@ -1365,7 +1397,96 @@ case10i() {
     esac
 }
 
+# --- 10j. a git that cannot be asked is `unknown`, never `unchanged` ------------------------
+# `_exclude_path` used to spell "not a git repository" and "could not ask git" the same way —
+# both an empty answer — so a transient failure made both fingerprints `no-repo`, they compared
+# equal, and the run reported `exclude-file=unchanged`. 128 is git's own "not a repository",
+# which IS an established answer; anything else is not.
+case10j() {
+    local d="$work/nogit" out
+    mkdir -p "$d/bin"
+    printf '#!/bin/sh\nexit 127\n' >"$d/bin/git"
+    chmod 755 "$d/bin/git"
+    git_q init -q "$d/r" >/dev/null 2>&1
+    printf '#!/bin/sh\necho hi\n' >"$d/src"
+
+    if PATH="$d/bin:$PATH" git rev-parse --git-common-dir >/dev/null 2>&1; then
+        fail "nogit: premise" "the shim did not break git, so nothing was tested"
+        return
+    fi
+    ok "the shim makes git unaskable, without saying 'not a repository'"
+
+    out="$(PATH="$d/bin:$PATH" reconcile_exclude "$d/r" "/p" yes 2>/dev/null)"
+    case "$out" in
+        *"exclude-file=unknown"*)   ok "and the run reports unknown rather than a definite answer" ;;
+        *"exclude-file=unchanged"*) fail "nogit: false" "claimed unchanged after failing to locate the file" ;;
+        *) fail "nogit: state" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    # The other side: genuinely not a git repository stays an established `none`/`unchanged`.
+    out="$(reconcile_exclude "$d" "/p" yes 2>/dev/null)"
+    case "$out" in
+        *"exclude=none (not a git repository)"*"exclude-file=unchanged"*)
+            ok "while a directory that really is no repository stays a definite answer" ;;
+        *) fail "nogit: norepo" "got: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
+# --- 10k. the protocol header names every key the producer emits ---------------------------
+# Three findings in this area were a header that had gone stale. Derived from the source, so
+# adding a key forces the decision at the moment it is added.
+case10k() {
+    local lib key missing="" n=0
+    lib="$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
+    for key in $(grep -oE "printf '[a-z-]+=" "$lib" | sed "s/printf '//; s/=$//" | sort -u); do
+        n=$((n + 1))
+        grep -q "^#   $key=" "$lib" || missing="$missing $key"
+    done
+    [ "$n" -ge 4 ] \
+        && ok "the producer's keys are derived from the source, and there are $n of them" \
+        || fail "header: derived" "found $n keys; the derivation is broken"
+    [ -z "$missing" ] \
+        && ok "and the protocol header documents every one of them" \
+        || fail "header: stale" "keys the header never mentions:$missing"
+}
+
+# --- 10l. the post-merge hook resolves ITS repository, not the environment's ---------------
+# The hook was exempted from the env scrub on the argument that a hook must honour the `GIT_DIR`
+# git hands it. Measured: false. Git chdirs to the working tree top before running a hook
+# (githooks(5)), so discovery from the cwd finds the right repository — the same answer with the
+# variables set or unset, including in a linked worktree. With `GIT_WORK_TREE` exported the hook
+# resolved a FOREIGN tree and then reported "no build-affecting changes pulled" after a pull that
+# changed crates/, leaving the binary, the extension and the hooks unrefreshed for ever.
+#
+# Nothing covered this file at all. It also caught a bug in the fix: `env` execs a binary and
+# `command` is a shell builtin, so `env … command git` failed every call and the hook exited at
+# its first one, silently, because the next token is `|| exit 0`.
+case10l() {
+    local d="$work/hookenv" hook mine theirs got
+    hook="$(cd "$(dirname "$0")/../.." && pwd)/scripts/hooks/post-merge"
+    mkdir -p "$d"
+    mine="$d/mine"; theirs="$d/theirs"
+    git_q init -q "$mine" >/dev/null 2>&1
+    git_q -C "$mine" commit -q --allow-empty -m init
+    git_q init -q "$theirs" >/dev/null 2>&1
+    git_q -C "$theirs" commit -q --allow-empty -m init
+
+    [ -x "$hook" ] || { fail "hookenv: missing" "no hook at $hook"; return; }
+
+    # The hook's own resolution, run the way git runs it: cwd at the working tree top.
+    got="$(cd "$mine" && GIT_WORK_TREE="$theirs" GIT_DIR="$theirs/.git" \
+           bash -c 'eval "$(sed -n "/^git() {/p" "$1")"; git rev-parse --show-toplevel' _ "$hook")"
+    [ "$got" = "$(cd "$mine" && pwd -P)" ] \
+        && ok "the hook resolves its own repository with GIT_WORK_TREE exported elsewhere" \
+        || fail "hookenv: root" "resolved '$got', not $mine"
+
+    # And the wrapper must actually run git, not die on a builtin `env` cannot exec.
+    got="$(cd "$mine" && bash -c 'eval "$(sed -n "/^git() {/p" "$1")"; git rev-parse --show-toplevel' _ "$hook" 2>&1)"
+    [ "$got" = "$(cd "$mine" && pwd -P)" ] \
+        && ok "and the wrapper resolves to the real git rather than failing every call" \
+        || fail "hookenv: wrapper" "got '$got'"
+}
+
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i
+run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l
 
 finish

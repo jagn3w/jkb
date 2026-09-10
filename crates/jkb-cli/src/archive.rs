@@ -1953,6 +1953,12 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(args)
+            // The three that SELECT A REPOSITORY, which outrank `-C`: with `GIT_DIR`/
+            // `GIT_WORK_TREE` exported this fixture would init, add and commit into the
+            // developer's unrelated repository. See `gitrepo::scrub_repo_selection`.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
             // The developer's global config signs commits and sets core.hooksPath; either would
             // fail this fixture for reasons that have nothing to do with archiving.
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
