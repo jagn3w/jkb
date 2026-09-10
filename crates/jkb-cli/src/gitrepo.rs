@@ -61,6 +61,72 @@ pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
 #[cfg(test)]
 pub(crate) const REPO_SELECTION_VARS: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
 
+/// The configuration a TEST FIXTURE must not inherit — `(var, Some(value))` to set it,
+/// `(var, None)` to remove it. One list, applied by [`isolate_fixture_config`] and checked by
+/// [`assert_isolated`], so the two cannot drift.
+///
+/// Deliberately WIDER than [`scrub_repo_selection`], which production uses: production keeps
+/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` because this project's dev container carries its
+/// `safe.directory` grants there, while a fixture must not inherit configuration it did not
+/// choose. Two rules, not drift. The env-injected form OUTRANKS the files pointed at
+/// `/dev/null`, so those alone are not isolation.
+#[cfg(test)]
+pub(crate) const FIXTURE_CONFIG: &[(&str, Option<&str>)] = &[
+    ("GIT_CONFIG_COUNT", None),
+    ("GIT_CONFIG_PARAMETERS", None),
+    ("GIT_CONFIG_GLOBAL", Some("/dev/null")),
+    ("GIT_CONFIG_SYSTEM", Some("/dev/null")),
+    ("GIT_AUTHOR_NAME", Some("t")),
+    ("GIT_AUTHOR_EMAIL", Some("t@t")),
+    ("GIT_COMMITTER_NAME", Some("t")),
+    ("GIT_COMMITTER_EMAIL", Some("t@t")),
+];
+
+/// Apply [`FIXTURE_CONFIG`] to `cmd`.
+///
+/// One function, because the block used to be written out inline in `gitrepo`'s and
+/// `archive`'s fixtures and nothing observed either copy: measured, deleting the whole block
+/// from BOTH left 118 tests green, since `assert_scrubbed` names only the selection variables.
+/// The state that produced is the harm all three comment blocks describe — on a machine that
+/// sets `core.hooksPath` globally and signs commits, the fixtures' `git commit` runs the
+/// developer's arbitrary global hooks and tries to sign.
+#[cfg(test)]
+pub(crate) fn isolate_fixture_config(cmd: &mut Command) {
+    for (key, value) in FIXTURE_CONFIG {
+        match *value {
+            Some(v) => cmd.env(key, v),
+            None => cmd.env_remove(key),
+        };
+    }
+}
+
+/// Assert that `cmd` inherits neither the caller's repository selection nor their configuration.
+///
+/// For FIXTURES only. Production spawns are checked with [`assert_scrubbed`], which is the
+/// narrower claim they actually make.
+#[cfg(test)]
+pub(crate) fn assert_isolated(what: &str, cmd: &Command) {
+    assert_scrubbed(what, cmd);
+    let envs: Vec<(String, Option<String>)> = cmd
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    for (key, want) in FIXTURE_CONFIG {
+        let got = envs.iter().find(|(k, _)| k == key);
+        assert!(
+            got.is_some_and(|(_, v)| v.as_deref() == *want),
+            "{what}: {key} is not {}; the developer's global git configuration reaches this \
+             fixture. envs: {envs:?}",
+            want.map_or_else(|| "removed".to_owned(), |v| format!("set to {v}"))
+        );
+    }
+}
+
 /// Assert that `cmd` will not inherit the caller's repository selection.
 ///
 /// Shared by the tests at all three call sites: what must be pinned is that each SPAWN is
@@ -1253,18 +1319,11 @@ mod tests {
     ];
     /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
     /// is a decision rather than an omission.
-    const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[
-        (
-            "src/owner.rs",
-            "a_reaped_child_is_established_dead",
-            "spawns a shell purely to own a pid; it is never asked about a repository",
-        ),
-        (
-            "tests/cli.rs",
-            "help_advertises_the_mcp_subcommand",
-            "runs `jkb --help`, which prints usage and never resolves a repository",
-        ),
-    ];
+    const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[(
+        "src/owner.rs",
+        "a_reaped_child_is_established_dead",
+        "spawns a shell purely to own a pid; it is never asked about a repository",
+    )];
 
     /// The function a declaration line declares, or `UNPARSED` when the line declares one
     /// in a shape this scan does not model. `None` when it is not a declaration at all.
@@ -1323,13 +1382,21 @@ mod tests {
         let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
         for line in self_src.lines() {
             // THE DECLARATION, and the needle is ASSEMBLED AT RUN TIME so that this line
-            // cannot be it. The scan sits 130 lines above the const it reads, and a literal
-            // `line.contains("const SCRUBBERS")` matched its OWN source first — it found the
+            // cannot be it.
+            //
+            // WHEN THE CONST LIVED INSIDE THIS TEST, BELOW the scan, a literal
+            // `line.contains("const SCRUBBERS")` matched its OWN source first — it reached the
             // right entries only because nothing in between happened to trim to `];` or start
             // with `(`, and one `vec![…];` in this function ended the scan on the wrong list.
             // Adding `&& line.contains("= &[")` did NOT fix it: that predicate is also true of
-            // the line spelling it. Measured, both ways. A marker no line of this scanner can
-            // contain is the only version of the anchor that is not about this scanner.
+            // the line spelling it. Measured, both ways.
+            //
+            // The const has since moved to module scope ABOVE the scan, so a literal needle
+            // would find the const first today and the bug would not reproduce. That is a fact
+            // about the current layout, not a property of the scan: moving either block back
+            // restores it. The assembled marker is what makes the anchor about the LIST rather
+            // than about where this scanner happens to sit, and the identity assertion below is
+            // what would notice if it stopped being.
             if line.contains(&marker) && line.contains("= &[") {
                 in_list = true;
                 continue;
@@ -1627,18 +1694,8 @@ mod tests {
         cmd.arg("-C").arg(at).args(args);
         // Selection — the half that was missing.
         super::scrub_repo_selection(&mut cmd);
-        // ...and configuration. Wider than production's scrub, deliberately: production keeps
-        // `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` because the dev container's
-        // `safe.directory` grants live there, while a fixture must not inherit configuration
-        // it did not choose. This machine sets `core.hooksPath` globally and signs commits.
-        cmd.env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t");
+        // ...and configuration, through the shared list rather than a second copy of it.
+        super::isolate_fixture_config(&mut cmd);
         cmd
     }
 
@@ -1647,7 +1704,7 @@ mod tests {
     /// also lets `gitrepo::tests` commit into an unrelated dirty repository.
     #[test]
     fn the_test_fixtures_do_not_reach_another_repository() {
-        super::assert_scrubbed(
+        super::assert_isolated(
             "gitrepo fixture",
             &fixture_git(Path::new("/somewhere"), &["status"]),
         );

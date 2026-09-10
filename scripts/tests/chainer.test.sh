@@ -1267,6 +1267,9 @@ case14() {
         # helps. Sharing `unreadable`'s row would have re-asserted exactly the confusion the
         # separate code exists to end.
         'dispatch=unaskable core.hooksPath could not be read from this git|upgrade git'
+        # ...and so is `unprobeable`: the MACHINE could not be asked, because the expansion
+        # probe needs a temporary file. Not the git, and not the value.
+        'dispatch=unprobeable core.hooksPath could not be tested for expansion on this machine|point TMPDIR at a writable directory'
         'exclude-file=unknown|could not tell whether .git/info/exclude changed'
         'error=not a git repo|not a git repo; skipping hook install'
     )
@@ -1282,6 +1285,26 @@ case14() {
     [ "$ok_all" = 1 ] \
         && ok "every state the producer can emit has a render arm that names it" \
         || fail "render: table" "no distinctive output for:$missing"
+
+    # ...and the table above is HAND-WRITTEN, so a refusal code added to `_override_verdict`
+    # arrives with no row and nothing notices. Measured: code 6 `unprobeable` was added with no
+    # render arm at all and this case still passed — one round after `unaskable` was caught here
+    # only because somebody had remembered to write its row. The set is derived instead, from
+    # `_override_statuses`, which derives itself from `_override_verdict`'s own arms; a verdict
+    # that renders nothing is as bad as one that renders the catch-all, since `dispatch=direct`
+    # is the silent verdict and silence would read as "the hook will run".
+    local st verdict rend uncovered_status=""
+    for st in $(_override_statuses); do
+        verdict="$(_override_verdict "$st")"
+        rend="$(printf 'dispatch=%s\n' "$verdict" | render_git_hooks_report 2>&1)"
+        case "$rend" in
+            "") uncovered_status="$uncovered_status $st(silent)" ;;
+            *"unrecognised dispatch verdict"*) uncovered_status="$uncovered_status $st(no arm)" ;;
+        esac
+    done
+    [ -z "$uncovered_status" ] \
+        && ok "and every refusal code the mapping can emit reaches a render arm, derived not listed" \
+        || fail "render: status-arm" "refusal codes with no render arm:$uncovered_status"
 
     # The two silent verdicts are silent ON PURPOSE — the lines above them already said the
     # hook will run — so assert the silence rather than leaving it unstated. Its OWN

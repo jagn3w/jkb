@@ -671,8 +671,15 @@ fn sync_with_no_mounts_is_a_clean_noop() {
 fn help_advertises_the_mcp_subcommand() {
     // `mcp` now launches the stdio server (covered by jkb-mcp's own tests); here we
     // just confirm the CLI advertises it rather than blocking a test on stdio I/O.
-    Command::cargo_bin("jkb")
-        .unwrap()
+    //
+    // Through the fixture, not a bare `cargo_bin`. It was the one `jkb` spawn in this file
+    // inheriting the developer's whole git environment, and it bought that with an entry in
+    // `NOT_REPO_AWARE` — an exemption that keys on the ENCLOSING FUNCTION, so it would have
+    // covered any spawn later added to this body, and whose stated reason ("clap exits inside
+    // `parse()` before `run()`") nothing checks. One line of isolation costs less than an
+    // allowlist entry that has to stay true.
+    let tmp = TempDir::new().unwrap();
+    jkb(&tmp.path().join("help.db"))
         .arg("--help")
         .assert()
         .success()
@@ -2891,15 +2898,5 @@ fn sync_keeps_two_tasks_files_in_one_directory_apart() {
 fn the_cli_fixture_does_not_inherit_a_repository() {
     let tmp = TempDir::new().unwrap();
     let cmd = jkb(&tmp.path().join("x.db"));
-    let removed: Vec<String> = cmd
-        .get_envs()
-        .filter(|(_, v)| v.is_none())
-        .map(|(k, _)| k.to_string_lossy().into_owned())
-        .collect();
-    for want in common::MUST_DROP {
-        assert!(
-            removed.iter().any(|k| k == want),
-            "{want} is not removed from the cli fixture; removed: {removed:?}"
-        );
-    }
+    common::assert_isolated("the cli fixture", &cmd);
 }

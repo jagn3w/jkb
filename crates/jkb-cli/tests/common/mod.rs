@@ -51,3 +51,49 @@ pub const MUST_DROP: &[&str] = &[
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
 ];
+
+/// ...and the settings it must APPLY. Dropping the injected forms is only half the isolation:
+/// the files stay in play until they are pointed somewhere empty, and until this list existed
+/// nothing observed that half at all — measured, deleting the two `GIT_CONFIG_*` lines from
+/// `isolate_git_env` left all 137 tests in the two integration crates green, the three written
+/// to pin this very function included, because they checked only the removals.
+///
+/// `src/gitrepo.rs`'s `FIXTURE_CONFIG` is the same list for the library's own fixtures. It is
+/// deliberately a SECOND list rather than a shared one: `FIXTURE_CONFIG` is `#[cfg(test)]`, and
+/// an integration test is a separate crate compiled with `cfg(test)` OFF, so it cannot see it.
+/// What keeps them honest is that each is asserted against the function beside it.
+pub const MUST_SET: &[(&str, &str)] = &[
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_AUTHOR_NAME", "t"),
+    ("GIT_AUTHOR_EMAIL", "t@t"),
+    ("GIT_COMMITTER_NAME", "t"),
+    ("GIT_COMMITTER_EMAIL", "t@t"),
+];
+
+/// Assert `cmd` carries the whole isolation — both halves of it.
+pub fn assert_isolated(what: &str, cmd: &Command) {
+    let envs: Vec<(String, Option<String>)> = cmd
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    for want in MUST_DROP {
+        assert!(
+            envs.iter().any(|(k, v)| k == want && v.is_none()),
+            "{what}: {want} is not removed; envs: {envs:?}"
+        );
+    }
+    for (key, want) in MUST_SET {
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == key && v.as_deref() == Some(*want)),
+            "{what}: {key} is not set to {want}; the developer's global git configuration \
+             reaches this fixture. envs: {envs:?}"
+        );
+    }
+}

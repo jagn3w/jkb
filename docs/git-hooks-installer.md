@@ -307,6 +307,13 @@ conventions every session is expected to know.
   <key> <value>` quotes on the way in (`hooksPath = "/a/b#c"`) and all six test values
   round-tripped, tilde expansion included. The general form: **when the question is "what does
   git make of this value", git writes the fixture too.**
+- **A probe we could not BUILD is not a verdict about the value** — rc 6, not rc 2. Both failure
+  paths (`mktemp`, and the `git config --file` write) reported "core.hooksPath cannot be expanded
+  on this machine", so a full disk, a read-only or `noexec` temp mount, or a sandbox with a
+  scoped `TMPDIR` silently reverted the whole arm to the wrong answer it was added to remove —
+  no chainer written, and a remedy pointing at `--show-origin`, which prints a perfectly ordinary
+  path. `setup.sh` runs unattended from `post-merge`, so the warning is all anyone sees. Six
+  refusal codes now: 1 unset, 2 the value, 3 empty, 4 unanchored, 5 this GIT, 6 this MACHINE.
 - **A mapping with an unreachable arm is lifted out so it can be called.** The refusal-code
   `case` sat inline in `install_git_hooks`, where `*)` and `4)` were behaviourally identical —
   there is no fifth code today — so a mutation collapsing them stayed green and nothing could
@@ -496,8 +503,35 @@ conventions every session is expected to know.
   live there). A fixture must not inherit configuration it did not choose: env-injected config
   OUTRANKS the files, so `GIT_CONFIG_GLOBAL=/dev/null` is not isolation on its own, and an
   exported `commit.gpgsign` reddened `./scripts/check.sh` with `gpg: signing failed`. Measured
-  both ways. One helper (`isolate_git_env`), because the file had two spawn sites and one of them
-  had already remembered only half the list.
+  both ways. One helper, because the file had two spawn sites and one of them had already
+  remembered only half the list.
+
+  **Round 22 corrects where that helper lives and what pins it.** `isolate_git_env` was in
+  `tests/sessions.rs`, and each `tests/*.rs` is its own crate — so `tests/cli.rs` could not
+  share it and had NO isolation at all, invisible to the crate-wide guard because that guard
+  keyed on the literal `Command::new(` while these fixtures build their process with
+  `Command::cargo_bin("jkb")`. The helper now lives in `tests/common/mod.rs`, which both
+  include, and the guard keys on a `SPAWN_FORMS` list rather than one spelling.
+
+  The CONFIGURATION half then turned out to be pinned by nothing at all. Measured: deleting the
+  two `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` lines from `isolate_git_env` left all 137 tests in
+  the two integration crates green — the three written to pin that very function included,
+  because they checked only `env_remove` — and deleting the whole block from BOTH `src/`
+  fixtures left 118 green, because `assert_scrubbed` names only the selection variables. The
+  state that produces is exactly the harm all three comment blocks describe. So the block is a
+  list now (`gitrepo::FIXTURE_CONFIG`, applied by `isolate_fixture_config` and checked by
+  `assert_isolated`) rather than three copies held up by prose. There are two such lists, one
+  per side of the crate boundary — `FIXTURE_CONFIG` is `#[cfg(test)]`, and an integration test
+  compiles with `cfg(test)` OFF — and each is asserted against the function beside it. Note the
+  asymmetry that is deliberate: production's `scrub_repo_selection` keeps
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, because production must not discard a
+  `safe.directory` grant it needs. Two rules, not drift.
+- **A hand-written coverage table is the same defect one level up.** `case14`'s row list caught
+  `unaskable` only because somebody remembered to write its row; when code 6 `unprobeable` was
+  added with no render arm AT ALL, the case still passed. The set is derived from
+  `_override_statuses` now — which derives itself from `_override_verdict`'s own arms — and a
+  verdict that renders nothing fails as loudly as one that renders the catch-all, because
+  `dispatch=direct` is the silent verdict and silence would read as "the hook will run".
 - **A closed vocabulary is derived from its renderer, or a new word gets no coverage silently.**
   `case14` asserted "the protocol and the render arms are the same set" from a HAND-WRITTEN table
   — so a state added to `render_git_hooks_report` with no row was an arm nothing drove, invisible
@@ -529,8 +563,8 @@ conventions every session is expected to know.
 - **Every spawn in the crate is now gated by ONE allowlist, keyed on (file, function).**
   Per-site pinning was the previous state of the art and it was not enough: it says nothing about
   the next file. `no_spawn_in_the_crate_resolves_a_repository_unscrubbed` walks every `.rs` under
-  the crate root (skipping `target/`) and requires each `Command::new` to sit in a named scrubbing constructor or in an
-  explicit `NOT_REPO_AWARE` list with its reason — so a new spawn forces the decision when it is
+  the crate root (skipping `target/`) and requires each spawn to sit in a named scrubbing
+  constructor or in an explicit `NOT_REPO_AWARE` list with its reason — so a new spawn forces the decision when it is
   written. Three rules it had to learn, each from something it missed:
   **test code counts** (its first version cut each file at `mod tests`, which is exactly where
   the live damage was — `gitrepo.rs`'s own four fixtures scrubbed nothing, and with a dirty
@@ -550,6 +584,20 @@ conventions every session is expected to know.
   literals), because a `Command::new(` that rustfmt had split across lines was invisible to it. Its own
   allowlist error — keying `tests/sessions.rs` on the delegate rather than the spawn site — was
   caught by the guard on first run.
+
+  **And one more, which cost a whole round: it keyed on ONE SPELLING of "spawn".** `Command::new(`
+  is not how a test builds the binary under test — `Command::cargo_bin("jkb")` is — so the three
+  `jkb` fixtures were invisible to a guard whose doc claims NO SPAWN IN THE CRATE goes unscrubbed.
+  Measured: deleting the isolation from `Fixture::jkb` left the guard and the whole suite green.
+  The forms are a list (`SPAWN_FORMS`) now. The premise moved too: `scrubbers.len() >= 6` was
+  `6 >= 6` on a const array of six — a guard that cannot fire, inside the guard against guards
+  that cannot fire — and counting what the scan parsed instead fixed the arity while still
+  saying nothing about WHICH six lines were read. It asserts IDENTITY now: the `(file, fn)` pairs
+  the scan reads must equal the pairs the compiler saw. The allowlist also shrank by one, which
+  is the right direction: `help_advertises_the_mcp_subcommand` was exempted for "runs `jkb
+  --help`, which never resolves a repository" — true today, and an exemption keyed on the
+  ENCLOSING FUNCTION covers spawns not yet written in that body. Routing it through the file's
+  own fixture cost one line and removed the entry.
 - **Three repository-aware spawns, one rule, pinned at each of them.** Asking *who else
   implements this rule* found two production spawns that were not git and resolved a repository
   from the environment anyway: `pr::gh` — `gh` finds the repo through git, so a leaked

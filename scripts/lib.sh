@@ -134,11 +134,12 @@ _real_dir() {
 # REPOSITORY'S OWN value.
 #
 # Prints the value and returns 0; returns 1 when the repository stores none, 2 when git will not
-# expand the value this repository would actually use, and 5 when THIS GIT could not be asked at
-# all (it answered 129, unknown option, to every scope) — which is a fact about the binary, not
-# about the value, and carries a different remedy. Listed here and not only at the arm that
-# returns it: the header is what a reader consults, and one that stopped at 2 told them a 5
-# could not happen. Both consumers — `git_hooks_override`, which resolves it to a directory,
+# expand the value this repository would actually use, 5 when THIS GIT could not be asked at all
+# (it answered 129, unknown option, to every scope) — which is a fact about the binary, not about
+# the value — and 6 when THIS MACHINE could not be asked, because the temporary file the
+# expansion probe needs could not be created or written. Three different facts with three
+# different remedies. Listed here and not only at the arms that return them: the header is what
+# a reader consults, and one that stopped at 2 told them a 5 could not happen. Both consumers — `git_hooks_override`, which resolves it to a directory,
 # and `git_hooks_exclude_pattern`, which needs the raw string — go through here, because they
 # need DIFFERENT things from the SAME fact and reading it twice is how they came to disagree
 # about it. They did, measurably: the override refused an environment-injected value while the
@@ -208,7 +209,8 @@ EOF
     # "the repository stores none", which the caller renders as `dispatch=direct` and prints
     # nothing for, while git itself resolves the hook and jkb writes no chainer. The two
     # branches of this one function have to answer the same question about the same repository.
-    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0 raw last probe
+    local scope out found2=1 value2="" wtc="" unsupported=0 asked=0 broken=0 unprobeable=0
+    local raw last probe
     # `--local`, because `extensions.worktreeConfig` is a LOCAL-ONLY repository extension: git
     # stores it per repository, so a global one — or a `-c` on the command line, which this
     # function refuses for `core.hooksPath` three lines up — is not this repository's answer.
@@ -228,7 +230,7 @@ EOF
         # Anything else is unestablished and must not be spelled as "stores none", which the
         # caller renders as `dispatch=direct` and prints nothing for.
         case "$rc" in
-            0) broken=0 ;;
+            0) broken=0; unprobeable=0 ;;
             1) continue ;;
             # 129 is an unknown OPTION — a fact about this git, not about the value. It is how a
             # git predating `--worktree` answers, and it is ALSO how one predating `--includes`
@@ -268,13 +270,22 @@ EOF
                 # unexpandable, which is the exact defect the arm exists to remove. `git config
                 # --file <f> <key> <value>` quotes on the way in (`hooksPath = "/a/b#c"`), and
                 # all six round-tripped, tilde expansion included.
-                probe="$(mktemp "${TMPDIR:-/tmp}/.jkb-hookspath.XXXXXX")" || { broken=1; continue; }
+                #
+                # A probe we could not BUILD is its own fact, and rc 6 not rc 2. Both failures
+                # here are about this machine — a full disk, a read-only or `noexec` temp mount,
+                # a sandbox with a scoped `TMPDIR` — and reporting them as "git will not expand
+                # this value" reverts the whole arm to the wrong answer it was added to remove,
+                # with a remedy (`--show-origin`) that prints a perfectly ordinary path. `setup.sh`
+                # runs unattended from `post-merge`, so the warning is all anyone sees.
+                probe="$(mktemp "${TMPDIR:-/tmp}/.jkb-hookspath.XXXXXX")" \
+                    || { unprobeable=1; broken=1; continue; }
                 if ! _git config --file "$probe" core.hooksPath "$last" 2>/dev/null; then
-                    rm -f "$probe"; broken=1; continue
+                    rm -f "$probe"; unprobeable=1; broken=1; continue
                 fi
                 if out="$(_git config --file "$probe" --path --get core.hooksPath 2>/dev/null)"; then
                     rm -f "$probe"
                     broken=0
+                    unprobeable=0
                 else
                     rm -f "$probe"
                     # THIS scope's answer is the unexpandable one, so a lower scope's value is
@@ -302,8 +313,12 @@ EOF
     if [ "$found2" -ne 0 ] && [ "$asked" -gt 0 ] && [ "$unsupported" -eq "$asked" ]; then
         return 5
     fi
-    # A break at the highest-precedence scope that answered: git would fail here too.
-    [ "$broken" -eq 0 ] || return 2
+    # A break at the highest-precedence scope that answered: git would fail here too — unless
+    # what broke was OUR probe rather than git's expansion, which is a different fact (6).
+    if [ "$broken" -ne 0 ]; then
+        [ "$unprobeable" -eq 0 ] || return 6
+        return 2
+    fi
     [ "$found2" -eq 0 ] || return 1
     printf '%s' "$value2"
     return 0
@@ -364,6 +379,7 @@ git_hooks_override() {
         0) ;;
         1) return 0 ;;      # the repository stores none
         5) return 5 ;;      # this git could not be asked at all (see `_hooks_path_read`)
+        6) return 6 ;;      # this MACHINE could not be asked: the expansion probe needs a temp file
         *) return 2 ;;      # set, and git will not expand it
     esac
     # Set to the empty string is NOT "not set". Measured: `config --get --path` exits 0
@@ -937,6 +953,7 @@ _override_verdict() {
         3) printf 'unreadable core.hooksPath is set to the empty string' ;;
         4) printf 'unanchored core.hooksPath' ;;
         5) printf 'unaskable core.hooksPath could not be read from this git' ;;
+        6) printf 'unprobeable core.hooksPath could not be tested for expansion on this machine' ;;
         *) printf 'unreadable core.hooksPath could not be resolved (unrecognised status %s)' "$1" ;;
     esac
 }
@@ -947,6 +964,7 @@ _override_why() {
         3) printf 'core.hooksPath is empty' ;;
         4) printf 'core.hooksPath is relative and this repository has no working tree' ;;
         5) printf 'this git is too old to report where core.hooksPath is set' ;;
+        6) printf 'no temporary file could be created to ask git about core.hooksPath' ;;
         *) printf 'core.hooksPath could not be resolved' ;;
     esac
 }
@@ -1482,9 +1500,23 @@ render_git_hooks_report() {
                     # and appears to refute the warning, with nothing pointing at the git binary.
                     # Measured under the all-refusing shim. A refusal must name a remedy that is
                     # true of the thing refused, and the thing refused here is the git.
+                    # Its own arm for its own remedy, again: this one is about the MACHINE, not
+                    # the git and not the value. jkb could not create the temporary file the
+                    # expansion probe needs, so it never found out whether git would expand the
+                    # value — and `--show-origin` would print a perfectly ordinary path here too.
+                    unprobeable)
+                             warn "$detail, so jkb could not tell where git will look for hooks."
+                             warn "  jkb could not create a temporary file (\$TMPDIR is ${TMPDIR:-/tmp}); free space or point TMPDIR at a writable directory and re-run." ;;
                     unaskable)
                              warn "$detail, so jkb could not tell where git will look for hooks."
-                             warn "  this git is too old to report where core.hooksPath is set (it needs --show-scope, or per-scope --includes); upgrade git, or set core.hooksPath yourself and re-run." ;;
+                             # ONE remedy, because the other one was false. It used to end "or
+                             # set core.hooksPath yourself and re-run", which cannot change the
+                             # answer: rc 5 is raised from the OPTION's 129, so `unsupported ==
+                             # asked` holds whatever the repository stores. Measured — set it,
+                             # re-ask, byte-identical warning. A half-true remedy is worse than
+                             # a short one: the operator disproves the half they can test and
+                             # stops trusting the half they cannot.
+                             warn "  this git is too old to report where core.hooksPath is set (it needs --show-scope, or per-scope --includes); upgrade git — setting core.hooksPath will not change this answer." ;;
                     *)       warn "unrecognised dispatch verdict: $line" ;;
                 esac ;;
             error=*) warn "$rest; skipping hook install" ;;

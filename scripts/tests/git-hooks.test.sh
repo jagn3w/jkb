@@ -1214,6 +1214,25 @@ case10f() {
             ok "and its repair line names the git, which is the thing that refused" ;;
         *) fail "unaskable: render" "got: $(printf '%s' "$rendered5" | tr '\n' '|')" ;;
     esac
+    # ...and it must not name a repair the fixture can be shown NOT to satisfy. The line used to
+    # offer "or set core.hooksPath yourself and re-run": rc 5 is raised from the OPTION's 129, so
+    # no repository state can change it. Demonstrated rather than argued — the repair is DONE
+    # here, and the answer must be identical.
+    mkdir -p "$d5/myhooks"
+    git_q -C "$d5/r" config core.hooksPath "$d5/myhooks"
+    after5="$(PATH="$d5/bin:$PATH" install_git_hooks "$d5/r" "$d5/src" 2>/dev/null)"
+    case "$after5" in
+        *"dispatch=unaskable"*)
+            case "$rendered5" in
+                *"set core.hooksPath yourself and re-run"*)
+                    fail "unaskable: falseremedy" "the repair line offers a repair that was just \
+performed and changed nothing" ;;
+                *) ok "and it offers no repair the operator can perform and see refuted" ;;
+            esac ;;
+        *) fail "unaskable: repair-premise" "setting core.hooksPath changed the verdict, so this \
+tested nothing: $(printf '%s' "$after5" | tr '\n' '|')" ;;
+    esac
+    git_q -C "$d5/r" config --unset core.hooksPath 2>/dev/null || :
 
     v="$(_override_verdict 9)"
     w="$(_override_why 9)"
@@ -2102,6 +2121,20 @@ reads it was never exercised"
         fail "oldscope: fidelity-premise" "git does not resolve the fixture's '#' hooksPath, so \
 this tested nothing"
     fi
+
+    # ...and when the PROBE cannot be built, that is a fact about this machine and not about the
+    # value. Collapsed into rc 2 it reported `unreadable core.hooksPath cannot be expanded on
+    # this machine` for a value git expands perfectly well, wrote no chainer, and sent the
+    # operator to `--show-origin`, which prints an ordinary path — the whole arm silently
+    # reverting to the answer it was added to remove, on a full disk or a read-only temp mount.
+    # Driven here, because two codes that are never both exercised are one code with two names.
+    rc=0
+    v="$(TMPDIR=/nonexistent-jkb-probe-dir PATH="$d/bin:$PATH" _hooks_path_read "$d/r4" 2>/dev/null)" \
+        || rc=$?
+    [ "$rc" = 6 ] \
+        && ok "and a probe this machine cannot build is code 6, not 'git will not expand it'" \
+        || fail "oldscope: unprobeable" "rc=$rc value='$v' — want 6; a temp-file failure is not \
+a verdict about the value"
     : >"$work/home/.gitconfig"
     git_q config --global user.email t@example.com
     git_q config --global user.name "Test"

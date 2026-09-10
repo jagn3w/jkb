@@ -1957,19 +1957,9 @@ mod tests {
         // `GIT_DIR`/`GIT_WORK_TREE` exported this fixture would init, add and commit into the
         // developer's unrelated repository — measured for `gitrepo.rs`'s siblings.
         crate::gitrepo::scrub_repo_selection(&mut cmd);
-        // ...and configuration, which is WIDER than production's scrub on purpose: production
-        // keeps `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` because the dev container's
-        // `safe.directory` grants live there, while a fixture must not inherit configuration it
-        // did not choose. The env-injected form outranks the files pointed at /dev/null below,
-        // so those alone are not isolation. This machine signs commits and sets core.hooksPath.
-        cmd.env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t");
+        // ...and configuration, through the shared list rather than a second copy of it. Both
+        // copies used to be written out here and in `gitrepo.rs`, and nothing observed either.
+        crate::gitrepo::isolate_fixture_config(&mut cmd);
         cmd
     }
 
@@ -1979,7 +1969,7 @@ mod tests {
     /// as covered; the same round fixed that for one sibling and left this one live.
     #[test]
     fn the_archive_fixture_does_not_reach_another_repository() {
-        crate::gitrepo::assert_scrubbed(
+        crate::gitrepo::assert_isolated(
             "archive fixture",
             &fixture_git(Path::new("/somewhere"), &["status"]),
         );

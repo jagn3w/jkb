@@ -106,13 +106,16 @@ implementation checklist and the **source of truth for what's done**.
 - **590 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
-  (also `--features fastembed`). Dev scripts (all accept pass-through args + allowlisted;
-  they self-source `~/.cargo/env`, so run them directly — no `source ~/.cargo/env &&` prefix):
-  `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `check.sh`,
-  `test-count.sh`, `inspect-dep.sh` (read a dep's extracted registry source). `check.sh` was
-  missing from this list AND from the behaviour — it called `cargo` without sourcing the
-  toolchain, so in any non-interactive shell the gate this file tells you to run before every
-  commit exited 127 at its first cargo line and nothing after the shell-syntax step ran.
+  (also `--features fastembed`). Dev scripts all self-source `~/.cargo/env`, so run them
+  directly — no `source ~/.cargo/env &&` prefix — and all but `check.sh` pass their arguments
+  through: `./scripts/fix.sh` (fmt+check), `build.sh`, `test.sh`, `clippy.sh`, `test-count.sh`,
+  `inspect-dep.sh` (read a dep's extracted registry source). **`check.sh` takes no arguments**
+  and always runs the whole gate; `./scripts/check.sh -p jkb-core` silently ignores the `-p` and
+  runs everything, including the `--all-features` clippy the paragraph below says cannot finish
+  in a sandbox. `check.sh` was missing from the pass-through list AND from the self-sourcing
+  behaviour — it called `cargo` without sourcing the toolchain, so in any non-interactive shell
+  the gate this file tells you to run before every commit exited 127 at its first cargo line and
+  nothing after the shell-syntax step ran. Pinned by `scripts/tests/dev-scripts.test.sh`.
 - **Fresh-machine setup:** `./scripts/setup.sh` is the one-shot, idempotent installer —
   `cargo install`s the `jkb` binary, scaffolds the standard KB roots via `jkb ns mk repos
   tasks media references memory`, builds+installs the VS Code extension (`install-extension.sh`),

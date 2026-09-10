@@ -114,26 +114,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 #[test]
 fn the_fixture_isolation_covers_selection_and_config() {
     let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
-    let removed: Vec<String> = cmd
-        .get_envs()
-        .filter(|(_, v)| v.is_none())
-        .map(|(k, _)| k.to_string_lossy().into_owned())
-        .collect();
-    for want in [
-        // Selection: outranks `-C`, so a leak sends the fixture at another repository.
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        // Configuration: outranks the files pointed at /dev/null below, so an exported
-        // `commit.gpgsign` reddens the gate over a fact about somebody's shell.
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
-    ] {
-        assert!(
-            removed.iter().any(|k| k == want),
-            "{want} is not removed from the fixture environment; removed: {removed:?}"
-        );
-    }
+    common::assert_isolated("Fixture::jkb", &cmd);
 }
 
 /// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into
