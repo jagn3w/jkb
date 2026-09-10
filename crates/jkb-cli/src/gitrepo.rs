@@ -1059,6 +1059,91 @@ mod tests {
     /// spawn is built there — the same shape as `scripts/lib.sh`'s `_git`, which needed the
     /// same kind of check. Production spawns only: the fixtures below deliberately build their
     /// own, and scrub by hand.
+    /// ...and NO OTHER FILE in the crate spawns a repository-aware tool outside a scrubbing
+    /// constructor.
+    ///
+    /// The guard below reads one file, so it says nothing about the next one. Three spawns
+    /// already had to be found by asking *who else implements this rule* — `git_cmd`, `pr::gh`
+    /// (a leaked `GIT_WORK_TREE` has `gh` reporting on an unrelated repository's pull requests)
+    /// and `session::run_gate` (whose verdict decides a landing) — and each was pinned only at
+    /// its own site, so a FOURTH in a new file is covered by nothing. This is the crate-wide
+    /// choke point: every production `Command::new` must sit in a constructor named here, and
+    /// each of those is separately asserted to scrub. Adding a spawn therefore forces the
+    /// decision at the moment it is added, rather than at the moment somebody notices.
+    #[test]
+    fn no_production_spawn_in_the_crate_bypasses_a_scrubbing_constructor() {
+        // Constructors whose scrub is pinned by a test of its own — `git_cmd` by the guard
+        // below and the behavioural test above it, `gh_cmd` in pr.rs, `gate_cmd` in
+        // session.rs, `isolate_git_env` by the fixtures it builds.
+        const SCRUBBERS: &[&str] = &["git_cmd", "gh_cmd", "gate_cmd", "isolate_git_env"];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root.join("src"), root.join("tests")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        // Finding no files means the walk is broken, and an empty result would read exactly
+        // like a clean sweep — the `check_shell_syntax` lesson.
+        assert!(
+            files.len() >= 5,
+            "walked {} source files under {}; the walk is broken, not the code",
+            files.len(),
+            root.display()
+        );
+
+        let mut stray: Vec<String> = Vec::new();
+        let mut found = 0usize;
+        for path in &files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            // Production half only, by the same rule as the guard below. A file with no test
+            // module is production throughout.
+            let prod = match src.find("\n#[cfg(test)]\nmod tests {") {
+                Some(cut) => &src[..cut],
+                None => &src[..],
+            };
+            let mut enclosing = "<no enclosing fn>";
+            for (i, line) in prod.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                {
+                    enclosing = rest.split(['(', '<']).next().unwrap_or(rest);
+                }
+                if line.contains("Command::new(") {
+                    found += 1;
+                    if !SCRUBBERS.contains(&enclosing) {
+                        let name = path.strip_prefix(root).unwrap_or(path).display();
+                        stray.push(format!("{name}:{} in `{enclosing}`", i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            found >= 4,
+            "found {found} production spawns; the scan is broken, not the code"
+        );
+        assert!(
+            stray.is_empty(),
+            "a repository-aware tool is spawned outside a scrubbing constructor ({SCRUBBERS:?}), \
+             so it inherits the caller's repository selection and may act on an unrelated \
+             repository: {stray:?}"
+        );
+    }
+
     #[test]
     fn no_production_git_spawn_bypasses_git_cmd() {
         let src = include_str!("gitrepo.rs");

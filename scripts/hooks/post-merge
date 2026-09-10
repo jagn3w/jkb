@@ -41,10 +41,13 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 # repository this merge was about. Both answers are resolved with `pwd -P` because a symlink,
 # a trailing slash and a `..` are three spellings of one directory. Best-effort, like
 # everything here: a question git will not answer stops the hook rather than failing the merge.
-# `--git-common-dir` rather than `--path-format=absolute --git-common-dir`, which is git 2.31+:
-# an older git would exit non-zero, the hook would `exit 0`, and the D34 automation would be
-# silently off. A relative answer is anchored at the directory it was ASKED FROM, never at the
-# cwd — the two differ here by construction, which is the whole point of the comparison.
+# `--git-common-dir` rather than `--path-format=absolute --git-common-dir`. `--path-format` is
+# a much later addition than `--git-common-dir` (not verified here to a version, which is why it
+# is avoided rather than relied on): on a git without it rev-parse exits non-zero, the hook
+# would `exit 0`, and the D34 automation would be silently off for that user.
+#
+# A relative answer is anchored at the directory it was ASKED FROM, never at the cwd — the two
+# differ here by construction, which is the whole point of the comparison.
 common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; no arg asks as git
     local d="${1:-}" c                    # handed us. Prints an absolute, symlink-resolved path.
     if [ -n "$d" ]; then
