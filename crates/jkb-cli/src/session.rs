@@ -434,12 +434,6 @@ pub fn resolve_gate(
     }
 }
 
-/// Run `cmd` in `dir` through the user's shell. Returns whether it passed, and its combined
-/// output when `capture` — which `--json` needs, since a build streaming to stdout would
-/// otherwise be interleaved into the JSON document.
-///
-/// # Errors
-/// Returns an error if the shell cannot be executed at all.
 /// Build the gate invocation for `dir`.
 ///
 /// Separate from [`run_gate`] so the scrubbing below is pinned at THIS call site.
@@ -453,6 +447,12 @@ fn gate_cmd(dir: &Path, cmd: &str) -> std::process::Command {
     command
 }
 
+/// Run `cmd` in `dir` through the user's shell. Returns whether it passed, and its combined
+/// output when `capture` — which `--json` needs, since a build streaming to stdout would
+/// otherwise be interleaved into the JSON document.
+///
+/// # Errors
+/// Returns an error if the shell cannot be executed at all.
 pub fn run_gate(dir: &Path, cmd: &str, capture: bool) -> Result<(bool, Option<String>)> {
     let mut command = gate_cmd(dir, cmd);
     if capture {
