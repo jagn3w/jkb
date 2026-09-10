@@ -1846,12 +1846,20 @@ case10l() {
         *) fail "hookenv: dot" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
 
-    # 11a. ...and chore 2 must still RUN. "Skipping setup.sh" is what the refusal says, and for
-    #      a while it was not what the hook did: one `exit 0` took `jkb task close-merged` with
-    #      it, which needs only the repository the merge was about — never in doubt here, since
-    #      `$hook_common` named it. A stub `jkb` on PATH is enough to see it, and unlike a `git`
-    #      stub it actually reaches the hook: git prepends its own `GIT_EXEC_PATH` (which holds
-    #      a real `git`) but nothing shadows `jkb`.
+    # 11a. ...and chore 2 must NOT run — REVERSED, and the reversal is the assertion. This step
+    #      used to require the opposite, on the argument that `close-merged` "needs only the
+    #      repository the merge was about, never in doubt here since `$hook_common` named it".
+    #      MEASURED against the real binary in this very layout, it needs to DISCOVER that
+    #      repository from its cwd with `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` scrubbed —
+    #      the ask that failed to produce a verdict in the first place — and prints
+    #
+    #          error: not inside a git repo — a task session is a git worktree, so run this from the repo
+    #
+    #      exiting 1, so the hook adds `jkb: close-merged failed (continuing)`. Two false lines
+    #      under a refusal built to be true in every sentence. The stub is kept, and now proves
+    #      the absence: a stub `jkb` on PATH reaches the hook, unlike a `git` stub — git prepends
+    #      its own `GIT_EXEC_PATH`, which holds a real `git`, but nothing shadows `jkb`. So if
+    #      the gate ever comes off, `JKB-RAN` appears and this fails.
     local jbin="$d/jkbbin"
     mkdir -p "$jbin"
     printf '%s\n' '#!/bin/sh' 'echo "JKB-RAN:$*"' >"$jbin/jkb"
@@ -1866,9 +1874,13 @@ case10l() {
         *"could not establish"*)
             case "$out11" in
                 *"JKB-RAN:task close-merged"*)
-                    ok "and an unestablished tree still closes merged tasks, which need no tree" ;;
-                *) fail "hookenv: closemerged" "one exit took close-merged with it; the refusal \
-says it skips setup.sh and it skipped both" ;;
+                    fail "hookenv: closemerged" "close-merged ran in a tree it cannot resolve to \
+a repository; measured, it answers 'not inside a git repo ... run this from the repo' and the \
+hook prints a second false line under the refusal" ;;
+                *"not closing merged tasks"*)
+                    ok "and it does not run close-merged, which cannot name this repository either" ;;
+                *) fail "hookenv: closemerged-silent" "chore 2 was skipped without saying so; in \
+the layout the arm ACCEPTS the pull looks entirely ordinary and the chore silently stops" ;;
             esac ;;
         *) fail "hookenv: closemerged-premise" "the fixture no longer reaches the unestablished \
 verdict: $(printf '%s' "$out11" | tr '\n' '|')" ;;
@@ -1915,7 +1927,23 @@ $(printf '%s' "$remedy" | tr '\n' '|')"
         out="$(cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q merge --no-edit feature 2>&1)"
         case "$out" in
             *"SETUP-RAN-IN:$btree"*)
-                ok "and after the remedy it is the ordinary case, building that very tree" ;;
+                ok "and after the remedy it is the ordinary case, building that very tree"
+                # ...ordinary for setup.sh, and NOT for chore 2, which is the half this layout
+                # had wrong before anyone looked. The declaration tells the HOOK which tree this
+                # is; it tells `jkb` nothing, because jkb rediscovers the repository from the cwd
+                # with the selection scrubbed and a `core.worktree` checkout has no `.git` to be
+                # found. So the accepted layout must say it is not closing tasks rather than
+                # print two false lines about task sessions — and must not do it silently, since
+                # everything else about this pull looks completely ordinary.
+                case "$out" in
+                    *"not closing merged tasks"*)
+                        ok "and it still says why it cannot close merged tasks in that layout" ;;
+                    *"not inside a git repo"*|*"close-merged failed"*)
+                        fail "hookenv: dotclose" "the accepted layout still runs close-merged, \
+which cannot resolve this tree to a repository" ;;
+                    *) fail "hookenv: dotclose-silent" "chore 2 vanished from an otherwise \
+ordinary-looking pull without a word" ;;
+                esac ;;
             *"could not establish"*|*"belongs to a different repository"*)
                 fail "hookenv: dotremedy-effect" "the remedy ran and changed nothing: \
 $(printf '%s' "$out" | tr '\n' '|')" ;;

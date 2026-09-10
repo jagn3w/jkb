@@ -136,6 +136,13 @@ if root_common="$(common_of "$repo_root")"; then
 else
     verdict=unestablished
 
+    # AND CHORE 2 IS OFF FROM HERE DOWN, including where this branch goes on to say `same`.
+    # Set in the branch rather than in one of the arms below, because it is a property of the
+    # branch: everything here is a tree that `git rev-parse` could not resolve to a repository
+    # with the caller's selection scrubbed, and that is precisely what `jkb task close-merged`
+    # does to find out which repository it is closing tasks for. See chore 2 for the measurement.
+    skip_close=1
+
     # ...because an answer we could not obtain is not the answer "a different repository". A
     # checkout set up with `core.worktree` has NO `.git` entry of its own, so discovering from
     # `$repo_root` with the environment scrubbed fails. The repository being merged knows the
@@ -300,17 +307,31 @@ case "$verdict" in
         # both dotfiles spellings build on the next pull WITH THE ALIAS UNCHANGED.
         echo "jkb: (your alias may keep setting the work tree; the declaration is what jkb" >&2
         echo "jkb:  trusts, and it is the repository's own answer rather than the caller's.)" >&2
-        # NOT `exit 0`. The sentence above says "Skipping setup.sh", and that is exactly what
-        # this skips — chore 2, `jkb task close-merged`, is a different question with a
-        # different answer. It needs only the repository the merge was ABOUT, which is not in
-        # doubt here: `$hook_common` named it, and `close-merged` scopes itself to the
-        # repository it is run from. What is unestablished is which TREE this is, and the tree
-        # is what setup.sh would build.
+        # NOT `exit 0`, and NOT because the two chores differ in what they need — SUPERSEDED,
+        # and the superseded claim is kept because it was confidently argued and measurably
+        # wrong. It read: "chore 2 needs only the repository the merge was ABOUT, which is not
+        # in doubt here: `$hook_common` named it, and `close-merged` scopes itself to the
+        # repository it is run from."
         #
-        # `elsewhere` still exits, because there the cwd belongs to a DIFFERENT repository and
-        # `close-merged` would scope itself to that one — closing tasks against the wrong repo
-        # key, quietly. Two verdicts, two answers; the one thing they must not share is a
-        # blanket `exit`.
+        # It scopes itself by DISCOVERING that repository from its cwd with `GIT_DIR`,
+        # `GIT_WORK_TREE` and `GIT_COMMON_DIR` scrubbed — the same three this file strips in
+        # `common_of`, and `--show-toplevel` needs strictly more than the `--git-common-dir`
+        # ask that just failed. `$hook_common` knows the answer and has no way to say it: there
+        # is no flag for it, and `--repo` is refused unless it equals a key close-merged could
+        # already compute. MEASURED against the real binary in the bare-dotfiles layout:
+        #
+        #     error: not inside a git repo — a task session is a git worktree, so run this from the repo
+        #
+        # and exit 1, so the hook adds `jkb: close-merged failed (continuing)`. Two lines, both
+        # false of this reader — they are not in a task session, and there is no other checkout
+        # to run it from — printed directly beneath a refusal whose entire worth is that every
+        # sentence in it is true.
+        #
+        # So the flags stay two, which is the part that was right: `same`-by-declaration runs
+        # setup.sh and skips chore 2, and those are genuinely two answers. What they must not
+        # share is a blanket `exit` — `elsewhere` keeps one, because there the cwd belongs to a
+        # DIFFERENT repository, discovery SUCCEEDS, and close-merged would close tasks against
+        # that repo's key, quietly.
         skip_setup=1 ;;
 esac
 
@@ -336,8 +357,22 @@ fi
 
 # --- 2. close tasks whose branch landed ----------------------------------------------
 # Runs in every repo that installs this hook, not just jkb: `close-merged` scopes itself to
-# the repo it is run from and needs nothing but git.
-if command -v jkb >/dev/null 2>&1; then
+# the repo it is run from — by DISCOVERING it from the cwd with the caller's repository
+# selection scrubbed, which is the one thing this hook already knows can fail here.
+#
+# `$skip_close` is that fact, computed once, sixty lines up: it is set on the branch where the
+# scrubbed ask did not resolve, which covers both the honest refusal AND the `core.worktree`
+# layout the arm accepts. In neither does close-merged have a repository to name; measured, it
+# prints "not inside a git repo — a task session is a git worktree, so run this from the repo"
+# and exits 1. Skipped WITH A LINE rather than silently, because in the accepted layout
+# everything else about the pull looks ordinary and a chore quietly not happening is how the
+# next round's defect gets built on top of it. The underlying gap — jkb's repository discovery
+# cannot see a `core.worktree` checkout at all, which also makes `install_git_hooks` report
+# `error=not a git repo` there — is filed, not papered over here: the scrub it would have to
+# relax is the one keeping jkb out of other people's repositories.
+if [ "${skip_close:-0}" = 1 ]; then
+    echo "jkb: not closing merged tasks — jkb cannot work out which repository this tree is" >&2
+elif command -v jkb >/dev/null 2>&1; then
     jkb task close-merged || echo "jkb: close-merged failed (continuing)"
 fi
 

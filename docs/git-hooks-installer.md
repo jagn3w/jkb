@@ -325,6 +325,25 @@ conventions every session is expected to know.
   three-valued `broken` (0 fine / 1 the value / 2 the probe): each arm becomes a single write and
   the stale combination cannot be spelled. The same shape as the `root_common` sentinel in
   `post-merge` — a state space with one more state than the code has names for.
+- **`jkb task close-merged` cannot run in either layout where the tree is not self-describing —
+  REVERSING the round-23 split.** That round ended the `unestablished` verdict with a flag
+  instead of `exit 0`, on the argument that chore 2 "needs only the repository the merge was
+  ABOUT, which `$hook_common` named". It does not need to be *told* that repository — it
+  DISCOVERS it, from its cwd, with `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` scrubbed
+  (`repo_ctx` → `main_root` → `rev-parse --show-toplevel`), which is strictly more than the
+  `--git-common-dir` ask whose failure produced the verdict. Measured against the real binary in
+  the bare-dotfiles layout: `error: not inside a git repo — a task session is a git worktree, so
+  run this from the repo`, exit 1, and the hook then adds `close-merged failed (continuing)` —
+  two lines, both false of that reader, printed under a refusal whose whole worth is that every
+  sentence in it is true. It fails the same way in the layout the arm ACCEPTS, which nobody had
+  measured: a `core.worktree` checkout has no `.git`, so scrubbed discovery cannot see it. So
+  the skip is set on the branch where the scrubbed ask failed — covering both — and chore 2 says
+  it is skipping rather than doing it silently. **The part that was right is that the flags stay
+  two**: `same`-by-declaration runs setup.sh and skips chore 2, which is genuinely two answers,
+  and only `elsewhere` still shares a blanket `exit` (there discovery SUCCEEDS and close-merged
+  would close tasks against the wrong repo key). The underlying gap is the filed one — jkb's
+  repository discovery cannot see a `core.worktree` checkout at all, which is also why
+  `install_git_hooks` reports `error=not a git repo` there.
 - **A repository whose EFFECTIVE `core.hooksPath` is unexpandable fails the RAW scope read too.**
   Measured on 2.51.1 while building that test: with `hooksPath = ~nosuchuser42/hooks` winning in
   `$GIT_DIR/config`, `git config --local --get-all core.hooksPath` — no `--path` — exits 128,
