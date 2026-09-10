@@ -325,6 +325,23 @@ conventions every session is expected to know.
   three-valued `broken` (0 fine / 1 the value / 2 the probe): each arm becomes a single write and
   the stale combination cannot be spelled. The same shape as the `root_common` sentinel in
   `post-merge` — a state space with one more state than the code has names for.
+- **A remedy must be written into the scope the value is HONOURED from.** Round 24's must-fix,
+  and the third time this refusal's one instruction has been inert for the layout it is printed
+  for. Reading a `config.worktree` declaration is what made that layout reachable; the line
+  printed beside it wrote the LOCAL scope, which a `config.worktree` value outranks. Measured on
+  2.51.1 — `config.worktree: core.worktree = /old` resolves to `/old`; `git --git-dir=D config
+  core.worktree /new` leaves it `/old`; `git --git-dir=D config --worktree core.worktree /new`
+  moves it. So the user ran the command, nothing changed, and the refusal reprinted for ever
+  beneath a new sentence claiming it "replaces that declaration". `core.bare` has the identical
+  hazard: a `config.worktree` `bare = true` survives a local `bare = false`. Both keys now go
+  through **one** `honoured_read`, which returns the value AND the flag needed to write it back
+  where it came from — reading and writing cannot disagree about scope because they are the same
+  function. Two follow-on lessons, both cheap and both already paid for elsewhere in this file:
+  a helper returning **two** facts must not be called in a command substitution (the scope was
+  assigned in a subshell and discarded, and every remedy printed the scope-less form again —
+  caught by the step that RUNS the remedy, one commit after it was written); and the mutation in
+  `case10l` step 9 lost its anchor for the second time when the declaration read moved into that
+  helper, which its own premise check reported rather than passing silently.
 - **`jkb task close-merged` cannot run in either layout where the tree is not self-describing —
   REVERSING the round-23 split.** That round ended the `unestablished` verdict with a flag
   instead of `exit 0`, on the argument that chore 2 "needs only the repository the merge was
@@ -559,13 +576,24 @@ conventions every session is expected to know.
     honours too, since a git predating the extension ignores `config.worktree` itself. The read
     mirrors the running git at every age.
 
-    **One `exit` served two chores, and only one of them was in doubt.** The refusal says
-    "Skipping setup.sh", and for a while it also skipped `jkb task close-merged` — which needs
-    only the repository the merge was ABOUT, and that was never in doubt: `$hook_common` named
-    it. What is unestablished is which *tree* this is, and the tree is what `setup.sh` builds.
-    `elsewhere` still exits on both, because there the cwd belongs to a different repository and
-    `close-merged` would scope itself to *that* one, closing tasks against the wrong repo key.
-    Two verdicts, two answers; what they must not share is a blanket `exit`.
+    **One `exit` served two chores — SUPERSEDED in the half that mattered.** This paragraph
+    used to end: "close-merged needs only the repository the merge was ABOUT, and that was never
+    in doubt: `$hook_common` named it." What reversed it: `close-merged` is never *told* that
+    repository, it DISCOVERS it — `repo_ctx` → `main_root` → `rev-parse --show-toplevel` with
+    the caller's selection scrubbed, which is strictly more than the `--git-common-dir` ask whose
+    failure produced this verdict. Measured against the real binary in the bare-dotfiles layout:
+    `error: not inside a git repo — a task session is a git worktree, so run this from the repo`,
+    exit 1, and the hook then adds `close-merged failed (continuing)` — two lines, both false of
+    that reader, under a refusal whose whole worth is that every sentence in it is true. It fails
+    the same way in the layout this arm ACCEPTS, which nobody had measured. So `$skip_close` is
+    set on the branch where the scrubbed ask failed, covering both, and chore 2 says it is
+    skipping rather than going quiet. See the bullet above for the full account.
+
+    **The half that stands** is that the flags are two, not one: `same`-by-declaration runs
+    `setup.sh` and skips chore 2, which is genuinely two answers. `elsewhere` alone keeps a
+    blanket `exit`, because there the cwd belongs to a different repository, discovery SUCCEEDS,
+    and `close-merged` would scope itself to *that* one, closing tasks against the wrong repo
+    key. What two verdicts must not share is one `exit` standing in for two decisions.
 
     Two things this arm does NOT buy, stated because half of it is missing: `setup.sh` runs, so
     the binary, extension and service refresh, but its **hook** section does not —

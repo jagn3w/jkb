@@ -1198,7 +1198,11 @@ _reconcile_exclude_decide() {
 #                             differs from before this run. The ONLY line that describes the
 #                             file; every other line describes one step or one pattern. Emitted
 #                             once per run by `reconcile_exclude`, below every arm.
-#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored | unaskable
+#   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored |
+#                             unaskable | unprobeable — the refusal words are DERIVED from
+#                             `_override_verdict`; `chainer.test.sh` case14 checks this list
+#                             against it, because a header that lags says a verdict the code
+#                             emits cannot happen.
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while

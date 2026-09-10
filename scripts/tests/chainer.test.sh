@@ -1293,7 +1293,13 @@ case14() {
     # `_override_statuses`, which derives itself from `_override_verdict`'s own arms; a verdict
     # that renders nothing is as bad as one that renders the catch-all, since `dispatch=direct`
     # is the silent verdict and silence would read as "the hook will run".
-    local st verdict rend uncovered_status=""
+    local st verdict word rend uncovered_status="" undocumented="" hdr
+    # ...and the PROTOCOL HEADER is a third hand-kept copy of the same vocabulary. `case10k`
+    # checks that every emitted KEY is documented and stops there, so the words after
+    # `dispatch=` went unchecked: code 6 shipped with `unprobeable` absent from the header,
+    # which tells a reader auditing the protocol that a verdict the code emits cannot happen.
+    # Derived from the same place as the arms, so the list has one home.
+    hdr="$(sed -n '/^#   dispatch=<verdict>/,/^#   error=/p' "$repo_root/scripts/lib.sh")"
     for st in $(_override_statuses); do
         verdict="$(_override_verdict "$st")"
         rend="$(printf 'dispatch=%s\n' "$verdict" | render_git_hooks_report 2>&1)"
@@ -1301,10 +1307,18 @@ case14() {
             "") uncovered_status="$uncovered_status $st(silent)" ;;
             *"unrecognised dispatch verdict"*) uncovered_status="$uncovered_status $st(no arm)" ;;
         esac
+        word="${verdict%% *}"
+        case "$hdr" in
+            *"$word"*) ;;
+            *) undocumented="$undocumented $st($word)" ;;
+        esac
     done
     [ -z "$uncovered_status" ] \
         && ok "and every refusal code the mapping can emit reaches a render arm, derived not listed" \
         || fail "render: status-arm" "refusal codes with no render arm:$uncovered_status"
+    [ -z "$undocumented" ] \
+        && ok "and every one of those verdict words is in the protocol header the reader audits" \
+        || fail "render: status-header" "verdict words the header does not list:$undocumented"
 
     # The two silent verdicts are silent ON PURPOSE — the lines above them already said the
     # hook will run — so assert the silence rather than leaving it unstated. Its OWN

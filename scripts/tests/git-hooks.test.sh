@@ -1783,11 +1783,15 @@ case10l() {
     #    is gone (round 22 read the declaration from the scopes git honours instead, which
     #    closes the forge the predicate was gesturing at), and a mutation whose target no longer
     #    exists is a test of nothing — this one caught its own obsolescence through the premise
-    #    check below, which is why the premise check is here. The seed is also the better
-    #    mutation: it tests the CONFINEMENT rather than the absence of one predicate, so it
-    #    survives any future rewording of the arm's internals.
+    #    check below, which is why the premise check is here. It has now caught it TWICE: the
+    #    seed first matched `declared=""`, which stopped existing when the read moved into
+    #    `honoured_read`. So the seed is APPENDED after whatever assignment the arm uses rather
+    #    than rewriting one, and it is anchored on `declared_raw=`, the line that has to exist
+    #    for the refusal to name the foreign declaration at all. The premise check below is what
+    #    makes any future miss loud instead of silent.
     local stripped="$d/post-merge.unconfined"
-    sed 's/^\( *\)declared=""$/\1declared="$repo_root"/' "$hook" >"$stripped"
+    sed 's/^\( *\)declared_raw="\$declared"$/\1declared="$repo_root"\n\1declared_raw="$declared"/' \
+        "$hook" >"$stripped"
     if ! grep -q 'declared="\$repo_root"' "$stripped"; then
         fail "hookenv: strip-premise" "the arm was not made permissive, so this tested nothing"
     else
@@ -2149,6 +2153,59 @@ $(printf '%s' "$out" | tr '\n' '|')" ;;
     else
         fail "hookenv: wtc-premise" "this git will not set a --worktree value, so this tested nothing"
     fi
+
+    # 16b. ...and THE REMEDY MUST REACH THAT SAME FILE. Reading a `config.worktree` declaration
+    #      is what made this layout reachable; the line printed beside the refusal wrote the
+    #      LOCAL scope, which a `config.worktree` value outranks. Measured on 2.51.1:
+    #
+    #        config.worktree: core.worktree = /old   ->  rev-parse --show-toplevel = /old
+    #        git --git-dir=D config core.worktree /new   ->  still /old
+    #        git --git-dir=D config --worktree …  /new   ->  /new
+    #
+    #      so the instruction did nothing, for ever, under a sentence claiming it "replaces that
+    #      declaration" — the identical failure round 22 fixed for the exported-work-tree
+    #      spelling, re-opened one scope over by the round that made the scope readable.
+    #
+    #      The fixture is the finding's own: a STALE declaration in `config.worktree` plus an
+    #      alias supplying the real tree, which is how a dotfiles checkout that has been moved
+    #      looks. The remedy is RUN, not matched — a substring check passes on a command that
+    #      writes the wrong file, which is the whole defect.
+    local stale="$d/wtcstale"
+    mkdir -p "$stale"
+    ( cd "$wtree" && GIT_DIR="$wgd" GIT_WORK_TREE="$wtree" git_q reset -q --hard HEAD~1 ) \
+        >/dev/null 2>&1
+    git_q --git-dir="$wgd" config --worktree core.worktree "$stale"
+    out="$(cd "$wtree" && GIT_DIR="$wgd" GIT_WORK_TREE="$wtree" git_q merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"could not establish"*)
+            local wremedy
+            wremedy="$(printf '%s\n' "$out" | sed -n 's/^jkb:   //p')"
+            if [ -z "$wremedy" ]; then
+                fail "hookenv: wtcremedy-premise" "the refusal printed no remedy line to run"
+            elif ! ( export GIT_DIR="$wgd" GIT_WORK_TREE="$wtree"
+                     while IFS= read -r line; do
+                         [ -n "$line" ] || continue
+                         eval "$line" || exit 1
+                     done <<<"$wremedy" ) >/dev/null 2>&1; then
+                fail "hookenv: wtcremedy-run" "a printed remedy line does not run: \
+$(printf '%s' "$wremedy" | tr '\n' '|')"
+            else
+                ( cd "$wtree" && GIT_DIR="$wgd" GIT_WORK_TREE="$wtree" git_q reset -q --hard HEAD~1 ) \
+                    >/dev/null 2>&1
+                out="$(cd "$wtree" && GIT_DIR="$wgd" GIT_WORK_TREE="$wtree" \
+                       git_q merge --no-edit feature 2>&1)"
+                case "$out" in
+                    *"SETUP-RAN-IN:$(cd "$wtree" && pwd -P)"*)
+                        ok "and the remedy reaches config.worktree, where such a declaration lives" ;;
+                    *"could not establish"*)
+                        fail "hookenv: wtcremedy-effect" "the remedy ran and changed nothing — it \
+wrote a scope the existing declaration outranks: $(printf '%s' "$wremedy" | tr '\n' '|')" ;;
+                    *) fail "hookenv: wtcremedy-other" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+                esac
+            fi ;;
+        *) fail "hookenv: wtcstale-premise" "a stale config.worktree declaration did not reach the \
+refusal, so the remedy was never printed: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
 
     # 17. ...and an INCLUDED declaration must skip, because git itself ignores it for work-tree
     #     resolution — measured, `rev-parse --show-toplevel` is not redirected by a

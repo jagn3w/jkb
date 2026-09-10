@@ -3399,16 +3399,8 @@ fn a_parent_with_an_open_subtask_is_refused_before_the_graft() {
 #[test]
 fn the_session_fixture_jkb_does_not_inherit_a_repository() {
     let fx = Fixture::new();
-    let cmd = fx.jkb();
-    let removed: Vec<String> = cmd
-        .get_envs()
-        .filter(|(_, v)| v.is_none())
-        .map(|(k, _)| k.to_string_lossy().into_owned())
-        .collect();
-    for want in common::MUST_DROP {
-        assert!(
-            removed.iter().any(|k| k == want),
-            "{want} is not removed from Fixture::jkb; removed: {removed:?}"
-        );
-    }
+    // Through the shared assertion, like its two siblings. Left hand-iterating `MUST_DROP` it
+    // checked only the REMOVALS — exactly the half-coverage `assert_isolated` was written to
+    // end, on the pin guarding every `jkb` spawn in this file.
+    common::assert_isolated("Fixture::jkb", &fx.jkb());
 }

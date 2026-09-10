@@ -94,6 +94,56 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
     [ -d "$c" ] || return 1
     (cd "$c" 2>/dev/null && pwd -P)
 }
+# honoured_read <key> [extra git config flags…] — set `$honoured_value` to the value git would
+# HONOUR for <key>, and `$honoured_scope` to the flag needed to write one back into that scope.
+#
+# TWO GLOBALS, and no printing, because the answer is two facts. Written as "print the value,
+# set the scope" it was called as `declared="$(honoured_read core.worktree)"` — a command
+# SUBSTITUTION, so the scope was assigned in a subshell and discarded, and every remedy printed
+# the scope-less form again. Caught immediately by the step that RUNS the remedy, which is the
+# only reason the fix for the finding was not itself the finding.
+#
+# One reader for both keys, because they have the same rule and the rule is not obvious. Git
+# honours `core.worktree` and `core.bare` from `$GIT_DIR/config`, and from
+# `$GIT_DIR/config.worktree` when `$GIT_DIR/config` itself enables `extensions.worktreeConfig` —
+# and a value in `config.worktree` OUTRANKS the local one. Measured on 2.51.1:
+#
+#     config.worktree: core.worktree = /old      rev-parse --show-toplevel -> /old
+#     git --git-dir=D config core.worktree /new  rev-parse --show-toplevel -> /old   (!)
+#     git --git-dir=D config --worktree … /new   rev-parse --show-toplevel -> /new
+#
+# That middle line was the printed remedy, so for anyone whose declaration lived in
+# `config.worktree` the instruction did nothing, for ever, under a sentence claiming it
+# "replaces that declaration". The same round that made such a declaration READABLE here is the
+# one that made it reachable. `core.bare` behaves identically — a `config.worktree` `bare = true`
+# survives a local `bare = false`, and the repository stays bare, so that remedy line is inert
+# in the same layout.
+#
+# So reading and writing go through one function: whatever scope the answer CAME from is the
+# scope the fix must go to. With no value anywhere, `$honoured_scope` is empty and a local write
+# is right — measured too: extension on, `config.worktree` holding no `core.worktree`, a local
+# declaration IS honoured.
+#
+# Degrades like the read it replaces: on a git without `--worktree` the first ask fails, the
+# value is empty, and everything falls through to `--local` — which is what that git honours.
+honoured_value=""
+honoured_scope=""
+honoured_read() {
+    local key="$1"
+    shift
+    honoured_value=""
+    honoured_scope=""
+    if [ "${wtc:-}" = true ]; then
+        honoured_value="$(git config --worktree "$@" "$key" 2>/dev/null)" || honoured_value=""
+        if [ -n "$honoured_value" ]; then
+            honoured_scope="--worktree"
+            return 0
+        fi
+    fi
+    honoured_value="$(git config --local "$@" "$key" 2>/dev/null)" || honoured_value=""
+    return 0
+}
+
 hook_common="$(common_of "")" || exit 0
 # THE VERDICT IS THREE-VALUED, AND THE ARM BELOW CAN REACH EXACTLY ONE OF ITS BRANCHES.
 #
@@ -192,14 +242,14 @@ else
     # remedy, nothing changed, and the same refusal reprinted for ever with a sentence that had
     # become false. Every harmful `GIT_WORK_TREE` case lands in `elsewhere`, which the arm cannot
     # reach, or fails the equality below.
-    declared=""
     wtc="$(git config --local --bool extensions.worktreeConfig 2>/dev/null)" || wtc=""
-    if [ "$wtc" = true ]; then
-        declared="$(git config --worktree core.worktree 2>/dev/null)" || declared=""
-    fi
-    if [ -z "$declared" ]; then
-        declared="$(git config --local core.worktree 2>/dev/null)" || declared=""
-    fi
+    honoured_read core.worktree
+    declared="$honoured_value"
+    # ...and WHERE it was honoured from, because the refusal below prints a command to change
+    # it and a write to the wrong scope is silently ignored. See `honoured_read`. Captured HERE
+    # rather than read at the print, because the `core.bare` read in the arm overwrites
+    # `$honoured_scope` and is printed first.
+    declared_scope="$honoured_scope"
     # Kept as read, because `$declared` is resolved to an absolute path below and the refusal
     # wants to show the operator the line that is actually in their config file.
     declared_raw="$declared"
@@ -291,16 +341,18 @@ case "$verdict" in
         # 2.51.1: with `core.bare` cleared first, the declaration takes and the next pull is the
         # ordinary case. It is printed only when the repository IS bare, because telling anyone
         # else to unset a flag they never set is noise a remedy cannot afford.
-        # `--local`, for the same reason the declaration twenty lines up is read that way. A
-        # bare read answers from `-c`, `GIT_CONFIG_COUNT`, `--global` and the environment — the
-        # caller's channels, every one — and this line decides what the operator is told to run.
-        # `git init --bare` writes `bare = true` into `$GIT_DIR/config`, so the layout this is
-        # printed for is exactly the one `--local` sees; case14 runs the printed remedy against
-        # a real bare repository, which is what says so rather than this comment.
-        if [ "$(git config --local --bool core.bare 2>/dev/null)" = true ]; then
-            echo "jkb:   git --git-dir=$(shq "$hook_common") config core.bare false" >&2
+        # Through `honoured_read`, for both reasons at once. A BARE `git config` read answers
+        # from `-c`, `GIT_CONFIG_COUNT`, `--global` and the environment — the caller's channels,
+        # every one — and this line decides what the operator is told to run. And the scope it
+        # answers FROM is the scope the remedy has to be written to, or the command is inert.
+        # `git init --bare` writes `bare = true` into `$GIT_DIR/config`, which is the layout
+        # this is printed for; `config.worktree` can hold it instead, and then a local
+        # `bare = false` changes nothing. case10l runs every printed line against both.
+        honoured_read core.bare --bool
+        if [ "$honoured_value" = true ]; then
+            echo "jkb:   git --git-dir=$(shq "$hook_common") config ${honoured_scope:+$honoured_scope }core.bare false" >&2
         fi
-        echo "jkb:   git --git-dir=$(shq "$hook_common") config core.worktree $(shq "$repo_root")" >&2
+        echo "jkb:   git --git-dir=$(shq "$hook_common") config ${declared_scope:+$declared_scope }core.worktree $(shq "$repo_root")" >&2
         # NOT "prefer that declaration to an exported GIT_WORK_TREE". That sentence named a
         # precondition which the scoped read removed: the alias may go on setting the work tree,
         # by flag or by variable, and the declaration is what jkb trusts either way. Measured —

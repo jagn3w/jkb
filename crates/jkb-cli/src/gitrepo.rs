@@ -1661,6 +1661,107 @@ mod tests {
         );
     }
 
+    /// Every quoted string on the lines of `const <name>`, up to the closing `];`.
+    ///
+    /// Enough of a parser for two `&[…]` literals and no more — it is here to compare two
+    /// lists, not to model Rust.
+    #[cfg(test)]
+    fn const_rows(src: &str, name: &str) -> Vec<Vec<String>> {
+        let needle = format!("const {name}");
+        let mut rows = Vec::new();
+        let mut inside = false;
+        for line in src.lines() {
+            if !inside {
+                if line.contains(&needle) {
+                    inside = true;
+                    // A one-line const carries its whole body here.
+                    let row = quoted(line);
+                    if !row.is_empty() {
+                        rows.push(row);
+                    }
+                    if line.trim_end().ends_with("];") {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if line.trim() == "];" {
+                break;
+            }
+            let row = quoted(line);
+            if !row.is_empty() {
+                rows.push(row);
+            }
+        }
+        assert!(!rows.is_empty(), "found no rows for `const {name}`");
+        rows
+    }
+
+    /// The double-quoted string literals on one line, in order.
+    #[cfg(test)]
+    fn quoted(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = line;
+        while let Some(a) = rest.find('"') {
+            let after = &rest[a + 1..];
+            let Some(b) = after.find('"') else { break };
+            out.push(after[..b].to_owned());
+            rest = &after[b + 1..];
+        }
+        out
+    }
+
+    /// The library's fixture isolation and the integration crates' must describe the SAME
+    /// environment.
+    ///
+    /// They are two lists on purpose — [`FIXTURE_CONFIG`] is `#[cfg(test)]`, and an integration
+    /// test is a separate crate compiled with `cfg(test)` off, so it cannot see it — and each
+    /// was asserted only against the fixtures beside it. That catches a fixture which stops
+    /// applying its own list; it does not catch a list that GROWS on one side, which is the
+    /// likelier edit and the historical one ("`isolate_git_env` unset five of seven"). Harden
+    /// one crate's fixtures against a new variable and the other's keep inheriting it, suite
+    /// green, while the doc comment says each is asserted against the function beside it as
+    /// though that closed the gap.
+    ///
+    /// So the two are compared at their source, the way the `SCRUBBERS` identity assertion
+    /// already compares a list against the thing that consumes it.
+    #[test]
+    fn the_two_fixture_isolation_lists_describe_the_same_environment() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read gitrepo.rs");
+        let tests =
+            std::fs::read_to_string(root.join("tests/common/mod.rs")).expect("read common/mod.rs");
+
+        // `(name, Some(value))` to set, `(name, None)` to remove — both sides normalised to it.
+        let mut library: Vec<(String, Option<String>)> = Vec::new();
+        for row in const_rows(&src, "FIXTURE_CONFIG") {
+            let (key, value) = (row[0].clone(), row.get(1).cloned());
+            library.push((key, value));
+        }
+        for row in const_rows(&src, "REPO_SELECTION_VARS") {
+            for key in row {
+                library.push((key, None));
+            }
+        }
+        let mut integration: Vec<(String, Option<String>)> = Vec::new();
+        for row in const_rows(&tests, "MUST_DROP") {
+            for key in row {
+                integration.push((key, None));
+            }
+        }
+        for row in const_rows(&tests, "MUST_SET") {
+            integration.push((row[0].clone(), Some(row[1].clone())));
+        }
+        library.sort();
+        integration.sort();
+        assert_eq!(
+            library, integration,
+            "the library's fixture isolation (FIXTURE_CONFIG + REPO_SELECTION_VARS) and the \
+             integration crates' (MUST_DROP + MUST_SET) disagree, so one crate's fixtures \
+             inherit something the other's do not"
+        );
+    }
+
     /// Every git spawn in this module drops the caller's repository selection.
     ///
     /// Asserted on the built `Command` rather than by exporting the variables, because
