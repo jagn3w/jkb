@@ -1603,6 +1603,24 @@ case10l() {
             *) fail "hookenv: cw" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
         esac
     fi
+
+    # 6. ...and the arm that accepts a DECLARED working tree must not accept a REDIRECTED one.
+    #    `core.worktree` and `GIT_WORK_TREE` answer the same question; the config one is the
+    #    repository's answer, the environment one is the caller's, and that distinction is the
+    #    whole guard. Found by probing the fix rather than by review: with `GIT_WORK_TREE`
+    #    leaked AND `core.worktree` naming that same foreign tree, the arm took it and built
+    #    somebody else's checkout — the arm re-opening the hole it sits above.
+    git_q -C "$d/mine" config core.worktree "$d/theirs"
+    git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)"
+    out="$(GIT_WORK_TREE="$d/theirs" git_q -C "$d/mine" merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"SETUP-RAN-IN:theirs"*)
+            fail "hookenv: declared-redirect" "a declared tree let a REDIRECTED one through" ;;
+        *"belongs to a different repository"*)
+            ok "and a declared working tree does not license a redirected one" ;;
+        *) fail "hookenv: dr" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+    git_q -C "$d/mine" config --unset core.worktree 2>/dev/null || :
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
@@ -1673,6 +1691,25 @@ reads it was never exercised"
     [ "$rc" = 0 ] && [ "$v" = /from-include ] \
         && ok "and a core.hooksPath reached through [include] is found, not reported absent" \
         || fail "oldscope: includes" "rc=$rc value='$v' — --includes is missing from the scoped read"
+
+    # A git that knows neither option answers 129 to EVERY scope. Absorbed into "not set in this
+    # scope", a repo with a stored core.hooksPath would read as storing none — which the caller
+    # renders as `dispatch=direct` and prints nothing for, the one verdict that is silent. So the
+    # refusals are counted: every asked scope refusing means the read FAILED (rc 2), not that
+    # nothing is stored.
+    printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do case "$a" in --show-scope|--includes) exit 129;; esac; done' \
+        "exec $(command -v git) \"\$@\"" >"$d/bin/git"
+    chmod 755 "$d/bin/git"
+    PATH="$d/bin:$PATH" git config --includes --get core.hooksPath >/dev/null 2>&1
+    if [ "$?" -ne 129 ]; then
+        fail "oldscope: nopremise" "the shim did not refuse --includes, so this case tested nothing"
+    else
+        ask "$d/r"
+        [ "$rc" = 2 ] \
+            && ok "and a git that refuses every option reads as unestablished, not as 'stores none'" \
+            || fail "oldscope: allrefused" "rc=$rc value='$v' — a failed read was spelled as an absent value"
+    fi
 }
 
 run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m

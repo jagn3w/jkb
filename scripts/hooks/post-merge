@@ -94,7 +94,17 @@ root_common="$(common_of "$repo_root")" || root_common=""
 #
 # The repository being merged knows the answer: `core.worktree` is IT DECLARING this working
 # tree. Asked in the hook's own environment, so it is that repository's config, not the caller's.
-declared="$(git config --path core.worktree 2>/dev/null)" || declared=""
+# ...but ONLY when the caller has not overridden the work tree. `core.worktree` and
+# `GIT_WORK_TREE` answer the same question — where this repository's files are — and the config
+# one is the REPOSITORY'S answer while the environment one is the CALLER'S, which is the whole
+# distinction this guard is built on. Measured: without this condition, a leaked `GIT_WORK_TREE`
+# plus a `core.worktree` naming that same foreign tree took the arm and built it, so the arm
+# re-opened the hole it sits above. With `GIT_WORK_TREE` set, git did not use `core.worktree`,
+# so it says nothing about the tree we are actually standing in.
+declared=""
+if [ -z "${GIT_WORK_TREE:-}" ]; then
+    declared="$(git config --path core.worktree 2>/dev/null)" || declared=""
+fi
 if [ -n "$declared" ] && [ -d "$declared" ] &&
    [ "$(cd "$declared" 2>/dev/null && pwd -P)" = "$(cd "$repo_root" 2>/dev/null && pwd -P)" ]; then
     root_common="$hook_common"
