@@ -84,74 +84,101 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
     (cd "$c" 2>/dev/null && pwd -P)
 }
 hook_common="$(common_of "")" || exit 0
-root_common="$(common_of "$repo_root")" || root_common=""
+# THE VERDICT IS THREE-VALUED, AND THE ARM BELOW CAN REACH EXACTLY ONE OF ITS BRANCHES.
+#
+# This is the shape correction a design pass produced after three consecutive rounds of defects
+# in the ~25 lines that follow. The two asks were never wrong; what oscillated was collapsing
+# their THREE outcomes into two. `root_common="$(common_of "$repo_root")" || root_common=""`
+# turned "could not establish" into a sentinel the comparison read as "a different repository",
+# and the acceptance arm then existed to repair that collapse — spelled as an assignment to
+# `root_common`, which made it an OVERRIDE of the comparison, able to rewrite any verdict at all.
+#
+# That is the machine that produced every round, and it explains why each locally-correct fix
+# opened the opposite defect: with no third place to stand, every fix had to choose which side
+# of one accept/refuse line to widen.
+#
+#   round 19  arm resolved the declaration against the HOOK'S CWD    false refusal
+#   round 20  arm dropped the comparison, asked only "is it set?"    false ACCEPTANCE: a
+#             (measured: `GIT_COMMON_DIR` makes git ignore the        GIT_COMMON_DIR leak ran
+#             declaration while `git config` still reports it)        another checkout's setup.sh
+#   round 21  arm restored the comparison + resolved per git-config  correct, but still an
+#                                                                     override held off by a
+#                                                                     list of predicates
+#
+# Measured across ten layouts: NO legitimate layout lands in "elsewhere", and NO harmful layout
+# lands in "same". Every ambiguity this guard has ever had lives inside "unestablished". So:
+#
+#   THE ARM MAY PROMOTE `unestablished` TO `same`. IT MUST NEVER SEE, LET ALONE REWRITE,
+#   AN ESTABLISHED ANSWER.
+#
+# Confined that way the invariant is structural rather than remembered — which is this repo's
+# own rule ("a rule every call site must remember is the defect") applied to the guard itself.
+# It also shrinks both failure modes at once: the worst a future arm bug can now do is accept a
+# tree NO repository owns, instead of building a different repository's checkout, and the worst
+# an over-narrow arm can do is an honest, remediable skip instead of a false permanent refusal.
+if root_common="$(common_of "$repo_root")"; then
+    if [ "$root_common" = "$hook_common" ]; then
+        verdict=same
+    else
+        verdict=elsewhere
+    fi
+else
+    verdict=unestablished
 
-# ...and an answer we could not obtain is not the answer "a different repository". A checkout
-# set up with `core.worktree` has NO `.git` entry of its own, so discovering from `$repo_root`
-# with the environment scrubbed fails — `root_common` comes back empty and the comparison below
-# read that as foreign, refusing a perfectly ordinary checkout and disabling the D34 automation
-# there permanently. Measured, with a bare-ish git dir outside the tree.
-#
-# The repository being merged knows the answer: `core.worktree` is IT DECLARING this working
-# tree. Asked in the hook's own environment, so it is that repository's config, not the caller's.
-# ...but ONLY when the caller has not overridden the work tree. `core.worktree` and
-# `GIT_WORK_TREE` answer the same question — where this repository's files are — and the config
-# one is the REPOSITORY'S answer while the environment one is the CALLER'S, which is the whole
-# distinction this guard is built on. Measured: without this condition, a leaked `GIT_WORK_TREE`
-# plus a `core.worktree` naming that same foreign tree took the arm and built it, so the arm
-# re-opened the hole it sits above. With `GIT_WORK_TREE` set, git did not use `core.worktree`,
-# so it says nothing about the tree we are actually standing in.
-# ...and the declaration has to NAME THE TREE WE ARE STANDING IN. "Set to something" is not the
-# same question. A previous round reasoned that it was — `$repo_root` came from `--show-toplevel`
-# in this environment, so git must have resolved the toplevel THROUGH `core.worktree` — and that
-# argument has a documented exception it did not survive: with `GIT_COMMON_DIR` set, git IGNORES
-# `core.worktree` and takes the cwd as the toplevel, while `git config` still reports the value.
-# Measured on 2.51.1, and then end to end: `GIT_DIR`+`GIT_COMMON_DIR` leaked at one repository
-# while standing in another ran the OTHER checkout's setup.sh — the whole harm this guard exists
-# to prevent, through the arm above it.
-#
-# So the comparison is back, and it asks about the relationship rather than about the selectors:
-# whatever variable disables `core.worktree` next, a declaration that does not name `$repo_root`
-# stops explaining why `$repo_root` looked foreign. Enumerating the selectors would have closed
-# `GIT_COMMON_DIR` and left the next one open.
-#
-# The relative form is resolved the way git documents it: "absolute or relative to the path to
-# the .git directory" (git-config(5)) — NOT to the hook's cwd, which refused a repository using
-# git's documented form, and not to the common dir. Measured: with `GIT_DIR=<d>/adm/gd` and
-# `core.worktree=../../rtree`, git's toplevel is `<d>/rtree` from any cwd, which is
-# `--absolute-git-dir` joined with the declaration.
-declared=""
-if [ -z "${GIT_WORK_TREE:-}" ]; then
-    declared="$(git config core.worktree 2>/dev/null)" || declared=""
-fi
-if [ -n "$declared" ]; then
-    # `--git-dir` and absolutise it here, NOT `--absolute-git-dir` — the same reasoning this file
-    # already applies to `--path-format=absolute` sixty lines up, and it was missing here.
-    # `--absolute-git-dir` is a much later addition than `--git-dir`: on a git without it
-    # rev-parse exits non-zero, `gitdir` is empty, this arm can never fire, and a `core.worktree`
-    # checkout is refused as foreign on EVERY pull, with the D34 automation silently off there.
+    # ...because an answer we could not obtain is not the answer "a different repository". A
+    # checkout set up with `core.worktree` has NO `.git` entry of its own, so discovering from
+    # `$repo_root` with the environment scrubbed fails. The repository being merged knows the
+    # answer, though: `core.worktree` is IT DECLARING this working tree. Asked in the hook's own
+    # environment, so it is that repository's config and not the caller's.
     #
-    # MEASURED, both forms, against a git shimmed to refuse `--absolute-git-dir`: the old form
-    # printed "belongs to a different repository" for a checkout git resolves perfectly well;
-    # this one proceeds. Note the shim has to be applied to a DIRECT run of this script — git
-    # prepends its own `GIT_EXEC_PATH` (which holds a real `git`) to PATH before running a hook,
-    # so a PATH shim never reaches one, and a `git merge` run of this test silently measures the
-    # unshimmed git and reports success either way. That false negative was observed first.
-    gitdir="$(git rev-parse --git-dir 2>/dev/null)" || gitdir=""
-    case "$gitdir" in
-        "") ;;
-        /*) ;;
-        # Relative to the CWD, which is where it was asked, exactly as in `common_of`.
-        *) gitdir="$PWD/$gitdir" ;;
-    esac
-    case "$declared" in /*) ;; *) declared="$gitdir/$declared" ;; esac
-    if [ -n "$gitdir" ] && [ -d "$declared" ] &&
-       [ "$(cd "$declared" 2>/dev/null && pwd -P)" = "$(cd "$repo_root" 2>/dev/null && pwd -P)" ]
-    then
-        root_common="$hook_common"
+    # ...but ONLY when the caller has not overridden the work tree. `core.worktree` and
+    # `GIT_WORK_TREE` answer the same question — where this repository's files are — and the
+    # config one is the REPOSITORY'S answer while the environment one is the CALLER'S, which is
+    # the distinction this whole guard is built on.
+    #
+    # Belt and braces now, and deliberately kept: the attack that motivated this condition (a
+    # leaked `GIT_WORK_TREE` plus a `core.worktree` naming that same foreign checkout) lands in
+    # `elsewhere`, which the arm can no longer reach. It is retained for one round rather than
+    # dropped in the same change that restructures the branch — the round-20 scar is precisely a
+    # confident argument that an arm could not misfire. `case10l` step 9 pins the confinement
+    # itself, so dropping this condition later is a measured decision rather than a hopeful one.
+    declared=""
+    if [ -z "${GIT_WORK_TREE:-}" ]; then
+        declared="$(git config core.worktree 2>/dev/null)" || declared=""
+    fi
+    if [ -n "$declared" ]; then
+        # `--git-dir` and absolutise it here, NOT `--absolute-git-dir` — the same reasoning this
+        # file applies to `--path-format=absolute` sixty lines up. `--absolute-git-dir` is a much
+        # later addition: on a git without it `gitdir` is empty, this arm can never fire, and a
+        # `core.worktree` checkout is refused on EVERY pull.
+        #
+        # MEASURED, both forms, against a git shimmed to refuse `--absolute-git-dir`: the old
+        # form printed "belongs to a different repository" for a checkout git resolves perfectly
+        # well. The shim must be applied to a DIRECT run of this script — git prepends its own
+        # `GIT_EXEC_PATH`, which holds a real `git`, before running a hook, so a PATH shim never
+        # reaches one and a `git merge` run silently measures the unshimmed git and passes
+        # either way. That false negative was observed first.
+        #
+        # The declaration is resolved as git-config(5) documents it: "absolute or relative to
+        # the path to the .git directory" — not to the hook's cwd, which refused a repository
+        # using git's own documented form.
+        gitdir="$(git rev-parse --git-dir 2>/dev/null)" || gitdir=""
+        case "$gitdir" in
+            "") ;;
+            /*) ;;
+            # Relative to the CWD, which is where it was asked, exactly as in `common_of`.
+            *) gitdir="$PWD/$gitdir" ;;
+        esac
+        case "$declared" in /*) ;; *) declared="$gitdir/$declared" ;; esac
+        if [ -n "$gitdir" ] && [ -d "$declared" ] &&
+           [ "$(cd "$declared" 2>/dev/null && pwd -P)" = "$(cd "$repo_root" 2>/dev/null && pwd -P)" ]
+        then
+            verdict=same
+        fi
     fi
 fi
-# What this arm buys, stated precisely because half of it is missing: setup.sh runs, so the
+
+# What the arm buys, stated precisely because half of it is missing: setup.sh runs, so the
 # binary, the extension and the service are refreshed. Its HOOK section is not — measured,
 # `install_git_hooks` reports `error=not a git repo` in this layout, because `_git` scrubs
 # `GIT_DIR` and the tree has no `.git` of its own to discover from. That message is false and
@@ -159,12 +186,37 @@ fi
 # bolted on here, since the scrub it would have to relax is the one keeping jkb out of other
 # people's repositories.
 
-if [ "$hook_common" != "$root_common" ]; then
-    echo "jkb: this merge is about $hook_common, but the working tree here is $repo_root," >&2
-    echo "jkb: which belongs to a different repository — GIT_DIR or GIT_WORK_TREE is set in" >&2
-    echo "jkb: your environment. Skipping, rather than building somebody else's checkout." >&2
-    exit 0
-fi
+case "$verdict" in
+    elsewhere)
+        echo "jkb: this merge is about $hook_common, but the working tree here is $repo_root," >&2
+        echo "jkb: which belongs to a different repository — GIT_DIR or GIT_WORK_TREE is set in" >&2
+        echo "jkb: your environment. Skipping, rather than building somebody else's checkout." >&2
+        exit 0 ;;
+    # ITS OWN SENTENCE, because it is its own fact. Reported as "belongs to a different
+    # repository", this refused the ordinary bare-dotfiles layout (a bare repo plus an exported
+    # `GIT_WORK_TREE`) with a claim that is false of it and a remedy that would break it — the
+    # rule this file states forty lines up and then broke.
+    #
+    # A skip and not a build, because within "unestablished" the legitimate dotfiles layout and
+    # a leak into a directory no repository owns are INDISTINGUISHABLE from the repository's own
+    # records: in both, the tree is solely the caller's word and the repository declares nothing.
+    # There is no signal to separate them, and the wrong guess registers a service and spends two
+    # minutes installing into a stranger's directory.
+    #
+    # What changes is the cost of being wrong: a true sentence that names a one-line remedy,
+    # which routes the user into the arm's legitimate accept on their next pull, instead of a
+    # false accusation that is silent and permanent. Any future environmental oddity that breaks
+    # the scrubbed ask — a `safe.directory` refusal, a leaked `GIT_CEILING_DIRECTORIES` — now
+    # degrades to this honest skip rather than to that accusation.
+    unestablished)
+        echo "jkb: could not establish which repository the checkout at $repo_root belongs to:" >&2
+        echo "jkb: it has no .git of its own, and the repository this merge is about does not" >&2
+        echo "jkb: declare it. Skipping setup.sh rather than guessing. To enable jkb here, tell" >&2
+        echo "jkb: the repository which tree is its own:" >&2
+        echo "jkb:   git --git-dir=$hook_common config core.worktree $repo_root" >&2
+        echo "jkb: (and prefer that declaration to an exported GIT_WORK_TREE)." >&2
+        exit 0 ;;
+esac
 
 # `post-merge` runs with $1 = 1 when the merge was a squash. ORIG_HEAD is the pre-merge tip
 # either way, so it is the honest range for "what did this pull bring in".

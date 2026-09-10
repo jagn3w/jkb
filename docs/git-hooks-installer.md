@@ -362,6 +362,48 @@ conventions every session is expected to know.
     | 19 | declared and `-d`, resolved against the hook's cwd | a git-documented **relative** declaration was refused — git anchors it on the **git directory**, not the cwd |
     | 20 | declared at all (the comparison dropped) | `GIT_COMMON_DIR` makes git **ignore** `core.worktree` while `git config` still reports it, so a leak at one repository **built another checkout** — the whole harm, through the arm above it |
     | 21 | declared, resolved against `--git-dir`, and equal to `$repo_root`; and `GIT_WORK_TREE` unset | holds both ways: the relative form is accepted, the ignored declaration is not |
+    | 22 | *nothing about the arm's predicates changed* — the arm was **confined** | the oscillation stopped being possible, rather than being patched again |
+
+    **Round 22 is the one worth reading, because it is not another predicate.** A design pass
+    asked why three locally-correct, individually-measured fixes each opened the opposite
+    defect, and found the answer in one line — `root_common="$(common_of "$repo_root")" ||
+    root_common=""`. That collapsed a THREE-valued fact into two: "could not establish" became a
+    sentinel the comparison read as "belongs elsewhere". The arm existed to repair the collapse,
+    and because it was spelled as an assignment to `root_common` it was an **override of the
+    comparison** — able to rewrite any verdict, not just the absent one. With no third place to
+    stand, every fix had to choose which side of one accept/refuse line to widen. Round 20 is
+    exactly that: the arm reaching a verdict that was never in doubt.
+
+    Measured across ten layouts: **no legitimate layout lands in `elsewhere`, and no harmful one
+    lands in `same`.** Every ambiguity this guard has ever had lives inside `unestablished`. So
+    the verdict is computed once, three-valued, and:
+
+    > **The acceptance arm may promote `unestablished` to `same`. It must never see, let alone
+    > rewrite, an established answer.**
+
+    Structural, not remembered — this record's own rule turned on the guard enforcing it. It
+    shrinks both failure modes at once: the worst a future arm bug can do is accept a tree *no
+    repository owns* rather than build a different repository's checkout, and the worst an
+    over-narrow arm can do is an honest, remediable skip rather than a false permanent refusal.
+    `case10l` step 9 pins the confinement by **removing** the arm's `GIT_WORK_TREE` predicate and
+    requiring the refusal to survive anyway — the difference between testing the belt and testing
+    the braces. It passes, which makes that predicate measured belt-and-braces; it is kept one
+    more round anyway, because the round-20 scar is precisely a confident argument that an arm
+    could not misfire.
+
+    `unestablished` now gets its own sentence and a one-line remedy (`config core.worktree`),
+    which resolves the bare-dotfiles false refusal without pretending to decide the undecidable:
+    inside `unestablished`, the legitimate dotfiles layout and a leak into a directory no
+    repository owns are indistinguishable from the repository's own records, so neither is built.
+
+    **A closed question was looked for and does not exist.** `git worktree list --porcelain` was
+    the best candidate — it answers from the repository's records and ignores `GIT_WORK_TREE` and
+    `GIT_COMMON_DIR` entirely — but measured, its main-worktree line names the **git directory,
+    not the working tree**, for every layout whose gitdir is detached: `core.worktree`,
+    `--separate-git-dir`, and submodules. Adopting it would have refused the layout the arm
+    exists for plus two the comparison already handles, as a simplification. Those last two had
+    no test until round 22 added steps 12 and 13; a layout with no case is a layout the next
+    round is free to break.
 
     The shape of the mistake was the same twice: a fix for a **false refusal** opened a **false
     acceptance**, and vice versa. Both directions have to be re-measured after any change here.

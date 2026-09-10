@@ -1535,6 +1535,22 @@ case10l() {
         git_q -C "$r" reset -q --hard HEAD~1
         cp "$hook" "$r/.git/hooks/post-merge"; chmod +x "$r/.git/hooks/post-merge"
     }
+    # Seed an EXISTING checkout (one whose repository was created by the caller, because these
+    # layouts are defined by how that creation was done) with the marker setup.sh, a crates/
+    # change on `feature`, and HEAD one commit back.
+    _hookenv_seed() {
+        local r="$1"
+        mkdir -p "$r/scripts"
+        printf 'seed\n' >"$r/seed"
+        printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+            >"$r/scripts/setup.sh"
+        chmod +x "$r/scripts/setup.sh"
+        git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm seed >/dev/null
+        mkdir -p "$r/crates"; printf 'x\n' >"$r/crates/x.rs"
+        git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm crates >/dev/null
+        git_q -C "$r" branch -q feature 2>/dev/null
+        git_q -C "$r" reset -q --hard HEAD~1
+    }
     _hookenv_build mine
     _hookenv_build theirs
 
@@ -1731,6 +1747,131 @@ case10l() {
         fail "hookenv: cd-premise" "GIT_COMMON_DIR no longer disables core.worktree, so this tested nothing"
     fi
     git_q -C "$d/mine" config --unset core.worktree 2>/dev/null || :
+
+    # 9. THE CONFINEMENT ITSELF, which is the invariant the round-22 design pass added: the
+    #    acceptance arm may promote "unestablished" to "same" and must never reach an
+    #    established answer. Every earlier step pins a PREDICATE that keeps the arm off a case
+    #    it should not take; this one removes the predicate and requires the refusal to survive
+    #    anyway. That is the difference between testing the belt and testing the braces — and
+    #    the round-20 defect was precisely an arm reaching a verdict that was never in doubt.
+    #
+    #    The hook is copied and the `GIT_WORK_TREE` guard stripped from the copy, so the arm's
+    #    condition is genuinely gone rather than merely unexercised. If this passes, that
+    #    condition is belt-and-braces and can be dropped as a measured decision.
+    local stripped="$d/post-merge.unconfined"
+    # Leading whitespace tolerated, so this still strips the guard if the block is ever
+    # re-indented — and so the pre-round-22 shape, where the guard sat at column 0, is a
+    # fixture this case can actually be run against.
+    sed 's/^\( *\)if \[ -z "${GIT_WORK_TREE:-}" \]; then$/\1if true; then/' "$hook" >"$stripped"
+    if ! grep -q 'if true; then' "$stripped"; then
+        fail "hookenv: strip-premise" "the GIT_WORK_TREE guard was not stripped, so this tested nothing"
+    else
+        git_q -C "$d/theirs" clean -qfd >/dev/null 2>&1 || :
+        git_q -C "$d/mine" config core.worktree "$d/theirs"
+        git_q -C "$d/mine" reset -q --hard "$(git_q -C "$d/mine" rev-parse feature~1)"
+        cp "$stripped" "$d/mine/.git/hooks/post-merge"
+        chmod +x "$d/mine/.git/hooks/post-merge"
+        out="$(GIT_WORK_TREE="$d/theirs" git_q -C "$d/mine" merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:$(cd "$d/theirs" && pwd -P)"*)
+                fail "hookenv: confinement" \
+                     "with its predicate removed the arm overrode an ESTABLISHED verdict and built theirs" ;;
+            *"belongs to a different repository"*)
+                ok "and the arm cannot reach an established verdict even with its guard removed" ;;
+            *) fail "hookenv: conf" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+        cp "$hook" "$d/mine/.git/hooks/post-merge"
+        chmod +x "$d/mine/.git/hooks/post-merge"
+        git_q -C "$d/mine" config --unset core.worktree 2>/dev/null || :
+    fi
+
+    # 10. The bare-dotfiles layout: a bare repo plus an exported `GIT_WORK_TREE`. `$repo_root`
+    #     IS the correct tree of the repository being merged, but it has no `.git` of its own,
+    #     so the scrubbed ask establishes nothing. This must not be spelled as "belongs to a
+    #     different repository" — that sentence is false of it, and the remedy it implies would
+    #     break the layout. It is the defect this round's design pass was asked to resolve.
+    local bgd="$d/dotfiles.git" btree="$d/dothome"
+    mkdir -p "$btree/scripts"
+    git_q init -q --bare "$bgd" >/dev/null 2>&1
+    printf 'seed\n' >"$btree/seed"
+    printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+        >"$btree/scripts/setup.sh"
+    chmod +x "$btree/scripts/setup.sh"
+    (
+        cd "$btree" && export GIT_DIR="$bgd" GIT_WORK_TREE="$btree"
+        git_q add -A && git_q commit -qm seed
+        mkdir -p crates && printf 'x\n' >crates/x.rs
+        git_q add -A && git_q commit -qm crates
+        git_q branch -q feature && git_q reset -q --hard HEAD~1
+    ) >/dev/null 2>&1
+    cp "$hook" "$bgd/hooks/post-merge"; chmod +x "$bgd/hooks/post-merge"
+    out="$(cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"belongs to a different repository"*)
+            fail "hookenv: dotfiles" "an unestablished identity was reported as a definite foreign one" ;;
+        *"could not establish which repository"*)
+            case "$out" in
+                *"config core.worktree"*)
+                    ok "and an identity we could not establish says so, and names the remedy" ;;
+                *) fail "hookenv: dotremedy" "the refusal names no remedy" ;;
+            esac ;;
+        *) fail "hookenv: dot" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+
+    # 11. ...and the same verdict must still SKIP. The two cases inside "unestablished" — this
+    #     legitimate one and a leak into a directory no repository owns — are indistinguishable
+    #     from the repository's own records, so the honest move is to build neither.
+    case "$out" in
+        *"SETUP-RAN-IN:"*) fail "hookenv: dotbuild" "it built a tree no repository vouches for" ;;
+        *) ok "and it builds nothing, because nothing vouches for that tree" ;;
+    esac
+
+    # 12/13. Two layouts that WORK today and nothing pinned — which is how a plausible
+    #        "improvement" removes them. The round-22 design pass evaluated replacing the two
+    #        asks with `git worktree list` membership and measured that it names the GIT
+    #        DIRECTORY rather than the working tree for exactly these layouts, so adopting it
+    #        would have refused both while looking like a simplification. A layout with no case
+    #        is a layout the next round is free to break.
+    local sgd="$d/sep.git" stree="$d/septree"
+    mkdir -p "$stree"
+    git_q init -q --separate-git-dir="$sgd" "$stree" >/dev/null 2>&1
+    if [ ! -f "$stree/.git" ]; then
+        fail "hookenv: sep-premise" "this git did not produce a .git FILE, so the layout is not the one named"
+    else
+        _hookenv_seed "$stree"
+        cp "$hook" "$sgd/hooks/post-merge"; chmod +x "$sgd/hooks/post-merge"
+        out="$(git_q -C "$stree" merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:$(cd "$stree" && pwd -P)"*)
+                ok "and a checkout whose .git is a FILE is the ordinary case" ;;
+            *"belongs to a different repository"*|*"could not establish"*)
+                fail "hookenv: sepgit" "a --separate-git-dir checkout was refused: $(printf '%s' "$out" | tr '\n' '|')" ;;
+            *) fail "hookenv: sep" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    fi
+
+    local sup="$d/super"
+    mkdir -p "$sup"
+    git_q init -q "$sup" >/dev/null 2>&1
+    printf 'x\n' >"$sup/f"; git_q -C "$sup" add -A >/dev/null; git_q -C "$sup" commit -qm init >/dev/null
+    if git_q -C "$sup" -c protocol.file.allow=always submodule add -q "$d/theirs" sub >/dev/null 2>&1 &&
+       [ -f "$sup/sub/.git" ]; then
+        _hookenv_seed "$sup/sub"
+        local subgd
+        subgd="$(git_q -C "$sup/sub" rev-parse --git-dir 2>/dev/null)"
+        case "$subgd" in /*) ;; *) subgd="$sup/sub/$subgd" ;; esac
+        cp "$hook" "$subgd/hooks/post-merge"; chmod +x "$subgd/hooks/post-merge"
+        out="$(git_q -C "$sup/sub" merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"SETUP-RAN-IN:$(cd "$sup/sub" && pwd -P)"*)
+                ok "and a submodule, whose git dir lives under the superproject, is too" ;;
+            *"belongs to a different repository"*|*"could not establish"*)
+                fail "hookenv: submodule" "a submodule was refused: $(printf '%s' "$out" | tr '\n' '|')" ;;
+            *) fail "hookenv: sub" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: sub-premise" "the submodule fixture did not build, so this tested nothing"
+    fi
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"
