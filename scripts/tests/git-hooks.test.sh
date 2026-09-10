@@ -1538,6 +1538,23 @@ case10l() {
     else
         fail "hookenv: wt-setup" "could not create a linked worktree"
     fi
+
+    # 4. Reached through a SYMLINK, which is the axis `pwd -P` exists for: --git-common-dir
+    #    answers the relative `.git`, and each side anchors it at the directory it was asked
+    #    from, so the two sides must still name one directory. A false refusal here disables
+    #    the D34 automation silently for anyone whose checkout path runs through a link.
+    _hookenv_build linked
+    if ln -s "$d/linked" "$d/vialink" 2>/dev/null && [ -d "$d/vialink" ]; then
+        out="$(git_q -C "$d/vialink" merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"belongs to a different repository"*)
+                fail "hookenv: symlink" "the guard fired on a checkout reached through a symlink" ;;
+            *"running setup.sh"*) ok "and a checkout reached through a symlink is the ordinary case" ;;
+            *) fail "hookenv: sym" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: sym-setup" "could not create a symlink"
+    fi
 }
 
 echo "==> scripts/lib.sh::git_hooks_dir + git_hooks_override + reconcile_exclude"

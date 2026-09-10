@@ -38,9 +38,16 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 # other people's professional repositories and must not build them.
 #
 # Asked of git, not of the variables: whether the checkout at $repo_root belongs to the
-# repository this merge was about. Both answers are resolved with `pwd -P` because a symlink,
-# a trailing slash and a `..` are three spellings of one directory. Best-effort, like
-# everything here: a question git will not answer stops the hook rather than failing the merge.
+# repository this merge was about. Best-effort, like everything here: a question git will not
+# answer stops the hook rather than failing the merge.
+#
+# `pwd -P` on both sides because a symlink, a trailing slash and a `..` are three spellings of
+# one directory — the rule `git_hooks_dir` needed in lib.sh, where literal equality DID produce
+# a false alarm. Stated honestly: it is DEFENSIVE here, not demonstrated. Five layouts were
+# tried on Linux (plain, symlinked checkout, linked worktree, submodule, and a `.git` symlinked
+# to a detached git dir) and removing it changed no answer in any of them, because git hands a
+# hook an already-resolved `GIT_DIR`. It is kept for the platform this box cannot reproduce,
+# where the temp or home path is itself a symlink (macOS `/tmp` -> `/private/tmp`).
 # `--git-common-dir` rather than `--path-format=absolute --git-common-dir`. `--path-format` is
 # a much later addition than `--git-common-dir` (not verified here to a version, which is why it
 # is avoided rather than relied on): on a git without it rev-parse exits non-zero, the hook
