@@ -336,12 +336,21 @@ conventions every session is expected to know.
   hazard: a `config.worktree` `bare = true` survives a local `bare = false`. Both keys now go
   through **one** `honoured_read`, which returns the value AND the flag needed to write it back
   where it came from — reading and writing cannot disagree about scope because they are the same
-  function. Two follow-on lessons, both cheap and both already paid for elsewhere in this file:
+  function. Three follow-on lessons, all cheap and all already paid for elsewhere in this file:
   a helper returning **two** facts must not be called in a command substitution (the scope was
   assigned in a subshell and discarded, and every remedy printed the scope-less form again —
   caught by the step that RUNS the remedy, one commit after it was written); and the mutation in
   `case10l` step 9 lost its anchor for the second time when the declaration read moved into that
-  helper, which its own premise check reported rather than passing silently.
+  helper, which its own premise check reported rather than passing silently. And the third,
+  caught by round 24's own self-review: the helper took the flag that DECIDES which scope to ask
+  — `extensions.worktreeConfig` — as an implicit input, a script-level variable assigned a
+  hundred lines below the definition and read nowhere else, so the second caller worked only
+  because the first had run. A caller that forgot it would get the LOCAL value silently while
+  git honoured the worktree one: this helper's own defect, reintroduced as a rule every call
+  site has to remember, inside the function written to remove that rule. It reads the flag
+  itself now, `local`, which is what `_hooks_path_read` in `lib.sh` had already settled on after
+  a stray global `true` sent it into a `--worktree` read that exits 128 in any repo with more
+  than one working tree.
 - **`jkb task close-merged` cannot run in either layout where the tree is not self-describing —
   REVERSING the round-23 split.** That round ended the `unestablished` verdict with a flag
   instead of `exit 0`, on the argument that chore 2 "needs only the repository the merge was

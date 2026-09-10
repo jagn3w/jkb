@@ -1299,7 +1299,25 @@ case14() {
     # `dispatch=` went unchecked: code 6 shipped with `unprobeable` absent from the header,
     # which tells a reader auditing the protocol that a verdict the code emits cannot happen.
     # Derived from the same place as the arms, so the list has one home.
-    hdr="$(sed -n '/^#   dispatch=<verdict>/,/^#   error=/p' "$repo_root/scripts/lib.sh")"
+    hdr="$(sed -n '/^#   dispatch=<verdict>/,/^#   error=/p' "$repo_root/scripts/lib.sh" \
+        | sed 's/^#[[:space:]]*//' | tr '\n' ' ')"
+    # THE VOCABULARY ONLY, not the prose beside it. The range has to reach `error=` to pick up
+    # the continuation line the list wraps onto, so it also swallows the sentences explaining
+    # where the list comes from — and a plain substring test over prose would accept a future
+    # verdict called `list` or `code` because the explanation happens to contain the word. Cut
+    # at the em dash the prose starts with, drop the key itself, and split the list on `|`.
+    hdr="${hdr%%—*}"
+    hdr="${hdr#dispatch=<verdict> [detail]}"
+    hdr=" $(printf '%s' "$hdr" | tr '|' ' ' | tr -s ' ' | sed 's/^ //;s/ $//') "
+    # A premise, because the two ways this extraction can fail are not equally loud. Cutting too
+    # LITTLE is silent — every word passes — while cutting too much fails everything. Today's
+    # list is eight words; anything past a dozen means the prose came with it.
+    local nwords
+    nwords="$(printf '%s' "$hdr" | wc -w | tr -d ' ')"
+    if [ "$nwords" -lt 1 ] || [ "$nwords" -gt 12 ]; then
+        fail "render: header-premise" "the verdict vocabulary could not be isolated from the \
+prose around it ($nwords words), so the check below asserts nothing: $hdr"
+    fi
     for st in $(_override_statuses); do
         verdict="$(_override_verdict "$st")"
         rend="$(printf 'dispatch=%s\n' "$verdict" | render_git_hooks_report 2>&1)"
@@ -1309,7 +1327,7 @@ case14() {
         esac
         word="${verdict%% *}"
         case "$hdr" in
-            *"$word"*) ;;
+            *" $word "*) ;;
             *) undocumented="$undocumented $st($word)" ;;
         esac
     done

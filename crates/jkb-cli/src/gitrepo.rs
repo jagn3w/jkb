@@ -1665,14 +1665,17 @@ mod tests {
     ///
     /// Enough of a parser for two `&[…]` literals and no more — it is here to compare two
     /// lists, not to model Rust.
-    #[cfg(test)]
     fn const_rows(src: &str, name: &str) -> Vec<Vec<String>> {
         let needle = format!("const {name}");
         let mut rows = Vec::new();
         let mut inside = false;
         for line in src.lines() {
             if !inside {
-                if line.contains(&needle) {
+                // Not a COMMENT that names it. This file carries the test's own prose about
+                // both constants, and latching onto a sentence would collect any quoted words
+                // in it and then go on to find the real rows below — so the mistake would pass
+                // rather than fail, which is the only kind worth a guard here.
+                if line.contains(&needle) && !line.trim_start().starts_with("//") {
                     inside = true;
                     // A one-line const carries its whole body here.
                     let row = quoted(line);
@@ -1698,7 +1701,6 @@ mod tests {
     }
 
     /// The double-quoted string literals on one line, in order.
-    #[cfg(test)]
     fn quoted(line: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut rest = line;

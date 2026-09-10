@@ -129,11 +129,24 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
 honoured_value=""
 honoured_scope=""
 honoured_read() {
-    local key="$1"
+    local key="$1" wtc
     shift
     honoured_value=""
     honoured_scope=""
-    if [ "${wtc:-}" = true ]; then
+    # Read HERE, not passed in. A caller that forgot it would get the LOCAL value silently while
+    # git honoured the worktree one — this function's own defect, reintroduced as a rule every
+    # call site has to remember, which is the shape this repository keeps paying for. It was a
+    # script-level variable set a hundred lines below the definition and read nowhere else, so
+    # the second caller worked only because the first had run. `local`, and the cost is one extra
+    # `git config` on a path that is about to print six lines of prose.
+    #
+    # `--local`, because `extensions.worktreeConfig` is a LOCAL-ONLY repository extension: git
+    # stores it per repository, so a global one — or a `-c` on the caller's command line — is not
+    # this repository's answer. The flag deciding HOW to read must come from the same place as
+    # the value; `_hooks_path_read` in lib.sh states the same rule at length, having been bitten
+    # by a stray global `true`.
+    wtc="$(git config --local --bool extensions.worktreeConfig 2>/dev/null)" || wtc=""
+    if [ "$wtc" = true ]; then
         honoured_value="$(git config --worktree "$@" "$key" 2>/dev/null)" || honoured_value=""
         if [ -n "$honoured_value" ]; then
             honoured_scope="--worktree"
@@ -242,7 +255,6 @@ else
     # remedy, nothing changed, and the same refusal reprinted for ever with a sentence that had
     # become false. Every harmful `GIT_WORK_TREE` case lands in `elsewhere`, which the arm cannot
     # reach, or fails the equality below.
-    wtc="$(git config --local --bool extensions.worktreeConfig 2>/dev/null)" || wtc=""
     honoured_read core.worktree
     declared="$honoured_value"
     # ...and WHERE it was honoured from, because the refusal below prints a command to change
