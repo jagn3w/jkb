@@ -107,7 +107,7 @@ missing_extensions() { # missing_extensions <declared, one per line> <installed,
     while read -r ext; do
         [ -n "$ext" ] || continue
         id="${ext%@*}"
-        printf '%s\n' "$installed" | grep -qiFx "$id" || out="$out $id"
+        grep -qiFx "$id" <<<"$installed" || out="$out $id"
     done <<<"$declared"
     printf '%s' "$out"
 }
@@ -268,7 +268,7 @@ reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <f
 if [ "$SELF_TEST" = yes ]; then
     st_fail=0
     st() { # st <mount point> <owned|checked>
-        if printf '%s' "$1" | grep -Eq "$RUNTIME_OWNED"; then got=owned; else got=checked; fi
+        if grep -Eq "$RUNTIME_OWNED" <<<"$1"; then got=owned; else got=checked; fi
         if [ "$got" = "$2" ]; then printf '  \033[32mok\033[0m   %-24s %s\n' "$1" "$2"
         else printf '  \033[31mFAIL\033[0m %-24s is %s, wanted %s\n' "$1" "$got" "$2"; st_fail=$((st_fail+1)); fi
     }
@@ -1193,7 +1193,7 @@ esac
 ws_mounted=no
 while IFS= read -r m; do
     [ -n "$m" ] || continue
-    printf '%s\n' "$EXPECTED" | grep -qx "$m" || continue
+    grep -qx "$m" <<<"$EXPECTED" || continue
     case "$mem_repo" in "$m"|"$m"/?*) ws_mounted=yes; break ;; *) ;; esac
 done <<<"$actual"
 assert "$mem_repo is inside a declared mount point" "$ws_mounted"

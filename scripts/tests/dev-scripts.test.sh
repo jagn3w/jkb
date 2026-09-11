@@ -22,6 +22,12 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/tests/harness.sh
 . "$(dirname "$0")/harness.sh"
+# ...and lib.sh, for `shell_sources` — the ONE file list `check.sh` and `ci.yml` already share.
+# A second glob here would be a second answer to "which files are scripts", and the defect the
+# newest case exists for lived in a directory the other scan's glob did not reach. Sourcing it is
+# definitions plus two harmless assignments; `git-hooks.test.sh` already does the same.
+# shellcheck source=scripts/lib.sh
+. "$repo_root/scripts/lib.sh"
 
 new_workdir
 
@@ -175,7 +181,194 @@ case2() {
     esac
 }
 
-echo "==> scripts/*.sh toolchain availability"
-run_cases case0 case1 case2
+# --- a pipe into a quiet grep, under pipefail ----------------------------------------------
+# `grep -q` exits at its FIRST match. A producer with more to write then dies on EPIPE, and
+# `set -o pipefail` makes the pipeline report THAT — so a SUCCESSFUL match comes back as a failed
+# test. Every occurrence is an inverted answer waiting for its input to grow.
+#
+# Two real instances, in two directories, found six days apart:
+#
+#   .container/run.sh          CI reported "run.sh no longer runs verify.sh" about a file that
+#                              did, the invocation sitting at byte 23501 of 25810.
+#   scripts/hooks/post-merge   announced "no build-affecting changes pulled — skipping setup.sh"
+#                              on a pull that changed every crate in the repository.
+#
+# The first was fixed with a scan local to `.container/*.sh` matching only the
+# `dc_strip_comments | grep -q` spelling. It could not have found the second: different spelling,
+# different directory. Two half-guards with the bug in the gap between them is the shape this
+# repository's own doc rules name as the defect, so there is ONE home, ONE glob and one message,
+# and the container-local copy is gone (a pointer stands where it was).
+#
+# MEASURED, bash 5.2.21 on Linux, 30 trials per cell, match on the first line:
+#
+#                    4 KB   8 KB   16 KB   32 KB   64 KB   82 KB
+#     pipefail       0/30   0/30    0/30   28/30   30/30   30/30
+#     no pipefail    0/30   0/30    0/30    0/30    0/30    0/30
+#
+# Three things follow, and each shapes the rule. It is PROBABILISTIC — a band, not a threshold —
+# so "our producer is small" is a claim about today's input. It is governed by the 64 KiB pipe
+# buffer rather than by write sizes: `printf` writes in 120-290 byte pieces, and what decides it
+# is whether the producer must BLOCK. And `pipefail` is the whole hazard: without it the
+# producer's death changes nothing, because `grep -q`'s own status is what the shell reports.
+#
+# So the rule is conditioned on `pipefail` rather than blanket. That is not a softening — it is
+# what makes the guard SELF-MAINTAINING. The three sites that survive it, both `.claude/hooks`
+# scripts, are safe only because those files set no shell options, and the day somebody adds
+# `set -o pipefail` to one this case fails and names the line. A blanket rule would have had to
+# exempt them by directory instead, which is the same fact written where nothing checks it.
+#
+# The fix is always a here-string. `<<<` is a pipe at or below 65536 bytes and a temp file above
+# (measured — the switch lands exactly on the pipe buffer), and it is safe either way for a reason
+# unrelated to which: the shell finishes the write before the consumer is exec'd, and there is ONE
+# command in the pipeline, so `pipefail` has no second status to take.
+_sets_pipefail() { grep -qE '\<set\>[^#]*pipefail' "$1"; }
+
+# ASSEMBLED FROM HALVES so this file cannot match its own detector. A check that fails on an
+# unmutated tree is the first thing a reader deletes, and this file has to spell the shape in
+# order to look for it.
+_racy_re() {
+    printf '%s%s' '(^|[^|])\|&?[[:space:]]*(command[[:space:]]+)?[ef]?g' \
+                  'rep([[:space:]]+-(-[a-z-]+|[A-Za-z]+))*[[:space:]]+(-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)([[:space:]]|$)'
+}
+
+# The files the rule applies to: those that set `pipefail`, plus any library they SOURCE, which
+# runs under the caller's options and sets none of its own. `scripts/lib.sh` and
+# `scripts/tests/harness.sh` are both in that second group and both are sourced by every suite
+# here — a racy line added to either would run under pipefail while a file-local check saw a file
+# with no `set` line at all.
+_pipefail_scope() {
+    local root="$1" f b libs
+    libs="$(while IFS= read -r f; do
+                _sets_pipefail "$f" || continue
+                sed -n 's/^[[:space:]]*\(\.\|source\)[[:space:]]\{1,\}["'"'"']*\([^"'"'"' ]*\).*/\2/p' "$f"
+            done < <(shell_sources "$root") | sed 's|.*/||' | sort -u)"
+    while IFS= read -r f; do
+        b="${f##*/}"
+        if _sets_pipefail "$f" || grep -qxF "$b" <<<"$libs"; then
+            printf '%s\n' "$f"
+        fi
+    done < <(shell_sources "$root")
+}
+
+_racy_sites() {
+    local f re
+    re="$(_racy_re)"
+    while IFS= read -r f; do
+        grep -nE "$re" "$f" 2>/dev/null \
+            | grep -vE '^[0-9]+:[[:space:]]*#' \
+            | sed "s|^|${f}:|"
+    done < <(_pipefail_scope "$1")
+}
+
+# --- 3. the detector, against every spelling it has to be right about ----------------------
+# Same reasoning as case0: a detector nothing tests is a silent exemption one level up. The probe
+# is written with `PIPE` where the character belongs and substituted in, so this suite's own source
+# never contains the shape and the real scan can never report this file.
+case3() {
+    local probe="$work/racy.sh" n hit want_hit want_miss re
+    re="$(_racy_re)"
+    sed 's/PIPE/|/g' >"$probe" <<'FORMS'
+  PIPE grep -qE 'x'
+printf '%s' "$1" PIPE grep -Eq "$RE"
+docker inspect x 2>/dev/null PIPE grep -q true
+cat f PIPEgrep -q x
+cat f PIPE egrep -q x
+cat f PIPE fgrep -q x
+cat f PIPE command grep -q x
+cat f PIPE& grep -q x
+cat f PIPE grep --quiet x
+cat f PIPE grep --silent x
+printf '%s' "${a[@]}" PIPE grep -qxF -- "$w"
+sed -n 1p f PIPE grep -q -- --flag
+grep -qE 'x' <<<"$changed"
+  PIPEPIPE grep -qF -- "$b" <<<"$(cat x)"
+procsub_safe='jqPIPEsedPIPEawkPIPEgrepPIPEcat'
+grep -q -- '--print-target' "$gen"
+  PIPE grep -vE '^[0-9]+:' PIPE head -1
+cat f PIPE grep -c .
+cat f PIPE grep -E 'x'
+# a comment about PIPE grep -q here
+  # PIPE grep -qE 'indented comment'
+cat f PIPE sed -n 1p
+FORMS
+    want_hit=""; want_miss=""
+    n=0
+    while IFS= read -r line; do
+        n=$((n + 1))
+        printf '%s\n' "$line" >"$work/one.sh"
+        hit="$(grep -nE "$re" "$work/one.sh" | grep -vE '^[0-9]+:[[:space:]]*#')"
+        if [ "$n" -le 12 ]; then
+            [ -n "$hit" ] || want_hit="$want_hit $n"
+        else
+            [ -z "$hit" ] || want_miss="$want_miss $n"
+        fi
+    done <"$probe"
+    [ "$n" -eq 22 ] || fail "pipefail: forms-premise" "read $n form(s), expected 22"
+    if [ -n "$want_hit" ]; then
+        fail "pipefail: forms-miss" "these real spellings of the idiom are not seen, so a script \
+using one is silently exempted:$want_hit"
+    elif [ -n "$want_miss" ]; then
+        fail "pipefail: forms-false" "these safe lines were read as the idiom, which is how a \
+guard gets deleted:$want_miss"
+    else
+        ok "the quiet-grep detector sees every spelling of the idiom, and no safe neighbour"
+    fi
+}
+
+# --- 4. ...and the glob reaches all five script directories --------------------------------
+# A FLOOR plus a planted file per directory. The floor alone is the mistake case1 already made
+# once: a scan pointed at the wrong list reports the same clean result as one pointed at
+# everything. `scripts/hooks/` held the real defect and is the directory the container-local scan
+# could not see, so "it reaches every directory" is the premise that matters here.
+case4() {
+    local fake="$work/fake" d n planted found
+    for d in scripts scripts/tests scripts/hooks .claude/hooks .container; do
+        mkdir -p "$fake/$d"
+        printf '%s\n' '#!/usr/bin/env bash' 'set -uo pipefail' \
+            "cat f $(printf '%s' '|') grep -q x" >"$fake/$d/planted.sh"
+    done
+    planted=5
+    # ...and one racy file per directory that sets NO shell options, which must NOT be reported.
+    # The rule's whole condition is `pipefail`, and a condition nothing tests is the way this
+    # guard would quietly become the blanket rule it deliberately is not — or, worse, stay
+    # blanket-shaped while reading as conditional. Today's three surviving sites are both
+    # `.claude/hooks` scripts, safe for exactly this reason.
+    for d in scripts scripts/tests scripts/hooks .claude/hooks .container; do
+        printf '%s\n' '#!/usr/bin/env bash' 'set -u' \
+            "cat f $(printf '%s' '|') grep -q x" >"$fake/$d/nopipefail.sh"
+    done
+    found="$(_racy_sites "$fake" | grep -c . || true)"
+    [ "$found" = "$planted" ] \
+        && ok "and the scan reaches all five script directories, and only where pipefail is set" \
+        || fail "pipefail: reach" "planted $planted racy files under pipefail (one per directory) \
+and $planted more without it, and the scan found $found rather than $planted — either the glob \
+does not cover what this rule claims to, or the pipefail condition is not being applied"
+
+    n="$(_pipefail_scope "$repo_root" | grep -c . || true)"
+    [ "$n" -ge 30 ] \
+        || fail "pipefail: coverage" "only $n file(s) are in scope, so the scan below asserts \
+almost nothing — shell_sources or the pipefail detection has regressed"
+}
+
+# --- 5. the rule itself --------------------------------------------------------------------
+case5() {
+    local sites count
+    sites="$(_racy_sites "$repo_root")"
+    count="$(grep -c . <<<"$sites" || true)"
+    [ -n "$sites" ] || count=0
+    if [ "$count" = 0 ]; then
+        ok "no script running under pipefail pipes into a quiet grep"
+    else
+        fail "pipefail: quiet grep" "$count site(s) feed a quiet grep through a pipe: it exits at \
+its first match, the producer dies on the unwritten tail, and pipefail reports the FOUND match as \
+a failure (28/30 at 32 KB; scripts/hooks/post-merge shipped it as 'no build-affecting changes'). \
+Match a here-string instead: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')"
+    fi
+}
+
+# ONE `run_cases`, because the harness requires the call to name every defined case — which is how
+# it catches a case written and never wired up.
+echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
+run_cases case0 case1 case2 case3 case4 case5
 
 finish

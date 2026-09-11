@@ -97,11 +97,15 @@ find_run_dir() {
     local roots=("$HOME/.claude/projects")
     [ -n "${CLAUDE_CONFIG_DIR:-}" ] && roots=("$CLAUDE_CONFIG_DIR/projects" "${roots[@]}")
     if [ -n "$arg" ]; then
-        find "${roots[@]}" -type d -name "$arg" 2>/dev/null | head -1
+        # `sed -n 1p`, not `head -1`: head EXITS after its line, find dies on the unwritten
+        # tail, and `set -euo pipefail` two dozen lines up turns that into an abort with no
+        # message. Measured: `producer | sort -rn | head -1` aborted 20/20 at 3000 lines,
+        # `| sed -n 1p` 0/20 — sed reads to EOF, so there is no early exit to race.
+        find "${roots[@]}" -type d -name "$arg" 2>/dev/null | sed -n 1p
     else
         find "${roots[@]}" -type d -name 'wf_*' -path '*/subagents/workflows/*' \
             2>/dev/null -exec stat -f '%m %N' {} + 2>/dev/null \
-            | sort -rn | head -1 | cut -d' ' -f2-
+            | sort -rn | sed -n 1p | cut -d' ' -f2-
     fi
 }
 

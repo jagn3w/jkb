@@ -115,7 +115,7 @@ judge() { # judge <label> <expect> <output> <rc>
     # Fixed-string, because the regex form escaped only some ERE metacharacters and silently
     # mis-matched "host bind source(s) parsed"; `-e`, because an expect may start with a dash,
     # which grep would otherwise read as an option.
-    if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
+    if [ "$rc" -ne 0 ] && grep -q "FAIL" <<<"$(grep -F -e "$expect" <<<"$out")"; then
         printf '  CAUGHT   %s\n' "$label"
     else
         fails=$((fails+1))
@@ -259,23 +259,6 @@ p = sys.argv[1]
 open(p, 'w').write("".join(l for l in open(p) if not l.startswith("ENTRYPOINT")))
 PYX
 run "the image stops running entrypoint.sh" "does not set ENTRYPOINT"
-
-# THE RACING IDIOM, REINTRODUCED. `dc_strip_comments <file> | grep -q` reports a FOUND match as a
-# failed pipeline under pipefail, because grep -q exits first and sed dies on the tail with EPIPE.
-# It is a race, so it passed on macOS and failed on the CI runner for identical bytes -- which is
-# exactly why a static refusal is worth having: nothing about running it locally would catch it.
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]
-# ASSEMBLED FROM TWO HALVES, for the same reason check-config.sh assembles the pattern it
-# searches with: this file has to CONTAIN the idiom in order to inject it, and a guard that
-# flags the harness injecting it is a guard that fails on an unmutated tree. The negative
-# control found exactly that -- which is what the negative control is for.
-lhs = 'dc_strip_comments "$here/run.sh" '
-rhs = '| grep -qE "verify" || true'
-open(p, "a").write("\n" + lhs + rhs + "\n")
-PYX
-run "a script pipes dc_strip_comments into grep -q" "pipes dc_strip_comments into grep -q"
 
 # THERE ARE NO REAPER-PATH MUTATIONS HERE, exactly as there are no verdict-path ones below: the
 # path is single-sourced as `ENV JKB_REAPER`, so there is no agreement between two spellings to
@@ -849,7 +832,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=72
+PINNED_BAD_SITES=71
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

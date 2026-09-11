@@ -96,7 +96,7 @@ n_declared="$(printf '%s\n' "$declared_pairs" | grep -c . || true)"
 if [ "$n_declared" -eq 0 ]; then
     bad "no --security-opt pairs could be read out of container.json's runArgs — every check over them below would pass having compared nothing"
 fi
-declares_security_opt() { printf '%s\n' "$declared_pairs" | grep -qxF -- "$1"; }
+declares_security_opt() { grep -qxF -- "$1" <<<"$declared_pairs"; }
 
 # WHAT IS DECLARED is a different question from what the control carries, and both are asked. This
 # one goes red when the profile is removed from container.json; the control guard below cannot,
@@ -450,28 +450,18 @@ else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
 fi
 
-# ...AND THE IDIOM THAT MADE THAT GUARD LIE, refused everywhere rather than fixed at the one site.
-# `dc_strip_comments <file> | grep -q <pat>` is the natural way to ask "does this script contain
-# X", and it is a race: grep -q exits at the first match, sed dies on the unwritten tail with
-# EPIPE, and `set -o pipefail` reports the SUCCESSFUL match as a failed pipeline. It passed on
-# macOS and failed on the CI runner for identical bytes, accusing run.sh of not invoking verify.sh
-# while the invocation sat at byte 23501 of 25810.
+# ...AND THE IDIOM THAT MADE THAT GUARD LIE is refused for the whole repository, in
+# `scripts/tests/dev-scripts.test.sh`, not here. The scan that stood in this place covered
+# `"$here"/*.sh` and matched only the `dc_strip_comments | grep -q` spelling, so it could not
+# have caught the instance that shipped in `scripts/hooks/post-merge` — a different spelling in a
+# directory it did not read. Two half-guards with the bug in the gap between them is what this
+# repository's doc rules call the defect; one home, one glob (`shell_sources`, 41 files across all
+# five script directories), one message.
 #
-# THE PATTERN IS ASSEMBLED FROM TWO HALVES so this guard does not match its own source line -- a
-# check that fails on itself is the first thing a reader deletes. Narrow ON PURPOSE: it covers the
-# dc_strip_comments idiom, which is the one that recurs here, and NOT every file-reader piped into
-# grep -q. `printf "$var" | grep -q` is safe (a single write completes before grep can exit), so a
-# blanket rule would be mostly false positives. Stated rather than implied: this does not cover the
-# whole class, only the shape that has bitten.
-racy_lhs='dc_strip_comments[^|]*'
-racy_rhs='[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q'
-racy="$(printf '%s\\|%s' "$racy_lhs" "$racy_rhs")"
-racy_hits="$(grep -nE "$racy" "$here"/*.sh 2>/dev/null | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
-if [ -z "$racy_hits" ]; then
-    ok "no script pipes dc_strip_comments into grep -q (that race reports a found match as a failure)"
-else
-    bad "a script pipes dc_strip_comments into grep -q — grep -q exits at the first match and sed dies on the tail, so under pipefail a SUCCESSFUL match reports as a failed pipeline (use stripped_matches): $(printf '%s' "$racy_hits" | head -2 | tr '\n' ' ')"
-fi
+# Its narrowing argument is also corrected there: this block exempted `printf "$var" | grep -q` as
+# "a single write, safe", and post-merge was exactly that shape. Measured, bash 5.2.21, 30 trials:
+# 0/30 failures at 16 KB and 28-30/30 at 32-82 KB, with `pipefail` set and 0/30 without it at any
+# size. The deciding condition is `pipefail`, not the producer.
 
 # THE ENTRYPOINT LINE ITSELF. `ENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]` appears exactly once
 # and was referenced by no check: delete it in a rebase or a base-image bump and the build
@@ -666,7 +656,7 @@ while IFS= read -r hit; do
     case "$line" in
         *'#'*dc_require_apparmor_profile*) continue ;;   # prose about it, not a call
     esac
-    if ! printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="\$\(dc_require_apparmor_profile '; then
+    if ! grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="\$\(dc_require_apparmor_profile ' <<<"$line"; then
         bad "$f:$n calls dc_require_apparmor_profile somewhere its \`exit 1\` cannot stop the script — it must be a plain assignment (\`name=\"\$(dc_require_apparmor_profile …)\"\`), or the empty name it refuses reaches docker as \`apparmor=\`, which is docker-default"
         shape_ok=0
     fi
@@ -827,7 +817,7 @@ for f in "$here"/*.sh; do
 done
 [ "${#callers[@]}" -gt 0 ] || bad "no script here calls init-firewall.sh — the derivation below is checking nothing"
 for want in setup.sh run.sh entrypoint.sh; do
-    printf '%s\n' "${callers[@]##*/}" | grep -qxF "$want" \
+    grep -qxF "$want" <<<"$(printf '%s\n' "${callers[@]##*/}")" \
         || bad "$want no longer reaches the firewall-argument guard (did it stop calling init-firewall.sh?)"
 done
 for caller in ${callers[@]+"${callers[@]}"}; do

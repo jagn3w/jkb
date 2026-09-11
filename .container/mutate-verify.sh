@@ -207,7 +207,7 @@ HEALTHY=("${POSTURE[@]}" ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 # AppArmor mutations below are skipped as a group when there is none, and skipping them on a
 # DIFFERENT answer from the one the container was started with is a guard reporting about another
 # machine.
-control_has() { printf '%s\n' "${HEALTHY[@]}" | grep -qF -- "$1"; }
+control_has() { grep -qF -- "$1" <<<"$(printf '%s\n' "${HEALTHY[@]}")"; }
 control_has_apparmor() { control_has 'apparmor='; }
 
 # A MUTATION CHANGES EXACTLY ONE THING, and hand-spelling the reduced flag set is how that stopped
@@ -409,7 +409,7 @@ judge() { # judge <label> <expect> <output> <rc>
   # guards as caught while they were deleted. Fixed-string, because the regex form escaped only
   # some ERE metacharacters and silently mis-matched "host bind source(s) parsed"; `-e`, because an
   # expect may start with a dash, which grep would otherwise read as an option.
-  if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
+  if [ "$rc" -ne 0 ] && grep -q "FAIL" <<<"$(grep -F -e "$expect" <<<"$out")"; then
     caught=$((caught+1))
     # The EXPECT, not the count. Coverage is a property of which failure paths in verify.sh were
     # driven, and several mutations legitimately share one — so counting mutations answers a
@@ -744,7 +744,7 @@ if ! grep -qF -e "$control_label" <<<"$control_out"; then
   self_ok=0
   echo "  MATCHER PROVES NOTHING: a healthy container's output never mentions \"$control_label\","
   echo "  so every CAUGHT above matched a string this harness cannot show discriminates."
-elif grep -F -e "$control_label" <<<"$control_out" | grep -q "FAIL"; then
+elif grep -q "FAIL" <<<"$(grep -F -e "$control_label" <<<"$control_out")"; then
   self_ok=0
   echo "  MATCHER IS BROKEN: that label is on a FAIL line in a HEALTHY container, so a CAUGHT"
   echo "  above means nothing — the matcher fires when nothing is wrong."

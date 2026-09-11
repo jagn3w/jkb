@@ -880,3 +880,60 @@ conventions every session is expected to know.
   itself triggers, since a pull runs the hook, which runs setup.sh, which reinstalls the binary,
   whose next invocation reconciles that bundle, and a running `/task-swarm` or `/review` reads
   those files. Three installers, one rule, so it is not a rule each new installer must remember.
+- **A pipe into a quiet `grep` reports a FOUND match as a failure — refused for the whole
+  repository, conditioned on `pipefail`.** `grep -q` exits at its first match; a producer with
+  more to write dies on EPIPE; `set -o pipefail` reports that, so the test comes back inverted.
+  Two real instances, in two directories, six days apart: `.container/run.sh` had CI announce
+  "run.sh no longer runs verify.sh" about a file that did (the invocation at byte 23501 of
+  25810), and `scripts/hooks/post-merge` announced "no build-affecting changes pulled — skipping
+  setup.sh" on a pull that changed every crate. The first was fixed with a scan local to
+  `.container/*.sh` matching only the `dc_strip_comments | grep -q` spelling, which could not
+  have found the second: different spelling, different directory. **Two half-guards with the bug
+  in the gap between them** — so there is now one home (`scripts/tests/dev-scripts.test.sh`), one
+  glob (`shell_sources`, 41 files across all five script directories, the same list `check.sh`
+  and `ci.yml` use) and one message, and the container-local copy is a pointer.
+
+  Measured, bash 5.2.21 on Linux, 30 trials per cell, match on the first line:
+
+  |             | 4 KB | 8 KB | 16 KB | 32 KB | 64 KB | 82 KB |
+  |---|---|---|---|---|---|---|
+  | `pipefail`    | 0/30 | 0/30 | 0/30 | 28/30 | 30/30 | 30/30 |
+  | no `pipefail` | 0/30 | 0/30 | 0/30 |  0/30 |  0/30 |  0/30 |
+
+  Three corrections come out of that table, and each one had been asserted the other way in this
+  repository first. It is **probabilistic** — a band, not a threshold — so the "800 files pass,
+  900 fail" pair originally recorded for `post-merge` was one sample reported as an edge, and
+  "our producer is small" is a claim about today's input rather than a property. It is governed
+  by the **64 KiB pipe buffer**, not by write sizes: `printf` writes in 120-290 byte pieces, and
+  what decides it is whether the producer must BLOCK — the container fix's "buffer size is
+  irrelevant" and this file's earlier "bash writes in 4 KB stdio chunks" were both wrong, in
+  opposite directions. And **`pipefail` is the entire hazard**: without it the producer's death
+  changes nothing, because `grep -q`'s own status is what the shell reports. That last one also
+  refutes the container fix's exemption of `printf "$var" | grep -q` as "a single write, safe" —
+  `post-merge` was exactly that shape.
+
+  So the rule is conditioned rather than blanket, and that is what makes it self-maintaining: the
+  three sites it permits today are both `.claude/hooks` scripts, safe only because those files
+  set no shell options, and the day one of them gains a `set -o pipefail` the case fails and
+  names the line. A blanket rule would have had to exempt them by directory — the same fact
+  recorded where nothing checks it. The scope includes any library a `pipefail` script SOURCES,
+  because `scripts/lib.sh` and `scripts/tests/harness.sh` set no options of their own and run
+  under their caller's; a racy line in either is pinned by that, verified by planting one.
+
+  The fix is always a here-string. `<<<` is a pipe at or below 65536 bytes and a temp file above
+  — the switch landing exactly on the pipe buffer — and it is safe either way for a reason that
+  has nothing to do with which: the shell finishes the write before the consumer is exec'd, and
+  there is ONE command in the pipeline, so `pipefail` has no second status to take. "A here-string
+  is a temp file" was the third wrong claim, corrected here.
+
+  **`head -N` is the same race and is deliberately NOT machine-checked.** Of 25 sites in this
+  tree, 23 are safe — status discarded inside a command substitution, `|| true`-guarded, or a
+  producer bounded to a line or two by construction — so a rule would be ~2/25 precise, which is
+  the shape of guard that gets deleted rather than obeyed. The two real ones were fixed by hand
+  (`scripts/swarm-status.sh`'s `find`/`sort` pair, measured 20/20 aborts at 3000 lines against
+  0/20 for `sed -n 1p`; `.container/check-drift.sh`'s stderr excerpt). Spelling "first line" as
+  `sed -n 1p` is a convention, stated here, not a gate. Found alongside them and fixed with them:
+  `check-drift.sh`'s `diff -u … | head -60` sits in the arm reached only when the files DIFFER,
+  and `diff` exits 1 on every difference, so under `set -euo pipefail` the first drifting
+  artifact ended the run and skipped every later generator — measured, the next line does not
+  execute.

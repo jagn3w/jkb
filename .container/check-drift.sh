@@ -283,7 +283,10 @@ for gen in "$here"/generate-*.sh; do
         # Restore first: a generator that died part-way must not leave a half-written policy behind.
         cp "$snapshot" "$target"
         printf '  \033[31mFAIL\033[0m %s could not run (exit %s) — drift is UNCHECKED, not absent\n' "$name" "$rc"
-        sed 's/^/         /' "$snapshot.err" | head -5
+        # `sed -n 1,5p` rather than `head -5`, under `set -euo pipefail`: head exits at five
+        # lines and the producer dies on the tail, so a generator whose stderr runs past 4 KB
+        # would abort this loop while REPORTING that generator's failure.
+        sed 's/^/         /' "$snapshot.err" | sed -n 1,5p
         status=1; RESTORE_FROM=""; RESTORE_TO=""; rm -f "$snapshot" "$snapshot.err"; continue
     fi
 
@@ -310,7 +313,13 @@ for gen in "$here"/generate-*.sh; do
                 printf '         digest — so this cannot be attributed to upstream or to a local edit.\n'
                 printf '         Make the generator record `upstream-sha256: <hex>` in what it writes.\n' ;;
         esac
-        diff -u "$snapshot" "$target" | sed 's/^/         /' | head -60
+        # TWO failures in one line, both of which abort the loop under `set -euo pipefail`,
+        # and this is the arm reached only when the files DIFFER. `diff` exits 1 on every
+        # difference — so the first drifting artifact ended the run, skipping every later
+        # generator and the restore three lines down (the EXIT trap covers the file, not the
+        # coverage). And `head -60` exits early, killing the producer on a long diff. Measured:
+        # the line after this one does not run, and the script exits 1.
+        { diff -u "$snapshot" "$target" || true; } | sed 's/^/         /' | sed -n 1,60p
     fi
     cp "$snapshot" "$target"
     RESTORE_FROM=""; RESTORE_TO=""

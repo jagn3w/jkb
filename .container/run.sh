@@ -783,7 +783,7 @@ in_container() { # in_container <args...>
     local rc=0
     docker exec "$@" || rc=$?
     if [ "$rc" -ne 0 ] \
-       && ! docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true; then
+       && ! grep -q true <<<"$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)"; then
         container_died "docker exec $*"
         exit 1
     fi
