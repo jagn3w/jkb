@@ -85,6 +85,15 @@ pub const MUST_DROP: &[&str] = &[
     // the victim's store. Both `assert_isolated` guards stayed green throughout, because they
     // compare against `EXPECT_DROPPED`, which spelled the same five names.
     //
+    // AND THE CLASS IS BOUNDED BY MEASUREMENT, not left as an open claim — an incomplete class
+    // stated as complete is the defect this branch keeps finding. Four more discovery-adjacent
+    // variables were exported one at a time over `gitrepo::tests` and NONE reaches the harm here:
+    // `GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`, `GIT_NAMESPACE`,
+    // `GIT_INDEX_VERSION` — 17 passed, 0 failed, victim untouched, in every case. They bound
+    // discovery or choose a format rather than naming a repository part, and these fixtures pass
+    // an absolute `-C <dir>` so discovery from the cwd is not the path they take. If one of them
+    // ever does reach it, this list is where it goes.
+    //
     // FIXTURE SIDE ONLY. `scrub_repo_selection` deliberately stays at the three that select a
     // repository: production must not discard a component a caller legitimately handed it (git
     // exports `GIT_INDEX_FILE` to hook processes), while a fixture must not inherit anything it
