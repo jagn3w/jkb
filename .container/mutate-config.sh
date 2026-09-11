@@ -260,31 +260,13 @@ open(p, 'w').write("".join(l for l in open(p) if not l.startswith("ENTRYPOINT"))
 PYX
 run "the image stops running entrypoint.sh" "does not set ENTRYPOINT"
 
-# THE REAPER PATH, all three ways its guard can fire. PID 1 must reap or every orphan reparented
-# to it is a zombie for ever; the path is spelled in two files that cannot share a variable, and
-# a build-time `test -x` against one spelling says nothing about the other.
-seed; python3 - "$work/t/.container/entrypoint.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("JKB_REAPER:-/usr/bin/tini", "JKB_REAPER:-/usr/local/bin/tini"))
-PYX
-run "the two files spell the reaper differently" "spell the reaper differently"
-
-seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
-import sys
-p = sys.argv[1]
-open(p, 'w').write("".join(l for l in open(p) if "test -x" not in l))
-PYX
-run "the Dockerfile stops asserting the reaper exists" "no longer asserts exactly one reaper path"
-
-# ...and the one that is the ORIGINAL DEFECT restated: a bare `exec "$@"` makes `sleep` PID 1.
-seed; python3 - "$work/t/.container/entrypoint.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('exec "${JKB_REAPER:-/usr/bin/tini}" -- "$@"', 'exec "$@"'))
-PYX
-run "entrypoint.sh hands over without a reaper (the original leak)" "no longer hands over through exactly one"
-
+# THE REAPER-PATH MUTATIONS ARE GONE with the guard they exercised, exactly as the verdict-path
+# ones below went. Two of them broke the agreement between the Dockerfile's `test -x` and
+# entrypoint.sh's `exec` default; there is one spelling now (`ENV JKB_REAPER`), so there is no
+# agreement to break. The third restored the original defect — a bare `exec "$@"`, making `sleep`
+# PID 1 — and it moves rather than disappears: `entrypoint.sh --self-test` asserts the handover
+# goes THROUGH the reaper by way of a stub that records having run, and ./scripts/check.sh runs it.
+#
 # THE VERDICT-PATH MUTATIONS ARE GONE with the guard they exercised (D52.5). They broke one
 # reader's spelling of /run/jkb-egress-verdict and required check-config.sh to notice the drift.
 # There is now one spelling -- `VERDICT_PATH` in egress-lib.sh, sourced by the writer and both
@@ -851,7 +833,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=74
+PINNED_BAD_SITES=71
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

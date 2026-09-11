@@ -430,39 +430,16 @@ else
     bad "the Dockerfile does not set ENTRYPOINT to entrypoint.sh — docker start would come up with no firewall"
 fi
 
-# THE REAPER PATH IS SPELLED IN TWO FILES THAT CANNOT SHARE A VARIABLE. The Dockerfile asserts it
-# exists at BUILD time (`test -x`), entrypoint.sh EXECS it to become a PID 1 that reaps -- without
-# which `sleep` is PID 1, never wait()s, and every orphan reparented to it is a zombie for ever
-# (README.md, "The measurements this is built on"). Move tini's install -- to /usr/local/bin, say,
-# which is where this image deliberately puts every other privileged binary -- update one spelling
-# and not the other, and the BUILD STILL PASSES: every route into the container then dies at
-# `exec: not found`, exit 127, and run.sh's settle() reports `gone`. What the reader is then shown
-# is `container_died`, which names the egress boot gate as the likeliest cause -- correctly, since
-# it usually is -- so the first thing audited is a boundary that is fine.
-# Neither self-test can catch it: entrypoint.sh's runs through the injected stub and never
-# exercises the default. Same shape as the ENTRYPOINT guard above.
+# THE REAPER PATH IS NOT GUARDED HERE EITHER, and for the same reason as the verdict path below:
+# it is no longer duplicated. It was, briefly — the Dockerfile's `test -x` and entrypoint.sh's
+# `exec` default each named /usr/bin/tini — and this file carried 33 lines asserting the two
+# agreed, with three mutations in mutate-config.sh watching them fail. That guard was correct and
+# it was the wrong answer: the Dockerfile now sets `ENV JKB_REAPER`, which reaches both the
+# build-time `test -x` and the entrypoint process, so there is one spelling and nothing to keep in
+# step. The duplication it policed included a THIRD site it did not cover — mutate-verify.sh's
+# `gcc -o` target — which had already gone stale, which is what a guard over duplication buys you
+# instead of deleting the duplication.
 #
-# BOTH EXTRACTIONS ARE PINNED AGAINST EMPTY AND AGAINST MORE THAN ONE MATCH -- a sed that silently
-# matched nothing would leave this comparing "" with "" and printing its ok, which is this
-# directory's recurring defect rather than a hypothetical one.
-# COMMENT LINES ARE DROPPED FIRST. Without that, the guard's subject is an instruction while it
-# is reading prose: delete the real `test -x` from the RUN block, leave a comment naming the same
-# path, and this printed ok about a build that asserts nothing. A grep, not a Dockerfile lexer --
-# this asks one question about one line, and every COPY and RUN here is a plain unindented
-# instruction.
-df_reaper="$(grep -vE '^[[:space:]]*#' "$here/Dockerfile" \
-    | sed -n 's/^.*test -x[[:space:]][[:space:]]*\([^[:space:]\\]*\).*$/\1/p')"
-ep_reaper="$(sed -n 's/^exec "\${JKB_REAPER:-\([^}]*\)}".*$/\1/p' "$here/entrypoint.sh")"
-if [ "$(printf '%s\n' "$df_reaper" | grep -c .)" -ne 1 ]; then
-    bad "the Dockerfile no longer asserts exactly one reaper path with \`test -x\` (found: ${df_reaper:-none}) — a missing reaper would surface only as the container failing to start"
-elif [ "$(printf '%s\n' "$ep_reaper" | grep -c .)" -ne 1 ]; then
-    bad "entrypoint.sh no longer hands over through exactly one \`exec \"\${JKB_REAPER:-<path>}\"\` (found: ${ep_reaper:-none}) — PID 1 would not reap"
-elif [ "$df_reaper" != "$ep_reaper" ]; then
-    bad "the Dockerfile and entrypoint.sh spell the reaper differently ($df_reaper vs $ep_reaper) — the build would pass and the container would fail to start"
-else
-    ok "the reaper the Dockerfile asserts is the one entrypoint.sh execs ($df_reaper)"
-fi
-
 # THE VERDICT PATH IS NO LONGER GUARDED HERE, because it is no longer duplicated (D52.5). This
 # carried a check that init-firewall.sh, entrypoint.sh and verify.sh all named /run/jkb-egress-verdict
 # identically, justified by a comment reading "three different processes [that] cannot share a

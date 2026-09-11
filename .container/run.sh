@@ -788,8 +788,21 @@ case "$settle_rc" in
     2) # Reported, not continued through. Proceeding here is what the old code did for every one
        # of these, and it is what let the execs below race a half-built chain.
        printf '\n\033[31merror:\033[0m could not read PID 1 in %s, so this script cannot tell\n' "$NAME" >&2
-       printf 'whether the entrypoint has finished deciding. `ps` may be missing from the image.\n' >&2
-       printf 'Everything below would be racing a firewall that may still be coming up.\n' >&2
+       printf 'whether the entrypoint has finished deciding. Everything below would be racing a\n' >&2
+       printf 'firewall that may still be coming up.\n\n' >&2
+       # TWO CAUSES, AND THE SECOND ONE IS THIS REPO'S OWN BUG. The probe is `docker exec ... ps`,
+       # so it needs to FORK INSIDE the container -- and a container whose PID 1 does not reap
+       # eventually cannot, having spent every one of container.json's 4096 pids on zombies. That
+       # is the exact end state verify.sh's reaping assertion exists to name, and naming only a
+       # missing `ps` here pre-empted it: the reader was sent to audit the image while the actual
+       # remedy, which is to recreate the container, was never printed because verify.sh never ran.
+       # `docker top` reads the process table from OUTSIDE, so it answers where the probe cannot.
+       printf '  `ps` may be missing from the image — or the container cannot fork at all,\n' >&2
+       printf '  which is what a PID 1 that does not reap comes to after a day (every one of\n' >&2
+       printf '  its pids spent on zombies). Tell them apart from outside the container:\n\n' >&2
+       printf '    docker top %s          # reads the table from the host; no fork inside\n' "$NAME" >&2
+       printf '\n  If that shows thousands of processes, recreate it:\n' >&2
+       printf '    ./.container/run.sh --rm && ./.container/run.sh --build\n' >&2
        exit 1 ;;
     3) printf '\n\033[31merror:\033[0m %s is still running its entrypoint after 120s.\n' "$NAME" >&2
        printf 'The firewall raise resolves the allowlist by DNS, so a black-holed resolver holds it\n' >&2

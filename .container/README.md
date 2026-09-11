@@ -53,11 +53,23 @@ a failure is attributable to the container profile and not the kernel.
   3968 tasks, and 4083 of `container.json`'s 4096 PIDs spent** — thirteen from a container that
   could not fork at all. It is one zombie per sandboxed Bash call, so it tracks agent activity and
   an unattended session reaches the limit unaided. `entrypoint.sh` execs tini now.
-- **Docker's `--init` is deliberately not how that is done.** It wraps the entrypoint, so PID 1's
-  argv names `entrypoint.sh` for the container's whole life — and `run.sh`'s `settle()` reads a
-  match of `entrypoint.sh` as "not finished yet", so under `--init` it never settles and every
-  create and start fails on its 120s budget. Exec'ing tini *from* the entrypoint keeps PID 1's
-  argv meaningful to that probe.
+## Why `--init` is not how PID 1 is made to reap
+
+Kept out of the measurements above on purpose: this one is **reasoned, not measured**, and a
+section called "the measurements this is built on" must not carry an argument nobody ran.
+
+Docker's `--init` wraps the entrypoint rather than being exec'd by it, so PID 1's argv would name
+`entrypoint.sh` for the container's whole life. `run.sh`'s `settle()` reads a match of
+`entrypoint.sh` in `ps -o args= -p 1` as "the entrypoint has not finished yet", so under `--init`
+it would never settle, and every create and start would fail on its 120s budget — blaming a
+black-holed resolver, since that is what usually holds a raise there. Exec'ing tini *from* the
+entrypoint keeps PID 1's argv meaningful to that probe: `entrypoint.sh sleep infinity` while the
+script runs, `tini -- sleep infinity` the moment it hands over.
+
+What *is* pinned is the consequence rather than the premise: `run.sh --self-test` carries a
+`settle_step` row for docker-init's argv asserting it reads as `waiting`. Whether `--init` really
+produces that argv has not been run here. Nothing refuses `--init` in `runArgs` either, so if you
+are reaching for it, this section is the whole of what stops you.
 
 ## Using it
 
@@ -416,9 +428,18 @@ the Dockerfile and rebuild, or `docker exec -u root` from the host.
 
 ## Verifying it
 
-- `verify.sh` — inside the container: non-root, bwrap works, the mount set is exactly as declared,
-  `~/.claude` is not a host mount, root is reachable only for the firewall, egress is denied *and*
-  the allowlist still works, posture intact.
+- `verify.sh` — inside the container: non-root, **PID 1 reaps what it adopts**, bwrap works, the
+  mount set is exactly as declared, `~/.claude` is not a host mount, root is reachable only for the
+  firewall, egress is denied *and* the allowlist still works, posture intact.
+  - The reaping assertion **fails on every container created before it existed**, which is correct
+    and is the point: the fix is an image change, and nothing else observes a running container —
+    `run.sh` without `--build` finds the argument hash and the image id both matching and starts
+    the old one. Recreate: `./.container/run.sh --rm && ./.container/run.sh --build`.
+  - It **refuses to run inside Claude Code's own sandbox**, which wraps a Bash tool call in
+    `bwrap --unshare-pid --proc /proc`. In there `/proc/1` and `/proc/self/mountinfo` are bwrap's,
+    so both the reaping and mount-boundary assertions would describe the wrong subject — and the
+    reaping one would *pass*, because bwrap's init reaps. Run it from a plain terminal in the
+    attached container, or let `run.sh` run it for you.
 - **Run these from your own terminal, not from an agent session.** Once the host posture is
   installed the Docker CLI is unreachable — `~/.docker/bin` is under `denyRead: ["~"]` and in no
   `allowRead` entry, so it fails with `Operation not permitted`. That is the posture working: an

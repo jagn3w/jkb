@@ -176,7 +176,13 @@ if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then
         # so the entrypoint boots and prints the recorded reason for the `denied` arm.
         printf '#!/usr/bin/env bash\ncase "$*" in *egress-status*) printf "state=denied\\n";; esac\nexit 0\n' > "$t/bin/sudo"
         chmod +x "$t/bin/sudo"
-        JKB_EGRESS_VERDICT="$t/verdict" PATH="$t/bin:$PATH" bash "$ep" echo BOOTED >/dev/null 2>"$t/err" || true
+        # JKB_REAPER is the entrypoint's handover target, normally the image's `ENV JKB_REAPER`.
+        # It has no default — two spellings of the path is what a guard was briefly added to
+        # police — so it must be supplied here, and a transparent stand-in keeps this a round-trip
+        # through a boot that COMPLETES rather than one that aborts at the last line. `env --`
+        # exists on both platforms this self-test runs on.
+        JKB_EGRESS_VERDICT="$t/verdict" JKB_REAPER=/usr/bin/env PATH="$t/bin:$PATH" \
+            bash "$ep" echo BOOTED >/dev/null 2>"$t/err" || true
         eq "the remedy reaches the operator" "$(grep -c 'Fix DNS and re-run this' "$t/err")" "1"
     fi
 

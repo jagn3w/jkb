@@ -609,7 +609,7 @@ mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/s
 run "blanket passwordless root is restored" "may run more than the firewall and the egress probe as root" \
     "${HEALTHY[@]}"
 
-# A PID 1 THAT NEVER wait()s. Replacing /usr/bin/tini with an init that runs the command and
+# A PID 1 THAT NEVER wait()s. Replacing the image's reaper with an init that runs the command and
 # observes its exit through waitid(WNOWAIT) -- which leaves that child, and every orphan this
 # process adopts, a zombie -- removes exactly the property the handover exists to supply, and
 # nothing else: firewall, mounts, entrypoint, sudoers and user are all untouched.
@@ -641,7 +641,15 @@ int main(int argc, char **argv) {
 }
 C
 )"
-mutant jkb-dev-no-reaper "printf %s '$NO_REAP_B64' | base64 -d > /tmp/noreap.c && gcc -O0 -o /usr/bin/tini /tmp/noreap.c && { /usr/bin/tini -- sh -c 'exit 7'; [ \"\$?\" -eq 7 ]; }"
+# THE TARGET IS NOT A LITERAL. It used to be `/usr/bin/tini`, hard-coded, with nothing able to
+# notice that the path had stopped being the reaper -- move tini and this would compile a new,
+# unused binary at a path nothing runs, the propagation check would exercise that same unused
+# binary and pass, the container would exec the real reaper, and `judge` would report MISSED. A
+# tooling failure dressed as a guard that did not fire, in the file whose whole job is detecting
+# guards that cannot fire. `$JKB_REAPER` is the image's own ENV, and the mutant is built `FROM
+# $IMAGE`, so it carries it: if the image stops declaring one, the RUN fails and this is reported
+# as BUILD-FAILED -- which is honest about being tooling -- rather than as a healthy guard missing.
+mutant jkb-dev-no-reaper "test -n \"\$JKB_REAPER\" && printf %s '$NO_REAP_B64' | base64 -d > /tmp/noreap.c && gcc -O0 -o \"\$JKB_REAPER\" /tmp/noreap.c && { \"\$JKB_REAPER\" -- sh -c 'exit 7'; [ \"\$?\" -eq 7 ]; }"
 run "PID 1 never wait()s (tini replaced by an init that observes its child with WNOWAIT)" "PID 1 does not reap" \
     "${HEALTHY[@]}"
 
@@ -729,8 +737,14 @@ fi
 # can only make coverage look worse than it is, while a missed one makes it look better. So this
 # takes any non-comment, non-definition line that calls `bad` or `assert` however it is written,
 # and deliberately does not try to be exact.
+# ANCHORED AT THE LINE NUMBER, because `grep -n` output is `NNN:<content>` and an unanchored
+# filter matches the CONTENT too: a `bad` whose message text contains `: #` or `: name()` was
+# dropped from the denominator. That is a realistic shape right here -- this file spells seven
+# `could not establish whether PID 1 reaps: ...` messages and the area's vocabulary is `wait()`
+# and `waitid()` -- and dropping one makes coverage read BETTER than it is, silently, which is
+# the direction this block exists to avoid.
 all_paths="$(grep -nE '(bad "|assert )' "$V" 2>/dev/null \
-    | grep -vE ':[[:space:]]*#' | grep -vE ':[[:space:]]*[a-z_]+\(\)' \
+    | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE '^[0-9]+:[[:space:]]*[a-z_]+\(\)' \
     | cut -d: -f1 | sort -un)"
 n_all="$(printf '%s' "$all_paths" | grep -c '^' || true)"
 # NOT `comm`, which requires both inputs in ITS collating order — bytes — while these are line

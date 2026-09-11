@@ -16,6 +16,15 @@ FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 # bubblewrap + socat are what Claude Code's Linux sandbox shells out to; its own dependency error
 # names exactly those two. iptables/ipset/dnsutils are for the egress firewall, which is the layer
 # that survives if the nested sandbox ever fails to start.
+# THE REAPER, SPELLED ONCE. entrypoint.sh execs this to become a PID 1 that reaps; without it
+# `sleep infinity` is PID 1, never wait()s, and every orphan reparented to it is a zombie for ever
+# (README.md, "The measurements this is built on"). An ENV rather than a literal in two files
+# because it is visible BOTH to the `test -x` below, which fails the build if the package stops
+# putting it here, AND to the entrypoint process and every `docker exec`, since ENV persists into
+# the image config. Two spellings needed a guard to keep them in step; one needs nothing, which is
+# what this directory did for /run/jkb-egress-verdict once egress-lib.sh single-sourced it.
+ENV JKB_REAPER=/usr/bin/tini
+
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
         bubblewrap socat ripgrep jq tini \
@@ -24,10 +33,10 @@ RUN apt-get update -qq \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs \
     && corepack enable \
-    # entrypoint.sh execs this ABSOLUTE path to become a PID 1 that reaps. If the package ever
-    # stops putting it here the container would fail to start at all, with the cause one exec
-    # deep -- so it fails the BUILD instead, the way the sudoers `visudo -c` check does.
-    && test -x /usr/bin/tini \
+    # If the package ever stops putting it where JKB_REAPER says, the container would fail to
+    # start at all, with the cause one exec deep -- so it fails the BUILD instead, the way the
+    # sudoers `visudo -c` check does.
+    && test -x "$JKB_REAPER" \
     && rm -rf /var/lib/apt/lists/*
 
 # The firewall script is installed INTO THE IMAGE, root-owned, and sudoers grants exactly that one

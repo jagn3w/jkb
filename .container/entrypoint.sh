@@ -237,8 +237,16 @@ esac
 #
 # The egress boot gate above is untouched — it has already run and can still have refused.
 #
-# Path-injected for the self-test, like JKB_EGRESS_VERDICT and JKB_INET6_PATH: this line is the
-# one thing in here that cannot run on a macOS host otherwise. The DEFAULT is not exercised by
-# that test, deliberately — a stub would only prove the stub — so the Dockerfile asserts
-# `test -x /usr/bin/tini` at build time and the two halves together cover the path.
-exec "${JKB_REAPER:-/usr/bin/tini}" -- "$@"
+# NO DEFAULT, DELIBERATELY. The path is the Dockerfile's `ENV JKB_REAPER`, which reaches this
+# process because ENV persists into the image config — so writing a fallback here would put the
+# path in two files again, which is the duplication a guard was briefly added to police instead of
+# remove. `:?` turns a dropped ENV into a named failure at start rather than into `exec: not
+# found` one level down, where run.sh reports it as the container dying and names the egress boot
+# gate as the likeliest cause.
+#
+# The variable doubles as the self-test seam, as JKB_EGRESS_VERDICT and JKB_INET6_PATH do: the
+# macOS self-test sets it to a transparent stub, since this is the one line in here that cannot
+# otherwise run off Linux. What that test proves is that the script hands over THROUGH whatever
+# JKB_REAPER names; that the named thing exists and reaps is the Dockerfile's `test -x` and
+# verify.sh's runtime assertion respectively.
+exec "${JKB_REAPER:?the image must set JKB_REAPER (see the Dockerfile) — refusing to become PID 1 without a reaper}" -- "$@"
