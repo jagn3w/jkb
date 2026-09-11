@@ -49,10 +49,16 @@ a failure is attributable to the container profile and not the kernel.
 - **`verify.sh` measures the wrong PID 1 inside a nested namespace, and now refuses.** Measured in
   the container, both topologies, one command apart. Under
   `bwrap --bind / / --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc`, PID 1 is
-  **bwrap itself** — so before the refusal existed, `verify.sh` reported `ok PID 1 reaps the
-  orphans it adopts` about bwrap's init, which reaps unconditionally, for a container that may not.
-  A false pass in the one assertion the reaping work exists to add. It now exits 2 there, while a
-  plain attached terminal (PID 1 = `/usr/bin/tini -- sleep infinity`) runs every assertion.
+  **bwrap itself**. The false pass was then **reproduced against the pre-refusal commit**, by
+  running that version of the script in the same namespace — it printed
+
+      ok  PID 1 reaps the orphans it adopts (PID 1 is: bwrap --bind / / ... --proc /proc -- ...)
+
+  which asserts the container reaps in a sentence whose own parenthesis names bwrap. bwrap's init
+  reaps unconditionally, so that `ok` was available for any container, including one that does
+  not. A false pass in the single assertion the reaping work exists to add. The current script
+  exits 2 there, while a plain attached terminal (PID 1 = `/usr/bin/tini -- sleep infinity`) runs
+  every assertion and passes.
   - **The discriminator is the ppid chain, and its polarity is the opposite of the obvious one.**
     A process the runtime starts — `docker exec`, or the VS Code server a terminal descends from —
     has a parent outside the pid namespace, reported as ppid 0, so the walk never reaches pid 1.
