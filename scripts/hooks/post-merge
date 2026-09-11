@@ -442,21 +442,35 @@ elif [ -x "$repo_root/scripts/setup.sh" ] &&
    # as the one the refusal above exists to prevent: the guard accusing the change of the one
    # thing it is not.
    #
-   # Measured here, bash 5.x on Linux, `$changed` as one `crates/...` path per line:
+   # THE QUANTITY IS THE 64 KiB PIPE BUFFER, and the failure is PROBABILISTIC — both corrected
+   # here from the first version of this comment, which said the bound was ~850 changed files
+   # because bash's `printf` writes in ~4 KB stdio chunks. Neither half survived measurement.
+   # `printf` writes in 120-290 byte pieces, not 4 KB ones, and a run either side of a single
+   # sample says nothing: what decides it is whether the producer must BLOCK, which it must
+   # once the consumer has not drained 64 KiB. Measured here, 30 trials per size, bash 5.2.21
+   # on Linux, `$changed` as one `crates/...` path per line, match on the first line:
    #
-   #     800 files / 26 KB   rc=0     (the whole write fits before grep can exit)
-   #     900 files / 30 KB   rc=141   SIGPIPE — reported as "nothing to build"
+   #      4 KB    0/30 failed        32 KB   29/30 failed
+   #      8 KB    0/30 failed        64 KB   30/30 failed
+   #     16 KB    0/30 failed        82 KB   30/30 failed
    #
-   # Note it breaks at 30 KB, well UNDER the 64 KiB pipe buffer, because bash's `printf` writes
-   # through stdio in ~4 KB chunks: grep exits after the first one and the second write dies.
-   # So the bound is not "a pull bigger than the pipe buffer" but roughly 850 changed files.
-   # jkb's own last 200 commits touch 81, which is why nobody has seen it — but this hook says
-   # in its own comment that it runs in every repo that installs it, and 850 files is an
-   # ordinary merge in a monorepo. A here-string is a temporary FILE: grep reads what it wants
-   # and the writer has already finished, so there is no writer left to kill.
+   # So it is a band between 16 and 32 KB on this machine, not an edge, and a site that passes
+   # today can fail tomorrow on the same input — which is the real argument for refusing the
+   # idiom rather than sizing each producer. jkb's own last 200 commits touch 81 files (2 KB),
+   # which is why nobody has seen it; this hook says in its own comment that it runs in every
+   # repo that installs it, where a 1000-file merge is ordinary.
    #
-   # Found by applying the lesson trunk learned in `.container/` (5849f28), where the identical
-   # idiom made CI report "run.sh no longer runs verify.sh" about a file that did.
+   # AND A HERE-STRING IS NOT A TEMPORARY FILE, which is what the first version claimed. Measured
+   # on the same bash: `<<<` is a PIPE at or below 65536 bytes and a temp file above it, the
+   # switch landing exactly on the pipe buffer. It is safe for a different reason — the shell
+   # finishes the write before the consumer is exec'd (it fits, so it cannot block) and there is
+   # ONE command in the pipeline, so `pipefail` has no second status to take. The writer is gone
+   # before the reader starts either way.
+   #
+   # Found by applying the lesson trunk learned in `.container/` (5849f28, in check-config.sh and
+   # mutate-config.sh), where the identical idiom made CI report "run.sh no longer runs
+   # verify.sh" about a file that did. Note trunk's own account exempts `printf "$var" | grep -q`
+   # as "a single write, safe" — measured false above, and it is the exact shape this line was.
    grep -qE '^(crates/|ui/|scripts/|Cargo\.(toml|lock)$)' <<<"$changed"; then
     echo "jkb: pulled changes touch crates/ ui/ or scripts/ — running setup.sh"
     "$repo_root/scripts/setup.sh" || echo "jkb: setup.sh failed (continuing; re-run by hand)"

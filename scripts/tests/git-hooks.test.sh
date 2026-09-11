@@ -925,7 +925,8 @@ case9() {
     # paths and would never reach it; the point is that the failure would be silent and inverted
     # (a found match read as "not found"), and that is not a property to leave depending on how
     # big someone's next fixture is. Measured for the real instance of this in `post-merge`:
-    # the inversion starts at roughly 850 lines.
+    # 0/30 failures at 16 KB, 29/30 at 32 KB, 30/30 at 64 KB — a probabilistic band around the
+    # pipe buffer rather than a line count, so "our fixture is small" is not a guarantee.
     grep -q 'no-newline' <<<"$(shell_sources "$d")" \
         && ok "including a shebang with no trailing newline" \
         || fail "gate: no-newline" "a one-line shebang file was dropped: $(shell_sources "$d" | tr '\n' ' ')"
