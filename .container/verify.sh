@@ -184,44 +184,47 @@ pstat() { # pstat <pid> -> 0 present (sets PS_*) | 1 gone | 2 unreadable
     return 1
 }
 
-# WHOSE PID 1? The mount-table refusal below establishes that this is a container. It does NOT
-# establish that this is the CONTAINER'S OWN pid namespace, and every assertion in this file is
-# about that. Claude Code's sandbox wraps a Bash tool call in `bwrap --unshare-pid --unshare-user
-# ... --proc /proc` (bwrap-probe.sh:46 records the invocation), and `--proc /proc` mounts a FRESH
-# procfs -- which this container deliberately permits, via `systempaths=unconfined`. Inside it
-# /proc/1 is bwrap's init and /proc/self/mountinfo is bwrap's mount table, so BOTH the reaping
-# assertion and the mount-boundary assertion answer about a subject that is not the container.
-# The reaping one does not merely answer wrongly: bwrap's init reaps unconditionally, so it
-# PASSES -- for exactly the pre-tini container it was added to catch.
+# WHOSE NAMESPACES IS THIS /proc AND THIS MOUNT TABLE FROM? Every assertion in this file is about
+# THE CONTAINER, and two of them -- the mount boundary and PID 1 reaping -- read /proc/self/mountinfo
+# and /proc/1. Claude Code's sandbox wraps a Bash tool call in `bwrap --new-session --die-with-parent
+# --unshare-net --bind / / --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc`
+# (bwrap-probe.sh records the invocation). `--proc /proc` mounts a FRESH procfs, so inside it
+# /proc/1 is bwrap's init and mountinfo is bwrap's table -- and bwrap's init reaps unconditionally,
+# so the reaping assertion PASSES on a container that does not reap. Measured, and reproduced
+# against the pre-refusal commit (README.md).
 #
-# THE DISCRIMINATOR IS THE PPID CHAIN, AND ITS POLARITY IS THE OPPOSITE OF THE OBVIOUS ONE. A
-# process the runtime started for you -- `docker exec`, which is how run.sh runs this, or the VS
-# Code server an attached terminal descends from -- has a parent OUTSIDE the pid namespace, which
-# /proc reports as ppid 0: walking up from it never reaches pid 1. Inside a NESTED namespace the
-# walk does reach pid 1, because that init really is our ancestor. So "PID 1 is an ancestor" means
-# "this is not the container's own pid namespace". Refusing on its ABSENCE -- the reading that
-# sounds right, and the one first proposed -- refuses every legitimate run instead.
+# THE QUESTION IS ASKED OF THE KERNEL, NOT INFERRED FROM PROCESS TOPOLOGY. `/proc/self/ns/pid` and
+# `/proc/self/ns/mnt` resolve to nsfs inodes that ARE those namespaces' identities; entrypoint.sh
+# records the container's own pair immediately before handing over, and this compares. Equality is
+# namespace identity by definition, so there is no polarity to get backwards and no premise about
+# who started whom.
 #
-# WHERE IT COMES APART, stated because it is an inference and not a measurement: were the
-# container's command ever to become a supervisor that spawns sessions, a legitimate run would
-# have PID 1 as an ancestor and this would refuse. Loudly, with a remedy, and never by passing.
+# TWO EARLIER DISCRIMINATORS INFERRED, AND BOTH WERE WRONG -- recorded because the next reader will
+# reach for one of them:
+#   * A PPID WALK ("PID 1 is an ancestor => nested"). True for `docker exec`, whose parent is
+#     outside the namespace and reads as ppid 0; FALSE for the container's own main command, which
+#     is a direct child of PID 1. mutate-verify.sh runs verify.sh exactly that way, so the walk
+#     refused its control and all sixteen mutations, and CI with them. It also refuses on any
+#     ordinary Linux host, where systemd is an ancestor of every shell.
+#   * PID 1's STARTTIME, compared against a recorded one. Sound on the pid axis (starttime survives
+#     exec, so entrypoint.sh's and tini's are the same), and BLIND on the mount axis: a sandbox that
+#     mounts a fresh /proc WITHOUT unsharing pid leaves /proc/1 as the real tini -- starttime
+#     matches, the gate opens -- while mountinfo is still the sandbox's. A pid-only test guarding a
+#     mount-table assertion is the same mistake one axis over, which is why BOTH ids are recorded.
 #
-# Forks nothing, like everything else on this path: the probe it guards runs in a container whose
-# failure mode is that fork no longer works.
-pid1_is_ancestor() { # pid1_is_ancestor <pid> -> 0 nested | 1 the container's own | 2 cannot walk
-    local p="$1" hops=0
-    pstat "$p" || return 2
-    p="$PS_PPID"
-    while [ "$p" != 0 ]; do
-        [ "$p" = 1 ] && return 0
-        pstat "$p" || return 2
-        p="$PS_PPID"
-        hops=$((hops+1))
-        # /proc cannot hold a cycle; a fixture can, and an unbounded walk in the one function that
-        # gates every assertion is not worth the two lines it saves.
-        [ "$hops" -gt 128 ] && return 2
-    done
-    return 1
+# Pure, taking its four observations as arguments, for the reason settle_step and reaper_verdict are:
+# the arm that matters most is the one no healthy container can reach.
+ns_verdict() { # ns_verdict <recorded-pid> <recorded-mnt> <observed-pid> <observed-mnt>
+    # Absence of the record is not evidence of anything. entrypoint.sh deletes the marker on entry
+    # and writes it only on reaching the handover, so absence means this container did not start
+    # through entrypoint.sh (`--entrypoint bash`) or did not finish starting -- never "it matches".
+    { [ -n "$1" ] && [ -n "$2" ]; } || { printf 'no-marker'; return; }
+    # An unobtainable observation must never be spelled as a definite answer. This is also where a
+    # container at its --pids-limit lands, `readlink` being a fork -- which is the end state of the
+    # very leak the reaping assertion exists to name, so the refusal says so.
+    { [ -n "$3" ] && [ -n "$4" ]; } || { printf 'unreadable'; return; }
+    { [ "$1" = "$3" ] && [ "$2" = "$4" ]; } || { printf 'nested'; return; }
+    printf 'ours'
 }
 
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
@@ -333,38 +336,31 @@ if [ "$SELF_TEST" = yes ]; then
     pstat 999; st2 "an absent process directory is GONE (1)"   "$?" "1"
     rm -rf "$PROC"; PROC=/proc
 
-    # WHOSE PID NAMESPACE, over both real topologies. This is the guard that decides whether any
-    # assertion in this file means anything, and its polarity is the opposite of the obvious one --
-    # so it is pinned as a literal table against fixture trees rather than reasoned about. The
-    # first proposed version of this rule refused on the ABSENCE of pid 1 in the chain, which
-    # refuses every legitimate run; the `docker exec` row below is the one that catches that.
-    echo "==> verify.sh self-test: whose pid namespace is this?"
-    st_row() { # st_row <pid> <ppid> -> a stat line for a process with that parent
-        printf '%s (proc) S %s 1 1 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 555 0 0\n' "$1" "$2"
-    }
-    PROC="$(mktemp -d)"
-    anc() { pid1_is_ancestor "$1" >/dev/null 2>&1; echo $?; }
-
-    # docker exec (how run.sh runs this) and an attached VS Code terminal: the parent lives outside
-    # the pid namespace, which /proc reports as ppid 0. The walk never reaches pid 1.
-    mkdir -p "$PROC/500" "$PROC/400"; st_row 500 400 >"$PROC/500/stat"; st_row 400 0 >"$PROC/400/stat"
-    st2 "a runtime-started process is the container's own namespace" "$(anc 500)" "1"
-
-    # Inside bwrap --unshare-pid: pid 1 is bwrap's init and really is our ancestor.
-    mkdir -p "$PROC/700" "$PROC/300" "$PROC/1"
-    st_row 700 300 >"$PROC/700/stat"; st_row 300 1 >"$PROC/300/stat"; st_row 1 0 >"$PROC/1/stat"
-    st2 "a process under a nested pid 1 is REFUSED, not trusted" "$(anc 700)" "0"
-
-    mkdir -p "$PROC/800"; st_row 800 1 >"$PROC/800/stat"
-    st2 "...including a direct child of that pid 1" "$(anc 800)" "0"
-
-    # An unwalkable chain establishes nothing, and nothing is not `the container's own`.
-    mkdir -p "$PROC/900" "$PROC/850"; st_row 900 850 >"$PROC/900/stat"   # 850 has no stat file
-    st2 "an unreadable ancestor is refused, not read as the container's own" "$(anc 900)" "2"
-    mkdir -p "$PROC/910"; st_row 910 860 >"$PROC/910/stat"               # 860 does not exist
-    st2 "an ancestor that is gone is refused too" "$(anc 910)" "2"
-    st2 "a process whose own entry cannot be read is refused" "$(anc 999)" "2"
-    rm -rf "$PROC"; PROC=/proc
+    # WHOSE NAMESPACES, as a literal table. This is the guard that decides whether any assertion in
+    # this file means anything -- so it is pinned against fixture values rather than reasoned about,
+    # and every arm including the ones no healthy container reaches. The two rows that matter most
+    # are the two topologies the PREVIOUS discriminator got wrong: `docker exec` (how run.sh runs
+    # this) and the container's own main command (how mutate-verify.sh does). Under a namespace-id
+    # comparison they are the SAME case -- both are in the container's namespaces -- which is the
+    # point: the question stopped depending on who started the process.
+    echo "==> verify.sh self-test: whose namespaces are these?"
+    P='pid:[4026531836]'; M='mnt:[4026532999]'
+    st2 "the container's own namespaces are recognised (docker exec, and its own command alike)" \
+        "$(ns_verdict "$P" "$M" "$P" "$M")" "ours"
+    st2 "a nested sandbox's fresh procfs is REFUSED, not trusted" \
+        "$(ns_verdict "$P" "$M" 'pid:[4026533111]' 'mnt:[4026533112]')" "nested"
+    st2 "...and so is a fresh MOUNT namespace alone, which a pid-only test cannot see" \
+        "$(ns_verdict "$P" "$M" "$P" 'mnt:[4026533112]')" "nested"
+    st2 "...and a fresh pid namespace alone" \
+        "$(ns_verdict "$P" "$M" 'pid:[4026533111]' "$M")" "nested"
+    st2 "no marker establishes nothing — it is not a match" \
+        "$(ns_verdict "" "" "$P" "$M")" "no-marker"
+    st2 "a half-written marker is no marker" \
+        "$(ns_verdict "$P" "" "$P" "$M")" "no-marker"
+    st2 "an unreadable observation establishes nothing either" \
+        "$(ns_verdict "$P" "$M" "" "")" "unreadable"
+    st2 "...including when only one of the two could be read" \
+        "$(ns_verdict "$P" "$M" "$P" "")" "unreadable"
 
     # Assertion 1b's judgement. Only ONE of these arms is reachable in a healthy container, so
     # without this the rest are unreachable code in a change whose whole subject is a check that
@@ -422,37 +418,77 @@ if [ ! -r /proc/self/mountinfo ]; then
     exit 2
 fi
 
-# ...AND IN THE CONTAINER'S OWN PID NAMESPACE, WHICH IS A SECOND QUESTION. The refusal above
-# establishes that a container is the subject; this establishes that THIS container is. Inside
-# Claude Code's nested sandbox both /proc/1 and /proc/self/mountinfo belong to bwrap, so the two
-# assertions this file exists for -- the mount boundary and PID 1 reaping -- are answered about
-# the wrong subject, and the reaping one answers `ok` because bwrap's init reaps. See
-# pid1_is_ancestor for why the polarity is what it is.
+# ...AND THEY MUST BE THIS CONTAINER'S NAMESPACES, WHICH IS A SECOND QUESTION. The refusal above
+# establishes that a container is the subject; this establishes that THIS one is. See ns_verdict
+# for what is compared and for the two inferred discriminators that were wrong before it.
 #
-# It dominates every assertion below rather than living inside one of them, which is the rule this
-# repo keeps arriving at: a condition that applies to every arm belongs above the dispatch, not
-# repeated into each. Sited inside the reaping assertion it would also be one more verdict word
-# for that `case` to forget.
-case "$(pid1_is_ancestor "$$" >/dev/null 2>&1; echo $?)" in
-    0)
-        echo "verify.sh asserts what THIS container is, and is being run inside a nested pid" >&2
-        echo "  namespace — PID 1 is an ancestor of this process, which it is not when the" >&2
-        echo "  container runtime starts you. You are almost certainly inside Claude Code's own" >&2
-        echo "  sandbox, which wraps a Bash tool call in \`bwrap --unshare-pid --proc /proc\`." >&2
-        echo >&2
-        echo "  Every assertion here would describe bwrap's namespaces instead of the container's," >&2
-        echo "  and the PID-1 reaping check would PASS on a container that does not reap, because" >&2
-        echo "  bwrap's own init does." >&2
-        echo >&2
-        echo "  Run it from a plain terminal in the attached container, or from the host:" >&2
-        echo "    ./.container/run.sh                       (runs this for you, via docker exec)" >&2
-        echo "    ./.container/mutate-verify.sh --control   (one healthy run)" >&2
+# IT DOMINATES EVERY ASSERTION BELOW rather than living inside one of them -- the rule this repo
+# keeps arriving at (D45.5): a condition that applies to every arm belongs above the dispatch. Both
+# the mount boundary and PID 1 reaping depend on it, so siting it inside either would leave the
+# other unguarded, and inside the reaping `case` it would be one more verdict word to forget.
+#
+# THE REFUSAL PRINTS A `FAIL` LINE, WHICH IS NOT COSMETIC. mutate-verify.sh's `judge` reports a
+# mutation CAUGHT only on a non-zero exit AND a line carrying both the expected text and `FAIL`.
+# A refusal that only wrote to stderr would be invisible to the harness -- so the two mutations
+# that break this marker could never be watched firing, in the guard whose whole subject is checks
+# that cannot fire. `bad` is what every other failure here uses; the guidance goes to stderr after.
+# NO SECOND SPELLING OF THE PATH. `${JKB_NS_MARKER:-/run/jkb/ns}` would put it in two files again,
+# which is the duplication this branch deleted for JKB_REAPER rather than guarded. Unset is not an
+# error here either: `cat ""` fails quietly and lands on `no-marker`, whose message is the right one
+# for a plain Linux host — where the variable is absent precisely because there is no container.
+ns_rec="$(cat "${JKB_NS_MARKER:-}" 2>/dev/null)" || ns_rec=""
+rec_pid="$(kv_field pid "$ns_rec")"; rec_mnt="$(kv_field mnt "$ns_rec")"
+obs="$(readlink "$PROC/self/ns/pid" "$PROC/self/ns/mnt" 2>/dev/null)" || obs=""
+obs_pid="$(printf '%s\n' "$obs" | sed -n 1p)"; obs_mnt="$(printf '%s\n' "$obs" | sed -n 2p)"
+
+case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
+    ours) ;;
+    nested)
+        bad "these are NOT this container's namespaces — every assertion below would describe a nested sandbox instead, and the PID-1 reaping check would PASS on a container that does not reap, because the sandbox's own init does"
+        {
+            echo
+            echo "  recorded by the container's entrypoint:  pid=$rec_pid  mnt=$rec_mnt"
+            echo "  observed by this process:                pid=$obs_pid  mnt=$obs_mnt"
+            echo
+            echo "  You are almost certainly inside Claude Code's own sandbox, which wraps a Bash"
+            echo "  tool call in \`bwrap --bind / / --unshare-pid --unshare-user --proc /proc\`."
+            echo "  The fresh procfs is why /proc/1 and the mount table are not this container's."
+            echo
+            echo "  Run it from a plain terminal in the attached container, or from the host:"
+            echo "    ./.container/run.sh                       (runs this for you, via docker exec)"
+            echo "    ./.container/mutate-verify.sh --control   (one healthy run)"
+        } >&2
         exit 2
         ;;
-    2)
-        echo "verify.sh could not establish whose pid namespace this is: the ppid chain from $$" >&2
-        echo "  could not be walked in $PROC, so whether PID 1 is an ancestor is unknown — and" >&2
-        echo "  every assertion below depends on the answer. Refusing rather than guessing." >&2
+    no-marker)
+        bad "this container recorded no namespace identity, so verify.sh cannot tell whether what it is about to measure is this container at all"
+        {
+            echo
+            echo "  ${JKB_NS_MARKER:-(JKB_NS_MARKER is not set)} is absent or incomplete. entrypoint.sh"
+            echo "  deletes it on entry and writes it only on reaching its handover, so this means"
+            echo "  one of:"
+            echo "    * the container was started with --entrypoint, bypassing entrypoint.sh;"
+            echo "    * its start did not finish (check \`docker logs\`);"
+            echo "    * the image predates the marker — rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+            echo
+            echo "  On an ordinary Linux host there is no marker either, and that is the honest"
+            echo "  answer: this script asserts what a CONTAINER is and has no subject here."
+        } >&2
+        exit 2
+        ;;
+    unreadable)
+        bad "verify.sh could not read its own namespace ids from $PROC/self/ns, so whether these are this container's namespaces is unknown — and every assertion below depends on the answer"
+        {
+            echo
+            echo "  \`readlink\` is a fork, so this is also where a container that cannot fork lands —"
+            echo "  which is the end state of a PID 1 that does not reap, every one of its pids spent"
+            echo "  on zombies. Tell them apart from OUTSIDE the container:"
+            echo
+            echo "    docker stats --no-stream <name>   # PIDS = the counter --pids-limit bounds"
+            echo
+            echo "  If that is near the limit, recreate it:"
+            echo "    ./.container/run.sh --rm && ./.container/run.sh --build"
+        } >&2
         exit 2
         ;;
 esac
@@ -500,7 +536,7 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 #     that is actually wrong rather than a hash mismatch the reader has to interpret.
 # WHAT IS AND IS NOT COVERED BY `--self-test`, said plainly because the previous wording claimed
 # more than it delivered: the JUDGEMENT is covered -- proc_stat_fields, pstat's three-way return,
-# pid1_is_ancestor and reaper_verdict all run against fixture trees, which is where the arms no
+# ns_verdict and reaper_verdict all run against fixtures, which is where the arms no
 # healthy container can reach live. The GATHERING below is not: it is exercised only by running it
 # in a container, and only ever takes its healthy path there.
 pid1_argv=""

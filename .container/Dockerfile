@@ -89,6 +89,28 @@ RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/in
     # start. Fail the BUILD instead.
     && visudo -c >/dev/null
 
+# THE NAMESPACE-IDENTITY MARKER, spelled once for the same reason JKB_REAPER is. entrypoint.sh
+# records the container's own pid and mount namespace ids here as its last act before handing over,
+# and verify.sh compares its OWN against them -- which is how that file tells "this container" from
+# a nested sandbox whose fresh /proc makes every assertion answer about bwrap instead. An ENV
+# because the path is needed at BUILD (the directory below must exist and be owned by the user who
+# writes it) and by TWO processes at runtime, and ENV persists into the image config so it reaches
+# both, `docker exec` included. A literal in three files is the duplication this directory deletes
+# rather than guards (README.md, "The reaper path is single-sourced").
+ENV JKB_NS_MARKER=/run/jkb/ns
+
+# Created root-owned and handed to vscode, because entrypoint.sh runs as vscode and /run is root's.
+# A named volume whose mount point does not exist in the image is created root-owned (D49); the
+# same rule applies to a directory a non-root process must write.
+#
+# THE MARKER IS AGENT-WRITABLE, AND THAT IS STATED RATHER THAN DESIGNED AWAY. vscode owns it, so a
+# session inside can forge it. Forging it can only produce a REFUSAL for anyone genuinely in the
+# container's namespaces (their ids will not match the forged ones); the only false pass it buys is
+# for a run inside the same sandbox as the forger -- an agent lying to its own verifier, which no
+# file ownership prevents. Routing it through the sudoers-granted root scripts would add a third
+# root-writable path to protect a fact ownership cannot protect anyway.
+RUN mkdir -p "$(dirname "$JKB_NS_MARKER")" && chown vscode:vscode "$(dirname "$JKB_NS_MARKER")"
+
 # --- non-root from here on ------------------------------------------------------------------
 USER vscode
 ENV PATH=/home/vscode/.local/bin:/home/vscode/.cargo/bin:$PATH

@@ -796,18 +796,43 @@ case "$settle_rc" in
        # is the exact end state verify.sh's reaping assertion exists to name, and naming only a
        # missing `ps` here pre-empted it: the reader was sent to audit the image while the actual
        # remedy, which is to recreate the container, was never printed because verify.sh never ran.
-       # `docker top` reads the process table from OUTSIDE, so it answers where the probe cannot.
+       #
+       # ASK THE COUNTER THE LIMIT IS APPLIED TO, NOT A PROCESS LISTING. `--pids-limit` is enforced
+       # by the pids cgroup controller, and `pids.current` -- which `docker stats` prints as PIDS --
+       # is the number it bounds; a zombie is charged against it until it is reaped, which is
+       # exactly why zombies exhaust it. `docker top` lists PROCESSES, from the host, needing no
+       # fork inside -- and a listing is not the charge: whether a dying leader appears in it is a
+       # kernel detail nobody here has measured, so a remedy resting on that count alone could read
+       # empty in the one state it exists to name. Printing BOTH removes the dependency and is
+       # strictly more informative, because the DISCREPANCY is the signature: the charge near the
+       # limit while the listing shows a handful of live processes is what a zombie pile looks like
+       # from outside, and no single number says that.
        printf '  `ps` may be missing from the image — or the container cannot fork at all,\n' >&2
        printf '  which is what a PID 1 that does not reap comes to after a day (every one of\n' >&2
        printf '  its pids spent on zombies). Tell them apart from outside the container:\n\n' >&2
-       printf '    docker top %s          # reads the table from the host; no fork inside\n' "$NAME" >&2
-       printf '\n  If that shows thousands of processes, recreate it:\n' >&2
-       printf '    ./.container/run.sh --rm && ./.container/run.sh --build\n' >&2
+       printf '    docker stats --no-stream %s   # PIDS = the counter --pids-limit bounds\n' "$NAME" >&2
+       printf '    docker top %s                 # the processes actually alive\n' "$NAME" >&2
+       printf '\n  PIDS near the --pids-limit with only a handful of processes listed IS the\n' >&2
+       printf '  zombie pile. Recreate it:\n' >&2
+       printf '    %s --rm && %s --build\n' "$0" "$0" >&2
        exit 1 ;;
     3) printf '\n\033[31merror:\033[0m %s is still running its entrypoint after 120s.\n' "$NAME" >&2
        printf 'The firewall raise resolves the allowlist by DNS, so a black-holed resolver holds it\n' >&2
        printf 'here. The container log says where it is:\n\n' >&2
        docker logs --tail 20 "$NAME" 2>&1 | sed 's/^/  /' >&2
+       # A SECOND CAUSE, FOR THE SAME REASON rc=2 HAS ONE. `settle_step` reads PID 1's argv and
+       # treats a match of *entrypoint.sh* as "not finished yet". Under Docker's `--init` that is
+       # true for the whole life of the container -- docker-init WRAPS this script instead of being
+       # exec'd by it, so PID 1 is `/sbin/docker-init -- .../entrypoint.sh sleep infinity` for ever
+       # and settle() can never return 0. It is pinned as a self-test row above, which is what makes
+       # leaving it unnamed here indefensible: the change recognised the mode well enough to test it
+       # and still sent the reader to audit DNS while `docker logs` shows an entrypoint that
+       # completed normally. Naming only the cause that occurs in normal use is what the rc=2 arm
+       # was just repaired for.
+       printf '\n  If that log shows the entrypoint COMPLETED, it is wrapped rather than stuck:\n' >&2
+       printf '  `--init` in runArgs makes docker-init PID 1, whose argv names entrypoint.sh for\n' >&2
+       printf '  ever. Check it from outside, and drop the flag if it is there:\n\n' >&2
+       printf '    docker inspect -f '"'"'{{.HostConfig.Init}}'"'"' %s\n' "$NAME" >&2
        exit 1 ;;
 esac
 

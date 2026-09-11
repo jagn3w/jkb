@@ -653,6 +653,45 @@ mutant jkb-dev-no-reaper "test -n \"\$JKB_REAPER\" && printf %s '$NO_REAP_B64' |
 run "PID 1 never wait()s (tini replaced by an init that observes its child with WNOWAIT)" "PID 1 does not reap" \
     "${HEALTHY[@]}"
 
+# THE NAMESPACE-IDENTITY GATE, both halves. It decides whether ANY assertion in verify.sh is about
+# this container (see ns_verdict), so a gate that cannot fire silently disables the whole file
+# rather than failing it — which is the worst shape available here and the reason these two rows
+# exist. They are the mutations the PREVIOUS discriminator could not have: a ppid walk has nothing
+# to break but its own polarity.
+#
+# The refusal is an `exit 2` with a `bad` line, which is what makes it judgeable at all: `judge`
+# wants a non-zero exit AND a line carrying the expect and `FAIL`. A refusal written only to stderr
+# would leave both of these permanently MISSED.
+#
+# `$JKB_NS_MARKER` rather than a literal: the path is the image's own ENV, so if the image stops
+# declaring one the RUN fails and this reports BUILD-FAILED — honest about being tooling — instead
+# of a healthy guard appearing not to fire. Same rule as the no-reaper mutant above.
+
+# 1. THE MARKER IS NEVER WRITTEN. Deleting the write leaves entrypoint.sh's delete-on-entry intact,
+#    so the container comes up with no record of its own namespaces and verify.sh has no way to
+#    know whether its subject is this container. It must refuse, not assume.
+#    The write is REPLACED BY A NO-OP, not deleted. Deleting it empties its enclosing `if`, which
+#    is a bash syntax error — so the mutant would not build, `run()` would report SKIPPED, and this
+#    guard would never be watched firing: the exact defect this file exists to find, introduced by
+#    the mutation meant to prove it fires. Caught by the `bash -n` below, run against a copy on the
+#    host before it ever reached a daemon.
+mutant jkb-dev-no-ns-marker "test -n \"\$JKB_NS_MARKER\" && sed -i 's|^ *printf .*JKB_NS_MARKER.*|    :|' /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
+run "the container records no namespace identity" "recorded no namespace identity" \
+    "${HEALTHY[@]}"
+
+# 2. THE MARKER NAMES SOMEBODY ELSE'S NAMESPACES. Written last, so overwriting it immediately
+#    before the handover is the same position the real write occupies — this tests the COMPARISON
+#    rather than the plumbing, and it is what a stale marker from a previous boot would look like
+#    (the state entrypoint.sh's delete-on-entry exists to make unrepresentable).
+#    A plain `s|||` with `&`, rather than sed's one-line `i` insert: `i` is a GNU extension whose
+#    text also processes backslash escapes, so it could be neither tested on this macOS host nor
+#    trusted to leave `\n` alone. `&` is the matched exec line, so this PREPENDS the forgery to it —
+#    the same position the real write occupies, immediately before the handover. Two `echo`s need
+#    no escapes at all. Verified by running this exact command against a copy of entrypoint.sh.
+mutant jkb-dev-forged-ns-marker "test -n \"\$JKB_NS_MARKER\" && sed -i 's|^exec .*JKB_REAPER.*|echo pid=pid:[1] > \"\$JKB_NS_MARKER\"; echo mnt=mnt:[1] >> \"\$JKB_NS_MARKER\"; &|' /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
+run "the recorded namespace identity is not this container's" "NOT this container's namespaces" \
+    "${HEALTHY[@]}"
+
 # The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher
 # is matching something that is present when nothing is wrong — which is precisely the defect
 # this file exists to detect in verify.sh, and it had it too.

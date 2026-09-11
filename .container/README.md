@@ -59,14 +59,48 @@ a failure is attributable to the container profile and not the kernel.
   not. A false pass in the single assertion the reaping work exists to add. The current script
   exits 2 there, while a plain attached terminal (PID 1 = `/usr/bin/tini -- sleep infinity`) runs
   every assertion and passes.
-  - **The discriminator is the ppid chain, and its polarity is the opposite of the obvious one.**
-    A process the runtime starts — `docker exec`, or the VS Code server a terminal descends from —
-    has a parent outside the pid namespace, reported as ppid 0, so the walk never reaches pid 1.
-    Inside a nested namespace it does. "PID 1 is an ancestor" therefore means "**not** this
-    container's own namespace". The reading that sounds right refuses every legitimate run, and
-    was the first version proposed; `verify.sh --self-test` pins both topologies as a table.
   - The same nesting makes `/proc/self/mountinfo` bwrap's too, which is why the refusal sits above
     every assertion rather than inside the reaping one.
+
+### The discriminator is namespace identity, asked of the kernel — after two inferences were wrong
+
+`entrypoint.sh` records the container's own `/proc/self/ns/pid` and `/proc/self/ns/mnt` — nsfs
+inodes, which **are** those namespaces' identities — immediately before it hands over, and
+`verify.sh` compares its own against them. Equality is identity by definition, so there is no
+polarity to get backwards and no premise about who started whom. `bwrap --bind / /` is recursive,
+so the marker stays readable from inside the sandbox while its `--proc /proc` means the ids do not
+match: that asymmetry is exactly what discriminates.
+
+Both earlier versions **inferred**, and each was wrong in a way its own author could not see:
+
+- **A ppid walk** ("PID 1 is an ancestor ⇒ nested"). True for `docker exec`; **false for the
+  container's own main command**, which is a direct child of PID 1. `mutate-verify.sh` runs
+  `verify.sh` exactly that way, so the walk refused its control, all sixteen mutations and the CI
+  Docker job — and `verify.sh`'s own self-test *pinned that shape as correct*. It also refuses on
+  any ordinary Linux host, where systemd is an ancestor of every shell.
+- **PID 1's starttime**, compared against a recorded one. Sound on the pid axis — starttime
+  survives `exec`, so `entrypoint.sh`'s and tini's are the same — and **blind on the mount axis**:
+  a sandbox mounting a fresh `/proc` *without* unsharing pid leaves `/proc/1` as the real tini, so
+  the gate opens while the mount table is still the sandbox's. A pid-only test guarding a
+  mount-table assertion is the same mistake one axis over. Recording **both** ids is the fix, and
+  it is why the marker carries two.
+
+**Delete-on-entry, write-before-handover**, which is the D51 shape rather than a nicety: `/run` is
+the writable layer, so a marker outlives `docker stop`, and namespace ids are reused once a
+namespace dies — a stale marker could be matched by an unrelated later namespace. Deleting first
+and writing last makes that unrepresentable: a marker exists only for a boot that reached its
+handover, and anything else leaves **absence**, which is refused. Pinned by a self-test that arms a
+stale marker and boots into a refusing state.
+
+The refusal prints a `FAIL` line rather than only writing to stderr, because `mutate-verify.sh`'s
+`judge` needs one — a gate the harness cannot watch firing is the defect this directory keeps
+meeting. Two mutations exist for it: the marker never written, and the marker naming somebody
+else's namespaces.
+
+**Residual, stated:** the marker is `vscode`-owned, so a session inside can forge it. Forging can
+only produce a *refusal* for anyone genuinely in the container's namespaces; the only false pass it
+buys is for a run inside the same sandbox as the forger — an agent lying to its own verifier, which
+no file ownership prevents.
 
 - **PID 1 must reap, and `sleep` cannot.** `run.sh` keeps the container alive with `sleep
   infinity`, and `entrypoint.sh` used to end in a bare `exec "$@"` — which made that `sleep` the
@@ -92,6 +126,30 @@ What *is* pinned is the consequence rather than the premise: `run.sh --self-test
 `settle_step` row for docker-init's argv asserting it reads as `waiting`. Whether `--init` really
 produces that argv has not been run here. Nothing refuses `--init` in `runArgs` either, so if you
 are reaching for it, this section is the whole of what stops you.
+
+`run.sh`'s 120s-timeout message now names this as a second cause beside the black-holed resolver,
+with `docker inspect -f '{{.HostConfig.Init}}'` to tell them apart: an entrypoint that `docker
+logs` shows *completing* and a `settle()` that never returns is the wrapped case, not the stuck
+one.
+
+## The reaper path is single-sourced, and a guard over the duplication was the wrong answer
+
+History, recorded here rather than in the files it is about, because the guard described never
+existed in a shipped state — it was added and deleted inside one branch, and a static-check file
+narrating its own branch's history reads as an inventory of checks the repository has.
+
+The path was briefly written twice: the Dockerfile's `test -x` and `entrypoint.sh`'s `exec`
+default each named `/usr/bin/tini`. `check-config.sh` grew 33 lines asserting the two agreed and
+`mutate-config.sh` grew three mutations watching that fail. The guard worked and it was still the
+wrong answer, for the reason this directory keeps arriving at: **delete the duplication rather
+than police it** (D52.5, which removed the same shape for `/run/jkb-egress-verdict`). `ENV
+JKB_REAPER` in the Dockerfile reaches the build-time `test -x` *and* the entrypoint process and
+every `docker exec`, because ENV persists into the image config — one spelling, nothing to keep in
+step, and 40 lines of guard and mutation deleted with it.
+
+The clinching detail is what the guard did *not* cover: a **third** site, `mutate-verify.sh`'s
+`gcc -o` target, which had already gone stale while the two-site guard reported agreement. That is
+what a guard over duplication buys — agreement between the sites somebody remembered.
 
 ## Using it
 

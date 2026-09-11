@@ -260,12 +260,11 @@ open(p, 'w').write("".join(l for l in open(p) if not l.startswith("ENTRYPOINT"))
 PYX
 run "the image stops running entrypoint.sh" "does not set ENTRYPOINT"
 
-# THE REAPER-PATH MUTATIONS ARE GONE with the guard they exercised, exactly as the verdict-path
-# ones below went. Two of them broke the agreement between the Dockerfile's `test -x` and
-# entrypoint.sh's `exec` default; there is one spelling now (`ENV JKB_REAPER`), so there is no
-# agreement to break. The third restored the original defect — a bare `exec "$@"`, making `sleep`
-# PID 1 — and it moves rather than disappears: `entrypoint.sh --self-test` asserts the handover
-# goes THROUGH the reaper by way of a stub that records having run, and ./scripts/check.sh runs it.
+# THERE ARE NO REAPER-PATH MUTATIONS HERE, exactly as there are no verdict-path ones below: the
+# path is single-sourced as `ENV JKB_REAPER`, so there is no agreement between two spellings to
+# break. What DOES get mutated is the handover itself, one file over -- `entrypoint.sh --self-test`
+# drives a stub that records having run, so a bare `exec "$@"` fails it -- and ./scripts/check.sh
+# runs that.
 #
 # THE VERDICT-PATH MUTATIONS ARE GONE with the guard they exercised (D52.5). They broke one
 # reader's spelling of /run/jkb-egress-verdict and required check-config.sh to notice the drift.

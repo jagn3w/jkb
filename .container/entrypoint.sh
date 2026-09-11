@@ -96,10 +96,16 @@ STUB
     chmod +x "$t/bin/reaper"
     export JKB_REAPER_LOG="$t/reaped"
 
+    # A fake /proc/self/ns: two symlinks whose TARGETS stand in for the nsfs ids. macOS has no
+    # /proc, so without this seam the marker write is the one line here that cannot run.
+    mkdir -p "$t/ns"
+    ln -sfn 'pid:[4026531836]' "$t/ns/pid"
+    ln -sfn 'mnt:[4026532999]' "$t/ns/mnt"
+
     run_ep() { # run_ep [accept]
         rm -f "$t/verdict"
         JKB_EGRESS_VERDICT="$t/verdict" JKB_EGRESS_ACCEPT_UNFILTERED="${1:-0}" \
-            JKB_REAPER="$t/bin/reaper" \
+            JKB_REAPER="$t/bin/reaper" JKB_NS_MARKER="$t/nsmarker" JKB_NS_DIR="$t/ns" \
             PATH="$t/bin:$PATH" bash "$0" echo BECAME-THE-COMMAND 2>"$t/err"
     }
     export JKB_EGRESS_VERDICT="$t/verdict"
@@ -114,6 +120,22 @@ STUB
     # every other assertion here, which is exactly why it survived.
     eq "...and hands over THROUGH the reaper, not straight to the command" \
        "$(cat "$t/reaped" 2>/dev/null)" "reaped"
+    # WHOSE NAMESPACES THESE ARE, recorded for verify.sh. Both ids, in one file, written only on a
+    # boot that reached the handover.
+    eq "...and records both namespace ids for verify.sh" \
+       "$(tr '\n' ' ' <"$t/nsmarker" 2>/dev/null)" "pid=pid:[4026531836] mnt=mnt:[4026532999] "
+
+    # DELETE-FIRST, WHICH IS THE HALF THAT CANNOT BE INFERRED FROM A HAPPY PATH. A marker in the
+    # container's writable layer outlives `docker stop`, and namespace ids are REUSED once a
+    # namespace dies -- so a marker left behind by a previous boot can be matched by a later,
+    # unrelated namespace. The guarantee is that a boot which does not reach its handover leaves
+    # ABSENCE. `unfiltered` is such a boot: it refuses long before the write.
+    printf 'pid=pid:[1] mnt=mnt:[1]\n' > "$t/nsmarker"
+    stub unfiltered "IPv6 is unfiltered"
+    run_ep >/dev/null 2>&1
+    eq "a boot that REFUSES leaves no stale marker behind" \
+       "$([ -e "$t/nsmarker" ] && echo present || echo absent)" "absent"
+    stub allowlisted "allowlist raised"
 
     # A blanket deny is SAFE but not working: no allowlist, so nothing but DNS and loopback. Staying
     # up is the point — this is the state you need to attach to in order to repair it.
@@ -162,6 +184,21 @@ STUB
     exit 0
 fi
 # --------------------------------------------------------------------------------------------
+
+# THE NAMESPACE MARKER IS DELETED FIRST AND WRITTEN LAST, and the order is the whole guarantee.
+#
+# It records which pid and mount namespaces are THIS container's, so verify.sh can tell them from a
+# nested sandbox's (see the write at the foot of this file). The failure to design against is the
+# one D51 spent a round on: a record that outlives the state it describes. `/run` is the container's
+# writable layer, not a tmpfs, so a marker survives `docker stop`/`docker start` exactly as the old
+# egress marker did — and namespace ids are IDA-allocated and REUSED once a namespace dies, so a
+# stale marker naming a dead namespace can be matched by a later, unrelated one.
+#
+# Deleting on entry and writing immediately before the handover makes that unrepresentable rather
+# than guarded: a marker can only exist for the namespaces of a container that reached its exec, and
+# a start that died anywhere in between leaves ABSENCE, which verify.sh refuses on. There is no
+# window in which a marker describes a namespace this boot does not hold.
+rm -f "${JKB_NS_MARKER:?the image must set JKB_NS_MARKER (see the Dockerfile)}"
 
 # No arguments to either: sudoers grants `vscode` exactly these two paths with none, and both
 # scripts refuse any. The allowlist the raise reads is the root-owned snapshot, never a path a
@@ -249,4 +286,37 @@ esac
 # otherwise run off Linux. What that test proves is that the script hands over THROUGH whatever
 # JKB_REAPER names; that the named thing exists and reaps is the Dockerfile's `test -x` and
 # verify.sh's runtime assertion respectively.
+# RECORD WHOSE NAMESPACES THESE ARE, as the last act before handing over. verify.sh's assertions --
+# the mount boundary and PID 1 reaping -- are only about this container if the /proc and the mount
+# table it reads are this container's. Claude Code's sandbox wraps a Bash call in `bwrap ... --bind
+# / / --unshare-pid --unshare-user --proc /proc`: the fresh procfs makes /proc/1 bwrap's init, which
+# REAPS, so the reaping assertion passes on a container that does not. Measured, and reproduced
+# against the pre-refusal commit (README.md).
+#
+# THE IDENTITY IS THE KERNEL'S, NOT A PROXY FOR IT. `/proc/self/ns/{pid,mnt}` resolve to nsfs inodes
+# that ARE the namespaces' identities, so verify.sh comparing its own against these is the question
+# asked rather than an inference from process topology. Two earlier discriminators inferred: a ppid
+# walk (false for the container's own main command, which is how the mutation harness runs, so it
+# refused all sixteen rows) and PID 1's starttime (blind to a sandbox that mounts a fresh /proc
+# WITHOUT unsharing pid -- /proc/1 would still be tini while the mount table was bwrap's). Recording
+# BOTH namespaces covers both assertions; a pid-only test guarding a mount-table check is the same
+# mistake one axis over.
+#
+# `--bind / /` is recursive, so this file is readable from inside such a sandbox while its /proc is
+# not the same -- which is exactly what makes the comparison discriminate.
+#
+# ONE FORK, AND A FAILED READ LEAVES ABSENCE RATHER THAN AN EMPTY MARKER. `readlink` takes both
+# links in one call. The values are collected BEFORE the file is touched, because `> "$MARKER"`
+# truncates as soon as it is evaluated -- so writing through a failing pipeline would replace
+# "nothing was recorded", which verify.sh refuses on, with "both namespaces are the empty string",
+# which is a record making a claim. The directory is the seam the self-test injects, as
+# JKB_EGRESS_VERDICT and JKB_REAPER are: there is no /proc/self/ns on the macOS host it runs on.
+ns_dir="${JKB_NS_DIR:-/proc/self/ns}"
+ns_read="$(readlink "$ns_dir/pid" "$ns_dir/mnt" 2>/dev/null)" || ns_read=""
+ns_pid="$(printf '%s\n' "$ns_read" | sed -n 1p)"
+ns_mnt="$(printf '%s\n' "$ns_read" | sed -n 2p)"
+if [ -n "$ns_pid" ] && [ -n "$ns_mnt" ]; then
+    printf 'pid=%s\nmnt=%s\n' "$ns_pid" "$ns_mnt" > "$JKB_NS_MARKER" || true
+fi
+
 exec "${JKB_REAPER:?the image must set JKB_REAPER (see the Dockerfile) — refusing to become PID 1 without a reaper}" -- "$@"

@@ -431,14 +431,8 @@ else
 fi
 
 # THE REAPER PATH IS NOT GUARDED HERE EITHER, and for the same reason as the verdict path below:
-# it is no longer duplicated. It was, briefly — the Dockerfile's `test -x` and entrypoint.sh's
-# `exec` default each named /usr/bin/tini — and this file carried 33 lines asserting the two
-# agreed, with three mutations in mutate-config.sh watching them fail. That guard was correct and
-# it was the wrong answer: the Dockerfile now sets `ENV JKB_REAPER`, which reaches both the
-# build-time `test -x` and the entrypoint process, so there is one spelling and nothing to keep in
-# step. The duplication it policed included a THIRD site it did not cover — mutate-verify.sh's
-# `gcc -o` target — which had already gone stale, which is what a guard over duplication buys you
-# instead of deleting the duplication.
+# it is single-sourced as the Dockerfile's `ENV JKB_REAPER`, so there are no two spellings to keep
+# in step. (Why a guard was tried first and deleted is in README.md, not here.)
 #
 # THE VERDICT PATH IS NO LONGER GUARDED HERE, because it is no longer duplicated (D52.5). This
 # carried a check that init-firewall.sh, entrypoint.sh and verify.sh all named /run/jkb-egress-verdict

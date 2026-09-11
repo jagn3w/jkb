@@ -181,8 +181,12 @@ if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then
         # police — so it must be supplied here, and a transparent stand-in keeps this a round-trip
         # through a boot that COMPLETES rather than one that aborts at the last line. `env --`
         # exists on both platforms this self-test runs on.
-        JKB_EGRESS_VERDICT="$t/verdict" JKB_REAPER=/usr/bin/env PATH="$t/bin:$PATH" \
-            bash "$ep" echo BOOTED >/dev/null 2>"$t/err" || true
+        # JKB_NS_MARKER joins JKB_REAPER for the same reason: the entrypoint has no default for
+        # either -- two spellings of a path is what a guard was briefly added to police -- so both
+        # must be supplied for this to be a round-trip through a boot that COMPLETES rather than
+        # one that aborts on an unset variable before printing anything.
+        JKB_EGRESS_VERDICT="$t/verdict" JKB_REAPER=/usr/bin/env JKB_NS_MARKER="$t/nsmarker" \
+            PATH="$t/bin:$PATH" bash "$ep" echo BOOTED >/dev/null 2>"$t/err" || true
         eq "the remedy reaches the operator" "$(grep -c 'Fix DNS and re-run this' "$t/err")" "1"
     fi
 
