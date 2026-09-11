@@ -433,8 +433,7 @@ fi
 # THE REAPER PATH IS SPELLED IN TWO FILES THAT CANNOT SHARE A VARIABLE. The Dockerfile asserts it
 # exists at BUILD time (`test -x`), entrypoint.sh EXECS it to become a PID 1 that reaps -- without
 # which `sleep` is PID 1, never wait()s, and every orphan reparented to it is a zombie for ever
-# (3941 of them on a 28h-old container, thirteen PIDs short of --pids-limit). Move tini's install
-# -- to /usr/local/bin, say, where every other privileged binary in this image is deliberately put
+# (README.md, "The measurements this is built on"). Move tini's install -- to /usr/local/bin, say, where every other privileged binary in this image is deliberately put
 # root-owned -- update one spelling and not the other, and the BUILD STILL PASSES: every route into
 # the container then dies at `exec: not found`, exit 127, and run.sh's settle() reports `gone`, so
 # the failure blames the egress boundary and sends the reader to audit something that is fine.
@@ -444,7 +443,13 @@ fi
 # BOTH EXTRACTIONS ARE PINNED AGAINST EMPTY AND AGAINST MORE THAN ONE MATCH -- a sed that silently
 # matched nothing would leave this comparing "" with "" and printing its ok, which is this
 # directory's recurring defect rather than a hypothetical one.
-df_reaper="$(sed -n 's/^.*test -x[[:space:]][[:space:]]*\([^[:space:]\\]*\).*$/\1/p' "$here/Dockerfile")"
+# COMMENT LINES ARE DROPPED FIRST. Without that, the guard's subject is an instruction while it
+# is reading prose: delete the real `test -x` from the RUN block, leave a comment naming the same
+# path, and this printed ok about a build that asserts nothing. A grep, not a Dockerfile lexer --
+# this asks one question about one line, and every COPY and RUN here is a plain unindented
+# instruction.
+df_reaper="$(grep -vE '^[[:space:]]*#' "$here/Dockerfile" \
+    | sed -n 's/^.*test -x[[:space:]][[:space:]]*\([^[:space:]\\]*\).*$/\1/p')"
 ep_reaper="$(sed -n 's/^exec "\${JKB_REAPER:-\([^}]*\)}".*$/\1/p' "$here/entrypoint.sh")"
 if [ "$(printf '%s\n' "$df_reaper" | grep -c .)" -ne 1 ]; then
     bad "the Dockerfile no longer asserts exactly one reaper path with \`test -x\` (found: ${df_reaper:-none}) — a missing reaper would surface only as the container failing to start"

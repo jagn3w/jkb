@@ -46,6 +46,18 @@ a failure is attributable to the container profile and not the kernel.
 - **Non-root is load-bearing, not hygiene.** With seccomp disabled entirely, *root* in a container
   still cannot create a mount/net/pid namespace directly — only the `--unshare-user` variants
   work. Non-root passes everything.
+- **PID 1 must reap, and `sleep` cannot.** `run.sh` keeps the container alive with `sleep
+  infinity`, and `entrypoint.sh` used to end in a bare `exec "$@"` — which made that `sleep` the
+  PID 1 of the namespace. PID 1 must `wait()` on the orphans it adopts, and `sleep` never does, so
+  every orphan stayed a zombie for ever. Measured on a container 28 hours old: **3941 zombies of
+  3968 tasks, and 4083 of `container.json`'s 4096 PIDs spent** — thirteen from a container that
+  could not fork at all. It is one zombie per sandboxed Bash call, so it tracks agent activity and
+  an unattended session reaches the limit unaided. `entrypoint.sh` execs tini now.
+- **Docker's `--init` is deliberately not how that is done.** It wraps the entrypoint, so PID 1's
+  argv names `entrypoint.sh` for the container's whole life — and `run.sh`'s `settle()` reads a
+  match of `entrypoint.sh` as "not finished yet", so under `--init` it never settles and every
+  create and start fails on its 120s budget. Exec'ing tini *from* the entrypoint keeps PID 1's
+  argv meaningful to that probe.
 
 ## Using it
 

@@ -451,9 +451,9 @@ true    /usr/local/bin/entrypoint.sh  waiting
 true    /bin/bash             settled
 true    sleep\x20infinity      settled
 # WHAT PID 1 IS ONCE entrypoint.sh HANDS OVER. It execs tini so that PID 1 reaps -- `sleep` never
-# wait()s, and every orphan reparented to it stayed a zombie for ever (3941 of them, thirteen PIDs
-# short of container.json's limit, before this). The argv has to stay readable BY THIS FUNCTION,
-# which is the half that is easy to break silently.
+# wait()s, and every orphan reparented to it stayed a zombie for ever (README.md, "The
+# measurements this is built on"). The argv has to stay readable BY THIS FUNCTION, which is the
+# half that is easy to break silently.
 true    /usr/bin/tini\x20--\x20sleep\x20infinity   settled
 # ...AND WHY `--init` IS NOT HOW THAT IS DONE, as a row rather than only as a comment in
 # entrypoint.sh. Docker's tini wraps this script instead of being exec'd by it, so PID 1's argv

@@ -125,6 +125,50 @@ missing_extensions() { # missing_extensions <declared, one per line> <installed,
 #
 # Everything that is not an observation of reaping is its own verdict and none of them is `ok` --
 # an unobtainable measurement must never be spelled as a definite answer.
+# /proc/<pid>/stat, split at the LAST ") ". comm is arbitrary — it can contain spaces and
+# parentheses — so splitting at the first is wrong for any process that chooses to be awkward.
+#
+# starttime (field 22 overall, position 20 after the comm) is what gives the orphan an IDENTITY.
+# Gating on comm being `(sleep)` would defeat pid recycling, but it also fails for the window
+# between fork() and execve() when the child's comm is still `bash` — so a healthy container would
+# report `vanished`. Identity by construction plus starttime removes the window instead of sizing
+# it: the pid is our own child, forked milliseconds ago; a DIFFERENT starttime on it later means
+# the pid was recycled, which can only happen after the original was reaped.
+proc_stat_fields() { # proc_stat_fields <stat line> -> sets PS_STATE PS_PPID PS_START; 1 if short
+    local rest
+    rest="${1##*) }"
+    # Deliberate word splitting: every field after the comm is a single token.
+    # shellcheck disable=SC2086
+    set -- $rest
+    [ "$#" -ge 20 ] || return 1
+    PS_STATE="$1"; PS_PPID="$2"; PS_START="${20}"
+}
+
+# NO FORK IN THE MEASUREMENT. The previous version read through `$( )` and polled sixty times with
+# `sleep 0.1` -- up to ~120 forks inside the probe whose own premise is that fork may be failing at
+# the --pids-limit. Worse, it spelled four different unobtainable observations (process gone, fork
+# failed, /proc unreadable, a line too short to parse) as `gone`, which reaper_verdict reads as
+# `reaped`: the PASS direction. So a container near the limit could be leaking and be certified.
+#
+# This sets globals and returns three ways instead: 0 present, 1 GONE, 2 UNREADABLE. `gone` is
+# claimed only when the process directory is observably absent -- an absence is proof only where
+# the place it would be is visible, which is the archive sweep's rule one level down. A read that
+# fails with the directory still there establishes nothing and must not pass.
+PS_STATE=""; PS_PPID=""; PS_START=""
+pstat() { # pstat <pid> -> 0 present (sets PS_*) | 1 gone | 2 unreadable
+    local l=""
+    # NOT `if read`: read returns non-zero at EOF WITHOUT a trailing newline while still having
+    # set the variable, so its exit code is not "did I get a line". The content is.
+    IFS= read -r l <"$PROC/$1/stat" 2>/dev/null
+    if [ -n "$l" ]; then
+        proc_stat_fields "$l" || return 2
+        return 0
+    fi
+    # `gone` is claimed ONLY where the place it would be is observably absent.
+    [ -d "$PROC/$1" ] && return 2
+    return 1
+}
+
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
     [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
     # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
@@ -133,12 +177,13 @@ reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <f
     [ -n "$3" ] || { printf 'vanished'; return; }
     [ "$3" = 1 ] || { printf 'not-adopted'; return; }
     case "$4" in
-        gone) printf 'reaped' ;;
-        Z)    printf 'not-reaped' ;;
-        *)    printf 'never-exited' ;;
+        gone)             printf 'reaped' ;;
+        Z)                printf 'not-reaped' ;;
+        proc-unreadable)  printf 'proc-unreadable' ;;
+        unreadable)       printf 'orphan-unreadable' ;;
+        *)                printf 'never-exited' ;;
     esac
 }
-
 # --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
 #
 # It is the one part of the mount boundary that widens by a TYPO rather than by an edit anyone
@@ -199,9 +244,43 @@ if [ "$SELF_TEST" = yes ]; then
     st2 "the dot in an id is literal, not a wildcard" \
         "$(missing_extensions "anthropic.claude-code@2.1.250" "anthropicXclaude-code")" " anthropic.claude-code"
 
-    # Assertion 1b's judgement. Only ONE of these six arms is reachable in a healthy container, so
-    # without this the other five are unreachable code in a change whose whole subject is a check
-    # that could not fire. A literal table, not a re-derivation of the conditions.
+    # THE STAT PARSER, against real-shaped lines. It splits at the LAST ") " because comm is
+    # arbitrary; the pre-exec row is the one that matters, since gating on comm being `(sleep)`
+    # would make a healthy container report `vanished` between fork() and execve().
+    echo "==> verify.sh self-test: proc_stat_fields"
+    st_line() { printf '%s (%s) %s 1 1 1 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$2" "$3" "$4"; }
+    psf() { PS_STATE=; PS_PPID=; PS_START=; proc_stat_fields "$1" || return 1; printf '%s %s %s' "$PS_STATE" "$PS_PPID" "$PS_START"; }
+    st2 "a sleeping orphan yields state, ppid and starttime" \
+        "$(psf "$(st_line 42 sleep S 987654)")" "S 1 987654"
+    st2 "a pre-exec child still named bash parses identically — no comm gate" \
+        "$(psf "$(st_line 42 bash R 987654)")" "R 1 987654"
+    st2 "a zombie is read as such" \
+        "$(psf "$(st_line 42 sleep Z 987654)")" "Z 1 987654"
+    st2 "a comm containing a space and a paren does not shift the fields" \
+        "$(psf "$(st_line 42 'we (ird) name' S 987654)")" "S 1 987654"
+    st2 "a truncated line is refused rather than answered from short fields" \
+        "$(psf '42 (sleep) S 1 1' >/dev/null 2>&1; echo $?)" "1"
+
+    # pstat's THREE-WAY RETURN, which is the whole of finding 2's fix: `gone` is claimed only where
+    # the process directory is observably absent, and a read that fails with the directory still
+    # there establishes nothing. Spelling those the same is what let a leaking container be
+    # certified as reaping. /proc is injected, so all three are reachable on a host without one.
+    echo "==> verify.sh self-test: pstat's three-way return"
+    PROC="$(mktemp -d)"; st_fail_trap="$PROC"
+    mkdir -p "$PROC/100" "$PROC/101" "$PROC/102"
+    st_line 100 sleep S 555 > "$PROC/100/stat"
+    printf '101 (sleep) S 1 1' > "$PROC/101/stat"          # too short to parse
+    # 102 has a directory and no stat file at all.
+    pstat 100; st2 "a readable stat is present (0)"            "$?" "0"
+    st2 "...and its fields are set"                            "$PS_STATE $PS_PPID $PS_START" "S 1 555"
+    pstat 101; st2 "an unparseable stat is UNREADABLE (2), not gone" "$?" "2"
+    pstat 102; st2 "a directory with no stat is UNREADABLE (2), not gone" "$?" "2"
+    pstat 999; st2 "an absent process directory is GONE (1)"   "$?" "1"
+    rm -rf "$PROC"; PROC="${JKB_PROC:-/proc}"
+
+    # Assertion 1b's judgement. Only ONE of these arms is reachable in a healthy container, so
+    # without this the rest are unreachable code in a change whose whole subject is a check that
+    # could not fire. A literal table, not a re-derivation of the conditions.
     echo "==> verify.sh self-test: reaper_verdict"
     st2 "a reaped orphan is the only ok arm" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 gone)" "reaped"
@@ -213,12 +292,17 @@ if [ "$SELF_TEST" = yes ]; then
         "$(reaper_verdict '' 42 1 gone)" "pid1-unreadable"
     st2 "a failed fork establishes nothing (and is the leak's own symptom)" \
         "$(reaper_verdict 'sleep infinity' '' '' '')" "fork-failed"
+    st2 "an unreadable /proc establishes nothing — it must not read as a reap" \
+        "$(reaper_verdict 'sleep infinity' 42 1 proc-unreadable)" "proc-unreadable"
+    st2 "an orphan whose entry cannot be read establishes nothing either" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 unreadable)" "orphan-unreadable"
     st2 "an orphan that vanished before it was observed establishes nothing" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 '' '')" "vanished"
     st2 "an orphan a subreaper took establishes nothing about PID 1" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 77 gone)" "not-adopted"
     st2 "an orphan still running was never there to be reaped" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 S)" "never-exited"
+
 
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
@@ -271,8 +355,8 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 
 # 1b. PID 1 REAPS WHAT IT ADOPTS. run.sh keeps this container alive with `sleep infinity`, and a
 #     bare `exec "$@"` in entrypoint.sh made THAT PID 1 -- `sleep` never wait()s, so every orphan
-#     reparented to it stayed a zombie for ever: 3941 of them on a 28h-old container, thirteen
-#     PIDs short of --pids-limit, i.e. thirteen from a container that cannot fork at all.
+#     reparented to it stayed a zombie for ever — see README.md, "The measurements this is
+#     built on", for the numbers and the date they were taken.
 #
 #     WHY IT IS ASSERTED HERE AND NOT ONLY AT BUILD. The fix is an IMAGE change, and nothing else
 #     observes the running container: `config_hash` covers the derived docker arguments and the
@@ -283,45 +367,63 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 #     "running and attachable" while the leak continues. This is the assertion that goes red there.
 #     The self-test proves the SCRIPT execs its reaper and the Dockerfile proves tini existed AT
 #     BUILD TIME; neither is an observation of the container you are about to attach to.
+# /proc is path-injected (JKB_PROC) exactly like JKB_INET6_PATH, so every arm below is exercised
+# by `--self-test` on a host that has no /proc at all. The arms that matter most are the ones no
+# healthy container can reach.
+PROC="${JKB_PROC:-/proc}"
+
 pid1_argv=""
-while IFS= read -r -d '' w; do pid1_argv="$pid1_argv$w "; done </proc/1/cmdline 2>/dev/null
+while IFS= read -r -d '' w; do pid1_argv="$pid1_argv$w "; done <"$PROC/1/cmdline" 2>/dev/null
 pid1_argv="${pid1_argv% }"
 
-# stdout, stderr AND stdin are redirected or the command substitution below waits for the orphan
-# too, and this blocks for its whole life instead of returning its pid.
-orphan="$( ( sleep 1 >/dev/null 2>&1 </dev/null & echo $! ) 2>/dev/null )"
-[ "${orphan:-0}" -gt 0 ] 2>/dev/null || orphan=""
 
-# "<state> <ppid>", or non-zero once the process is gone. The comm check is what stops a pid
-# RECYCLED between two reads from being mistaken for our orphan -- at 4000 PIDs in flight that is
-# not a hypothetical. Builtins only: on the container this exists for, fork may be failing.
-pstat() { # pstat <pid> -> "<state> <ppid>"
-    local l rest st pp
-    IFS= read -r l <"/proc/$1/stat" 2>/dev/null || return 1
-    case "$l" in *"(sleep) "*) ;; *) return 1 ;; esac
-    rest="${l##*) }"          # strip through comm, leaving "<state> <ppid> ..."
-    st="${rest%% *}"; rest="${rest#* }"; pp="${rest%% *}"
-    printf '%s %s' "$st" "$pp"
-}
+# THE PREMISE, ESTABLISHED BEFORE IT IS USED: if our own stat is unreadable then nothing below
+# observes anything, and every later "gone" would be a fact about /proc rather than about PID 1.
+orphan=""; adopted=""; final=""; born=""
+if ! pstat "$$"; then
+    final=proc-unreadable
+else
+    # The pid comes back through a FILE, not a command substitution: `$( )` would fork again, and
+    # the substitution also has to wait for the subshell. These two forks (the subshell and the
+    # orphan) are the only ones before the measurement, and a failure of either shows up as an
+    # empty pid, which reaper_verdict reads as fork-failed -- the leak's own end state.
+    pidfile="$(mktemp)"
+    ( sleep 1 >/dev/null 2>&1 </dev/null & echo $! >"$pidfile" ) 2>/dev/null
+    IFS= read -r orphan <"$pidfile" 2>/dev/null || orphan=""
+    rm -f "$pidfile"
+    case "$orphan" in ''|*[!0-9]*) orphan="" ;; esac
 
-adopted=""; final=""
-if [ -n "$orphan" ] && s="$(pstat "$orphan")"; then
-    adopted="${s#* }"
-    i=0
-    while [ "$i" -lt 60 ]; do          # 6s, well past the orphan's 1s life
-        if s="$(pstat "$orphan")"; then final="${s%% *}"; else final=gone; break; fi
-        sleep 0.1; i=$((i+1))
-    done
+    if [ -n "$orphan" ] && pstat "$orphan"; then
+        adopted="$PS_PPID"; born="$PS_START"
+        # ONE WAIT, NOT A POLL. The orphan lives 1s; three seconds is well past it, and a `sleep`
+        # that cannot fork is itself the answer rather than sixty chances to be wrong.
+        if sleep 3; then
+            pstat "$orphan"; rc=$?
+            case "$rc" in
+                # A DIFFERENT starttime on the same pid is a recycled pid, and a pid is recycled
+                # only after the process holding it was reaped -- evidence of a reap, not a miss.
+                0) if [ "$PS_START" != "$born" ]; then final=gone; else final="$PS_STATE"; fi ;;
+                2) final=unreadable ;;
+                *) final=gone ;;
+            esac
+        else
+            orphan=""     # fork-failed
+        fi
+    elif [ -n "$orphan" ]; then
+        final=unreadable
+    fi
 fi
 
 case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
     reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
-    not-reaped) bad "PID 1 does not reap: an orphan it adopted has been a zombie for 6s (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
-    fork-failed)     bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
-    pid1-unreadable) bad "could not establish whether PID 1 reaps: /proc/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
-    not-adopted)     bad "could not establish whether PID 1 reaps: the test orphan was adopted by pid $adopted rather than PID 1, so a subreaper is in the way (PID 1 is: $pid1_argv)" ;;
-    vanished)        bad "could not establish whether PID 1 reaps: the test orphan could not be observed at all after being spawned (PID 1 is: $pid1_argv)" ;;
-    never-exited)    bad "could not establish whether PID 1 reaps: the test orphan is still in state '$final' after 6s, so it never exited to be reaped (PID 1 is: $pid1_argv)" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    fork-failed)      bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
+    pid1-unreadable)  bad "could not establish whether PID 1 reaps: $PROC/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
+    proc-unreadable)  bad "could not establish whether PID 1 reaps: this process's own $PROC entry is unreadable, so an absent orphan would say nothing about reaping" ;;
+    orphan-unreadable) bad "could not establish whether PID 1 reaps: the test orphan's $PROC entry exists but could not be read or parsed (PID 1 is: $pid1_argv)" ;;
+    not-adopted)      bad "could not establish whether PID 1 reaps: the test orphan was adopted by pid $adopted rather than PID 1, so a subreaper is in the way (PID 1 is: $pid1_argv)" ;;
+    vanished)         bad "could not establish whether PID 1 reaps: the test orphan could not be observed at all after being spawned (PID 1 is: $pid1_argv)" ;;
+    never-exited)     bad "could not establish whether PID 1 reaps: the test orphan is still in state '$final' after 3s, so it never exited to be reaped (PID 1 is: $pid1_argv)" ;;
 esac
 
 # 2. THE NESTED SANDBOX'S MECHANISM, measured by the one probe (D54.3).

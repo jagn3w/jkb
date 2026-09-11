@@ -109,9 +109,9 @@ STUB
     eq "an allowlisted kernel execs the command"    "$(run_ep)" "BECAME-THE-COMMAND"
     eq "...and says nothing on stderr"              "$(wc -c <"$t/err" | tr -d ' ')" "0"
     # THE HANDOVER GOES THROUGH A REAPER. `sleep` as PID 1 never wait()s, so every orphan
-    # reparented to it stayed a zombie for ever — 3941 of them, thirteen PIDs short of the
-    # container's limit. The command running proves nothing about this on its own: a bare
-    # `exec "$@"` satisfies every other assertion here, which is exactly why it survived.
+    # reparented to it stayed a zombie for ever (README.md, "The measurements this is built
+    # on"). The command running proves nothing about this on its own: a bare `exec "$@"` satisfies
+    # every other assertion here, which is exactly why it survived.
     eq "...and hands over THROUGH the reaper, not straight to the command" \
        "$(cat "$t/reaped" 2>/dev/null)" "reaped"
 
@@ -217,7 +217,7 @@ esac
 # reparented to PID 1, and PID 1 must wait() on it or it stays a zombie for ever; `sleep` never
 # wait()s. The leak is therefore unbounded, and it is not a corner case: it is one zombie per
 # sandboxed Bash call (the zombies are bwrap/bash/sh/touch), so it tracks agent activity and an
-# unattended session walks into it unaided. Measured on a container 28 hours old: 3941 zombies of
+# unattended session walks into it unaided. Measured on a container 28 hours old: of
 # 3968 tasks, and 4083 of container.json's 4096 PIDs spent — thirteen from a container that cannot
 # fork at all, which is not a slow degradation but every build, shell and tool call failing at once.
 #

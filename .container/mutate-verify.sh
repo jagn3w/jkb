@@ -720,7 +720,18 @@ if [ "${#caught_expects[@]}" -gt 0 ]; then
         grep -nF -e "$want" "$V" 2>/dev/null | cut -d: -f1
     done | sort -un)"
 fi
-all_paths="$(grep -nE '^[[:space:]]*(bad "|assert )' "$V" 2>/dev/null | cut -d: -f1 | sort -un)"
+# ANCHORING THIS AT LINE START WAS WRONG, and wrong in the unsafe direction: it could not see a
+# `bad` written as a `case` arm (`not-reaped) bad "..."`), so it counted 36 where the file has
+# ~50, those paths never appeared under "NOT covered by this run", and the report could say `all
+# 36 failure paths were driven` about a file where a quarter had never been watched failing.
+#
+# OVER-COUNTING IS THE SAFE DIRECTION FOR A DENOMINATOR: a line that is not really a failure path
+# can only make coverage look worse than it is, while a missed one makes it look better. So this
+# takes any non-comment, non-definition line that calls `bad` or `assert` however it is written,
+# and deliberately does not try to be exact.
+all_paths="$(grep -nE '(bad "|assert )' "$V" 2>/dev/null \
+    | grep -vE ':[[:space:]]*#' | grep -vE ':[[:space:]]*[a-z_]+\(\)' \
+    | cut -d: -f1 | sort -un)"
 n_all="$(printf '%s' "$all_paths" | grep -c '^' || true)"
 # NOT `comm`, which requires both inputs in ITS collating order — bytes — while these are line
 # numbers sorted NUMERICALLY. The two orders disagree the moment the file passes 99 lines: `100`
