@@ -1386,9 +1386,26 @@ $(awk '/^render_git_hooks_report\(\) \{/ { inside = 1 }
        }
        /^                esac ;;/ { key = "" }' "$lib_path")
 EOF
-    [ "${#declared[@]}" -ge 12 ] \
-        && ok "the renderer's state vocabulary is derived from it, and has ${#declared[@]} entries" \
-        || fail "render: derived" "derived ${#declared[@]} states; the derivation is broken, not the code"
+    # PER KEY, not one total. The awk pass is keyed on exact indentation inside
+    # `render_git_hooks_report`, and a single total floor is cleared by whichever keys survived:
+    # measured, dedenting the `dispatch=*)` inner case by two spaces in lib.sh — still valid under
+    # `bash -n` — dropped all eight dispatch arms, and this case printed `ok … has 18 entries`
+    # (chainer 5 + exclude 10 + exclude-file 3) and then `ok` for the header check below, with the
+    # entire dispatch vocabulary unchecked. Both derived checks go vacuous together and both say
+    # so in the past tense. A floor over a SUM cannot notice that one summand went to zero.
+    local key derived_keys missing_key=""
+    derived_keys="$(printf '%s\n' "${declared[@]}" | cut -d= -f1 | sort -u)"
+    for key in chainer exclude exclude-file dispatch; do
+        grep -qxF "$key" <<<"$derived_keys" || missing_key="$missing_key $key"
+    done
+    if [ -n "$missing_key" ]; then
+        fail "render: derived" "the derivation found no arms at all for:$missing_key — every check \
+below that consumes them is asserting nothing, and would say ok"
+    elif [ "${#declared[@]}" -lt 12 ]; then
+        fail "render: derived" "derived ${#declared[@]} states; the derivation is broken, not the code"
+    else
+        ok "the renderer's state vocabulary is derived from it, every key present, ${#declared[@]} entries"
+    fi
 
     # ...and now the protocol header, against that complete set rather than against the quarter
     # of it the refusal mapping can reach. `$hdr` was extracted above; every `dispatch=` word the

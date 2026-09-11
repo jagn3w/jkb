@@ -1910,6 +1910,46 @@ the layout the arm ACCEPTS the pull looks entirely ordinary and the chore silent
 verdict: $(printf '%s' "$out11" | tr '\n' '|')" ;;
     esac
 
+    # 11a2. ...and SILENT where there is no jkb at all. The reorder that asks `command -v jkb`
+    #       before deciding what to say is pinned by nothing otherwise: both chore-2 steps prepend
+    #       a stub, so the jkb-absent branch never runs, and folding the two nested ifs back into
+    #       one `if skip_close … elif command -v jkb …` restores a per-pull line blaming jkb's
+    #       repository discovery on a machine that has no jkb — measured green across all five
+    #       suites before this step existed.
+    #
+    #       A PATH of SYMLINKS rather than an empty one: the hook still needs `git` and `grep`,
+    #       and `#!/usr/bin/env bash` needs `bash` findable. Built from whatever the real binaries
+    #       are, so this holds on a developer machine too — where `jkb` normally IS on PATH, which
+    #       is exactly the environment the assertion has to be true in.
+    local nobin="$d/nojkb" tool src
+    mkdir -p "$nobin"
+    for tool in git grep bash sh env; do
+        src="$(command -v "$tool" 2>/dev/null)" || continue
+        ln -sf "$src" "$nobin/$tool"
+    done
+    if PATH="$nobin" command -v jkb >/dev/null 2>&1; then
+        fail "hookenv: nojkb-premise" "jkb is still resolvable on the fixture PATH, so the \
+absence this step is about was never created"
+    else
+        ( cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q reset -q --hard HEAD~1 ) \
+            >/dev/null 2>&1
+        local out11b
+        out11b="$(cd "$btree" && PATH="$nobin" GIT_DIR="$bgd" GIT_WORK_TREE="$btree" \
+                  git_q merge --no-edit feature 2>&1)"
+        case "$out11b" in
+            *"could not establish"*)
+                case "$out11b" in
+                    *"not closing merged tasks"*)
+                        fail "hookenv: nojkb" "with no jkb on PATH the hook still explains that \
+jkb cannot work out which repository this is — a claim about jkb from an arm that never found \
+one, printed on every pull" ;;
+                    *) ok "and says nothing about closing tasks where there is no jkb to close them" ;;
+                esac ;;
+            *) fail "hookenv: nojkb-reach" "the fixture no longer reaches the unestablished \
+verdict without jkb on PATH: $(printf '%s' "$out11b" | tr '\n' '|')" ;;
+        esac
+    fi
+
     # 11. ...and the same verdict must still SKIP. The two cases inside "unestablished" — this
     #     legitimate one and a leak into a directory no repository owns — are indistinguishable
     #     from the repository's own records, so the honest move is to build neither.

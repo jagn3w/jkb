@@ -153,6 +153,28 @@ GEN
     chmod +x "$d/generate-fixture.sh"
     ( cd "$d" && ./generate-fixture.sh >/dev/null )   # lay down the in-sync artifact
 
+    # A SECOND GENERATOR, so that "the loop went on to the next one" is observable at all. With one
+    # fixture, every row below passes whether the loop continues or aborts — which is how the
+    # `diff -u … | head -60` line sat in the DIFFER arm aborting the whole run on the first drifting
+    # artifact: `diff` exits 1 on every difference, `head` exits early, and under `set -euo
+    # pipefail` the script ended there, skipping every later generator AND the restore three lines
+    # down. Measured: reverting that line leaves this self-test fully green with one fixture. Named
+    # `generate-second.sh` because the glob is sorted and `f` sorts before `s`, so the drifting one
+    # is processed first — the ordering the failure needs.
+    cat > "$d/generate-second.sh" <<'GEN2'
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+out="$here/second-artifact"
+if [ "${1:-}" = --print-target ]; then printf '%s\n' "$out"; exit 0; fi
+{ printf '# GENERATED FILE -- DO NOT EDIT.\n'
+  printf '# Source: %s\n' "https://fixture.invalid/second"
+  printf '# upstream-sha256: %s\n' 3333333333333333333333333333333333333333333333333333333333333333
+  printf 'second body\n'; } > "$out"
+GEN2
+    chmod +x "$d/generate-second.sh"
+    ( cd "$d" && ./generate-second.sh >/dev/null )
+
     # THE ARTIFACT MUST BE BYTE-IDENTICAL AFTERWARDS, asserted on every drive that has one.
     #
     # This check REGENERATES IN PLACE and puts the file back, so its non-destructiveness is a
@@ -191,6 +213,11 @@ GEN
     # something that is present when nothing is wrong.
     drive "an in-sync artifact reports no drift (the control)" ok
     drive "a hand-edited artifact is caught" "hand-edited" JKB_FIXTURE_BODY=different
+    # ...AND THE LOOP CARRIES ON. The row above only needs the word "hand-edited", which is printed
+    # BEFORE the diff — so it passes just as happily when the script dies immediately afterwards.
+    # This one names the second artifact, which is only reached if the first one's arm returned.
+    drive "and a later generator is still checked after an earlier one drifts" \
+          "second-artifact" JKB_FIXTURE_BODY=different
     drive "a moved upstream is caught and named as such" "upstream moved" JKB_FIXTURE_DIGEST=2222222222222222222222222222222222222222222222222222222222222222
     # A GENERATOR THAT CANNOT RUN, which is the network-failure path and the one arm whose whole
     # value is that it does NOT report success. Deleting its `status=1` left every row here green
@@ -206,9 +233,12 @@ GEN
     mv "$d/fixture-artifact" "$d/gone"
     drive "a missing artifact is caught" "which does not exist"
     mv "$d/gone" "$d/fixture-artifact"
-    mv "$d/generate-fixture.sh" "$d/nope"
+    # BOTH, now that there are two. Moving only the first left the second in place, so "no
+    # generator at all" was driven against a directory that still had one — the row reported no
+    # drift and failed on its own premise, which is the harness working.
+    mv "$d/generate-fixture.sh" "$d/nope"; mv "$d/generate-second.sh" "$d/nope2"
     drive "no generator at all establishes nothing" "no generator was checked"
-    mv "$d/nope" "$d/generate-fixture.sh"
+    mv "$d/nope" "$d/generate-fixture.sh"; mv "$d/nope2" "$d/generate-second.sh"
 
     if [ "$fails" -eq 0 ]; then printf '\033[32mcheck-drift self-test passed\033[0m\n'; exit 0; fi
     printf '\033[31mcheck-drift self-test: %s failed\033[0m\n' "$fails"; exit 1
