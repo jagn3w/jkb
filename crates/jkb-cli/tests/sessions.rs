@@ -3404,3 +3404,83 @@ fn the_session_fixture_jkb_does_not_inherit_a_repository() {
     // end, on the pin guarding every `jkb` spawn in this file.
     common::assert_isolated("Fixture::jkb", &fx.jkb());
 }
+
+/// The repository-selection scrub, observed by ITS HARM rather than by agreeing lists.
+///
+/// Every other guard on this rule compares one written-down thing against another: production
+/// iterates `REPO_SELECTION_VARS`, `assert_scrubbed` holds a literal, and the crate-wide spawn
+/// scan checks that each site calls the scrubber. That is three artifacts and they are checked
+/// pairwise — which is exactly as strong as the weakest editor who touches two of them at once.
+/// Round 25 measured that: with the assertion iterating the same list production did, deleting one
+/// name from it left 260 tests green while every spawn inherited the variable. The literal closed
+/// that; this closes the next one, where somebody edits the literal too.
+///
+/// So this asserts nothing about any list. It exports the variable a caller would really have
+/// exported, runs a real `jkb task work`, and asks whether the session landed in the repository
+/// jkb was RUN IN and whether the other repository was left alone. `.env()` after
+/// `isolate_git_env` overrides that fixture's `env_remove`, which is precisely the attack.
+///
+/// `GIT_DIR` is the subtle one and the reason the foreign repository is snapshotted rather than
+/// merely checked for existence: the cwd still reads as the toplevel, so a naive assertion passes
+/// while the branch `task work` creates is written into the OTHER repository's ref store.
+///
+/// TWO OF THE THREE, and the third is named rather than quietly folded in. Each variable was
+/// measured by removing it from `REPO_SELECTION_VARS` and re-running: `GIT_DIR` and
+/// `GIT_COMMON_DIR` both fail here, and `GIT_WORK_TREE` does NOT — traced with the real binary,
+/// an exported and unscrubbed `GIT_WORK_TREE` leaves `task work` landing in the repository jkb was
+/// run in, with the other repository's files and branches untouched. It selects a work tree, not a
+/// repository, so this path gives it nothing to redirect. It stays in the scrub because the harm
+/// it does is elsewhere — `git -C <dir> init` with one exported re-initialises the OTHER
+/// repository, which is what `isolate_git_env`'s own comment records — and that belongs to a probe
+/// of `init`, not of sessions. Writing it into this loop would have produced an iteration that
+/// passes for the same reason a deleted assertion does.
+#[test]
+fn an_exported_repository_selection_cannot_redirect_a_session() {
+    for var in ["GIT_DIR", "GIT_COMMON_DIR"] {
+        let f = Fixture::new();
+        let foreign = f.home.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        git(&foreign, &["init", "-q", "-b", "main"]);
+        std::fs::write(foreign.join("F.md"), "foreign\n").unwrap();
+        git(&foreign, &["add", "-A"]);
+        git(&foreign, &["commit", "-qm", "foreign base"]);
+
+        // What a session would disturb if it resolved to this repository: its branches and its
+        // registered worktrees. Both are what `task work` writes.
+        let snapshot = |p: &Path| {
+            (
+                git(p, &["branch", "--list", "--format=%(refname)"]),
+                git(p, &["worktree", "list", "--porcelain"]),
+            )
+        };
+        let before = snapshot(&foreign);
+
+        let value = foreign.join(".git");
+        let uid = f.add_task("redirect probe !p2");
+        let out = f
+            .jkb()
+            .env(var, &value)
+            .args(["task", "work", &uid, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{var}: `task work` failed outright: {out:?}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let worktree = PathBuf::from(v["worktree"].as_str().unwrap());
+        assert!(
+            worktree.starts_with(&f.repo),
+            "{var}: an exported repository selection moved the session out of the repository jkb \
+             was run in — it landed at {worktree:?}, not under {:?}",
+            f.repo
+        );
+        assert_eq!(
+            before,
+            snapshot(&foreign),
+            "{var}: opening a session wrote into a repository the caller merely had selected in \
+             their environment. Nothing in this test reads REPO_SELECTION_VARS: if it fails, a \
+             spawn stopped scrubbing, whatever the lists say."
+        );
+    }
+}
