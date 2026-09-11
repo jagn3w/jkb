@@ -3420,9 +3420,17 @@ fn the_session_fixture_jkb_does_not_inherit_a_repository() {
 /// jkb was RUN IN and whether the other repository was left alone. `.env()` after
 /// `isolate_git_env` overrides that fixture's `env_remove`, which is precisely the attack.
 ///
-/// `GIT_DIR` is the subtle one and the reason the foreign repository is snapshotted rather than
-/// merely checked for existence: the cwd still reads as the toplevel, so a naive assertion passes
-/// while the branch `task work` creates is written into the OTHER repository's ref store.
+/// `GIT_DIR` redirects the SESSION, not merely the ref store, and the containment assertion below
+/// is what catches it. Measured on git 2.51.1: delete `"GIT_DIR"` from `REPO_SELECTION_VARS` and
+/// this test fails on `starts_with`, never reaching the snapshot compare. The earlier version of
+/// this paragraph had it backwards — it said the cwd "still reads as the toplevel, so a naive
+/// assertion passes". Half true and the wrong half: `GIT_DIR=<foreign>/.git git -C proj rev-parse
+/// --show-toplevel` does answer `proj`, but `session` does not ask that. `gitrepo::main_root`
+/// takes the parent of `rev-parse --path-format=absolute --git-common-dir`, which answers
+/// `<foreign>/.git`, so the session is placed under `foreign` outright.
+///
+/// The snapshot is still the second assertion, for the writes containment would not see — a
+/// session that landed in the right place while creating branches in the wrong repository.
 ///
 /// TWO OF THE THREE, and the third is named rather than quietly folded in. Each variable was
 /// measured by removing it from `REPO_SELECTION_VARS` and re-running: `GIT_DIR` and
@@ -3477,11 +3485,16 @@ fn an_exported_repository_selection_cannot_redirect_a_session() {
         // `session::is_within` records the same hazard; the integration crate cannot import it.
         let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let worktree = canon(Path::new(v["worktree"].as_str().unwrap()));
+        // BOUND ONCE and used in both the comparison and the message. Printing the canonicalized
+        // worktree against a raw `f.repo` made a genuine break on a symlinked TMPDIR show two
+        // different path prefixes — the exact visual signature of the symlink false positive the
+        // canonicalization just removed, so a reader would conclude the fix was incomplete rather
+        // than that the scrub was broken.
+        let repo = canon(&f.repo);
         assert!(
-            worktree.starts_with(canon(&f.repo)),
+            worktree.starts_with(&repo),
             "{var}: an exported repository selection moved the session out of the repository jkb \
-             was run in — it landed at {worktree:?}, not under {:?}",
-            f.repo
+             was run in — it landed at {worktree:?}, not under {repo:?}"
         );
         assert_eq!(
             before,

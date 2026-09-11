@@ -1641,6 +1641,38 @@ mod tests {
         );
     }
 
+    /// Everything production SELECTS is also dropped by the fixtures.
+    ///
+    /// The two were coupled by construction until round 26: both `fixture_git` builders called
+    /// `scrub_repo_selection` on top of the config isolation, so a name added to
+    /// `REPO_SELECTION_VARS` reached the fixtures automatically. That call was removed because it
+    /// had become redundant AND was pinning nothing — but removing it also removed the coupling,
+    /// and nothing replaced it: measured in round 27, adding `"GIT_OBJECT_DIRECTORY"` to
+    /// `REPO_SELECTION_VARS` and `EXPECT_SELECTION_REMOVED` left 118 tests passing while the two
+    /// library fixtures no longer dropped it, and with that variable exported they wrote loose
+    /// objects into a foreign object store.
+    ///
+    /// This is containment, not parity. `MUST_DROP` is deliberately WIDER — it carries the config
+    /// channels and the repository COMPONENTS that production leaves alone — so the assertion is
+    /// one-directional and production may grow without the fixture list being wrong. It reads the
+    /// constants the compiler saw, not their source text, which is what the deleted parity test
+    /// did wrong.
+    #[test]
+    fn the_fixtures_drop_everything_production_selects() {
+        let missing: Vec<&str> = super::REPO_SELECTION_VARS
+            .iter()
+            .filter(|v| !super::fixture_env::MUST_DROP.contains(v))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "production selects {missing:?} but the test fixtures do not drop them, so every \
+             fixture `git` would inherit them from the developer's shell. Add each to \
+             `MUST_DROP` and to `EXPECT_DROPPED` in tests/common/mod.rs — that is the edit, and \
+             it is not the same as editing `REPO_SELECTION_VARS` back down."
+        );
+    }
+
     /// Every git spawn in this module drops the caller's repository selection.
     ///
     /// Asserted on the built `Command` rather than by exporting the variables, because

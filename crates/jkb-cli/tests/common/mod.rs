@@ -11,8 +11,15 @@
 //! (`gitrepo::tests::fixture_git`, `archive::tests::fixture_git`) use these functions too. That
 //! replaced a second copy of the list in `gitrepo.rs` — `FIXTURE_CONFIG` and
 //! `isolate_fixture_config` — plus a test that parsed both out of their source files and compared
-//! them. One source text is not a thing to keep in agreement. Keep this module `std`-only: it is
-//! compiled by a crate that has no dev-dependencies in scope.
+//! them. One source text is not a thing to keep in agreement.
+//!
+//! (An earlier version of this paragraph asked that the module stay `std`-only "because it is
+//! compiled by a crate that has no dev-dependencies in scope". That is not true: `jkb-cli`'s
+//! `[dev-dependencies]` are available to the bin target compiled with `cfg(test)`, which is this
+//! compilation — `src/gitrepo.rs`'s own tests call `tempfile::tempdir()`. The claim is deleted
+//! rather than softened, because a false constraint is what produced the second list in the first
+//! place: a maintainer wanting `tempfile` here would have believed the boundary forbade it and
+//! written another copy somewhere else.)
 
 use std::process::Command;
 
@@ -64,9 +71,29 @@ pub fn isolate_git_env(cmd: &mut Command) {
 /// this list is then evidence about the environment that fixture builds, not about a second copy
 /// of the list.
 pub const MUST_DROP: &[&str] = &[
+    // Repository SELECTION — these outrank `-C`.
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
+    // Repository COMPONENTS. The list named only the three selectors, and the class it was
+    // supposed to cover is "every variable git reads to locate any PART of a repository" — an
+    // enumeration nothing bounded. Measured on an unmodified tree: with
+    // `GIT_INDEX_FILE=<victim>/.git/index` exported, `./scripts/test.sh -p jkb-cli --bin jkb
+    // gitrepo::tests` leaves the victim's index listing base.txt/mergecommit.txt/rebase.txt/
+    // squash.txt instead of its own file, and `git status` there fails outright with
+    // `fatal: unable to read <sha>`. The `GIT_OBJECT_DIRECTORY` variant leaks loose objects into
+    // the victim's store. Both `assert_isolated` guards stayed green throughout, because they
+    // compare against `EXPECT_DROPPED`, which spelled the same five names.
+    //
+    // FIXTURE SIDE ONLY. `scrub_repo_selection` deliberately stays at the three that select a
+    // repository: production must not discard a component a caller legitimately handed it (git
+    // exports `GIT_INDEX_FILE` to hook processes), while a fixture must not inherit anything it
+    // did not choose. Two rules, not drift — the same split that keeps `GIT_CONFIG_COUNT` here
+    // and not there.
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    // Configuration injection.
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
 ];
@@ -109,6 +136,9 @@ const EXPECT_DROPPED: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
 ];

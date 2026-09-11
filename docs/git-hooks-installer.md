@@ -680,13 +680,21 @@ conventions every session is expected to know.
   because they checked only `env_remove` — and deleting the whole block from BOTH `src/`
   fixtures left 118 green, because `assert_scrubbed` names only the selection variables. The
   state that produces is exactly the harm all three comment blocks describe. So the block is a
-  list now (`gitrepo::FIXTURE_CONFIG`, applied by `isolate_fixture_config` and checked by
-  `assert_isolated`) rather than three copies held up by prose. There are two such lists, one
-  per side of the crate boundary — `FIXTURE_CONFIG` is `#[cfg(test)]`, and an integration test
-  compiles with `cfg(test)` OFF — and each is asserted against the function beside it. Note the
-  asymmetry that is deliberate: production's `scrub_repo_selection` keeps
+  list now, applied by one function and checked by an oracle, rather than three copies held up by
+  prose. Note the asymmetry that is deliberate: production's `scrub_repo_selection` keeps
   `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, because production must not discard a
   `safe.directory` grant it needs. Two rules, not drift.
+
+  **SUPERSEDED — the two-lists half.** This paragraph used to continue: "There are two such lists,
+  one per side of the crate boundary — `FIXTURE_CONFIG` is `#[cfg(test)]`, and an integration test
+  compiles with `cfg(test)` OFF — and each is asserted against the function beside it." Both named
+  identifiers are gone. What reversed it: round 26 bridged the boundary with
+  `#[cfg(test)] #[path = "../tests/common/mod.rs"]`, compiling ONE source text into the bin
+  crate's test build and both integration crates, so the second list was never necessary — the
+  boundary forbade importing, not sharing a file. The parity test that compared the two lists went
+  with the duplicate; it compared text rather than environments, and its failure message read as
+  an instruction to sync them, which round 25 measured as the edit that reopens the scrub hole.
+  The live account is the seam bullet near the end of this file.
 - **A hand-written coverage table is the same defect one level up.** `case14`'s row list caught
   `unaskable` only because somebody remembered to write its row; when code 6 `unprobeable` was
   added with no render arm AT ALL, the case still passed. The set is derived from
@@ -935,7 +943,11 @@ conventions every session is expected to know.
   absolute path) made it look verified. The third exists because "no shebang" is not the whole
   set: `.container/lib.sh` and `egress-lib.sh` carry one, being `--self-test`-able, and are
   sourced by scripts that set `pipefail`. Anchoring the first clause without adding the third
-  would have dropped `.container/lib.sh` out entirely — the two bugs were holding each other up.
+  would have dropped BOTH out entirely — the two bugs were holding each other up. Neither file
+  sets `pipefail`: `egress-lib.sh`'s only match is a `set -euo pipefail` inside a single-quoted
+  `bash -c '…'` body, script text rather than a command that shell runs, so the anchored detector
+  still matches it for a reason unrelated to what it does. That is over-inclusion and safe, but it
+  is why "sets `pipefail`" should be read as "has a line beginning with `set` that mentions it".
   Membership now names all four libraries (`scripts/lib.sh`, `scripts/tests/harness.sh`,
   `.container/lib.sh`, `.container/egress-lib.sh`), because a coverage FLOOR is cleared by the
   three dozen files that declare `pipefail` themselves and can never notice a missing member.

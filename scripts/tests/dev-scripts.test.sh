@@ -227,6 +227,11 @@ case2() {
 # scope for a reason that had nothing to do with the code. Over-inclusion is the safe direction,
 # so nothing was wrong; but the file was in scope by accident, and fixing the accident without
 # fixing the rule would have dropped it out.
+#
+# It matches a line that BEGINS with `set`, which is not the same as "a `set` command": one inside
+# a here-doc body or a quoted `bash -c '…'` script still counts. That is over-inclusion and so
+# safe — the file is scanned, nothing is exempted — but it is not what the word "sets" suggests,
+# and reading it that way is what produced the wrong account further down.
 _sets_pipefail() { grep -qE '^[[:space:]]*set[[:space:]]+[^#]*pipefail' "$1"; }
 
 # ASSEMBLED FROM HALVES so this file cannot match its own detector. A check that fails on an
@@ -265,15 +270,20 @@ _has_shebang() { case "$(head -c 2 "$1" 2>/dev/null)" in "#!") return 0 ;; *) re
 # attempt at it is what shipped the `$(dirname` bug, so this time the basename is taken off the
 # WHOLE argument rather than the first quote-free run, and the result is checked by name below.
 #
-# BY BASENAME, which over-includes and does not follow a variable — both checked rather than
-# assumed. `lib.sh` and `setup.sh` each name two files in `shell_sources`, so sourcing either puts
-# both in scope; that is the safe direction (a file scanned for nothing costs nothing) and it masks
-# nothing here, because each of the four libraries has an INDEPENDENT reason to be in scope:
-# `scripts/lib.sh` and `harness.sh` have no shebang, `egress-lib.sh` sets `pipefail` itself, and
-# `.container/lib.sh` is the only one resting on this clause alone — which is why disabling the
-# clause fails on exactly that file and no other. A source written through a variable cannot be
-# followed at all; the one in this tree, `egress-lib.sh`'s `LIB="${BASH_SOURCE[0]}"`, is the file
-# re-sourcing ITSELF in a child shell, so there is no second hop to miss.
+# BY BASENAME, which over-includes and does not follow a variable. `lib.sh` and `setup.sh` each
+# name two files in `shell_sources`, so sourcing either puts both in scope — the safe direction, a
+# file scanned for nothing costs nothing. A source written through a variable cannot be followed at
+# all; the one in this tree, `egress-lib.sh`'s `LIB="${BASH_SOURCE[0]}"`, is the file re-sourcing
+# ITSELF in a child shell, so there is no second hop to miss.
+#
+# TWO of the four libraries rest on THIS CLAUSE ALONE — `.container/lib.sh` and
+# `.container/egress-lib.sh`, both of which carry a shebang and neither of which sets `pipefail`.
+# An earlier version of this paragraph said `egress-lib.sh` set it itself, and concluded that
+# `.container/lib.sh` was the only one depending on the clause. Wrong, and wrong in an instructive
+# way: I checked it with `_sets_pipefail`, which is the function under discussion. Its only match
+# in that file is line 366 — `set -euo pipefail` inside a single-quoted `bash -c '…'` body in
+# `under_trap`, script TEXT rather than a command this shell runs. Verifying a claim about a
+# detector with that detector is how the prose match two paragraphs up survived as long as it did.
 _sourced_by_scope() {
     local root="$1" f
     while IFS= read -r f; do
@@ -326,7 +336,12 @@ _joined() {
 _racy_in_file() {
     local re
     re="$(_racy_re)"
-    _joined "$1" 2>/dev/null | grep -E "$re" | grep -vE '^[0-9]+:[[:space:]]*#'
+    # No trailing comment filter: `_joined`'s own `/^[ \t]*#/ { next }` already guarantees that no
+    # emitted record begins with one, so the filter that used to sit here could not fire — measured
+    # by deleting it, every assertion including the two comment FORMS still passed. Two
+    # implementations of "a comment is not code", one unreachable, is one more than the next reader
+    # should have to reason about.
+    _joined "$1" 2>/dev/null | grep -E "$re"
 }
 
 _racy_sites() {
@@ -507,26 +522,62 @@ in one would run under every suite's pipefail and go unreported:$missing"
     # So it is also DRIVEN, against a planted export, rather than only asked. A check whose green
     # is the absence of a match must be shown capable of a match, or it is a guard that cannot
     # fire — which is what the whole of round 24 was about.
-    local exporters
-    _shellopts_exporters() {
-        grep -rlE '^[[:space:]]*export[[:space:]]+([^#]*[[:space:]])?(SHELL|BASH)OPTS([[:space:]=]|$)' \
-            "$1" 2>/dev/null || true
+    local exporters miss="" false_hit="" n=0 form want
+    _shellopts_re() {
+        printf '%s' '^[[:space:]]*export[[:space:]]+([^#]*[[:space:]])?(SHELL|BASH)OPTS([[:space:]=]|$)'
     }
-    printf '%s\n' '#!/usr/bin/env bash' 'export SHELLOPTS' >"$fake/scripts/exporter.sh"
-    if [ -z "$(_shellopts_exporters "$fake")" ]; then
-        fail "pipefail: shellopts-premise" "the exported-SHELLOPTS pattern does not match a file \
-that plainly exports it, so its green below means nothing"
-    fi
+    # DRIVEN ON BOTH SIDES, like the grep detector above. One planted spelling proved the pattern
+    # was not inert, which is what it was added for — but six of the seven forms it was rewritten
+    # to classify, and every must-NOT-match case, could still break with that premise green. This
+    # is the one pattern in this file that has already been broken twice: once by the GNU-only
+    # `\<`/`\>` boundaries, and once by my own portable rewrite putting `[^#]*` where the variable
+    # name starts. A guard satisfied by ABSENCE cannot report its own deadness, so it is the one
+    # that most needs its pattern exercised rather than trusted.
+    while IFS='|' read -r want form; do
+        [ -n "$form" ] || continue
+        n=$((n + 1))
+        printf '%s\n' "$form" >"$fake/scripts/exporter.sh"
+        if [ -n "$(grep -rlE "$(_shellopts_re)" "$fake/scripts/exporter.sh" 2>/dev/null)" ]; then
+            [ "$want" = hit ] || false_hit="$false_hit [$form]"
+        else
+            [ "$want" = miss ] || miss="$miss [$form]"
+        fi
+    done <<'SPELLINGS'
+hit|export SHELLOPTS
+hit|export BASHOPTS
+hit|  export SHELLOPTS
+hit|export SHELLOPTS=posix
+hit|export FOO SHELLOPTS
+miss|export MYSHELLOPTS
+miss|export SHELLOPTSFOO
+miss|# export SHELLOPTS
+miss|echo export SHELLOPTS
+SPELLINGS
     rm -f "$fake/scripts/exporter.sh"
+    if [ "$n" -ne 9 ]; then
+        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 9"
+    elif [ -n "$miss" ]; then
+        fail "pipefail: shellopts-premise" "the exported-SHELLOPTS pattern does not match these \
+real spellings, and a guard satisfied by absence cannot tell that from a clean tree:$miss"
+    elif [ -n "$false_hit" ]; then
+        fail "pipefail: shellopts-false" "these lines export nothing and were read as doing so, \
+which is how a guard gets loosened until it means nothing:$false_hit"
+    fi
+
+    # ...over `shell_sources`, the ONE file list this suite already uses. A hand-written list of
+    # three directories is a second answer to "which files are scripts" — sitting beside the guard
+    # that exists because two half-lists once disagreed with the defect in the gap. They agree
+    # today; they stop agreeing the moment a sixth directory joins `shell_sources`, and this
+    # guard's silence would then mean "not looked at" rather than "nothing found".
     exporters=""
-    for d in scripts .container .claude/hooks; do
-        exporters="$exporters$(_shellopts_exporters "$repo_root/$d")"
-    done
+    while IFS= read -r form; do
+        grep -qE "$(_shellopts_re)" "$form" 2>/dev/null \
+            && exporters="$exporters $form"
+    done < <(shell_sources "$repo_root")
     [ -z "$exporters" ] \
-        && ok "and nothing exports SHELLOPTS, a pattern shown able to find one" \
+        && ok "and nothing exports SHELLOPTS, a pattern driven against nine spellings" \
         || fail "pipefail: shellopts" "these files export SHELLOPTS/BASHOPTS, so every script they \
-run inherits pipefail and the per-file condition above is no longer the right question: \
-$(printf '%s' "$exporters" | tr '\n' ' ')"
+run inherits pipefail and the per-file condition above is no longer the right question:$exporters"
 }
 
 # --- 5. the rule itself --------------------------------------------------------------------
