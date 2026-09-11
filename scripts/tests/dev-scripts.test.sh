@@ -221,7 +221,13 @@ case2() {
 # (measured — the switch lands exactly on the pipe buffer), and it is safe either way for a reason
 # unrelated to which: the shell finishes the write before the consumer is exec'd, and there is ONE
 # command in the pipeline, so `pipefail` has no second status to take.
-_sets_pipefail() { grep -qE '\<set\>[^#]*pipefail' "$1"; }
+# ANCHORED TO A `set` COMMAND. Unanchored (`\<set\>[^#]*pipefail`) this matched PROSE: a comment
+# reading "...because every caller happens to set `pipefail` --" satisfied it, which is how
+# `.container/lib.sh` — shebang'd, sourced, and setting no options of its own — appeared to be in
+# scope for a reason that had nothing to do with the code. Over-inclusion is the safe direction,
+# so nothing was wrong; but the file was in scope by accident, and fixing the accident without
+# fixing the rule would have dropped it out.
+_sets_pipefail() { grep -qE '^[[:space:]]*set[[:space:]]+[^#]*pipefail' "$1"; }
 
 # ASSEMBLED FROM HALVES so this file cannot match its own detector. A check that fails on an
 # unmutated tree is the first thing a reader deletes, and this file has to spell the shape in
@@ -252,10 +258,27 @@ _racy_re() {
 # rather than re-deriving the answer from a path.
 _has_shebang() { case "$(head -c 2 "$1" 2>/dev/null)" in "#!") return 0 ;; *) return 1 ;; esac; }
 
-_pipefail_scope() {
+# ...AND A SOURCED FILE THAT HAS ONE. "No shebang" identifies the libraries meant only to be
+# sourced, but it is not the whole set: `.container/lib.sh` and `egress-lib.sh` carry a shebang
+# (they are `--self-test`-able) and are sourced by scripts that set `pipefail`, so they run under
+# it too. That is the dangerous direction — a racy line there would go unreported — and the earlier
+# attempt at it is what shipped the `$(dirname` bug, so this time the basename is taken off the
+# WHOLE argument rather than the first quote-free run, and the result is checked by name below.
+_sourced_by_scope() {
     local root="$1" f
     while IFS= read -r f; do
-        if _sets_pipefail "$f" || ! _has_shebang "$f"; then
+        _sets_pipefail "$f" || ! _has_shebang "$f" || continue
+        sed -n 's/^[[:space:]]*\(\.\|source\)[[:space:]]\{1,\}\(.*\)/\2/p' "$f" 2>/dev/null \
+            | sed 's/[[:space:]]*#.*//; s/.*\///; s/["'"'"']*[[:space:]]*$//'
+    done < <(shell_sources "$root") | grep -E '^[A-Za-z0-9._-]+$' | sort -u
+}
+
+_pipefail_scope() {
+    local root="$1" f libs
+    libs="$(_sourced_by_scope "$root")"
+    while IFS= read -r f; do
+        if _sets_pipefail "$f" || ! _has_shebang "$f" \
+           || grep -qxF "${f##*/}" <<<"$libs"; then
             printf '%s\n' "$f"
         fi
     done < <(shell_sources "$root")
@@ -414,7 +437,7 @@ almost nothing — shell_sources or the pipefail detection has regressed"
     # missing member; only naming it can.
     local missing="" want scope
     scope="$(_pipefail_scope "$repo_root")"
-    for want in scripts/lib.sh scripts/tests/harness.sh; do
+    for want in scripts/lib.sh scripts/tests/harness.sh .container/lib.sh .container/egress-lib.sh; do
         grep -qxF "$repo_root/$want" <<<"$scope" || missing="$missing $want"
     done
     [ -z "$missing" ] \
