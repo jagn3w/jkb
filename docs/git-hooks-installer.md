@@ -168,7 +168,7 @@ conventions every session is expected to know.
     inside somebody else's repository and rewrites its `.git/info/exclude`**. Every production
     spawn in the crate is built there; a review found the claim stated as covered while only the
     shell half was.
-  - **Only the three that select a REPOSITORY.** `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`
+  - **Everything that names a repository or a part of one — six, not three since round 28.** `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`
     inject configuration and are deliberately left alone — this project's own dev container
     carries `safe.directory` grants in them, and stripping those makes git refuse the checkout
     outright. Pinned at both ends, so the list cannot be "tidied" into a blanket sweep.

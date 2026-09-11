@@ -38,6 +38,17 @@ set -uo pipefail
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
       GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
+# Every `scripts/tests/*.test.sh`, derived rather than listed: a suite added to that directory and
+# not to a hand-written list here would be a guard the queue silently does not run.
+_shell_suites_pass() {
+    local t rc=0
+    for t in ./scripts/tests/*.test.sh; do
+        [ -f "$t" ] || continue
+        bash "$t" || rc=1
+    done
+    return "$rc"
+}
+
 BRANCH="${1:?usage: merge-queue.sh <branch> <base> <worktree>}"
 BASE="${2:?missing <base>}"
 WT="${3:?missing <worktree>}"
@@ -105,9 +116,20 @@ if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue.
 fi
 
 # 3. Run the gate on the integrated result.
+# THE SHELL SUITES ARE PART OF THE GATE. It was `build.sh && test.sh` — cargo only — so nothing
+# under `scripts/tests/` could block a landing, which is most of what this branch spent its rounds
+# building: the quiet-grep refusal, the unscrubbed-git scan, the isolation oracles. A guard that
+# cannot fail a landing is a guard the merge queue does not have.
+#
+# NOT `check.sh`, and the reason is stated rather than left as an omission: that gate also runs
+# `clippy --all-features` and `cargo deny`, both of which fetch crates, and the swarm runs behind
+# an egress firewall where they cannot complete — so making it the queue's gate would eject every
+# candidate for a fact about the network. Those two stay CI's job. The suites added here need no
+# network and take seconds.
 start=$(date +%s)
 if ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
-   && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1; then
+   && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1 \
+   && _shell_suites_pass >/tmp/merge-queue-shell.log 2>&1; then
   # Record that jkb itself grafted this branch (design D48), which is what closes the group's
   # tasks and what lets a later `jkb task review record` of $BASE credit them: a landing is an
   # EVENT jkb wrote, not something a reader infers from the commit graph.

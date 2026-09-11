@@ -255,6 +255,11 @@ GIT_INDEX_VERSION"
     added="$(
         bash -c '
             . "$1" >/dev/null 2>&1
+            # A DIFF SEES NOTHING WHERE THE VALUE WAS ALREADY THERE. On a machine that already
+            # exports GIT_CONFIG_NOSYSTEM — a plausible developer setting, and this assertion is
+            # about the variable that holds /etc/gitconfig out — `isolate_git` would add nothing
+            # and this would blame it for a setting it makes correctly.
+            unset GIT_CONFIG_NOSYSTEM
             before="$(compgen -e | sort)"
             isolate_git "$2/home" >/dev/null 2>&1
             after="$(compgen -e | sort)"

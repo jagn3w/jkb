@@ -25,6 +25,16 @@ set -euo pipefail
 # and the same one-line fix.
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
       GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+# `stat` IS NOT PORTABLE, and the two spellings do different things rather than failing. GNU
+# coreutils reads `-c '%Y %n'` for mtime+name; BSD/macOS reads `-f '%m %N'`. On Linux `-f` means
+# "filesystem status", so the no-argument path — `./scripts/swarm-status.sh` with no run named —
+# silently found nothing and reported no runs at all. Probed once rather than guessed from uname.
+if stat -c '%Y' . >/dev/null 2>&1; then
+    STAT_FLAG=-c; STAT_FMT='%Y %n'          # GNU coreutils
+else
+    STAT_FLAG=-f; STAT_FMT='%m %N'          # BSD / macOS
+fi
+
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 # =====================================================================
@@ -112,7 +122,7 @@ find_run_dir() {
         find "${roots[@]}" -type d -name "$arg" 2>/dev/null | sed -n 1p
     else
         find "${roots[@]}" -type d -name 'wf_*' -path '*/subagents/workflows/*' \
-            2>/dev/null -exec stat -f '%m %N' {} + 2>/dev/null \
+            2>/dev/null -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null \
             | sort -rn | sed -n 1p | cut -d' ' -f2-
     fi
 }
@@ -173,8 +183,13 @@ if merges:
     for m in merges:
         out = "landed" if m.get("landed") else "eject"
         print(f"{out:14} {str(m.get('detail',''))[:60]:60}")
-        # Parse the base branch from a "landed: <branch> -> <base> in …" line.
-        mm = re.search(r'->\s*(\S+)', str(m.get("detail","")))
+        # Parse the base branch from a "landed: <branch> → <base> in …" line.
+        #
+        # BOTH ARROWS. `merge-queue.sh` prints U+2192; this matched only ASCII `->`, so `mm` was
+        # always None, `.swarm-base` was never written, and the run view reported "no landed
+        # merges recorded yet" however many branches had landed. Accepting both costs nothing and
+        # means a future edit to either spelling does not silently break the other.
+        mm = re.search(r'(?:->|\u2192)\s*(\S+)', str(m.get("detail","")))
         if mm and not base:
             base = mm.group(1)
 if base:
