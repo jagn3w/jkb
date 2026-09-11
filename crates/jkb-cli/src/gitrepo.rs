@@ -1673,9 +1673,18 @@ mod tests {
     fn fixture_git(at: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(at).args(args);
-        // Selection — the half that was missing.
-        super::scrub_repo_selection(&mut cmd);
-        // ...and configuration, through the shared list rather than a second copy of it.
+        // ONE call, and the selection is inside it. This used to be two — a
+        // `scrub_repo_selection` for the three selectors and then the config isolation — and the
+        // doc above pinned the first by saying its deletion was caught. It stopped being caught
+        // the moment `isolate_git_env` became the shared applier, because `MUST_DROP` is a
+        // SUPERSET of `REPO_SELECTION_VARS`: measured in round 26, deleting the scrub line left
+        // every test passing. A claimed pin that does not exist is worse than no claim, which
+        // this cluster has already paid for once in `archive.rs`.
+        //
+        // It also coupled the fixtures' equality oracle to the PRODUCTION list: adding a fourth
+        // selector to `REPO_SELECTION_VARS` — the edit `EXPECT_SELECTION_REMOVED`'s own doc asks
+        // for — failed these fixture tests with a message forbidding the edit that reconciles
+        // them. A fixture must not be able to fail because production got stricter.
         super::fixture_env::isolate_git_env(&mut cmd);
         cmd
     }

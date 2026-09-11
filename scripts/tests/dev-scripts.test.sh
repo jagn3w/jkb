@@ -290,13 +290,26 @@ _pipefail_scope() {
 # So lines are joined on a trailing `|` before matching, and the reported number is the line the
 # pipeline STARTS on, which is the one a reader has to go and edit.
 _joined() {
-    awk '{
-             if (held == "") { ln = NR; cur = $0 } else { cur = held " " $0 }
-             if (cur ~ /\|[ \t]*$/) { held = cur; next }
-             held = ""
-             printf "%d:%s\n", ln, cur
-         }
-         END { if (held != "") printf "%d:%s\n", ln, held }' "$1"
+    # A COMMENT NEVER JOINS, and this is not tidiness. `scripts/lib.sh` — in scope, no shebang —
+    # has two comment lines ending in `|` at 1191 and 1201, the exclude and dispatch vocabulary
+    # lists, in the very file whose code those comments describe. A racy pipeline written under one
+    # of them would be joined into the comment, and the joined record then STARTS with `#`, so the
+    # comment filter downstream drops both: the line-joining added to WIDEN this detector would
+    # have narrowed it instead.
+    #
+    # Dropped rather than flushed, because bash allows a comment BETWEEN the halves of a continued
+    # pipeline and the pipeline really does continue past it. Skipping keeps `cat f |` / `# why` /
+    # `grep -q x` joined; flushing would break it in two and miss the hit. A comment can never be a
+    # racy site itself, so losing it costs nothing.
+    awk '
+        /^[ \t]*#/ { next }
+        {
+            if (held == "") { ln = NR; cur = $0 } else { cur = held " " $0 }
+            if (cur ~ /\|[ \t]*$/) { held = cur; next }
+            held = ""
+            printf "%d:%s\n", ln, cur
+        }
+        END { if (held != "") printf "%d:%s\n", ln, held }' "$1"
 }
 
 # One file, so case3 can drive it with a multi-line probe — a form the per-line loop cannot express.
@@ -384,6 +397,20 @@ TWO2
 cat f PIPE
     sed -n 1p
 TWO3
+    # A COMMENT ENDING IN `|` DIRECTLY ABOVE A RACY LINE. lib.sh has two such comments, in scope,
+    # and the line-joining added this round would have swallowed the code beneath them into a
+    # record starting with `#` — narrowing the detector while claiming to widen it.
+    sed 's/PIPE/|/g' >"$work/two4.sh" <<'TWO4'
+#   states: added PIPE kept PIPE retracted PIPE
+cat f PIPE grep -q x
+TWO4
+    # ...and a comment BETWEEN the halves of a continued pipeline, which bash permits and which a
+    # rule that FLUSHED on comments rather than skipping them would break in two and miss.
+    sed 's/PIPE/|/g' >"$work/two5.sh" <<'TWO5'
+cat f PIPE
+    # why we do this
+    grep -q x
+TWO5
     if [ -z "$(_racy_in_file "$work/two.sh")" ]; then
         fail "pipefail: forms-multiline" "a pipeline whose \`|\` ends the line is not seen, so the \
 same pipeline written the other way is exempt"
@@ -391,6 +418,12 @@ same pipeline written the other way is exempt"
         fail "pipefail: forms-multiline" "a pipeline continued with a backslash is not seen"
     elif [ -n "$(_racy_in_file "$work/two3.sh")" ]; then
         fail "pipefail: forms-multiline-false" "joining lines made a safe two-line pipeline match"
+    elif [ -z "$(_racy_in_file "$work/two4.sh")" ]; then
+        fail "pipefail: forms-comment-above" "a racy line under a comment ending in a pipe is not \
+seen — the comment swallows it and the record reads as a comment"
+    elif [ -z "$(_racy_in_file "$work/two5.sh")" ]; then
+        fail "pipefail: forms-comment-within" "a comment between the halves of a continued \
+pipeline breaks the join, so the pipeline is not seen"
     else
         ok "and a pipeline split across lines, whichever side of the break the pipe sits on"
     fi
@@ -453,12 +486,34 @@ in one would run under every suite's pipefail and go unreported:$missing"
     # as `bash "<path>"`, so the exemption is sound today; a single `export SHELLOPTS` anywhere
     # would make it wrong everywhere at once, silently. That is the shape this whole round is
     # about, so it is a check and not a sentence.
+    # PORTABLE BOUNDARIES. This was `\<(SHELL|BASH)OPTS\>`, which is a GNU extension: POSIX ERE
+    # leaves a backslash before an ordinary character undefined, and the BSD regex macOS grep uses
+    # spells boundaries `[[:<:]]`/`[[:>:]]` and reads `\<` as a literal `<`. The pattern would
+    # therefore match nothing on the platform this repo is developed on — and because this guard is
+    # satisfied by ABSENCE, matching nothing is indistinguishable from passing. Pattern 8 in this
+    # file's own record, paid for three times before; the sibling `_sets_pipefail` was rewritten
+    # away from `\<set\>` in this same range, and this was the one that got left.
+    #
+    # So it is also DRIVEN, against a planted export, rather than only asked. A check whose green
+    # is the absence of a match must be shown capable of a match, or it is a guard that cannot
+    # fire — which is what the whole of round 24 was about.
     local exporters
-    exporters="$(grep -rlE '^[[:space:]]*export[[:space:]]+[^#]*\<(SHELL|BASH)OPTS\>' \
-                     "$repo_root/scripts" "$repo_root/.container" "$repo_root/.claude/hooks" \
-                     2>/dev/null || true)"
+    _shellopts_exporters() {
+        grep -rlE '^[[:space:]]*export[[:space:]]+([^#]*[[:space:]])?(SHELL|BASH)OPTS([[:space:]=]|$)' \
+            "$1" 2>/dev/null || true
+    }
+    printf '%s\n' '#!/usr/bin/env bash' 'export SHELLOPTS' >"$fake/scripts/exporter.sh"
+    if [ -z "$(_shellopts_exporters "$fake")" ]; then
+        fail "pipefail: shellopts-premise" "the exported-SHELLOPTS pattern does not match a file \
+that plainly exports it, so its green below means nothing"
+    fi
+    rm -f "$fake/scripts/exporter.sh"
+    exporters=""
+    for d in scripts .container .claude/hooks; do
+        exporters="$exporters$(_shellopts_exporters "$repo_root/$d")"
+    done
     [ -z "$exporters" ] \
-        && ok "and nothing exports SHELLOPTS, which would put every executed script under pipefail" \
+        && ok "and nothing exports SHELLOPTS, a pattern shown able to find one" \
         || fail "pipefail: shellopts" "these files export SHELLOPTS/BASHOPTS, so every script they \
 run inherits pipefail and the per-file condition above is no longer the right question: \
 $(printf '%s' "$exporters" | tr '\n' ' ')"

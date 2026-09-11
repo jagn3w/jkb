@@ -922,9 +922,23 @@ conventions every session is expected to know.
   three sites it permits today are both `.claude/hooks` scripts, safe only because those files
   set no shell options, and the day one of them gains a `set -o pipefail` the case fails and
   names the line. A blanket rule would have had to exempt them by directory — the same fact
-  recorded where nothing checks it. The scope includes any library a `pipefail` script SOURCES,
-  because `scripts/lib.sh` and `scripts/tests/harness.sh` set no options of their own and run
-  under their caller's; a racy line in either is pinned by that, verified by planting one.
+  recorded where nothing checks it.
+
+  **The scope is three clauses, and each one was wrong first.** A file is in scope if it sets
+  `pipefail` itself, OR has no shebang, OR its basename is sourced from a file already in scope.
+  The first was written as `\<set\>[^#]*pipefail` and matched PROSE — a comment reading "because
+  every caller happens to set `pipefail`" satisfied it, which is the only reason
+  `.container/lib.sh` was in scope at all. The second replaced a first attempt that parsed the
+  `.`/`source` lines of every script for library names and, on `. "$(dirname "$0")/harness.sh"` —
+  how all five suites source the harness — captured `$(dirname` as the filename, leaving
+  `harness.sh` outside the guard that names it while a planted line in `lib.sh` (sourced by an
+  absolute path) made it look verified. The third exists because "no shebang" is not the whole
+  set: `.container/lib.sh` and `egress-lib.sh` carry one, being `--self-test`-able, and are
+  sourced by scripts that set `pipefail`. Anchoring the first clause without adding the third
+  would have dropped `.container/lib.sh` out entirely — the two bugs were holding each other up.
+  Membership now names all four libraries (`scripts/lib.sh`, `scripts/tests/harness.sh`,
+  `.container/lib.sh`, `.container/egress-lib.sh`), because a coverage FLOOR is cleared by the
+  three dozen files that declare `pipefail` themselves and can never notice a missing member.
 
   The fix is always a here-string. `<<<` is a pipe at or below 65536 bytes and a temp file above
   — the switch landing exactly on the pipe buffer — and it is safe either way for a reason that

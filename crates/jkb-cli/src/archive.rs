@@ -1953,12 +1953,12 @@ mod tests {
     fn fixture_git(dir: &Path, args: &[&str]) -> std::process::Command {
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C").arg(dir).args(args);
-        // Selection, through the shared rule rather than a second copy of the list: with
-        // `GIT_DIR`/`GIT_WORK_TREE` exported this fixture would init, add and commit into the
-        // developer's unrelated repository — measured for `gitrepo.rs`'s siblings.
-        crate::gitrepo::scrub_repo_selection(&mut cmd);
-        // ...and configuration, through the shared list rather than a second copy of it. Both
-        // copies used to be written out here and in `gitrepo.rs`, and nothing observed either.
+        // ONE call, selection included. With `GIT_DIR`/`GIT_WORK_TREE` exported this fixture
+        // would init, add and commit into the developer's unrelated repository — measured for
+        // `gitrepo.rs`'s siblings — and `MUST_DROP` names those three alongside the config
+        // channels, so the separate `scrub_repo_selection` that used to precede this line was
+        // doing nothing: measured in round 26, deleting it left every test passing, under a
+        // comment that pinned it. See `gitrepo::tests::fixture_git` for the full diagnosis.
         crate::gitrepo::fixture_env::isolate_git_env(&mut cmd);
         cmd
     }

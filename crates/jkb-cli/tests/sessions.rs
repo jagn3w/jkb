@@ -3468,9 +3468,17 @@ fn an_exported_repository_selection_cannot_redirect_a_session() {
             "{var}: `task work` failed outright: {out:?}"
         );
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        let worktree = PathBuf::from(v["worktree"].as_str().unwrap());
+        // CANONICALIZED, both sides. `git rev-parse --show-toplevel` resolves symlinks, so the
+        // reported worktree carries the `/private/var/...` spelling on macOS while `f.repo` holds
+        // the `/var/folders/...` one the TempDir handed out — and `Path::starts_with` is purely
+        // lexical. The failure that produces is BYTE-IDENTICAL to a genuine break, so the gate
+        // this project mandates before every commit would be permanently red on the platform it
+        // is developed on, accusing the repository-selection scrub of a hole it does not have.
+        // `session::is_within` records the same hazard; the integration crate cannot import it.
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let worktree = canon(Path::new(v["worktree"].as_str().unwrap()));
         assert!(
-            worktree.starts_with(&f.repo),
+            worktree.starts_with(canon(&f.repo)),
             "{var}: an exported repository selection moved the session out of the repository jkb \
              was run in — it landed at {worktree:?}, not under {:?}",
             f.repo

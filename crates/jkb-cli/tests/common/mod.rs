@@ -5,6 +5,14 @@
 //! rather one and a gap: `cli.rs` had none at all, and the crate-wide spawn guard could not see
 //! that, because it keyed on the literal `Command::new(` while these fixtures build their
 //! process with `Command::cargo_bin("jkb")`.
+//!
+//! THREE COMPILATIONS NOW, not two. `src/gitrepo.rs` pulls this file in with
+//! `#[cfg(test)] #[path = "../tests/common/mod.rs"]`, so the library's own fixtures
+//! (`gitrepo::tests::fixture_git`, `archive::tests::fixture_git`) use these functions too. That
+//! replaced a second copy of the list in `gitrepo.rs` — `FIXTURE_CONFIG` and
+//! `isolate_fixture_config` — plus a test that parsed both out of their source files and compared
+//! them. One source text is not a thing to keep in agreement. Keep this module `std`-only: it is
+//! compiled by a crate that has no dev-dependencies in scope.
 
 use std::process::Command;
 
@@ -39,8 +47,10 @@ pub fn isolate_git_env(cmd: &mut Command) {
     // because `assert_isolated` is a superset check and the cross-crate test compares the two
     // CONSTANTS. Two comments agreeing is not evidence about two environments.
     //
-    // The library side had this right already — `isolate_fixture_config` iterates
-    // `FIXTURE_CONFIG` — which is precisely what hid the asymmetry.
+    // The library side had this right already — its own applier iterated its own list — which is
+    // precisely what hid the asymmetry. SUPERSEDED in the half that named the fix: that list and
+    // applier are gone, and this file is compiled into the library's test build instead, so there
+    // is no second copy for either side to be right or wrong about.
     for key in MUST_DROP {
         cmd.env_remove(key);
     }
@@ -67,15 +77,18 @@ pub const MUST_DROP: &[&str] = &[
 /// `isolate_git_env` left all 137 tests in the two integration crates green, the three written
 /// to pin this very function included, because they checked only the removals.
 ///
-/// `src/gitrepo.rs`'s `FIXTURE_CONFIG` is the same list for the library's own fixtures. It is
-/// deliberately a SECOND list rather than a shared one: `FIXTURE_CONFIG` is `#[cfg(test)]`, and
-/// an integration test is a separate crate compiled with `cfg(test)` OFF, so it cannot see it.
-/// What keeps them honest is that each is ITERATED by the function beside it — `isolate_git_env`
-/// here, `isolate_fixture_config` there — and that
-/// `the_two_fixture_isolation_lists_describe_the_same_environment` compares the two at their
-/// source. "Asserted against the function beside it" was the earlier claim and it was too weak on
-/// this side: the assertion was a superset check against a hand-kept copy, so a variable added to
-/// the function and not to the list passed everything.
+/// SUPERSEDED, and kept because the reasoning was confident and wrong twice running. This
+/// paragraph used to argue that `src/gitrepo.rs` should hold a SECOND copy of the list, on the
+/// ground that an integration test is a separate crate compiled with `cfg(test)` off and cannot
+/// see a `#[cfg(test)]` const — and that a test comparing the two at their source kept them
+/// honest. Round 24 showed the two copies could agree while a function drifted from both; round
+/// 26's fix removed the copy altogether by compiling THIS file into the library's test build
+/// (`#[path]`), which the crate boundary never actually prevented. The parity test went with it:
+/// it compared two pieces of text, and its failure message read as an instruction to sync them,
+/// which is the edit round 25 measured as reopening the scrub hole.
+///
+/// What keeps this honest now is [`EXPECT_DROPPED`]/[`EXPECT_SET`] — written down, not computed —
+/// and equality rather than a superset.
 pub const MUST_SET: &[(&str, &str)] = &[
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_SYSTEM", "/dev/null"),
@@ -85,7 +98,6 @@ pub const MUST_SET: &[(&str, &str)] = &[
     ("GIT_COMMITTER_EMAIL", "t@t"),
 ];
 
-/// Assert `cmd` carries the whole isolation — both halves of it.
 /// The oracle for [`isolate_git_env`], written down rather than computed.
 ///
 /// LITERALS, and never `MUST_DROP`/`MUST_SET`, which the function iterates. An assertion that read
@@ -110,6 +122,7 @@ const EXPECT_SET: &[(&str, &str)] = &[
     ("GIT_COMMITTER_EMAIL", "t@t"),
 ];
 
+/// Assert `cmd` carries the whole isolation — both halves of it.
 pub fn assert_isolated(what: &str, cmd: &Command) {
     let envs: Vec<(String, Option<String>)> = cmd
         .get_envs()
