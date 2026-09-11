@@ -126,6 +126,17 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
 #
 # Degrades like the read it replaces: on a git without `--worktree` the first ask fails, the
 # value is empty, and everything falls through to `--local` — which is what that git honours.
+#
+# EMPTY IS TREATED AS ABSENT, which conflates two states, and both were measured on 2.51.1
+# rather than argued about, because the conflation would pick the wrong scope silently:
+#
+#   core.worktree set to the empty string in `config.worktree` — git is FATAL on every command
+#   in that repository ("cannot chdir to ''"), the config read included, so the merge this hook
+#   runs after could never have happened. The state is unreachable rather than mishandled.
+#
+#   core.bare written valueless (`[core]` / `bare`) — `--bool` renders it `true`, which is
+#   non-empty, so the worktree scope is kept and it matches what `rev-parse
+#   --is-bare-repository` answers. The `--bool` the caller passes is what makes this safe.
 honoured_value=""
 honoured_scope=""
 honoured_read() {
