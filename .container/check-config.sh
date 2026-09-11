@@ -33,6 +33,37 @@ command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0
 # the harm the pin below is written against.
 dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
+# NEVER PIPE A FILE-READER INTO `grep -q`, AND THIS IS NOT STYLE. `grep -q` exits at its FIRST
+# match by design, so a producer still writing gets EPIPE -- and under `set -o pipefail` (line 9)
+# that turns a SUCCESSFUL match into a FAILED pipeline. It is a race between how fast the producer
+# writes and how early in the stream the match sits, so it passes on one machine and fails on
+# another for the same bytes.
+#
+# That is not hypothetical: `dc_strip_comments run.sh | grep -qE '<the verify invocation>'` passed
+# on macOS and failed on the CI runner with `sed: couldn't flush stdout: Broken pipe`, reporting
+# "run.sh no longer runs verify.sh" about a line sitting at byte 23501 of 25810 -- the match is
+# found, grep exits, and sed dies on the remaining 2.3KB. The guard did not merely misfire: it
+# accused the file of the one thing it exists to prevent.
+#
+# Buffer size does not save it. The reader CLOSES the pipe; it is not a question of the 64KiB
+# buffer filling. What is safe is a SINGLE-WRITE producer -- `printf "$var" | grep -q` completes
+# its write before grep can exit -- so the rule is about multi-write producers, i.e. anything
+# reading a FILE in chunks (`sed`, `grep`, `awk` over a path).
+#
+# Materialise first, match second. A here-string is ONE command, so pipefail has no second status
+# to take. The rule lives here rather than at each call site, because a rule every call site must
+# remember is itself the defect.
+stripped_matches() { # stripped_matches <file> <extended-regex> -> 0 if the stripped file matches
+    local text
+    text="$(dc_strip_comments "$1")" || return 2
+    grep -qE "$2" <<<"$text"
+}
+file_matches() { # file_matches <file> <grep args...> -> 0 if the raw file matches, no pipe
+    local f="$1"; shift
+    local text; text="$(cat "$f" 2>/dev/null)" || return 2
+    grep -q "$@" <<<"$text"
+}
+
 # Sourced HERE rather than 80 lines down, so this file has one copy of the comment-stripping rule
 # instead of a verbatim `strip()` beside the `dc_strip()` it later sources — two halves of one file
 # parsing the same input through two copies that can disagree.
@@ -394,7 +425,7 @@ fi
 # and stay broken on the other. It also made a verify failure read as "setup did not complete", so
 # the next run redid the toolchain because an extension was missing. Putting it back would restore
 # both, silently and slowly, which is the kind of regression nobody goes looking for.
-if dc_strip_comments "$here/setup.sh" | grep -qE '(^|[^-[:alnum:]])verify\.sh'; then
+if stripped_matches "$here/setup.sh" '(^|[^-[:alnum:]])verify\.sh'; then
     bad "setup.sh runs verify.sh again — run.sh verifies after both arms, and a second verifier there is what made a failed check re-run the whole of setup"
 else
     ok "setup.sh does not verify; run.sh does, once, after either arm"
@@ -413,10 +444,33 @@ fi
 #
 # So: require a statement-level exec of it — the shape the firewall-argument guard below already
 # uses — and let mutate-config.sh delete only that line.
-if dc_strip_comments "$here/run.sh" | grep -qE '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh'; then
+if stripped_matches "$here/run.sh" '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh'; then
     ok "run.sh invokes verify.sh (a statement, not a mention of the name)"
 else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
+fi
+
+# ...AND THE IDIOM THAT MADE THAT GUARD LIE, refused everywhere rather than fixed at the one site.
+# `dc_strip_comments <file> | grep -q <pat>` is the natural way to ask "does this script contain
+# X", and it is a race: grep -q exits at the first match, sed dies on the unwritten tail with
+# EPIPE, and `set -o pipefail` reports the SUCCESSFUL match as a failed pipeline. It passed on
+# macOS and failed on the CI runner for identical bytes, accusing run.sh of not invoking verify.sh
+# while the invocation sat at byte 23501 of 25810.
+#
+# THE PATTERN IS ASSEMBLED FROM TWO HALVES so this guard does not match its own source line -- a
+# check that fails on itself is the first thing a reader deletes. Narrow ON PURPOSE: it covers the
+# dc_strip_comments idiom, which is the one that recurs here, and NOT every file-reader piped into
+# grep -q. `printf "$var" | grep -q` is safe (a single write completes before grep can exit), so a
+# blanket rule would be mostly false positives. Stated rather than implied: this does not cover the
+# whole class, only the shape that has bitten.
+racy_lhs='dc_strip_comments[^|]*'
+racy_rhs='[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q'
+racy="$(printf '%s\\|%s' "$racy_lhs" "$racy_rhs")"
+racy_hits="$(grep -nE "$racy" "$here"/*.sh 2>/dev/null | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
+if [ -z "$racy_hits" ]; then
+    ok "no script pipes dc_strip_comments into grep -q (that race reports a found match as a failure)"
+else
+    bad "a script pipes dc_strip_comments into grep -q — grep -q exits at the first match and sed dies on the tail, so under pipefail a SUCCESSFUL match reports as a failed pipeline (use stripped_matches): $(printf '%s' "$racy_hits" | head -2 | tr '\n' ' ')"
 fi
 
 # THE ENTRYPOINT LINE ITSELF. `ENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]` appears exactly once
@@ -430,6 +484,10 @@ else
     bad "the Dockerfile does not set ENTRYPOINT to entrypoint.sh — docker start would come up with no firewall"
 fi
 
+# THE REAPER PATH IS NOT GUARDED HERE EITHER, and for the same reason as the verdict path below:
+# it is single-sourced as the Dockerfile's `ENV JKB_REAPER`, so there are no two spellings to keep
+# in step. (Why a guard was tried first and deleted is in README.md, not here.)
+#
 # THE VERDICT PATH IS NO LONGER GUARDED HERE, because it is no longer duplicated (D52.5). This
 # carried a check that init-firewall.sh, entrypoint.sh and verify.sh all named /run/jkb-egress-verdict
 # identically, justified by a comment reading "three different processes [that] cannot share a
@@ -558,7 +616,7 @@ else
     # that a regeneration silently losing them is caught even before the CI drift check runs.
     for r in 'sysrq-trigger' 'kcore' '/sys/firmware' '/sys/kernel/security' \
              'network alg' 'network vsock' 'powercap'; do
-        grep -E '^[[:space:]]*deny[[:space:]]' "$aa_file" | grep -qF -e "$r" \
+        grep -qF -e "$r" <<<"$(grep -E '^[[:space:]]*deny[[:space:]]' "$aa_file")" \
             || { bad "$aa_file no longer denies $r — it is supposed to be docker-default with ONE rule relaxed, not a permissive profile wearing its name"; aa_ok=0; }
     done
     # (That the profile is GENERATED rather than hand-maintained is asserted below, by the derived

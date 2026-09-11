@@ -80,16 +80,62 @@ exit 0
 STUB
         chmod +x "$t/bin/sudo"
     }
+    # THE REAPER STUB. The real one is tini, which does not exist on a macOS host, so the exec
+    # that hands over PID 1 is path-injected. The stub is transparent — it drops the `--` and
+    # execs the command — so every assertion below still reads the command's own output, and it
+    # records that it ran so that "the reaper was skipped entirely" is distinguishable from "the
+    # command ran". Without that marker this stub would turn the reaper into something the test
+    # cannot see, which is how the bare `exec "$@"` went unnoticed in the first place.
+    mkdir -p "$t/bin"
+    cat >"$t/bin/reaper" <<'STUB'
+#!/bin/sh
+echo reaped >>"$JKB_REAPER_LOG"
+[ "$1" = "--" ] && shift
+exec "$@"
+STUB
+    chmod +x "$t/bin/reaper"
+    export JKB_REAPER_LOG="$t/reaped"
+
+    # A fake /proc/self/ns: two symlinks whose TARGETS stand in for the nsfs ids. macOS has no
+    # /proc, so without this seam the marker write is the one line here that cannot run.
+    mkdir -p "$t/ns"
+    ln -sfn 'pid:[4026531836]' "$t/ns/pid"
+    ln -sfn 'mnt:[4026532999]' "$t/ns/mnt"
+
     run_ep() { # run_ep [accept]
         rm -f "$t/verdict"
         JKB_EGRESS_VERDICT="$t/verdict" JKB_EGRESS_ACCEPT_UNFILTERED="${1:-0}" \
+            JKB_REAPER="$t/bin/reaper" JKB_NS_MARKER="$t/nsmarker" JKB_NS_DIR="$t/ns" \
             PATH="$t/bin:$PATH" bash "$0" echo BECAME-THE-COMMAND 2>"$t/err"
     }
     export JKB_EGRESS_VERDICT="$t/verdict"
 
     stub allowlisted "allowlist raised"
+    rm -f "$t/reaped"
     eq "an allowlisted kernel execs the command"    "$(run_ep)" "BECAME-THE-COMMAND"
     eq "...and says nothing on stderr"              "$(wc -c <"$t/err" | tr -d ' ')" "0"
+    # THE HANDOVER GOES THROUGH A REAPER. `sleep` as PID 1 never wait()s, so every orphan
+    # reparented to it stayed a zombie for ever (README.md, "The measurements this is built
+    # on"). The command running proves nothing about this on its own: a bare `exec "$@"` satisfies
+    # every other assertion here, which is exactly why it survived.
+    eq "...and hands over THROUGH the reaper, not straight to the command" \
+       "$(cat "$t/reaped" 2>/dev/null)" "reaped"
+    # WHOSE NAMESPACES THESE ARE, recorded for verify.sh. Both ids, in one file, written only on a
+    # boot that reached the handover.
+    eq "...and records both namespace ids for verify.sh" \
+       "$(tr '\n' ' ' <"$t/nsmarker" 2>/dev/null)" "pid=pid:[4026531836] mnt=mnt:[4026532999] "
+
+    # DELETE-FIRST, WHICH IS THE HALF THAT CANNOT BE INFERRED FROM A HAPPY PATH. A marker in the
+    # container's writable layer outlives `docker stop`, and namespace ids are REUSED once a
+    # namespace dies -- so a marker left behind by a previous boot can be matched by a later,
+    # unrelated namespace. The guarantee is that a boot which does not reach its handover leaves
+    # ABSENCE. `unfiltered` is such a boot: it refuses long before the write.
+    printf 'pid=pid:[1] mnt=mnt:[1]\n' > "$t/nsmarker"
+    stub unfiltered "IPv6 is unfiltered"
+    run_ep >/dev/null 2>&1
+    eq "a boot that REFUSES leaves no stale marker behind" \
+       "$([ -e "$t/nsmarker" ] && echo present || echo absent)" "absent"
+    stub allowlisted "allowlist raised"
 
     # A blanket deny is SAFE but not working: no allowlist, so nothing but DNS and loopback. Staying
     # up is the point — this is the state you need to attach to in order to repair it.
@@ -139,6 +185,21 @@ STUB
 fi
 # --------------------------------------------------------------------------------------------
 
+# THE NAMESPACE MARKER IS DELETED FIRST AND WRITTEN LAST, and the order is the whole guarantee.
+#
+# It records which pid and mount namespaces are THIS container's, so verify.sh can tell them from a
+# nested sandbox's (see the write at the foot of this file). The failure to design against is the
+# one D51 spent a round on: a record that outlives the state it describes. `/run` is the container's
+# writable layer, not a tmpfs, so a marker survives `docker stop`/`docker start` exactly as the old
+# egress marker did — and namespace ids are IDA-allocated and REUSED once a namespace dies, so a
+# stale marker naming a dead namespace can be matched by a later, unrelated one.
+#
+# Deleting on entry and writing immediately before the handover makes that unrepresentable rather
+# than guarded: a marker can only exist for the namespaces of a container that reached its exec, and
+# a start that died anywhere in between leaves ABSENCE, which verify.sh refuses on. There is no
+# window in which a marker describes a namespace this boot does not hold.
+rm -f "${JKB_NS_MARKER:?the image must set JKB_NS_MARKER (see the Dockerfile)}"
+
 # No arguments to either: sudoers grants `vscode` exactly these two paths with none, and both
 # scripts refuse any. The allowlist the raise reads is the root-owned snapshot, never a path a
 # caller names. The raise's exit code is deliberately NOT consulted — what decides is what the
@@ -187,4 +248,73 @@ case "$state" in
         ;;
 esac
 
-exec "$@"
+# PID 1 MUST REAP, AND `sleep` CANNOT. This script is the image's ENTRYPOINT and nothing in here
+# runs a program, so run.sh keeps the container alive by passing `sleep infinity` as the command —
+# which a bare `exec "$@"` would make the PID 1 of this namespace. A process whose parent exits is
+# reparented to PID 1, and PID 1 must wait() on it or it stays a zombie for ever; `sleep` never
+# wait()s. The leak is therefore unbounded, and it is not a corner case: it is one zombie per
+# sandboxed Bash call (the zombies are bwrap/bash/sh/touch), so it tracks agent activity and an
+# unattended session walks into it unaided, and the end state is not a slow degradation but every
+# build, shell and tool call failing at once. README.md, "The measurements this is built on", has
+# the numbers and the date they were taken; they are deliberately NOT restated here, because a
+# count copied to a second place is a count that goes stale in one of them.
+#
+# WHY NOT `--init`. Docker's own tini does exactly this job, and it is the wrong shape HERE: it
+# becomes PID 1 *wrapping* this script, so PID 1's argv is `/sbin/docker-init -- …/entrypoint.sh
+# sleep infinity` for the whole life of the container. run.sh's `settle()` reads `ps -o args= -p 1`
+# and treats a match of `*entrypoint.sh*` as "the entrypoint has not finished yet" — so under
+# `--init` it never settles, exhausts its 120s budget and fails every create and start. Probing
+# PID 1's children instead would have a race of its own: there is a window in which tini has not
+# yet forked, and `settle_step` deliberately does not retry an unreadable probe.
+#
+# Exec'ing tini FROM here keeps PID 1's argv meaningful, which is what settle() actually reads:
+# while this script runs PID 1 is `entrypoint.sh sleep infinity` (waiting), and the moment it
+# hands over PID 1 is `tini -- sleep infinity` (settled, and reaping). No window, no new probe,
+# and settle_step is unchanged. `-s` is not passed: tini reaps unconditionally when it IS PID 1.
+#
+# The egress boot gate above is untouched — it has already run and can still have refused.
+#
+# NO DEFAULT, DELIBERATELY. The path is the Dockerfile's `ENV JKB_REAPER`, which reaches this
+# process because ENV persists into the image config — so writing a fallback here would put the
+# path in two files again, which is the duplication a guard was briefly added to police instead of
+# remove. `:?` turns a dropped ENV into a named failure at start rather than into `exec: not
+# found` one level down, where run.sh reports it as the container dying and names the egress boot
+# gate as the likeliest cause.
+#
+# The variable doubles as the self-test seam, as JKB_EGRESS_VERDICT and JKB_INET6_PATH do: the
+# macOS self-test sets it to a transparent stub, since this is the one line in here that cannot
+# otherwise run off Linux. What that test proves is that the script hands over THROUGH whatever
+# JKB_REAPER names; that the named thing exists and reaps is the Dockerfile's `test -x` and
+# verify.sh's runtime assertion respectively.
+# RECORD WHOSE NAMESPACES THESE ARE, as the last act before handing over. verify.sh's assertions --
+# the mount boundary and PID 1 reaping -- are only about this container if the /proc and the mount
+# table it reads are this container's. Claude Code's sandbox wraps a Bash call in `bwrap ... --bind
+# / / --unshare-pid --unshare-user --proc /proc`: the fresh procfs makes /proc/1 bwrap's init, which
+# REAPS, so the reaping assertion passes on a container that does not. Measured, and reproduced
+# against the pre-refusal commit (README.md).
+#
+# THE IDENTITY IS THE KERNEL'S, NOT A PROXY FOR IT. `/proc/self/ns/{pid,mnt}` resolve to nsfs inodes
+# that ARE the namespaces' identities, so verify.sh comparing its own against these is the question
+# asked rather than an inference from process topology. Two earlier discriminators inferred: a ppid
+# walk (false for the container's own main command, which is how the mutation harness runs, so it
+# refused all sixteen rows) and PID 1's starttime (blind to a sandbox that mounts a fresh /proc
+# WITHOUT unsharing pid -- /proc/1 would still be tini while the mount table was bwrap's). Recording
+# BOTH namespaces covers both assertions; a pid-only test guarding a mount-table check is the same
+# mistake one axis over.
+#
+# `--bind / /` is recursive, so this file is readable from inside such a sandbox while its /proc is
+# not the same -- which is exactly what makes the comparison discriminate.
+#
+# THE READ IS ns_pair, IN egress-lib.sh, SHARED WITH verify.sh -- one algorithm, covered by that
+# library's own self-test, rather than this block and verify.sh's copy drifting apart. The values
+# are collected BEFORE the file is touched, because `> "$MARKER"`
+# truncates as soon as it is evaluated -- so writing through a failing pipeline would replace
+# "nothing was recorded", which verify.sh refuses on, with "both namespaces are the empty string",
+# which is a record making a claim. The directory is the seam the self-test injects, as
+# JKB_EGRESS_VERDICT and JKB_REAPER are: there is no /proc/self/ns on the macOS host it runs on.
+ns_pair "${JKB_NS_DIR:-/proc/self/ns}"
+if [ -n "$NS_PID" ] && [ -n "$NS_MNT" ]; then
+    printf 'pid=%s\nmnt=%s\n' "$NS_PID" "$NS_MNT" > "$JKB_NS_MARKER" || true
+fi
+
+exec "${JKB_REAPER:?the image must set JKB_REAPER (see the Dockerfile) — refusing to become PID 1 without a reaper}" -- "$@"

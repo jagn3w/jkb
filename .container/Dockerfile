@@ -16,14 +16,27 @@ FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 # bubblewrap + socat are what Claude Code's Linux sandbox shells out to; its own dependency error
 # names exactly those two. iptables/ipset/dnsutils are for the egress firewall, which is the layer
 # that survives if the nested sandbox ever fails to start.
+# THE REAPER, SPELLED ONCE. entrypoint.sh execs this to become a PID 1 that reaps; without it
+# `sleep infinity` is PID 1, never wait()s, and every orphan reparented to it is a zombie for ever
+# (README.md, "The measurements this is built on"). An ENV rather than a literal in two files
+# because it is visible BOTH to the `test -x` below, which fails the build if the package stops
+# putting it here, AND to the entrypoint process and every `docker exec`, since ENV persists into
+# the image config. Two spellings needed a guard to keep them in step; one needs nothing, which is
+# what this directory did for /run/jkb-egress-verdict once egress-lib.sh single-sourced it.
+ENV JKB_REAPER=/usr/bin/tini
+
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        bubblewrap socat ripgrep jq \
+        bubblewrap socat ripgrep jq tini \
         build-essential pkg-config libssl-dev ca-certificates curl git \
         iptables ipset dnsutils \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs \
     && corepack enable \
+    # If the package ever stops putting it where JKB_REAPER says, the container would fail to
+    # start at all, with the cause one exec deep -- so it fails the BUILD instead, the way the
+    # sudoers `visudo -c` check does.
+    && test -x "$JKB_REAPER" \
     && rm -rf /var/lib/apt/lists/*
 
 # The firewall script is installed INTO THE IMAGE, root-owned, and sudoers grants exactly that one
@@ -75,6 +88,28 @@ RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/in
     # A malformed sudoers file locks sudo out entirely, which would break the firewall at every
     # start. Fail the BUILD instead.
     && visudo -c >/dev/null
+
+# THE NAMESPACE-IDENTITY MARKER, spelled once for the same reason JKB_REAPER is. entrypoint.sh
+# records the container's own pid and mount namespace ids here as its last act before handing over,
+# and verify.sh compares its OWN against them -- which is how that file tells "this container" from
+# a nested sandbox whose fresh /proc makes every assertion answer about bwrap instead. An ENV
+# because the path is needed at BUILD (the directory below must exist and be owned by the user who
+# writes it) and by TWO processes at runtime, and ENV persists into the image config so it reaches
+# both, `docker exec` included. A literal in three files is the duplication this directory deletes
+# rather than guards (README.md, "The reaper path is single-sourced").
+ENV JKB_NS_MARKER=/run/jkb/ns
+
+# Created root-owned and handed to vscode, because entrypoint.sh runs as vscode and /run is root's.
+# A named volume whose mount point does not exist in the image is created root-owned (D49); the
+# same rule applies to a directory a non-root process must write.
+#
+# THE MARKER IS AGENT-WRITABLE, AND THAT IS STATED RATHER THAN DESIGNED AWAY. vscode owns it, so a
+# session inside can forge it. Forging it can only produce a REFUSAL for anyone genuinely in the
+# container's namespaces (their ids will not match the forged ones); the only false pass it buys is
+# for a run inside the same sandbox as the forger -- an agent lying to its own verifier, which no
+# file ownership prevents. Routing it through the sudoers-granted root scripts would add a third
+# root-writable path to protect a fact ownership cannot protect anyway.
+RUN mkdir -p "$(dirname "$JKB_NS_MARKER")" && chown vscode:vscode "$(dirname "$JKB_NS_MARKER")"
 
 # --- non-root from here on ------------------------------------------------------------------
 USER vscode

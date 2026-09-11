@@ -106,6 +106,29 @@ verdict_field() { # verdict_field <key> -> the value from the recorded verdict, 
     kv_field "$1" "$(cat "$VERDICT_PATH" 2>/dev/null)"
 }
 
+# WHOSE NAMESPACES, READ ONCE FOR BOTH READERS. entrypoint.sh records the container's own pid and
+# mount namespace ids so verify.sh can tell this container from a nested sandbox whose fresh /proc
+# would otherwise make every assertion answer about bwrap. The WRITE and the READ are the same
+# three-line algorithm, and they were written out separately in the two scripts -- the shape D52.5
+# collapsed here for the verdict path rather than guarding. This file is the one both source.
+#
+# ITS NAME IS NOW NARROWER THAN ITS CONTENTS, and that is a knowing trade: this is the only file
+# `entrypoint.sh` and `verify.sh` share, and renaming it means moving a root-owned COPY target that
+# init-firewall.sh sources as root, plus five guards in check-config.sh that name it. `kv_field`
+# was already generic. Filed as a rename, not done here.
+#
+# READ SEPARATELY, NOT `readlink "$d/pid" "$d/mnt"`. One call is one fork, but GNU readlink prints
+# only the links it could resolve -- so if the pid link alone fails, line 1 is the MNT id and a
+# positional read lands it in the pid variable. Both copies had that latent, and both were saved
+# only by a downstream non-empty check; a later correction applied to one side would have left the
+# two comparing a mnt id against a pid id and refusing with `nested` for a reason neither file
+# explains. Two forks is the right price for a pairing that cannot silently transpose.
+NS_PID=""; NS_MNT=""
+ns_pair() { # ns_pair <ns-dir> -> sets NS_PID / NS_MNT; either is empty if that link is unreadable
+    NS_PID="$(readlink "$1/pid" 2>/dev/null)" || NS_PID=""
+    NS_MNT="$(readlink "$1/mnt" 2>/dev/null)" || NS_MNT=""
+}
+
 # --- the rules themselves, written ONCE ---------------------------------------------------------
 #
 # A probe and an installer that spell the same rule separately are two statements that must agree,
@@ -222,6 +245,23 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ] && [ "${BASH_SOURCE[0]}" = "$0
             *) fails=$((fails+1)); printf '  \033[31mFAIL\033[0m %s returned %s, which is not in VERDICT_STATES\n' "$1" "$2" ;;
         esac
     }
+    # THE NAMESPACE PAIR-READ, file-injected. This is the half of verify.sh's namespace gate that
+    # its own self-test comment says is "not covered" -- it was only ever exercised by running it in
+    # a container, and only on the healthy path. The transposition row is the one that matters: it
+    # is the failure a single `readlink a b` produces and neither copy could have caught.
+    echo "==> egress-lib self-test: reading a namespace pair"
+    nsd="$(mktemp -d)"
+    ln -sfn 'pid:[4026531836]' "$nsd/pid"; ln -sfn 'mnt:[4026532999]' "$nsd/mnt"
+    ns_pair "$nsd";       eq "both links read"                      "$NS_PID|$NS_MNT" "pid:[4026531836]|mnt:[4026532999]"
+    rm -f "$nsd/pid"
+    ns_pair "$nsd";       eq "a missing pid link does not shift mnt into it" "$NS_PID|$NS_MNT" "|mnt:[4026532999]"
+    ln -sfn 'pid:[4026531836]' "$nsd/pid"; rm -f "$nsd/mnt"
+    ns_pair "$nsd";       eq "a missing mnt link leaves pid alone"   "$NS_PID|$NS_MNT" "pid:[4026531836]|"
+    rm -f "$nsd/pid"
+    ns_pair "$nsd";       eq "neither readable is two empties, never a guess" "$NS_PID|$NS_MNT" "|"
+    ns_pair "$nsd/absent"; eq "an absent directory is the same"      "$NS_PID|$NS_MNT" "|"
+    rm -rf "$nsd"
+
     echo "==> egress-lib self-test: what bounded means"
 
     # THE RULE, as a literal table rather than a re-derivation. Writing the expectation as a second

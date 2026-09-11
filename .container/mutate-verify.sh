@@ -609,6 +609,100 @@ mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/s
 run "blanket passwordless root is restored" "may run more than the firewall and the egress probe as root" \
     "${HEALTHY[@]}"
 
+# A PID 1 THAT NEVER wait()s. Replacing the image's reaper with an init that runs the command and
+# observes its exit through waitid(WNOWAIT) -- which leaves that child, and every orphan this
+# process adopts, a zombie -- removes exactly the property the handover exists to supply, and
+# nothing else: firewall, mounts, entrypoint, sudoers and user are all untouched.
+#
+# THE TWO OBVIOUS MUTATIONS BOTH FAIL TO MUTATE, which is why this one is written in C.
+#   * NOT `--init`: docker-init IS tini, so under it PID 1 genuinely reaps and the assertion
+#     correctly passes. The row would print MISSED and read as a guard that cannot fire -- this
+#     directory's recurring defect, added by the very harness meant to detect it.
+#   * NOT a bare `exec "$@"` in entrypoint.sh either: `run()` executes `bash -c "$SUBJECT"`, so
+#     PID 1's command here is BASH, and bash as PID 1 reaps (it waitpid(-1)s in waitchld). The
+#     leak belongs to `sleep`, which run.sh passes and this harness never does.
+#
+# C rather than a shell or perl stand-in: build-essential is a dependency the Dockerfile already
+# installs, and `waitid(..., WNOWAIT)` makes "observes the exit without reaping it" literal in one
+# line rather than something to be inferred from /proc polling. The exit-propagation check inside
+# the RUN turns "compiled but wrong" into BUILD-FAILED -- which `run()` reports as SKIPPED rather
+# than testing the base image -- instead of into a MISSED blaming a healthy guard.
+NO_REAP_B64="$(base64 <<'C' | tr -d '\n'
+#include <sys/wait.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    siginfo_t si; pid_t child;
+    if (argc > 1 && strcmp(argv[1], "--") == 0) { argv++; argc--; }
+    if (argc < 2) return 127;
+    if ((child = fork()) == 0) { execvp(argv[1], argv + 1); _exit(127); }
+    while (waitid(P_PID, child, &si, WEXITED | WNOWAIT) != 0) {}
+    return si.si_code == CLD_EXITED ? si.si_status : 128 + si.si_status;
+}
+C
+)"
+# THE TARGET IS NOT A LITERAL. It used to be `/usr/bin/tini`, hard-coded, with nothing able to
+# notice that the path had stopped being the reaper -- move tini and this would compile a new,
+# unused binary at a path nothing runs, the propagation check would exercise that same unused
+# binary and pass, the container would exec the real reaper, and `judge` would report MISSED. A
+# tooling failure dressed as a guard that did not fire, in the file whose whole job is detecting
+# guards that cannot fire. `$JKB_REAPER` is the image's own ENV, and the mutant is built `FROM
+# $IMAGE`, so it carries it: if the image stops declaring one, the RUN fails and this is reported
+# as BUILD-FAILED -- which is honest about being tooling -- rather than as a healthy guard missing.
+mutant jkb-dev-no-reaper "test -n \"\$JKB_REAPER\" && printf %s '$NO_REAP_B64' | base64 -d > /tmp/noreap.c && gcc -O0 -o \"\$JKB_REAPER\" /tmp/noreap.c && { \"\$JKB_REAPER\" -- sh -c 'exit 7'; [ \"\$?\" -eq 7 ]; }"
+run "PID 1 never wait()s (tini replaced by an init that observes its child with WNOWAIT)" "PID 1 does not reap" \
+    "${HEALTHY[@]}"
+
+# THE NAMESPACE-IDENTITY GATE, both halves. It decides whether ANY assertion in verify.sh is about
+# this container (see ns_verdict), so a gate that cannot fire silently disables the whole file
+# rather than failing it — which is the worst shape available here and the reason these two rows
+# exist. They are the mutations the PREVIOUS discriminator could not have: a ppid walk has nothing
+# to break but its own polarity.
+#
+# The refusal is an `exit 2` with a `bad` line, which is what makes it judgeable at all: `judge`
+# wants a non-zero exit AND a line carrying the expect and `FAIL`. A refusal written only to stderr
+# would leave both of these permanently MISSED.
+#
+# `$JKB_NS_MARKER` rather than a literal: the path is the image's own ENV, so if the image stops
+# declaring one the RUN fails and this reports BUILD-FAILED — honest about being tooling — instead
+# of a healthy guard appearing not to fire. Same rule as the no-reaper mutant above.
+
+# EACH MUTATION ASSERTS THAT ITS PATCH TOOK, which is not belt-and-braces. `sed` that matches
+# nothing exits 0: entrypoint.sh's marker write moves into a helper, or its `exec` line gets
+# wrapped -- ordinary edits, and this area was rewritten twice while it was being built -- and then
+# the pattern is stale, the build succeeds, `run()` tests an image byte-identical to the healthy
+# one, verify.sh passes, and `judge` reports MISSED under "N guard(s) did not fire". The reader
+# then audits ns_verdict while the real cause is a dead pattern in this file. `! cmp -s` against a
+# pre-patch copy turns that into BUILD-FAILED, which `run()` reports as SKIPPED and which is honest
+# about being tooling rather than a healthy guard failing to fire. The no-reaper mutant two rows
+# above has always ended in a positive assertion that its replacement took effect; these did not.
+# mutate-verify.sh needs Docker, so nothing in the gate could have noticed.
+
+# 1. THE MARKER IS NEVER WRITTEN. Deleting the write leaves entrypoint.sh's delete-on-entry intact,
+#    so the container comes up with no record of its own namespaces and verify.sh has no way to
+#    know whether its subject is this container. It must refuse, not assume.
+#    The write is REPLACED BY A NO-OP, not deleted. Deleting it empties its enclosing `if`, which
+#    is a bash syntax error — so the mutant would not build, `run()` would report SKIPPED, and this
+#    guard would never be watched firing: the exact defect this file exists to find, introduced by
+#    the mutation meant to prove it fires. Caught by the `bash -n` below, run against a copy on the
+#    host before it ever reached a daemon.
+mutant jkb-dev-no-ns-marker "test -n \"\$JKB_NS_MARKER\" && cp /usr/local/bin/entrypoint.sh /tmp/ep.orig && sed -i 's|^ *printf .*JKB_NS_MARKER.*|    :|' /usr/local/bin/entrypoint.sh && ! cmp -s /tmp/ep.orig /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
+run "the container records no namespace identity" "recorded no namespace identity" \
+    "${HEALTHY[@]}"
+
+# 2. THE MARKER NAMES SOMEBODY ELSE'S NAMESPACES. Written last, so overwriting it immediately
+#    before the handover is the same position the real write occupies — this tests the COMPARISON
+#    rather than the plumbing, and it is what a stale marker from a previous boot would look like
+#    (the state entrypoint.sh's delete-on-entry exists to make unrepresentable).
+#    A plain `s|||` with `&`, rather than sed's one-line `i` insert: `i` is a GNU extension whose
+#    text also processes backslash escapes, so it could be neither tested on this macOS host nor
+#    trusted to leave `\n` alone. `&` is the matched exec line, so this PREPENDS the forgery to it —
+#    the same position the real write occupies, immediately before the handover. Two `echo`s need
+#    no escapes at all. Verified by running this exact command against a copy of entrypoint.sh.
+mutant jkb-dev-forged-ns-marker "test -n \"\$JKB_NS_MARKER\" && cp /usr/local/bin/entrypoint.sh /tmp/ep.orig && sed -i 's|^exec .*JKB_REAPER.*|echo pid=pid:[1] > \"\$JKB_NS_MARKER\"; echo mnt=mnt:[1] >> \"\$JKB_NS_MARKER\"; &|' /usr/local/bin/entrypoint.sh && ! cmp -s /tmp/ep.orig /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
+run "the recorded namespace identity is not this container's" "NOT this container's namespaces" \
+    "${HEALTHY[@]}"
+
 # The harness's own negative control. If an UNMUTATED container is reported CAUGHT, the matcher
 # is matching something that is present when nothing is wrong — which is precisely the defect
 # this file exists to detect in verify.sh, and it had it too.
@@ -684,7 +778,24 @@ if [ "${#caught_expects[@]}" -gt 0 ]; then
         grep -nF -e "$want" "$V" 2>/dev/null | cut -d: -f1
     done | sort -un)"
 fi
-all_paths="$(grep -nE '^[[:space:]]*(bad "|assert )' "$V" 2>/dev/null | cut -d: -f1 | sort -un)"
+# ANCHORING THIS AT LINE START WAS WRONG, and wrong in the unsafe direction: it could not see a
+# `bad` written as a `case` arm (`not-reaped) bad "..."`), so it counted 36 where the file has
+# ~50, those paths never appeared under "NOT covered by this run", and the report could say `all
+# 36 failure paths were driven` about a file where a quarter had never been watched failing.
+#
+# OVER-COUNTING IS THE SAFE DIRECTION FOR A DENOMINATOR: a line that is not really a failure path
+# can only make coverage look worse than it is, while a missed one makes it look better. So this
+# takes any non-comment, non-definition line that calls `bad` or `assert` however it is written,
+# and deliberately does not try to be exact.
+# ANCHORED AT THE LINE NUMBER, because `grep -n` output is `NNN:<content>` and an unanchored
+# filter matches the CONTENT too: a `bad` whose message text contains `: #` or `: name()` was
+# dropped from the denominator. That is a realistic shape right here -- this file spells seven
+# `could not establish whether PID 1 reaps: ...` messages and the area's vocabulary is `wait()`
+# and `waitid()` -- and dropping one makes coverage read BETTER than it is, silently, which is
+# the direction this block exists to avoid.
+all_paths="$(grep -nE '(bad "|assert )' "$V" 2>/dev/null \
+    | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE '^[0-9]+:[[:space:]]*[a-z_]+\(\)' \
+    | cut -d: -f1 | sort -un)"
 n_all="$(printf '%s' "$all_paths" | grep -c '^' || true)"
 # NOT `comm`, which requires both inputs in ITS collating order — bytes — while these are line
 # numbers sorted NUMERICALLY. The two orders disagree the moment the file passes 99 lines: `100`

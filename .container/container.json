@@ -59,7 +59,9 @@
     "--cap-add=NET_ADMIN",
 
     // Belt and braces on the thing containers are worst at: a fork bomb or runaway build in here
-    // should not take the machine down with it.
+    // should not take the machine down with it. PID 1 REAPS so that this is a bound on runaway
+    // work rather than one ordinary use walks into on its own — see entrypoint.sh's exec, and
+    // note that `--init` is deliberately NOT the way that is done here.
     "--pids-limit", "4096"
   ],
 

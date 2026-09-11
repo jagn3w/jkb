@@ -46,6 +46,134 @@ a failure is attributable to the container profile and not the kernel.
 - **Non-root is load-bearing, not hygiene.** With seccomp disabled entirely, *root* in a container
   still cannot create a mount/net/pid namespace directly — only the `--unshare-user` variants
   work. Non-root passes everything.
+- **`verify.sh` measures the wrong PID 1 inside a nested namespace, and now refuses.** Measured in
+  the container, both topologies, one command apart. Under
+  `bwrap --bind / / --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc`, PID 1 is
+  **bwrap itself**. The false pass was then **reproduced against the pre-refusal commit**, by
+  running that version of the script in the same namespace — it printed
+
+      ok  PID 1 reaps the orphans it adopts (PID 1 is: bwrap --bind / / ... --proc /proc -- ...)
+
+  which asserts the container reaps in a sentence whose own parenthesis names bwrap. bwrap's init
+  reaps unconditionally, so that `ok` was available for any container, including one that does
+  not. A false pass in the single assertion the reaping work exists to add. The current script
+  exits 2 there, while a plain attached terminal (PID 1 = `/usr/bin/tini -- sleep infinity`) runs
+  every assertion and passes.
+  - The same nesting makes `/proc/self/mountinfo` bwrap's too, which is why the refusal sits above
+    every assertion rather than inside the reaping one.
+
+### The discriminator is namespace identity, asked of the kernel — after two inferences were wrong
+
+`entrypoint.sh` records the container's own `/proc/self/ns/pid` and `/proc/self/ns/mnt` — nsfs
+inodes, which **are** those namespaces' identities — immediately before it hands over, and
+`verify.sh` compares its own against them. Equality is identity by definition, so there is no
+polarity to get backwards and no premise about who started whom. `bwrap --bind / /` is recursive,
+so the marker stays readable from inside the sandbox while its `--proc /proc` means the ids do not
+match: that asymmetry is exactly what discriminates.
+
+Both earlier versions **inferred**, and each was wrong in a way its own author could not see:
+
+- **A ppid walk** ("PID 1 is an ancestor ⇒ nested"). True for `docker exec`; **false for the
+  container's own main command**, which is a direct child of PID 1. `mutate-verify.sh` runs
+  `verify.sh` exactly that way, so the walk refused its control, all sixteen mutations and the CI
+  Docker job — and `verify.sh`'s own self-test *pinned that shape as correct*. It also refuses on
+  any ordinary Linux host, where systemd is an ancestor of every shell.
+- **PID 1's starttime**, compared against a recorded one. Sound on the pid axis — starttime
+  survives `exec`, so `entrypoint.sh`'s and tini's are the same — and **blind on the mount axis**:
+  a sandbox mounting a fresh `/proc` *without* unsharing pid leaves `/proc/1` as the real tini, so
+  the gate opens while the mount table is still the sandbox's. A pid-only test guarding a
+  mount-table assertion is the same mistake one axis over. Recording **both** ids is the fix, and
+  it is why the marker carries two.
+
+**Delete-on-entry, write-before-handover**, which is the D51 shape rather than a nicety: `/run` is
+the writable layer, so a marker outlives `docker stop`, and namespace ids are reused once a
+namespace dies — a stale marker could be matched by an unrelated later namespace. Deleting first
+and writing last makes that unrepresentable: a marker exists only for a boot that reached its
+handover, and anything else leaves **absence**, which is refused. Pinned by a self-test that arms a
+stale marker and boots into a refusing state.
+
+The refusal prints a `FAIL` line rather than only writing to stderr, because `mutate-verify.sh`'s
+`judge` needs one — a gate the harness cannot watch firing is the defect this directory keeps
+meeting. Two mutations exist for it: the marker never written, and the marker naming somebody
+else's namespaces.
+
+**Measured, on a real daemon, after two discriminators that were not** (2026-09-11):
+
+- `mutate-verify.sh --control` passes, **18/18** — and its `PID 1 is: /usr/bin/tini -- bash -c …`
+  line is the topology that matters: the harness runs `verify.sh` as the container's OWN main
+  command, a direct child of PID 1, which is exactly what the ppid walk refused. That refusal took
+  the control, all sixteen mutations and four CI steps with it.
+- The full harness reports **20/20 CAUGHT**, with the matcher shown to stay quiet about a healthy
+  container. Three of those rows are new and none had ever been observed firing before: `PID 1
+  never wait()s` — the assertion this whole branch exists to add — plus the marker never written
+  and the marker naming somebody else's namespaces.
+- Inside `bwrap $(bwrap-probe.sh --print-invocation proc)` it **refuses, naming both pairs**:
+
+      recorded by the container's entrypoint:  pid=pid:[4026532556]  mnt=mnt:[4026532553]
+      observed by this process:                pid=pid:[4026532691]  mnt=mnt:[4026532690]
+
+  Both axes differ, which is the evidence that recording *two* ids was not belt-and-braces: a
+  starttime comparison would have seen only the first, and a fresh mount namespace alone is a
+  state it could not have refused.
+- A plain attached terminal runs **19/19**, PID 1 `/usr/bin/tini -- sleep infinity`.
+
+A refusal that does not print what it compared is the previous discriminator again — it refused
+without ever showing its evidence, which is why nobody noticed it was answering a different
+question. That is why the pairs are in the message and not only in the reasoning.
+
+**Residual, stated:** the marker is `vscode`-owned, so a session inside can forge it. Forging can
+only produce a *refusal* for anyone genuinely in the container's namespaces; the only false pass it
+buys is for a run inside the same sandbox as the forger — an agent lying to its own verifier, which
+no file ownership prevents.
+
+- **PID 1 must reap, and `sleep` cannot.** `run.sh` keeps the container alive with `sleep
+  infinity`, and `entrypoint.sh` used to end in a bare `exec "$@"` — which made that `sleep` the
+  PID 1 of the namespace. PID 1 must `wait()` on the orphans it adopts, and `sleep` never does, so
+  every orphan stayed a zombie for ever. Measured on a container 28 hours old: **3941 zombies of
+  3968 tasks, and 4083 of `container.json`'s 4096 PIDs spent** — thirteen from a container that
+  could not fork at all. It is one zombie per sandboxed Bash call, so it tracks agent activity and
+  an unattended session reaches the limit unaided. `entrypoint.sh` execs tini now.
+## Why `--init` is not how PID 1 is made to reap
+
+Kept out of the measurements above on purpose: this one is **reasoned, not measured**, and a
+section called "the measurements this is built on" must not carry an argument nobody ran.
+
+Docker's `--init` wraps the entrypoint rather than being exec'd by it, so PID 1's argv would name
+`entrypoint.sh` for the container's whole life. `run.sh`'s `settle()` reads a match of
+`entrypoint.sh` in `ps -o args= -p 1` as "the entrypoint has not finished yet", so under `--init`
+it would never settle, and every create and start would fail on its 120s budget — blaming a
+black-holed resolver, since that is what usually holds a raise there. Exec'ing tini *from* the
+entrypoint keeps PID 1's argv meaningful to that probe: `entrypoint.sh sleep infinity` while the
+script runs, `tini -- sleep infinity` the moment it hands over.
+
+What *is* pinned is the consequence rather than the premise: `run.sh --self-test` carries a
+`settle_step` row for docker-init's argv asserting it reads as `waiting`. Whether `--init` really
+produces that argv has not been run here. Nothing refuses `--init` in `runArgs` either, so if you
+are reaching for it, this section is the whole of what stops you.
+
+`run.sh`'s 120s-timeout message now names this as a second cause beside the black-holed resolver,
+with `docker inspect -f '{{.HostConfig.Init}}'` to tell them apart: an entrypoint that `docker
+logs` shows *completing* and a `settle()` that never returns is the wrapped case, not the stuck
+one.
+
+## The reaper path is single-sourced, and a guard over the duplication was the wrong answer
+
+History, recorded here rather than in the files it is about, because the guard described never
+existed in a shipped state — it was added and deleted inside one branch, and a static-check file
+narrating its own branch's history reads as an inventory of checks the repository has.
+
+The path was briefly written twice: the Dockerfile's `test -x` and `entrypoint.sh`'s `exec`
+default each named `/usr/bin/tini`. `check-config.sh` grew 33 lines asserting the two agreed and
+`mutate-config.sh` grew three mutations watching that fail. The guard worked and it was still the
+wrong answer, for the reason this directory keeps arriving at: **delete the duplication rather
+than police it** (D52.5, which removed the same shape for `/run/jkb-egress-verdict`). `ENV
+JKB_REAPER` in the Dockerfile reaches the build-time `test -x` *and* the entrypoint process and
+every `docker exec`, because ENV persists into the image config — one spelling, nothing to keep in
+step, and 40 lines of guard and mutation deleted with it.
+
+The clinching detail is what the guard did *not* cover: a **third** site, `mutate-verify.sh`'s
+`gcc -o` target, which had already gone stale while the two-site guard reported agreement. That is
+what a guard over duplication buys — agreement between the sites somebody remembered.
 
 ## Using it
 
@@ -404,9 +532,18 @@ the Dockerfile and rebuild, or `docker exec -u root` from the host.
 
 ## Verifying it
 
-- `verify.sh` — inside the container: non-root, bwrap works, the mount set is exactly as declared,
-  `~/.claude` is not a host mount, root is reachable only for the firewall, egress is denied *and*
-  the allowlist still works, posture intact.
+- `verify.sh` — inside the container: non-root, **PID 1 reaps what it adopts**, bwrap works, the
+  mount set is exactly as declared, `~/.claude` is not a host mount, root is reachable only for the
+  firewall, egress is denied *and* the allowlist still works, posture intact.
+  - The reaping assertion **fails on every container created before it existed**, which is correct
+    and is the point: the fix is an image change, and nothing else observes a running container —
+    `run.sh` without `--build` finds the argument hash and the image id both matching and starts
+    the old one. Recreate: `./.container/run.sh --rm && ./.container/run.sh --build`.
+  - It **refuses to run inside Claude Code's own sandbox**, which wraps a Bash tool call in
+    `bwrap --unshare-pid --proc /proc`. In there `/proc/1` and `/proc/self/mountinfo` are bwrap's,
+    so both the reaping and mount-boundary assertions would describe the wrong subject — and the
+    reaping one would *pass*, because bwrap's init reaps. Run it from a plain terminal in the
+    attached container, or let `run.sh` run it for you.
 - **Run these from your own terminal, not from an agent session.** Once the host posture is
   installed the Docker CLI is unreachable — `~/.docker/bin` is under `denyRead: ["~"]` and in no
   `allowRead` entry, so it fails with `Operation not permitted`. That is the posture working: an

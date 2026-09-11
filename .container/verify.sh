@@ -112,6 +112,151 @@ missing_extensions() { # missing_extensions <declared, one per line> <installed,
     printf '%s' "$out"
 }
 
+# WHAT AN ORPHAN'S FATE MEANS. Pure, taking its observations as arguments, for the reason
+# settle_step is (D52.4): the arm that matters most here is the one no healthy container can
+# reach, and a decision reachable only by running a container is a decision nothing in the gate
+# checks. Gathering the observations needs /proc; judging them does not.
+#
+# THE PROPERTY IS MEASURED, NOT THE NAME. `--init` makes PID 1 `docker-init`, which IS tini and
+# DOES reap, so "PID 1 is /usr/bin/tini" would fail a correct container; and "PID 1 is not sleep"
+# would pass any non-reaping program that is not sleep. What leaked was that PID 1 did not wait()
+# on what it adopted, so that is what is asked. A zombie is removed from /proc by nothing but a
+# wait, so `reaped` cannot be produced by a PID 1 that does not reap: no false pass exists.
+#
+# Everything that is not an observation of reaping is its own verdict and none of them is `ok` --
+# an unobtainable measurement must never be spelled as a definite answer.
+# /proc/<pid>/stat, split at the LAST ") ". comm is arbitrary — it can contain spaces and
+# parentheses — so splitting at the first is wrong for any process that chooses to be awkward.
+#
+# starttime (field 22 overall, position 20 after the comm) is what gives the orphan an IDENTITY.
+# Gating on comm being `(sleep)` would defeat pid recycling, but it also fails for the window
+# between fork() and execve() when the child's comm is still `bash` — so a healthy container would
+# report `vanished`. Identity by construction plus starttime removes the window instead of sizing
+# it: the pid is our own child, forked milliseconds ago; a DIFFERENT starttime on it later means
+# the pid was recycled, which can only happen after the original was reaped.
+proc_stat_fields() { # proc_stat_fields <stat line> -> sets PS_STATE PS_PPID PS_START; 1 if short
+    local rest
+    rest="${1##*) }"
+    # Deliberate word splitting: every field after the comm is a single token.
+    # shellcheck disable=SC2086
+    set -- $rest
+    [ "$#" -ge 20 ] || return 1
+    PS_STATE="$1"; PS_PPID="$2"; PS_START="${20}"
+}
+
+# AS FEW FORKS AS THE MEASUREMENT CAN BE MADE WITH -- not none, and the comment used to say none.
+# `mktemp`, the subshell, the orphan itself and the two `sleep`s all fork; what went is the
+# previous version's poll, which read through `$( )` sixty times with `sleep 0.1` for up to ~120
+# forks inside a probe whose own premise is that fork may be failing at the --pids-limit. Every
+# one of the remaining forks fails into `fork-failed`, which is a refusal, so the count is a cost
+# rather than a correctness argument. Worse, it spelled four different unobtainable observations (process gone, fork
+# failed, /proc unreadable, a line too short to parse) as `gone`, which reaper_verdict reads as
+# `reaped`: the PASS direction. So a container near the limit could be leaking and be certified.
+#
+# This sets globals and returns three ways instead: 0 present, 1 GONE, 2 UNREADABLE. `gone` is
+# claimed only when the process directory is observably absent -- an absence is proof only where
+# the place it would be is visible, which is the archive sweep's rule one level down. A read that
+# fails with the directory still there establishes nothing and must not pass.
+# ONE SPELLING, AND NOT AN ENVIRONMENT OVERRIDE. This used to read `${JKB_PROC:-/proc}` under a
+# comment claiming `--self-test` drove every arm below through it. It did not: the self-test exits
+# ~60 lines above the gathering block, so the variable was never a test seam at runtime -- only a
+# live override that could point the one assertion this file exists for at a fabricated /proc. The
+# self-test injects by assigning PROC directly, which is what it already did.
+PROC=/proc
+
+PS_STATE=""; PS_PPID=""; PS_START=""
+pstat() { # pstat <pid> -> 0 present (sets PS_*) | 1 gone | 2 unreadable
+    local l=""
+    # NOT `if read`: read returns non-zero at EOF WITHOUT a trailing newline while still having
+    # set the variable, so its exit code is not "did I get a line". The content is.
+    # 2>/dev/null FIRST: redirections are processed left to right, so with the input redirect
+    # first the shell reports "No such file or directory" on the REAL stderr before stderr is
+    # suppressed. An absent stat file is this function's ordinary GONE answer — it happens on every
+    # healthy run, the moment the orphan is reaped — so the wrong order printed a scary line under
+    # a passing check, which is how people learn to ignore warnings.
+    IFS= read -r l 2>/dev/null <"$PROC/$1/stat"
+    if [ -n "$l" ]; then
+        proc_stat_fields "$l" || return 2
+        return 0
+    fi
+    # `gone` is claimed ONLY where the place it would be is observably absent.
+    [ -d "$PROC/$1" ] && return 2
+    return 1
+}
+
+# WHOSE NAMESPACES IS THIS /proc AND THIS MOUNT TABLE FROM? Every assertion in this file is about
+# THE CONTAINER, and two of them -- the mount boundary and PID 1 reaping -- read /proc/self/mountinfo
+# and /proc/1. Claude Code's sandbox wraps a Bash tool call in `bwrap --new-session --die-with-parent
+# --unshare-net --bind / / --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc`
+# (bwrap-probe.sh records the invocation). `--proc /proc` mounts a FRESH procfs, so inside it
+# /proc/1 is bwrap's init and mountinfo is bwrap's table -- and bwrap's init reaps unconditionally,
+# so the reaping assertion PASSES on a container that does not reap. Measured, and reproduced
+# against the pre-refusal commit (README.md).
+#
+# THE QUESTION IS ASKED OF THE KERNEL, NOT INFERRED FROM PROCESS TOPOLOGY. `/proc/self/ns/pid` and
+# `/proc/self/ns/mnt` resolve to nsfs inodes that ARE those namespaces' identities; entrypoint.sh
+# records the container's own pair immediately before handing over, and this compares. Equality is
+# namespace identity by definition, so there is no polarity to get backwards and no premise about
+# who started whom.
+#
+# TWO EARLIER DISCRIMINATORS INFERRED, AND BOTH WERE WRONG -- recorded because the next reader will
+# reach for one of them:
+#   * A PPID WALK ("PID 1 is an ancestor => nested"). True for `docker exec`, whose parent is
+#     outside the namespace and reads as ppid 0; FALSE for the container's own main command, which
+#     is a direct child of PID 1. mutate-verify.sh runs verify.sh exactly that way, so the walk
+#     refused its control and all sixteen mutations, and CI with them. It also refuses on any
+#     ordinary Linux host, where systemd is an ancestor of every shell.
+#   * PID 1's STARTTIME, compared against a recorded one. Sound on the pid axis (starttime survives
+#     exec, so entrypoint.sh's and tini's are the same), and BLIND on the mount axis: a sandbox that
+#     mounts a fresh /proc WITHOUT unsharing pid leaves /proc/1 as the real tini -- starttime
+#     matches, the gate opens -- while mountinfo is still the sandbox's. A pid-only test guarding a
+#     mount-table assertion is the same mistake one axis over, which is why BOTH ids are recorded.
+#
+# Pure, taking its four observations as arguments, for the reason settle_step and reaper_verdict are:
+# the arm that matters most is the one no healthy container can reach.
+ns_verdict() { # ns_verdict <recorded-pid> <recorded-mnt> <observed-pid> <observed-mnt>
+    # THE OBSERVATION IS TESTED FIRST, AND THE ORDER IS THE WHOLE OF IT. Both reads are forks --
+    # `readlink` for the observation, `cat` for the record -- so a container that cannot fork
+    # returns EMPTY FOR BOTH, and whichever test runs first decides what such a container is told.
+    # That is not a corner case: it is the measured end state of the leak the reaping assertion
+    # below exists to name, ~4083 of 4096 pids spent on zombies (README.md).
+    #
+    # Asked record-first, it answered `no-marker` and sent the operator to rebuild the image, while
+    # this arm's own comment claimed -- in so many words -- that a pid-exhausted container lands
+    # HERE, and its `docker stats` remedy was unreachable. A comment asserting what the code beside
+    # it does not do, in the file whose subject is guards that cannot fire. `reaper_verdict` below
+    # has always had this precedence right, which is what makes the disagreement a defect rather
+    # than a choice.
+    #
+    # It is also right on its own terms: whether our own namespaces are readable is a fact about
+    # THIS process, and it dominates whatever a file on disk says. A record can only be interpreted
+    # by something that knows what it is holding.
+    { [ -n "$3" ] && [ -n "$4" ]; } || { printf 'unreadable'; return; }
+    # Absence of the record is not evidence of anything. entrypoint.sh deletes the marker on entry
+    # and writes it only on reaching the handover, so absence means this container did not start
+    # through entrypoint.sh (`--entrypoint bash`) or did not finish starting -- never "it matches".
+    # Reached only once the observation IS readable, which is the ordinary Linux host case: /proc
+    # is there, /run/jkb/ns is not, and "no marker" is the honest answer.
+    { [ -n "$1" ] && [ -n "$2" ]; } || { printf 'no-marker'; return; }
+    { [ "$1" = "$3" ] && [ "$2" = "$4" ]; } || { printf 'nested'; return; }
+    printf 'ours'
+}
+
+reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
+    [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
+    # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
+    # does not reap, so this arm is not noise on the machine this assertion exists for.
+    [ -n "$2" ] || { printf 'fork-failed'; return; }
+    [ -n "$3" ] || { printf 'vanished'; return; }
+    [ "$3" = 1 ] || { printf 'not-adopted'; return; }
+    case "$4" in
+        gone)             printf 'reaped' ;;
+        Z)                printf 'not-reaped' ;;
+        proc-unreadable)  printf 'proc-unreadable' ;;
+        unreadable)       printf 'orphan-unreadable' ;;
+        *)                printf 'never-exited' ;;
+    esac
+}
 # --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
 #
 # It is the one part of the mount boundary that widens by a TYPO rather than by an edit anyone
@@ -172,6 +317,98 @@ if [ "$SELF_TEST" = yes ]; then
     st2 "the dot in an id is literal, not a wildcard" \
         "$(missing_extensions "anthropic.claude-code@2.1.250" "anthropicXclaude-code")" " anthropic.claude-code"
 
+    # THE STAT PARSER, against real-shaped lines. It splits at the LAST ") " because comm is
+    # arbitrary; the pre-exec row is the one that matters, since gating on comm being `(sleep)`
+    # would make a healthy container report `vanished` between fork() and execve().
+    echo "==> verify.sh self-test: proc_stat_fields"
+    st_line() { printf '%s (%s) %s 1 1 1 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$2" "$3" "$4"; }
+    psf() { PS_STATE=; PS_PPID=; PS_START=; proc_stat_fields "$1" || return 1; printf '%s %s %s' "$PS_STATE" "$PS_PPID" "$PS_START"; }
+    st2 "a sleeping orphan yields state, ppid and starttime" \
+        "$(psf "$(st_line 42 sleep S 987654)")" "S 1 987654"
+    st2 "a pre-exec child still named bash parses identically — no comm gate" \
+        "$(psf "$(st_line 42 bash R 987654)")" "R 1 987654"
+    st2 "a zombie is read as such" \
+        "$(psf "$(st_line 42 sleep Z 987654)")" "Z 1 987654"
+    st2 "a comm containing a space and a paren does not shift the fields" \
+        "$(psf "$(st_line 42 'we (ird) name' S 987654)")" "S 1 987654"
+    st2 "a truncated line is refused rather than answered from short fields" \
+        "$(psf '42 (sleep) S 1 1' >/dev/null 2>&1; echo $?)" "1"
+
+    # pstat's THREE-WAY RETURN, which is the whole of finding 2's fix: `gone` is claimed only where
+    # the process directory is observably absent, and a read that fails with the directory still
+    # there establishes nothing. Spelling those the same is what let a leaking container be
+    # certified as reaping. /proc is injected, so all three are reachable on a host without one.
+    echo "==> verify.sh self-test: pstat's three-way return"
+    PROC="$(mktemp -d)"
+    mkdir -p "$PROC/100" "$PROC/101" "$PROC/102"
+    st_line 100 sleep S 555 > "$PROC/100/stat"
+    printf '101 (sleep) S 1 1' > "$PROC/101/stat"          # too short to parse
+    # 102 has a directory and no stat file at all.
+    pstat 100; st2 "a readable stat is present (0)"            "$?" "0"
+    st2 "...and its fields are set"                            "$PS_STATE $PS_PPID $PS_START" "S 1 555"
+    pstat 101; st2 "an unparseable stat is UNREADABLE (2), not gone" "$?" "2"
+    pstat 102; st2 "a directory with no stat is UNREADABLE (2), not gone" "$?" "2"
+    pstat 999; st2 "an absent process directory is GONE (1)"   "$?" "1"
+    rm -rf "$PROC"; PROC=/proc
+
+    # WHOSE NAMESPACES, as a literal table. This is the guard that decides whether any assertion in
+    # this file means anything -- so it is pinned against fixture values rather than reasoned about,
+    # and every arm including the ones no healthy container reaches. The two rows that matter most
+    # are the two topologies the PREVIOUS discriminator got wrong: `docker exec` (how run.sh runs
+    # this) and the container's own main command (how mutate-verify.sh does). Under a namespace-id
+    # comparison they are the SAME case -- both are in the container's namespaces -- which is the
+    # point: the question stopped depending on who started the process.
+    echo "==> verify.sh self-test: whose namespaces are these?"
+    P='pid:[4026531836]'; M='mnt:[4026532999]'
+    st2 "the container's own namespaces are recognised (docker exec, and its own command alike)" \
+        "$(ns_verdict "$P" "$M" "$P" "$M")" "ours"
+    st2 "a nested sandbox's fresh procfs is REFUSED, not trusted" \
+        "$(ns_verdict "$P" "$M" 'pid:[4026533111]' 'mnt:[4026533112]')" "nested"
+    st2 "...and so is a fresh MOUNT namespace alone, which a pid-only test cannot see" \
+        "$(ns_verdict "$P" "$M" "$P" 'mnt:[4026533112]')" "nested"
+    st2 "...and a fresh pid namespace alone" \
+        "$(ns_verdict "$P" "$M" 'pid:[4026533111]' "$M")" "nested"
+    st2 "no marker establishes nothing — it is not a match" \
+        "$(ns_verdict "" "" "$P" "$M")" "no-marker"
+    st2 "a half-written marker is no marker" \
+        "$(ns_verdict "$P" "" "$P" "$M")" "no-marker"
+    st2 "an unreadable observation establishes nothing either" \
+        "$(ns_verdict "$P" "$M" "" "")" "unreadable"
+    st2 "...including when only one of the two could be read" \
+        "$(ns_verdict "$P" "$M" "$P" "")" "unreadable"
+    # THE ROW THAT PINS THE PRECEDENCE, and its absence is why the table was satisfied by either
+    # order. A container that cannot fork fails BOTH reads, so this is the only input that
+    # distinguishes record-first from observation-first — and it is the input a pid-exhausted
+    # container actually produces, which is the state the reaping assertion exists to name.
+    st2 "a container that cannot fork fails BOTH reads, and is told THAT — not to rebuild" \
+        "$(ns_verdict "" "" "" "")" "unreadable"
+
+    # Assertion 1b's judgement. Only ONE of these arms is reachable in a healthy container, so
+    # without this the rest are unreachable code in a change whose whole subject is a check that
+    # could not fire. A literal table, not a re-derivation of the conditions.
+    echo "==> verify.sh self-test: reaper_verdict"
+    st2 "a reaped orphan is the only ok arm" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 gone)" "reaped"
+    st2 "docker-init reaps too — the verdict is the property, not the name" \
+        "$(reaper_verdict '/sbin/docker-init -- /usr/local/bin/entrypoint.sh sleep infinity' 42 1 gone)" "reaped"
+    st2 "a lingering zombie is the leak itself" \
+        "$(reaper_verdict 'sleep infinity' 42 1 Z)" "not-reaped"
+    st2 "an unreadable PID 1 establishes nothing" \
+        "$(reaper_verdict '' 42 1 gone)" "pid1-unreadable"
+    st2 "a failed fork establishes nothing (and is the leak's own symptom)" \
+        "$(reaper_verdict 'sleep infinity' '' '' '')" "fork-failed"
+    st2 "an unreadable /proc establishes nothing — it must not read as a reap" \
+        "$(reaper_verdict 'sleep infinity' 42 1 proc-unreadable)" "proc-unreadable"
+    st2 "an orphan whose entry cannot be read establishes nothing either" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 unreadable)" "orphan-unreadable"
+    st2 "an orphan that vanished before it was observed establishes nothing" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 '' '')" "vanished"
+    st2 "an orphan a subreaper took establishes nothing about PID 1" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 77 gone)" "not-adopted"
+    st2 "an orphan still running was never there to be reaped" \
+        "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 S)" "never-exited"
+
+
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
     printf '\033[32mverify.sh self-test passed\033[0m\n'
@@ -202,6 +439,93 @@ if [ ! -r /proc/self/mountinfo ]; then
     exit 2
 fi
 
+# ...AND THEY MUST BE THIS CONTAINER'S NAMESPACES, WHICH IS A SECOND QUESTION. The refusal above
+# establishes that a container is the subject; this establishes that THIS one is. See ns_verdict
+# for what is compared and for the two inferred discriminators that were wrong before it.
+#
+# IT DOMINATES EVERY ASSERTION BELOW rather than living inside one of them -- the rule this repo
+# keeps arriving at (D45.5): a condition that applies to every arm belongs above the dispatch. Both
+# the mount boundary and PID 1 reaping depend on it, so siting it inside either would leave the
+# other unguarded, and inside the reaping `case` it would be one more verdict word to forget.
+#
+# THE REFUSAL PRINTS A `FAIL` LINE, WHICH IS NOT COSMETIC. mutate-verify.sh's `judge` reports a
+# mutation CAUGHT only on a non-zero exit AND a line carrying both the expected text and `FAIL`.
+# A refusal that only wrote to stderr would be invisible to the harness -- so the two mutations
+# that break this marker could never be watched firing, in the guard whose whole subject is checks
+# that cannot fire. `bad` is what every other failure here uses; the guidance goes to stderr after.
+# NO SECOND SPELLING OF THE PATH. `${JKB_NS_MARKER:-/run/jkb/ns}` would put it in two files again,
+# which is the duplication this branch deleted for JKB_REAPER rather than guarded. Unset is not an
+# error here either: `cat ""` fails quietly and lands on `no-marker`, whose message is the right one
+# for a plain Linux host — where the variable is absent precisely because there is no container.
+ns_rec="$(cat "${JKB_NS_MARKER:-}" 2>/dev/null)" || ns_rec=""
+rec_pid="$(kv_field pid "$ns_rec")"; rec_mnt="$(kv_field mnt "$ns_rec")"
+# ns_pair is egress-lib.sh's, shared with the entrypoint that WRITES the record this reads, so the
+# two halves cannot drift. Its own self-test covers the transposition a single `readlink a b` can
+# produce; this gathering is otherwise exercised only by running it in a container.
+ns_pair "$PROC/self/ns"; obs_pid="$NS_PID"; obs_mnt="$NS_MNT"
+
+case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
+    ours) ;;
+    nested)
+        bad "these are NOT this container's namespaces — every assertion below would describe a nested sandbox instead, and the PID-1 reaping check would PASS on a container that does not reap, because the sandbox's own init does"
+        {
+            echo
+            echo "  recorded by the container's entrypoint:  pid=$rec_pid  mnt=$rec_mnt"
+            echo "  observed by this process:                pid=$obs_pid  mnt=$obs_mnt"
+            echo
+            echo "  You are almost certainly inside Claude Code's own sandbox, which wraps a Bash"
+            echo "  tool call in \`bwrap --bind / / --unshare-pid --unshare-user --proc /proc\`."
+            echo "  The fresh procfs is why /proc/1 and the mount table are not this container's."
+            echo
+            echo "  Run it from a plain terminal in the attached container, or from the host:"
+            echo "    ./.container/run.sh                       (runs this for you, via docker exec)"
+            echo "    ./.container/mutate-verify.sh --control   (one healthy run)"
+        } >&2
+        exit 2
+        ;;
+    no-marker)
+        bad "this container recorded no namespace identity, so verify.sh cannot tell whether what it is about to measure is this container at all"
+        {
+            echo
+            echo "  ${JKB_NS_MARKER:-(JKB_NS_MARKER is not set)} is absent or incomplete. entrypoint.sh"
+            echo "  deletes it on entry and writes it only on reaching its handover, so this means"
+            echo "  one of:"
+            echo "    * the container was started with --entrypoint, bypassing entrypoint.sh;"
+            echo "    * its start did not finish (check \`docker logs\`);"
+            echo "    * the image predates the marker — rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+            echo
+            echo "  On an ordinary Linux host there is no marker either, and that is the honest"
+            echo "  answer: this script asserts what a CONTAINER is and has no subject here."
+        } >&2
+        exit 2
+        ;;
+    unreadable)
+        bad "verify.sh could not read its own namespace ids from $PROC/self/ns, so whether these are this container's namespaces is unknown — and every assertion below depends on the answer"
+        {
+            echo
+            echo "  \`readlink\` is a fork, so this is also where a container that cannot fork lands —"
+            echo "  which is the end state of a PID 1 that does not reap, every one of its pids spent"
+            echo "  on zombies. Tell them apart from OUTSIDE the container:"
+            echo
+            echo "    docker stats --no-stream <name>   # PIDS = the counter --pids-limit bounds"
+            echo
+            echo "  If that is near the limit, recreate it:"
+            echo "    ./.container/run.sh --rm && ./.container/run.sh --build"
+        } >&2
+        exit 2
+        ;;
+    # A VERDICT WITH NO ARM MUST NOT OPEN THE GATE. `set -uo pipefail` is on and `set -e` is not, so
+    # an unmatched `case` is a no-op returning 0 -- which here means falling through into every
+    # assertion below with the subject UNVERIFIED, the one failure direction this gate exists to
+    # prevent. The verdict words and these arms are two lists, and the next edit to ns_verdict is
+    # the one that forgets this one. reaper_verdict's `case` carries the identical arm for the
+    # identical reason; this one was missing it, found by asking who else implements the rule.
+    *)
+        bad "could not establish whose namespaces these are: unrecognised verdict '$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")' — ns_verdict gained a word this case has no arm for, and an unhandled verdict must refuse rather than let every assertion below run against an unverified subject"
+        exit 2
+        ;;
+esac
+
 echo "==> container posture"
 
 # READ ONCE, AND AN EMPTY TABLE IS NOT A ZERO. This count feeds a pass/fail verdict below, and it
@@ -220,6 +544,96 @@ fi
 # 1. Non-root. Load-bearing, not hygiene: root in a container cannot create a mount namespace
 #    directly even with seccomp relaxed, so bubblewrap fails and the nested sandbox with it.
 assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo yes || echo no)"
+
+# 1b. PID 1 REAPS WHAT IT ADOPTS. run.sh keeps this container alive with `sleep infinity`, and a
+#     bare `exec "$@"` in entrypoint.sh made THAT PID 1 -- `sleep` never wait()s, so every orphan
+#     reparented to it stayed a zombie for ever — see README.md, "The measurements this is
+#     built on", for the numbers and the date they were taken.
+#
+#     WHY IT IS ASSERTED HERE AND NOT ONLY AT BUILD. The fix is an IMAGE change, and nothing else
+#     observes the running container: `config_hash` covers the derived docker arguments and the
+#     seccomp profile's content, not entrypoint.sh or the Dockerfile, and the container.json edit
+#     that carried the fix was comment-only, which `dc_strip` removes before it is hashed. So
+#     `run.sh` without `--build` finds the args-hash and the image id both matching, starts the
+#     PRE-TINI container, settle() reads `sleep infinity` and returns settled, and the run reports
+#     "running and attachable" while the leak continues. This is the assertion that goes red there.
+#     The self-test proves the SCRIPT execs its reaper and the Dockerfile proves the reaper existed
+#     AT BUILD TIME; neither is an observation of the container you are about to attach to.
+#
+#     SO THIS IS THE IMAGE-STALENESS CHECK, re-entering as a direct measurement — worth saying
+#     because a separate branch was built to compare image inputs against a fingerprint, and the
+#     next person to notice the gap will reach for that again. Measuring the property the stale
+#     image LACKS beats comparing ids: it needs no fingerprint to keep current, it cannot be
+#     defeated by an input nobody thought to hash (the container.json edit that carried this fix
+#     was comment-only, which `dc_strip` removes before hashing), and what it reports is the thing
+#     that is actually wrong rather than a hash mismatch the reader has to interpret.
+# WHAT IS AND IS NOT COVERED BY `--self-test`, said plainly because the previous wording claimed
+# more than it delivered: the JUDGEMENT is covered -- proc_stat_fields, pstat's three-way return,
+# ns_verdict and reaper_verdict all run against fixtures, which is where the arms no
+# healthy container can reach live. The GATHERING below is not: it is exercised only by running it
+# in a container, and only ever takes its healthy path there.
+pid1_argv=""
+while IFS= read -r -d '' w; do pid1_argv="$pid1_argv$w "; done 2>/dev/null <"$PROC/1/cmdline"
+pid1_argv="${pid1_argv% }"
+
+
+# THE PREMISE, ESTABLISHED BEFORE IT IS USED: if our own stat is unreadable then nothing below
+# observes anything, and every later "gone" would be a fact about /proc rather than about PID 1.
+orphan=""; adopted=""; final=""; born=""
+if ! pstat "$$"; then
+    final=proc-unreadable
+else
+    # The pid comes back through a FILE, not a command substitution: `$( )` would fork again, and
+    # the substitution also has to wait for the subshell. These two forks (the subshell and the
+    # orphan) are the only ones before the measurement, and a failure of either shows up as an
+    # empty pid, which reaper_verdict reads as fork-failed -- the leak's own end state.
+    pidfile="$(mktemp)"
+    ( sleep 1 >/dev/null 2>&1 </dev/null & echo $! >"$pidfile" ) 2>/dev/null
+    IFS= read -r orphan 2>/dev/null <"$pidfile" || orphan=""
+    rm -f "$pidfile"
+    case "$orphan" in ''|*[!0-9]*) orphan="" ;; esac
+
+    if [ -n "$orphan" ] && pstat "$orphan"; then
+        adopted="$PS_PPID"; born="$PS_START"
+        # ONE WAIT, NOT A POLL. The orphan lives 1s; three seconds is well past it, and a `sleep`
+        # that cannot fork is itself the answer rather than sixty chances to be wrong.
+        if sleep 3; then
+            pstat "$orphan"; rc=$?
+            case "$rc" in
+                # A DIFFERENT starttime on the same pid is a recycled pid, and a pid is recycled
+                # only after the process holding it was reaped -- evidence of a reap, not a miss.
+                0) if [ "$PS_START" != "$born" ]; then final=gone; else final="$PS_STATE"; fi ;;
+                2) final=unreadable ;;
+                *) final=gone ;;
+            esac
+        else
+            orphan=""     # fork-failed
+        fi
+    fi
+    # THERE IS DELIBERATELY NO ARM FOR A FAILED FIRST OBSERVATION. Whether the orphan was already
+    # gone or its entry could not be read, `adopted` is unset -- and reaper_verdict answers
+    # `vanished` on that before it ever reads the final state. An arm setting `final` here would be
+    # dead code: there is nothing to say without an adopter, because we do not know whether PID 1
+    # was ever in the picture. The `vanished` message names both.
+fi
+
+case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
+    reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    fork-failed)      bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
+    pid1-unreadable)  bad "could not establish whether PID 1 reaps: $PROC/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
+    proc-unreadable)  bad "could not establish whether PID 1 reaps: this process's own $PROC entry is unreadable, so an absent orphan would say nothing about reaping" ;;
+    orphan-unreadable) bad "could not establish whether PID 1 reaps: the test orphan's $PROC entry exists but could not be read or parsed (PID 1 is: $pid1_argv)" ;;
+    not-adopted)      bad "could not establish whether PID 1 reaps: the test orphan was adopted by pid $adopted rather than PID 1, so a subreaper is in the way (PID 1 is: $pid1_argv)" ;;
+    vanished)         bad "could not establish whether PID 1 reaps: the test orphan could not be observed after being spawned — it was already gone, or its $PROC entry could not be read (PID 1 is: $pid1_argv)" ;;
+    never-exited)     bad "could not establish whether PID 1 reaps: the test orphan is still in state '$final' after 3s, so it never exited to be reaped (PID 1 is: $pid1_argv)" ;;
+    # A VERDICT WITH NO ARM MUST NOT BE SILENCE. `set -uo pipefail` is on and `set -e` is not, so
+    # an unmatched `case` is a no-op returning 0: neither `pass` nor `fail` would move, no line
+    # would print, and verify would report every check passed having asserted NOTHING about PID 1.
+    # The verdict words and these arms are two lists, and the next edit to reaper_verdict is the
+    # one that forgets this one.
+    *)                bad "could not establish whether PID 1 reaps: unrecognised verdict '$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")' — reaper_verdict gained a word this case has no arm for" ;;
+esac
 
 # 2. THE NESTED SANDBOX'S MECHANISM, measured by the one probe (D54.3).
 #

@@ -429,8 +429,18 @@ if [ "${1:-}" = --self-test ]; then
     # A literal table, not a re-derivation: writing the expectation as a second copy of the
     # condition passes for any condition, including the one this replaced.
     while read -r running psout want; do
-        [ -n "${running:-}" ] || continue
+        # Blank lines and `#` comments are skipped, so a row can carry the reason it exists. A
+        # comment read as a row would not be inert: it becomes `settle_step '#' 'WHAT'`, which
+        # returns `gone` and fails against whatever the third field happened to be.
+        case "${running:-}" in ''|\#*) continue ;; esac
         [ "$psout" = "-" ] && psout=""
+        # Rows are whitespace-split, so a space in an argv is written `\x20` -- and `read -r`
+        # does not decode it. Undecoded, the table fed settle_step a literal 34-character string
+        # rather than the argv `ps -o args= -p 1` prints, which makes the fidelity claim above
+        # false: a future settle_step that looked at the FIRST WORD would be pinned against a
+        # string ps never emits. The decoded label is its own evidence -- the self-test prints
+        # the row back with real spaces.
+        psout="${psout//\\x20/ }"
         got="$(settle_step "$running" "$psout")"
         eq "settle_step $running '$psout' -> $want" "$got" "$want"
     done <<'TABLE'
@@ -440,6 +450,16 @@ true    -                     unreadable
 true    /usr/local/bin/entrypoint.sh  waiting
 true    /bin/bash             settled
 true    sleep\x20infinity      settled
+# WHAT PID 1 IS ONCE entrypoint.sh HANDS OVER. It execs tini so that PID 1 reaps -- `sleep` never
+# wait()s, and every orphan reparented to it stayed a zombie for ever (README.md, "The
+# measurements this is built on"). The argv has to stay readable BY THIS FUNCTION, which is the
+# half that is easy to break silently.
+true    /usr/bin/tini\x20--\x20sleep\x20infinity   settled
+# ...AND WHY `--init` IS NOT HOW THAT IS DONE, as a row rather than only as a comment in
+# entrypoint.sh. Docker's tini wraps this script instead of being exec'd by it, so PID 1's argv
+# names entrypoint.sh for the whole life of the container: this function reads that as "not
+# finished yet", settle() never returns 0, and every create and start fails on its 120s budget.
+true    /sbin/docker-init\x20--\x20/usr/local/bin/entrypoint.sh\x20sleep\x20infinity   waiting
 TABLE
 
     echo
@@ -701,12 +721,21 @@ esac
 # same way -- so a black-holed resolver (which keeps the raise inside ~15 getent calls at 5s x2 per
 # name, well past this budget) and an image without `ps` both reported the entrypoint as finished,
 # which is exactly the state this function was added to stop run.sh proceeding through.
+# THE LAST PID 1 ARGV settle() SAW, carried out rather than discarded. It read this up to 120
+# times and threw every one away, so the rc=3 arm had to send the operator looking for evidence
+# elsewhere — and the evidence it named (a completion line in `docker logs`) is one entrypoint.sh
+# never prints: its `allowlisted` arm is empty, so a healthy boot says nothing about itself at all.
+# Reporting the observation the loop already made needs no new probe and no new failure mode.
+SETTLE_PID1=""
+
 settle() { # settle -> 0 settled | 1 container gone | 2 could not read PID 1 | 3 budget exhausted
-    local i state
+    local i state argv
     for i in $(seq 1 120); do
+        argv="$(docker exec "$NAME" sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null)"
+        [ -z "$argv" ] || SETTLE_PID1="$argv"
         state="$(settle_step \
             "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" \
-            "$(docker exec "$NAME" sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null)")"
+            "$argv")"
         case "$state" in
             gone)       return 1 ;;
             settled)    return 0 ;;
@@ -765,16 +794,82 @@ settle_rc=0; settle || settle_rc=$?
 case "$settle_rc" in
     0) ;;
     1) container_died "waiting for the entrypoint to settle"; exit 1 ;;
-    2) # Reported, not continued through. Proceeding here is what the old code did for every one
+    2) # THE DECLARED LIMIT, from the arguments this script derived from container.json, so the
+       # sentence below names a number the reader can compare against rather than a flag name.
+       # `docker stats` prints PIDS as a bare count and never the limit, so without this the
+       # operator is told to judge "near the --pids-limit" from output that does not contain it.
+       pids_limit=""
+       for _i in "${!ARGS[@]}"; do
+           [ "${ARGS[$_i]}" = "--pids-limit" ] && { pids_limit="${ARGS[$((_i+1))]:-}"; break; }
+       done
+       # Reported, not continued through. Proceeding here is what the old code did for every one
        # of these, and it is what let the execs below race a half-built chain.
        printf '\n\033[31merror:\033[0m could not read PID 1 in %s, so this script cannot tell\n' "$NAME" >&2
-       printf 'whether the entrypoint has finished deciding. `ps` may be missing from the image.\n' >&2
-       printf 'Everything below would be racing a firewall that may still be coming up.\n' >&2
+       printf 'whether the entrypoint has finished deciding. Everything below would be racing a\n' >&2
+       printf 'firewall that may still be coming up.\n\n' >&2
+       # TWO CAUSES, AND THE SECOND ONE IS THIS REPO'S OWN BUG. The probe is `docker exec ... ps`,
+       # so it needs to FORK INSIDE the container -- and a container whose PID 1 does not reap
+       # eventually cannot, having spent every one of container.json's 4096 pids on zombies. That
+       # is the exact end state verify.sh's reaping assertion exists to name, and naming only a
+       # missing `ps` here pre-empted it: the reader was sent to audit the image while the actual
+       # remedy, which is to recreate the container, was never printed because verify.sh never ran.
+       #
+       # ASK THE COUNTER THE LIMIT IS APPLIED TO, NOT A PROCESS LISTING. `--pids-limit` is enforced
+       # by the pids cgroup controller, and `pids.current` -- which `docker stats` prints as PIDS --
+       # is the number it bounds; a zombie is charged against it until it is reaped, which is
+       # exactly why zombies exhaust it. `docker top` lists PROCESSES, from the host, needing no
+       # fork inside -- and a listing is not the charge: whether a dying leader appears in it is a
+       # kernel detail nobody here has measured, so a remedy resting on that count alone could read
+       # empty in the one state it exists to name. Printing BOTH removes the dependency and is
+       # strictly more informative, because the DISCREPANCY is the signature: the charge near the
+       # limit while the listing shows a handful of live processes is what a zombie pile looks like
+       # from outside, and no single number says that.
+       printf '  `ps` may be missing from the image — or the container cannot fork at all,\n' >&2
+       printf '  which is what a PID 1 that does not reap comes to after a day (every one of\n' >&2
+       printf '  its pids spent on zombies). Tell them apart from outside the container:\n\n' >&2
+       printf '    docker stats --no-stream %s   # PIDS = the counter --pids-limit bounds\n' "$NAME" >&2
+       printf '    docker top %s                 # what is actually there\n' "$NAME" >&2
+       # THE SUFFICIENT CONDITION, NOT A CONJUNCTION. This used to read "PIDS near the limit AND
+       # only a handful of processes listed", which gates the remedy on an unmeasured premise --
+       # and probably the wrong way round: a zombie is charged against pids.current precisely
+       # BECAUSE it is still a task, so `docker top` most likely lists thousands of `<defunct>`
+       # rows rather than a handful, the literal test fails, and the operator concludes it is not
+       # the zombie pile and skips the recreate. PIDS at the limit is on its own grounds to
+       # recreate, whatever the listing looks like; the listing is corroboration, worded as such.
+       if [ -n "$pids_limit" ]; then
+           printf '\n  PIDS at or near %s (the limit this container declares) is on its own enough\n' "$pids_limit" >&2
+       else
+           printf '\n  PIDS at or near the limit this container declares is on its own enough\n' >&2
+       fi
+       printf '  to recreate it — no second condition needed. If it IS zombies, `docker top`\n' >&2
+       printf '  will be mostly `<defunct>` rows.\n\n' >&2
+       printf '    %s --rm && %s --build\n' "$0" "$0" >&2
        exit 1 ;;
     3) printf '\n\033[31merror:\033[0m %s is still running its entrypoint after 120s.\n' "$NAME" >&2
        printf 'The firewall raise resolves the allowlist by DNS, so a black-holed resolver holds it\n' >&2
        printf 'here. The container log says where it is:\n\n' >&2
        docker logs --tail 20 "$NAME" 2>&1 | sed 's/^/  /' >&2
+       # A SECOND CAUSE, READ OFF THE OBSERVATION RATHER THAN LOOKED FOR ELSEWHERE. `settle_step`
+       # treats a match of *entrypoint.sh* in PID 1's argv as "not finished yet". Under Docker's
+       # `--init` that is true for the container's whole life -- docker-init WRAPS this script
+       # instead of being exec'd by it -- so settle() can never return 0. It is pinned as a
+       # self-test row above.
+       #
+       # The argv IS the discriminator, and settle() has just read it 120 times. The first version
+       # of this message instead asked the reader to look for a completion line in `docker logs`,
+       # which entrypoint.sh never prints (its `allowlisted` arm is empty), and fell back to
+       # `docker inspect .HostConfig.Init` -- the flag as REQUESTED, which is `<nil>` when unset and
+       # says nothing about a daemon-level `init: true`. Printing what was observed needs neither.
+       printf '\n  PID 1 is: %s\n' "${SETTLE_PID1:-<never readable>}" >&2
+       case "$SETTLE_PID1" in
+           *docker-init*|*/sbin/init*|*tini*entrypoint.sh*)
+               printf '\n  That argv WRAPS the entrypoint rather than being exec"'"'"'d by it, so this is not a\n' >&2
+               printf '  stuck boot: `--init` (or a daemon-level init) is making docker-init PID 1,\n' >&2
+               printf '  whose argv names entrypoint.sh for ever. Drop `--init` from runArgs.\n' >&2 ;;
+           *)
+               printf '\n  That argv is the entrypoint itself, so it really is still deciding — the DNS\n' >&2
+               printf '  cause above is the one to chase.\n' >&2 ;;
+       esac
        exit 1 ;;
 esac
 
