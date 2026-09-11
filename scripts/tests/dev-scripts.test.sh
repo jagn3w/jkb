@@ -554,9 +554,18 @@ in one would run under every suite's pipefail and go unreported:$missing"
     # this very comment and inside the spellings table below, which is the self-matching problem
     # the PIPE placeholder exists for one guard over — so the bound is the honest trade, and the
     # message says what is detected instead of claiming completeness.
+    # QUOTES AROUND THE NAME. `export "SHELLOPTS"` exports exactly as the bare form does —
+    # measured, child pipefail ON for both `"` and `'` — and the prefix group must end in
+    # whitespace, so a quote sitting immediately before the name could not be absorbed and the
+    # spelling walked past. The round that added `readonly`, which measurably does NOT leak, left
+    # one that does outside.
+    #
+    # The line-continuation form (`export FOO \` / newline / `SHELLOPTS`) also leaks and is still
+    # not matched; that is stated in the ok message rather than papered over, because this guard's
+    # green is an absence and an overstated claim about it is worth more than the gap.
     _shellopts_re() {
         printf '%s%s' '^[[:space:]]*(export|declare|typeset|readonly)[[:space:]]+' \
-                      '([^#]*[[:space:]])?(SHELL|BASH)OPTS([[:space:]=]|$)'
+                      '([^#]*[[:space:]])?["'"'"']?(SHELL|BASH)OPTS["'"'"']?([[:space:]=]|$)'
     }
     # DRIVEN ON BOTH SIDES, like the grep detector above. One planted spelling proved the pattern
     # was not inert, which is what it was added for — but six of the seven forms it was rewritten
@@ -584,17 +593,18 @@ hit|declare -x SHELLOPTS
 hit|typeset -x BASHOPTS
 hit|readonly SHELLOPTS
 hit|declare SHELLOPTS
+hit|export "SHELLOPTS"
 miss|export MYSHELLOPTS
 miss|export SHELLOPTSFOO
 miss|# export SHELLOPTS
 miss|echo export SHELLOPTS
 SPELLINGS
     rm -f "$fake/scripts/exporter.sh"
-    if [ "$n" -ne 13 ]; then
-        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 13"
+    if [ "$n" -ne 14 ]; then
+        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 14"
     elif [ -n "$miss" ]; then
-        fail "pipefail: shellopts-premise" "the exported-SHELLOPTS pattern does not match these \
-real spellings, and a guard satisfied by absence cannot tell that from a clean tree:$miss"
+        fail "pipefail: shellopts-premise" "the SHELLOPTS pattern does not match these spellings it is \
+meant to classify, and a guard satisfied by absence cannot tell that from a clean tree:$miss"
     elif [ -n "$false_hit" ]; then
         fail "pipefail: shellopts-false" "these lines export nothing and were read as doing so, \
 which is how a guard gets loosened until it means nothing:$false_hit"
@@ -611,9 +621,11 @@ which is how a guard gets loosened until it means nothing:$false_hit"
             && exporters="$exporters $form"
     done < <(shell_sources "$repo_root")
     [ -z "$exporters" ] \
-        && ok "and no line-initial export/declare/typeset/readonly gives SHELLOPTS away" \
-        || fail "pipefail: shellopts" "these files export SHELLOPTS/BASHOPTS, so every script they \
-run inherits pipefail and the per-file condition above is no longer the right question:$exporters"
+        && ok "and no single-line export/declare/typeset/readonly gives SHELLOPTS away" \
+        || fail "pipefail: shellopts" "these files match the line-initial \
+export/declare/typeset/readonly + SHELLOPTS shape. If it really exports (bare \`readonly\` and \
+\`declare\` without -x do NOT), every script they run inherits pipefail and the per-file \
+condition above is no longer the right question:$exporters"
 }
 
 # --- 5. the rule itself --------------------------------------------------------------------

@@ -190,6 +190,59 @@ echo "==> scripts/tests/harness.sh"
 # a GNU BRE extension, so on BSD/macOS sed it matched nothing and unset nothing, silently, on
 # the platform this project is developed on. The variables are live: this project's dev
 # container exports `GIT_CONFIG_COUNT` to carry `safe.directory` grants.
+# THE WHOLE SET, compared for EQUALITY against a list written down here.
+#
+# `case_isolate` below enumerates five names and reports "isolate_git unsets every variable that
+# can outrank the empty configuration" — a claim about a class, checked against a sample. That is
+# why the shell half could be left a round behind when the Rust half was widened: round 27 added
+# three repository COMPONENT selectors to `MUST_DROP` after measuring that an exported
+# `GIT_INDEX_FILE` lets a fixture rewrite somebody's real index, and nothing here noticed that the
+# suites which build actual repositories still inherited it. Measured at the time: deleting the
+# names again left this suite at 17 ok, 0 fail.
+#
+# The literal below is this test's own, never derived from `harness.sh` — the rule the Rust side
+# arrived at over rounds 24-26 after getting it wrong in both directions. A name added to
+# `isolate_git` and not here fails as an extra; a name dropped from `isolate_git` fails as a
+# missing one; and `CONTROL_KEEP` must survive, so a function that simply unset everything would
+# not pass either.
+case_isolate_set() {
+    local d="$work/isoset" lib got want
+    lib="$(cd "$(dirname "$0")" && pwd)/harness.sh"
+    mkdir -p "$d"
+    want="GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL \
+GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM GIT_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+GIT_TEMPLATE_DIR GIT_WORK_TREE XDG_CONFIG_HOME"
+    want="$(printf '%s\n' $want | sort | tr '\n' ' ')"
+    # DIFFED, not polled. Asking "which of the names I expected are gone" cannot see an unset
+    # nobody expected — the first version of this case exported only the wanted names, so adding
+    # `EDITOR` to `isolate_git` passed. `compgen -e` before and after gives the removals whatever
+    # they are, which is what makes this equality rather than a checklist.
+    #
+    # `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` are filtered out of the comparison because how many of them
+    # exist is a fact about the machine — this project's dev container exports four to carry its
+    # `safe.directory` grants — so they cannot be a written-down literal. That sweep is pinned by
+    # `case_isolate`'s third assertion instead, which is the one that discriminates it.
+    got="$(
+        bash -c '
+            . "$1" >/dev/null 2>&1
+            for v in $3 CONTROL_KEEP EDITOR PAGER; do export "$v=probe"; done
+            before="$(compgen -e | sort)"
+            isolate_git "$2/home" >/dev/null 2>&1
+            after="$(compgen -e | sort)"
+            comm -23 <(printf "%s\n" "$before") <(printf "%s\n" "$after") \
+                | grep -vE "^GIT_CONFIG_(KEY|VALUE)_[0-9]+$" | sort | tr "\n" " "
+        ' _ "$lib" "$d" "$want"
+    )"
+    if [ "$got" = "$want" ]; then
+        ok "and that is the WHOLE set it unsets, against a list this test writes down itself"
+    else
+        fail "isolate: set" "isolate_git unsets a different set than this test expects. Missing \
+means a variable the developer's shell now reaches these suites' \`git\` through — add it to \
+\`isolate_git\`, and to the Rust twin \`MUST_DROP\`. Extra means it unsets something nobody \
+asked for. wanted [$want] got [$got]"
+    fi
+}
+
 case_isolate() {
     local d="$work/iso" lib got
     lib="$(cd "$(dirname "$0")" && pwd)/harness.sh"
@@ -279,6 +332,7 @@ case_orphanname() {
     esac
 }
 
-run_cases case1 case2 case2b case2c case2d case3 case4 case_orphanname case_isolate
+run_cases case1 case2 case2b case2c case2d case3 case4 case_orphanname case_isolate \
+           case_isolate_set
 
 finish

@@ -26,7 +26,9 @@ const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 /// other people's professional repositories and must not decorate them — the same rule that
 /// keeps it from writing a git ref (D46). `scripts/lib.sh::_git` is this rule's shell half.
 ///
-/// Only the three that select a REPOSITORY. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
+/// Everything that names a repository or a PART of one — six variables, not the three this
+/// sentence claimed until round 28, when `jkb task work` was measured rewriting a foreign
+/// repository's index through an inherited `GIT_INDEX_FILE`. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
 /// configuration and are deliberately left alone: this project's own dev container uses them
 /// to carry `safe.directory` grants, and stripping those makes git refuse the checkout
 /// outright.
@@ -47,7 +49,9 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
 /// gate runner (whose verdict decides a landing). Anything else that shells out to a
 /// repository-aware tool belongs here too.
 ///
-/// Only the three that select a REPOSITORY. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
+/// Everything that names a repository or a PART of one — six variables, not the three this
+/// sentence claimed until round 28, when `jkb task work` was measured rewriting a foreign
+/// repository's index through an inherited `GIT_INDEX_FILE`. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
 /// configuration and are deliberately left alone: this project's own dev container carries
 /// `safe.directory` grants in them, and stripping those makes git refuse the checkout.
 pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
@@ -1681,7 +1685,8 @@ mod tests {
     /// objects into a foreign object store.
     ///
     /// This is containment, not parity. `MUST_DROP` is deliberately WIDER — it carries the config
-    /// channels and the repository COMPONENTS that production leaves alone — so the assertion is
+    /// channels and `GIT_TEMPLATE_DIR`, which production leaves alone because it never runs
+    /// `git init` — so the assertion is
     /// one-directional and production may grow without the fixture list being wrong. It reads the
     /// constants the compiler saw, not their source text, which is what the deleted parity test
     /// did wrong.
