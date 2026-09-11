@@ -1199,10 +1199,12 @@ _reconcile_exclude_decide() {
 #                             file; every other line describes one step or one pattern. Emitted
 #                             once per run by `reconcile_exclude`, below every arm.
 #   dispatch=<verdict> [detail] direct | chained | unknown | dead | unreadable | unanchored |
-#                             unaskable | unprobeable — the refusal words are DERIVED from
-#                             `_override_verdict`; `chainer.test.sh` case14 checks this list
-#                             against it, because a header that lags says a verdict the code
-#                             emits cannot happen.
+#                             unaskable | unprobeable — `chainer.test.sh` case14 checks this
+#                             list against the RENDERER's own arms, because a header that lags
+#                             says a verdict the code emits cannot happen. Against the renderer
+#                             and not `_override_verdict`, which maps refusal codes and so knows
+#                             only the four `un*` words: derived from that, the check let
+#                             `unknown | dead` be deleted here with every suite still green.
 #   error=<reason>            nothing was done; ALWAYS the only line, and the only rc 1
 #
 # Each key reports a STATE, not an action taken. That distinction is the whole design: while

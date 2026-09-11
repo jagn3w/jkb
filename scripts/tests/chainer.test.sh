@@ -1293,12 +1293,20 @@ case14() {
     # `_override_statuses`, which derives itself from `_override_verdict`'s own arms; a verdict
     # that renders nothing is as bad as one that renders the catch-all, since `dispatch=direct`
     # is the silent verdict and silence would read as "the hook will run".
-    local st verdict word rend uncovered_status="" undocumented="" hdr
+    local st verdict rend uncovered_status="" hdr
     # ...and the PROTOCOL HEADER is a third hand-kept copy of the same vocabulary. `case10k`
     # checks that every emitted KEY is documented and stops there, so the words after
     # `dispatch=` went unchecked: code 6 shipped with `unprobeable` absent from the header,
     # which tells a reader auditing the protocol that a verdict the code emits cannot happen.
-    # Derived from the same place as the arms, so the list has one home.
+    #
+    # COMPARED AGAINST THE RENDERER, not against `_override_verdict`, and the difference is four
+    # of the eight words. `_override_verdict` maps REFUSAL CODES, so it yields only the four
+    # `un*` verdicts; `direct`, `chained`, `unknown` and `dead` are assigned as literals inside
+    # `install_git_hooks` and pass through it at no point. Derived from the refusal mapping, this
+    # guard let `unknown | dead` be deleted from the header with every suite still green — half a
+    # documented vocabulary unchecked by the check written to stop exactly that. The renderer's
+    # own `case` arms ARE the complete set and are already derived below as `declared`, so the
+    # comparison waits until that array exists rather than keeping a second derivation here.
     hdr="$(sed -n '/^#   dispatch=<verdict>/,/^#   error=/p' "$repo_root/scripts/lib.sh" \
         | sed 's/^#[[:space:]]*//' | tr '\n' ' ')"
     # THE VOCABULARY ONLY, not the prose beside it. The range has to reach `error=` to pick up
@@ -1325,18 +1333,10 @@ prose around it ($nwords words), so the check below asserts nothing: $hdr"
             "") uncovered_status="$uncovered_status $st(silent)" ;;
             *"unrecognised dispatch verdict"*) uncovered_status="$uncovered_status $st(no arm)" ;;
         esac
-        word="${verdict%% *}"
-        case "$hdr" in
-            *" $word "*) ;;
-            *) undocumented="$undocumented $st($word)" ;;
-        esac
     done
     [ -z "$uncovered_status" ] \
         && ok "and every refusal code the mapping can emit reaches a render arm, derived not listed" \
         || fail "render: status-arm" "refusal codes with no render arm:$uncovered_status"
-    [ -z "$undocumented" ] \
-        && ok "and every one of those verdict words is in the protocol header the reader audits" \
-        || fail "render: status-header" "verdict words the header does not list:$undocumented"
 
     # The two silent verdicts are silent ON PURPOSE — the lines above them already said the
     # hook will run — so assert the silence rather than leaving it unstated. Its OWN
@@ -1389,6 +1389,18 @@ EOF
     [ "${#declared[@]}" -ge 12 ] \
         && ok "the renderer's state vocabulary is derived from it, and has ${#declared[@]} entries" \
         || fail "render: derived" "derived ${#declared[@]} states; the derivation is broken, not the code"
+
+    # ...and now the protocol header, against that complete set rather than against the quarter
+    # of it the refusal mapping can reach. `$hdr` was extracted above; every `dispatch=` word the
+    # RENDERER knows must appear in the sentence a reader audits the protocol by.
+    local dword undocumented=""
+    for want in "${declared[@]}"; do
+        case "$want" in dispatch=*) dword="${want#dispatch=}" ;; *) continue ;; esac
+        case "$hdr" in *" $dword "*) ;; *) undocumented="$undocumented $dword" ;; esac
+    done
+    [ -n "$undocumented" ] && fail "render: status-header" \
+        "verdict words the protocol header does not list:$undocumented" \
+        || ok "and every verdict word the renderer knows is in the protocol header a reader audits"
 
     local want covered uncovered=""
     for want in "${declared[@]}"; do

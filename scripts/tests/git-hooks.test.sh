@@ -1796,10 +1796,22 @@ case10l() {
     #    than rewriting one, and it is anchored on `declared_raw=`, the line that has to exist
     #    for the refusal to name the foreign declaration at all. The premise check below is what
     #    makes any future miss loud instead of silent.
+    #
+    #    ONE LINE, because `\n` in a sed REPLACEMENT is a GNU extension. BSD sed — stock
+    #    /usr/bin/sed on macOS, which is where this repo is developed — emits a literal `n`, so
+    #    the seeded line became `declared="$repo_root"n    declared_raw="$declared"`, which bash
+    #    reads as two assignment prefixes: `declared` ends up `/tmp/…n`, `[ -d "$declared" ]`
+    #    fails, the arm is never made permissive, the merge still refuses and the step prints ok
+    #    for the wrong reason. A `;` needs no newline and means the same thing on both seds. The
+    #    repo has been bitten by this exact class twice before (harness.sh:139, harness.test.sh:190).
     local stripped="$d/post-merge.unconfined"
-    sed 's/^\( *\)declared_raw="\$declared"$/\1declared="$repo_root"\n\1declared_raw="$declared"/' \
+    sed 's/^\( *\)declared_raw="\$declared"$/\1declared="$repo_root"; declared_raw="$declared"/' \
         "$hook" >"$stripped"
-    if ! grep -q 'declared="\$repo_root"' "$stripped"; then
+    #    ...and the premise is anchored to the WHOLE seeded line rather than a substring of it.
+    #    `grep -q 'declared="\$repo_root"'` matched the BSD-mangled line too, so the guard written
+    #    to make a dead mutation loud was itself dead in the only environment where the mutation
+    #    dies. Anchored, a mangled seed fails here instead of passing four steps later.
+    if ! grep -qE '^ *declared="\$repo_root"; declared_raw="\$declared"$' "$stripped"; then
         fail "hookenv: strip-premise" "the arm was not made permissive, so this tested nothing"
     else
         git_q -C "$d/theirs" clean -qfd >/dev/null 2>&1 || :
@@ -1935,7 +1947,14 @@ $(printf '%s' "$remedy" | tr '\n' '|')"
         : "$ranall"
         ( cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q reset -q --hard HEAD~1 ) \
             >/dev/null 2>&1
-        out="$(cd "$btree" && GIT_DIR="$bgd" GIT_WORK_TREE="$btree" git_q merge --no-edit feature 2>&1)"
+        # `$jbin` on PATH, because the nested check below is about the SKIP, not about whether
+        # jkb exists. Chore 2 asks `command -v jkb` first and stays silent where there is none —
+        # correctly, since a line blaming jkb's repository discovery on a machine with no jkb is
+        # a true-sounding sentence about the wrong thing. Without the stub this step asserted
+        # that distinction by accident and would have read a REGRESSION (the skip removed) as the
+        # same silence it read absence as.
+        out="$(cd "$btree" && PATH="$jbin:$PATH" GIT_DIR="$bgd" GIT_WORK_TREE="$btree" \
+               git_q merge --no-edit feature 2>&1)"
         case "$out" in
             *"SETUP-RAN-IN:$btree"*)
                 ok "and after the remedy it is the ordinary case, building that very tree"
@@ -1949,7 +1968,7 @@ $(printf '%s' "$remedy" | tr '\n' '|')"
                 case "$out" in
                     *"not closing merged tasks"*)
                         ok "and it still says why it cannot close merged tasks in that layout" ;;
-                    *"not inside a git repo"*|*"close-merged failed"*)
+                    *"JKB-RAN:task close-merged"*|*"not inside a git repo"*|*"close-merged failed"*)
                         fail "hookenv: dotclose" "the accepted layout still runs close-merged, \
 which cannot resolve this tree to a repository" ;;
                     *) fail "hookenv: dotclose-silent" "chore 2 vanished from an otherwise \
@@ -2213,6 +2232,83 @@ wrote a scope the existing declaration outranks: $(printf '%s' "$wremedy" | tr '
         *) fail "hookenv: wtcstale-premise" "a stale config.worktree declaration did not reach the \
 refusal, so the remedy was never printed: $(printf '%s' "$out" | tr '\n' '|')" ;;
     esac
+
+    # 16c. AND THE OTHER KEY. `core.bare` is read through the same `honoured_read` and printed
+    #      with the same scope flag, and until this step NOTHING drove that half: the round-24
+    #      reviewer reverted lines 374-377 to the old `--local` read and the scope-less echo and
+    #      all five suites stayed green, under a comment one line above claiming case10l runs
+    #      every printed line against both layouts. The code was right and the comment was true
+    #      of nothing — which is worse than a wrong comment, because it reads as coverage.
+    #
+    #      Every other `core.bare` fixture in this file sets it `--local` (1664, 1719, 2168,
+    #      2255), and 16b sets local `core.bare false` on purpose so only the `core.worktree`
+    #      line prints. So the uncovered layout is the one built here: `core.bare = true` in
+    #      `config.worktree` with local `false`, which a `git init --bare` followed by somebody
+    #      turning the extension on produces. Reverting the read makes the hook print no bare
+    #      remedy at all, and the operator following that incomplete refusal lands on
+    #      `warning: core.bare and core.worktree do not make sense` then `fatal: this operation
+    #      must be run in a work tree`.
+    local bwgd="$d/barewtc.git" bwtree="$d/barewtctree"
+    mkdir -p "$bwtree"
+    git_q init -q --bare "$bwgd" >/dev/null 2>&1
+    ( cd "$bwtree" && export GIT_DIR="$bwgd" GIT_WORK_TREE="$bwtree"
+      printf 'seed\n' >seed
+      mkdir -p scripts
+      printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN-IN:$(cd "$(dirname "$0")/.." && pwd -P)"' \
+          >scripts/setup.sh
+      chmod +x scripts/setup.sh
+      git_q add -A && git_q commit -qm seed
+      mkdir -p crates && printf 'x\n' >crates/x.rs
+      git_q add -A && git_q commit -qm crates
+      git_q branch -q feature && git_q reset -q --hard HEAD~1 ) >/dev/null 2>&1
+    git_q --git-dir="$bwgd" config core.bare false
+    git_q --git-dir="$bwgd" config extensions.worktreeConfig true
+    # The declaration git honours says BARE, and the local file disagrees — which is the whole
+    # point: a remedy written `--local` would be writing to the file that is already `false`.
+    if git_q --git-dir="$bwgd" config --worktree core.bare true 2>/dev/null; then
+        cp "$hook" "$bwgd/hooks/post-merge"; chmod +x "$bwgd/hooks/post-merge"
+        out="$(cd "$bwtree" && GIT_DIR="$bwgd" GIT_WORK_TREE="$bwtree" \
+               git_q merge --no-edit feature 2>&1)"
+        case "$out" in
+            *"could not establish"*)
+                local bremedy
+                bremedy="$(printf '%s\n' "$out" | sed -n 's/^jkb:   //p')"
+                case "$bremedy" in
+                    *"--worktree core.bare false"*)
+                        ok "and a bare declaration in config.worktree is repaired where it lives" ;;
+                    *"core.bare"*)
+                        fail "hookenv: barewtc-scope" "the bare remedy was printed for the LOCAL \
+scope, which the config.worktree value outranks: $(printf '%s' "$bremedy" | tr '\n' '|')" ;;
+                    *) fail "hookenv: barewtc-missing" "no core.bare remedy was printed for a \
+repository whose honoured core.bare is true: $(printf '%s' "$bremedy" | tr '\n' '|')" ;;
+                esac
+                # ...and RUN, because a line that names the right scope can still be unrunnable.
+                if ! ( export GIT_DIR="$bwgd" GIT_WORK_TREE="$bwtree"
+                       while IFS= read -r line; do
+                           [ -n "$line" ] || continue
+                           eval "$line" || exit 1
+                       done <<<"$bremedy" ) >/dev/null 2>&1; then
+                    fail "hookenv: barewtc-run" "a printed remedy line does not run: \
+$(printf '%s' "$bremedy" | tr '\n' '|')"
+                else
+                    ( cd "$bwtree" && GIT_DIR="$bwgd" GIT_WORK_TREE="$bwtree" \
+                      git_q reset -q --hard HEAD~1 ) >/dev/null 2>&1
+                    out="$(cd "$bwtree" && GIT_DIR="$bwgd" GIT_WORK_TREE="$bwtree" \
+                           git_q merge --no-edit feature 2>&1)"
+                    case "$out" in
+                        *"SETUP-RAN-IN:$(cd "$bwtree" && pwd -P)"*)
+                            ok "and after both remedy lines that repository builds its own tree" ;;
+                        *) fail "hookenv: barewtc-effect" "the remedy ran and the next pull still \
+did not build: $(printf '%s' "$out" | tr '\n' '|')" ;;
+                    esac
+                fi ;;
+            *) fail "hookenv: barewtc-premise" "a repository whose honoured core.bare is true did \
+not reach the refusal: $(printf '%s' "$out" | tr '\n' '|')" ;;
+        esac
+    else
+        fail "hookenv: barewtc-support" "this git will not set a --worktree value, so this \
+tested nothing"
+    fi
 
     # 17. ...and an INCLUDED declaration must skip, because git itself ignores it for work-tree
     #     resolution — measured, `rev-parse --show-toplevel` is not redirected by a

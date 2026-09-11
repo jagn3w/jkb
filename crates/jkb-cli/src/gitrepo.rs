@@ -51,14 +51,20 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
 /// configuration and are deliberately left alone: this project's own dev container carries
 /// `safe.directory` grants in them, and stripping those makes git refuse the checkout.
 pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
+    for key in REPO_SELECTION_VARS {
+        cmd.env_remove(key);
+    }
+    cmd
 }
 
-/// The variables [`scrub_repo_selection`] removes — so each call site's test names the same
-/// list as the rule, instead of restating it and drifting.
-#[cfg(test)]
+/// The variables [`scrub_repo_selection`] removes — and the list it ITERATES to remove them, so
+/// the rule and the list cannot come to say different things.
+///
+/// It was three literal `env_remove` calls beside a `#[cfg(test)]` copy of the same three names,
+/// which reads as a pinned list and is a mirror: a fourth variable added to the function would
+/// have left every test green, since each only ever asked that the named three were gone. The
+/// `cfg(test)` gate was what forced the duplication, and it bought nothing — three `&'static str`
+/// in the binary is not a cost worth a second copy of a security rule.
 pub(crate) const REPO_SELECTION_VARS: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
 
 /// The configuration a TEST FIXTURE must not inherit — `(var, Some(value))` to set it,

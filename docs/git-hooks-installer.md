@@ -335,8 +335,15 @@ conventions every session is expected to know.
   beneath a new sentence claiming it "replaces that declaration". `core.bare` has the identical
   hazard: a `config.worktree` `bare = true` survives a local `bare = false`. Both keys now go
   through **one** `honoured_read`, which returns the value AND the flag needed to write it back
-  where it came from — reading and writing cannot disagree about scope because they are the same
-  function. Three follow-on lessons, all cheap and all already paid for elsewhere in this file:
+  where it came from — reading and writing cannot disagree about SCOPE because the flag comes from
+  the same function. Precisely the scope, and not the git directory: the read is made through the
+  ambient `GIT_DIR` while the remedy is printed against `--git-dir=$hook_common`, and with the
+  extension on those are two different `config.worktree` files whenever `GIT_DIR` names a LINKED
+  worktree (measured on 2.51.1: `GIT_DIR=<repo>/.git/worktrees/W git config --worktree` reads
+  `…/worktrees/W/config.worktree`, while `git --git-dir=<repo>/.git config --worktree` writes
+  `<repo>/.git/config.worktree`). It is not reachable from this arm — a linked worktree has a
+  `.git` FILE, so `common_of "$repo_root"` succeeds and the verdict is never `unestablished` — but
+  the unqualified sentence was the kind this record's own rule says the next round builds on. Three follow-on lessons, all cheap and all already paid for elsewhere in this file:
   a helper returning **two** facts must not be called in a command substitution (the scope was
   assigned in a subshell and discarded, and every remedy printed the scope-less form again —
   caught by the step that RUNS the remedy, one commit after it was written); and the mutation in

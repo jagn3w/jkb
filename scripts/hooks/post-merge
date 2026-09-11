@@ -127,6 +127,17 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
 # Degrades like the read it replaces: on a git without `--worktree` the first ask fails, the
 # value is empty, and everything falls through to `--local` — which is what that git honours.
 #
+# WHAT IS SHARED IS THE SCOPE FLAG, NOT THE GIT DIRECTORY. This reads through the ambient
+# `GIT_DIR`; the remedy is printed against `--git-dir=$hook_common`. With the extension on those
+# name two different `config.worktree` files whenever `GIT_DIR` is a LINKED worktree's directory
+# — measured on 2.51.1, a `--worktree` read there answers from `…/worktrees/W/config.worktree`
+# while a `--git-dir=<common>` write lands in `<common>/config.worktree`. It cannot be reached
+# from the arm that prints the remedy: a linked worktree has a `.git` FILE, so `common_of
+# "$repo_root"` resolves and the verdict is `same` or `elsewhere`, never `unestablished`. Stated
+# rather than guarded, because a guard for an unreachable state is the other defect this file
+# keeps producing — but stated, because "they are the same function" was written here as though
+# it settled the git dir too.
+#
 # EMPTY IS TREATED AS ABSENT, which conflates two states, and both were measured on 2.51.1
 # rather than argued about, because the conflation would pick the wrong scope silently:
 #
@@ -468,10 +479,20 @@ fi
 # cannot see a `core.worktree` checkout at all, which also makes `install_git_hooks` report
 # `error=not a git repo` there — is filed, not papered over here: the scrub it would have to
 # relax is the one keeping jkb out of other people's repositories.
-if [ "${skip_close:-0}" = 1 ]; then
-    echo "jkb: not closing merged tasks — jkb cannot work out which repository this tree is" >&2
-elif command -v jkb >/dev/null 2>&1; then
-    jkb task close-merged || echo "jkb: close-merged failed (continuing)"
+#
+# `command -v jkb` IS ASKED FIRST, and the skip line lives inside it. Written as the first arm of
+# the same `if`, the explanation printed on a machine with no jkb at all — a line blaming jkb's
+# repository discovery for a chore that could not have run either way, on every pull, from an arm
+# that had never looked for jkb. In the `same`-by-declaration case it would be the ONLY jkb line
+# on an otherwise ordinary pull. A refusal whose whole worth is that every sentence in it is true
+# cannot afford to explain the wrong reason; where jkb is absent the chore is silent, as it was
+# before this flag existed.
+if command -v jkb >/dev/null 2>&1; then
+    if [ "${skip_close:-0}" = 1 ]; then
+        echo "jkb: not closing merged tasks — jkb cannot work out which repository this tree is" >&2
+    else
+        jkb task close-merged || echo "jkb: close-merged failed (continuing)"
+    fi
 fi
 
 exit 0

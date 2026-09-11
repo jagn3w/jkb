@@ -24,26 +24,35 @@ pub fn isolate_git_env(cmd: &mut Command) {
     // creates nothing here, and the `add`/`commit` that follow land a commit in it. That is
     // `./scripts/check.sh` — the gate `jkb task land` and the merge queue trust — writing to a
     // repository the developer merely happens to have configured.
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        // Configuration: the env-injected form OUTRANKS the files neutralized below, so
-        // pointing those at /dev/null is not isolation on its own. `GIT_CONFIG_COUNT` gates
-        // every `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` pair, so dropping it disables them all
-        // without naming an unbounded set. An exported `commit.gpgsign` or `core.hooksPath`
-        // would otherwise redden the gate over a fact about somebody's shell.
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t");
+    // Configuration: the env-injected form OUTRANKS the files neutralized below, so pointing
+    // those at /dev/null is not isolation on its own. `GIT_CONFIG_COUNT` gates every
+    // `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` pair, so dropping it disables them all without naming an
+    // unbounded set. An exported `commit.gpgsign` or `core.hooksPath` would otherwise redden the
+    // gate over a fact about somebody's shell.
+    //
+    // ITERATED, not restated. This function used to spell the same eleven variables that
+    // `MUST_DROP`/`MUST_SET` spell, with a doc comment on those constants saying they existed so
+    // a test could check this function "without reading the function it is checking" — which is
+    // what made them a MIRROR rather than a source. Measured by the round-24 reviewer: adding
+    // `.env_remove("GIT_OBJECT_DIRECTORY")` here and leaving `MUST_DROP` alone left all four
+    // isolation guards green, including the cross-crate one written to close exactly that edit,
+    // because `assert_isolated` is a superset check and the cross-crate test compares the two
+    // CONSTANTS. Two comments agreeing is not evidence about two environments.
+    //
+    // The library side had this right already — `isolate_fixture_config` iterates
+    // `FIXTURE_CONFIG` — which is precisely what hid the asymmetry.
+    for key in MUST_DROP {
+        cmd.env_remove(key);
+    }
+    for (key, value) in MUST_SET {
+        cmd.env(key, value);
+    }
 }
 
-/// The variables [`isolate_git_env`] must drop, named here so a test can assert them without
-/// reading the function it is checking.
+/// The variables [`isolate_git_env`] must drop — and the list it iterates to drop them, so the
+/// function cannot come to mean something the constant does not say. Asserting a fixture against
+/// this list is then evidence about the environment that fixture builds, not about a second copy
+/// of the list.
 pub const MUST_DROP: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -61,7 +70,12 @@ pub const MUST_DROP: &[&str] = &[
 /// `src/gitrepo.rs`'s `FIXTURE_CONFIG` is the same list for the library's own fixtures. It is
 /// deliberately a SECOND list rather than a shared one: `FIXTURE_CONFIG` is `#[cfg(test)]`, and
 /// an integration test is a separate crate compiled with `cfg(test)` OFF, so it cannot see it.
-/// What keeps them honest is that each is asserted against the function beside it.
+/// What keeps them honest is that each is ITERATED by the function beside it — `isolate_git_env`
+/// here, `isolate_fixture_config` there — and that
+/// `the_two_fixture_isolation_lists_describe_the_same_environment` compares the two at their
+/// source. "Asserted against the function beside it" was the earlier claim and it was too weak on
+/// this side: the assertion was a superset check against a hand-kept copy, so a variable added to
+/// the function and not to the list passed everything.
 pub const MUST_SET: &[(&str, &str)] = &[
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_SYSTEM", "/dev/null"),
