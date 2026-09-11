@@ -131,6 +131,22 @@ trap _cleanup_workdir EXIT
 isolate_git() {
     mkdir -p "$1" || return 1
     export HOME="$1" GIT_CONFIG_NOSYSTEM=1
+    # ...AND THE DEVELOPER'S `jkb`, which is not a git variable but is the same class of thing: a
+    # real binary these fixtures reach by accident. `scripts/hooks/post-merge` runs `jkb task
+    # close-merged` as its second chore, gated only by `command -v jkb`, and five cases here run
+    # that hook for real inside fixture repositories. Measured with a spy first on PATH: five
+    # invocations of the write verb, cwd set to a throwaway directory.
+    #
+    # Harmless while a human ran `check.sh` against their own store. Not harmless now that
+    # `merge-queue.sh` runs these suites as part of its landing gate with the swarm's `JKB_DB`
+    # exported — `close-merged` scopes itself by the repository key it derives from its cwd, so
+    # the only thing standing between a fixture and real tasks being closed is that no fixture
+    # directory happens to share a name with a repo that has `repo=` tags in that database.
+    #
+    # A stub rather than an empty PATH: the hook's `command -v jkb` must still find something, or
+    # the cases that assert what it says about chore 2 would be asserting the absence instead.
+    mkdir -p "$1/bin" && printf '%s\n' '#!/bin/sh' 'exit 0' >"$1/bin/jkb" \
+        && chmod +x "$1/bin/jkb" && export PATH="$1/bin:$PATH"
     # THE SAME LIST AS THE RUST SIDE'S `MUST_DROP`, and they move together. These suites build
     # real repositories — `git_q init`/`add`/`commit` in the work dir — so everything true of
     # `crates/jkb-cli/tests/common/mod.rs` is true here. Round 27 widened that list after

@@ -6,10 +6,20 @@
 #   ./scripts/merge-queue.sh <branch> <base> <worktree>
 #
 # Run inside the integration worktree (checked out to <base>). Exit codes:
-#   0  landed  — <branch> rebased onto the live <base> tip, fast-forwarded, gate green.
+#   0  landed  — <branch> rebased onto the live <base> tip, gate green, <base> fast-forwarded.
 #   1  eject   — rebase conflict (hand back to the implementer to rebase-and-fix).
-#   2  eject   — gate (build/test) failed on the integrated result; base reset to pre-graft.
-#   3  error   — setup problem (bad worktree/branch); nothing changed.
+#   2  eject   — gate failed on the integrated result; <base> never moved.
+#   3  error   — setup problem (bad worktree/branch, or nothing to graft); nothing changed.
+#   4  error   — the graft passed but <base> could not be advanced onto it (another worktree
+#               holds the branch, or the fast-forward was refused). NOT the implementer's
+#               problem, which is why it is not 1: the swarm hands 1 back as "rebase and fix
+#               your branch", and there is nothing wrong with the branch.
+#
+# THE GATE RUNS BEFORE <base> MOVES, which is why 2 no longer says "reset to pre-graft": there is
+# nothing to reset. It used to fast-forward first and roll back on red, and the window between
+# those was minutes — long enough for a concurrent implementer, told to cut from the integration
+# branch, to branch from commits that had passed nothing and carry them back in under its own
+# name.
 #
 # Because the gate runs against the LIVE base tip, a branch green in isolation can still
 # fail once an earlier queue entry landed — exactly the semantic/textual conflict the
@@ -118,35 +128,62 @@ if ! git rebase "$BASE" >/tmp/merge-queue.log 2>&1; then
 fi
 GRAFT=$(git rev-parse HEAD)   # the rebased commits (detached HEAD)
 
-# 2. Fast-forward the base to the rebased result — linear graft, no merge commit.
+# 2. GATE THE GRAFT WHILE IT IS STILL DETACHED, before $BASE is allowed to move.
 #
-# CHECKED. Step 1 detached HEAD to rebase, releasing $BASE for the whole of it, so the conclusion
-# reached at line 57 — "this worktree holds $BASE" — is stale by the time we get here. If another
-# worktree claimed the branch meanwhile this switch fails, HEAD stays detached AT $GRAFT, and the
-# fast-forward below then trivially succeeds because it is already there: the script would print
-# `landed:` and record the landing with jkb while $BASE never moved a commit.
+# The order used to be ff-then-gate, and the window between them is minutes: build.sh, test.sh and
+# now the shell suites, with a container-wide CARGO_TARGET_DIR. task-swarm.js serialises only the
+# merge stage, so Implement and Review run throughout it — and it tells each implementer to cut
+# from the integration branch. So a group could branch from commits that had passed nothing, the
+# gate could then go red, step 4 would `reset --hard "$PRE"`, and those commits would live on in
+# somebody else's history and be carried back in under their name: the second group ejects for a
+# defect it did not write, and if the first failure was intermittent the rejected code lands
+# silently.
+#
+# The worktree at $GRAFT is byte-identical to what $BASE becomes, so gating here tests exactly the
+# same thing and $BASE only ever advances to a commit that has already passed. That also deletes
+# both `git reset --hard "$PRE"` rollbacks: there is nothing to roll back, because nothing moved.
+# A rollback that never runs cannot fail silently, which is one of the two ways the old shape went
+# wrong (the other was that its status was discarded).
+#
+# THE SHELL SUITES ARE PART OF IT. It was `build.sh && test.sh` — cargo only — so nothing under
+# `scripts/tests/` could block a landing, which is most of what this branch built. NOT `check.sh`:
+# that also runs `clippy --all-features` and `cargo deny`, both of which fetch crates, and the
+# swarm runs behind an egress firewall where they cannot complete, so it would eject every
+# candidate for a fact about the network. Those two stay CI's job.
+start=$(date +%s)
+if ! { ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
+       && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1 \
+       && _shell_suites_pass >/tmp/merge-queue-shell.log 2>&1; }; then
+  git switch "$BASE" >/dev/null 2>&1 || true
+  echo "eject: gate failed after $(( $(date +%s) - start ))s (see /tmp/merge-queue-*.log)"
+  exit 2
+fi
+
+# 3. Green — put $BASE on the gated commit.
+#
+# CHECKED. Step 1 detached HEAD, releasing $BASE for the whole rebase and the whole gate, so the
+# conclusion reached before that — "this worktree holds $BASE" — is long stale. If another
+# worktree claimed the branch meanwhile this switch fails, HEAD stays detached AT $GRAFT and the
+# fast-forward below trivially succeeds because it is already there: the script would print
+# `landed:` and record the landing while $BASE never moved a commit.
 if ! git switch "$BASE" >/tmp/merge-queue.log 2>&1; then
   echo "eject: cannot switch back to $BASE — another worktree holds it (see /tmp/merge-queue.log)"
-  exit 1
+  exit 4
 fi
-# HOOKS OFF FOR THIS MERGE. A fast-forward fires `post-merge`, and in this repository that hook
-# runs setup.sh, which `cargo install`s the jkb binary, rebuilds the VS Code extension and
-# reinstalls the watcher service. At this point in the script the gate has NOT run — it is step 3,
-# below — so every graft was installing a binary built from a candidate that might fail the gate
-# seconds later and be rolled back by step 4, leaving the operator's `jkb` newer than the branch
-# they are on. Measured: the hook fires on `merge --ff-only`, and `-c core.hooksPath=/dev/null`
-# suppresses it while the merge still happens.
+# HOOKS OFF. A fast-forward fires `post-merge`, which in this repository runs setup.sh —
+# cargo-installing the jkb binary, rebuilding the extension, reinstalling the watcher service.
+# Measured: the hook fires on `merge --ff-only`, and `-c core.hooksPath=/dev/null` suppresses it
+# while the merge still happens. Even now that the gate has already passed, the queue is not the
+# place to reinstall an operator's tooling mid-run.
 if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue.log 2>&1; then
-  git reset --hard "$PRE" >/dev/null 2>&1
-  echo "eject: fast-forward failed"
-  exit 1
+  echo "eject: fast-forward failed (see /tmp/merge-queue.log)"
+  exit 4
 fi
-# ...AND THE BASE MUST HAVE MOVED. The entry check above refuses a branch with nothing ahead; this
+# ...AND THE BASE MUST HAVE MOVED. The entry check refuses a branch with nothing ahead; this
 # catches the other arrival at the same state — every commit dropped as empty by the rebase,
-# because an earlier queue entry landed the same content. That is not a failure and not a landing:
-# the work IS in the base, under somebody else's commit. Reported in its own words so the operator
-# is not told a graft happened that did not, and the tasks are still closed, because the content
-# they asked for is there.
+# because an earlier queue entry landed the same content. Not a failure and not a graft: the work
+# IS in the base, under somebody else's commit. Reported in its own words, and the tasks still
+# close, because the content they asked for is there.
 if [ "$(git rev-parse HEAD)" = "$PRE" ]; then
   "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
     || echo "note: could not record the landing of $BRANCH"
@@ -154,36 +191,15 @@ if [ "$(git rev-parse HEAD)" = "$PRE" ]; then
   exit 0
 fi
 
-# 3. Run the gate on the integrated result.
-# THE SHELL SUITES ARE PART OF THE GATE. It was `build.sh && test.sh` — cargo only — so nothing
-# under `scripts/tests/` could block a landing, which is most of what this branch spent its rounds
-# building: the quiet-grep refusal, the unscrubbed-git scan, the isolation oracles. A guard that
-# cannot fail a landing is a guard the merge queue does not have.
+# 4. Record that jkb itself grafted this branch (design D48), which is what closes the group's
+# tasks and what lets a later `jkb task review record` of $BASE credit them: a landing is an EVENT
+# jkb wrote, not something a reader infers from the commit graph.
 #
-# NOT `check.sh`, and the reason is stated rather than left as an omission: that gate also runs
-# `clippy --all-features` and `cargo deny`, both of which fetch crates, and the swarm runs behind
-# an egress firewall where they cannot complete — so making it the queue's gate would eject every
-# candidate for a fact about the network. Those two stay CI's job. The suites added here need no
-# network and take seconds.
-start=$(date +%s)
-if ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
-   && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1 \
-   && _shell_suites_pass >/tmp/merge-queue-shell.log 2>&1; then
-  # Record that jkb itself grafted this branch (design D48), which is what closes the group's
-  # tasks and what lets a later `jkb task review record` of $BASE credit them: a landing is an
-  # EVENT jkb wrote, not something a reader infers from the commit graph.
-  #
-  # A failure here is reported and never fails the queue -- the commits ARE in $BASE either way,
-  # and the repair is one command. stdout is noise; stderr is not: the verb names any task it
-  # could not close (open subtasks, most often), and swallowing that would leave the caller
-  # believing a whole group was done.
-  "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
-    || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
-  echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
-  exit 0
-fi
-
-# 4. Red gate → roll the base back to its pre-graft tip and eject.
-git reset --hard "$PRE" >/dev/null 2>&1
-echo "eject: gate failed after $(( $(date +%s) - start ))s (see /tmp/merge-queue-*.log)"
-exit 2
+# A failure here is reported and never fails the queue -- the commits ARE in $BASE either way, and
+# the repair is one command. stdout is noise; stderr is not: the verb names any task it could not
+# close (open subtasks, most often), and swallowing that would leave the caller believing a whole
+# group was done.
+"$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
+  || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
+echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
+exit 0

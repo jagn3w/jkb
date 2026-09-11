@@ -395,8 +395,32 @@ _runs_git() {
     # whole shell-test tree runs git, and by function-name alone that file looked like it never
     # touched git — exempting any future suite that used only the wrapper.
     awk '
+        BEGIN { q = sprintf("%c", 39) }
         /^[[:space:]]*#/ { next }
         {
+            # A TRAILING COMMENT IS NOT CODE, and it has to go before the backtick split. These
+            # files are dense with prose about git, and a line ending
+            #   echo done   # the tree comes from `git rev-parse --show-toplevel`
+            # made `scripts/build.sh` — which runs no git and scrubs nothing — fail this case.
+            # That case is part of the merge queue landing gate, so a false positive here ejects a
+            # branch for a comment.
+            #
+            # Quote-aware, because a pattern like grep -qE (caret)# is an ordinary line in this
+            # tree and cutting at the first # anywhere would truncate it into nonsense. Walk the
+            # line, track the quote state, cut at the first # outside quotes. `q` is built with
+            # sprintf because this program is itself inside single quotes.
+            cut = 0; inq = ""
+            for (k = 1; k <= length($0); k++) {
+                ch = substr($0, k, 1)
+                if (inq == "") {
+                    if (ch == "\"" || ch == q) { inq = ch }
+                    else if (ch == "#" && (k == 1 || substr($0, k - 1, 1) ~ /[ \t]/)) {
+                        cut = k; break
+                    }
+                } else if (ch == inq) { inq = "" }
+            }
+            if (cut > 0) { $0 = substr($0, 1, cut - 1) }
+
             # THREE PASSES, and the order is the whole trick. A command substitution opens a new
             # command CONTEXT while sitting inside quotes, so it must be split out BEFORE quoted
             # spans are blanked; but a JSON string like "Bash(git diff *)" must be blanked before
