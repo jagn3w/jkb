@@ -46,6 +46,22 @@ a failure is attributable to the container profile and not the kernel.
 - **Non-root is load-bearing, not hygiene.** With seccomp disabled entirely, *root* in a container
   still cannot create a mount/net/pid namespace directly — only the `--unshare-user` variants
   work. Non-root passes everything.
+- **`verify.sh` measures the wrong PID 1 inside a nested namespace, and now refuses.** Measured in
+  the container, both topologies, one command apart. Under
+  `bwrap --bind / / --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc`, PID 1 is
+  **bwrap itself** — so before the refusal existed, `verify.sh` reported `ok PID 1 reaps the
+  orphans it adopts` about bwrap's init, which reaps unconditionally, for a container that may not.
+  A false pass in the one assertion the reaping work exists to add. It now exits 2 there, while a
+  plain attached terminal (PID 1 = `/usr/bin/tini -- sleep infinity`) runs every assertion.
+  - **The discriminator is the ppid chain, and its polarity is the opposite of the obvious one.**
+    A process the runtime starts — `docker exec`, or the VS Code server a terminal descends from —
+    has a parent outside the pid namespace, reported as ppid 0, so the walk never reaches pid 1.
+    Inside a nested namespace it does. "PID 1 is an ancestor" therefore means "**not** this
+    container's own namespace". The reading that sounds right refuses every legitimate run, and
+    was the first version proposed; `verify.sh --self-test` pins both topologies as a table.
+  - The same nesting makes `/proc/self/mountinfo` bwrap's too, which is why the refusal sits above
+    every assertion rather than inside the reaping one.
+
 - **PID 1 must reap, and `sleep` cannot.** `run.sh` keeps the container alive with `sleep
   infinity`, and `entrypoint.sh` used to end in a bare `exec "$@"` — which made that `sleep` the
   PID 1 of the namespace. PID 1 must `wait()` on the orphans it adopts, and `sleep` never does, so
