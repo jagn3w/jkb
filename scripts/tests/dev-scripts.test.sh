@@ -264,6 +264,16 @@ _has_shebang() { case "$(head -c 2 "$1" 2>/dev/null)" in "#!") return 0 ;; *) re
 # it too. That is the dangerous direction — a racy line there would go unreported — and the earlier
 # attempt at it is what shipped the `$(dirname` bug, so this time the basename is taken off the
 # WHOLE argument rather than the first quote-free run, and the result is checked by name below.
+#
+# BY BASENAME, which over-includes and does not follow a variable — both checked rather than
+# assumed. `lib.sh` and `setup.sh` each name two files in `shell_sources`, so sourcing either puts
+# both in scope; that is the safe direction (a file scanned for nothing costs nothing) and it masks
+# nothing here, because each of the four libraries has an INDEPENDENT reason to be in scope:
+# `scripts/lib.sh` and `harness.sh` have no shebang, `egress-lib.sh` sets `pipefail` itself, and
+# `.container/lib.sh` is the only one resting on this clause alone — which is why disabling the
+# clause fails on exactly that file and no other. A source written through a variable cannot be
+# followed at all; the one in this tree, `egress-lib.sh`'s `LIB="${BASH_SOURCE[0]}"`, is the file
+# re-sourcing ITSELF in a child shell, so there is no second hop to miss.
 _sourced_by_scope() {
     local root="$1" f
     while IFS= read -r f; do
