@@ -448,10 +448,34 @@ _selection_vars() {
         "$repo_root/crates/jkb-cli/src/gitrepo.rs" | grep -oE '"GIT_[A-Z_]+"' | tr -d '"'
 }
 
+# A COUNT PREMISE, because an empty extraction is a PASS here and not a failure. `_selection_vars`
+# reads a Rust constant with a `sed` range anchored on `^pub(crate) const REPO_SELECTION_VARS`; a
+# visibility change to `pub`, a rename, a module move or an attribute line above it makes that
+# range match nothing, the `while read` loop below runs zero times, and `_drops_selection` falls
+# through to `return 0` for EVERY file. Measured: with that one-word edit, case6 reports
+# "ok … (8)" while `merge-queue.sh` carries no scrub at all.
+#
+# That is worse here than anywhere else this pattern has appeared, because this case is now part
+# of the merge queue's landing gate. The sibling `case_rust_twin` got exactly this premise in the
+# same commit, for exactly this reason, and this one did not.
+_require_selection_vars() {
+    local n
+    n="$(_selection_vars | grep -c .)"
+    [ "$n" -ge 6 ] && return 0
+    fail "gitenv: vars-premise" "read $n name(s) from REPO_SELECTION_VARS in gitrepo.rs, expected \
+at least 6 — the extraction is broken, not the code, and an empty list would make every script \
+below comply vacuously"
+    return 1
+}
+
 _drops_selection() {
     local f="$1" v body
-    # A wrapper that scrubs, or a suite-wide isolation call, satisfies it for the whole file.
-    grep -qE 'isolate_git|_git[[:space:]]+-C|^_git\(\)' "$f" && return 0
+    # A wrapper that scrubs, or a suite-wide isolation call, satisfies it for the whole file —
+    # but only as CODE. Grepping the raw file meant a comment mentioning `isolate_git` or
+    # `_git -C` exempted a script from the six-name requirement, and every one of these files is
+    # heavily commented about exactly those names.
+    grep -qE 'isolate_git|_git[[:space:]]+-C|^_git\(\)' \
+        <<<"$(grep -vE '^[[:space:]]*#' "$f")" && return 0
     # Otherwise every name must be dropped, by `unset` or by `env -u`, on a line that runs.
     # CONTINUATIONS JOINED. `unset A B C \` + newline + `D E F` is how all three production
     # scripts spell it, and a per-line match sees the second line without the keyword.
@@ -465,6 +489,7 @@ _drops_selection() {
 
 case6() {
     local f exposed="" seen=0 gitline
+    _require_selection_vars || return
     while IFS= read -r f; do
         gitline="$(_runs_git "$f")"
         [ -n "$gitline" ] || continue

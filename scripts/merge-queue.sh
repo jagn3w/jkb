@@ -41,11 +41,22 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
 # Every `scripts/tests/*.test.sh`, derived rather than listed: a suite added to that directory and
 # not to a hand-written list here would be a guard the queue silently does not run.
 _shell_suites_pass() {
-    local t rc=0
+    local t rc=0 n=0
     for t in ./scripts/tests/*.test.sh; do
         [ -f "$t" ] || continue
+        n=$((n + 1))
         bash "$t" || rc=1
     done
+    # AN EMPTY GLOB IS NOT A PASS. Deriving the list from the directory means a branch that moves,
+    # renames or deletes `scripts/tests/` silently restores the cargo-only gate this half exists to
+    # replace — and it would do it by landing, which is the one moment nobody is watching. The
+    # floor is low enough that ordinary churn does not trip it and high enough that an emptied
+    # directory does.
+    if [ "$n" -lt 4 ]; then
+        echo "gate: only $n shell suite(s) found under scripts/tests — expected at least 4;" >&2
+        echo "      the suites moved or were deleted, so this half of the gate checked nothing" >&2
+        return 1
+    fi
     return "$rc"
 }
 
@@ -67,6 +78,22 @@ WT="${3:?missing <worktree>}"
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; exit 3; }
 git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; exit 3; }
 git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; exit 3; }
+# AND IT MUST HAVE SOMETHING TO GRAFT. A branch sitting at the base tip rebases to a no-op, and
+# `merge --ff-only` then answers "Already up to date." with exit 0 — so the queue printed `landed:`
+# and called `jkb task landed`, which drives every task recording that branch to done with
+# `landed_elsewhere: Fact::Yes`. A whole group closed, dependents unblocked, and not one commit in
+# the base. Measured: base and branch at the same commit, the full step-1/step-2 sequence, exit 0,
+# base tip unchanged.
+#
+# Reachable two ways. An IMPLEMENTER that reports `outcome: ready` without committing leaves the
+# branch at the base tip and `rev-parse --verify` still succeeds, because the branch exists. And a
+# branch whose commits the rebase drops as empty — the case step 1's own comment says it accepts —
+# arrives here the same way, though that one has genuinely landed its content via an earlier entry
+# and is reported separately below rather than refused.
+if [ "$(git rev-list --count "$BASE..$BRANCH")" -eq 0 ]; then
+  echo "eject: $BRANCH has no commits ahead of $BASE — nothing to graft"
+  exit 3
+fi
 
 PRE=$(git rev-parse HEAD)   # the base tip before this graft, for a clean rollback
 
@@ -113,6 +140,18 @@ if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue.
   git reset --hard "$PRE" >/dev/null 2>&1
   echo "eject: fast-forward failed"
   exit 1
+fi
+# ...AND THE BASE MUST HAVE MOVED. The entry check above refuses a branch with nothing ahead; this
+# catches the other arrival at the same state — every commit dropped as empty by the rebase,
+# because an earlier queue entry landed the same content. That is not a failure and not a landing:
+# the work IS in the base, under somebody else's commit. Reported in its own words so the operator
+# is not told a graft happened that did not, and the tasks are still closed, because the content
+# they asked for is there.
+if [ "$(git rev-parse HEAD)" = "$PRE" ]; then
+  "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
+    || echo "note: could not record the landing of $BRANCH"
+  echo "landed: $BRANCH → $BASE (no new commits; its content was already in $BASE)"
+  exit 0
 fi
 
 # 3. Run the gate on the integrated result.

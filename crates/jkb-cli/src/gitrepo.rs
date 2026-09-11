@@ -1120,6 +1120,24 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     git_must(dir, &["switch", onto])?;
     let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
 
+    // NOTHING TO GRAFT IS NOT A LANDING. A branch sitting at `onto`'s tip rebases to a no-op and
+    // `merge --ff-only` then answers "Already up to date." with exit 0 — so this returned
+    // `Graft::Landed` and the caller marked every task recording that branch done, dependents
+    // unblocked, with not one commit added to `onto`. Reachable whenever a worker reports success
+    // without committing: the branch exists, so every check that asks whether it exists passes.
+    //
+    // Measured before the rebase, which is what separates this from the legitimate case. A branch
+    // that HAD commits and whose rebase drops them all as empty — because an earlier landing
+    // carried the same content — is a real landing of that content and still returns `Landed`.
+    // Zero ahead means nobody ever wrote anything.
+    if ahead_count(dir, onto, branch)? == 0 {
+        anyhow::bail!(
+            "{branch} has no commits ahead of {onto} — there is nothing to land. If its work is \
+             already in {onto} under someone else's commit, close it with `jkb task landed \
+             {branch} --onto {onto}`; if the work was never committed, it is still in the session."
+        );
+    }
+
     if !git_run(dir, &["checkout", "--detach", branch])?.0 {
         git_must(dir, &["switch", onto])?;
         return Ok((Graft::Conflict, pre));
@@ -1131,7 +1149,28 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     }
     let grafted = rev(dir, "HEAD")?.context("rebase produced no commit")?;
     git_must(dir, &["switch", onto])?;
-    if !git_run(dir, &["merge", "--ff-only", &grafted])?.0 {
+    // HOOKS OFF FOR THE FAST-FORWARD, the same rule `scripts/merge-queue.sh` states at its own
+    // graft. A fast-forward fires `post-merge`, which in this repository runs setup.sh —
+    // cargo-installing the jkb binary, rebuilding the VS Code extension, reinstalling the watcher
+    // service. `jkb task land` does not run its gate until after this returns, so the human path
+    // was installing a binary built from a candidate that could go red seconds later and be rolled
+    // back by `reset_hard`, leaving the operator's `jkb` newer than any branch carries.
+    //
+    // The suppression belongs HERE, with the graft, rather than with one of its two callers: the
+    // shell queue had it and this did not, which is the twinned-rule drift this branch has now
+    // paid for on three separate pairs.
+    if !git_run(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "merge",
+            "--ff-only",
+            &grafted,
+        ],
+    )?
+    .0
+    {
         reset_hard(dir, &pre)?;
         return Ok((Graft::Conflict, pre));
     }
