@@ -130,7 +130,23 @@ trap _cleanup_workdir EXIT
 isolate_git() {
     mkdir -p "$1" || return 1
     export HOME="$1" GIT_CONFIG_NOSYSTEM=1
+    # THE SAME LIST AS THE RUST SIDE'S `MUST_DROP`, and they move together. These suites build
+    # real repositories — `git_q init`/`add`/`commit` in the work dir — so everything true of
+    # `crates/jkb-cli/tests/common/mod.rs` is true here. Round 27 widened that list after
+    # measuring the harm and this one was left behind for a round: with
+    # `GIT_INDEX_FILE=<victim>/.git/index` exported, these suites' `add`/`commit` write into the
+    # victim's index and `GIT_OBJECT_DIRECTORY` leaks loose objects out of them — and the thing
+    # that runs them is `./scripts/check.sh`, the gate `jkb task land` and the merge queue trust.
+    # Two implementations of one rule, and only one of them widened, is the drift this file's own
+    # header warns about.
+    #
+    # `GIT_TEMPLATE_DIR` is here for a different route to the same kind of harm: it is copied into
+    # every `git init`, so the developer's own hooks land inside each fixture repo and run on its
+    # first commit. Pointing the config files at /dev/null cannot cover it — that neutralizes
+    # `init.templateDir`, not the environment spelling.
     unset XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+          GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+          GIT_TEMPLATE_DIR \
           GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
     # KEY_<n>/VALUE_<n> are inert once COUNT is gone, but they are the machine's values and a
     # later export of COUNT by anything under test would make them live again. Swept by

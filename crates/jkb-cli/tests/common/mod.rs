@@ -94,14 +94,26 @@ pub const MUST_DROP: &[&str] = &[
     // an absolute `-C <dir>` so discovery from the cwd is not the path they take. If one of them
     // ever does reach it, this list is where it goes.
     //
-    // FIXTURE SIDE ONLY. `scrub_repo_selection` deliberately stays at the three that select a
-    // repository: production must not discard a component a caller legitimately handed it (git
-    // exports `GIT_INDEX_FILE` to hook processes), while a fixture must not inherit anything it
-    // did not choose. Two rules, not drift — the same split that keeps `GIT_CONFIG_COUNT` here
-    // and not there.
+    // PRODUCTION SCRUBS THESE TOO, as of round 28 — this list is no longer the only place they
+    // appear. The paragraph that stood here said production "must not discard a component a
+    // caller legitimately handed it (git exports `GIT_INDEX_FILE` to hook processes)", which was
+    // measured false: `post-merge`, the only hook jkb installs, is handed no component selector,
+    // and `pre-commit` gets a RELATIVE `.git/index`. Meanwhile `jkb task work` was rewriting a
+    // foreign index through `worktree add`. See `gitrepo::REPO_SELECTION_VARS`.
+    //
+    // What remains asymmetric is CONFIG: production keeps `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`
+    // because this container carries its `safe.directory` grants there, while a fixture must not
+    // inherit configuration it did not choose. Two rules, and now only one axis of difference.
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    // A different route to the same kind of harm: `GIT_TEMPLATE_DIR` is copied into every
+    // `git init`, so the developer's own hooks land inside each fixture repository and run on its
+    // first commit — a `pre-commit` that exits 1 fails the `run` closure's `status.success()`
+    // assertion, reddening the gate over a fact about somebody's shell, which is the exact harm
+    // this list's own doc says it exists to stop. Pointing the config files at `/dev/null` cannot
+    // cover it: that neutralizes `init.templateDir`, not the environment spelling.
+    "GIT_TEMPLATE_DIR",
     // Configuration injection.
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
@@ -148,6 +160,7 @@ const EXPECT_DROPPED: &[&str] = &[
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_TEMPLATE_DIR",
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
 ];

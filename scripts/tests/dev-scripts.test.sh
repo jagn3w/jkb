@@ -276,14 +276,22 @@ _has_shebang() { case "$(head -c 2 "$1" 2>/dev/null)" in "#!") return 0 ;; *) re
 # all; the one in this tree, `egress-lib.sh`'s `LIB="${BASH_SOURCE[0]}"`, is the file re-sourcing
 # ITSELF in a child shell, so there is no second hop to miss.
 #
-# TWO of the four libraries rest on THIS CLAUSE ALONE — `.container/lib.sh` and
-# `.container/egress-lib.sh`, both of which carry a shebang and neither of which sets `pipefail`.
-# An earlier version of this paragraph said `egress-lib.sh` set it itself, and concluded that
-# `.container/lib.sh` was the only one depending on the clause. Wrong, and wrong in an instructive
-# way: I checked it with `_sets_pipefail`, which is the function under discussion. Its only match
-# in that file is line 366 — `set -euo pipefail` inside a single-quoted `bash -c '…'` body in
-# `under_trap`, script TEXT rather than a command this shell runs. Verifying a claim about a
-# detector with that detector is how the prose match two paragraphs up survived as long as it did.
+# ONE of the four libraries rests on THIS CLAUSE ALONE: `.container/lib.sh`. Settled by running
+# the code rather than reading it — disabling the clause and re-running names exactly that file
+# and no other — because this sentence has now been wrong twice in opposite directions. It first
+# said `egress-lib.sh` sets `pipefail` itself (it does not, in any sense that matters); corrected,
+# it then said BOTH container libraries rest on this clause (they do not).
+#
+# The truth is stranger than either: `egress-lib.sh` IS admitted by the first clause, on a match
+# its author never wrote as a shell option — line 366's `set -euo pipefail` inside a single-quoted
+# `bash -c '…'` body in `under_trap`, which is script TEXT. So the file is in scope for a reason
+# unrelated to what it does, and the clause that would cover it properly never gets consulted.
+# Over-inclusion, therefore safe, and left alone — but not something to write down as though the
+# detector understood the file.
+#
+# What made both wrong answers possible: I checked each with `_sets_pipefail`, the function under
+# discussion. Verifying a claim about a detector with that detector is how the prose match two
+# paragraphs up survived as long as it did, and it is why the claim above cites a command to run.
 _sourced_by_scope() {
     local root="$1" f
     while IFS= read -r f; do
@@ -523,8 +531,20 @@ in one would run under every suite's pipefail and go unreported:$missing"
     # is the absence of a match must be shown capable of a match, or it is a guard that cannot
     # fire — which is what the whole of round 24 was about.
     local exporters miss="" false_hit="" n=0 form want
+    # `export` IS NOT THE ONLY SPELLING. `declare -x`, `typeset -x` and `readonly -x` set the
+    # export attribute identically — measured: `bash -c 'set -uo pipefail; declare -x SHELLOPTS;
+    # ./child.sh'` leaves the child with pipefail ON, exactly as `export` does. Nine variants of
+    # one keyword read as thorough while three other keywords walked past, under an `ok` message
+    # that named the count.
+    #
+    # Still LINE-INITIAL, and that bound is stated rather than hidden: `[ -n "$x" ] && export
+    # SHELLOPTS` is not matched. Widening to "anywhere on the line" would match the word inside
+    # this very comment and inside the spellings table below, which is the self-matching problem
+    # the PIPE placeholder exists for one guard over — so the bound is the honest trade, and the
+    # message says what is detected instead of claiming completeness.
     _shellopts_re() {
-        printf '%s' '^[[:space:]]*export[[:space:]]+([^#]*[[:space:]])?(SHELL|BASH)OPTS([[:space:]=]|$)'
+        printf '%s%s' '^[[:space:]]*(export|declare|typeset|readonly)[[:space:]]+' \
+                      '([^#]*[[:space:]])?(SHELL|BASH)OPTS([[:space:]=]|$)'
     }
     # DRIVEN ON BOTH SIDES, like the grep detector above. One planted spelling proved the pattern
     # was not inert, which is what it was added for — but six of the seven forms it was rewritten
@@ -548,14 +568,17 @@ hit|export BASHOPTS
 hit|  export SHELLOPTS
 hit|export SHELLOPTS=posix
 hit|export FOO SHELLOPTS
+hit|declare -x SHELLOPTS
+hit|typeset -x BASHOPTS
+hit|readonly SHELLOPTS
 miss|export MYSHELLOPTS
 miss|export SHELLOPTSFOO
 miss|# export SHELLOPTS
 miss|echo export SHELLOPTS
 SPELLINGS
     rm -f "$fake/scripts/exporter.sh"
-    if [ "$n" -ne 9 ]; then
-        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 9"
+    if [ "$n" -ne 12 ]; then
+        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 12"
     elif [ -n "$miss" ]; then
         fail "pipefail: shellopts-premise" "the exported-SHELLOPTS pattern does not match these \
 real spellings, and a guard satisfied by absence cannot tell that from a clean tree:$miss"
@@ -575,7 +598,7 @@ which is how a guard gets loosened until it means nothing:$false_hit"
             && exporters="$exporters $form"
     done < <(shell_sources "$repo_root")
     [ -z "$exporters" ] \
-        && ok "and nothing exports SHELLOPTS, a pattern driven against nine spellings" \
+        && ok "and no line-initial export/declare/typeset/readonly gives SHELLOPTS away" \
         || fail "pipefail: shellopts" "these files export SHELLOPTS/BASHOPTS, so every script they \
 run inherits pipefail and the per-file condition above is no longer the right question:$exporters"
 }

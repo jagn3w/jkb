@@ -65,7 +65,28 @@ pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
 /// have left every test green, since each only ever asked that the named three were gone. The
 /// `cfg(test)` gate was what forced the duplication, and it bought nothing — three `&'static str`
 /// in the binary is not a cost worth a second copy of a security rule.
-pub(crate) const REPO_SELECTION_VARS: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+pub(crate) const REPO_SELECTION_VARS: &[&str] = &[
+    // Which repository.
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    // ...and which PARTS of one. Added in round 28 after the reason for leaving them out was
+    // measured false. The comment that kept them out said production "must not discard a
+    // component a caller legitimately handed it (git exports `GIT_INDEX_FILE` to hook
+    // processes)". Measured on git 2.51.1, dumping `env | grep ^GIT_` from real hooks:
+    // `post-merge` — the only hook jkb installs, and the one that runs `close-merged` — is handed
+    // NO component selector at all, and `pre-commit` is handed `GIT_INDEX_FILE=.git/index`,
+    // RELATIVE, which is meaningless to a `git -C <other dir>` call anyway.
+    //
+    // The harm is not hypothetical and it is reached through a user-facing command. With
+    // `GIT_INDEX_FILE=<victim>/.git/index` exported, `worktree_add`'s `git -C <proj> worktree add`
+    // — `jkb task work` — rewrote the victim's index (md5 changed) and left `git status` there
+    // failing with `fatal: unable to read <sha>`. That is the same corruption round 27 fixed on
+    // the fixture side, reached from the product.
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
 
 /// The integration crates' fixture isolation, COMPILED INTO THIS CRATE'S TEST BUILD TOO.
 ///
@@ -96,7 +117,14 @@ pub(crate) mod fixture_env;
 /// EQUALITY here — a name added to the list forces an edit next to this paragraph, which is where
 /// the reason lives.
 #[cfg(test)]
-const EXPECT_SELECTION_REMOVED: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+const EXPECT_SELECTION_REMOVED: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
 
 /// Assert that `cmd` removes EXACTLY the repository selectors, plus `also` where a tool has its
 /// own (`gh` names a repository outright through `GH_REPO`).

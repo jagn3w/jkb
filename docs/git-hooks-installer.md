@@ -681,9 +681,26 @@ conventions every session is expected to know.
   fixtures left 118 green, because `assert_scrubbed` names only the selection variables. The
   state that produces is exactly the harm all three comment blocks describe. So the block is a
   list now, applied by one function and checked by an oracle, rather than three copies held up by
-  prose. Note the asymmetry that is deliberate: production's `scrub_repo_selection` keeps
-  `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`, because production must not discard a
-  `safe.directory` grant it needs. Two rules, not drift.
+  prose. The asymmetry is now exactly three names: `MUST_DROP` is `REPO_SELECTION_VARS` plus
+  `GIT_TEMPLATE_DIR` and the two `GIT_CONFIG_*` injection channels. Production keeps the config
+  channels because it must not discard a `safe.directory` grant it needs, and leaves
+  `GIT_TEMPLATE_DIR` alone because it never runs `git init`; a fixture must not inherit either.
+  Two rules, not drift — and the relation between the lists is CONTAINMENT, asserted by
+  `the_fixtures_drop_everything_production_selects`, because the coupling that used to be
+  structural (the fixtures calling `scrub_repo_selection` themselves) was removed in round 26 and
+  nothing replaced it for a round: adding a fourth selector to production left 118 tests passing
+  while the fixtures stopped dropping it.
+
+  **Production scrubs repository COMPONENTS too, as of round 28**, and the reason it did not is
+  worth keeping. The comment that held them out said production "must not discard a component a
+  caller legitimately handed it — git exports `GIT_INDEX_FILE` to hook processes". Measured on git
+  2.51.1 by dumping `env | grep ^GIT_` from real hooks: `post-merge`, the only hook jkb installs
+  and the one that runs `close-merged`, is handed NO component selector at all; `pre-commit` is
+  handed `GIT_INDEX_FILE=.git/index`, relative, which is meaningless to a `git -C <other dir>`
+  call. Meanwhile the harm was reachable from a user-facing command — with
+  `GIT_INDEX_FILE=<victim>/.git/index` exported, `jkb task work`'s `git -C <proj> worktree add`
+  rewrote the victim's index and left `git status` there failing with `fatal: unable to read
+  <sha>`. A justification nobody had measured was holding open a corruption path.
 
   **SUPERSEDED — the two-lists half.** This paragraph used to continue: "There are two such lists,
   one per side of the crate boundary — `FIXTURE_CONFIG` is `#[cfg(test)]`, and an integration test
@@ -943,11 +960,15 @@ conventions every session is expected to know.
   absolute path) made it look verified. The third exists because "no shebang" is not the whole
   set: `.container/lib.sh` and `egress-lib.sh` carry one, being `--self-test`-able, and are
   sourced by scripts that set `pipefail`. Anchoring the first clause without adding the third
-  would have dropped BOTH out entirely — the two bugs were holding each other up. Neither file
-  sets `pipefail`: `egress-lib.sh`'s only match is a `set -euo pipefail` inside a single-quoted
-  `bash -c '…'` body, script text rather than a command that shell runs, so the anchored detector
-  still matches it for a reason unrelated to what it does. That is over-inclusion and safe, but it
-  is why "sets `pipefail`" should be read as "has a line beginning with `set` that mentions it".
+  would have dropped `.container/lib.sh` out entirely — the two bugs were holding each other up.
+  `egress-lib.sh` survives anchoring, but for a reason nobody wrote on purpose: its only match is
+  a `set -euo pipefail` inside a single-quoted `bash -c '…'` body, script TEXT rather than a
+  command that shell runs, so the first clause admits it and the clause that would cover it
+  properly is never consulted. Over-inclusion, therefore safe. This sentence has been wrong twice
+  in opposite directions — first claiming that file sets `pipefail` itself, then that both
+  libraries depended on the third clause — because each time it was checked with the detector
+  under discussion. Disabling the clause and re-running names exactly one file, and that is the
+  check worth repeating rather than the prose worth trusting.
   Membership now names all four libraries (`scripts/lib.sh`, `scripts/tests/harness.sh`,
   `.container/lib.sh`, `.container/egress-lib.sh`), because a coverage FLOOR is cleared by the
   three dozen files that declare `pipefail` themselves and can never notice a missing member.
@@ -995,4 +1016,9 @@ conventions every session is expected to know.
   with the duplicate it existed for: it compared two pieces of TEXT rather than two environments,
   and the crate boundary that forced the duplication (`jkb-cli` is bin-only, so an integration
   test cannot import from `src/`) is bridged by `#[cfg(test)] #[path = "../tests/common/mod.rs"]`
-  — one source text, three compilations, no parity to check.
+  — one source text, three compilations, no parity to check. The one relation that remains is
+  CONTAINMENT in the other direction — `MUST_DROP` must contain `REPO_SELECTION_VARS`, since a
+  fixture that inherits what production refuses is a fixture writing into somebody's repository —
+  and that is asserted from the constants the compiler saw, one-directional because wider is the
+  safe side. It exists because removing the redundant call removed the only coupling, which
+  nothing noticed for a round.
