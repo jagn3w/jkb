@@ -359,6 +359,79 @@ _racy_sites() {
     done < <(_pipefail_scope "$1")
 }
 
+# --- a script that runs git must drop the caller's repository selection first ---------------
+# `-C` DOES NOT PROTECT YOU, and that is the whole reason this case exists. An exported
+# `GIT_WORK_TREE` outranks the working directory AND `-C`, so a script that carefully passes
+# `-C "$REPO"` is still pointed wherever the caller's environment says.
+#
+# Measured on git 2.51.1, from inside a real repository with `GIT_WORK_TREE=<victim>` exported:
+# `git switch feature` wrote the repository's tracked files into <victim>, and `git reset --hard`
+# replaced a colliding file there — "MY UNSAVED WORK" became the repository's content, silently.
+#
+# `scripts/merge-queue.sh` had exactly that: nine bare git calls including two `reset --hard`,
+# spawned by the swarm with the developer's environment inherited whole. Six review rounds of this
+# branch went past it, because the only guard on this rule scanned `lib.sh` alone and matched only
+# the spelling `git -C`. One home, one glob — the same correction the quiet-grep rule needed.
+#
+# A file satisfies the rule by dropping the selection itself (`unset`/`env -u`), by calling
+# `isolate_git`, or by routing every git call through `lib.sh`'s `_git`. Those are the three
+# spellings in the tree; a fourth would fail here and should, until somebody adds it deliberately.
+_runs_git() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            # QUOTED SPANS FIRST, SINGLE BEFORE DOUBLE. `auto-mode-test.sh` carries the JSON
+            # string "Bash(git diff *)" in a settings fixture, and splitting on `(` turns that
+            # into a fragment beginning `git `. A guard that reports a string literal is one
+            # somebody silences. The order matters: that file also passes a single-quoted `jq`
+            # program CONTAINING a double-quoted string, so stripping double quotes first cuts
+            # from the wrong `"` and leaves the fragment behind.
+            gsub(/'"'"'[^'"'"']*'"'"'/, "", line)
+            gsub(/"[^"]*"/, "", line)
+            gsub(/[;&|()]/, "\n", line)
+            n = split(line, parts, "\n")
+            for (i = 1; i <= n; i++) {
+                p = parts[i]
+                sub(/^[[:space:]]+/, "", p)
+                while (p ~ /^(if|then|do|else|elif|exec|time|env|!)[[:space:]]/) {
+                    sub(/^[A-Za-z!]+[[:space:]]+/, "", p)
+                }
+                if (p ~ /^git[[:space:]]/) { print NR; exit }
+            }
+        }' "$1"
+}
+
+# The file must KNOW about the selection, by any of the three spellings the tree uses. Deliberately
+# file-level and not per-call: `scripts/hooks/post-merge` makes BOTH kinds of ask on purpose — an
+# ambient `git rev-parse --show-toplevel` to learn what tree it is standing in, and a scrubbed
+# `env -u …` one to learn which repository that tree belongs to — and telling those apart is the
+# entire subject of that file. A check that demanded every call be scrubbed would be wrong about
+# the one script that has thought hardest about this.
+_drops_selection() {
+    grep -qE '^[[:space:]]*unset[^#]*GIT_WORK_TREE|env([[:space:]]+-u[[:space:]]+[A-Z_]+)*[[:space:]]+-u[[:space:]]+GIT_WORK_TREE|isolate_git|_git[[:space:]]+-C|^_git\(\)' "$1"
+}
+
+case6() {
+    local f exposed="" seen=0 gitline
+    while IFS= read -r f; do
+        gitline="$(_runs_git "$f")"
+        [ -n "$gitline" ] || continue
+        seen=$((seen + 1))
+        _drops_selection "$f" || exposed="$exposed ${f#"$repo_root"/}:$gitline"
+    done < <(shell_sources "$repo_root")
+    if [ "$seen" -lt 5 ]; then
+        fail "gitenv: coverage" "only $seen script(s) were found to run git at all, so this case \
+asserts almost nothing — the glob or the git detector has regressed"
+    elif [ -n "$exposed" ]; then
+        fail "gitenv: unscrubbed" "these scripts run git without first dropping the caller's \
+repository selection, so an exported GIT_WORK_TREE redirects them. A -C flag does not help, it \
+is outranked. Add the unset at the top, or route every call through lib.sh's _git:$exposed"
+    else
+        ok "every script that runs git drops the caller's repository selection first ($seen)"
+    fi
+}
+
 # --- 3. the detector, against every spelling it has to be right about ----------------------
 # Same reasoning as case0: a detector nothing tests is a silent exemption one level up. The probe
 # is written with `PIPE` where the character belongs and substituted in, so this suite's own source
@@ -594,14 +667,16 @@ hit|typeset -x BASHOPTS
 hit|readonly SHELLOPTS
 hit|declare SHELLOPTS
 hit|export "SHELLOPTS"
+hit|export 'SHELLOPTS'
+miss|export FOO  # SHELLOPTS mentioned only in a trailing comment
 miss|export MYSHELLOPTS
 miss|export SHELLOPTSFOO
 miss|# export SHELLOPTS
 miss|echo export SHELLOPTS
 SPELLINGS
     rm -f "$fake/scripts/exporter.sh"
-    if [ "$n" -ne 14 ]; then
-        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 14"
+    if [ "$n" -ne 16 ]; then
+        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 16"
     elif [ -n "$miss" ]; then
         fail "pipefail: shellopts-premise" "the SHELLOPTS pattern does not match these spellings it is \
 meant to classify, and a guard satisfied by absence cannot tell that from a clean tree:$miss"
@@ -621,7 +696,7 @@ which is how a guard gets loosened until it means nothing:$false_hit"
             && exporters="$exporters $form"
     done < <(shell_sources "$repo_root")
     [ -z "$exporters" ] \
-        && ok "and no single-line export/declare/typeset/readonly gives SHELLOPTS away" \
+        && ok "and no line-initial, single-line export/declare/typeset/readonly gives it away" \
         || fail "pipefail: shellopts" "these files match the line-initial \
 export/declare/typeset/readonly + SHELLOPTS shape. If it really exports (bare \`readonly\` and \
 \`declare\` without -x do NOT), every script they run inherits pipefail and the per-file \
@@ -647,6 +722,6 @@ Match a here-string instead: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5
+run_cases case0 case1 case2 case3 case4 case5 case6
 
 finish

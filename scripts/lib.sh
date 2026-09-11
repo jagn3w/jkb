@@ -56,7 +56,15 @@ _JKB_LIB_SELF="${BASH_SOURCE[0]}"
 #
 # Every caller HERE passes `-C "$repo_root"`, so stripping the inherited selection loses
 # nothing: this file is asked ABOUT a repository, a hook is run BY one.
-_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git "$@"; }
+# SIX, not three — the same set `gitrepo::REPO_SELECTION_VARS` drops. The three that say WHICH
+# repository were here from the start; the three that say which PART of one were added in round 28,
+# after `jkb task work` was measured rewriting a foreign repository's index through an inherited
+# `GIT_INDEX_FILE`. This wrapper is the shell half of that rule and was left at three for a round.
+_git() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+        -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+        git "$@"
+}
 
 # install_exec <dest> — install stdin as an executable file at <dest>, ATOMICALLY.
 #

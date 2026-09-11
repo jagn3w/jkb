@@ -114,7 +114,8 @@ trap _cleanup_workdir EXIT
 # builds and nothing about the machine it runs on.
 #
 # The list is defined by a CLASS, not by a count: every variable that can outrank the empty
-# configuration this points git at, plus the three that select a repository. A count in the
+# configuration this points git at, plus every variable that selects a repository or a part of
+# one. A count in the
 # prose ("all five") is a fact about the line below it that goes stale the first time somebody
 # extends it, and this one already had.
 #

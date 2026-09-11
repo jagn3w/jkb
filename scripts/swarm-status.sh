@@ -17,6 +17,14 @@
 # hand values from the embedded python back to bash, and deletes them again as it consumes them.
 set -euo pipefail
 
+# The caller's repository selection, dropped before the first git runs. `rev-parse
+# --show-toplevel` with an exported `GIT_DIR`/`GIT_WORK_TREE` answers about THAT repository, so
+# `$REPO` — which every listing below is scoped to — would name a repo the operator never asked
+# about, and the status display would be confidently about the wrong tree. Read-only here, so this
+# is wrong information rather than the data loss `merge-queue.sh` had, but it is the same variable
+# and the same one-line fix.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+      GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 # =====================================================================

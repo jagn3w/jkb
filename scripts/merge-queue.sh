@@ -17,6 +17,27 @@
 # new base, never a merger reconciling blind.
 set -uo pipefail
 
+# THE CALLER'S REPOSITORY SELECTION, DROPPED ONCE, BEFORE ANY GIT RUNS. This script is spawned by
+# the swarm as `cd $INTEGRATION_WT && ./scripts/merge-queue.sh …`, inheriting the developer's
+# environment whole, and every git call below is BARE — no `-C`, no `--git-dir`. An exported
+# `GIT_WORK_TREE` outranks the working directory, so line 36's `git switch` checks the base branch
+# out over whatever that variable names, and the two `git reset --hard "$PRE"` calls then force
+# that tree to a commit.
+#
+# Measured on git 2.51.1, from inside a real repository with `GIT_WORK_TREE=<victim>` exported:
+# `git switch feature` wrote the repository's tracked files INTO <victim>, and `git reset --hard`
+# replaced a file there whose name collided with a tracked one — "MY UNSAVED WORK" became the
+# repository's content, silently. That is somebody's home directory under the
+# `export GIT_WORK_TREE=$HOME` dotfiles recipe this whole cluster (D46) exists for.
+#
+# ONCE, AT THE TOP, rather than `-C` on each of nine call sites: a rule every call site has to
+# remember is the defect this repository keeps rediscovering, and a tenth git call added below
+# would not have to remember this one. The six names are `gitrepo::REPO_SELECTION_VARS` — which
+# repository, and which parts of one — kept in step with it by
+# `git-hooks.test.sh`'s bare-git scan.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+      GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
 BRANCH="${1:?usage: merge-queue.sh <branch> <base> <worktree>}"
 BASE="${2:?missing <base>}"
 WT="${3:?missing <worktree>}"

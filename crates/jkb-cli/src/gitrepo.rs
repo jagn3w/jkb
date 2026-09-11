@@ -1684,12 +1684,12 @@ mod tests {
     /// library fixtures no longer dropped it, and with that variable exported they wrote loose
     /// objects into a foreign object store.
     ///
-    /// This is containment, not parity. `MUST_DROP` is deliberately WIDER — it carries the config
-    /// channels and `GIT_TEMPLATE_DIR`, which production leaves alone because it never runs
-    /// `git init` — so the assertion is
-    /// one-directional and production may grow without the fixture list being wrong. It reads the
-    /// constants the compiler saw, not their source text, which is what the deleted parity test
-    /// did wrong.
+    /// This is containment, not parity. `MUST_DROP` is deliberately WIDER by three names, for two
+    /// different reasons: the `GIT_CONFIG_*` channels, because production must not discard the
+    /// `safe.directory` grants this container carries there; and `GIT_TEMPLATE_DIR`, because
+    /// production never runs `git init`. So the assertion is one-directional and production may
+    /// grow without the fixture list being wrong. It reads the constants the compiler saw, not
+    /// their source text, which is what the deleted parity test did wrong.
     #[test]
     fn the_fixtures_drop_everything_production_selects() {
         let missing: Vec<&str> = super::REPO_SELECTION_VARS
@@ -1755,8 +1755,13 @@ mod tests {
     }
 
     /// `fixture_git` really scrubs — the SCRUBBERS entry above claims it, so something must
-    /// check it. Reverting the `scrub_repo_selection` call inside it fails here, and (measured)
-    /// also lets `gitrepo::tests` commit into an unrelated dirty repository.
+    /// check it. Deleting the `isolate_git_env` call inside it fails here: measured, the removed
+    /// set comes back empty against a nine-name oracle.
+    ///
+    /// The sentence this replaces named `scrub_repo_selection`, a call `fixture_git` has not
+    /// contained since round 26 — so the pin a reader was told to verify by reverting could not
+    /// be verified at all. A claimed pin that does not exist is worse than no claim, which is the
+    /// shape this cluster has now paid for three times.
     #[test]
     fn the_test_fixtures_do_not_reach_another_repository() {
         super::fixture_env::assert_isolated(

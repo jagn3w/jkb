@@ -193,12 +193,14 @@ echo "==> scripts/tests/harness.sh"
 # THE WHOLE SET, compared for EQUALITY against a list written down here.
 #
 # `case_isolate` below enumerates five names and reports "isolate_git unsets every variable that
-# can outrank the empty configuration" — a claim about a class, checked against a sample. That is
-# why the shell half could be left a round behind when the Rust half was widened: round 27 added
-# three repository COMPONENT selectors to `MUST_DROP` after measuring that an exported
-# `GIT_INDEX_FILE` lets a fixture rewrite somebody's real index, and nothing here noticed that the
-# suites which build actual repositories still inherited it. Measured at the time: deleting the
-# names again left this suite at 17 ok, 0 fail.
+# can outrank the empty configuration" — a claim about a class, checked against a sample. So a
+# NARROWING of `isolate_git` went unnoticed, which is what this case fixes.
+#
+# It is NOT why the shell half fell a round behind the Rust half, and the first version of this
+# paragraph said it was. Round 27 widened `MUST_DROP` and nothing here was wrong — both sides of
+# this comparison live in one file and move together, so this case would have passed then too. The
+# drift was between the LANGUAGES, and that needs an artifact reading the other one; `case_rust_twin`
+# below is it.
 #
 # The literal below is this test's own, never derived from `harness.sh` — the rule the Rust side
 # arrived at over rounds 24-26 after getting it wrong in both directions. A name added to
@@ -213,6 +215,14 @@ case_isolate_set() {
 GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM GIT_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 GIT_TEMPLATE_DIR GIT_WORK_TREE XDG_CONFIG_HOME"
     want="$(printf '%s\n' $want | sort | tr '\n' ' ')"
+    # A CANDIDATE SET WIDER THAN THE EXPECTATION, or the "extra" half of the equality is a
+    # tautology: the probe used to export only `$want`, so the diff could contain nothing else and
+    # an added `unset` was invisible. I "verified" that direction with EDITOR — which was in the
+    # probe list, so the check was circular. These four are the names `MUST_DROP`'s own comment
+    # nominates as the next plausible widening, which makes them exactly the shape this oracle has
+    # to be able to see.
+    local candidates="GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_NAMESPACE \
+GIT_INDEX_VERSION"
     # DIFFED, not polled. Asking "which of the names I expected are gone" cannot see an unset
     # nobody expected — the first version of this case exported only the wanted names, so adding
     # `EDITOR` to `isolate_git` passed. `compgen -e` before and after gives the removals whatever
@@ -221,18 +231,42 @@ GIT_TEMPLATE_DIR GIT_WORK_TREE XDG_CONFIG_HOME"
     # `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` are filtered out of the comparison because how many of them
     # exist is a fact about the machine — this project's dev container exports four to carry its
     # `safe.directory` grants — so they cannot be a written-down literal. That sweep is pinned by
-    # `case_isolate`'s third assertion instead, which is the one that discriminates it.
+    # the `isolate: revive` assertion in `case_isolate` instead, named rather than counted: an
+    # ordinal cross-reference is read off whichever assertion the next reader starts counting from.
     got="$(
         bash -c '
             . "$1" >/dev/null 2>&1
-            for v in $3 CONTROL_KEEP EDITOR PAGER; do export "$v=probe"; done
+            for v in $3 $4 CONTROL_KEEP EDITOR PAGER; do export "$v=probe"; done
             before="$(compgen -e | sort)"
             isolate_git "$2/home" >/dev/null 2>&1
             after="$(compgen -e | sort)"
             comm -23 <(printf "%s\n" "$before") <(printf "%s\n" "$after") \
                 | grep -vE "^GIT_CONFIG_(KEY|VALUE)_[0-9]+$" | sort | tr "\n" " "
-        ' _ "$lib" "$d" "$want"
+        ' _ "$lib" "$d" "$want" "$candidates"
     )"
+    # ...AND WHAT IT SETS. `comm -23` is removals only, so `GIT_CONFIG_NOSYSTEM=1` was unpinned —
+    # and it is the only thing holding /etc/gitconfig out of these suites, because `isolate_git`
+    # UNSETS `GIT_CONFIG_SYSTEM` rather than pointing it at /dev/null the way the Rust twin's
+    # `MUST_SET` does. Measured: cutting `isolate_git` down to `export HOME="$1"` left all
+    # assertions green while this container's live /etc/gitconfig came back into a suite that is
+    # entirely about `core.hooksPath`. A case headed "THE WHOLE SET" that checks half of one is
+    # worse than no case, because a reader stops looking.
+    local added
+    added="$(
+        bash -c '
+            . "$1" >/dev/null 2>&1
+            before="$(compgen -e | sort)"
+            isolate_git "$2/home" >/dev/null 2>&1
+            after="$(compgen -e | sort)"
+            comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after") | sort | tr "\n" " "
+        ' _ "$lib" "$d"
+    )"
+    [ "$added" = "GIT_CONFIG_NOSYSTEM " ] \
+        && ok "and the only variable it ADDS is GIT_CONFIG_NOSYSTEM, which holds /etc/gitconfig out" \
+        || fail "isolate: added" "isolate_git sets a different set than expected — \
+GIT_CONFIG_NOSYSTEM is what keeps the system config out of these suites, since GIT_CONFIG_SYSTEM \
+is unset rather than pointed at /dev/null. wanted [GIT_CONFIG_NOSYSTEM ] got [$added]"
+
     if [ "$got" = "$want" ]; then
         ok "and that is the WHOLE set it unsets, against a list this test writes down itself"
     else
@@ -241,6 +275,47 @@ means a variable the developer's shell now reaches these suites' \`git\` through
 \`isolate_git\`, and to the Rust twin \`MUST_DROP\`. Extra means it unsets something nobody \
 asked for. wanted [$want] got [$got]"
     fi
+}
+
+# THE RUST TWIN, READ FROM ITS OWN SOURCE.
+#
+# `isolate_git` and `crates/jkb-cli/tests/common/mod.rs`'s `MUST_DROP` are one rule in two
+# languages. Nothing related them, and the cost was measured: round 27 widened `MUST_DROP` after
+# reproducing a fixture rewriting somebody's real index, and the shell half — whose suites run
+# `git init`/`add`/`commit` in a work dir — kept inheriting the same variables for a round, with
+# the whole gate green. `case_isolate_set` cannot see that; both sides of its comparison live in
+# this file.
+#
+# SUBSET, not equality, and in this direction: everything the Rust fixtures refuse, the shell ones
+# must refuse too. `isolate_git` may drop more (it takes `XDG_CONFIG_HOME`, which means nothing to
+# a `Command`), and the message says to widen `isolate_git` rather than trim `MUST_DROP` — the
+# lesson of rounds 24-26, where "the lists disagree" read as an instruction to sync them and the
+# sync was the edit that reopened a hole.
+#
+# This is the parity test this branch deleted twice, and it earns its place here for a reason those
+# did not have: there is no `#[path]` trick across a language boundary, and the drift it names has
+# actually happened.
+case_rust_twin() {
+    local must_drop shell_unset missing="" v
+    must_drop="$(sed -n '/^pub const MUST_DROP/,/^\];/p' \
+        "$repo_root/crates/jkb-cli/tests/common/mod.rs" \
+        | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u)"
+    shell_unset="$(sed -n '/^isolate_git()/,/^}/p' "$repo_root/scripts/tests/harness.sh" \
+        | grep -oE '\bGIT_[A-Z_]+\b|\bXDG_[A-Z_]+\b' | sort -u)"
+    if [ -z "$must_drop" ] || [ -z "$shell_unset" ]; then
+        fail "isolate: twin-premise" "could not read one of the two lists — MUST_DROP had \
+$(printf '%s' "$must_drop" | grep -c .) name(s), isolate_git had \
+$(printf '%s' "$shell_unset" | grep -c .); the extraction is broken, not the code"
+        return
+    fi
+    for v in $must_drop; do
+        grep -qxF "$v" <<<"$shell_unset" || missing="$missing $v"
+    done
+    [ -z "$missing" ] \
+        && ok "and everything the Rust fixtures refuse, isolate_git refuses too" \
+        || fail "isolate: twin" "these are in MUST_DROP but not in isolate_git, so the shell \
+suites — which build real repositories — still inherit them:$missing. Widen isolate_git (and this \
+file's own want list); do not trim MUST_DROP."
 }
 
 case_isolate() {
@@ -333,6 +408,6 @@ case_orphanname() {
 }
 
 run_cases case1 case2 case2b case2c case2d case3 case4 case_orphanname case_isolate \
-           case_isolate_set
+           case_isolate_set case_rust_twin
 
 finish
