@@ -217,9 +217,10 @@ esac
 # reparented to PID 1, and PID 1 must wait() on it or it stays a zombie for ever; `sleep` never
 # wait()s. The leak is therefore unbounded, and it is not a corner case: it is one zombie per
 # sandboxed Bash call (the zombies are bwrap/bash/sh/touch), so it tracks agent activity and an
-# unattended session walks into it unaided. Measured on a container 28 hours old: of
-# 3968 tasks, and 4083 of container.json's 4096 PIDs spent — thirteen from a container that cannot
-# fork at all, which is not a slow degradation but every build, shell and tool call failing at once.
+# unattended session walks into it unaided, and the end state is not a slow degradation but every
+# build, shell and tool call failing at once. README.md, "The measurements this is built on", has
+# the numbers and the date they were taken; they are deliberately NOT restated here, because a
+# count copied to a second place is a count that goes stale in one of them.
 #
 # WHY NOT `--init`. Docker's own tini does exactly this job, and it is the wrong shape HERE: it
 # becomes PID 1 *wrapping* this script, so PID 1's argv is `/sbin/docker-init -- …/entrypoint.sh

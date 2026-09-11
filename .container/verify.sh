@@ -271,7 +271,7 @@ if [ "$SELF_TEST" = yes ]; then
     # there establishes nothing. Spelling those the same is what let a leaking container be
     # certified as reaping. /proc is injected, so all three are reachable on a host without one.
     echo "==> verify.sh self-test: pstat's three-way return"
-    PROC="$(mktemp -d)"; st_fail_trap="$PROC"
+    PROC="$(mktemp -d)"
     mkdir -p "$PROC/100" "$PROC/101" "$PROC/102"
     st_line 100 sleep S 555 > "$PROC/100/stat"
     printf '101 (sleep) S 1 1' > "$PROC/101/stat"          # too short to parse

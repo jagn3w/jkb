@@ -433,10 +433,12 @@ fi
 # THE REAPER PATH IS SPELLED IN TWO FILES THAT CANNOT SHARE A VARIABLE. The Dockerfile asserts it
 # exists at BUILD time (`test -x`), entrypoint.sh EXECS it to become a PID 1 that reaps -- without
 # which `sleep` is PID 1, never wait()s, and every orphan reparented to it is a zombie for ever
-# (README.md, "The measurements this is built on"). Move tini's install -- to /usr/local/bin, say, where every other privileged binary in this image is deliberately put
-# root-owned -- update one spelling and not the other, and the BUILD STILL PASSES: every route into
-# the container then dies at `exec: not found`, exit 127, and run.sh's settle() reports `gone`, so
-# the failure blames the egress boundary and sends the reader to audit something that is fine.
+# (README.md, "The measurements this is built on"). Move tini's install -- to /usr/local/bin, say,
+# which is where this image deliberately puts every other privileged binary -- update one spelling
+# and not the other, and the BUILD STILL PASSES: every route into the container then dies at
+# `exec: not found`, exit 127, and run.sh's settle() reports `gone`. What the reader is then shown
+# is `container_died`, which names the egress boot gate as the likeliest cause -- correctly, since
+# it usually is -- so the first thing audited is a boundary that is fine.
 # Neither self-test can catch it: entrypoint.sh's runs through the injected stub and never
 # exercises the default. Same shape as the ENTRYPOINT guard above.
 #
