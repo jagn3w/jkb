@@ -300,8 +300,24 @@ case_rust_twin() {
     must_drop="$(sed -n '/^pub const MUST_DROP/,/^\];/p' \
         "$repo_root/crates/jkb-cli/tests/common/mod.rs" \
         | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u)"
+    # FROM THE STATEMENT, NOT THE BODY. This grepped names out of the whole function including its
+    # COMMENTS — and that body explains, in prose, why `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and
+    # `GIT_TEMPLATE_DIR` are there. Measured: deleting those three from the real `unset` and
+    # narrowing `case_isolate_set`'s literal to match left this case reporting ok. They are exactly
+    # the three the round-27 drift was about, so the pin was blind to the one state it exists for.
     shell_unset="$(sed -n '/^isolate_git()/,/^}/p' "$repo_root/scripts/tests/harness.sh" \
+        | grep -vE '^[[:space:]]*#' \
+        | sed -e :a -e '/\\$/N; s/\\\n//; ta' \
+        | grep -E '^[[:space:]]*unset[[:space:]]' \
         | grep -oE '\bGIT_[A-Z_]+\b|\bXDG_[A-Z_]+\b' | sort -u)"
+    # A COUNT PREMISE, because both halves of this comparison are extracted by regex and an
+    # extraction that returns nothing compares equal to nothing.
+    if [ "$(printf '%s' "$shell_unset" | grep -c .)" -lt 8 ]; then
+        fail "isolate: twin-premise" "extracted only \
+$(printf '%s' "$shell_unset" | grep -c .) name(s) from isolate_git's unset statement; the \
+extraction is broken, not the code"
+        return
+    fi
     if [ -z "$must_drop" ] || [ -z "$shell_unset" ]; then
         fail "isolate: twin-premise" "could not read one of the two lists — MUST_DROP had \
 $(printf '%s' "$must_drop" | grep -c .) name(s), isolate_git had \

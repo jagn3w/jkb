@@ -377,27 +377,52 @@ _racy_sites() {
 # `isolate_git`, or by routing every git call through `lib.sh`'s `_git`. Those are the three
 # spellings in the tree; a fourth would fail here and should, until somebody adds it deliberately.
 _runs_git() {
+    # COMMAND SUBSTITUTIONS ARE NOT QUOTED SPANS. The first version stripped `"[^"]*"` before
+    # splitting, which removes `x="$(git rev-parse …)"` whole — so a script whose every git call is
+    # written that way ran none, as far as this case could tell. MEASURED: a planted
+    # `scripts/release.sh` doing `root="$(git rev-parse --show-toplevel)"` then
+    # `rm -rf "$root/dist"` — two git calls, no scrub, a destructive operation on git's answer —
+    # passed, and the `seen` floor did not move. The form is not exotic: `swarm-status.sh`'s
+    # `REPO="$(git rev-parse …)"`, the very line the previous round scrubbed that file FOR, is
+    # written exactly like it.
+    #
+    # So `$(`, backticks and `{` open a fragment before quotes are considered, and only then are
+    # the remaining quoted spans blanked — which is still needed for the JSON string in
+    # `auto-mode-test.sh`. The keyword strip covers the loop and grouping words, a leading
+    # `VAR=value` assignment prefix, and the runners that take a command as an argument.
+    #
+    # A WRAPPER COUNTS AS AN INVOCATION. `harness.sh`'s `git_q() { git -c … "$@"; }` is how the
+    # whole shell-test tree runs git, and by function-name alone that file looked like it never
+    # touched git — exempting any future suite that used only the wrapper.
     awk '
         /^[[:space:]]*#/ { next }
         {
+            # THREE PASSES, and the order is the whole trick. A command substitution opens a new
+            # command CONTEXT while sitting inside quotes, so it must be split out BEFORE quoted
+            # spans are blanked; but a JSON string like "Bash(git diff *)" must be blanked before
+            # `(` is treated as a separator, or it becomes a fragment beginning `git `. Splitting
+            # on `(` first breaks the second; blanking quotes first breaks the first.
             line = $0
-            # QUOTED SPANS FIRST, SINGLE BEFORE DOUBLE. `auto-mode-test.sh` carries the JSON
-            # string "Bash(git diff *)" in a settings fixture, and splitting on `(` turns that
-            # into a fragment beginning `git `. A guard that reports a string literal is one
-            # somebody silences. The order matters: that file also passes a single-quoted `jq`
-            # program CONTAINING a double-quoted string, so stripping double quotes first cuts
-            # from the wrong `"` and leaves the fragment behind.
-            gsub(/'"'"'[^'"'"']*'"'"'/, "", line)
-            gsub(/"[^"]*"/, "", line)
-            gsub(/[;&|()]/, "\n", line)
-            n = split(line, parts, "\n")
+            gsub(/\$\(/, "\n", line)
+            gsub(/`/, "\n", line)
+            n = split(line, outer, "\n")
             for (i = 1; i <= n; i++) {
-                p = parts[i]
-                sub(/^[[:space:]]+/, "", p)
-                while (p ~ /^(if|then|do|else|elif|exec|time|env|!)[[:space:]]/) {
-                    sub(/^[A-Za-z!]+[[:space:]]+/, "", p)
+                frag = outer[i]
+                gsub(/"[^"]*"/, "", frag)
+                gsub(/'"'"'[^'"'"']*'"'"'/, "", frag)
+                gsub(/[;&|(){}]/, "\n", frag)
+                m = split(frag, parts, "\n")
+                for (j = 1; j <= m; j++) {
+                    p = parts[j]
+                    sub(/^[[:space:]]+/, "", p)
+                    while (p ~ /^(if|then|do|done|else|elif|while|until|exec|time|env|sudo|command|xargs|!)[[:space:]]/) {
+                        sub(/^[A-Za-z!]+[[:space:]]+/, "", p)
+                    }
+                    while (p ~ /^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+/) {
+                        sub(/^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+/, "", p)
+                    }
+                    if (p ~ /^git([[:space:]]|$)/) { print NR; exit }
                 }
-                if (p ~ /^git[[:space:]]/) { print NR; exit }
             }
         }' "$1"
 }
@@ -408,8 +433,34 @@ _runs_git() {
 # `env -u …` one to learn which repository that tree belongs to — and telling those apart is the
 # entire subject of that file. A check that demanded every call be scrubbed would be wrong about
 # the one script that has thought hardest about this.
+# EVERY NAME, not one token. This asked only for `GIT_WORK_TREE`, so the six-name widening that
+# round 30 made in three production shell files was pinned by nothing: measured, reverting it in
+# `merge-queue.sh`, `swarm-status.sh` and `lib.sh`'s `_git` all at once left all five suites at 0
+# FAIL. The three that say which PART of a repository are exactly the ones round 28 measured
+# rewriting a victim's index, so a check that stops at the first name is a check for the harm this
+# rule no longer considers the whole harm.
+#
+# The set is read from `gitrepo::REPO_SELECTION_VARS` rather than written here, so a seventh name
+# added in Rust makes these shell files fail until they carry it too — the cross-language relation
+# `case_rust_twin` gives the fixtures, applied to the production scripts.
+_selection_vars() {
+    sed -n '/^pub(crate) const REPO_SELECTION_VARS/,/^\];/p' \
+        "$repo_root/crates/jkb-cli/src/gitrepo.rs" | grep -oE '"GIT_[A-Z_]+"' | tr -d '"'
+}
+
 _drops_selection() {
-    grep -qE '^[[:space:]]*unset[^#]*GIT_WORK_TREE|env([[:space:]]+-u[[:space:]]+[A-Z_]+)*[[:space:]]+-u[[:space:]]+GIT_WORK_TREE|isolate_git|_git[[:space:]]+-C|^_git\(\)' "$1"
+    local f="$1" v body
+    # A wrapper that scrubs, or a suite-wide isolation call, satisfies it for the whole file.
+    grep -qE 'isolate_git|_git[[:space:]]+-C|^_git\(\)' "$f" && return 0
+    # Otherwise every name must be dropped, by `unset` or by `env -u`, on a line that runs.
+    # CONTINUATIONS JOINED. `unset A B C \` + newline + `D E F` is how all three production
+    # scripts spell it, and a per-line match sees the second line without the keyword.
+    body="$(grep -vE '^[[:space:]]*#' "$f" | sed -e :a -e '/\\$/N; s/\\\n//; ta')"
+    while IFS= read -r v; do
+        grep -qE "(^|[[:space:]])(unset|-u)([[:space:]]+[A-Za-z_]+)*[[:space:]]+$v([[:space:]]|\\\\|$)" \
+            <<<"$body" || return 1
+    done < <(_selection_vars)
+    return 0
 }
 
 case6() {

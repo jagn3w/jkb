@@ -81,8 +81,24 @@ fi
 GRAFT=$(git rev-parse HEAD)   # the rebased commits (detached HEAD)
 
 # 2. Fast-forward the base to the rebased result — linear graft, no merge commit.
-git switch "$BASE" >/dev/null 2>&1
-if ! git merge --ff-only "$GRAFT" >/tmp/merge-queue.log 2>&1; then
+#
+# CHECKED. Step 1 detached HEAD to rebase, releasing $BASE for the whole of it, so the conclusion
+# reached at line 57 — "this worktree holds $BASE" — is stale by the time we get here. If another
+# worktree claimed the branch meanwhile this switch fails, HEAD stays detached AT $GRAFT, and the
+# fast-forward below then trivially succeeds because it is already there: the script would print
+# `landed:` and record the landing with jkb while $BASE never moved a commit.
+if ! git switch "$BASE" >/tmp/merge-queue.log 2>&1; then
+  echo "eject: cannot switch back to $BASE — another worktree holds it (see /tmp/merge-queue.log)"
+  exit 1
+fi
+# HOOKS OFF FOR THIS MERGE. A fast-forward fires `post-merge`, and in this repository that hook
+# runs setup.sh, which `cargo install`s the jkb binary, rebuilds the VS Code extension and
+# reinstalls the watcher service. At this point in the script the gate has NOT run — it is step 3,
+# below — so every graft was installing a binary built from a candidate that might fail the gate
+# seconds later and be rolled back by step 4, leaving the operator's `jkb` newer than the branch
+# they are on. Measured: the hook fires on `merge --ff-only`, and `-c core.hooksPath=/dev/null`
+# suppresses it while the merge still happens.
+if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue.log 2>&1; then
   git reset --hard "$PRE" >/dev/null 2>&1
   echo "eject: fast-forward failed"
   exit 1

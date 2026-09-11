@@ -84,6 +84,7 @@ common_of() {   # common_of [dir] — [dir] asks with the environment scrubbed; 
     local d="${1:-}" c                    # handed us. Prints an absolute, symlink-resolved path.
     if [ -n "$d" ]; then
         c="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+             -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
              git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 1
     else
         d="$PWD"
