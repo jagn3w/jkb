@@ -231,32 +231,62 @@ _racy_re() {
                   'rep([[:space:]]+-(-[a-z-]+|[A-Za-z]+))*[[:space:]]+(-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)([[:space:]]|$)'
 }
 
-# The files the rule applies to: those that set `pipefail`, plus any library they SOURCE, which
-# runs under the caller's options and sets none of its own. `scripts/lib.sh` and
+# The files the rule applies to: those that set `pipefail`, plus every SOURCED library, which runs
+# under its caller's options and sets none of its own. `scripts/lib.sh` and
 # `scripts/tests/harness.sh` are both in that second group and both are sourced by every suite
 # here — a racy line added to either would run under pipefail while a file-local check saw a file
-# with no `set` line at all.
+# with no `set` line at all. Membership is asserted by name below, because this half was wrong
+# once already and nothing noticed.
+# A file with NO SHEBANG cannot be run as a program — it can only be sourced, so it executes
+# under its caller's shell options and is in scope whatever it does or does not `set` itself.
+# That is a property of the file rather than a fact about who sources it, which is the whole
+# reason to test it this way: the first version of this function parsed the `.`/`source` lines of
+# every pipefail script to collect library basenames, and on
+#
+#     . "$(dirname "$0")/harness.sh"
+#
+# — how all five suites source the harness — it captured `$(dirname` as the filename. So
+# `harness.sh` was outside the scope of the guard that names it, while the doc claimed the
+# opposite and a planted line in `lib.sh` (sourced by an absolute path, hence parsed correctly)
+# made it look verified. `shell_sources` already distinguishes the two kinds of file, so ask it
+# rather than re-deriving the answer from a path.
+_has_shebang() { case "$(head -c 2 "$1" 2>/dev/null)" in "#!") return 0 ;; *) return 1 ;; esac; }
+
 _pipefail_scope() {
-    local root="$1" f b libs
-    libs="$(while IFS= read -r f; do
-                _sets_pipefail "$f" || continue
-                sed -n 's/^[[:space:]]*\(\.\|source\)[[:space:]]\{1,\}["'"'"']*\([^"'"'"' ]*\).*/\2/p' "$f"
-            done < <(shell_sources "$root") | sed 's|.*/||' | sort -u)"
+    local root="$1" f
     while IFS= read -r f; do
-        b="${f##*/}"
-        if _sets_pipefail "$f" || grep -qxF "$b" <<<"$libs"; then
+        if _sets_pipefail "$f" || ! _has_shebang "$f"; then
             printf '%s\n' "$f"
         fi
     done < <(shell_sources "$root")
 }
 
-_racy_sites() {
-    local f re
+# A pipeline may be broken across lines in EITHER direction, and a line-oriented match sees only
+# one of them. `  | grep -q x` on a continuation line is caught by the `(^|[^|])` alternation;
+# `cat f |` followed by `    grep -q x` is the same pipeline written the other way and was not.
+# So lines are joined on a trailing `|` before matching, and the reported number is the line the
+# pipeline STARTS on, which is the one a reader has to go and edit.
+_joined() {
+    awk '{
+             if (held == "") { ln = NR; cur = $0 } else { cur = held " " $0 }
+             if (cur ~ /\|[ \t]*$/) { held = cur; next }
+             held = ""
+             printf "%d:%s\n", ln, cur
+         }
+         END { if (held != "") printf "%d:%s\n", ln, held }' "$1"
+}
+
+# One file, so case3 can drive it with a multi-line probe — a form the per-line loop cannot express.
+_racy_in_file() {
+    local re
     re="$(_racy_re)"
+    _joined "$1" 2>/dev/null | grep -E "$re" | grep -vE '^[0-9]+:[[:space:]]*#'
+}
+
+_racy_sites() {
+    local f
     while IFS= read -r f; do
-        grep -nE "$re" "$f" 2>/dev/null \
-            | grep -vE '^[0-9]+:[[:space:]]*#' \
-            | sed "s|^|${f}:|"
+        _racy_in_file "$f" | sed "s|^|${f}:|"
     done < <(_pipefail_scope "$1")
 }
 
@@ -296,7 +326,7 @@ FORMS
     while IFS= read -r line; do
         n=$((n + 1))
         printf '%s\n' "$line" >"$work/one.sh"
-        hit="$(grep -nE "$re" "$work/one.sh" | grep -vE '^[0-9]+:[[:space:]]*#')"
+        hit="$(_racy_in_file "$work/one.sh")"
         if [ "$n" -le 12 ]; then
             [ -n "$hit" ] || want_hit="$want_hit $n"
         else
@@ -312,6 +342,34 @@ using one is silently exempted:$want_hit"
 guard gets deleted:$want_miss"
     else
         ok "the quiet-grep detector sees every spelling of the idiom, and no safe neighbour"
+    fi
+
+    # ...and BOTH continuation directions, which the per-line loop above cannot express.
+    # PIPE placeholders here too, for the same reason the FORMS heredoc uses them — and not as
+    # hypothetical caution: writing these three probes with literal pipes made the joined detector
+    # report THIS FILE, which is the "a check that fails on an unmutated tree" failure the
+    # placeholder exists to prevent, arriving the moment the detector got strong enough to see it.
+    sed 's/PIPE/|/g' >"$work/two.sh" <<'TWO'
+cat f PIPE
+    grep -q x
+TWO
+    sed 's/PIPE/|/g' >"$work/two2.sh" <<'TWO2'
+cat f \
+    PIPE grep -q x
+TWO2
+    sed 's/PIPE/|/g' >"$work/two3.sh" <<'TWO3'
+cat f PIPE
+    sed -n 1p
+TWO3
+    if [ -z "$(_racy_in_file "$work/two.sh")" ]; then
+        fail "pipefail: forms-multiline" "a pipeline whose \`|\` ends the line is not seen, so the \
+same pipeline written the other way is exempt"
+    elif [ -z "$(_racy_in_file "$work/two2.sh")" ]; then
+        fail "pipefail: forms-multiline" "a pipeline continued with a backslash is not seen"
+    elif [ -n "$(_racy_in_file "$work/two3.sh")" ]; then
+        fail "pipefail: forms-multiline-false" "joining lines made a safe two-line pipeline match"
+    else
+        ok "and a pipeline split across lines, whichever side of the break the pipe sits on"
     fi
 }
 
@@ -348,6 +406,39 @@ does not cover what this rule claims to, or the pipefail condition is not being 
     [ "$n" -ge 30 ] \
         || fail "pipefail: coverage" "only $n file(s) are in scope, so the scan below asserts \
 almost nothing — shell_sources or the pipefail detection has regressed"
+
+    # MEMBERSHIP BY NAME for the sourced half. The floor above is cleared by the three dozen files
+    # that declare `pipefail` themselves, so it said nothing at all about the libraries — and that
+    # half was broken and silent: it parsed `. "$(dirname "$0")/harness.sh"` down to `$(dirname`,
+    # leaving `harness.sh` outside the guard while the doc said otherwise. A floor cannot notice a
+    # missing member; only naming it can.
+    local missing="" want scope
+    scope="$(_pipefail_scope "$repo_root")"
+    for want in scripts/lib.sh scripts/tests/harness.sh; do
+        grep -qxF "$repo_root/$want" <<<"$scope" || missing="$missing $want"
+    done
+    [ -z "$missing" ] \
+        && ok "and the sourced libraries are in scope, which is the half that was silently absent" \
+        || fail "pipefail: sourced" "these sourced libraries are outside the scan, so a racy line \
+in one would run under every suite's pipefail and go unreported:$missing"
+
+    # THE ONE WAY THE CONDITION CAN BE WRONG, checked rather than trusted. An executed script does
+    # not inherit its parent's shell options — measured: a `set -uo pipefail` parent running
+    # `./child.sh` leaves the child with pipefail OFF — which is what lets this rule exempt the
+    # two `.claude/hooks` scripts. But `export SHELLOPTS` propagates them, measured on the same
+    # bash: the child then reports pipefail ON. Nothing here exports it and the hooks are invoked
+    # as `bash "<path>"`, so the exemption is sound today; a single `export SHELLOPTS` anywhere
+    # would make it wrong everywhere at once, silently. That is the shape this whole round is
+    # about, so it is a check and not a sentence.
+    local exporters
+    exporters="$(grep -rlE '^[[:space:]]*export[[:space:]]+[^#]*\<(SHELL|BASH)OPTS\>' \
+                     "$repo_root/scripts" "$repo_root/.container" "$repo_root/.claude/hooks" \
+                     2>/dev/null || true)"
+    [ -z "$exporters" ] \
+        && ok "and nothing exports SHELLOPTS, which would put every executed script under pipefail" \
+        || fail "pipefail: shellopts" "these files export SHELLOPTS/BASHOPTS, so every script they \
+run inherits pipefail and the per-file condition above is no longer the right question: \
+$(printf '%s' "$exporters" | tr '\n' ' ')"
 }
 
 # --- 5. the rule itself --------------------------------------------------------------------
