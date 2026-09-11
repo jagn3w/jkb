@@ -667,6 +667,17 @@ run "PID 1 never wait()s (tini replaced by an init that observes its child with 
 # declaring one the RUN fails and this reports BUILD-FAILED — honest about being tooling — instead
 # of a healthy guard appearing not to fire. Same rule as the no-reaper mutant above.
 
+# EACH MUTATION ASSERTS THAT ITS PATCH TOOK, which is not belt-and-braces. `sed` that matches
+# nothing exits 0: entrypoint.sh's marker write moves into a helper, or its `exec` line gets
+# wrapped -- ordinary edits, and this area was rewritten twice while it was being built -- and then
+# the pattern is stale, the build succeeds, `run()` tests an image byte-identical to the healthy
+# one, verify.sh passes, and `judge` reports MISSED under "N guard(s) did not fire". The reader
+# then audits ns_verdict while the real cause is a dead pattern in this file. `! cmp -s` against a
+# pre-patch copy turns that into BUILD-FAILED, which `run()` reports as SKIPPED and which is honest
+# about being tooling rather than a healthy guard failing to fire. The no-reaper mutant two rows
+# above has always ended in a positive assertion that its replacement took effect; these did not.
+# mutate-verify.sh needs Docker, so nothing in the gate could have noticed.
+
 # 1. THE MARKER IS NEVER WRITTEN. Deleting the write leaves entrypoint.sh's delete-on-entry intact,
 #    so the container comes up with no record of its own namespaces and verify.sh has no way to
 #    know whether its subject is this container. It must refuse, not assume.
@@ -675,7 +686,7 @@ run "PID 1 never wait()s (tini replaced by an init that observes its child with 
 #    guard would never be watched firing: the exact defect this file exists to find, introduced by
 #    the mutation meant to prove it fires. Caught by the `bash -n` below, run against a copy on the
 #    host before it ever reached a daemon.
-mutant jkb-dev-no-ns-marker "test -n \"\$JKB_NS_MARKER\" && sed -i 's|^ *printf .*JKB_NS_MARKER.*|    :|' /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
+mutant jkb-dev-no-ns-marker "test -n \"\$JKB_NS_MARKER\" && cp /usr/local/bin/entrypoint.sh /tmp/ep.orig && sed -i 's|^ *printf .*JKB_NS_MARKER.*|    :|' /usr/local/bin/entrypoint.sh && ! cmp -s /tmp/ep.orig /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
 run "the container records no namespace identity" "recorded no namespace identity" \
     "${HEALTHY[@]}"
 
@@ -688,7 +699,7 @@ run "the container records no namespace identity" "recorded no namespace identit
 #    trusted to leave `\n` alone. `&` is the matched exec line, so this PREPENDS the forgery to it —
 #    the same position the real write occupies, immediately before the handover. Two `echo`s need
 #    no escapes at all. Verified by running this exact command against a copy of entrypoint.sh.
-mutant jkb-dev-forged-ns-marker "test -n \"\$JKB_NS_MARKER\" && sed -i 's|^exec .*JKB_REAPER.*|echo pid=pid:[1] > \"\$JKB_NS_MARKER\"; echo mnt=mnt:[1] >> \"\$JKB_NS_MARKER\"; &|' /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
+mutant jkb-dev-forged-ns-marker "test -n \"\$JKB_NS_MARKER\" && cp /usr/local/bin/entrypoint.sh /tmp/ep.orig && sed -i 's|^exec .*JKB_REAPER.*|echo pid=pid:[1] > \"\$JKB_NS_MARKER\"; echo mnt=mnt:[1] >> \"\$JKB_NS_MARKER\"; &|' /usr/local/bin/entrypoint.sh && ! cmp -s /tmp/ep.orig /usr/local/bin/entrypoint.sh && bash -n /usr/local/bin/entrypoint.sh"
 run "the recorded namespace identity is not this container's" "NOT this container's namespaces" \
     "${HEALTHY[@]}"
 

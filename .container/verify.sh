@@ -215,14 +215,29 @@ pstat() { # pstat <pid> -> 0 present (sets PS_*) | 1 gone | 2 unreadable
 # Pure, taking its four observations as arguments, for the reason settle_step and reaper_verdict are:
 # the arm that matters most is the one no healthy container can reach.
 ns_verdict() { # ns_verdict <recorded-pid> <recorded-mnt> <observed-pid> <observed-mnt>
+    # THE OBSERVATION IS TESTED FIRST, AND THE ORDER IS THE WHOLE OF IT. Both reads are forks --
+    # `readlink` for the observation, `cat` for the record -- so a container that cannot fork
+    # returns EMPTY FOR BOTH, and whichever test runs first decides what such a container is told.
+    # That is not a corner case: it is the measured end state of the leak the reaping assertion
+    # below exists to name, ~4083 of 4096 pids spent on zombies (README.md).
+    #
+    # Asked record-first, it answered `no-marker` and sent the operator to rebuild the image, while
+    # this arm's own comment claimed -- in so many words -- that a pid-exhausted container lands
+    # HERE, and its `docker stats` remedy was unreachable. A comment asserting what the code beside
+    # it does not do, in the file whose subject is guards that cannot fire. `reaper_verdict` below
+    # has always had this precedence right, which is what makes the disagreement a defect rather
+    # than a choice.
+    #
+    # It is also right on its own terms: whether our own namespaces are readable is a fact about
+    # THIS process, and it dominates whatever a file on disk says. A record can only be interpreted
+    # by something that knows what it is holding.
+    { [ -n "$3" ] && [ -n "$4" ]; } || { printf 'unreadable'; return; }
     # Absence of the record is not evidence of anything. entrypoint.sh deletes the marker on entry
     # and writes it only on reaching the handover, so absence means this container did not start
     # through entrypoint.sh (`--entrypoint bash`) or did not finish starting -- never "it matches".
+    # Reached only once the observation IS readable, which is the ordinary Linux host case: /proc
+    # is there, /run/jkb/ns is not, and "no marker" is the honest answer.
     { [ -n "$1" ] && [ -n "$2" ]; } || { printf 'no-marker'; return; }
-    # An unobtainable observation must never be spelled as a definite answer. This is also where a
-    # container at its --pids-limit lands, `readlink` being a fork -- which is the end state of the
-    # very leak the reaping assertion exists to name, so the refusal says so.
-    { [ -n "$3" ] && [ -n "$4" ]; } || { printf 'unreadable'; return; }
     { [ "$1" = "$3" ] && [ "$2" = "$4" ]; } || { printf 'nested'; return; }
     printf 'ours'
 }
@@ -361,6 +376,12 @@ if [ "$SELF_TEST" = yes ]; then
         "$(ns_verdict "$P" "$M" "" "")" "unreadable"
     st2 "...including when only one of the two could be read" \
         "$(ns_verdict "$P" "$M" "$P" "")" "unreadable"
+    # THE ROW THAT PINS THE PRECEDENCE, and its absence is why the table was satisfied by either
+    # order. A container that cannot fork fails BOTH reads, so this is the only input that
+    # distinguishes record-first from observation-first — and it is the input a pid-exhausted
+    # container actually produces, which is the state the reaping assertion exists to name.
+    st2 "a container that cannot fork fails BOTH reads, and is told THAT — not to rebuild" \
+        "$(ns_verdict "" "" "" "")" "unreadable"
 
     # Assertion 1b's judgement. Only ONE of these arms is reachable in a healthy container, so
     # without this the rest are unreachable code in a change whose whole subject is a check that
@@ -438,8 +459,10 @@ fi
 # for a plain Linux host — where the variable is absent precisely because there is no container.
 ns_rec="$(cat "${JKB_NS_MARKER:-}" 2>/dev/null)" || ns_rec=""
 rec_pid="$(kv_field pid "$ns_rec")"; rec_mnt="$(kv_field mnt "$ns_rec")"
-obs="$(readlink "$PROC/self/ns/pid" "$PROC/self/ns/mnt" 2>/dev/null)" || obs=""
-obs_pid="$(printf '%s\n' "$obs" | sed -n 1p)"; obs_mnt="$(printf '%s\n' "$obs" | sed -n 2p)"
+# ns_pair is egress-lib.sh's, shared with the entrypoint that WRITES the record this reads, so the
+# two halves cannot drift. Its own self-test covers the transposition a single `readlink a b` can
+# produce; this gathering is otherwise exercised only by running it in a container.
+ns_pair "$PROC/self/ns"; obs_pid="$NS_PID"; obs_mnt="$NS_MNT"
 
 case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
     ours) ;;

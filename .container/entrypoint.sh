@@ -305,18 +305,16 @@ esac
 # `--bind / /` is recursive, so this file is readable from inside such a sandbox while its /proc is
 # not the same -- which is exactly what makes the comparison discriminate.
 #
-# ONE FORK, AND A FAILED READ LEAVES ABSENCE RATHER THAN AN EMPTY MARKER. `readlink` takes both
-# links in one call. The values are collected BEFORE the file is touched, because `> "$MARKER"`
+# THE READ IS ns_pair, IN egress-lib.sh, SHARED WITH verify.sh -- one algorithm, covered by that
+# library's own self-test, rather than this block and verify.sh's copy drifting apart. The values
+# are collected BEFORE the file is touched, because `> "$MARKER"`
 # truncates as soon as it is evaluated -- so writing through a failing pipeline would replace
 # "nothing was recorded", which verify.sh refuses on, with "both namespaces are the empty string",
 # which is a record making a claim. The directory is the seam the self-test injects, as
 # JKB_EGRESS_VERDICT and JKB_REAPER are: there is no /proc/self/ns on the macOS host it runs on.
-ns_dir="${JKB_NS_DIR:-/proc/self/ns}"
-ns_read="$(readlink "$ns_dir/pid" "$ns_dir/mnt" 2>/dev/null)" || ns_read=""
-ns_pid="$(printf '%s\n' "$ns_read" | sed -n 1p)"
-ns_mnt="$(printf '%s\n' "$ns_read" | sed -n 2p)"
-if [ -n "$ns_pid" ] && [ -n "$ns_mnt" ]; then
-    printf 'pid=%s\nmnt=%s\n' "$ns_pid" "$ns_mnt" > "$JKB_NS_MARKER" || true
+ns_pair "${JKB_NS_DIR:-/proc/self/ns}"
+if [ -n "$NS_PID" ] && [ -n "$NS_MNT" ]; then
+    printf 'pid=%s\nmnt=%s\n' "$NS_PID" "$NS_MNT" > "$JKB_NS_MARKER" || true
 fi
 
 exec "${JKB_REAPER:?the image must set JKB_REAPER (see the Dockerfile) — refusing to become PID 1 without a reaper}" -- "$@"
