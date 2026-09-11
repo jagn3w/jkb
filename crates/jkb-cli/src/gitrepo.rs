@@ -67,92 +67,66 @@ pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
 /// in the binary is not a cost worth a second copy of a security rule.
 pub(crate) const REPO_SELECTION_VARS: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
 
-/// The configuration a TEST FIXTURE must not inherit — `(var, Some(value))` to set it,
-/// `(var, None)` to remove it. One list, applied by [`isolate_fixture_config`] and checked by
-/// [`assert_isolated`], so the two cannot drift.
+/// The integration crates' fixture isolation, COMPILED INTO THIS CRATE'S TEST BUILD TOO.
 ///
-/// Deliberately WIDER than [`scrub_repo_selection`], which production uses: production keeps
-/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` because this project's dev container carries its
-/// `safe.directory` grants there, while a fixture must not inherit configuration it did not
-/// choose. Two rules, not drift. The env-injected form OUTRANKS the files pointed at
-/// `/dev/null`, so those alone are not isolation.
+/// `jkb-cli` is bin-only, so an integration test cannot import anything from here and this file
+/// used to carry its own copy of the list — `FIXTURE_CONFIG` — with a test that parsed both out of
+/// their source files and compared them. That test was deleted with the copy: it compared two
+/// pieces of TEXT rather than two environments (round 24 measured a function drifting from a list
+/// both copies agreed on), and its failure message said the lists "disagree", which reads as an
+/// instruction to sync them — the precise edit round 25 measured as reopening the scrub hole.
+///
+/// One source text, three compilations, no parity to check. `tests/common/mod.rs` uses only
+/// `std`, so it compiles here unchanged.
 #[cfg(test)]
-pub(crate) const FIXTURE_CONFIG: &[(&str, Option<&str>)] = &[
-    ("GIT_CONFIG_COUNT", None),
-    ("GIT_CONFIG_PARAMETERS", None),
-    ("GIT_CONFIG_GLOBAL", Some("/dev/null")),
-    ("GIT_CONFIG_SYSTEM", Some("/dev/null")),
-    ("GIT_AUTHOR_NAME", Some("t")),
-    ("GIT_AUTHOR_EMAIL", Some("t@t")),
-    ("GIT_COMMITTER_NAME", Some("t")),
-    ("GIT_COMMITTER_EMAIL", Some("t@t")),
-];
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod fixture_env;
 
-/// Apply [`FIXTURE_CONFIG`] to `cmd`.
+/// The oracle for [`scrub_repo_selection`], written down rather than computed.
 ///
-/// One function, because the block used to be written out inline in `gitrepo`'s and
-/// `archive`'s fixtures and nothing observed either copy: measured, deleting the whole block
-/// from BOTH left 118 tests green, since `assert_scrubbed` names only the selection variables.
-/// The state that produced is the harm all three comment blocks describe — on a machine that
-/// sets `core.hooksPath` globally and signs commits, the fixtures' `git commit` runs the
-/// developer's arbitrary global hooks and tries to sign.
+/// A LITERAL on purpose, and never [`REPO_SELECTION_VARS`]. Production iterates that list, so an
+/// assertion that also read it would shrink with it: measured in round 25, deleting
+/// `"GIT_WORK_TREE"` from the list left 260 tests passing while every `git` and `gh` spawn in the
+/// crate inherited an exported one. That is the whole reason a test's expected value is a thing
+/// somebody wrote down — two artifacts, one production and one test, never the same source.
+///
+/// Round 24 had the opposite defect and the fix for it created this one: the applying function
+/// restated the names instead of iterating them, so it could quietly scrub MORE than the list
+/// said. Both directions are now closed, by iterating on the production side and comparing for
+/// EQUALITY here — a name added to the list forces an edit next to this paragraph, which is where
+/// the reason lives.
 #[cfg(test)]
-pub(crate) fn isolate_fixture_config(cmd: &mut Command) {
-    for (key, value) in FIXTURE_CONFIG {
-        match *value {
-            Some(v) => cmd.env(key, v),
-            None => cmd.env_remove(key),
-        };
-    }
-}
+const EXPECT_SELECTION_REMOVED: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
 
-/// Assert that `cmd` inherits neither the caller's repository selection nor their configuration.
+/// Assert that `cmd` removes EXACTLY the repository selectors, plus `also` where a tool has its
+/// own (`gh` names a repository outright through `GH_REPO`).
 ///
-/// For FIXTURES only. Production spawns are checked with [`assert_scrubbed`], which is the
-/// narrower claim they actually make.
+/// Equality, not a superset. A superset check cannot see a list that grew, and "it scrubs at
+/// least these" is how a blanket sweep gets in — `config_injection_is_left_alone` names the two
+/// variables this deliberately does NOT remove, and that test would have gone on passing beside a
+/// removal of them.
 #[cfg(test)]
-pub(crate) fn assert_isolated(what: &str, cmd: &Command) {
-    assert_scrubbed(what, cmd);
-    let envs: Vec<(String, Option<String>)> = cmd
-        .get_envs()
-        .map(|(k, v)| {
-            (
-                k.to_string_lossy().into_owned(),
-                v.map(|v| v.to_string_lossy().into_owned()),
-            )
-        })
-        .collect();
-    for (key, want) in FIXTURE_CONFIG {
-        let got = envs.iter().find(|(k, _)| k == key);
-        assert!(
-            got.is_some_and(|(_, v)| v.as_deref() == *want),
-            "{what}: {key} is not {}; the developer's global git configuration reaches this \
-             fixture. envs: {envs:?}",
-            want.map_or_else(|| "removed".to_owned(), |v| format!("set to {v}"))
-        );
-    }
-}
-
-/// Assert that `cmd` will not inherit the caller's repository selection.
-///
-/// Shared by the tests at all three call sites: what must be pinned is that each SPAWN is
-/// scrubbed, not that the scrubbing function works. Removing the call from `gh` or from the
-/// gate runner left a test of the primitive perfectly green — the same lesson `install_exec`
-/// already carries, that a test of the primitive is not the claim.
-#[cfg(test)]
-pub(crate) fn assert_scrubbed(what: &str, cmd: &Command) {
-    let removed: Vec<String> = cmd
+pub(crate) fn assert_scrubbed(what: &str, cmd: &Command, also: &[&str]) {
+    let mut removed: Vec<String> = cmd
         .get_envs()
         .filter(|(_, v)| v.is_none())
         .map(|(k, _)| k.to_string_lossy().into_owned())
         .collect();
-    for want in REPO_SELECTION_VARS {
-        assert!(
-            removed.iter().any(|k| k == want),
-            "{what}: {want} is not removed; an exported one outranks the working directory \
-             and points the tool at another repository. removed: {removed:?}"
-        );
-    }
+    let mut want: Vec<String> = EXPECT_SELECTION_REMOVED
+        .iter()
+        .chain(also)
+        .map(|s| (*s).to_owned())
+        .collect();
+    removed.sort();
+    want.sort();
+    assert_eq!(
+        removed, want,
+        "{what}: the removed set must be exactly the repository selectors. A missing one outranks \
+         the working directory and points the tool at another repository; an extra one is a \
+         blanket sweep, which this crate refuses deliberately (see \
+         `config_injection_is_left_alone`). Do not reconcile this by editing the list it is \
+         checked against — that is the edit measured to reopen the hole."
+    );
 }
 
 /// Blank every comment and string literal, so a source-scanning test sees code and not text.
@@ -1667,109 +1641,6 @@ mod tests {
         );
     }
 
-    /// Every quoted string on the lines of `const <name>`, up to the closing `];`.
-    ///
-    /// Enough of a parser for two `&[…]` literals and no more — it is here to compare two
-    /// lists, not to model Rust.
-    fn const_rows(src: &str, name: &str) -> Vec<Vec<String>> {
-        let needle = format!("const {name}");
-        let mut rows = Vec::new();
-        let mut inside = false;
-        for line in src.lines() {
-            if !inside {
-                // Not a COMMENT that names it. This file carries the test's own prose about
-                // both constants, and latching onto a sentence would collect any quoted words
-                // in it and then go on to find the real rows below — so the mistake would pass
-                // rather than fail, which is the only kind worth a guard here.
-                if line.contains(&needle) && !line.trim_start().starts_with("//") {
-                    inside = true;
-                    // A one-line const carries its whole body here.
-                    let row = quoted(line);
-                    if !row.is_empty() {
-                        rows.push(row);
-                    }
-                    if line.trim_end().ends_with("];") {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if line.trim() == "];" {
-                break;
-            }
-            let row = quoted(line);
-            if !row.is_empty() {
-                rows.push(row);
-            }
-        }
-        assert!(!rows.is_empty(), "found no rows for `const {name}`");
-        rows
-    }
-
-    /// The double-quoted string literals on one line, in order.
-    fn quoted(line: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut rest = line;
-        while let Some(a) = rest.find('"') {
-            let after = &rest[a + 1..];
-            let Some(b) = after.find('"') else { break };
-            out.push(after[..b].to_owned());
-            rest = &after[b + 1..];
-        }
-        out
-    }
-
-    /// The library's fixture isolation and the integration crates' must describe the SAME
-    /// environment.
-    ///
-    /// They are two lists on purpose — [`FIXTURE_CONFIG`] is `#[cfg(test)]`, and an integration
-    /// test is a separate crate compiled with `cfg(test)` off, so it cannot see it — and each
-    /// was asserted only against the fixtures beside it. That catches a fixture which stops
-    /// applying its own list; it does not catch a list that GROWS on one side, which is the
-    /// likelier edit and the historical one ("`isolate_git_env` unset five of seven"). Harden
-    /// one crate's fixtures against a new variable and the other's keep inheriting it, suite
-    /// green, while the doc comment says each is asserted against the function beside it as
-    /// though that closed the gap.
-    ///
-    /// So the two are compared at their source, the way the `SCRUBBERS` identity assertion
-    /// already compares a list against the thing that consumes it.
-    #[test]
-    fn the_two_fixture_isolation_lists_describe_the_same_environment() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read gitrepo.rs");
-        let tests =
-            std::fs::read_to_string(root.join("tests/common/mod.rs")).expect("read common/mod.rs");
-
-        // `(name, Some(value))` to set, `(name, None)` to remove — both sides normalised to it.
-        let mut library: Vec<(String, Option<String>)> = Vec::new();
-        for row in const_rows(&src, "FIXTURE_CONFIG") {
-            let (key, value) = (row[0].clone(), row.get(1).cloned());
-            library.push((key, value));
-        }
-        for row in const_rows(&src, "REPO_SELECTION_VARS") {
-            for key in row {
-                library.push((key, None));
-            }
-        }
-        let mut integration: Vec<(String, Option<String>)> = Vec::new();
-        for row in const_rows(&tests, "MUST_DROP") {
-            for key in row {
-                integration.push((key, None));
-            }
-        }
-        for row in const_rows(&tests, "MUST_SET") {
-            integration.push((row[0].clone(), Some(row[1].clone())));
-        }
-        library.sort();
-        integration.sort();
-        assert_eq!(
-            library, integration,
-            "the library's fixture isolation (FIXTURE_CONFIG + REPO_SELECTION_VARS) and the \
-             integration crates' (MUST_DROP + MUST_SET) disagree, so one crate's fixtures \
-             inherit something the other's do not"
-        );
-    }
-
     /// Every git spawn in this module drops the caller's repository selection.
     ///
     /// Asserted on the built `Command` rather than by exporting the variables, because
@@ -1783,6 +1654,7 @@ mod tests {
         super::assert_scrubbed(
             "git",
             &git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]),
+            &[],
         );
     }
 
@@ -1804,7 +1676,7 @@ mod tests {
         // Selection — the half that was missing.
         super::scrub_repo_selection(&mut cmd);
         // ...and configuration, through the shared list rather than a second copy of it.
-        super::isolate_fixture_config(&mut cmd);
+        super::fixture_env::isolate_git_env(&mut cmd);
         cmd
     }
 
@@ -1813,7 +1685,7 @@ mod tests {
     /// also lets `gitrepo::tests` commit into an unrelated dirty repository.
     #[test]
     fn the_test_fixtures_do_not_reach_another_repository() {
-        super::assert_isolated(
+        super::fixture_env::assert_isolated(
             "gitrepo fixture",
             &fixture_git(Path::new("/somewhere"), &["status"]),
         );

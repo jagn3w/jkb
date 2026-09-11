@@ -1959,7 +1959,7 @@ mod tests {
         crate::gitrepo::scrub_repo_selection(&mut cmd);
         // ...and configuration, through the shared list rather than a second copy of it. Both
         // copies used to be written out here and in `gitrepo.rs`, and nothing observed either.
-        crate::gitrepo::isolate_fixture_config(&mut cmd);
+        crate::gitrepo::fixture_env::isolate_git_env(&mut cmd);
         cmd
     }
 
@@ -1969,7 +1969,7 @@ mod tests {
     /// as covered; the same round fixed that for one sibling and left this one live.
     #[test]
     fn the_archive_fixture_does_not_reach_another_repository() {
-        crate::gitrepo::assert_isolated(
+        crate::gitrepo::fixture_env::assert_isolated(
             "archive fixture",
             &fixture_git(Path::new("/somewhere"), &["status"]),
         );

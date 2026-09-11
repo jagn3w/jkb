@@ -86,6 +86,30 @@ pub const MUST_SET: &[(&str, &str)] = &[
 ];
 
 /// Assert `cmd` carries the whole isolation — both halves of it.
+/// The oracle for [`isolate_git_env`], written down rather than computed.
+///
+/// LITERALS, and never `MUST_DROP`/`MUST_SET`, which the function iterates. An assertion that read
+/// the same lists would shrink with them — measured in round 25 on the sibling rule in
+/// `gitrepo.rs`: deleting one name from the production list left 260 tests passing while every
+/// spawn inherited the variable. Production iterates a list; a test's expected value is written
+/// down; the two are never the same source.
+const EXPECT_DROPPED: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+];
+
+const EXPECT_SET: &[(&str, &str)] = &[
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_AUTHOR_NAME", "t"),
+    ("GIT_AUTHOR_EMAIL", "t@t"),
+    ("GIT_COMMITTER_NAME", "t"),
+    ("GIT_COMMITTER_EMAIL", "t@t"),
+];
+
 pub fn assert_isolated(what: &str, cmd: &Command) {
     let envs: Vec<(String, Option<String>)> = cmd
         .get_envs()
@@ -96,13 +120,24 @@ pub fn assert_isolated(what: &str, cmd: &Command) {
             )
         })
         .collect();
-    for want in MUST_DROP {
-        assert!(
-            envs.iter().any(|(k, v)| k == want && v.is_none()),
-            "{what}: {want} is not removed; envs: {envs:?}"
-        );
-    }
-    for (key, want) in MUST_SET {
+    // EQUALITY on the removed set. A superset check cannot see a list that GREW, and a fixture
+    // that quietly removes more than it says is how a variable a test depends on disappears.
+    let mut removed: Vec<String> = envs
+        .iter()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut want: Vec<String> = EXPECT_DROPPED.iter().map(|s| (*s).to_owned()).collect();
+    removed.sort();
+    want.sort();
+    assert_eq!(
+        removed, want,
+        "{what}: the removed set must be exactly the variables a fixture must not inherit. Do \
+         not reconcile this by editing MUST_DROP — that is the edit measured to reopen the hole."
+    );
+    // ...and a SUPERSET on the set ones, deliberately: `Fixture::jkb` legitimately adds its own
+    // variables (HOSTNAME and friends), so equality here would fail on something harmless.
+    for (key, want) in EXPECT_SET {
         assert!(
             envs.iter()
                 .any(|(k, v)| k == key && v.as_deref() == Some(*want)),

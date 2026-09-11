@@ -321,28 +321,18 @@ mod tests {
     #[test]
     fn the_gh_spawn_does_not_inherit_a_repository_selection() {
         let cmd = super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]);
-        crate::gitrepo::assert_scrubbed("gh", &cmd);
-        // ...and gh's OWN selectors, which git's three do not cover.
-        let removed: Vec<String> = cmd
-            .get_envs()
-            .filter(|(_, v)| v.is_none())
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
-        // NAMED LITERALLY, not read from the constant this is guarding. Iterating
-        // `GH_SELECTION_VARS` meant both loops shrank together: editing the const to
-        // `&["GH_REPO"]` — the likeliest edit, since GH_HOST rests on unverified documentation —
-        // reopened the hole with the test green, and `&[]` asserted nothing at all while
-        // production removed nothing. `REPO_SELECTION_VARS` two functions away is a SEPARATE
-        // expectation list from the `.env_remove` calls it checks, which is exactly why deleting
-        // one of those calls is caught. Same rule here.
-        for want in ["GH_REPO", "GH_HOST"] {
-            assert!(
-                removed.iter().any(|k| k == want),
-                "gh: {want} is not removed; it names a repository outright and outranks the \
-                 working directory, so close-merged would answer about another repo. \
-                 removed: {removed:?}"
-            );
-        }
+        // gh's OWN selectors go through the same assertion, as `also`. NAMED LITERALLY, not read
+        // from the constant this is guarding: iterating `GH_SELECTION_VARS` meant both loops
+        // shrank together — editing the const to `&["GH_REPO"]`, the likeliest edit since GH_HOST
+        // rests on unverified documentation, reopened the hole with the test green, and `&[]`
+        // asserted nothing at all while production removed nothing.
+        //
+        // The paragraph that stood here also said `REPO_SELECTION_VARS` "is a SEPARATE expectation
+        // list from the `.env_remove` calls it checks". That stopped being true in round 24, when
+        // `scrub_repo_selection` was changed to iterate it — and round 25 measured the hole that
+        // opened. `assert_scrubbed` now holds its own literal, so this file's rule and the crate's
+        // are the same rule again, which is why the hand-rolled loop below is gone.
+        crate::gitrepo::assert_scrubbed("gh", &cmd, &["GH_REPO", "GH_HOST"]);
     }
     use super::{spent, Discovery, PullRequest, Staleness};
     use jkb_fsm::Fact;

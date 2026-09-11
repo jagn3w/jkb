@@ -480,6 +480,7 @@ mod tests {
         crate::gitrepo::assert_scrubbed(
             "gate",
             &super::gate_cmd(std::path::Path::new("/somewhere"), "true"),
+            &[],
         );
     }
     use super::{branch_for, mint_name, name_from_branch, LandLock};
