@@ -491,6 +491,16 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
         } >&2
         exit 2
         ;;
+    # A VERDICT WITH NO ARM MUST NOT OPEN THE GATE. `set -uo pipefail` is on and `set -e` is not, so
+    # an unmatched `case` is a no-op returning 0 -- which here means falling through into every
+    # assertion below with the subject UNVERIFIED, the one failure direction this gate exists to
+    # prevent. The verdict words and these arms are two lists, and the next edit to ns_verdict is
+    # the one that forgets this one. reaper_verdict's `case` carries the identical arm for the
+    # identical reason; this one was missing it, found by asking who else implements the rule.
+    *)
+        bad "could not establish whose namespaces these are: unrecognised verdict '$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")' — ns_verdict gained a word this case has no arm for, and an unhandled verdict must refuse rather than let every assertion below run against an unverified subject"
+        exit 2
+        ;;
 esac
 
 echo "==> container posture"
