@@ -97,6 +97,30 @@ The refusal prints a `FAIL` line rather than only writing to stderr, because `mu
 meeting. Two mutations exist for it: the marker never written, and the marker naming somebody
 else's namespaces.
 
+**Measured, on a real daemon, after two discriminators that were not** (2026-09-11):
+
+- `mutate-verify.sh --control` passes, **18/18** — and its `PID 1 is: /usr/bin/tini -- bash -c …`
+  line is the topology that matters: the harness runs `verify.sh` as the container's OWN main
+  command, a direct child of PID 1, which is exactly what the ppid walk refused. That refusal took
+  the control, all sixteen mutations and four CI steps with it.
+- The full harness reports **20/20 CAUGHT**, with the matcher shown to stay quiet about a healthy
+  container. Three of those rows are new and none had ever been observed firing before: `PID 1
+  never wait()s` — the assertion this whole branch exists to add — plus the marker never written
+  and the marker naming somebody else's namespaces.
+- Inside `bwrap $(bwrap-probe.sh --print-invocation proc)` it **refuses, naming both pairs**:
+
+      recorded by the container's entrypoint:  pid=pid:[4026532556]  mnt=mnt:[4026532553]
+      observed by this process:                pid=pid:[4026532691]  mnt=mnt:[4026532690]
+
+  Both axes differ, which is the evidence that recording *two* ids was not belt-and-braces: a
+  starttime comparison would have seen only the first, and a fresh mount namespace alone is a
+  state it could not have refused.
+- A plain attached terminal runs **19/19**, PID 1 `/usr/bin/tini -- sleep infinity`.
+
+A refusal that does not print what it compared is the previous discriminator again — it refused
+without ever showing its evidence, which is why nobody noticed it was answering a different
+question. That is why the pairs are in the message and not only in the reasoning.
+
 **Residual, stated:** the marker is `vscode`-owned, so a session inside can forge it. Forging can
 only produce a *refusal* for anyone genuinely in the container's namespaces; the only false pass it
 buys is for a run inside the same sandbox as the forger — an agent lying to its own verifier, which
