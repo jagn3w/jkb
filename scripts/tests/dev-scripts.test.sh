@@ -531,11 +531,23 @@ in one would run under every suite's pipefail and go unreported:$missing"
     # is the absence of a match must be shown capable of a match, or it is a guard that cannot
     # fire — which is what the whole of round 24 was about.
     local exporters miss="" false_hit="" n=0 form want
-    # `export` IS NOT THE ONLY SPELLING. `declare -x`, `typeset -x` and `readonly -x` set the
-    # export attribute identically — measured: `bash -c 'set -uo pipefail; declare -x SHELLOPTS;
-    # ./child.sh'` leaves the child with pipefail ON, exactly as `export` does. Nine variants of
-    # one keyword read as thorough while three other keywords walked past, under an `ok` message
-    # that named the count.
+    # `export` IS NOT THE ONLY SPELLING — but only two of the other three actually leak, and the
+    # difference was measured rather than assumed the second time. `bash -c 'set -uo pipefail;
+    # <spelling>; ./child.sh'`, asking the child whether `pipefail` is on:
+    #
+    #     export SHELLOPTS       ON        readonly SHELLOPTS     off
+    #     declare -x SHELLOPTS   ON        declare SHELLOPTS      off
+    #     typeset -x SHELLOPTS   ON
+    #
+    # The first version of this paragraph said all four "set the export attribute identically —
+    # measured", having measured `declare -x` alone and generalised. `readonly` sets no export
+    # attribute at all.
+    #
+    # The pattern still matches all four keywords, DELIBERATELY: it is a line-shaped check, the
+    # cost of a match is one loud failure a reader can dismiss in a second, and the cost of a miss
+    # is an exemption that quietly stops being true. So the table below asserts what the PATTERN
+    # does, not what leaks — `readonly SHELLOPTS` is a hit here and harmless in reality, and that
+    # is written down rather than left for the next reader to re-derive.
     #
     # Still LINE-INITIAL, and that bound is stated rather than hidden: `[ -n "$x" ] && export
     # SHELLOPTS` is not matched. Widening to "anywhere on the line" would match the word inside
@@ -571,14 +583,15 @@ hit|export FOO SHELLOPTS
 hit|declare -x SHELLOPTS
 hit|typeset -x BASHOPTS
 hit|readonly SHELLOPTS
+hit|declare SHELLOPTS
 miss|export MYSHELLOPTS
 miss|export SHELLOPTSFOO
 miss|# export SHELLOPTS
 miss|echo export SHELLOPTS
 SPELLINGS
     rm -f "$fake/scripts/exporter.sh"
-    if [ "$n" -ne 12 ]; then
-        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 12"
+    if [ "$n" -ne 13 ]; then
+        fail "pipefail: shellopts-premise" "read $n spelling(s), expected 13"
     elif [ -n "$miss" ]; then
         fail "pipefail: shellopts-premise" "the exported-SHELLOPTS pattern does not match these \
 real spellings, and a guard satisfied by absence cannot tell that from a clean tree:$miss"
