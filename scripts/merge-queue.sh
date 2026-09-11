@@ -44,7 +44,10 @@ set -uo pipefail
 # remember is the defect this repository keeps rediscovering, and a tenth git call added below
 # would not have to remember this one. The six names are `gitrepo::REPO_SELECTION_VARS` — which
 # repository, and which parts of one — kept in step with it by
-# `git-hooks.test.sh`'s bare-git scan.
+# `dev-scripts.test.sh`'s case6, which reads the six names out of `REPO_SELECTION_VARS` itself.
+# (Not `git-hooks.test.sh`'s bare-git scan, which this line used to name: that one reads only
+# `scripts/lib.sh` and knows nothing about variable NAMES — it checks that calls go through the
+# wrapper, not what the wrapper strips.)
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
       GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 

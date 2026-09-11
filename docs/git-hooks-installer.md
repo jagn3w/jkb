@@ -155,7 +155,11 @@ conventions every session is expected to know.
   "the chainer there is not hidden … that working tree will read dirty" beside `dispatch=dead`
   ("nothing runnable is at …"), about an empty directory in a clean tree: two contradictory
   statements in one report. `exposed` now needs both ownership and existence.
-- **jkb's own git calls strip `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`** (`_git`). Those
+- **jkb's own git calls strip every variable naming a repository or a part of one** — six since
+  round 28: `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` and
+  `GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY`/`GIT_ALTERNATE_OBJECT_DIRECTORIES` (`_git`, and
+  `gitrepo::scrub_repo_selection`). The headline said three for four rounds after the nested
+  bullet below it said six. Those
   outrank `-C`, so with `GIT_WORK_TREE` exported — the standard bare-dotfiles shell recipe —
   `--show-toplevel` answered somebody else's tree and `install_git_hooks` **created `.githooks/`
   inside that unrelated repository**, reporting `dispatch=chained`, while the repo it was asked
