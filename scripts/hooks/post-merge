@@ -497,8 +497,11 @@ fi
 # `command -v jkb` IS ASKED FIRST, and the skip line lives inside it. Written as the first arm of
 # the same `if`, the explanation printed on a machine with no jkb at all — a line blaming jkb's
 # repository discovery for a chore that could not have run either way, on every pull, from an arm
-# that had never looked for jkb. In the `same`-by-declaration case it would be the ONLY jkb line
-# on an otherwise ordinary pull. A refusal whose whole worth is that every sentence in it is true
+# that had never looked for jkb. (An earlier version of this paragraph called it "the ONLY jkb
+# line on an otherwise ordinary pull" — not true, and traced rather than argued: chore 1 always
+# emits one, either "running setup.sh" or "no build-affecting changes pulled". It was the only
+# jkb line reporting a FAILURE under a pull that had none, which is a smaller claim and the one
+# the measurement supports.) A refusal whose whole worth is that every sentence in it is true
 # cannot afford to explain the wrong reason; where jkb is absent the chore is silent, as it was
 # before this flag existed.
 if command -v jkb >/dev/null 2>&1; then

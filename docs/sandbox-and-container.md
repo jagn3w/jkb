@@ -11,7 +11,12 @@ not here**, and that file is the one that grows when `.container/` changes: what
 for, the measurements under them, the mount list, how to run and verify it. Said plainly because
 the split is not obvious from either end — this file's title names the container, and a reader
 who stops here would miss thirteen commits of decisions that landed over there (the PID-1
-reaper, the namespace-identity discriminator, the `grep -q` refusal).
+reaper, the namespace-identity discriminator, the mount list as the security boundary).
+
+The `grep -q` refusal is NOT among them, though trunk's fix for it landed in `.container/`: it is
+a repository-wide rule now, recorded in [git-hooks-installer.md](git-hooks-installer.md) and
+enforced from `scripts/tests/dev-scripts.test.sh`. Both of these lists named it here first, which
+is how a routing sentence written in the same commit as the move can still point backwards.
 
 Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the
 conventions every session is expected to know.

@@ -371,7 +371,13 @@ conventions every session is expected to know.
   sentence in it is true. It fails the same way in the layout the arm ACCEPTS, which nobody had
   measured: a `core.worktree` checkout has no `.git`, so scrubbed discovery cannot see it. So
   the skip is set on the branch where the scrubbed ask failed — covering both — and chore 2 says
-  it is skipping rather than doing it silently. **The part that was right is that the flags stay
+  it is skipping rather than doing it silently, **where there is a `jkb` to skip**. It asks
+  `command -v jkb` FIRST and the explanation lives inside that arm: printed before the check, the
+  sentence blamed jkb's repository discovery on a machine with no jkb, for a chore that could not
+  have run either way, on every pull. Round 25 found that reorder pinned by nothing — both chore-2
+  steps prepend a stub, so the jkb-absent branch never ran — and it is now driven with a PATH of
+  symlinks to the real `git`/`grep`/`bash` and no `jkb`, built from the real binaries so it holds
+  on a developer machine, where `jkb` normally IS on PATH. **The part that was right is that the flags stay
   two**: `same`-by-declaration runs setup.sh and skips chore 2, which is genuinely two answers,
   and only `elsewhere` still shares a blanket `exit` (there discovery SUCCEEDS and close-merged
   would close tasks against the wrong repo key). The underlying gap is the filed one — jkb's
@@ -937,3 +943,30 @@ conventions every session is expected to know.
   and `diff` exits 1 on every difference, so under `set -euo pipefail` the first drifting
   artifact ended the run and skipped every later generator — measured, the next line does not
   execute.
+
+- **A test's expected value is written down; production iterates a list; the two are never the
+  same source.** Two rounds got this seam wrong in opposite directions, and the second was caused
+  by the fix for the first. Round 24: `isolate_git_env` RESTATED the eleven names its constants
+  spelled, so the function could drift from both — measured, adding an `.env_remove` left all four
+  isolation guards green. I made the appliers iterate the lists and dropped the `#[cfg(test)]` on
+  `REPO_SELECTION_VARS` so `scrub_repo_selection` could iterate it too. Round 25: the rule and its
+  only guard now had ONE source — measured, deleting `"GIT_WORK_TREE"` from that list and from
+  `MUST_DROP`, two lines, left 260 tests passing while every `git` and `gh` spawn inherited an
+  exported one. The harmless defect had been traded for the harmful one: over-scrubbing costs
+  nothing, an unscrubbed selector points the tool at somebody else's repository.
+
+  The arrangement with neither hole has **production as one artifact** (the list, iterated by the
+  applier), **the test holding its own literal**, and the comparison being **equality**. Iterating
+  closes "the function does less than the list says". The literal closes "the list shrinks and
+  takes the guard with it". Equality closes "the list grows" — which is what a separate parity
+  test used to be for. Two conditions on the literal, both learned here: it lives beside the text
+  naming the harm, and its failure message says outright *not* to reconcile it by editing the
+  list, because "the lists disagree" reads as an instruction to make exactly the measured edit.
+
+  `pr.rs` had been right all along and its comment argued for it — a comment round 24 silently
+  falsified by making `scrub_repo_selection` iterate the constant it called "a SEPARATE
+  expectation list". The parity test that parsed both lists out of their source files is deleted
+  with the duplicate it existed for: it compared two pieces of TEXT rather than two environments,
+  and the crate boundary that forced the duplication (`jkb-cli` is bin-only, so an integration
+  test cannot import from `src/`) is bridged by `#[cfg(test)] #[path = "../tests/common/mod.rs"]`
+  — one source text, three compilations, no parity to check.
