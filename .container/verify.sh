@@ -159,7 +159,12 @@ pstat() { # pstat <pid> -> 0 present (sets PS_*) | 1 gone | 2 unreadable
     local l=""
     # NOT `if read`: read returns non-zero at EOF WITHOUT a trailing newline while still having
     # set the variable, so its exit code is not "did I get a line". The content is.
-    IFS= read -r l <"$PROC/$1/stat" 2>/dev/null
+    # 2>/dev/null FIRST: redirections are processed left to right, so with the input redirect
+    # first the shell reports "No such file or directory" on the REAL stderr before stderr is
+    # suppressed. An absent stat file is this function's ordinary GONE answer — it happens on every
+    # healthy run, the moment the orphan is reaped — so the wrong order printed a scary line under
+    # a passing check, which is how people learn to ignore warnings.
+    IFS= read -r l 2>/dev/null <"$PROC/$1/stat"
     if [ -n "$l" ]; then
         proc_stat_fields "$l" || return 2
         return 0
@@ -373,7 +378,7 @@ assert "runs as a non-root user (uid $(id -u))" "$([ "$(id -u)" -ne 0 ] && echo 
 PROC="${JKB_PROC:-/proc}"
 
 pid1_argv=""
-while IFS= read -r -d '' w; do pid1_argv="$pid1_argv$w "; done <"$PROC/1/cmdline" 2>/dev/null
+while IFS= read -r -d '' w; do pid1_argv="$pid1_argv$w "; done 2>/dev/null <"$PROC/1/cmdline"
 pid1_argv="${pid1_argv% }"
 
 
@@ -389,7 +394,7 @@ else
     # empty pid, which reaper_verdict reads as fork-failed -- the leak's own end state.
     pidfile="$(mktemp)"
     ( sleep 1 >/dev/null 2>&1 </dev/null & echo $! >"$pidfile" ) 2>/dev/null
-    IFS= read -r orphan <"$pidfile" 2>/dev/null || orphan=""
+    IFS= read -r orphan 2>/dev/null <"$pidfile" || orphan=""
     rm -f "$pidfile"
     case "$orphan" in ''|*[!0-9]*) orphan="" ;; esac
 
