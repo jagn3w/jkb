@@ -919,10 +919,17 @@ case9() {
     [ "$n" = "7" ] \
         && ok "and it counts what it parsed, selecting by shebang rather than by extension" \
         || fail "gate: count" "parsed $n files, expected 7: $out"
-    printf '%s\n' "$(shell_sources "$d")" | grep -q 'no-newline' \
+    # HERE-STRINGS, not pipes into `grep -q`. This suite runs under `set -uo pipefail`, and a
+    # `grep -q` exits at its first match — so a producer with anything left to write takes EPIPE
+    # and the pipeline reports the SIGPIPE rather than the match. Today's fixture is seven short
+    # paths and would never reach it; the point is that the failure would be silent and inverted
+    # (a found match read as "not found"), and that is not a property to leave depending on how
+    # big someone's next fixture is. Measured for the real instance of this in `post-merge`:
+    # the inversion starts at roughly 850 lines.
+    grep -q 'no-newline' <<<"$(shell_sources "$d")" \
         && ok "including a shebang with no trailing newline" \
         || fail "gate: no-newline" "a one-line shebang file was dropped: $(shell_sources "$d" | tr '\n' ' ')"
-    printf '%s\n' "$(shell_sources "$d")" | grep -q 'zshy' \
+    grep -q 'zshy' <<<"$(shell_sources "$d")" \
         && fail "gate: zsh" "zsh was selected; bash -n cannot parse it" \
         || ok "and not zsh, which bash -n cannot parse"
 
