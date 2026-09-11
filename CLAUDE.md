@@ -259,7 +259,7 @@ cost to learn, and which alternatives were rejected and why.
 |---|---|---|
 | [docs/git-hooks-installer.md](docs/git-hooks-installer.md) | `scripts/lib.sh`, `scripts/setup.sh`, `scripts/hooks/post-merge`, and the repository-selection scrub in `gitrepo.rs`/`pr.rs`/`session.rs` | The longest defect cluster in the repo. Seventeen review rounds on one installer, and nearly every lesson generalizes. |
 | [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `crates/jkb-fsm`, `crates/jkb-cli/src/{gitrepo,session,repo,archive,pr}.rs`, `scripts/merge-queue.sh` | Subtasks and containment (D34/D35), per-task worktrees (D36), the checkable state machine and transition log (D48), review-gated landing (D38), the design gate (D28). |
-| [docs/sandbox-and-container.md](docs/sandbox-and-container.md) | `scripts/auto-mode*`, `.container/` | The unattended-agent boundary (D48) and the container nested inside it (D49), plus the egress firewall and its verdict (D50/D51). |
+| [docs/sandbox-and-container.md](docs/sandbox-and-container.md) | `scripts/auto-mode*`, and the boundary questions about `.container/` | The unattended-agent boundary (D48) and the container nested inside it (D49), plus the egress firewall and its verdict (D50/D51). The container's OWN internals — what each layer is for, the measurements under them, the mount list, how to run and verify it — are in [.container/README.md](.container/README.md), and that is the file which grows when `.container/` changes. |
 | [docs/namespaces-and-sync.md](docs/namespaces-and-sync.md) | `jkb-sync`, `jkb-core`'s namespace/item/undo code | The namespace layout (D32), typed namespaces (D33), investigations (Dmem), and the file-sync data-loss cluster (D45/D39/D40/D42/D47). |
 | [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |
 | [docs/ui-and-review.md](docs/ui-and-review.md) | `ui/`, `.claude/workflows/code-review.js` | The explorer is a CLI client, never a bespoke backend (D31); our reviewer returns structured findings (D37). |
@@ -273,6 +273,13 @@ Some rules about this set, because a split decision record fails in predictable 
 - **A decision is recorded in exactly one of these files.** If a change spans two subjects,
   write it where the *code* lives and cross-reference from the other, rather than describing it
   twice — two copies of a rule is the defect this whole record keeps rediscovering.
+- **One member of the set does not live under `docs/`.** `.container/README.md` is the container's
+  own record and is governed by the same rules as the rows above. It is called out because the
+  table was written when the row named `.container/` outright, and trunk then recorded thirteen
+  commits of container decisions — the PID-1 reaper, the namespace-identity discriminator, the
+  `grep -q` refusal — in the README rather than in `docs/sandbox-and-container.md`. The README was
+  right and the row was wrong: a reader who follows a row to a file that has not moved in a month
+  concludes the record is dead, which is worse than no row at all.
 - **Correct in place, and keep the diagnosis.** When a decision is reversed, mark it superseded
   and say what measurement reversed it (see D46's heading, or the `dispatch=transient` reversal
   in the hooks doc). The wrong turning is usually worth more than the destination.

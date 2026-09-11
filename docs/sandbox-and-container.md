@@ -3,7 +3,15 @@
 Running the IDE and CLI with no permission prompts behind a boundary that holds when the
 model is wrong (D48), the container that nests inside it (D49), the egress firewall and
 its verdict (D50/D51). Covers `scripts/auto-mode.sh`, `scripts/auto-mode-posture.json`
-and everything under `.container/`.
+and the BOUNDARY questions about `.container/` — why there are two layers, what each one
+is asked to hold, and what the egress verdict rests on.
+
+**The container's own internals are recorded in [`.container/README.md`](../.container/README.md),
+not here**, and that file is the one that grows when `.container/` changes: what each layer is
+for, the measurements under them, the mount list, how to run and verify it. Said plainly because
+the split is not obvious from either end — this file's title names the container, and a reader
+who stops here would miss thirteen commits of decisions that landed over there (the PID-1
+reaper, the namespace-identity discriminator, the `grep -q` refusal).
 
 Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the
 conventions every session is expected to know.
