@@ -171,12 +171,28 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
   of a sentence the user can act on. Trunk is compared against the canonical name, not against two
   spellings guessed by hand.
-- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner, with **one**
-  knowledge-base call: after a genuine fast-forward it runs `jkb task landed <branch> --onto
-  <target>` to record the landing event (D46). That makes it a jkb client, so its caller must
-  export `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script
-  header states the contract. `jkb task land` is the same algorithm in Rust for the human path
-  (D36.1). The CLI is the home because the UI calls it directly and it must work in any repo.
+- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner. It makes
+  **one kind** of knowledge-base call — `jkb task landed <branch> --onto <target>`, recording the
+  landing event (D46) — from two arms: after a genuine fast-forward, and when `<target>` already
+  contains everything the branch adds. That makes it a jkb client, so its caller must export
+  `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script header
+  states the contract. The CLI is the home of the human path because the UI calls it directly and
+  it must work in any repo.
+- **`jkb task land` is NO LONGER the same algorithm**, and the divergence is deliberate rather
+  than drift, so it is recorded here instead of only in a Rust comment. Two differences, both
+  introduced on 2026-09-12 when the queue was reworked:
+  - **Ordering.** The queue gates the rebased commit while it is still detached and only then
+    fast-forwards, so `<target>` never points at an ungated commit. `jkb task land` still
+    fast-forwards first and rewinds with `reset --hard` on red — the window is the whole gate,
+    and an implementer told to cut from the integration branch can carry ungated commits away
+    inside it. Filed, not fixed: reordering the human path changes `graft`'s contract and
+    `do_land`'s flow and wants its own change.
+  - **What "nothing to land" asks.** The queue asks the content question — a branch whose net
+    diff against its merge-base is empty is refused however many commits it carries — because it
+    closes whole task groups unattended, and a phantom landing there unblocks dependents with
+    nothing implemented. `gitrepo::graft` still asks the commit question (`ahead_count == 0`).
+  Both are tracked as their own tasks. Until they close, a reader comparing the two must expect
+  them to differ **here** and nowhere else.
 
 ## The lifecycle is a checkable state machine, and a landing is an event (D48)
 

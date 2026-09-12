@@ -1313,6 +1313,12 @@ scripts/merge-queue.sh — they were renamed or moved, and everything below woul
     try one-red   5 3 5 1      # a single red suite fails the gate — the whole point
     try too-few   3 0 5 1      # suites deleted: refused even though every one that ran passed
     try empty     0 0 1 1      # an empty glob is not a pass
+    # STRICTLY BETWEEN THE OLD LITERAL AND THE PASSED FLOOR. Every arm above also passes with
+    # `local floor=4` substituted for `local floor="$1"` — the exact hardcoded floor the change
+    # abolished — because 3 and 0 are below 4 as well. So the argument could be ignored entirely
+    # and this case stayed green: it certified the hole it was written to close. Four suites
+    # against a floor of five is the one shape that tells the two apart.
+    try ignores-arg 4 0 5 1
 
     if [ -n "$bad" ]; then
         fail "queue-gate: arms" "_shell_suites_pass did not answer as written for:$bad"
@@ -1333,14 +1339,30 @@ does not run it, so the landing gate is cargo-only again and nothing under scrip
 a landing"
     fi
 
-    # ...and the floor is the base's own count, not a number written down.
-    local floor
-    floor="$(cd "$repo_root" && _suite_floor HEAD)"
-    if [ "$floor" -ge 4 ] 2>/dev/null; then
-        ok "and its floor is read from the tree ($floor suites at HEAD), so it cannot rot as suites are added"
+    # ...and the floor is COUNTED, against a tree whose answer is known. `-ge 4` against the live
+    # repository passed with `_suite_floor`'s body replaced by `echo 4` — the literal the change
+    # exists to abolish — so it asserted nothing about the derivation. A planted repository with a
+    # count nobody can guess, checked for equality, is what makes the read real.
+    #
+    # The subdirectory arm is the second question: `_shell_suites_pass` runs the FLAT glob
+    # `./scripts/tests/*.test.sh`, so a floor that counted recursively would be permanently
+    # unreachable and would eject every branch queued after a suite was nested.
+    local g="$w9/floorrepo" got want
+    rm -rf "$g"; mkdir -p "$g/scripts/tests/nested"
+    git init -q "$g" 2>/dev/null
+    git -C "$g" config user.email t@t; git -C "$g" config user.name t
+    : >"$g/scripts/tests/a.test.sh"; : >"$g/scripts/tests/b.test.sh"; : >"$g/scripts/tests/c.test.sh"
+    : >"$g/scripts/tests/helper.sh"            # not a suite
+    : >"$g/scripts/tests/nested/d.test.sh"     # a suite the flat runner cannot reach
+    git -C "$g" add -A >/dev/null 2>&1; git -C "$g" commit -qm plant >/dev/null 2>&1
+    want=3
+    got="$(cd "$g" && _suite_floor HEAD)"
+    if [ "$got" = "$want" ]; then
+        ok "and its floor counts exactly the suites the runner can run ($want of 5 planted files)"
     else
-        fail "queue-gate: floor" "_suite_floor read '$floor' suites out of HEAD, so the gate would \
-accept a directory emptied down to that — the derivation is broken, not the tree"
+        fail "queue-gate: floor" "_suite_floor counted '$got' where the planted tree has $want \
+runnable suites (plus one helper and one nested). Counting the helper or the nested file makes the \
+floor unreachable by the flat glob the gate actually runs, and every branch after it ejects"
     fi
 }
 
@@ -1412,15 +1434,31 @@ group is marked done"
         ok "every exit code the merge queue documents is classified by its consumer ($n), and an unknown one stalls"
     fi
 
-    # The two actions that must not be confused, since confusing them is the whole harm.
-    out="$(node -e "$src
-console.log(classifyMerge(0).outcome, classifyMerge(1).outcome, classifyMerge(2).outcome, classifyMerge(4).outcome)" 2>&1)"
-    if [ "$out" = "landed eject eject stall" ]; then
-        ok "and 0 lands, 1 and 2 go back to the implementer, 4 stalls for an operator"
+    # EVERY DOCUMENTED CODE HAS A NAMED EXPECTED OUTCOME, not just "reaches some arm". The first
+    # version named 0/1/2/4 and omitted 3 — so the classifier still passed with exit 3 remapped to
+    # `landed`, which is the exact harm this case's own failure message spells out. The expectation
+    # is written down here and checked against the codes read from the header, so a code the header
+    # grows arrives as a missing expectation rather than as silence.
+    local want_map="0=landed 1=eject 2=eject 3=stall 4=stall"
+    local code want got routing_bad=""
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        want="$(tr ' ' '\n' <<<"$want_map" | sed -n "s/^$code=//p")"
+        if [ -z "$want" ]; then
+            routing_bad="$routing_bad $code(no-expectation-written-down)"
+            continue
+        fi
+        got="$(node -e "$src
+console.log(classifyMerge($code).outcome)" 2>&1)"
+        [ "$got" = "$want" ] || routing_bad="$routing_bad $code(want=$want got=$got)"
+    done <<<"$codes"
+    if [ -z "$routing_bad" ]; then
+        ok "and every documented code routes where this test says it must ($n checked)"
     else
-        fail "queue-contract: routing" "classifyMerge(0,1,2,4) answered '$out', wanted 'landed \
-eject eject stall' — a landing reported as an eject burns the group's retry budget, and an eject \
-reported as a landing closes it with nothing in the base"
+        fail "queue-contract: routing" "classifyMerge sends these codes somewhere this test does \
+not expect:$routing_bad. A landing reported as an eject burns the group's retry budget; an eject \
+reported as a landing closes the group with nothing in the base; and a code with no expectation \
+here means the header grew one and nobody decided what it means"
     fi
 }
 

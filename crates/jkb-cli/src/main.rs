@@ -6031,11 +6031,10 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
              the context is: cd {} && git rebase {onto}, fix the conflict, then land again",
             sess.worktree.display()
         ),
-        gitrepo::Graft::CouldNotAdvance => anyhow::bail!(
+        gitrepo::Graft::CouldNotAdvance { why } => anyhow::bail!(
             "{branch} rebased onto {onto} cleanly, but {onto} could not be advanced onto the \
-             result — another checkout may hold it, or {} has changes the fast-forward would \
-             overwrite. Nothing changed, and the branch is fine: this is contention, not a \
-             conflict. Check `git worktree list`, then land again",
+             result. Nothing changed, and the branch is fine — this is contention in {}, not a \
+             conflict in the branch, so rebasing it will not help. git said: {why}",
             land_dir.display()
         ),
     };

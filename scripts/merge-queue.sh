@@ -10,15 +10,19 @@
 #               every byte the branch adds (its commits dropped as empty, or empty to begin
 #               with) and is reported as such. BOTH arms call `jkb task landed`, because in
 #               both the content the tasks asked for is in <base>.
-#   1  eject   — rebase conflict (hand back to the implementer to rebase-and-fix).
+#   1  eject   — the implementer's to fix: a rebase conflict, or a branch that changes nothing
+#               against <base> however many commits it carries. Both are handed back.
 #   2  eject   — gate failed on the integrated result; <base> never moved.
 #   3  error   — setup problem (bad worktree/branch, or nothing to graft); nothing changed.
-#   4  stall   — this worktree needs a human, and the branch is not at fault. Three arms reach
-#               it: <base> could not be checked out again after the gate, the fast-forward was
-#               refused, or the gate went red AND the worktree could not be returned to <base>
-#               (left detached — the next run would die at startup). NOT the implementer's
-#               problem, which is why it is not 1: the swarm hands 1 back as "rebase and fix
-#               your branch", and there is nothing wrong with the branch.
+#   4  stall   — this worktree needs a human. Three arms reach it, and they do NOT all mean the
+#               graft passed, so every message says which: (a) the gate passed but <base> could
+#               not be checked out again, (b) the gate passed but the fast-forward was refused,
+#               (c) THE GATE FAILED and the worktree could not be returned to <base>, leaving it
+#               detached at an UNGATED commit. An operator told "the graft passed" in case (c)
+#               would fast-forward <base> onto commits that failed — the ungated landing this
+#               file's reorder exists to prevent — so the distinction is in the text, not only
+#               here. Not the implementer's problem in any of the three, which is why it is not
+#               1: the swarm hands 1 back as "rebase and fix your branch".
 #
 # THIS LIST IS THE CONTRACT, and `.claude/workflows/task-swarm.js` is its only consumer. It reads
 # the raw code and classifies it in ONE function (`classifyMerge`); a code that list does not know
@@ -74,9 +78,14 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
 # The base's own count is the number that cannot drift, and it says the right thing in both
 # directions: adding suites is fine, deleting one is a decision somebody has to make deliberately
 # rather than a number nobody re-reads.
+# ONE QUESTION, ASKED THE SAME WAY IN BOTH PLACES. This counted recursively (`ls-tree -r`) while
+# the runner below uses the flat glob `./scripts/tests/*.test.sh`, so a single suite added in a
+# SUBDIRECTORY raised the floor by one that the runner could never reach — and every branch queued
+# after it would eject on a gate that was working correctly. Anchored to the flat directory, which
+# is the set the runner actually runs.
 _suite_floor() {
     git ls-tree -r --name-only "$1" -- scripts/tests 2>/dev/null \
-        | grep -c '\.test\.sh$' || true
+        | grep -cE '^scripts/tests/[^/]+\.test\.sh$' || true
 }
 
 # _shell_suites_pass <floor> — run every shell suite, and refuse if fewer than <floor> were found.
@@ -97,7 +106,10 @@ _shell_suites_pass() {
     if [ "$n" -lt "$floor" ]; then
         echo "gate: found $n shell suite(s) under scripts/tests; ${BASE:-the base} carries $floor." >&2
         echo "      Suites were moved or deleted, so this half of the gate checked less than the" >&2
-        echo "      base already guarantees. If that is deliberate, land the deletion on its own." >&2
+        echo "      base already guarantees. THE QUEUE WILL NOT LAND A SUITE DELETION: the floor is" >&2
+        echo "      read from the base, so a branch that removes one can never satisfy it, and" >&2
+        echo "      'land the deletion on its own' — which this message used to advise — hits the" >&2
+        echo "      identical comparison. Removing a suite is an operator action, outside the queue." >&2
         return 1
     fi
     return "$rc"
@@ -133,9 +145,36 @@ git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branc
 # branch whose commits the rebase drops as empty — the case step 1's own comment says it accepts —
 # arrives here the same way, though that one has genuinely landed its content via an earlier entry
 # and is reported separately below rather than refused.
+# THE QUESTION IS WHAT THE BRANCH CONTRIBUTES, and a commit count does not answer it. Measured on
+# git 2.51.1: a branch of three commits — `--allow-empty`, add a file, `git revert` it — has a
+# count of 3 and a net diff against its merge-base of nothing. It cleared this check, the rebase
+# kept all three (rebase drops what BECOMES empty, not what starts empty), and the tree check
+# further down then matched, so the queue printed `landed:`, called `jkb task landed`, and closed
+# the whole group with the base untouched. That is the phantom landing this file exists to
+# abolish, arriving through the arm added to abolish it.
+#
+# Asked against the MERGE-BASE, which is what separates the two branches that reach an identical
+# tree. Empty here means this branch never wrote anything. Non-empty with an identical tree means
+# it wrote something an earlier queue entry already landed — a real landing of that content, and
+# it is reported as such after the rebase rather than refused.
+#
+# EJECT, NOT ERROR. This was exit 3 alongside "bad worktree", and the two have opposite remedies:
+# a worktree the queue cannot use needs a person, while an implementer who reported ready without
+# committing needs to go back and implement. Since the consumer now stalls deterministically on 3,
+# leaving it there would have stopped the retryable case from ever retrying.
+_merge_base="$(git merge-base "$BASE" "$BRANCH" 2>/dev/null)" || _merge_base=""
+if [ -z "$_merge_base" ]; then
+  echo "error: $BRANCH and $BASE have no common ancestor"
+  exit 3
+fi
+if git diff --quiet "$_merge_base" "$BRANCH"; then
+  echo "eject: $BRANCH changes nothing against $BASE — it has no work to land, however many"
+  echo "       commits it carries. Implement it, commit, and resubmit."
+  exit 1
+fi
 if [ "$(git rev-list --count "$BASE..$BRANCH")" -eq 0 ]; then
   echo "eject: $BRANCH has no commits ahead of $BASE — nothing to graft"
-  exit 3
+  exit 1
 fi
 
 PRE=$(git rev-parse HEAD)   # the base tip before this graft: what the gated result is compared
@@ -201,9 +240,11 @@ if ! { ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
   # `open`. Before the reorder the gate ran with HEAD already on $BASE, so there was no switch
   # here to fail; the reorder is what made this reachable.
   if ! git switch "$BASE" >>/tmp/merge-queue.log 2>&1; then
-    echo "eject: gate failed after $(( $(date +%s) - start ))s, AND this worktree could not be"
-    echo "       returned to $BASE — it is left on a detached HEAD at $GRAFT and the next run"
-    echo "       will fail at startup. A human has to clear it (see /tmp/merge-queue.log)."
+    echo "stall: THE GATE FAILED after $(( $(date +%s) - start ))s — these commits did NOT pass —"
+    echo "       and this worktree could not be returned to $BASE either. It is left on a detached"
+    echo "       HEAD at $GRAFT and the next run will fail at startup. Do NOT fast-forward $BASE"
+    echo "       onto it: that is the one repair this state invites and the commits are ungated."
+    echo "       Clear the worktree by hand. git said: $(sed -n 1p /tmp/merge-queue.log)"
     exit 4
   fi
   echo "eject: gate failed after $(( $(date +%s) - start ))s (see /tmp/merge-queue-*.log)"
@@ -223,9 +264,9 @@ fi
 # list`, sees nothing, and concludes the queue is confused — while git's own sentence sits unread
 # in the log. So the causes are offered, not asserted, and git's first line is printed.
 if ! git switch "$BASE" >/tmp/merge-queue.log 2>&1; then
-  echo "eject: cannot switch back to $BASE — another worktree may hold it, or this tree has"
-  echo "       changes the switch would overwrite, or an index.lock is held. git said:"
-  sed -n '1p' /tmp/merge-queue.log >&2
+  echo "stall: the graft PASSED the gate, but $BASE could not be checked out again — another"
+  echo "       worktree may hold it, or this tree has changes the switch would overwrite, or an"
+  echo "       index.lock is held. git said: $(sed -n 1p /tmp/merge-queue.log)"
   exit 4
 fi
 # NOTHING TO ADD IS ASKED OF THE CONTENT, NOT OF THE COMMIT COUNT — and it is asked HERE, after
@@ -253,8 +294,8 @@ fi
 # while the merge still happens. Even now that the gate has already passed, the queue is not the
 # place to reinstall an operator's tooling mid-run.
 if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue.log 2>&1; then
-  echo "eject: fast-forward of $BASE onto the gated commit failed. git said:"
-  sed -n '1p' /tmp/merge-queue.log >&2
+  echo "stall: the graft PASSED the gate, but the fast-forward of $BASE onto it failed."
+  echo "       git said: $(sed -n 1p /tmp/merge-queue.log)"
   exit 4
 fi
 # ...AND THE BASE MUST HAVE MOVED, which after the tree check above should be unreachable: a

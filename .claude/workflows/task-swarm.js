@@ -155,7 +155,13 @@ function classifyMerge(code) {
     case 4:
       return {
         outcome: 'stall',
-        why: 'the graft passed but the base could not be advanced — another worktree holds it, or the fast-forward was refused. NOT the branch\'s fault, so it is not handed back to the implementer',
+        // THE THREE ARMS DO NOT ALL MEAN THE GRAFT PASSED, and this sentence used to say they
+        // did. One of them is "the gate went RED and the worktree could not be returned to the
+        // base", which leaves it detached at an UNGATED commit — an operator who believes the
+        // graft passed does the obvious repair, fast-forwards the base onto that commit, and
+        // lands code that failed the gate. The script says which arm it is in its own last line,
+        // so this defers to it rather than asserting the common case.
+        why: 'the base could not be advanced — see the detail line for which arm: the gate may have passed and the base be held elsewhere, or the GATE MAY HAVE FAILED and left the worktree detached at an ungated commit. NOT the branch\'s fault, so it is not handed back to the implementer',
       }
     default:
       return { outcome: 'stall', why: `unknown exit ${code} — merge-queue.sh grew a code this workflow does not classify` }
@@ -367,6 +373,8 @@ const gaveUp = [] // uids the swarm exhausted RETRY_CAP on
 // Groups whose merge could neither land nor be blamed on the branch. Reported in the run summary
 // rather than swallowed, because nothing downstream will ever retry them on its own.
 const stalled = []
+// ...and their uids, which the re-dispatch guard consults so a stalled group is not re-offered.
+const stalledUids = []
 const dispatched = new Set() // group signatures already in flight or finished
 const inFlight = new Set() // live group-chain promises
 const stats = { groups: 0, land: 0, eject: 0, requestChanges: 0, stall: 0 }
@@ -484,6 +492,7 @@ async function processGroup(group) {
         stats.stall++
         log(`group ${label}: MERGE STALLED — ${verdict.why} · ${merge.detail}`)
         stalled.push({ group: label, branch, exit: merge.exit, why: verdict.why, detail: merge.detail })
+        group.tasks.forEach((t) => stalledUids.push(t.uid))
         return
       }
       // EJECT (rebase conflict or red gate) → SAME implementer pulls the updated feature
@@ -570,7 +579,13 @@ while (inFlight.size > 0 && round < ROUND_CAP) {
     // Skip groups already in flight/finished, or any task already dispatched (claims keep
     // the frontier from re-offering in-flight tasks, but guard against races anyway).
     if (dispatched.has(sig)) continue
-    if (g.tasks.some((t) => landed.includes(t.uid) || gaveUp.includes(t.uid))) continue
+    // STALLED UIDS TOO. A stalled group is released and its tasks sit at `needs_review`, which
+    // is on the ready frontier — so without this the next scheduler pass re-offers the same work
+    // inside the same run, an implementer rebuilds it, and it queues behind the very condition
+    // that stalled it. `landed` and `gaveUp` were excluded and this third outcome was not,
+    // because it did not exist when this line was written.
+    if (g.tasks.some((t) => landed.includes(t.uid) || gaveUp.includes(t.uid) || stalledUids.includes(t.uid)))
+      continue
     dispatched.add(sig)
     startGroup(g)
     added++
@@ -584,8 +599,15 @@ while (inFlight.size > 0 && round < ROUND_CAP) {
 await Promise.allSettled([...inFlight])
 
 log(
-  `swarm done · passes ${round} · groups ${stats.groups} · landed ${stats.land} · ejects ${stats.eject} · request_changes ${stats.requestChanges}`,
+  `swarm done · passes ${round} · groups ${stats.groups} · landed ${stats.land} · ejects ${stats.eject} · stalled ${stats.stall} · request_changes ${stats.requestChanges}`,
 )
+// A STALL IS THE ONE OUTCOME NOTHING WILL RETRY, so it is said again, in words, where a human
+// reads. It reached `stats` and the returned JSON but not this line, and a run in which three
+// groups stalled read exactly like a run in which nothing went wrong.
+if (stalled.length) {
+  log(`** ${stalled.length} group(s) STALLED and need a person — nothing will pick them up:`)
+  for (const st of stalled) log(`   ${st.group} (${st.branch}) exit ${st.exit}: ${st.detail}`)
+}
 
 return {
   scope: scopeExpr,

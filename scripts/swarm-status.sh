@@ -204,7 +204,8 @@ for e in rows:
     if "groups" in r:          sched.append(r)
     elif "outcome" in r:       impls.append(r)         # IMPL {outcome, branch, summary}
     elif "verdict" in r:       reviews.append(r)       # REVIEW {verdict, notes, handoff}
-    elif "landed" in r:        merges.append(r)        # MERGE {landed, detail}
+    elif "exit" in r:          merges.append(r)        # MERGE {exit, detail}
+    elif "landed" in r:        merges.append(r)        # MERGE, pre-2026-09-12 shape
 
 namespaces, base = [], None
 for s in sched:
@@ -216,8 +217,30 @@ n_groups = sum(len(s.get("groups", [])) for s in sched)
 n_impl_ok = sum(1 for r in impls if r.get("outcome") == "ready")
 n_approve = sum(1 for r in reviews if r.get("verdict") == "approve")
 n_reqchg  = sum(1 for r in reviews if r.get("verdict") == "request_changes")
-n_land = sum(1 for r in merges if r.get("landed"))
-n_eject = sum(1 for r in merges if not r.get("landed"))
+# THE SAME THREE WORDS THE WORKFLOW USES. The runner's result shape changed from
+# {landed: bool} to {exit, detail} and this chain still keyed on "landed", so every merge result
+# was dropped: the counts read 0/0 over an empty list, the outcome table vanished, and the
+# base-branch derivation below — and the `git log` that depends on it — went dead. Read a journal
+# written before that change and the old key still works, because a status view of a finished run
+# must not stop being able to read it.
+#
+# THREE words, not two. `classifyMerge` in task-swarm.js is the authority: 0 lands, 1 and 2 are
+# the implementer's to fix, everything else stalls for an operator. Collapsing stall into eject
+# here would repeat, on the reporting surface, exactly the two-way collapse the workflow was just
+# fixed to stop making.
+def merge_outcome(r):
+    if "exit" not in r:
+        return "landed" if r.get("landed") else "eject"
+    code = r.get("exit")
+    if code == 0:
+        return "landed"
+    if code in (1, 2):
+        return "eject"
+    return "stall"
+
+n_land = sum(1 for r in merges if merge_outcome(r) == "landed")
+n_eject = sum(1 for r in merges if merge_outcome(r) == "eject")
+n_stall = sum(1 for r in merges if merge_outcome(r) == "stall")
 
 print(f"scheduler passes: {len(sched)}   agents started: {started}")
 if sched:
@@ -225,13 +248,15 @@ if sched:
     print(f"last pass: groups={len(last.get('groups',[]))} remaining={last.get('remaining')}")
 print(f"groups scheduled: {n_groups}   implemented(ok): {n_impl_ok}")
 print(f"reviews: approve={n_approve} request_changes={n_reqchg}")
-print(f"merge queue: landed={n_land} eject={n_eject}")
+print(f"merge queue: landed={n_land} eject={n_eject} stalled={n_stall}")
+if n_stall:
+    print("  ** a stalled merge needs a person: the branch is not at fault and nothing will retry it **")
 if merges:
     print()
     hdr = f"{'merge outcome':14} {'detail':60}"
     print(hdr); print("-" * len(hdr))
     for m in merges:
-        out = "landed" if m.get("landed") else "eject"
+        out = merge_outcome(m)
         print(f"{out:14} {str(m.get('detail',''))[:60]:60}")
         # Parse the base branch from a "landed: <branch> → <base> in …" line.
         #

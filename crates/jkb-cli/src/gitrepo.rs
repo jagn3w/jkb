@@ -1115,7 +1115,13 @@ pub enum Graft {
     ///
     /// No rollback on this arm, for the reason the shell deleted both of its own: nothing has
     /// moved, so there is nothing to restore and a reset can only destroy.
-    CouldNotAdvance,
+    ///
+    /// Carries git's own explanation, because the caller cannot infer it: the checkout of `onto`
+    /// has already succeeded by the time this can fire, so "another worktree holds it" is exactly
+    /// what it is NOT, and the cause that does reach here — a held `index.lock`, a tracked file
+    /// the fast-forward would overwrite, `onto` moved on by a concurrent writer — is whatever git
+    /// says it is.
+    CouldNotAdvance { why: String },
 }
 
 /// Rebase `branch` onto the live tip of `onto` and fast-forward `onto` to the result, in the
@@ -1184,7 +1190,10 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     // The suppression belongs HERE, with the graft, rather than with one of its two callers: the
     // shell queue had it and this did not, which is the twinned-rule drift this branch has now
     // paid for on three separate pairs.
-    if !git_run(
+    // GIT'S OWN TEXT TRAVELS WITH THE REFUSAL. The first version of this arm dropped it and the
+    // caller then guessed at causes — naming two that cannot reach this line, because
+    // `git_must(switch onto)` has already succeeded just above, and omitting the one that can.
+    let (advanced, why) = git_run(
         dir,
         &[
             "-c",
@@ -1193,10 +1202,9 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
             "--ff-only",
             &grafted,
         ],
-    )?
-    .0
-    {
-        return Ok((Graft::CouldNotAdvance, pre));
+    )?;
+    if !advanced {
+        return Ok((Graft::CouldNotAdvance { why }, pre));
     }
     Ok((Graft::Landed { grafted }, pre))
 }
