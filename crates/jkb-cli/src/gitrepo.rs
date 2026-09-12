@@ -1100,6 +1100,22 @@ pub enum Graft {
     Landed { grafted: String },
     /// The rebase hit a conflict; nothing changed. The branch's author must rebase it.
     Conflict,
+    /// The graft is good — the rebase was clean — but `onto` could not be advanced onto it: it
+    /// moved under us, another checkout holds it, or the working tree has something the
+    /// fast-forward would overwrite. **Not the branch's fault**, which is the whole reason this
+    /// is not [`Graft::Conflict`].
+    ///
+    /// It used to be. A refused fast-forward ran `reset_hard` and returned `Conflict`, so
+    /// `jkb task land` told the user "does not rebase cleanly onto {onto} — nothing changed.
+    /// Rebase it…" — and all three claims were false: the rebase WAS clean so the advice is
+    /// unfollowable and reproduces every time, "nothing changed" was asserted immediately after a
+    /// `git reset --hard`, and if `onto` had moved forward the reset dragged it back. The shell
+    /// twin (`scripts/merge-queue.sh`, exit 4) split this case out with its own wording for
+    /// exactly these reasons; this is the Rust spelling of it.
+    ///
+    /// No rollback on this arm, for the reason the shell deleted both of its own: nothing has
+    /// moved, so there is nothing to restore and a reset can only destroy.
+    CouldNotAdvance,
 }
 
 /// Rebase `branch` onto the live tip of `onto` and fast-forward `onto` to the result, in the
@@ -1129,7 +1145,16 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     // Measured before the rebase, which is what separates this from the legitimate case. A branch
     // that HAD commits and whose rebase drops them all as empty — because an earlier landing
     // carried the same content — is a real landing of that content and still returns `Landed`.
-    // Zero ahead means nobody ever wrote anything.
+    //
+    // THIS COUNTS COMMITS, NOT CONTENT, and the two are not the same question. Measured on git
+    // 2.51.1: `git rebase` drops a commit that BECOMES empty but keeps one that STARTED empty, so
+    // a branch carrying a single `git commit --allow-empty` passes this check and advances `onto`
+    // by a commit that changes nothing. `scripts/merge-queue.sh` asks the content question after
+    // its rebase (`git diff --quiet "$PRE" "$GRAFT"`) and reports that case in its own words; the
+    // twins disagree here, deliberately and for now — the shell queue closes whole groups
+    // unattended, which is where the harm was, and the same fix here needs a `Graft` variant and
+    // a `do_land` arm deciding whether a task with no content should be marked done at all. Filed
+    // rather than guessed at.
     if ahead_count(dir, onto, branch)? == 0 {
         anyhow::bail!(
             "{branch} has no commits ahead of {onto} — there is nothing to land. If its work is \
@@ -1171,8 +1196,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     )?
     .0
     {
-        reset_hard(dir, &pre)?;
-        return Ok((Graft::Conflict, pre));
+        return Ok((Graft::CouldNotAdvance, pre));
     }
     Ok((Graft::Landed { grafted }, pre))
 }

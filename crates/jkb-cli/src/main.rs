@@ -6019,12 +6019,25 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
     let land_dir = land_dir_for(&ctx, &onto)?;
 
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
-    let gitrepo::Graft::Landed { grafted } = outcome else {
-        anyhow::bail!(
+    // TWO FAILURES, TWO REMEDIES. They were one arm, and the message it printed was written for
+    // the rebase conflict — so a refused fast-forward sent the user to rebase a branch that had
+    // rebased cleanly, which reproduces every time it is tried. `scripts/merge-queue.sh` splits
+    // the same pair (exit 1 against exit 4) and for the same reason: only one of them is the
+    // branch's fault.
+    let grafted = match outcome {
+        gitrepo::Graft::Landed { grafted } => grafted,
+        gitrepo::Graft::Conflict => anyhow::bail!(
             "{branch} does not rebase cleanly onto {onto} — nothing changed. Rebase it where \
              the context is: cd {} && git rebase {onto}, fix the conflict, then land again",
             sess.worktree.display()
-        );
+        ),
+        gitrepo::Graft::CouldNotAdvance => anyhow::bail!(
+            "{branch} rebased onto {onto} cleanly, but {onto} could not be advanced onto the \
+             result — another checkout may hold it, or {} has changes the fast-forward would \
+             overwrite. Nothing changed, and the branch is fine: this is contention, not a \
+             conflict. Check `git worktree list`, then land again",
+            land_dir.display()
+        ),
     };
 
     let (gate, source) = session::resolve_gate(db, &ctx.root, &ctx.key, gate_flag, no_gate)?;

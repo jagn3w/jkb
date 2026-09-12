@@ -30,6 +30,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$repo_root/scripts/lib.sh"
 
 new_workdir
+w9="$work/queue-gate"
 
 # --- 1. no script calls cargo before it has arranged to have one ---------------------------
 # Line-ordered, not merely "mentions it somewhere": a source line BELOW the first invocation
@@ -1263,9 +1264,89 @@ covers nothing — green on Linux, blind on macOS. Ask for an extended regex wit
     fi
 }
 
+# --- 9. the gate half that had no oracle ----------------------------------------------------
+# `merge-queue.sh`'s `_shell_suites_pass` is what makes a red shell suite able to block a landing
+# — and nothing anywhere exercised it. `grep -rn merge-queue scripts/tests/` returned only case6's
+# comments about the environment scrub. So a branch reverting the queue's gate to
+# `build.sh && test.sh` passed every check in this repository and would have landed, restoring
+# the cargo-only gate that function exists to replace. That is the same "guard with no oracle"
+# this tree has already paid for once, in cb3254a.
+#
+# The functions are read out of the script rather than duplicated here, for the reason
+# `_selection_vars` reads REPO_SELECTION_VARS out of the Rust: a copy is a second answer that
+# drifts. Extraction is by name, so renaming either function reddens this case rather than
+# silently exempting it — which is the premise `_require_selection_vars` exists to hold for case6,
+# applied here.
+_queue_fn() { sed -n "/^$1() {/,/^}/p" "$repo_root/scripts/merge-queue.sh"; }
+
+case9() {
+    local d="$w9" src bad=""
+    # A LITERAL NEWLINE. `$(printf '\n')` is not one: command substitution strips trailing
+    # newlines, so the two extracted functions were joined into `}_suite_floor() {` on one line
+    # and the eval defined neither.
+    src="$(_queue_fn _shell_suites_pass)
+$(_queue_fn _suite_floor)"
+    case "$src" in
+        *_shell_suites_pass*_suite_floor*) ;;
+        *) fail "queue-gate: premise" "could not read _shell_suites_pass and _suite_floor out of \
+scripts/merge-queue.sh — they were renamed or moved, and everything below would pass vacuously"
+           return ;;
+    esac
+    eval "$src"
+
+    plant() {   # plant <dir> <count> <failing-index|0>
+        local root="$1" n="$2" bad_i="$3" i
+        rm -rf "$root"; mkdir -p "$root/scripts/tests"
+        for i in $(seq 1 "$n"); do
+            if [ "$i" = "$bad_i" ]; then printf '#!/bin/sh\nexit 1\n' > "$root/scripts/tests/s$i.test.sh"
+            else printf '#!/bin/sh\nexit 0\n' > "$root/scripts/tests/s$i.test.sh"; fi
+        done
+    }
+    try() {     # try <label> <count> <failing> <floor> <want-rc>
+        local got
+        plant "$d/$1" "$2" "$3" >/dev/null 2>&1
+        ( cd "$d/$1" && _shell_suites_pass "$4" ) >/dev/null 2>&1
+        got=$?
+        [ "$got" = "$5" ] || bad="$bad $1(want=$5 got=$got)"
+    }
+    try all-green 5 0 5 0      # every suite passes and the floor is met
+    try one-red   5 3 5 1      # a single red suite fails the gate — the whole point
+    try too-few   3 0 5 1      # suites deleted: refused even though every one that ran passed
+    try empty     0 0 1 1      # an empty glob is not a pass
+
+    if [ -n "$bad" ]; then
+        fail "queue-gate: arms" "_shell_suites_pass did not answer as written for:$bad"
+    else
+        ok "the merge queue's shell-suite gate passes green, fails red, and refuses a thinned directory"
+    fi
+
+    # ...AND THE GATE ACTUALLY CALLS IT, which the arms above do not establish. Everything so far
+    # would still pass with the invocation deleted from the gate conjunction and the function left
+    # sitting there unused — which is precisely the revert this case exists to make impossible:
+    # the gate back to `build.sh && test.sh`, cargo-only, with every guard in the repo green.
+    if grep -qE '&&[[:space:]]*_shell_suites_pass[[:space:]]' \
+        <<<"$(grep -vE '^[[:space:]]*#' "$repo_root/scripts/merge-queue.sh")"; then
+        ok "and the queue's gate conjunction actually invokes it, so the shell half can fail a landing"
+    else
+        fail "queue-gate: uncalled" "scripts/merge-queue.sh defines _shell_suites_pass but its gate \
+does not run it, so the landing gate is cargo-only again and nothing under scripts/tests can block \
+a landing"
+    fi
+
+    # ...and the floor is the base's own count, not a number written down.
+    local floor
+    floor="$(cd "$repo_root" && _suite_floor HEAD)"
+    if [ "$floor" -ge 4 ] 2>/dev/null; then
+        ok "and its floor is read from the tree ($floor suites at HEAD), so it cannot rot as suites are added"
+    else
+        fail "queue-gate: floor" "_suite_floor read '$floor' suites out of HEAD, so the gate would \
+accept a directory emptied down to that — the derivation is broken, not the tree"
+    fi
+}
+
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9
 
 finish

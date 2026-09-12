@@ -28,7 +28,13 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
 # `stat` IS NOT PORTABLE, and the two spellings do different things rather than failing. GNU
 # coreutils reads `-c '%Y %n'` for mtime+name; BSD/macOS reads `-f '%m %N'`. On Linux `-f` means
 # "filesystem status", so the no-argument path — `./scripts/swarm-status.sh` with no run named —
-# silently found nothing and reported no runs at all. Probed once rather than guessed from uname.
+# produced the wrong answer on Linux. Probed once rather than guessed from uname.
+#
+# NOT "silently found nothing and reported no runs at all", which this line claimed until the
+# `find_run_dir` comment below was written in the same commit and contradicted it: the script
+# printed nothing on either stream because `find` over a missing root aborted the whole run under
+# `pipefail`. A silent death looks exactly like an empty result, and describing one as the other
+# is how the abort went unexamined for a round.
 if stat -c '%Y' . >/dev/null 2>&1; then
     STAT_FLAG=-c; STAT_FMT='%Y %n'          # GNU coreutils
 else
@@ -138,9 +144,18 @@ find_run_dir() {
         # `| sed -n 1p` 0/20 — sed reads to EOF, so there is no early exit to race.
         { find "${present[@]}" -type d -name "$arg" 2>/dev/null || true; } | sed -n 1p
     else
-        { find "${present[@]}" -type d -name 'wf_*' -path '*/subagents/workflows/*' \
+        # THE JOURNAL'S MTIME, NOT THE DIRECTORY'S, because this script writes into the
+        # directory. `run_view` drops `.swarm-base` and `.swarm-scope` into `$run_dir` and
+        # removes them again — four directory-modifying operations — so inspecting a finished
+        # run by name once bumped that run's mtime above the live one, and every later
+        # no-argument invocation picked the finished run FOR EVER. Measured with two runs
+        # 1.1s apart: correct before, permanently wrong after a single `swarm-status wf_OLD`.
+        # Appending to `journal.jsonl` does not touch the parent directory, which is exactly
+        # why the directory was the wrong thing to ask and the journal is the right one: it is
+        # the file the harness writes and this script only reads.
+        { find "${present[@]}" -type f -name journal.jsonl -path '*/subagents/workflows/wf_*' \
             2>/dev/null -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null || true; } \
-            | sort -rn | sed -n 1p | cut -d' ' -f2-
+            | sort -rn | sed -n 1p | cut -d' ' -f2- | sed 's|/journal\.jsonl$||'
     fi
 }
 
@@ -160,7 +175,22 @@ run_view() {
 
     JOURNAL="$run_dir/journal.jsonl" SCOPE_OUT="$run_dir/.swarm-scope" BASE_OUT="$run_dir/.swarm-base" python3 - <<'PY'
 import json, os, re
-rows = [json.loads(l) for l in open(os.environ["JOURNAL"]) if l.strip()]
+# A PARTIAL LAST LINE IS THE NORMAL STATE OF A LIVE RUN. This was a list comprehension over
+# `json.loads`, so one malformed line — most often the final line of a journal still being
+# written, caught mid-flush — raised and replaced the entire report with a traceback and exit 1.
+# The whole point of this view is watching a run that is still going. Unparseable lines are
+# counted and mentioned, never fatal.
+rows, skipped = [], 0
+for l in open(os.environ["JOURNAL"]):
+    if not l.strip():
+        continue
+    try:
+        rows.append(json.loads(l))
+    except ValueError:
+        skipped += 1
+if skipped:
+    print(f"(note: {skipped} journal line(s) could not be parsed — a run still being written "
+          f"usually has one, and it is the last)")
 # New swarm shape (D27): SCHEDULER groups → IMPLEMENTER → REVIEWER → merge queue.
 sched, impls, reviews, merges, started = [], [], [], [], 0
 for e in rows:
