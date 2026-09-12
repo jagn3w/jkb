@@ -45,6 +45,19 @@ set -uo pipefail
 # `--show-toplevel` answers the redirected tree with the variables set OR unset (with `GIT_DIR`
 # set and `GIT_WORK_TREE` unset, git regards the CWD as the work-tree top, and git already
 # chdir'd there). So the redirection is detected below rather than fought.
+#
+# case6-ambient: git invokes this file with the repository selection already set, and reading it
+# is the job — the ambient ask below learns what tree git handed us, `common_of`'s scrubbed one
+# learns which repository that tree belongs to, and telling those two apart is this file's whole
+# subject. `dev-scripts.test.sh`'s case6 requires the scrub above the first git call everywhere
+# else; this line is what exempts this file from the ORDER and nothing more. The six names must
+# still all be dropped somewhere here — they are, in `common_of` — so a seventh name added to
+# `gitrepo::REPO_SELECTION_VARS` still reddens this file until it carries it too.
+#
+# It used to pass that case by accident: the check asked whether the six names appeared anywhere
+# in the file, `common_of`'s `env -u` list satisfied it, and this file was credited for a scrub
+# covering one call site out of many. An accident that gives the right answer is still not a
+# reason, and it stops being right the moment somebody rewrites `common_of`.
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ -n "$repo_root" ] || exit 0

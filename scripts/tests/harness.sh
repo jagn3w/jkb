@@ -137,9 +137,11 @@ isolate_git() {
     # that hook for real inside fixture repositories. Measured with a spy first on PATH: five
     # invocations of the write verb, cwd set to a throwaway directory.
     #
-    # Harmless while a human ran `check.sh` against their own store. Not harmless now that
-    # `merge-queue.sh` runs these suites as part of its landing gate with the swarm's `JKB_DB`
-    # exported — `close-merged` scopes itself by the repository key it derives from its cwd, so
+    # Harmless while only a human ran `check.sh` against their own store. Not harmless the
+    # moment anything runs these suites with a `JKB_DB` pointing at a live knowledge base — CI
+    # does, and `merge-queue.sh` will once `task/merge-queue-gates-the-graft` lands and puts the
+    # suites in the landing gate with the swarm's `JKB_DB` exported. `close-merged` scopes itself
+    # by the repository key it derives from its cwd, so
     # the only thing standing between a fixture and real tasks being closed is that no fixture
     # directory happens to share a name with a repo that has `repo=` tags in that database.
     #

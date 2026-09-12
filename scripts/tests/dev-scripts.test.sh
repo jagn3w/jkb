@@ -394,7 +394,8 @@ _runs_git() {
     # A WRAPPER COUNTS AS AN INVOCATION. `harness.sh`'s `git_q() { git -c … "$@"; }` is how the
     # whole shell-test tree runs git, and by function-name alone that file looked like it never
     # touched git — exempting any future suite that used only the wrapper.
-    awk '
+    local out rc
+    out="$(awk '
         BEGIN { q = sprintf("%c", 39) }
         /^[[:space:]]*#/ { next }
         {
@@ -402,8 +403,8 @@ _runs_git() {
             # files are dense with prose about git, and a line ending
             #   echo done   # the tree comes from `git rev-parse --show-toplevel`
             # made `scripts/build.sh` — which runs no git and scrubs nothing — fail this case.
-            # That case is part of the merge queue landing gate, so a false positive here ejects a
-            # branch for a comment.
+            # A false positive here reddens `check.sh` and CI for a comment, and will eject a
+            # branch from the merge queue for one once the queue runs these suites.
             #
             # Quote-aware, because a pattern like grep -qE (caret)# is an ordinary line in this
             # tree and cutting at the first # anywhere would truncate it into nonsense. Walk the
@@ -448,7 +449,20 @@ _runs_git() {
                     if (p ~ /^git([[:space:]]|$)/) { print NR; exit }
                 }
             }
-        }' "$1"
+        }' "$1")"
+    rc=$?
+    # A FILE THIS CANNOT READ IS NOT A FILE WITHOUT GIT. Every other arm of case6 keys off an
+    # empty answer meaning "runs no git, nothing to check", so an awk that never ran produced
+    # the most permissive verdict there is: a silent, file-level exemption from the only check
+    # that asks this question at all. Measured on mawk 1.3.4: a file that cannot be opened — wrong
+    # permissions, a dangling symlink, a path `shell_sources` emitted and the reader cannot
+    # follow — exits 2 with an empty stdout, indistinguishable from a clean parse finding
+    # nothing. Binary content is NOT this case; mawk reads it without complaint and returns 0.
+    #
+    # Reported as its own word rather than as "runs git", so the failure names the real problem
+    # instead of sending somebody to add a scrub to a file they cannot open.
+    if [ "$rc" -ne 0 ]; then printf 'unreadable\n'; return 0; fi
+    printf '%s\n' "$out"
 }
 
 # The file must KNOW about the selection, by any of the three spellings the tree uses. Deliberately
@@ -475,13 +489,16 @@ _selection_vars() {
 # A COUNT PREMISE, because an empty extraction is a PASS here and not a failure. `_selection_vars`
 # reads a Rust constant with a `sed` range anchored on `^pub(crate) const REPO_SELECTION_VARS`; a
 # visibility change to `pub`, a rename, a module move or an attribute line above it makes that
-# range match nothing, the `while read` loop below runs zero times, and `_drops_selection` falls
-# through to `return 0` for EVERY file. Measured: with that one-word edit, case6 reports
+# range match nothing, `_first_scrub_line`'s name loop runs zero times, its `END` block finds
+# nothing missing and prints `0`, and every file scrubs "at line 0" — above its first git call,
+# whatever that is. Measured: with that one-word edit and this guard removed, case6 reports
 # "ok … (8)" while `merge-queue.sh` carries no scrub at all.
 #
-# That is worse here than anywhere else this pattern has appeared, because this case is now part
-# of the merge queue's landing gate. The sibling `case_rust_twin` got exactly this premise in the
-# same commit, for exactly this reason, and this one did not.
+# The sibling `case_rust_twin` got exactly this premise in the same commit, for exactly this
+# reason, and this one did not. It is no longer the only thing holding it: case7 builds its
+# probes from the same extraction, so an empty one also makes `late.sh` and `bare.sh` report
+# `scrubbed` and fails there too. Measured, with this guard disabled — two assertions red, not
+# eight files silently exempt.
 _require_selection_vars() {
     local n
     n="$(_selection_vars | grep -c .)"
@@ -492,43 +509,208 @@ below comply vacuously"
     return 1
 }
 
-_drops_selection() {
-    local f="$1" v body
+# THE LINE BY WHICH THE SCRUB IS COMPLETE, or `none` if it never is. Prints the LAST of the six
+# names' drop lines, because six names dropped is one event and it has not happened until the
+# sixth one has: a file that drops one name at the top and the other five below its first git
+# call is `late`, and taking the first line would call it scrubbed.
+#
+# CONTINUATIONS ARE JOINED, because `unset A B C \` + newline + `D E F` is how all three
+# production scripts spell it and the second physical line carries no `unset` keyword — unjoined,
+# five of the six names are never seen at all and the file reads as `exposed`. Measured: deleting
+# the join line turns case7's `cont.sh` probe from `scrubbed` into `exposed`.
+#
+# The number reported for a joined line is where it ENDS, which is the honest answer to "by which
+# line is this complete". No probe here distinguishes that from where it begins, and none can: a
+# git call cannot sit between the two halves of a continuation, so the two answers differ only in
+# cases the shell cannot express.
+#
+# Comments are skipped where they are read, not by filtering the file first, because a filtered
+# file has no line numbers and a line number is the entire point of this helper.
+_first_scrub_line() {
+    awk -v names="$(_selection_vars | tr '\n' ' ')" '
+        BEGIN { nn = split(names, N, " ") }
+        {
+            if (acc == "" && $0 ~ /^[[:space:]]*#/) { next }
+            line = (acc == "") ? $0 : acc " " $0
+            if (line ~ /\\$/) { sub(/\\$/, "", line); acc = line; next }
+            acc = ""
+            for (i = 1; i <= nn; i++) {
+                if (i in seen) { continue }
+                re = "(^|[ \t])(unset|-u)([ \t]+[A-Za-z_]+)*[ \t]+" N[i] "([ \t]|$)"
+                if (line ~ re) { seen[i] = NR }
+            }
+        }
+        END {
+            mx = 0
+            for (i = 1; i <= nn; i++) {
+                if (!(i in seen)) { print "none"; exit }
+                if (seen[i] > mx) { mx = seen[i] }
+            }
+            print mx
+        }' "$1"
+}
+
+# THE VERDICT, as a word, because "compliant" was hiding three different things and two of them
+# were not compliance. `$2` is the line of the file's first git call, from `_runs_git`.
+#
+#   wrapper    every call goes through a scrubbing wrapper; ordering is not the question
+#   scrubbed   the file drops all six names itself, and does it BEFORE its first git call
+#   ambient    the file declares that git itself hands it the selection and reading it is the job
+#   late       drops all six, but only after a git call has already run under the caller's
+#   exposed    never drops them at all
+#
+# `late` is the arm this was missing. The check asked whether the six names appear ANYWHERE, so a
+# script that ran `git rev-parse --show-toplevel` at line 10 and scrubbed at line 200 passed — and
+# line 10 is the call whose answer everything downstream is scoped to. case1 has made exactly this
+# correction for `cargo` already ("a source line BELOW the first invocation reads as compliant and
+# is not"); this is the same rule, arrived at from the other end.
+_selection_verdict() {
+    local f="$1" gitline="$2" scrubline
+    # A LINE NUMBER OR NOTHING DOING. The order comparison below is `[ "$scrubline" -lt
+    # "$gitline" ]`, and `test` handed a non-numeric operand writes to stderr and returns 2 —
+    # which `&&`/`||` reads as false, so the file would be reported `late` on the strength of a
+    # bad argument rather than a bad scrub. `_runs_git` answers with a number, an empty string
+    # (no git here) or `unreadable`, and only the first is a question this function can answer.
+    case "$gitline" in
+        ''|*[!0-9]*) printf 'no-git-line\n'; return 0 ;;
+    esac
     # A wrapper that scrubs, or a suite-wide isolation call, satisfies it for the whole file —
     # but only as CODE. Grepping the raw file meant a comment mentioning `isolate_git` or
     # `_git -C` exempted a script from the six-name requirement, and every one of these files is
     # heavily commented about exactly those names.
-    grep -qE 'isolate_git|_git[[:space:]]+-C|^_git\(\)' \
-        <<<"$(grep -vE '^[[:space:]]*#' "$f")" && return 0
-    # Otherwise every name must be dropped, by `unset` or by `env -u`, on a line that runs.
-    # CONTINUATIONS JOINED. `unset A B C \` + newline + `D E F` is how all three production
-    # scripts spell it, and a per-line match sees the second line without the keyword.
-    body="$(grep -vE '^[[:space:]]*#' "$f" | sed -e :a -e '/\\$/N; s/\\\n//; ta')"
-    while IFS= read -r v; do
-        grep -qE "(^|[[:space:]])(unset|-u)([[:space:]]+[A-Za-z_]+)*[[:space:]]+$v([[:space:]]|\\\\|$)" \
-            <<<"$body" || return 1
-    done < <(_selection_vars)
+    if grep -qE 'isolate_git|_git[[:space:]]+-C|^_git\(\)' \
+        <<<"$(grep -vE '^[[:space:]]*#' "$f")"; then printf 'wrapper\n'; return 0; fi
+    scrubline="$(_first_scrub_line "$f")"
+    [ "$scrubline" != none ] || { printf 'exposed\n'; return 0; }
+    # THE ONE DECLARED EXCEPTION, and it has to be declared. `scripts/hooks/post-merge` is
+    # INVOKED BY GIT with the repository selection already set, and reading it is that file's
+    # whole subject: it makes an ambient ask to learn what tree it was handed and a scrubbed one
+    # to learn which repository that tree belongs to. Scrubbing at its top would delete the first
+    # question. It passed this case anyway — on the strength of `common_of`'s `env -u` list, a
+    # helper that has nothing to do with its earlier bare calls — so the file was credited for a
+    # scrub that covers one call site out of many, by accident rather than by decision.
+    #
+    # The marker exempts a file from the ORDER rule only. The six names must still all be
+    # dropped somewhere in it, which is what keeps `post-merge` in step when a seventh name is
+    # added to `REPO_SELECTION_VARS`. case6 counts these and says how many there are, so a second
+    # file quietly acquiring the marker is visible in the ok line rather than inside the check.
+    if grep -qE '^[[:space:]]*#[[:space:]]*case6-ambient:' "$f"; then printf 'ambient\n'; return 0; fi
+    [ "$scrubline" -lt "$gitline" ] && printf 'scrubbed\n' || printf 'late\n'
     return 0
 }
 
 case6() {
-    local f exposed="" seen=0 gitline
+    local f bad="" unread="" ambient=0 seen=0 gitline verdict
     _require_selection_vars || return
     while IFS= read -r f; do
         gitline="$(_runs_git "$f")"
+        if [ "$gitline" = unreadable ]; then
+            unread="$unread ${f#"$repo_root"/}"
+            continue
+        fi
         [ -n "$gitline" ] || continue
         seen=$((seen + 1))
-        _drops_selection "$f" || exposed="$exposed ${f#"$repo_root"/}:$gitline"
+        verdict="$(_selection_verdict "$f" "$gitline")"
+        case "$verdict" in
+            wrapper|scrubbed) ;;
+            ambient) ambient=$((ambient + 1)) ;;
+            *) bad="$bad ${f#"$repo_root"/}:$gitline($verdict)" ;;
+        esac
     done < <(shell_sources "$repo_root")
-    if [ "$seen" -lt 5 ]; then
+    if [ -n "$unread" ]; then
+        fail "gitenv: unreadable" "these files are in the gate's own file list and could not be \
+read, so every check below skipped them silently rather than failing:$unread"
+    elif [ "$seen" -lt 5 ]; then
         fail "gitenv: coverage" "only $seen script(s) were found to run git at all, so this case \
 asserts almost nothing — the glob or the git detector has regressed"
-    elif [ -n "$exposed" ]; then
-        fail "gitenv: unscrubbed" "these scripts run git without first dropping the caller's \
-repository selection, so an exported GIT_WORK_TREE redirects them. A -C flag does not help, it \
-is outranked. Add the unset at the top, or route every call through lib.sh's _git:$exposed"
+    elif [ -n "$bad" ]; then
+        fail "gitenv: unscrubbed" "these scripts run git at the line shown without the caller's \
+repository selection having been dropped first, so an exported GIT_WORK_TREE redirects them. A -C \
+flag does not help, it is outranked. \`exposed\` never drops the six names; \`late\` drops them, but \
+below a git call that has already answered about the wrong repository. Move the unset above the \
+first call, route every call through lib.sh's _git, or — if git itself hands this file the \
+selection and reading it is the point — say so with a \`# case6-ambient:\` line:$bad"
     else
-        ok "every script that runs git drops the caller's repository selection first ($seen)"
+        ok "every script that runs git drops the caller's repository selection first, above that \
+call ($seen script(s), $ambient declared ambient)"
+    fi
+}
+
+# --- 7. every verdict case6 can reach, driven against a file that produces it ---------------
+# Same reasoning as case0, which says it for the cargo detector: a detector nothing tests is a
+# silent exemption one level up. case6 grew from a boolean to five words and three of those words
+# are new, so three arms of it had never been observed to fire. `late` in particular was written
+# to catch a shape no file in the tree has, which is exactly the arm that rots.
+#
+# The marker is spelled with a placeholder and substituted in, so this suite's own source never
+# contains the literal — the same reason case3 writes `PIPE` where the pipe belongs. Without that,
+# a file explaining the marker would claim it, which is the comment-versus-code confusion
+# `_selection_verdict` already had to be corrected for once.
+#
+# The six names come from `_selection_vars`, not from a list written here: a probe that drops a
+# hard-coded six would stop being a `scrubbed` probe the day a seventh name is added, and would
+# fail as `late` while telling the reader nothing about ordering.
+case7() {
+    local d="$work/verdicts" names first_git v got want bad=""
+    mkdir -p "$d"
+    names="$(_selection_vars | tr '\n' ' ')"
+
+    local g
+    g="$(printf 'g%sit' '')"          # never the literal, for the reason in the header above
+    # THE WRAPPER PROBE DEFINES THE WRAPPER, because a file that only CALLS `_git` and never
+    # spells the command has no first-git line at all, and case6 skips it before any verdict is
+    # reached — the first version of this probe was that file, and `_selection_verdict`'s refusal
+    # of a missing line number is what said so. `lib.sh` is the real shape: it defines the
+    # wrapper, so the bare call inside the definition is what the scan finds.
+    printf '#!/bin/sh\n_%s() { command %s "$@"; }\n_%s -C "$r" rev-parse --show-toplevel\n' \
+        "$g" "$g" "$g" >"$d/wrap.sh"
+    printf '#!/bin/sh\nunset %s\n%s rev-parse --show-toplevel\n' "$names" "$g" >"$d/top.sh"
+    printf '#!/bin/sh\n%s rev-parse --show-toplevel\nunset %s\n' "$g" "$names" >"$d/late.sh"
+    printf '#!/bin/sh\n%s rev-parse --show-toplevel\n' "$g" >"$d/bare.sh"
+    sed -e 's/MARK/case6-ambient/' -e 's/GITCMD/git/' >"$d/amb.sh" <<'AMB'
+#!/bin/sh
+# MARK: GITCMD hands this one its selection on purpose.
+GITCMD rev-parse --show-toplevel
+AMB
+    printf 'unset %s\n' "$names" >>"$d/amb.sh"
+    # The marker excuses the ORDER and nothing else: a file claiming it while dropping none of
+    # the names is still exposed. Otherwise the marker would be a way to turn the case off.
+    sed -e 's/MARK/case6-ambient/' -e 's/GITCMD/git/' >"$d/amb-bare.sh" <<'AMBBARE'
+#!/bin/sh
+# MARK: claims the exemption but drops nothing.
+GITCMD rev-parse --show-toplevel
+AMBBARE
+    # A CONTINUATION IS ONE EVENT, and the second line of one carries no `unset` keyword. This is
+    # how all three production scripts spell the drop, so without the join five of the six names
+    # go unseen and every one of them reads as `exposed`. Split at the name that must land last.
+    {
+        printf '#!/bin/sh\nunset %s \\\n' "${names%% *}"
+        printf '      %s\n' "${names#* }"
+        printf '%s rev-parse --show-toplevel\n' "$g"
+    } >"$d/cont.sh"
+
+    for v in wrap:wrapper top:scrubbed late:late bare:exposed amb:ambient amb-bare:exposed \
+             cont:scrubbed; do
+        want="${v#*:}"
+        first_git="$(_runs_git "$d/${v%%:*}.sh")"
+        got="$(_selection_verdict "$d/${v%%:*}.sh" "$first_git")"
+        [ "$got" = "$want" ] || bad="$bad ${v%%:*}.sh(want=$want got=$got)"
+    done
+    if [ -n "$bad" ]; then
+        fail "gitenv: verdicts" "case6's verdict for these planted files is not the one the file \
+was written to produce, so an arm of this check is not the arm it reports:$bad"
+    else
+        ok "every verdict case6 reaches is produced by a file written to produce it"
+    fi
+
+    # ...and the answer for a file that cannot be read at all, which used to be "runs no git".
+    ln -sf "$d/nothing-is-here" "$d/dangle.sh"
+    got="$(_runs_git "$d/dangle.sh" 2>/dev/null)"
+    if [ "$got" = unreadable ]; then
+        ok "and a file the scan cannot open is named, not silently exempted"
+    else
+        fail "gitenv: unreadable-arm" "a dangling symlink in the file list answered '$got', which \
+case6 reads as 'runs no git' and skips — the file-level exemption this arm exists to close"
     fi
 }
 
@@ -822,6 +1004,6 @@ Match a here-string instead: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6
+run_cases case0 case1 case2 case3 case4 case5 case6 case7
 
 finish
