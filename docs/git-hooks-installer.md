@@ -176,6 +176,24 @@ conventions every session is expected to know.
     inject configuration and are deliberately left alone — this project's own dev container
     carries `safe.directory` grants in them, and stripping those makes git refuse the checkout
     outright. Pinned at both ends, so the list cannot be "tidied" into a blanket sweep.
+  - **The rule is ORDERED, and exactly one file is exempt from the ordering.**
+    `dev-scripts.test.sh`'s case6 requires every shell script that runs git to have dropped all
+    six names *above its first git call* — a scrub below the first call is `late`, which is the
+    same correction case1 had already made for `cargo` ("a source line BELOW the first invocation
+    reads as compliant and is not"). A file satisfies it three ways: it drops the names itself
+    above the call; it routes every call through a wrapper that is ITSELF checked (`lib.sh`'s
+    `_git`, whose definition is read and required to carry all six — granting `wrapper` on the
+    name alone let a `_git` stripped to one name pass everything); or it carries a
+    **`# case6-ambient:`** comment.
+    That marker exempts a file from the ORDER and from nothing else — the six names must still
+    all be dropped somewhere in it. It exists for `scripts/hooks/post-merge` and the set is
+    pinned literally in the suite, so a second file acquiring one fails the gate rather than
+    incrementing a number in a message. The hook earns it because git invokes it with the
+    selection already set and reading it is the file's subject: an ambient ask learns what tree
+    git handed it, `common_of`'s scrubbed ask learns which repository that tree belongs to, and
+    telling those apart is what the file is for. Before the marker it passed by accident, on the
+    strength of `common_of`'s `env -u` list — credited for a scrub covering one call site out of
+    many.
   - **It stops at hooks on purpose**, and the REASON has been stated wrongly twice, so it is
     written out here once. Not *"in a linked worktree `GIT_DIR` is the only way to reach the
     right repository"* — that is false, git chdirs to the working tree top before running a hook

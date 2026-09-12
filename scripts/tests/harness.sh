@@ -137,11 +137,18 @@ isolate_git() {
     # that hook for real inside fixture repositories. Measured with a spy first on PATH: five
     # invocations of the write verb, cwd set to a throwaway directory.
     #
-    # Harmless while only a human ran `check.sh` against their own store. Not harmless the
-    # moment anything runs these suites with a `JKB_DB` pointing at a live knowledge base — CI
-    # does, and `merge-queue.sh` will once `task/merge-queue-gates-the-graft` lands and puts the
-    # suites in the landing gate with the swarm's `JKB_DB` exported. `close-merged` scopes itself
-    # by the repository key it derives from its cwd, so
+    # The exposure is a DEVELOPER running `check.sh`, which is the surface that actually carries
+    # a store: a machine where `jkb` is installed and `~/.jkb/jkb.db` is the default. CI is not
+    # it — `.github/workflows/ci.yml` runs the suites on a stock runner with no `cargo install`
+    # step and no `JKB_DB`, so there is nothing there to write into. That claim was in this
+    # paragraph for one commit: the accurate sentence it replaced named `merge-queue.sh` with the
+    # swarm's exported `JKB_DB`, the split made that false, and I substituted a surface without
+    # measuring it — in the file whose header warns that prose goes stale. It becomes true again
+    # if `task/merge-queue-gates-the-graft` lands, which puts these suites in the landing gate.
+    #
+    # The stub is load-bearing either way, and for a second reason that does not depend on any
+    # store: `command -v jkb` must find something or the chore-2 assertions never run.
+    # `close-merged` scopes itself by the repository key it derives from its cwd, so
     # the only thing standing between a fixture and real tasks being closed is that no fixture
     # directory happens to share a name with a repo that has `repo=` tags in that database.
     #

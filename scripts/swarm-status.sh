@@ -174,8 +174,16 @@ if merges:
     for m in merges:
         out = "landed" if m.get("landed") else "eject"
         print(f"{out:14} {str(m.get('detail',''))[:60]:60}")
-        # Parse the base branch from a "landed: <branch> -> <base> in …" line.
-        mm = re.search(r'->\s*(\S+)', str(m.get("detail","")))
+        # Parse the base branch from a "landed: <branch> → <base> in …" line.
+        #
+        # BOTH ARROWS. `merge-queue.sh` prints U+2192; matching only ASCII `->` left `mm` as None,
+        # so `.swarm-base` was never written and the run view reported "no landed merges recorded
+        # yet" directly below the table listing those landings. Restored here after the 2026-09-12
+        # split took the queue rework to its own branch and carried this fix away with it, while
+        # the producer that prints the arrow stayed — so this file and `merge-queue.sh:116`
+        # disagreed on the same branch. Accepting both costs nothing and means a future edit to
+        # either spelling does not silently break the other.
+        mm = re.search(r'(?:->|\u2192)\s*(\S+)', str(m.get("detail","")))
         if mm and not base:
             base = mm.group(1)
 if base:
