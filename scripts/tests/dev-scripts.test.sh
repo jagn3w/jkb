@@ -1344,9 +1344,89 @@ accept a directory emptied down to that — the derivation is broken, not the tr
     fi
 }
 
+# --- 10. the merge queue's exit contract has exactly one consumer, and it must know every code -
+# THE DEFECT THIS EXISTS FOR SHIPPED IN THIS BRANCH. `merge-queue.sh` grew exit 4; the only thing
+# that reads it — `.claude/workflows/task-swarm.js` — still enumerated 0/1/2/3 in a prompt and
+# asked an agent to map the result to a boolean. Both answers it could give were wrong: one marks
+# a whole task group done with the base never advanced, the other sends the implementer to fix a
+# branch the script's own header says is not at fault.
+#
+# So the relation, not the function, is what is held here: every code the script DOCUMENTS must be
+# one the workflow CLASSIFIES, and a code it does not document must fall to the unknown arm. Both
+# sides are read from their home files — the header legend and the classifier source — so adding a
+# code to one without the other reddens this case. That is `_selection_vars` reading
+# `REPO_SELECTION_VARS` out of the Rust, applied across the shell/JS seam.
+#
+# Nothing else in this repository tests `.claude/workflows/*.js`, which is why the classifier was
+# introduced with no oracle at all — the same "guard with no oracle" the queue's own gate half was
+# just corrected for, one file over and in the same commit.
+_queue_exit_codes() {
+    sed -n '/^# Run inside the integration worktree/,/^set /p' "$repo_root/scripts/merge-queue.sh" \
+        | grep -E '^#   [0-9]+ ' | sed -E 's/^#   ([0-9]+) .*/\1/'
+}
+
+_classify_merge_src() {
+    sed -n '/^function classifyMerge(/,/^}/p' "$repo_root/.claude/workflows/task-swarm.js"
+}
+
+case10() {
+    local codes src n bad="" out code
+    codes="$(_queue_exit_codes)"
+    src="$(_classify_merge_src)"
+    n="$(grep -c . <<<"$codes" || true)"
+    if [ "$n" -lt 4 ] || [ -z "$src" ]; then
+        fail "queue-contract: premise" "read $n exit code(s) from merge-queue.sh's header and \
+$( [ -n "$src" ] && echo "found" || echo "did NOT find") classifyMerge in task-swarm.js — one of \
+the two extractions is broken, and everything below would pass vacuously"
+        return
+    fi
+
+    # Every documented code must reach a real arm, not the default.
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        out="$(node -e "$src
+const v = classifyMerge($code)
+console.log(v.outcome + '|' + (v.why || ''))" 2>&1)"
+        case "$out" in
+            *unknown\ exit*) bad="$bad $code(falls-to-default)" ;;
+            landed\|*|eject\|*|stall\|*) ;;
+            *) bad="$bad $code(bad-shape:$out)" ;;
+        esac
+    done <<<"$codes"
+
+    # ...and a code the script does NOT document must stall as unknown, rather than being sorted
+    # into the nearest bucket. This is the arm that makes the next code safe.
+    out="$(node -e "$src
+const v = classifyMerge(99)
+console.log(v.outcome + '|' + (v.why || ''))" 2>&1)"
+    case "$out" in
+        stall\|*unknown\ exit\ 99*) ;;
+        *) bad="$bad 99(undocumented-code-not-stalled:$out)" ;;
+    esac
+
+    if [ -n "$bad" ]; then
+        fail "queue-contract: codes" "merge-queue.sh documents $n exit codes and task-swarm.js \
+does not classify them all:$bad. A code the workflow has never heard of decides whether a task \
+group is marked done"
+    else
+        ok "every exit code the merge queue documents is classified by its consumer ($n), and an unknown one stalls"
+    fi
+
+    # The two actions that must not be confused, since confusing them is the whole harm.
+    out="$(node -e "$src
+console.log(classifyMerge(0).outcome, classifyMerge(1).outcome, classifyMerge(2).outcome, classifyMerge(4).outcome)" 2>&1)"
+    if [ "$out" = "landed eject eject stall" ]; then
+        ok "and 0 lands, 1 and 2 go back to the implementer, 4 stalls for an operator"
+    else
+        fail "queue-contract: routing" "classifyMerge(0,1,2,4) answered '$out', wanted 'landed \
+eject eject stall' — a landing reported as an eject burns the group's retry budget, and an eject \
+reported as a landing closes it with nothing in the base"
+    fi
+}
+
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10
 
 finish
