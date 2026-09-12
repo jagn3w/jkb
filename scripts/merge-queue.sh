@@ -10,10 +10,14 @@
 #               every byte the branch adds (its commits dropped as empty, or empty to begin
 #               with) and is reported as such. BOTH arms call `jkb task landed`, because in
 #               both the content the tasks asked for is in <base>.
-#   1  eject   — the implementer's to fix: a rebase conflict, or a branch that changes nothing
-#               against <base> however many commits it carries. Both are handed back.
+#   1  eject   — the implementer's to fix: a rebase conflict, or a branch that DIVERGED from
+#               <base> and still changes nothing against it, however many commits it carries.
+#               Both are handed back.
 #   2  eject   — gate failed on the integrated result; <base> never moved.
-#   3  error   — setup problem (bad worktree/branch, or nothing to graft); nothing changed.
+#   3  error   — setup problem: a worktree or branch the queue cannot use, or a branch with no
+#               common ancestor with <base> at all. Nothing changed.
+#   5  stall   — <branch> is already an ancestor of <base>, and the graph cannot say whether an
+#               earlier entry landed its work or it was never committed to. A person decides.
 #   4  stall   — this worktree needs a human. Three arms reach it, and they do NOT all mean the
 #               graft passed, so every message says which: (a) the gate passed but <base> could
 #               not be checked out again, (b) the gate passed but the fast-forward was refused,
@@ -167,13 +171,37 @@ if [ -z "$_merge_base" ]; then
   echo "error: $BRANCH and $BASE have no common ancestor"
   exit 3
 fi
-if git diff --quiet "$_merge_base" "$BRANCH"; then
-  echo "eject: $BRANCH changes nothing against $BASE — it has no work to land, however many"
-  echo "       commits it carries. Implement it, commit, and resubmit."
-  exit 1
+
+# AN ANCESTOR IS A QUESTION THE GRAPH CANNOT ANSWER, so it is the one case that goes to a person.
+#
+# When $BRANCH is already an ancestor of $BASE, two histories are indistinguishable from here:
+# its commits were landed by an earlier entry and it was then rebased onto $BASE — which is
+# exactly what this queue's own eject message tells implementers to do — or the implementer
+# reported ready without ever committing, leaving the branch at a base tip. The first has landed
+# its work and its tasks should close; the second has done nothing and must not close anything.
+# Nothing in the commit graph separates them.
+#
+# So it is neither exit 0 nor exit 1. An earlier draft of this check called it exit 1 with
+# "Implement it, commit, and resubmit" — which sends an implementer whose work IS in the base
+# round a retry loop with nothing to fix, until the group resets to `open` with its tasks never
+# closed. Stalling says the true thing: somebody has to look.
+if git merge-base --is-ancestor "$BRANCH" "$BASE" 2>/dev/null; then
+  echo "stall: $BRANCH is already an ancestor of $BASE — either an earlier entry landed its work and it was rebased since, or it was never committed to. The graph cannot tell those apart; close it with \`jkb task landed\` if the work is in, or send it back if it is not."
+  exit 5
 fi
-if [ "$(git rev-list --count "$BASE..$BRANCH")" -eq 0 ]; then
-  echo "eject: $BRANCH has no commits ahead of $BASE — nothing to graft"
+
+# ...AND OTHERWISE, WHAT THE BRANCH CONTRIBUTES. A commit count does not answer that: measured on
+# git 2.51.1, a branch of three commits — `--allow-empty`, add a file, revert it — has a count of
+# 3 and a net diff against its merge-base of nothing. It cleared a count check, the rebase kept
+# all three (rebase drops what BECOMES empty, not what starts empty), and the queue closed the
+# whole group with the base untouched.
+#
+# EJECT, NOT ERROR: an implementer who diverged and contributed nothing needs to go back and
+# implement, and exit 3 now stalls for a human. The `rev-list --count` check that used to sit
+# here is gone rather than kept as a belt — it was unreachable, because a branch with no commits
+# ahead is an ancestor and is answered above.
+if git diff --quiet "$_merge_base" "$BRANCH"; then
+  echo "eject: $BRANCH diverged from $BASE but changes nothing against it — no work to land, however many commits it carries. Implement it, commit, and resubmit."
   exit 1
 fi
 
@@ -239,12 +267,13 @@ if ! { ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
   # branch behind it then ejects for a wedged worktree, and each group burns its retry budget to
   # `open`. Before the reorder the gate ran with HEAD already on $BASE, so there was no switch
   # here to fail; the reorder is what made this reachable.
-  if ! git switch "$BASE" >>/tmp/merge-queue.log 2>&1; then
-    echo "stall: THE GATE FAILED after $(( $(date +%s) - start ))s — these commits did NOT pass —"
-    echo "       and this worktree could not be returned to $BASE either. It is left on a detached"
-    echo "       HEAD at $GRAFT and the next run will fail at startup. Do NOT fast-forward $BASE"
-    echo "       onto it: that is the one repair this state invites and the commits are ungated."
-    echo "       Clear the worktree by hand. git said: $(sed -n 1p /tmp/merge-queue.log)"
+  # ITS OWN LOG FILE. This appended to /tmp/merge-queue.log with `>>` while the message read line
+  # 1 of it — and `git rebase` wrote there first, so the operator was told `git said: HEAD is up
+  # to date.` while the switch's actual refusal sat on lines 2-4 unread. Deterministic: a
+  # successful rebase always writes something. The wider rule is that `sed -n 1p` on a shared log
+  # is a claim about who wrote it last, and this script has more than one writer.
+  if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then
+    echo "stall: THE GATE FAILED after $(( $(date +%s) - start ))s (these commits did NOT pass) and this worktree could not be returned to $BASE — it is left detached at $GRAFT and the next run will fail at startup. Do NOT fast-forward $BASE onto it: the commits are ungated. Clear it by hand. git said: $(sed -n 1p /tmp/merge-queue-switch.log)"
     exit 4
   fi
   echo "eject: gate failed after $(( $(date +%s) - start ))s (see /tmp/merge-queue-*.log)"
@@ -263,10 +292,13 @@ fi
 # would overwrite, and a held `index.lock`. An operator told the wrong cause runs `git worktree
 # list`, sees nothing, and concludes the queue is confused — while git's own sentence sits unread
 # in the log. So the causes are offered, not asserted, and git's first line is printed.
-if ! git switch "$BASE" >/tmp/merge-queue.log 2>&1; then
-  echo "stall: the graft PASSED the gate, but $BASE could not be checked out again — another"
-  echo "       worktree may hold it, or this tree has changes the switch would overwrite, or an"
-  echo "       index.lock is held. git said: $(sed -n 1p /tmp/merge-queue.log)"
+# ONE LINE, LABEL FIRST. `.claude/workflows/task-swarm.js` defines `detail` as the script's LAST
+# line of output, so a message split across several `echo`s hands the workflow — and
+# `swarm-status.sh`, which truncates it to 60 characters — whichever fragment happened to be last.
+# One of these arms ended on `git said: …`, with no label and no arm, so the sentence
+# `classifyMerge` was rewritten to defer to never reached a person at all.
+if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then
+  echo "stall: the graft PASSED the gate, but $BASE could not be checked out again — another worktree may hold it, this tree may have changes the switch would overwrite, or an index.lock is held. git said: $(sed -n 1p /tmp/merge-queue-switch.log)"
   exit 4
 fi
 # NOTHING TO ADD IS ASKED OF THE CONTENT, NOT OF THE COMMIT COUNT — and it is asked HERE, after
@@ -293,9 +325,8 @@ fi
 # Measured: the hook fires on `merge --ff-only`, and `-c core.hooksPath=/dev/null` suppresses it
 # while the merge still happens. Even now that the gate has already passed, the queue is not the
 # place to reinstall an operator's tooling mid-run.
-if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue.log 2>&1; then
-  echo "stall: the graft PASSED the gate, but the fast-forward of $BASE onto it failed."
-  echo "       git said: $(sed -n 1p /tmp/merge-queue.log)"
+if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue-ff.log 2>&1; then
+  echo "stall: the graft PASSED the gate, but the fast-forward of $BASE onto it failed. git said: $(sed -n 1p /tmp/merge-queue-ff.log)"
   exit 4
 fi
 # ...AND THE BASE MUST HAVE MOVED, which after the tree check above should be unreachable: a

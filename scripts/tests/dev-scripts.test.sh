@@ -30,6 +30,18 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$repo_root/scripts/lib.sh"
 
 new_workdir
+# THIS SUITE BUILDS GIT REPOSITORIES, so it isolates git exactly as the other four that do.
+# case9 plants a repo with `git init` and drives `git -C` at it, and every one of those calls is
+# outranked by an exported `GIT_DIR`/`GIT_WORK_TREE`: measured, the victim repository is re-inited,
+# `git config user.email/user.name` overwrite the operator's identity, and `git add -A; git commit`
+# commits their in-progress working tree under the message `plant`. That is the harm this whole
+# branch cluster exists to prevent, introduced in a test written for it.
+#
+# The second half needs no exported selection at all: a `GIT_CONFIG_GLOBAL` setting
+# `commit.gpgsign = true` makes the planted commit fail, HEAD never exists, `_suite_floor HEAD`
+# answers 0, and case9 reddens. That suite runs inside the merge queue's gate, so on such a
+# machine every queued branch ejects and every group burns its retries to `open`.
+isolate_git "$work/home"
 w9="$work/queue-gate"
 
 # --- 1. no script calls cargo before it has arranged to have one ---------------------------
@@ -653,7 +665,17 @@ _selection_verdict() {
         _wrapper_scrubs "$f" && printf 'wrapper\n' || printf 'leaky-wrapper\n'
         return 0
     fi
-    if grep -qE 'isolate_git|_git[[:space:]]+-C' \
+    # A CALL, NOT A MENTION — AND NOT THIS FILE'S OWN PATTERN. The exemption matched the literal
+    # names anywhere in a file's code, and the code that does the matching is itself a file with
+    # those names in it: `dev-scripts.test.sh` certified ITSELF as scrubbed, which is how case9's
+    # unscrubbed `git init` sat under a green case6. The names are assembled from pieces so this
+    # file never contains either literal, and the shapes required are call shapes — the wrapper at
+    # the start of a command, or `isolate_git` followed by an argument — so naming one in prose or
+    # in a pattern is not a claim to route through it.
+    local _iso _gitw
+    _iso="isolate""_git"
+    _gitw="_git""[[:space:]]+-C"
+    if grep -qE "(^|[;&|(){}[:space:]])($_iso[[:space:]]+[^[:space:]]|$_gitw)" \
         <<<"$(grep -vE '^[[:space:]]*#' "$f")"; then printf 'wrapper\n'; return 0; fi
     scrubline="$(_first_scrub_line "$f")"
     [ "$scrubline" != none ] || { printf 'exposed\n'; return 0; }
@@ -1439,7 +1461,7 @@ group is marked done"
     # `landed`, which is the exact harm this case's own failure message spells out. The expectation
     # is written down here and checked against the codes read from the header, so a code the header
     # grows arrives as a missing expectation rather than as silence.
-    local want_map="0=landed 1=eject 2=eject 3=stall 4=stall"
+    local want_map="0=landed 1=eject 2=eject 3=stall 4=stall 5=stall"
     local code want got routing_bad=""
     while IFS= read -r code; do
         [ -n "$code" ] || continue
@@ -1459,6 +1481,33 @@ console.log(classifyMerge($code).outcome)" 2>&1)"
 not expect:$routing_bad. A landing reported as an eject burns the group's retry budget; an eject \
 reported as a landing closes the group with nothing in the base; and a code with no expectation \
 here means the header grew one and nobody decided what it means"
+    fi
+
+    # ...AND THE SECOND COPY OF THE MAPPING. `swarm-status.sh` classifies the same exit codes in
+    # its own embedded python, so the tree holds the rule twice and nothing compared them: a future
+    # edit to `classifyMerge` would leave the status view quietly reporting a different outcome
+    # than the workflow acted on, with case10 green. Both are driven from the same expectation
+    # here, which is the cross-file relation this case already holds for the header.
+    local py bad2=""
+    py="$(sed -n '/^def merge_outcome(r):/,/^    return "stall"/p' "$repo_root/scripts/swarm-status.sh")"
+    if [ -z "$py" ]; then
+        fail "queue-contract: status-premise" "could not read merge_outcome out of \
+scripts/swarm-status.sh — it was renamed or moved, and the comparison below would pass vacuously"
+        return
+    fi
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        want="$(tr ' ' '\n' <<<"$want_map" | sed -n "s/^$code=//p")"
+        got="$(python3 -c "$py
+print(merge_outcome({'exit': $code, 'detail': ''}))" 2>&1)"
+        [ "$got" = "$want" ] || bad2="$bad2 $code(want=$want got=$got)"
+    done <<<"$codes"
+    if [ -z "$bad2" ]; then
+        ok "and swarm-status.sh classifies every one of them the same way the workflow does"
+    else
+        fail "queue-contract: status-drift" "scripts/swarm-status.sh reports a different outcome \
+than task-swarm.js acts on, for:$bad2. The status view is how a person finds out a group stalled, \
+so a disagreement here is invisible exactly when it matters"
     fi
 }
 

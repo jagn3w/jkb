@@ -152,6 +152,11 @@ function classifyMerge(code) {
       return { outcome: 'eject' } // rebase conflict, or red gate: the implementer's to fix
     case 3:
       return { outcome: 'stall', why: 'setup error — bad branch or worktree; nothing changed' }
+    case 5:
+      return {
+        outcome: 'stall',
+        why: 'the branch is already an ancestor of the base — either an earlier entry landed its work and it was rebased since, or it was never committed to. The graph cannot tell those apart, so a person closes it or sends it back',
+      }
     case 4:
       return {
         outcome: 'stall',
@@ -617,6 +622,10 @@ return {
   // Landed on the feature branch and marked done in jkb; dependents unblocked.
   completed: landed,
   gave_up: gaveUp,
+  // NAMED, not just counted. The stall count reached `stats` and the log, but the uids did not
+  // reach the returned lists — so a caller relaying the run's outcome could say three groups
+  // stalled and not say WHICH tasks, which is the only thing a person can act on.
+  stalled_tasks: stalledUids,
   merge_queue: { landed: stats.land, ejects: stats.eject, stalled: stats.stall, stalls: stalled },
   reviews: { request_changes: stats.requestChanges },
 }

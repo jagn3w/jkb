@@ -51,24 +51,34 @@ queue() {
     local r="$1"; shift
     local pre post rc out
     pre="$(git -C "$r" rev-parse trunk)"
-    out="$( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb env "$@" \
+    : >"$r/.jkb-calls"
+    out="$( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" env "$@" \
         bash scripts/merge-queue.sh feat trunk "$r" 2>&1 )"
     rc=$?
     post="$(git -C "$r" rev-parse trunk)"
-    printf '%s %s %s\n' "$rc" "$([ "$pre" = "$post" ] && echo still || echo moved)" "$(tail -1 <<<"$out")"
+    # `grep -c` PRINTS ITS ZERO AND THEN EXITS 1, so `|| echo 0` appends a second zero and every
+    # field after it shifts. `|| true` keeps the count grep already printed.
+    local calls detail
+    calls="$(grep -c 'task landed' "$r/.jkb-calls" 2>/dev/null || true)"
+    # ...and git's own text is multi-line, so the detail is flattened rather than trusted to be
+    # one field — this harness is parsing it positionally.
+    detail="$(tail -1 <<<"$out" | tr '\n' ' ')"
+    printf '%s|%s|%s|%s\n' "$rc" "$([ "$pre" = "$post" ] && echo still || echo moved)" \
+        "${calls:-0}" "$detail"
 }
 
-# check <label> <repo> <want-exit> <want-moved> [VAR=VAL …]
+# check <label> <repo> <want-exit> <want-moved> <want-landed-calls> [VAR=VAL …]
 check() {
-    local label="$1" r="$2" want_rc="$3" want_mv="$4"; shift 4
-    local got rc mv
+    local label="$1" r="$2" want_rc="$3" want_mv="$4" want_jkb="$5"; shift 5
+    local got rc mv jkb
     got="$(queue "$r" "$@")"
-    rc="${got%% *}"; mv="$(cut -d' ' -f2 <<<"$got")"
-    if [ "$rc" = "$want_rc" ] && [ "$mv" = "$want_mv" ]; then
-        ok "$label → exit $rc, base $mv"
+    IFS='|' read -r rc mv jkb detail <<<"$got"
+    if [ "$rc" = "$want_rc" ] && [ "$mv" = "$want_mv" ] && [ "$jkb" = "$want_jkb" ]; then
+        ok "$label → exit $rc, base $mv, $jkb landing record(s)"
     else
-        fail "queue: $label" "wanted exit $want_rc with the base $want_mv, got exit $rc with the \
-base $mv. Last line: $(cut -d' ' -f3- <<<"$got")"
+        fail "queue: $label" "wanted exit $want_rc with the base $want_mv and $want_jkb \
+\`jkb task landed\` call(s); got exit $rc, base $mv, $jkb call(s). A landing recorded over a base \
+that did not move closes the whole group. Last line: $(cut -d' ' -f4- <<<"$got")"
     fi
 }
 
@@ -77,27 +87,27 @@ case_land() {       # the ordinary path: green gate, base advances
     local r; r="$(mkrepo land)"
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
     git -C "$r" checkout -q trunk
-    check "a green branch lands" "$r" 0 moved
+    check "a green branch lands" "$r" 0 moved 1
 }
 
 case_red_gate() {   # THE HEADLINE: a red gate must not have moved the base
     local r; r="$(mkrepo red)"
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
     git -C "$r" checkout -q trunk
-    check "a red cargo gate ejects and the base never moves" "$r" 2 still TEST_RC=1
+    check "a red cargo gate ejects and the base never moves" "$r" 2 still 0 TEST_RC=1
 }
 
 case_red_suite() {  # the half of the gate that could not fail before this file's rework
     local r; r="$(mkrepo suite)"
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
     git -C "$r" checkout -q trunk
-    check "a red shell suite ejects and the base never moves" "$r" 2 still SUITE_RC=1
+    check "a red shell suite ejects and the base never moves" "$r" 2 still 0 SUITE_RC=1
 }
 
 case_nothing_ahead() {
     local r; r="$(mkrepo ahead)"
     git -C "$r" branch feat
-    check "a branch with no commits ahead is handed back" "$r" 1 still
+    check "a branch with no commits ahead of the base stalls for a person" "$r" 5 still 0
 }
 
 case_empty_work() { # commits, but a net diff of nothing: the phantom landing
@@ -107,21 +117,21 @@ case_empty_work() { # commits, but a net diff of nothing: the phantom landing
     echo g >"$r/g"; git -C "$r" add g; git -C "$r" commit -qm add
     git -C "$r" revert --no-edit HEAD >/dev/null
     git -C "$r" checkout -q trunk
-    check "a branch whose net diff is empty is handed back, not landed" "$r" 1 still
+    check "a diverged branch whose net diff is empty is handed back, not landed" "$r" 1 still 0
 }
 
 case_conflict() {
     local r; r="$(mkrepo conflict)"
     git -C "$r" checkout -qb feat; echo THEIRS >"$r/f"; git -C "$r" commit -qam theirs
     git -C "$r" checkout -q trunk; echo OURS >"$r/f"; git -C "$r" commit -qam ours
-    check "a rebase conflict is handed back and the base never moves" "$r" 1 still
+    check "a rebase conflict is handed back and the base never moves" "$r" 1 still 0
 }
 
 case_already_landed() {   # real content, already in the base under somebody else's commit
     local r; r="$(mkrepo already)"
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam mine
     git -C "$r" checkout -q trunk; echo x >>"$r/f"; git -C "$r" commit -qam theirs
-    check "content already in the base is reported without moving it" "$r" 0 still
+    check "content already in the base is reported without moving it" "$r" 0 still 1
 }
 
 # --- and the one that wedges the worktree ---------------------------------------------------
@@ -144,12 +154,33 @@ case_wedged() {
     git -C "$r" add scripts/test.sh; git -C "$r" commit -qm "a gate that dirties the tree"
     git -C "$r" checkout -q feat; git -C "$r" rebase -q trunk >/dev/null 2>&1
     git -C "$r" checkout -q trunk
-    check "a red gate that also wedges the worktree stalls for a human" "$r" 4 still
+    check "a red gate that also wedges the worktree stalls for a human" "$r" 4 still 0
+}
+
+# --- the branch whose work is already in the base ------------------------------------------
+# THE ONE THE GRAPH CANNOT ANSWER. An earlier entry landed this branch's content and the
+# implementer then did exactly what the eject path tells them to — rebased onto the base — so the
+# branch is now an ancestor of it. Indistinguishable, from the graph alone, from an implementer
+# who reported ready and never committed. It must not be closed (that would mark a group done for
+# work that may never have been written) and must not be handed back (that sends someone to fix a
+# branch whose work is already in), so it stalls with no landing record.
+case_already_merged() {
+    local r; r="$(mkrepo merged)"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
+    git -C "$r" checkout -q trunk; git -C "$r" merge -q --ff-only feat
+    echo y >>"$r/f"; git -C "$r" commit -qam "the base moved on"
+    check "a branch already merged into the base stalls rather than closing or ejecting" "$r" 5 still 0
 }
 
 echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
-mkdir -p "$work/bin" && printf '#!/bin/sh\nexit 0\n' >"$work/bin/jkb" && chmod +x "$work/bin/jkb"
+# THE STUB RECORDS. Asserting the exit code and the base ref leaves out the half of a phantom
+# landing that does the damage: `jkb task landed` is what closes every task in the group and
+# unblocks its dependents. A run can report the right code, leave the base alone, and still have
+# made that call — so the call is now evidence the cases check.
+mkdir -p "$work/bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$JKB_CALLS"\nexit 0\n' >"$work/bin/jkb"
+chmod +x "$work/bin/jkb"
 run_cases case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
-          case_conflict case_already_landed case_wedged
+          case_conflict case_already_landed case_wedged case_already_merged
 
 finish

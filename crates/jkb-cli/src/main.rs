@@ -6033,8 +6033,10 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
         ),
         gitrepo::Graft::CouldNotAdvance { why } => anyhow::bail!(
             "{branch} rebased onto {onto} cleanly, but {onto} could not be advanced onto the \
-             result. Nothing changed, and the branch is fine — this is contention in {}, not a \
-             conflict in the branch, so rebasing it will not help. git said: {why}",
+             result. Nothing changed, and the branch is fine — rebasing it will not help. This is \
+             usually transient: something else moved or held {onto} while the graft ran. git \
+             said: {why}\n\nTry landing again; if it repeats, look at what else is writing to \
+             {onto} (`git worktree list`, a running watcher, a held index.lock in {})",
             land_dir.display()
         ),
     };

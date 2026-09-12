@@ -1155,8 +1155,12 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     // THIS COUNTS COMMITS, NOT CONTENT, and the two are not the same question. Measured on git
     // 2.51.1: `git rebase` drops a commit that BECOMES empty but keeps one that STARTED empty, so
     // a branch carrying a single `git commit --allow-empty` passes this check and advances `onto`
-    // by a commit that changes nothing. `scripts/merge-queue.sh` asks the content question after
-    // its rebase (`git diff --quiet "$PRE" "$GRAFT"`) and reports that case in its own words; the
+    // by a commit that changes nothing. `scripts/merge-queue.sh` asks the content
+    // question at ENTRY, against the merge-base, and EJECTS a branch that diverged and
+    // contributes nothing rather than reporting it as a landing — an earlier shape of that check
+    // did report it as one, and this comment described that shape for a commit after it was
+    // replaced. The queue also STALLS a branch already an ancestor of the base, because the graph
+    // cannot say whether an earlier entry landed its work or it was never committed to. The
     // twins disagree here, deliberately and for now — the shell queue closes whole groups
     // unattended, which is where the harm was, and the same fix here needs a `Graft` variant and
     // a `do_land` arm deciding whether a task with no content should be marked done at all. Filed
