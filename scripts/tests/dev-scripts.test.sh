@@ -296,7 +296,20 @@ _sourced_by_scope() {
     local root="$1" f
     while IFS= read -r f; do
         _sets_pipefail "$f" || ! _has_shebang "$f" || continue
-        sed -n 's/^[[:space:]]*\(\.\|source\)[[:space:]]\{1,\}\(.*\)/\2/p' "$f" 2>/dev/null \
+        # `-E`, BECAUSE THE ALTERNATION IS NOT PORTABLE IN A BASIC REGEX. This was written as a
+        # BRE with an escaped alternation, and that is a GNU extension: BSD sed — every macOS
+        # developer, and any BSD CI runner — reads it as a literal and the expression matches
+        # NOTHING. `_sourced_by_scope` then returns the empty set, and every sourced library that
+        # has a shebang and does not set `pipefail` itself silently leaves the racy-grep scan.
+        #
+        # MEASURED with GNU sed 4.9 `--posix`, which disables exactly the extensions BSD lacks:
+        # the BRE form matched 0 of 3 real source lines, the `-E` form 3 of 3 both with and
+        # without the flag. Found by `./scripts/check.sh` on macOS reporting `.container/lib.sh`
+        # as outside the scan — and ONLY that file, because it is the one library of the four
+        # that depends on this extraction: `scripts/lib.sh` and `harness.sh` have no shebang and
+        # `.container/egress-lib.sh` sets `pipefail` itself, so all three stay in scope by other
+        # arms. The membership assertion below is what caught it; the count floor could not.
+        sed -E -n 's/^[[:space:]]*(\.|source)[[:space:]]+(.*)/\2/p' "$f" 2>/dev/null \
             | sed 's/[[:space:]]*#.*//; s/.*\///; s/["'"'"']*[[:space:]]*$//'
     done < <(shell_sources "$root") | grep -E '^[A-Za-z0-9._-]+$' | sort -u
 }
@@ -1168,9 +1181,91 @@ Match a here-string instead: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')
     fi
 }
 
+# --- 8. no BASIC regex leans on a GNU extension --------------------------------------------
+# The defect this exists for shipped on this branch and could only be found ON macOS:
+# `_sourced_by_scope` extracted `source` lines with a BRE alternation, which is a GNU extension.
+# BSD sed reads it as a literal, the expression matches nothing, `_sourced_by_scope` returns the
+# empty set — so on every macOS machine the sourced-library half of the pipefail scan covered
+# nothing at all, while this suite stayed green on Linux for four rounds.
+#
+# MEASURED with GNU sed 4.9 `--posix`, which turns off exactly the extensions BSD lacks: the BRE
+# form matched 0 of 3 real source lines, the `-E` form 3 of 3 with and without the flag.
+#
+# A GUARD RATHER THAN A CORRECTED SITE, because the property is "this tree means the same thing
+# on both seds" and one fixed expression does not hold it — the next person writing a basic
+# regex has no way to know. The other two GNU-only constructs are flagged with it. A line that
+# asks for an extended or Perl regex is exempt: there the escaped plus is a literal plus, which
+# is legitimate and is what `.claude/hooks/block-raw-cargo.sh` uses. `grep -F` is exempt for the
+# same reason — its backslash is data, and over-refusing innocent code is how a guard gets
+# deleted rather than obeyed.
+#
+# Every construct is built from a variable rather than written, so this file never contains the
+# shapes it scans for — case3's PIPE rule, applied again.
+_gnu_bre_sites() {
+    local root="$1" f
+    while IFS= read -r f; do
+        awk -v name="${f#"$root"/}" '
+            /^[ \t]*#/ { next }
+            {
+                if ($0 !~ /(^|[^A-Za-z_-])(sed|grep)[ \t]/) { next }
+                if ($0 ~ /(^|[^A-Za-z_-])(sed|grep)[ \t]+(-[A-Za-z]*[ErPF])/) { next }
+                bs = sprintf("%c", 92)
+                for (k = 1; k < length($0); k++) {
+                    if (substr($0, k, 1) == bs) {
+                        c = substr($0, k + 1, 1)
+                        if (c == "|" || c == "+" || c == "?") { printf "%s:%d\n", name, NR; next }
+                    }
+                }
+            }' "$f"
+    done < <(shell_sources "$root")
+}
+
+case8() {
+    local probe="$work/bre" sites n hit miss
+    mkdir -p "$probe/scripts"
+    # The detector first, against the spellings it has to be right about. BS is substituted in, so
+    # this suite's own source carries none of them.
+    sed 's/BS/\\/g' >"$probe/scripts/hits.sh" <<'HITS'
+sed -n 's/^\(aBS|b\)/x/p' f
+grep -n 'aBS|b' f
+sed 's/xBS+/y/' f
+sed -n 's/xBS?/y/p' f
+HITS
+    sed 's/BS/\\/g' >"$probe/scripts/miss.sh" <<'MISS'
+sed -E -n 's/^(a|b)/x/p' f
+grep -qE '(a|b)BS+c' f
+grep -F 'aBS|b' f
+sed -n 's/xBS{1,BS}/y/p' f
+echo 'no command here at all'
+MISS
+    hit="$(_gnu_bre_sites "$probe" | grep -c 'hits\.sh' || true)"
+    miss="$(_gnu_bre_sites "$probe" | grep -c 'miss\.sh' || true)"
+    if [ "$hit" -lt 4 ]; then
+        fail "bre: forms-miss" "the detector saw $hit of the 4 GNU-only spellings, so a basic \
+regex that matches nothing on BSD sed would ship unreported"
+    elif [ "$miss" != 0 ]; then
+        fail "bre: forms-false" "$miss portable line(s) were read as GNU-only, which is how a \
+guard gets deleted rather than obeyed"
+    else
+        ok "the GNU-extension detector sees every unportable spelling, and no portable neighbour"
+    fi
+
+    # ...and then the tree it is here to hold.
+    sites="$(_gnu_bre_sites "$repo_root")"
+    n="$(grep -c . <<<"$sites" || true)"
+    [ -n "$sites" ] || n=0
+    if [ "$n" = 0 ]; then
+        ok "no basic regex in this tree depends on a GNU extension, so every scan means the same under BSD sed"
+    else
+        fail "bre: gnu-only" "$n site(s) use a GNU-only construct in a BASIC regex. BSD sed and \
+BSD grep read it as a literal, so the expression matches nothing and whatever it feeds silently \
+covers nothing — green on Linux, blind on macOS. Ask for an extended regex with -E: $(tr '\n' ' ' <<<"$sites")"
+    fi
+}
+
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6 case7
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8
 
 finish
