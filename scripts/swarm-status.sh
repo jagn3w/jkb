@@ -25,15 +25,6 @@ set -euo pipefail
 # and the same one-line fix.
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
       GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-# `stat` IS NOT PORTABLE, and the two spellings do different things rather than failing. GNU
-# coreutils reads `-c '%Y %n'` for mtime+name; BSD/macOS reads `-f '%m %N'`. On Linux `-f` means
-# "filesystem status", so the no-argument path — `./scripts/swarm-status.sh` with no run named —
-# silently found nothing and reported no runs at all. Probed once rather than guessed from uname.
-if stat -c '%Y' . >/dev/null 2>&1; then
-    STAT_FLAG=-c; STAT_FMT='%Y %n'          # GNU coreutils
-else
-    STAT_FLAG=-f; STAT_FMT='%m %N'          # BSD / macOS
-fi
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
@@ -112,44 +103,24 @@ file_view() {
 find_run_dir() {
     local arg="$1"
     if [ -n "$arg" ] && [ -d "$arg" ]; then printf '%s\n' "$arg"; return; fi
-    local roots=("$HOME/.claude/projects") present=()
+    local roots=("$HOME/.claude/projects")
     [ -n "${CLAUDE_CONFIG_DIR:-}" ] && roots=("$CLAUDE_CONFIG_DIR/projects" "${roots[@]}")
-    # ONLY THE ROOTS THAT EXIST, and a pipeline that cannot abort the caller.
-    #
-    # `find` exits non-zero when any argument is missing or any directory under it is unreadable,
-    # and `set -euo pipefail` at the top of this file turns that into an abort INSIDE the command
-    # substitution that calls this function — so the script printed zero bytes and exited 1, and
-    # the "no swarm run found" message below was unreachable. Measured here: CLAUDE_CONFIG_DIR
-    # unset and `$HOME/.claude/projects` absent, `./scripts/swarm-status.sh` produced no output at
-    # all on either stream.
-    #
-    # That also explains why the BSD-`stat` bug one round ago was described as "found nothing and
-    # reported no runs": it never reported anything. The same abort swallowed the report, which is
-    # why the abort itself went unexamined — a silent death looks exactly like an empty result.
-    # The success path is no safer: one unreadable sibling directory makes `find` print the right
-    # answer and still exit 1, and `pipefail` then discards it.
-    local r
-    for r in "${roots[@]}"; do [ -d "$r" ] && present+=("$r"); done
-    if [ "${#present[@]}" -eq 0 ]; then return 1; fi
     if [ -n "$arg" ]; then
         # `sed -n 1p`, not `head -1`: head EXITS after its line, find dies on the unwritten
         # tail, and `set -euo pipefail` two dozen lines up turns that into an abort with no
         # message. Measured: `producer | sort -rn | head -1` aborted 20/20 at 3000 lines,
         # `| sed -n 1p` 0/20 — sed reads to EOF, so there is no early exit to race.
-        { find "${present[@]}" -type d -name "$arg" 2>/dev/null || true; } | sed -n 1p
+        find "${roots[@]}" -type d -name "$arg" 2>/dev/null | sed -n 1p
     else
-        { find "${present[@]}" -type d -name 'wf_*' -path '*/subagents/workflows/*' \
-            2>/dev/null -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null || true; } \
+        find "${roots[@]}" -type d -name 'wf_*' -path '*/subagents/workflows/*' \
+            2>/dev/null -exec stat -f '%m %N' {} + 2>/dev/null \
             | sort -rn | sed -n 1p | cut -d' ' -f2-
     fi
 }
 
 run_view() {
     local run_dir
-    # `|| run_dir=""`, because a bare assignment from a command substitution is subject to
-    # `errexit`: `find_run_dir` returning non-zero — which it now does when no search root exists
-    # — would abort here, before the message below that exists to explain exactly that.
-    run_dir="$(find_run_dir "${1:-}")" || run_dir=""
+    run_dir="$(find_run_dir "${1:-}")"
     if [ -z "$run_dir" ] || [ ! -f "$run_dir/journal.jsonl" ]; then
         echo "no swarm run found (arg='${1:-}'). Pass a run id (wf_...) or transcript dir." >&2
         exit 1
@@ -203,13 +174,8 @@ if merges:
     for m in merges:
         out = "landed" if m.get("landed") else "eject"
         print(f"{out:14} {str(m.get('detail',''))[:60]:60}")
-        # Parse the base branch from a "landed: <branch> → <base> in …" line.
-        #
-        # BOTH ARROWS. `merge-queue.sh` prints U+2192; this matched only ASCII `->`, so `mm` was
-        # always None, `.swarm-base` was never written, and the run view reported "no landed
-        # merges recorded yet" however many branches had landed. Accepting both costs nothing and
-        # means a future edit to either spelling does not silently break the other.
-        mm = re.search(r'(?:->|\u2192)\s*(\S+)', str(m.get("detail","")))
+        # Parse the base branch from a "landed: <branch> -> <base> in …" line.
+        mm = re.search(r'->\s*(\S+)', str(m.get("detail","")))
         if mm and not base:
             base = mm.group(1)
 if base:

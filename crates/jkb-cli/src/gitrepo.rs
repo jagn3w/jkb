@@ -1120,24 +1120,6 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     git_must(dir, &["switch", onto])?;
     let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
 
-    // NOTHING TO GRAFT IS NOT A LANDING. A branch sitting at `onto`'s tip rebases to a no-op and
-    // `merge --ff-only` then answers "Already up to date." with exit 0 — so this returned
-    // `Graft::Landed` and the caller marked every task recording that branch done, dependents
-    // unblocked, with not one commit added to `onto`. Reachable whenever a worker reports success
-    // without committing: the branch exists, so every check that asks whether it exists passes.
-    //
-    // Measured before the rebase, which is what separates this from the legitimate case. A branch
-    // that HAD commits and whose rebase drops them all as empty — because an earlier landing
-    // carried the same content — is a real landing of that content and still returns `Landed`.
-    // Zero ahead means nobody ever wrote anything.
-    if ahead_count(dir, onto, branch)? == 0 {
-        anyhow::bail!(
-            "{branch} has no commits ahead of {onto} — there is nothing to land. If its work is \
-             already in {onto} under someone else's commit, close it with `jkb task landed \
-             {branch} --onto {onto}`; if the work was never committed, it is still in the session."
-        );
-    }
-
     if !git_run(dir, &["checkout", "--detach", branch])?.0 {
         git_must(dir, &["switch", onto])?;
         return Ok((Graft::Conflict, pre));
