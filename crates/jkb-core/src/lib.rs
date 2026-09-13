@@ -23,6 +23,7 @@ pub mod investigation;
 pub mod item;
 pub mod lifecycle;
 pub mod mount;
+pub mod mq;
 pub mod ns;
 pub mod nstype;
 pub mod placement;

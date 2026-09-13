@@ -26,6 +26,10 @@ pub enum Error {
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A message-queue operation was refused ([`crate::mq`]).
+    #[error(transparent)]
+    Queue(#[from] crate::mq::QueueError),
+
     /// The background writer thread has stopped, so the request cannot be served.
     #[error("database writer has stopped")]
     WriterClosed,
