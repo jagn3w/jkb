@@ -5,8 +5,8 @@
 #   1. installs the `jkb` binary to ~/.cargo/bin (cargo install)
 #   2. scaffolds the standard KB namespace roots (repos/ tasks/ media/ references/ memory/)
 #   3. builds + installs the VS Code extension (pnpm; skipped if VS Code/pnpm absent)
-#   4. installs + activates the background services (file-sync watcher and worktree
-#      reaper) as OS services (launchd/systemd)
+#   4. installs + activates the background services (file-sync watcher, worktree reaper, and
+#      the jkb serve daemon) as OS services (launchd/systemd)
 #   5. installs the repo's post-merge git hook into this repo's .git/hooks — and, when
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
@@ -126,7 +126,7 @@ fi
 
 # --- 4. file-sync watcher service -------------------------------------------
 if [ "$do_service" -eq 1 ]; then
-  say "install + activate background services (file sync, worktree reaper)"
+  say "install + activate background services (file sync, worktree reaper, jkb serve)"
   # Wrapped, like the extension step above it. A bare statement under `set -euo pipefail`
   # ends the script here — so a unit that could not be written (an uncreatable
   # ~/.config/systemd/user, a full disk, no HOME in the post-merge hook's environment) took
@@ -138,7 +138,7 @@ if [ "$do_service" -eq 1 ]; then
   # worktrees accumulate for ever — visible only as `jkb doctor` output nobody reads.
   case "$(uname -s)" in
     Darwin)
-      for label in com.jkb.sync com.jkb.reap; do
+      for label in com.jkb.sync com.jkb.reap com.jkb.serve; do
         plist="$HOME/Library/LaunchAgents/$label.plist"
         launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
         if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
@@ -149,12 +149,16 @@ if [ "$do_service" -eq 1 ]; then
     Linux)
       if command -v systemctl >/dev/null 2>&1; then
         systemctl --user daemon-reload || true
-        for label in com.jkb.sync com.jkb.reap; do
+        for label in com.jkb.sync com.jkb.reap com.jkb.serve; do
           if systemctl --user enable --now "$label"; then echo "$label enabled (systemd)"; else
             warn "could not enable $label; activate manually: systemctl --user enable --now $label"
             watcher_state=failed
           fi
         done
+        # `enable --now` leaves an already-running daemon on the OLD binary, and a daemon older than
+        # the database it serves refuses every request (schema_newer). A restart is what a pull
+        # that rebuilt jkb needs; on macOS the unload/load above already does it.
+        systemctl --user restart com.jkb.serve 2>/dev/null || true
       else
         warn "systemctl not found; activate the printed units manually."
         watcher_state=failed

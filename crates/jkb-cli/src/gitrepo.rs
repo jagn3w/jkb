@@ -1402,7 +1402,7 @@ mod tests {
         // the spawn is, since that is what the scan can see.
         ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
         ("tests/sessions.rs", "jkb"),     // the_session_fixture_jkb_does_not_inherit_a_repository
-        ("tests/cli.rs", "jkb"),          // the_cli_fixture_does_not_inherit_a_repository
+        ("tests/cli.rs", "jkb_bare"),     // the_cli_fixture_does_not_inherit_a_repository
     ];
     /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
     /// is a decision rather than an omission.

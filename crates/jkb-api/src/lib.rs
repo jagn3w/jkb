@@ -267,6 +267,36 @@ impl From<mq::TopicReport> for Topic {
     }
 }
 
+impl Request {
+    /// Every op name, as `GET /v1/hello` advertises them.
+    pub const OPS: &'static [&'static str] = &[
+        "mq.topic_create",
+        "mq.send",
+        "mq.group_create",
+        "mq.poll",
+        "mq.ack",
+        "mq.compact",
+        "mq.inspect",
+        "mq.tail",
+    ];
+
+    /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
+    /// named here (and, by the test that pins them together, in [`Request::OPS`]).
+    #[must_use]
+    pub const fn op(&self) -> &'static str {
+        match self {
+            Self::MqTopicCreate { .. } => "mq.topic_create",
+            Self::MqSend { .. } => "mq.send",
+            Self::MqGroupCreate { .. } => "mq.group_create",
+            Self::MqPoll { .. } => "mq.poll",
+            Self::MqAck { .. } => "mq.ack",
+            Self::MqCompact { .. } => "mq.compact",
+            Self::MqInspect {} => "mq.inspect",
+            Self::MqTail { .. } => "mq.tail",
+        }
+    }
+}
+
 /// The answer to a [`Request`]. Serialized with a `"result"` tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -333,8 +363,15 @@ pub enum ErrorCode {
     CorruptPayload,
     /// The request itself could not be read.
     BadRequest,
-    /// The database was locked by another writer for longer than the busy timeout. Transient: retry.
+    /// The database was locked by another writer for longer than the busy timeout, or the daemon is
+    /// at its concurrency limit. Transient: retry.
     Busy,
+    /// Served over HTTP without a valid bearer token (`jkb serve`).
+    Unauthorized,
+    /// The database has been migrated past what the serving `jkb` knows; rebuild the host's `jkb`.
+    SchemaNewer,
+    /// The daemon could not be reached (client-side: refused, timed out, or recently unreachable).
+    Unavailable,
     /// Anything else: a database or internal failure.
     Internal,
     /// A code this build does not know, from a newer peer. Clients treat it like `internal`.
@@ -368,6 +405,12 @@ impl ApiError {
     #[must_use]
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BadRequest, message)
+    }
+
+    /// An error with this code and message.
+    #[must_use]
+    pub fn with_code(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::new(code, message)
     }
 }
 

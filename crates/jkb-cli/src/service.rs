@@ -30,6 +30,11 @@ pub const LABEL: &str = "com.jkb.sync";
 /// something (design D49).
 pub const REAP_LABEL: &str = "com.jkb.reap";
 
+/// ...and for `jkb serve`, the daemon that owns the database for processes that must not open it
+/// themselves — the dev container's `jkb` (design r3.2 H3). A third unit, not a job inside another:
+/// a crashed file watcher must not take the container's access to the knowledge base with it.
+pub const SERVE_LABEL: &str = "com.jkb.serve";
+
 /// Which OS service manager to target (chosen by `cfg!` at the call site).
 #[derive(Clone, Copy)]
 enum Manager {
@@ -147,6 +152,12 @@ fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
                     .join(format!("{REAP_LABEL}.plist")),
                 launchd_reap_plist(&exe, &db),
             ),
+            (
+                SERVE_LABEL,
+                home.join("Library/LaunchAgents")
+                    .join(format!("{SERVE_LABEL}.plist")),
+                launchd_serve_plist(&exe, &db),
+            ),
         ],
         Manager::Systemd => vec![
             (
@@ -160,6 +171,12 @@ fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
                 home.join(".config/systemd/user")
                     .join(format!("{REAP_LABEL}.service")),
                 systemd_reap_unit(&exe, &db),
+            ),
+            (
+                SERVE_LABEL,
+                home.join(".config/systemd/user")
+                    .join(format!("{SERVE_LABEL}.service")),
+                systemd_serve_unit(&exe, &db),
             ),
         ],
     })
@@ -299,6 +316,59 @@ fn systemd_reap_unit(exe: &Path, db: &Path) -> String {
     )
 }
 
+/// A launchd agent plist running `jkb serve`, kept alive, logging beside the database.
+fn launchd_serve_plist(exe: &Path, db: &Path) -> String {
+    let exe = xml_escape(&exe.to_string_lossy());
+    let log_dir = db.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let log = xml_escape(&log_dir.join("serve.log").to_string_lossy());
+    let db = xml_escape(&db.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{SERVE_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>--db</string>
+        <string>{db}</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// A systemd **user** unit running `jkb serve`, restarted on failure.
+fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
+    let exe = exe.to_string_lossy();
+    let db = db.to_string_lossy();
+    format!(
+        "[Unit]\n\
+         Description=jkb knowledge base daemon (serves the dev container)\n\
+         After=default.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} --db {db} serve\n\
+         Restart=on-failure\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
 /// Minimal XML escaping for text that goes inside plist `<string>` elements.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -311,8 +381,8 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        install_units, launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit,
-        xml_escape, Manager, LABEL, REAP_LABEL,
+        install_units, launchd_plist, launchd_reap_plist, launchd_serve_plist, systemd_reap_unit,
+        systemd_serve_unit, systemd_unit, xml_escape, Manager, LABEL, REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
 
@@ -356,6 +426,22 @@ mod tests {
         // Its own log: an archive made and an archive deleted are both worth looking up later,
         // and without these launchd sends the whole record to /dev/null.
         assert!(plist.contains("reap.log"));
+    }
+
+    #[test]
+    fn the_serve_units_run_the_daemon_under_their_own_label() {
+        let plist = launchd_serve_plist(
+            Path::new("/usr/local/bin/jkb"),
+            Path::new("/home/u/.jkb/jkb.db"),
+        );
+        assert!(plist.contains(&format!("<string>{SERVE_LABEL}</string>")));
+        assert!(![LABEL, REAP_LABEL].contains(&SERVE_LABEL));
+        assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("serve.log"));
+        let unit = systemd_serve_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
+        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db serve"));
+        assert!(unit.contains("Restart=on-failure"));
     }
 
     #[test]

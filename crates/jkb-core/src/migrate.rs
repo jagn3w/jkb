@@ -17,6 +17,21 @@ mod embedded {
     refinery::embed_migrations!("src/migrations");
 }
 
+/// The newest schema version this build's migrations produce.
+///
+/// A long-running process (the daemon) compares it with the database's `PRAGMA user_version` per
+/// request: a newer binary may have migrated the database underneath it, and serving that schema with
+/// this code's queries is how a stale daemon writes rows a newer schema does not expect.
+#[must_use]
+pub fn supported_version() -> i64 {
+    embedded::migrations::runner()
+        .get_migrations()
+        .iter()
+        .map(|m| i64::from(m.version()))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Apply all pending migrations, then stamp `PRAGMA user_version` with the highest
 /// applied version as a human-readable marker for `jkb doctor`. Refinery's history
 /// table remains the authoritative record.

@@ -1,0 +1,196 @@
+//! [`RemoteBackend`]: the [`jkb_api::Backend`] a process that must not open `jkb.db` uses to reach
+//! `jkb serve`.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+
+use jkb_api::{ApiError, Backend, ErrorCode, Request, Response};
+
+use crate::token;
+
+/// How long an unreachable daemon is remembered, so a burst of short-lived `jkb` processes (a hook
+/// per tool call) pays one connect timeout rather than one each.
+pub const UNREACHABLE_FOR: Duration = Duration::from_secs(5);
+
+/// Serves requests by calling a `jkb serve` daemon over HTTP.
+pub struct RemoteBackend {
+    base: String,
+    token_file: PathBuf,
+    token: Mutex<Option<String>>,
+    client: reqwest::blocking::Client,
+    poll_wait: Duration,
+    down_marker: Option<PathBuf>,
+}
+
+impl RemoteBackend {
+    /// A backend for the daemon at `base` (e.g. `http://127.0.0.1:7117`), authenticating with the
+    /// token in `token_file`.
+    ///
+    /// # Errors
+    /// An [`ErrorCode::Internal`] error if the HTTP client cannot be built.
+    pub fn new(base: &str, token_file: PathBuf) -> Result<Self, ApiError> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_owned(),
+            token_file,
+            token: Mutex::new(None),
+            client,
+            poll_wait: Duration::from_secs(2),
+            down_marker: None,
+        })
+    }
+
+    /// How long an `mq.poll` may be held by the daemon when it has nothing to hand over.
+    #[must_use]
+    pub const fn with_poll_wait(mut self, wait: Duration) -> Self {
+        self.poll_wait = wait;
+        self
+    }
+
+    /// A file whose recent modification means "the daemon was unreachable just now": touched on a
+    /// failed connect, removed on success, and consulted before trying, across processes.
+    #[must_use]
+    pub fn with_down_marker(mut self, marker: PathBuf) -> Self {
+        self.down_marker = Some(marker);
+        self
+    }
+
+    fn token(&self, fresh: bool) -> Result<String, ApiError> {
+        let mut cached = self
+            .token
+            .lock()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "token lock poisoned"))?;
+        if fresh || cached.is_none() {
+            *cached = Some(token::read(&self.token_file).map_err(|e| {
+                ApiError::with_code(
+                    ErrorCode::Unavailable,
+                    format!("no daemon token ({e}); is jkb serve running on the host?"),
+                )
+            })?);
+        }
+        cached
+            .clone()
+            .ok_or_else(|| ApiError::with_code(ErrorCode::Internal, "no token"))
+    }
+
+    fn recently_unreachable(&self) -> bool {
+        self.down_marker
+            .as_ref()
+            .and_then(|m| std::fs::metadata(m).ok())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|at| SystemTime::now().duration_since(at).ok())
+            .is_some_and(|age| age < UNREACHABLE_FOR)
+    }
+
+    fn mark_unreachable(&self, down: bool) {
+        let Some(marker) = &self.down_marker else {
+            return;
+        };
+        if down {
+            if let Some(dir) = marker.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(marker, b"");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+
+    fn send(
+        &self,
+        request: &Request,
+        token: &str,
+    ) -> Result<reqwest::blocking::Response, ApiError> {
+        let wait = match request {
+            Request::MqPoll { .. } => self.poll_wait,
+            _ => Duration::ZERO,
+        };
+        let url = if wait.is_zero() {
+            format!("{}/v1/op", self.base)
+        } else {
+            format!("{}/v1/op?wait_ms={}", self.base, wait.as_millis())
+        };
+        self.client
+            .post(url)
+            .bearer_auth(token)
+            .json(request)
+            .timeout(wait + Duration::from_secs(30))
+            .send()
+            .map_err(|e| {
+                if e.is_connect() || e.is_timeout() {
+                    self.mark_unreachable(true);
+                }
+                ApiError::with_code(
+                    ErrorCode::Unavailable,
+                    format!("cannot reach jkb serve at {}: {e}", self.base),
+                )
+            })
+    }
+
+    /// `GET /v1/hello`: the daemon's protocol, schema and op list.
+    ///
+    /// # Errors
+    /// [`ErrorCode::Unavailable`] when unreachable, or the daemon's refusal.
+    pub fn hello(&self) -> Result<serde_json::Value, ApiError> {
+        let token = self.token(false)?;
+        let resp = self
+            .client
+            .get(format!("{}/v1/hello", self.base))
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
+        decode(resp)
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(
+    resp: reqwest::blocking::Response,
+) -> Result<T, ApiError> {
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
+    if status.is_success() {
+        serde_json::from_slice(&bytes).map_err(|e| {
+            ApiError::with_code(ErrorCode::Internal, format!("unreadable response: {e}"))
+        })
+    } else {
+        Err(
+            serde_json::from_slice::<ApiError>(&bytes).unwrap_or_else(|_| {
+                ApiError::with_code(
+                    ErrorCode::Internal,
+                    format!("HTTP {status}: {}", String::from_utf8_lossy(&bytes)),
+                )
+            }),
+        )
+    }
+}
+
+impl Backend for RemoteBackend {
+    fn call(&self, request: Request) -> Result<Response, ApiError> {
+        if self.recently_unreachable() {
+            return Err(ApiError::with_code(
+                ErrorCode::Unavailable,
+                format!(
+                    "jkb serve at {} was unreachable less than {}s ago",
+                    self.base,
+                    UNREACHABLE_FOR.as_secs()
+                ),
+            ));
+        }
+        let resp = self.send(&request, &self.token(false)?)?;
+        self.mark_unreachable(false);
+        // The token rotates each time the daemon starts: one retry with a freshly read token, and
+        // only for a 401, so a wrong token is never retried in a loop.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let resp = self.send(&request, &self.token(true)?)?;
+            return decode(resp);
+        }
+        decode(resp)
+    }
+}

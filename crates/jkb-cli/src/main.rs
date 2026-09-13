@@ -16,6 +16,7 @@ mod output;
 mod owner;
 mod pr;
 mod presence;
+mod remote;
 mod repo;
 mod review;
 mod service;
@@ -204,6 +205,17 @@ enum Command {
     Mq {
         #[command(subcommand)]
         cmd: mq_cli::MqCmd,
+    },
+    /// Serve the knowledge base's operations over HTTP for processes that must not open the
+    /// database themselves — the dev container's `jkb` (design r3.2 H3). Runs on the host, usually as
+    /// the `com.jkb.serve` service; writes a fresh bearer token beside the database each start.
+    Serve {
+        /// Where to listen. An unspecified address (0.0.0.0, ::) is refused.
+        #[arg(long, default_value = jkb_daemon::DEFAULT_ADDR)]
+        addr: std::net::SocketAddr,
+        /// Where to write the token (default: `<database directory>/daemon/token`).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// List the direct children of a namespace (sub-namespaces + items homed there) —
     /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
@@ -1132,6 +1144,14 @@ fn main() {
 
 #[allow(clippy::too_many_lines)] // a flat command dispatcher; one arm per subcommand
 fn run(cli: Cli) -> Result<()> {
+    // REMOTE MODE FIRST, before anything with a side effect. With JKB_REMOTE set this process must
+    // never open a database — on the dev container's kernel that is the host's `jkb.db`, which a
+    // process on each side of the bind corrupts — so every command either goes to the daemon or is
+    // refused here, at dispatch, before it has run git, written a file or opened anything.
+    if let Some(remote) = remote::target() {
+        return remote::run(cli, &remote);
+    }
+
     // Commands that touch NO database are dispatched before it is opened, and this is
     // structural rather than a remembered ordering: `open_db` verifies fifteen migrations and
     // spawns the writer thread — 110 ms against the real database — and `notify hook` runs after
@@ -1249,6 +1269,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Mq { cmd } => mq_cli::run(&jkb_api::LocalBackend::new(db), cmd, json),
+        Command::Serve { addr, token_file } => cmd_serve(db, &db_path, addr, token_file),
         Command::Ls {
             path,
             all,
@@ -6513,6 +6534,41 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+    Ok(())
+}
+
+/// `jkb serve`: run the daemon until Ctrl-C.
+fn cmd_serve(
+    db: Db,
+    db_path: &Path,
+    addr: std::net::SocketAddr,
+    token_file: Option<PathBuf>,
+) -> Result<()> {
+    let token_path = token_file.unwrap_or_else(|| {
+        db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("daemon/token")
+    });
+    let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
+    let handle = jkb_daemon::server::spawn(db, &cfg).context("starting jkb serve")?;
+    // One line, flushed, that a supervisor log and a test can both read: the address actually
+    // bound (a `:0` port is resolved) and where the token went.
+    println!(
+        "jkb serve listening on http://{} (token: {})",
+        handle.addr,
+        token_path.display()
+    );
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    });
+    let _ = rx.recv();
+    handle.shutdown();
     Ok(())
 }
 

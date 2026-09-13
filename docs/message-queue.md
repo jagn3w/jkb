@@ -129,8 +129,60 @@ Pinned end to end through a real binary by `tests/cli.rs`
 after an ack), a group recreated mid-stream, a closed stdout, a stdin read failure, bad commands and
 `--at-most-once`.
 
+## Over HTTP: `jkb serve` and remote mode
+
+A process that must not open `jkb.db` — the dev container's `jkb`, whose kernel corrupts the host's
+database across the bind mount — reaches the same operations through the host daemon
+(`crates/jkb-daemon`, design H2/H3).
+
+**The daemon.** `jkb serve [--addr 127.0.0.1:7117] [--token-file PATH]`, normally the `com.jkb.serve`
+launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts. It:
+
+- refuses an unspecified address (`0.0.0.0`, `::`);
+- mints a 256-bit bearer token each start and writes it, owner-only, tmp+rename, to
+  `<database directory>/daemon/token` (so `~/.jkb/daemon/token` for the default database);
+- refuses every operation, with `schema_newer`, while the database is at a schema this build does not
+  know — a newer `jkb` migrated it; restart the daemon from that build;
+- holds a 1 MiB body limit, and separate concurrency budgets for operations and long-polls, answering
+  `busy` when one is exhausted.
+
+**The wire.** Both endpoints need `Authorization: Bearer <token>`. The body is always JSON; clients
+branch on its `code`, the HTTP status is for people and proxies.
+
+```
+GET  /v1/hello            → {"protocol":1,"schema_version":…,"supported_schema":…,"ops":[…]}
+POST /v1/op[?wait_ms=N]   → a response object ({"result":…}), or an error object ({"code","message"})
+```
+
+`wait_ms` (capped at 30 s) turns an empty `mq.poll` into a long-poll: it returns as soon as a message
+arrives — at once for a send the daemon served, within 250 ms for one another host process wrote.
+
+**The token keeps out other local processes, not the container's agent**, which can read the file.
+What bounds the agent is the operation set: nothing in it touches a file, a URL or a process on the
+host.
+
+**Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
+`~/.jkb/daemon/token`), `jkb`:
+
+- runs `jkb mq …` through the daemon;
+- runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
+- **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
+  `mount`, `ingest`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
+- refuses `--db`.
+
+The table is an exhaustive `match` (`crates/jkb-cli/src/remote.rs`), so a new subcommand does not
+compile until it says which it is. A daemon that cannot be reached is remembered for 5 seconds
+(`~/.cache/jkb/remote-unreachable`), so a burst of short-lived `jkb` processes pays one connect
+timeout, not one each.
+
+Pinned by `crates/jkb-daemon/tests/loopback.rs` (the server and client over real TCP: round trip,
+long-poll wake-ups, token rotation, unspecified-address refusal, body limit, unknown fields, schema
+refusal, the unreachable cache) and `tests/cli.rs`
+`remote_mode_reaches_the_daemon_and_refuses_everything_else` (real binaries on both sides).
+
 ## Not yet
 
-- The HTTP transport for these operations (`jkb serve`) and the container's remote mode — stage S3.
+- Wiring the container to the daemon (firewall port, host alias, `JKB_REMOTE`) — stage S4.
+- Porting the agent read and task-mutate command sets to operations — stage S6.
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.
-- A native, non-subprocess client (Swift) — it will speak the HTTP protocol, documented with S3.
+- A native, non-subprocess client (Swift) — it would speak the HTTP protocol above.

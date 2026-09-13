@@ -51,6 +51,59 @@ fn an_unknown_op_or_field_is_refused_rather_than_ignored() {
 }
 
 #[test]
+fn every_op_names_its_own_wire_tag_and_is_advertised() {
+    let samples = [
+        Request::MqTopicCreate {
+            topic: "t".into(),
+            spec: SpecInput::default(),
+        },
+        Request::MqSend {
+            topic: "t".into(),
+            key: "k".into(),
+            kind: "k".into(),
+            payload: json!(1),
+            ttl_ms: None,
+            producer: "p".into(),
+        },
+        Request::MqGroupCreate {
+            topic: "t".into(),
+            group: "g".into(),
+            from_start: false,
+        },
+        Request::MqPoll {
+            topic: "t".into(),
+            group: "g".into(),
+            max: 1,
+            after: None,
+        },
+        Request::MqAck {
+            topic: "t".into(),
+            group: "g".into(),
+            seq: 1,
+        },
+        Request::MqCompact { force: false },
+        Request::MqInspect {},
+        Request::MqTail {
+            topic: "t".into(),
+            limit: 1,
+        },
+    ];
+    assert_eq!(
+        samples.len(),
+        Request::OPS.len(),
+        "one sample per advertised op"
+    );
+    for r in &samples {
+        assert_eq!(serde_json::to_value(r).unwrap()["op"], r.op());
+        assert!(
+            Request::OPS.contains(&r.op()),
+            "{} is not advertised",
+            r.op()
+        );
+    }
+}
+
+#[test]
 fn an_error_code_from_a_newer_peer_decodes_as_unknown() {
     let e: ApiError =
         serde_json::from_value(json!({ "code": "rate_limited", "message": "slow down" })).unwrap();

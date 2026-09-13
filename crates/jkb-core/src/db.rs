@@ -260,6 +260,11 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(user_version, 17);
+        assert_eq!(
+            crate::supported_schema_version(),
+            user_version,
+            "a freshly migrated database is at exactly the version this build supports"
+        );
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
