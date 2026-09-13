@@ -263,6 +263,7 @@ cost to learn, and which alternatives were rejected and why.
 | [docs/namespaces-and-sync.md](docs/namespaces-and-sync.md) | `jkb-sync`, `jkb-core`'s namespace/item/undo code | The namespace layout (D32), typed namespaces (D33), investigations (Dmem), and the file-sync data-loss cluster (D45/D39/D40/D42/D47). |
 | [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |
 | [docs/ui-and-review.md](docs/ui-and-review.md) | `ui/`, `.claude/workflows/code-review.js` | The explorer is a CLI client, never a bespoke backend (D31); our reviewer returns structured findings (D37). |
+| [docs/notifications.md](docs/notifications.md) | `.claude/hooks/notify-sticky.sh`, `crates/jkb-cli/src/notify.rs`, `macos/notifier/`, `scripts/build-notifier.sh` | Sticky, self-clearing permission notifications: why the notifier is ours, the three facts measured about it, and what no installer can do. |
 
 Some rules about this set, because a split decision record fails in predictable ways:
 

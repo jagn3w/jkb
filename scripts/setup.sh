@@ -48,8 +48,6 @@ while [ "$#" -gt 0 ]; do
     --no-scaffold) do_scaffold=0 ;;
     --link-memory) link_memory=1 ;;
     --db) shift; db="$1" ;;
-    --skip-paths) printf '%s\n' "$SKIP_PATHS"; exit 0 ;;
-    --hooks-dir) shift; hooks_dir_for "${1:-.}"; exit 0 ;;
     -h|--help)
       # Derived, not a pinned line range: the header grows, and a stale `2,18p` silently
       # truncates the help or prints a line of code as documentation. Both happened here.

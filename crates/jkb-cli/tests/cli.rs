@@ -2899,6 +2899,8 @@ fn the_cli_fixture_does_not_inherit_a_repository() {
     let tmp = TempDir::new().unwrap();
     let cmd = jkb(&tmp.path().join("x.db"));
     common::assert_isolated("the cli fixture", &cmd);
+}
+
 /// `notify` must run before the database is opened.
 ///
 /// It fires after EVERY tool call, and `open_db` verifies fifteen migrations and starts the
@@ -2914,11 +2916,10 @@ fn notify_needs_no_database() {
     let not_a_db = dir.path().join("not-a-database");
     std::fs::write(&not_a_db, b"this is not a sqlite file").expect("write");
 
-    // `assert_cmd::Command` rather than the `std::process::Command` this file otherwise uses,
-    // because the payload arrives on stdin.
-    assert_cmd::Command::cargo_bin("jkb")
-        .expect("binary")
-        .args(["--db", not_a_db.to_str().expect("path"), "notify", "hook"])
+    // Wrapped in `assert_cmd::Command` because the payload arrives on stdin, but built by the
+    // `jkb` fixture so the spawn inherits no repository selection.
+    assert_cmd::Command::from_std(jkb(&not_a_db))
+        .args(["notify", "hook"])
         .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
         .assert()
         .success();

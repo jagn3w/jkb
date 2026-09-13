@@ -702,8 +702,8 @@ fn owner_from(raw: &str, parent: u32, me: u32) -> String {
 /// left — but it belongs here because the question this table answers is "which registrations
 /// must exist", and a name that drifts out of `.claude/settings.json` or the shim is silent in
 /// the worst way: renaming the `SessionStart` literal alone disabled the sweep permanently with
-/// every check still green. `jkb notify events` prints it so `scripts/test-hooks.sh` can diff all
-/// three spellings instead of two.
+/// every check still green. `jkb notify events` prints it so
+/// `scripts/tests/notify-hook.test.sh` can diff all three spellings instead of two.
 const HOOK_EVENTS: &[(&str, Option<NotifEvent>)] = &[
     ("Notification", Some(NotifEvent::Needed)),
     ("PostToolUse", Some(NotifEvent::ToolFinished)),

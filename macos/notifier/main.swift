@@ -42,7 +42,7 @@ func fail(_ message: String, _ code: Int32) -> Never {
 // MARK: - arguments
 
 /// `--flag value` pairs after the verb. Deliberately not a general parser: the only caller is a
-/// shell hook whose invocation is pinned by `scripts/test-hooks.sh`.
+/// shell hook whose invocation is pinned by `scripts/tests/notify-hook.test.sh`.
 func parseFlags(_ args: ArraySlice<String>) -> [String: String] {
     var out: [String: String] = [:]
     var rest = Array(args)

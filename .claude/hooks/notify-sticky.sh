@@ -41,7 +41,7 @@
 # writes nothing to stdout (a hook's stdout lands in the transcript).
 #
 # Env seams: `JKB_NOTIFIER` overrides the notifier binary, `JKB_NOTIFY_STATE` the marker
-# directory. `scripts/test-hooks.sh` drives both, which is what lets this be tested off macOS.
+# directory. `scripts/tests/notify-hook.test.sh` drives both, which is what lets this be tested off macOS.
 
 # Where the notifier lives, spelled ONCE for the whole repo. `scripts/build-notifier.sh` installs
 # to `--notifier-path` (the first entry) rather than composing a path of its own: the two used to
@@ -56,7 +56,7 @@ NOTIFIER_PATHS=(
 # Every event `.claude/settings.json` must register for this hook, and the ONLY place they are
 # enumerated. The shim no longer dispatches on them — `jkb notify hook` does — but a registration
 # that goes missing is silent in the worst way, so `--events` exists for the cross-check in
-# `scripts/test-hooks.sh` to diff this list against settings.json in both directions.
+# `scripts/tests/notify-hook.test.sh` to diff this list against settings.json in both directions.
 #
 # `SessionStart` is not one of the lifecycle's events: it drives the sweep over records left by
 # OTHER sessions, which is the only route by which a notification from a killed session ever
@@ -112,8 +112,7 @@ if [ "${1:-}" = "--notifier-path" ]; then
   exit 0
 fi
 
-# Every event this hook acts on, for the settings.json cross-check in scripts/test-hooks.sh.
-# Every event this hook acts on, for the settings.json cross-check in scripts/test-hooks.sh.
+# Every event this hook acts on, for the settings.json cross-check in scripts/tests/notify-hook.test.sh.
 if [ "${1:-}" = "--events" ]; then
   printf '%s\n' "${HOOK_EVENTS[@]}"
   exit 0

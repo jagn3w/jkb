@@ -71,7 +71,7 @@ enum NotifyCmd {
     /// Withdraw notifications left behind by sessions that are provably gone.
     Sweep,
     /// Print the Claude Code hook events this command answers to, for the registration
-    /// cross-check in `scripts/test-hooks.sh`.
+    /// cross-check in `scripts/tests/notify-hook.test.sh`.
     Events,
 }
 

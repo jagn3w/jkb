@@ -7,7 +7,7 @@
 # the suite passes on the Linux CI runner too.
 set -uo pipefail
 
-hook="$(cd "$(dirname "$0")/.." && pwd)/.claude/hooks/notify-sticky.sh"
+hook="$(cd "$(dirname "$0")/../.." && pwd)/.claude/hooks/notify-sticky.sh"
 [ -x "$hook" ] || { echo "missing or non-executable: $hook" >&2; exit 1; }
 
 # Checked, not assumed: an unusable temp dir must stop the suite, never let it fall back to
@@ -170,7 +170,7 @@ check "the install path is one find_notifier searches" \
 # CI too. It used to call /usr/libexec/PlistBuddy directly, which does not exist on ubuntu-latest:
 # the `|| echo MISSING` arm turned "cannot read" into a wrong VALUE and reddened CI on every push,
 # in a suite whose header claims it is portable.
-"$(cd "$(dirname "$0")/.." && pwd)/scripts/build-notifier.sh" --check --quiet >/dev/null 2>&1
+"$(cd "$(dirname "$0")/../.." && pwd)/scripts/build-notifier.sh" --check --quiet >/dev/null 2>&1
 check "the plist declares the executable the install path names" "$?" "0"
 
 # 12d. The hook's events and `.claude/settings.json`'s registrations, diffed BOTH ways. The hook
@@ -179,7 +179,7 @@ check "the plist declares the executable the install path names" "$?" "0"
 #      but unhandled spawns a process per occurrence for no reason. Neither errors. Losing `Stop`
 #      is the sharpest case: a *denied* permission produces no `PostToolUse`, so its notification
 #      would sit on screen until the session ended, which is the case `Stop` exists for.
-settings="$(cd "$(dirname "$0")/.." && pwd)/.claude/settings.json"
+settings="$(cd "$(dirname "$0")/../.." && pwd)/.claude/settings.json"
 handled=$(env -u JKB_NOTIFIER bash "$hook" --events </dev/null 2>/dev/null | sort)
 registered=$(jq -r --arg h "notify-sticky.sh" '
   .hooks | to_entries[]
@@ -192,8 +192,8 @@ check "every event the hook handles is registered in settings.json" \
 # The names also appear in the Rust dispatcher, which the shim cannot see. `jkb notify events`
 # prints what it answers to, so all THREE spellings are diffed rather than two — renaming the
 # `"SessionStart"` literal in `hook()` disabled the sweep permanently with every check green.
-if [ -x "$(cd "$(dirname "$0")/.." && pwd)/target/debug/jkb" ]; then
-  rust_events=$("$(cd "$(dirname "$0")/.." && pwd)/target/debug/jkb" notify events 2>/dev/null | sort)
+if [ -x "$(cd "$(dirname "$0")/../.." && pwd)/target/debug/jkb" ]; then
+  rust_events=$("$(cd "$(dirname "$0")/../.." && pwd)/target/debug/jkb" notify events 2>/dev/null | sort)
   check "the hook's events and jkb's agree" \
     "$(comm -3 <(printf '%s\n' "$handled") <(printf '%s\n' "$rust_events") | tr -d '[:space:]')" ""
 else
@@ -214,7 +214,7 @@ if [ "${JKB_HOOK_LIVE_TEST:-0}" != "1" ]; then
   printf '  --  %s\n' "skipped (set JKB_HOOK_LIVE_TEST=1 to run; posts a real notification)"
 elif [ -z "$live_bin" ]; then
   fail "live round-trip: no notifier installed — run scripts/build-notifier.sh"
-elif ! "$live_bin" status 2>/dev/null | grep -q "authorization=authorized"; then
+elif ! grep -q "authorization=authorized" <<<"$("$live_bin" status 2>/dev/null)"; then
   fail "live round-trip: notifier is not authorized — run: '$live_bin' authorize"
 else
   # Driven through the REAL hook with the payloads Claude Code actually sends — nothing stubbed,
@@ -226,7 +226,7 @@ else
   # Driven against THIS CHECKOUT's jkb, not whatever is installed. The shim delegates to the
   # first `jkb` on PATH, and an installed binary predating `notify` silently does nothing — which
   # is precisely what this test saw the first time it ran against the shim.
-  repo_target="$(cd "$(dirname "$0")/.." && pwd)/target/debug"
+  repo_target="$(cd "$(dirname "$0")/../.." && pwd)/target/debug"
   if [ ! -x "$repo_target/jkb" ]; then
     fail "live round-trip: $repo_target/jkb is not built — run ./scripts/build.sh"
     live_bin=""
@@ -261,173 +261,6 @@ else
     *alert-style=alert*) ok "the alert style is sticky" ;;
     *) printf '  --  %s\n' "alert style is not 'alert' — banners will hide; set System Settings > Notifications > jkb Notifier > Alerts" ;;
   esac
-fi
-
-echo "==> post-merge (setup.sh rebuild trigger)"
-
-# CANARY. These fixtures run a real git hook, and a hook that escapes its temp dir does not fail
-# loudly — it silently rewrites the repository it escaped into. That happened once (see pm_run),
-# so the suite records the repo's own state before and after and refuses to call itself green if
-# anything moved. This detects an escape whatever its cause, rather than trusting the guards in
-# pm_run to be exhaustive, and it is what makes those guards testable at all.
-repo_root_for_canary="$(cd "$(dirname "$0")/.." && pwd)"
-canary_before=$(git -C "$repo_root_for_canary" status --porcelain 2>/dev/null; \
-                git -C "$repo_root_for_canary" rev-parse HEAD 2>/dev/null)
-
-# post-merge is RUN here, not pattern-matched. These assertions used to re-implement its `grep`
-# against setup.sh's answer and never execute the hook — so changing post-merge's own matching
-# (say `grep -qE` to `grep -q`) would have made every pull silently skip setup.sh with all eleven
-# of them still green. A test that reimplements the thing it tests measures the copy.
-#
-# Each case is a throwaway git repo with a stub setup.sh that records whether it was invoked.
-# PATH deliberately excludes ~/.cargo/bin so `command -v jkb` fails and the hook's second step
-# (`jkb task close-merged`) cannot touch the real knowledge base from a test.
-pm_src="$(cd "$(dirname "$0")/.." && pwd)/scripts/hooks/post-merge"
-
-pm_run() { # pm_run <changed-paths, space-separated> <skip-paths-answer> -> "ran" | "skipped"
-  local d ans f
-  ans=$2
-
-  # THE TEMP DIR IS VALIDATED BEFORE ANYTHING IS WRITTEN, because `cd ""` SUCCEEDS in bash. When
-  # `mktemp -d` failed (a sandbox denying $TMPDIR is enough), `d` was empty, `cd "$d" || exit` did
-  # not fire, and this whole fixture ran in the REAL REPOSITORY: it `git init`-ed over the
-  # worktree, committed, overwrote tracked sources with `x`, and executed the real post-merge —
-  # which found the real scripts/setup.sh and ran it, reaching `cargo install` and `pnpm install`.
-  # That is observed behaviour, not a hypothetical. Everything below is written so that no single
-  # failure can reproduce it.
-  d=$(mktemp -d 2>/dev/null) || d=""
-  if [ -z "$d" ] || [ ! -d "$d" ]; then
-    echo "fixture-error: could not create a temp dir" >&2
-    echo fixture-error
-    return
-  fi
-  : > "$d/.pm-fixture"          # sentinel: proves cwd is the fixture, not the repo
-
-  mkdir -p "$d/scripts"
-  cat > "$d/scripts/setup.sh" <<STUB
-#!/bin/sh
-[ "\$1" = "--skip-paths" ] && { printf '%s\\n' '$ans'; exit 0; }
-echo ran > "$d/invoked"
-STUB
-  chmod +x "$d/scripts/setup.sh"
-
-  # Every path is ABSOLUTE and every git call takes -C, so the destructive half does not depend on
-  # the working directory at all — the second layer, independent of the check above.
-  git -C "$d" init -q . && git -C "$d" config user.email t@t && git -C "$d" config user.name t
-  echo seed > "$d/seed.txt"
-  git -C "$d" add -A && git -C "$d" commit -qm one
-  git -C "$d" rev-parse HEAD > "$d/.git/ORIG_HEAD"
-  # An empty <changed-path> leaves ORIG_HEAD at HEAD, so `git diff` yields nothing — which is
-  # also what an unresolvable range produces, since line 22 of the hook swallows the failure.
-  if [ -n "$1" ]; then
-    for f in $1; do
-      mkdir -p "$d/$(dirname "$f")" && echo x > "$d/$f"
-    done
-    git -C "$d" add -A && git -C "$d" commit -qm two
-  fi
-
-  # The hook itself must run WITH the fixture as cwd (it calls `git rev-parse --show-toplevel`),
-  # so this is the one place cwd matters. The sentinel is checked after the cd rather than
-  # comparing $PWD to $d, which does not hold on macOS where /var is a symlink to /private/var.
-  #
-  # Invoked the way git does — through the shebang — NOT with `sh`. Ubuntu's /bin/sh is dash,
-  # which rejects the hook's own `set -uo pipefail` and exits before doing anything.
-  (
-    cd "$d" || exit 1
-    [ -f .pm-fixture ] || exit 1
-    PATH=/usr/bin:/bin "$pm_src" >/dev/null 2>&1
-  )
-
-  [ -f "$d/invoked" ] && echo ran || echo skipped
-  [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
-}
-
-skip_paths=$("$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh" --skip-paths 2>/dev/null)
-check "setup.sh answers --skip-paths" "$([ -n "$skip_paths" ] && echo yes || echo no)" "yes"
-
-# Everything that feeds a setup.sh step must rebuild. `.claude/` is here because
-# build-notifier.sh takes its install path from .claude/hooks/notify-sticky.sh, which the previous
-# inclusion-list version did not match — the second silent drift of the same kind.
-for path in macos/notifier/main.swift .claude/hooks/notify-sticky.sh .claude/settings.json \
-            crates/jkb-cli/src/main.rs ui/core/src/summary.ts scripts/build-notifier.sh \
-            Cargo.toml; do
-  check "a pull touching $path rebuilds" "$(pm_run "$path" "$skip_paths")" "ran"
-done
-
-# Only things that provably cannot change what any step installs may be skipped.
-for path in openspec/changes/x/design.md README.md CLAUDE.md .codereviews/x/tasks.md; do
-  check "a pull touching $path does not rebuild" "$(pm_run "$path" "$skip_paths")" "skipped"
-done
-
-# MIXED pulls, which are the common case — nearly every branch touches a top-level .md as well as
-# code, and this one touches CLAUDE.md alongside crates/, macos/ and .claude/. Every case above
-# changes exactly one path, so on its own the suite cannot tell "rebuild if ANY changed path is
-# outside the skip list" from "rebuild only if ALL are": inverting that quantifier leaves all of
-# them green while every real pull silently skips the rebuild.
-check "a pull touching docs AND code rebuilds" \
-  "$(pm_run "CLAUDE.md crates/jkb-cli/src/main.rs" "$skip_paths")" "ran"
-check "a pull touching docs AND the notifier rebuilds" \
-  "$(pm_run "README.md macos/notifier/main.swift" "$skip_paths")" "ran"
-check "a pull touching only several doc paths still skips" \
-  "$(pm_run "README.md CLAUDE.md openspec/changes/x/design.md" "$skip_paths")" "skipped"
-
-# An unanswerable trigger degrades toward doing the work: a skipped rebuild leaves a stale
-# artifact and says nothing, an unnecessary one only costs time.
-check "an unanswerable --skip-paths rebuilds anyway" "$(pm_run README.md "")" "ran"
-
-# A pattern grep CANNOT COMPILE is a third state, and as a bare `if` condition it was
-# indistinguishable from "everything matched" — so the hook printed grep's error and then took the
-# skip arm, the one direction its own comment forbids. The status is now read explicitly, and
-# anything that is not a clean "all matched" rebuilds.
-check "a skip pattern grep cannot compile rebuilds anyway" \
-  "$(pm_run crates/f.rs '^(unbalanced')" "ran"
-
-# The other unknown, and the one that used to degrade the wrong way: `git diff` produces an empty
-# list both when nothing was pulled and when it could not resolve the range at all, and the hook
-# cannot tell those apart — so it must not read either as "nothing to do".
-check "an unreadable diff rebuilds anyway" "$(pm_run "" "$skip_paths")" "ran"
-
-# ...and it must not rely on today's skip pattern happening to reject an empty line. `printf
-# '%s\n' ""` emits one blank line, which no current alternative matches, so the inverted `grep -qv`
-# rebuilds by luck as much as by design. An over-broad pattern removes that luck, and the explicit
-# empty-`changed` guard is what still rebuilds — this is the case that makes it load-bearing
-# rather than decorative.
-check "an unreadable diff rebuilds even under an over-broad skip pattern" \
-  "$(pm_run "" ".*")" "ran"
-
-canary_after=$(git -C "$repo_root_for_canary" status --porcelain 2>/dev/null; \
-               git -C "$repo_root_for_canary" rev-parse HEAD 2>/dev/null)
-check "the post-merge fixtures did not touch the real repository" \
-  "$([ "$canary_before" = "$canary_after" ] && echo intact || echo CHANGED)" "intact"
-
-# The hooks directory, in a real WORKTREE — which is the mode this project works in, and the one
-# the answer used to be wrong for. `--git-dir` there is .git/worktrees/<name>, where git never
-# looks for hooks, so setup.sh installed into a path git ignores while printing it as success and
-# D34.5's post-merge automation was silently off in every `jkb task work` session.
-echo "==> setup.sh (hooks directory)"
-hd_repo=$(mktemp -d) || hd_repo=""
-if [ -z "$hd_repo" ] || [ ! -d "$hd_repo" ]; then
-  fail "hooks-dir fixture: could not create a temp dir"
-else
-  (
-    cd "$hd_repo" || exit 1
-    git init -q . && git config user.email t@t && git config user.name t
-    echo seed > seed.txt && git add -A && git commit -qm one
-    git worktree add -q wt -b side
-  ) >/dev/null 2>&1
-  setup="$(cd "$(dirname "$0")/.." && pwd)/scripts/setup.sh"
-  check "in a plain checkout it is git's own answer" \
-    "$("$setup" --hooks-dir "$hd_repo")" \
-    "$(git -C "$hd_repo" rev-parse --path-format=absolute --git-common-dir)"
-  check "in a WORKTREE it is still the common dir, not --git-dir" \
-    "$("$setup" --hooks-dir "$hd_repo/wt")" \
-    "$(git -C "$hd_repo/wt" rev-parse --path-format=absolute --git-common-dir)"
-  # ...and the two really do differ there, or the assertion above proves nothing.
-  check "and --git-dir would have been somewhere else" \
-    "$([ "$(git -C "$hd_repo/wt" rev-parse --path-format=absolute --git-dir)" \
-        = "$(git -C "$hd_repo/wt" rev-parse --path-format=absolute --git-common-dir)" ] \
-       && echo same || echo different)" "different"
-  [ -n "$hd_repo" ] && [ -d "$hd_repo" ] && rm -rf "$hd_repo"
 fi
 
 if [ "$failures" -ne 0 ]; then

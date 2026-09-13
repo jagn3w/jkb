@@ -442,7 +442,8 @@ git rev-parse --verify --quiet ORIG_HEAD >/dev/null 2>&1 || range="HEAD^..HEAD"
 changed="$(git diff --name-only "$range" 2>/dev/null)"
 
 # --- 1. setup.sh, only when it would actually change something -----------------------
-# setup.sh installs the binary (crates/), the extension (ui/) and the service (scripts/).
+# setup.sh installs the binary (crates/), the extension (ui/), the service (scripts/) and the
+# notifier (macos/) — a stale notifier is silent, since a broken one posts nothing.
 # A pull touching only openspec/ or docs cannot affect any of them, and a full cargo
 # install is ~1-2 minutes we should not spend on every pull.
 if [ "${skip_setup:-0}" = 1 ]; then
@@ -485,8 +486,8 @@ elif [ -x "$repo_root/scripts/setup.sh" ] &&
    # mutate-config.sh), where the identical idiom made CI report "run.sh no longer runs
    # verify.sh" about a file that did. Note trunk's own account exempts `printf "$var" | grep -q`
    # as "a single write, safe" — measured false above, and it is the exact shape this line was.
-   grep -qE '^(crates/|ui/|scripts/|Cargo\.(toml|lock)$)' <<<"$changed"; then
-    echo "jkb: pulled changes touch crates/ ui/ or scripts/ — running setup.sh"
+   grep -qE '^(crates/|ui/|scripts/|macos/|Cargo\.(toml|lock)$)' <<<"$changed"; then
+    echo "jkb: pulled changes touch crates/ ui/ scripts/ or macos/ — running setup.sh"
     "$repo_root/scripts/setup.sh" || echo "jkb: setup.sh failed (continuing; re-run by hand)"
 else
     echo "jkb: no build-affecting changes pulled — skipping setup.sh"

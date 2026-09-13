@@ -96,7 +96,7 @@ check_plist() {
   return "$rc"
 }
 
-# The consistency check on its own, buildable-or-not and macOS-or-not, so `scripts/test-hooks.sh`
+# The consistency check on its own, buildable-or-not and macOS-or-not, so `scripts/tests/notify-hook.test.sh`
 # can assert the real rule rather than re-implementing it in a second place. Answered before the
 # Darwin gate below, which is the whole point — this is the arm CI reaches.
 if [ "${check_only:-0}" -eq 1 ]; then
