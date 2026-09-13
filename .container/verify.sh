@@ -1218,23 +1218,46 @@ kb_dir="$(dirname "${JKB_DB:-/nonexistent/jkb.db}")"
 assert "JKB_DB's directory ($kb_dir) is writable by $(id -un)" \
     "$([ -d "$kb_dir" ] && [ -w "$kb_dir" ] && echo yes || echo no)"
 # Asked of the INSTALLED jkb, not of a third copy of the filesystem rule: jkb-core refuses a database
-# on a filesystem shared with another kernel (crates/jkb-core/src/shared_fs.rs), and scripts/lib.sh
-# applies the same set. A binary built before that refusal opens the host's database from in here
-# — which a review measured, while this file only statted a directory — so the binary itself is
-# asked to open a probe on the bind and must refuse, and to open JKB_DB and must not.
+# on a filesystem shared with another kernel and any `file:` URI (crates/jkb-core/src/shared_fs.rs).
+# A binary built before a given refusal still opens the host's database from in here — a review
+# measured one — so the binary itself is asked.
+#
+# Two things are conditional, and each for a stated reason:
+#   - no `jkb` on PATH is a NOTE: the image does not install one (setup.sh does), and the mutation
+#     harness runs this file against that bare image, where two FAILs made its control fail;
+#   - the bind refusal is required only when the bind IS a shared filesystem, asked of lib.sh's
+#     `shared_fs_kind` (the list shared_fs.rs is checked against). On a native Linux Docker host the
+#     bind is same-kernel ext4, where opening is correct and refusing would be the bug.
+# The `file:` refusal is required everywhere, because Rust refuses URIs on every filesystem.
+kb_lib="$(cd "$(dirname "$0")/.." && pwd)/scripts/lib.sh"
 kb_probe_dir="/home/vscode/.jkb/.verify-refusal-probe-$$"
-kb_refused=no
-if command -v jkb >/dev/null 2>&1; then
-    if ! kb_out="$(jkb --db "$kb_probe_dir/jkb.db" ns ls 2>&1)" \
-        && grep -q "refusing to open a database" <<<"$kb_out" \
-        && [ ! -e "$kb_probe_dir/jkb.db" ]; then
-        kb_refused=yes
+if ! command -v jkb >/dev/null 2>&1; then
+    note "no jkb installed here, so the installed-binary refusal checks did not run (setup.sh installs it)"
+else
+    kb_uri_refused=no
+    if ! kb_out="$(jkb --db "file:$kb_probe_dir/uri.db" ns ls 2>&1)" \
+        && grep -q "never \`file:\` URIs" <<<"$kb_out"; then
+        kb_uri_refused=yes
     fi
+    assert "the installed jkb refuses a file: URI database (rebuild it if not: setup.sh)" "$kb_uri_refused"
+
+    kb_magic="$(stat -f -c %t /home/vscode/.jkb 2>/dev/null || true)"
+    kb_kind="$(bash -c '. "$1" && shared_fs_kind "$2"' _ "$kb_lib" "$kb_magic" 2>/dev/null || true)"
+    if [ -n "$kb_kind" ]; then
+        kb_refused=no
+        if ! kb_out="$(jkb --db "$kb_probe_dir/jkb.db" ns ls 2>&1)" \
+            && grep -q "refusing to open a database" <<<"$kb_out" \
+            && [ ! -e "$kb_probe_dir/jkb.db" ]; then
+            kb_refused=yes
+        fi
+        assert "the installed jkb refuses a database on the $kb_kind host bind (rebuild it if not: setup.sh)" "$kb_refused"
+    else
+        note "the ~/.jkb bind is not a shared filesystem here (magic ${kb_magic:-unreadable}), so there is nothing for jkb to refuse on it"
+    fi
+    assert "the installed jkb opens JKB_DB (${JKB_DB:-unset})" \
+        "$([ -n "${JKB_DB:-}" ] && jkb ns ls >/dev/null 2>&1 && echo yes || echo no)"
 fi
-rm -rf -- "$kb_probe_dir"
-assert "the installed jkb refuses a database on the host bind (rebuild it if not: setup.sh)" "$kb_refused"
-assert "the installed jkb opens JKB_DB ($JKB_DB)" \
-    "$([ -n "${JKB_DB:-}" ] && jkb ns ls >/dev/null 2>&1 && echo yes || echo no)"
+rm -rf -- "$kb_probe_dir" "$PWD/file:"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.

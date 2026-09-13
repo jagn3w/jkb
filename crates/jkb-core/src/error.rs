@@ -33,14 +33,15 @@ pub enum Error {
     /// The database would live on a filesystem shared with another kernel, where `SQLite`'s locks
     /// and wal-index do not hold (design r3.2 H1).
     #[error(
-        "refusing to open a database in {} — it is on a {kind} filesystem shared with another \
-         kernel, where SQLite's locks and WAL index do not work: measured, a process on each side \
+        "refusing to open a database: {} is on a {kind} filesystem shared with another kernel, \
+         where SQLite's locks and WAL index do not work: measured, a process on each side \
          corrupted a database within 38 commits (.container/sqlite-share-probe.py). Use a database \
          on a local disk (set JKB_DB or --db), or reach the host's knowledge base through its daemon",
         path.display()
     )]
     SharedFilesystem {
-        /// The directory whose filesystem was judged.
+        /// The path whose filesystem was judged: the directory that would hold the database, or
+        /// the database file or one of its `-wal`/`-shm`/`-journal` siblings.
         path: std::path::PathBuf,
         /// Which shared filesystem it is.
         kind: &'static str,
@@ -61,7 +62,7 @@ pub enum Error {
     /// Whether the database's directory is on a shared filesystem could not be established.
     #[error("cannot tell what filesystem {} is on ({reason}); refusing to open a database there", path.display())]
     FilesystemUnknown {
-        /// The directory that was asked.
+        /// The path that was asked about: the database path as given, or one resolved from it.
         path: std::path::PathBuf,
         /// Why `statfs` failed.
         reason: String,

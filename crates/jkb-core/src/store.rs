@@ -235,9 +235,10 @@ impl Db {
     /// the copy and the destination reflects all committed state.
     ///
     /// # Errors
-    /// Returns an error for an in-memory database, if `dest` resolves to the live database or
-    /// one of its `-wal`/`-shm` siblings, if the vacuum fails, or if the finished backup cannot
-    /// be renamed over `dest`.
+    /// Returns an error for an in-memory database, if `dest` is a `file:` URI or on a filesystem
+    /// shared with another kernel, if `dest` resolves to the live database or one of its
+    /// `-wal`/`-shm` siblings, if the vacuum fails, or if the finished backup cannot be renamed over
+    /// `dest`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         let Some(src) = self.path.clone() else {
             return Err(jkb_types::Error::Validation(
@@ -246,6 +247,14 @@ impl Db {
             .into());
         };
         let dest = dest.as_ref().to_path_buf();
+
+        // A backup WRITES a database file, so it answers to the same rule as `db::open`: not on a
+        // filesystem shared with another kernel, and never a `file:` URI (the bundled SQLite parses
+        // `VACUUM INTO 'file:…'` as one). Without it, `jkb doctor --backup ~/.jkb/jkb.db` run in the
+        // dev container renamed a fresh file over the HOST's live database — the comparison below
+        // only knows this process's own `src` — while host processes kept committing to the
+        // unlinked inode.
+        crate::shared_fs::refuse(&dest)?;
 
         // Refuse to write over the live database, its `-wal`/`-shm` siblings included.
         //
@@ -523,6 +532,26 @@ mod tests {
     /// Backing up ONTO the live database must be refused. `VACUUM INTO` used to make this
     /// impossible by refusing any existing destination; temp-and-rename removed that, so the
     /// precondition has to be stated rather than inherited.
+    #[test]
+    fn a_backup_to_a_uri_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("jkb.db")).unwrap();
+        let err = db
+            .backup("file:/nonexistent/backup.db")
+            .expect_err("VACUUM INTO would parse a file: destination as a URI");
+        assert!(matches!(err, crate::Error::UriPath { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_uri_database_is_refused_by_db_open_itself() {
+        // Behavioural, not a text scan: a commented-out or discarded refusal inside `db::open`
+        // satisfies a search for the call, and this does not.
+        let Err(err) = Db::open("file:/nonexistent/jkb.db") else {
+            panic!("a file: URI must not open");
+        };
+        assert!(matches!(err, crate::Error::UriPath { .. }), "{err}");
+    }
+
     #[test]
     fn backup_refuses_to_overwrite_the_live_database() {
         let dir = tempfile::tempdir().unwrap();

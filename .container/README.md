@@ -773,9 +773,14 @@ commands, which would run gates and git on the host, outside this sandbox). Unti
 the separate database is what keeps the two sides from corrupting each other.
 
 **Enforced, not just configured.** `JKB_DB` is only a default, so the rule also lives where a
-database is opened: `jkb-core`'s `db::open` refuses a database whose directory is on a FUSE, 9p, NFS
-or SMB filesystem (`crates/jkb-core/src/shared_fs.rs`, statfs of the directory SQLite would write
-into, symlinks resolved), and every script's database read goes through `jkb_sqlite` in
+database is created or opened: `jkb-core`'s `db::open` and `Db::backup` refuse any `file:` URI, and
+any database that would touch a FUSE, 9p, NFS or SMB filesystem (`crates/jkb-core/src/shared_fs.rs`).
+What is asked: the directory the files will be created in (symlinks followed, dangling ones
+included, since SQLite creates the database at a dangling link's target; the nearest existing
+ancestor for a path that does not exist yet), **and** the database file and its `-wal`/`-shm`/
+`-journal` when they exist, because a single file bind-mounted into a local directory is invisible
+to statfs of that directory. A statfs that cannot answer refuses. Every script's database read goes
+through `jkb_sqlite` in
 `scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
 on a bare call, on the two sets drifting, and inside the container on the live bind not being
 refused. So a process with `JKB_DB` unset, or `--db ~/.jkb/jkb.db`, gets a refusal instead of the

@@ -11,9 +11,10 @@
 //! read-write, and closing what a connection believes is the last WAL connection checkpoints and
 //! truncates a WAL the other side is still writing.
 //!
-//! So the rule lives here, at the one place a database file is opened, rather than in the
-//! container's environment or in each caller: an open that would put a database — or any of its
-//! files — on such a filesystem is refused, whatever `JKB_DB` or `--db` says.
+//! So the rule lives here, called from the two places jkb creates or opens a database file —
+//! `db::open` and `Db::backup` (`VACUUM INTO` writes one) — rather than in the container's
+//! environment or in each caller: an open that would put a database, or any of its files, on such
+//! a filesystem is refused, whatever `JKB_DB`, `--db` or `--backup` says.
 //!
 //! **Linux only, and that is the argument rather than a gap.** The side that must never open the
 //! host's database is the Linux container; the host's `~/.jkb` is a local disk.
@@ -84,10 +85,11 @@ fn follow_links(path: &Path) -> Option<PathBuf> {
 ///   file bind-mounted from the host into a local directory lives on the host's filesystem while
 ///   its directory does not, and `statfs` of the directory cannot see that.
 ///
-/// Symlinks are followed first, dangling ones included. `None` when the path cannot be resolved,
-/// which the caller refuses rather than reading as local.
-fn paths_to_ask(path: &Path) -> Option<Vec<PathBuf>> {
-    let target = follow_links(path)?;
+/// Symlinks are followed first, dangling ones included. An `Err` carries why the path cannot be
+/// judged, which the caller refuses rather than reading as local.
+fn paths_to_ask(path: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let target = follow_links(path)
+        .ok_or_else(|| format!("its symlinks do not resolve within {MAX_LINK_HOPS} hops"))?;
     let mut asks = Vec::new();
     let mut dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -106,7 +108,10 @@ fn paths_to_ask(path: &Path) -> Option<Vec<PathBuf>> {
             }
         }
     }
-    let name = target.file_name()?.to_os_string();
+    let name = target
+        .file_name()
+        .ok_or_else(|| "it names no file (a directory, `.` or `..`)".to_owned())?
+        .to_os_string();
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut file = name.clone();
         file.push(suffix);
@@ -115,7 +120,7 @@ fn paths_to_ask(path: &Path) -> Option<Vec<PathBuf>> {
             asks.push(candidate);
         }
     }
-    Some(asks)
+    Ok(asks)
 }
 
 /// Refuse a database path that is a URI, or that is on a filesystem shared with another kernel.
@@ -147,12 +152,7 @@ fn refuse_shared(path: &Path) -> Result<()> {
         path: at.to_path_buf(),
         reason,
     };
-    let asks = paths_to_ask(path).ok_or_else(|| {
-        unknown(
-            path,
-            format!("its symlinks do not resolve within {MAX_LINK_HOPS} hops"),
-        )
-    })?;
+    let asks = paths_to_ask(path).map_err(|reason| unknown(path, reason))?;
     for at in asks {
         let stat = rustix::fs::statfs(&at).map_err(|e| unknown(&at, e.to_string()))?;
         // `f_type` is a kernel long: i64 on 64-bit targets, i32 on 32-bit ones, and the SMB magics
@@ -268,7 +268,14 @@ mod tests {
         let b = tmp.path().join("b.db");
         std::os::unix::fs::symlink(&b, &a).unwrap();
         std::os::unix::fs::symlink(&a, &b).unwrap();
-        assert_eq!(paths_to_ask(&a), None);
+        assert!(paths_to_ask(&a).unwrap_err().contains("symlinks"));
+    }
+
+    #[test]
+    fn a_path_naming_no_file_says_so_rather_than_blaming_symlinks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = paths_to_ask(&tmp.path().join("sub/..")).unwrap_err();
+        assert!(err.contains("names no file"), "{err}");
     }
 
     #[test]

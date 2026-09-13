@@ -1542,7 +1542,7 @@ _bare_sqlite_sites() {
                 sub(/[[:space:]]#.*$/, "", line)
                 # Command position, a path prefix (/usr/bin/…), or quoted; followed by anything
                 # that ends the word — space, quote, redirection, paren or end of line.
-                if (match(line, "(^|[;&|({`$[:space:]/\"'"'"'])" cmd "([[:space:]\"'"'"'<>);]|$)")) {
+                if (match(line, "(^|[;&|({`$[:space:]/\"'"'"'=:-])" cmd "([[:space:]\"'"'"'<>);}]|$)")) {
                     print FILENAME ":" NR
                 }
             }' "$f"
@@ -1556,6 +1556,17 @@ _wrapper_calls() {
     cmd="sqli""te3"
     sed -n '/^jkb_sqlite() {/,/^}/p' "$repo_root/scripts/lib.sh" \
         | grep -cE "^[[:space:]]+$cmd[[:space:]]" || true
+}
+
+# The wrapper's ORDER: a refusal that RETURNS, strictly before the one call. Exempting the body from
+# the bare-call scan meant deleting the refusal — or moving the call above it — stayed green.
+_wrapper_refuses_first() {
+    local cmd body refuse_ln call_ln
+    cmd="sqli""te3"
+    body="$(sed -n '/^jkb_sqlite() {/,/^}/p' "$repo_root/scripts/lib.sh")"
+    refuse_ln="$(grep -nE '^[[:space:]]+if ! refuse_shared_db "\$db"; then return [1-9]; fi' <<<"$body" | head -1 | cut -d: -f1)"
+    call_ln="$(grep -nE "$cmd" <<<"$body" | grep -v '^[0-9]*:[[:space:]]*#' | head -1 | cut -d: -f1)"
+    [ -n "$refuse_ln" ] && [ -n "$call_ln" ] && [ "$refuse_ln" -lt "$call_ln" ]
 }
 
 # Only the `const SHARED … ];` block, and every entry line must be a hex tuple: an entry spelled any
@@ -1586,7 +1597,7 @@ _jkb_is_a_bind_here() {
 }
 
 case11() {
-    local sites rust shell odd m probe_dir rc real_home calls
+    local sites rust shell odd m probe_dir rc=0 real_home calls
     sites="$(_bare_sqlite_sites "$repo_root")"
     calls="$(_wrapper_calls)"
     if [ "$calls" != 1 ]; then
@@ -1597,6 +1608,26 @@ database shell and holds $calls — the scan below is not looking at what it thi
     else
         fail "shared-db: bare call" "these run the database shell directly, so the shared-filesystem \
 refusal never runs for them — use jkb_sqlite from scripts/lib.sh: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')"
+    fi
+
+    if _wrapper_refuses_first; then
+        ok "jkb_sqlite refuses, and returns, before it calls the database shell"
+    else
+        fail "shared-db: wrapper order" "scripts/lib.sh's jkb_sqlite must run \`if ! refuse_shared_db \"\$db\"; \
+then return N; fi\` before its one call, or the refusal guards nothing"
+    fi
+    # ...and behaviourally: a shim shell on PATH records whether the wrapper reached it for a path the
+    # guard refuses. A URI is refused on every platform, so this runs everywhere.
+    mkdir -p "$work/shim"
+    printf '#!/bin/sh\necho called >> "%s"\n' "$work/shim.calls" > "$work/shim/sqli""te3"
+    chmod +x "$work/shim/sqli""te3"
+    : > "$work/shim.calls"
+    (PATH="$work/shim:$PATH" jkb_sqlite "file:/refused/jkb.db" "select 1" 2>/dev/null); rc=$?
+    if [ "$rc" != 0 ] && [ ! -s "$work/shim.calls" ]; then
+        ok "jkb_sqlite on a refused path never starts the database shell"
+    else
+        fail "shared-db: wrapper ran" "jkb_sqlite returned $rc and the shim recorded \
+$(grep -c . "$work/shim.calls" || true) call(s) for a path the guard refuses"
     fi
 
     rust="$(_rust_shared_magics)"
@@ -1620,15 +1651,43 @@ the CLI would disagree about the same directory"
 
     # From a LOCAL directory: judged as a relative path, the URI would ask about the working
     # directory — and from inside the checkout that is itself the shared bind, so the test passed
-    # with the URI rule deleted.
+    # with the URI rule deleted. Asserted BEFORE the platform skip, because the rule is not Linux-only.
     (cd "$work" && refuse_shared_db "file:/anything/jkb.db" 2>/dev/null); rc=$?
+    [ "$rc" != 0 ] && ok "a file: URI is refused rather than judged as a relative path" \
+        || fail "shared-db: URI allowed" "refuse_shared_db accepted a file: URI, which the database \
+shell opens as a URI while the guard judged the working directory"
     if [ "$(uname -s)" != Linux ]; then
         skip "live refusal (not Linux)"
         return 0
     fi
-    [ "$rc" != 0 ] && ok "a file: URI is refused rather than judged as a relative path" \
-        || fail "shared-db: URI allowed" "refuse_shared_db accepted a file: URI, which the database \
-shell opens as a URI while the guard judged the working directory"
+
+    # The per-file asks and the fail-closed branch, driven through a stub `stat` because no test can
+    # mount a single-file bind. The stub reports FUSE for the database FILE only and ext4 for its
+    # directory — the shape of a file bind-mounted into a local directory.
+    mkdir -p "$work/statstub" "$work/filebind"
+    cat > "$work/statstub/stat" <<'STUB'
+#!/bin/sh
+[ -n "${STAT_FAILS:-}" ] && exit 1
+for last; do :; done
+case "$last" in
+    */jkb.db) echo 65735546 ;;
+    *) echo ef53 ;;
+esac
+STUB
+    chmod +x "$work/statstub/stat"
+    : > "$work/filebind/jkb.db"
+    (PATH="$work/statstub:$PATH" refuse_shared_db "$work/filebind/jkb.db" 2>/dev/null); rc=$?
+    [ "$rc" = 3 ] && ok "a database FILE on a shared filesystem is refused though its directory is local" \
+        || fail "shared-db: file bind allowed" "refuse_shared_db returned $rc when only the file itself \
+reported a shared filesystem — a single-file bind mount"
+    rm -f "$work/filebind/jkb.db"
+    (PATH="$work/statstub:$PATH" refuse_shared_db "$work/filebind/jkb.db" 2>/dev/null); rc=$?
+    [ "$rc" = 0 ] && ok "and once the file is gone, its local directory alone is allowed" \
+        || fail "shared-db: stub control" "refuse_shared_db returned $rc with no file present — the \
+per-file assertion above proves nothing if this refuses too"
+    (PATH="$work/statstub:$PATH" STAT_FAILS=1 refuse_shared_db "$work/filebind/jkb.db" 2>/dev/null); rc=$?
+    [ "$rc" = 2 ] && ok "an unanswerable stat refuses rather than reading as local" \
+        || fail "shared-db: fail-open" "refuse_shared_db returned $rc when stat could not answer"
 
     probe_dir="$work/local-db"
     mkdir -p "$probe_dir"

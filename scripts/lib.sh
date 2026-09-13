@@ -1655,16 +1655,18 @@ shared_fs_kind() {
 #   - the nearest existing ancestor of the resolved path is asked, and so are the file and its
 #     -wal/-shm/-journal when they exist — a single file bind-mounted from the host into a local
 #     directory is invisible to statfs of that directory.
-# Linux only — the host side of the boundary is a local disk.
+# The filesystem half is Linux only — the host side of the boundary is a local disk.
 refuse_shared_db() {
     local db="$1" target dir at magic kind asks=()
-    if [ "$(uname -s)" != Linux ]; then return 0; fi
+    # Before the platform check: shared_fs.rs refuses a URI on every platform, and two copies of one
+    # rule that disagree on macOS are the defect this pair exists to avoid.
     case "$db" in
         file:*)
             printf 'refusing to open %s: a URI is not a path this guard can judge\n' "$db" >&2
             return 2 ;;
         *) : ;;
     esac
+    if [ "$(uname -s)" != Linux ]; then return 0; fi
     if ! target="$(readlink -m -- "$db" 2>/dev/null)" || [ -z "$target" ]; then
         printf 'refusing to open %s: cannot resolve where it points\n' "$db" >&2
         return 2
