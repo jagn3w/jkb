@@ -641,8 +641,14 @@ pub fn group_create(
     })
 }
 
-/// Up to `max` messages after the group's position, in `seq` order. Records the poll (which is
-/// what keeps an idle-but-alive consumer's group from being removed), so it is a write.
+/// Up to `max` messages after the group's position — or after `after`, when that is further on — in
+/// `seq` order. Records the poll (which is what keeps an idle-but-alive consumer's group from being
+/// removed), so it is a write.
+///
+/// `after` is the consumer's FETCH position, kept apart from its committed one as Kafka does: a
+/// consumer that has handed messages on but not yet acked them asks for what comes after them.
+/// Without it a batch full of unacked messages is returned again on every poll, and a consumer that
+/// acks late never sees past its first batch.
 ///
 /// # Errors
 /// [`QueueError::NoSuchTopic`], [`QueueError::NoSuchGroup`], [`QueueError::CorruptPayload`] when the
@@ -653,23 +659,57 @@ pub fn poll(
     topic: &str,
     group: &str,
     max: usize,
+    after: Option<i64>,
     now: i64,
 ) -> Result<Vec<Delivered>> {
     let (topic_id, _) = topic_row(conn, topic)?;
-    let position = group_position(conn, topic, topic_id, group)?;
+    let position = group_position(conn, topic, topic_id, group)?.max(after.unwrap_or(0));
     conn.prepare_cached(
         "UPDATE mq_groups SET last_poll_at = ?1 WHERE topic_id = ?2 AND name = ?3",
     )?
     .execute(params![now, topic_id, group])?;
     let limit = i64::try_from(max).unwrap_or(i64::MAX);
-    // The payload is parsed after the query, so a corrupt one is a named error rather than a
-    // rusqlite conversion failure: `payload` is carried as its stored text in `Value::String`.
-    let rows: Vec<Delivered> = conn
-        .prepare_cached(
-            "SELECT seq, key, kind, payload, producer, enqueued_at, expires_at FROM mq_messages \
-             WHERE topic_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
-        )?
-        .query_map(params![topic_id, position, limit], |r| {
+    let rows = message_rows(
+        conn,
+        "SELECT seq, key, kind, payload, producer, enqueued_at, expires_at FROM mq_messages \
+         WHERE topic_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        params![topic_id, position, limit],
+        now,
+    )?;
+    parse_payloads(topic, rows)
+}
+
+/// The newest `limit` messages a topic holds, oldest first, without touching any group — for
+/// `jkb mq tail`. Same payload handling as [`poll`].
+///
+/// # Errors
+/// [`QueueError::NoSuchTopic`], [`QueueError::CorruptPayload`], or a database error.
+pub fn tail(conn: &Connection, topic: &str, limit: usize, now: i64) -> Result<Vec<Delivered>> {
+    let (topic_id, _) = topic_row(conn, topic)?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = message_rows(
+        conn,
+        "SELECT * FROM (SELECT seq, key, kind, payload, producer, enqueued_at, expires_at \
+                        FROM mq_messages WHERE topic_id = ?1 ORDER BY seq DESC LIMIT ?2) \
+         ORDER BY seq",
+        params![topic_id, limit],
+        now,
+    )?;
+    parse_payloads(topic, rows)
+}
+
+/// Rows of `seq, key, kind, payload, producer, enqueued_at, expires_at`, with the payload still its
+/// stored text (in `Value::String`) so a corrupt one is a named error rather than a conversion
+/// failure inside the query.
+fn message_rows(
+    conn: &Connection,
+    sql: &str,
+    args: impl rusqlite::Params,
+    now: i64,
+) -> Result<Vec<Delivered>> {
+    Ok(conn
+        .prepare_cached(sql)?
+        .query_map(args, |r| {
             let expires_at: Option<i64> = r.get(6)?;
             Ok(Delivered {
                 seq: r.get(0)?,
@@ -682,10 +722,13 @@ pub fn poll(
                 expired: expires_at.is_some_and(|at| at <= now),
             })
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    // A payload that does not parse ends the batch just before it, so everything earlier is still
-    // handed over; when it is the FIRST message, the error names its seq so the consumer can ack past
-    // it rather than the whole topic wedging behind it.
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Parse stored payloads. A payload that does not parse ends the batch just before it, so everything
+/// earlier is still handed over; when it is the FIRST message, the error names its seq so a consumer
+/// can ack past it rather than the whole topic wedging behind it.
+fn parse_payloads(topic: &str, rows: Vec<Delivered>) -> Result<Vec<Delivered>> {
     let mut out = Vec::with_capacity(rows.len());
     for mut d in rows {
         let parsed = match &d.payload {

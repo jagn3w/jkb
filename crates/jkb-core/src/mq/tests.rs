@@ -2,8 +2,8 @@ use proptest::prelude::*;
 use serde_json::json;
 
 use super::{
-    ack, compact, group_create, inspect, now_ms, poll, send, topic_create, Created, Delivered,
-    Draft, QueueError, Start, TopicSpec,
+    ack, compact, group_create, inspect, now_ms, poll, send, tail, topic_create, Created,
+    Delivered, Draft, QueueError, Start, TopicSpec,
 };
 use crate::{Db, Error};
 
@@ -36,7 +36,7 @@ fn do_group(db: &Db, g: &'static str, start: Start, now: i64) -> Created {
 }
 
 fn do_poll(db: &Db, g: &'static str, max: usize, now: i64) -> Vec<Delivered> {
-    db.write_txn("t", move |c, m| poll(c, m, "t", g, max, now))
+    db.write_txn("t", move |c, m| poll(c, m, "t", g, max, None, now))
         .unwrap()
 }
 
@@ -342,7 +342,7 @@ fn an_idle_group_is_removed_after_its_idle_period_and_stops_holding_messages_bac
         "and with it went the only thing holding s back"
     );
     let err = db
-        .write_txn("t", move |c, m| poll(c, m, "t", "gone", 1, past))
+        .write_txn("t", move |c, m| poll(c, m, "t", "gone", 1, None, past))
         .unwrap_err();
     assert!(matches!(queue_err(err), QueueError::NoSuchGroup { .. }));
 }
@@ -521,7 +521,7 @@ fn a_corrupt_stored_payload_is_named_by_seq_and_can_be_acked_past() {
     do_ack(&db, "g", good, T0).unwrap();
     // ...then it is named, so the consumer can step over it.
     let err = db
-        .write_txn("t", |c, m| poll(c, m, "t", "g", 10, T0))
+        .write_txn("t", |c, m| poll(c, m, "t", "g", 10, None, T0))
         .unwrap_err();
     assert_eq!(
         queue_err(err),
@@ -580,6 +580,46 @@ fn a_refused_send_reports_what_the_topic_really_holds() {
         "the refusal reports the held totals, not an in-memory reap the rollback undid"
     );
     assert_eq!(held_seqs(&db).len(), 3);
+}
+
+#[test]
+fn a_fetch_position_past_the_committed_one_reads_on_without_acking() {
+    let db = db_with_topic(TopicSpec::default());
+    do_group(&db, "g", Start::FromStart, T0);
+    let s: Vec<i64> = (0..4)
+        .map(|n| do_send(&db, draft("k", n), T0).unwrap())
+        .collect();
+    let after = s[1];
+    let got = db
+        .write_txn("t", move |c, m| poll(c, m, "t", "g", 10, Some(after), T0))
+        .unwrap();
+    assert_eq!(got.iter().map(|d| d.seq).collect::<Vec<_>>(), s[2..]);
+    // The committed position did not move: a poll from it still starts at the beginning.
+    assert_eq!(do_poll(&db, "g", 10, T0)[0].seq, s[0]);
+    // A fetch position behind the committed one does not rewind it.
+    do_ack(&db, "g", s[2], T0).unwrap();
+    let got = db
+        .write_txn("t", move |c, m| poll(c, m, "t", "g", 10, Some(0), T0))
+        .unwrap();
+    assert_eq!(got.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![s[3]]);
+}
+
+#[test]
+fn tail_shows_the_newest_messages_oldest_first_without_moving_any_group() {
+    let db = db_with_topic(TopicSpec::default());
+    do_group(&db, "g", Start::FromStart, T0);
+    let seqs: Vec<i64> = (0..5)
+        .map(|n| do_send(&db, draft("k", n), T0).unwrap())
+        .collect();
+    let got = db.read(|c| tail(c, "t", 2, T0)).unwrap();
+    assert_eq!(got.iter().map(|d| d.seq).collect::<Vec<_>>(), seqs[3..]);
+    assert_eq!(
+        do_poll(&db, "g", 10, T0).len(),
+        5,
+        "the group's position is untouched"
+    );
+    let err = db.read(|c| tail(c, "missing", 2, T0)).unwrap_err();
+    assert!(matches!(queue_err(err), QueueError::NoSuchTopic(_)));
 }
 
 // --- the reaping rules, against a model ------------------------------------------------------
@@ -758,7 +798,9 @@ fn two_processes_never_hand_a_reader_a_lower_seq() {
             "timed out after {seen} messages"
         );
         let batch = db
-            .write_txn("reader", |c, m| poll(c, m, "t", "reader", 25, now_ms()))
+            .write_txn("reader", |c, m| {
+                poll(c, m, "t", "reader", 25, None, now_ms())
+            })
             .unwrap();
         for d in &batch {
             assert!(

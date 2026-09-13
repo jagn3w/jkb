@@ -2924,3 +2924,185 @@ fn notify_needs_no_database() {
         .assert()
         .success();
 }
+
+/// `jkb mq` end to end through a real binary: create a topic, send, and consume through
+/// `jkb mq subscribe`'s NDJSON protocol over pipes, acking on stdin. A second subscription resumes
+/// after the ack, which is the at-least-once contract a daemon in another language relies on.
+#[test]
+#[allow(clippy::too_many_lines)] // one protocol walk-through, kept in order
+fn mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("x.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&[
+        "mq",
+        "topic",
+        "create",
+        "claude/notify",
+        "--max-messages",
+        "100",
+    ]);
+    let again = run(&[
+        "mq",
+        "topic",
+        "create",
+        "claude/notify",
+        "--max-messages",
+        "100",
+    ]);
+    assert!(again.contains("already exists"), "{again}");
+    run(&[
+        "mq",
+        "group",
+        "create",
+        "claude/notify",
+        "reader",
+        "--from-start",
+    ]);
+    let mut seqs = Vec::new();
+    for n in 0..3 {
+        let out = run(&[
+            "mq",
+            "send",
+            "claude/notify",
+            "--key",
+            "host/h/session/s1",
+            "--kind",
+            "notify.post",
+            "--payload",
+            &format!(r#"{{"n":{n}}}"#),
+        ]);
+        seqs.push(out.trim().parse::<i64>().unwrap());
+    }
+
+    let subscribe = || {
+        let mut cmd = jkb(&db);
+        cmd.args([
+            "mq",
+            "subscribe",
+            "claude/notify",
+            "--group",
+            "reader",
+            "--interval-ms",
+            "20",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        cmd.spawn().unwrap()
+    };
+    let mut child = subscribe();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let event: serde_json::Value =
+            serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(event["event"], "message");
+        got.push(event["message"]["seq"].as_i64().unwrap());
+    }
+    assert_eq!(got, seqs);
+    // Ack only the first, then close stdin: the subscription ends cleanly.
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"ack":{}}}"#, seqs[0]).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+
+    let mut child = subscribe();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut again = Vec::new();
+    for _ in 0..2 {
+        let event: serde_json::Value =
+            serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        again.push(event["message"]["seq"].as_i64().unwrap());
+    }
+    assert_eq!(again, seqs[1..], "what was not acked is delivered again");
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+
+    let tail = run(&["--json", "mq", "tail", "claude/notify", "--limit", "1"]);
+    let tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+    assert_eq!(tail[0]["seq"], seqs[2]);
+    let groups = run(&["--json", "mq", "group", "ls", "claude/notify"]);
+    let groups: serde_json::Value = serde_json::from_str(&groups).unwrap();
+    assert_eq!(
+        (
+            groups[0]["position"].as_i64(),
+            groups[0]["backlog"].as_i64()
+        ),
+        (Some(seqs[0]), Some(2))
+    );
+}
+
+/// The reap service compacts the queue on its pass — and an unopenable database stops only the
+/// compaction, never the sweep.
+#[test]
+fn task_reap_compacts_the_message_queue() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("x.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["mq", "topic", "create", "t", "--default-ttl-ms", "1"]);
+    run(&["mq", "group", "create", "t", "g", "--from-start"]);
+    let seq = run(&[
+        "mq",
+        "send",
+        "t",
+        "--key",
+        "k",
+        "--kind",
+        "k.m",
+        "--payload",
+        "1",
+    ]);
+    // Ack through a short subscription: the ack line is read before EOF ends it.
+    let mut child = jkb(&db)
+        .args([
+            "mq",
+            "subscribe",
+            "t",
+            "--group",
+            "g",
+            "--interval-ms",
+            "10",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, r#"{{"ack":{}}}"#, seq.trim()).unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let reap = run(&["task", "reap"]);
+    assert!(reap.contains("mq compact: reaped 1 message(s)"), "{reap}");
+
+    let not_a_db = tmp.path().join("garbage.db");
+    std::fs::write(&not_a_db, b"not sqlite").unwrap();
+    let out = jkb(&not_a_db).args(["task", "reap"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "the sweep still ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("mq compact: not run"));
+}

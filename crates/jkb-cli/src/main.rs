@@ -10,6 +10,7 @@ mod archive;
 mod atomic;
 mod commands;
 mod gitrepo;
+mod mq_cli;
 mod notify;
 mod output;
 mod owner;
@@ -199,6 +200,11 @@ enum Command {
     },
     /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
+    /// The message queue: topics, sends, NDJSON subscriptions (design r3.2 Q6).
+    Mq {
+        #[command(subcommand)]
+        cmd: mq_cli::MqCmd,
+    },
     /// List the direct children of a namespace (sub-namespaces + items homed there) —
     /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
     Ls {
@@ -1238,6 +1244,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Index { sweep } => cmd_index(&db, sweep),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
+        Command::Mq { cmd } => mq_cli::run(&jkb_api::LocalBackend::new(db), cmd, json),
         Command::Ls {
             path,
             all,
@@ -6451,6 +6458,11 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
             dry_run,
             json,
         );
+        if !dry_run {
+            if let Some(line) = compact_queue(db_path) {
+                println!("{line}");
+            }
+        }
         return Ok(());
     }
     // The service form. Ctrl-C stops it, the same shared-flag shape `sync --watch` uses.
@@ -6464,7 +6476,20 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     // is a log nobody reads the rest of; saying it once, and again when it changes, is the whole
     // of the signal.
     let mut last_observed = String::new();
+    let mut last_compaction = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        // The queue's compaction rides the same timer (design r3.2 Q3). Printed only when it did
+        // something or its failure changed, for the same reason as the sweep's silence below.
+        if !dry_run {
+            if let Some(line) = compact_queue(db_path) {
+                if line != last_compaction {
+                    println!("{line}");
+                }
+                last_compaction = line;
+            } else {
+                last_compaction.clear();
+            }
+        }
         match archive::reap(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
             // log that says "nothing to do" 96 times a day is a log nobody reads the rest of.
@@ -6486,6 +6511,33 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One compaction pass of the message queue, for the reap service. `None` when there is nothing to
+/// say; a line when it reaped or removed something, or could not run.
+///
+/// It opens the database itself and never lets that failure reach the sweep. The sweep deliberately
+/// does not open the database — a schema this binary does not know would put the service into a
+/// restart loop — and compaction must not reintroduce that dependency through the back door.
+/// Compaction is a no-op for a topic compacted within its own interval, so asking every pass is
+/// cheap; "every few days" is the queue's rule, not this timer's.
+fn compact_queue(db_path: &Path) -> Option<String> {
+    use jkb_api::{Backend as _, Response};
+    let db = match open_db(db_path) {
+        Ok(db) => db,
+        Err(e) => return Some(format!("mq compact: not run ({e:#})")),
+    };
+    match jkb_api::LocalBackend::new(db).call(jkb_api::Request::MqCompact { force: false }) {
+        Ok(Response::Compacted {
+            messages_reaped,
+            groups_removed,
+            ..
+        }) if messages_reaped > 0 || groups_removed > 0 => Some(format!(
+            "mq compact: reaped {messages_reaped} message(s), removed {groups_removed} idle group(s)"
+        )),
+        Ok(_) => None,
+        Err(e) => Some(format!("mq compact: {}", e.message)),
+    }
 }
 
 fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
