@@ -18,7 +18,8 @@ new_workdir
 
 # stubs <os> — a fresh bin dir of stub `jkb`, `uname`, `systemctl` and `launchctl` on PATH.
 # `jkb service units` prints each of $STUB_LABELS with a path under $HOME/units (or fails with
-# STUB_LABELS_FAIL=1), `jkb service token-path` a path under the stub KB; every manager call is logged
+# STUB_LABELS_FAIL=1), `jkb service token-path` a path under the stub KB, and `jkb mq topic ls` (the
+# database check) fails with STUB_DB_REFUSES=1; every manager call is logged
 # to $log; starting `com.jkb.serve` writes its token unless STUB_SERVE_DOWN=1, and a unit
 # named in STUB_BROKEN fails to start. STUB_SERVE_DELAY (Linux) delays the token like a slow start.
 stubs() {
@@ -29,7 +30,11 @@ stubs() {
 #!/usr/bin/env bash
 [ "${STUB_LABELS_FAIL:-0}" = 1 ] && exit 1
 case "$3 $4" in
-    "service units") for l in $STUB_LABELS; do printf '%s\t%s\n' "$l" "$HOME/units/$l.unit"; done ;;
+    "service units") for l in $STUB_LABELS; do
+        role=watcher; [ "$l" = com.jkb.serve ] && role=serve
+        printf '%s\t%s\t%s\n' "$l" "$HOME/units/$l.unit" "$role"
+    done ;;
+    "mq topic") if [ "${STUB_DB_REFUSES:-0}" = 1 ]; then exit 1; fi ;;
     "service token-path") printf '%s\n' "$STUB_KB/daemon/token" ;;
 esac
 EOF
@@ -48,6 +53,9 @@ EOF
     cat >"$bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 echo "launchctl $*" >>"$STUB_LOG"
+for broken in ${STUB_BROKEN:-}; do
+    case "$1 $2" in "load "*"/$broken.unit") exit 1 ;; esac
+done
 case "$2" in *com.jkb.serve.unit)
     [ "$1" = load ] && [ "${STUB_SERVE_DOWN:-0}" != 1 ] && mkdir -p "$STUB_KB/daemon" && echo token >"$STUB_KB/daemon/token" ;;
 esac
@@ -119,7 +127,20 @@ case4() {
     stubs Linux
     local state
     state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_BROKEN=com.jkb.sync activate)"
-    [ "$state" = "failed unchecked" ] && ok "a unit that will not restart: failed, serve not waited for" || fail "broken: state" "got '$state'"
+    [ "$state" = "failed up" ] && ok "a watcher unit that will not restart: the watcher failed, serve still checked and up" || fail "broken: state" "got '$state'"
+}
+
+# --- 4b. the daemon's own failures are reported as the daemon's, never as the watcher's ----------
+case4b() {
+    stubs Linux
+    local state
+    state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_BROKEN=com.jkb.serve activate)"
+    [ "$state" = "running failed" ] && ok "a serve unit that will not restart: serve failed, the watcher running" \
+        || fail "serve broken: state" "got '$state'"
+    stubs Linux
+    state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_DB_REFUSES=1 activate)"
+    [ "$state" = "running refusing" ] && ok "a daemon listening over a database it cannot open: refusing, not up" \
+        || fail "serve refusing: state" "got '$state'"
 }
 
 # --- 5. launchd: every listed unit is loaded from the path jkb names ------------------------------------------------
@@ -132,9 +153,13 @@ case5() {
         grep -qx "launchctl load ${bin%/bin}/units/$label.unit" "$log" \
             && ok "darwin: $label loaded" || fail "darwin: $label" "$(tr '\n' ';' <"$log")"
     done
+    stubs Darwin
+    state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_BROKEN=com.jkb.serve activate)"
+    [ "$state" = "running failed" ] && ok "darwin: a serve plist that will not load is serve's failure, not the watcher's" \
+        || fail "darwin: serve broken" "got '$state'"
 }
 
 echo "==> activate_services: every unit, restarted, and serve proven up"
-run_cases case1 case2 case3 case4 case5
+run_cases case1 case2 case3 case4 case4b case5
 
 finish

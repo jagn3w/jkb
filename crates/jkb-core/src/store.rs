@@ -367,6 +367,38 @@ mod tests {
     use super::Db;
     use crate::item::{upsert, NewItem};
 
+    /// The guard is asked under the write lock, not before taking it. `stale` starts its write while
+    /// `newer` holds the lock mid-migration, and blocks; `newer` then commits the migration. Asked
+    /// before the lock, `stale` would have read the old history, passed, and written after the
+    /// migration committed — exactly the window the guard exists to close.
+    #[test]
+    fn the_schema_guard_is_asked_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jkb.db");
+        let (newer, stale) = (Db::open(&path).unwrap(), Db::open(&path).unwrap());
+        let future = crate::migrate::supported_version() + 1;
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let migrating = std::thread::spawn(move || {
+            newer
+                .write_txn("newer jkb", move |conn, _| {
+                    conn.execute(
+                        "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                         VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                        [future],
+                    )?;
+                    locked_tx.send(()).unwrap();
+                    // Long enough for `stale` to reach its own write and wait on the lock.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let err = stale.write_txn("stale", |_, _| Ok(())).unwrap_err();
+        migrating.join().unwrap();
+        assert!(matches!(err, crate::Error::SchemaNewer { .. }), "{err}");
+    }
+
     /// A process opened before a newer jkb migrated the database stops WRITING — checked inside the
     /// write transaction, so no migration can land between the check and the write — and can still
     /// read. `PRAGMA user_version` would not do: it is stamped only after every migration finishes.

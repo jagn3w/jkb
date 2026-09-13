@@ -1620,9 +1620,10 @@ render_setup_summary() {
                 case "$state" in
                     up)        printf '  • jkb serve:  up; the dev container reaches the knowledge base through it\n' ;;
                     skipped)   printf '  • jkb serve:  skipped (--no-service)\n' ;;
-                    # Not "failed": nothing was waited for, because the units themselves did not start.
-                    unchecked) printf '  • jkb serve:  not checked (the units did not all start; see the watcher line)\n' ;;
-                    failed)    printf '  • jkb serve:  NOT up (no new token); see serve.log beside the database\n' ;;
+                    # Not "failed": nothing was activated, so there was nothing to check.
+                    unchecked) printf '  • jkb serve:  not checked (no unit was activated; see the warnings above)\n' ;;
+                    refusing)  printf '  • jkb serve:  listening but REFUSING every request (this jkb cannot open the database; see the warnings above)\n' ;;
+                    failed)    printf '  • jkb serve:  NOT up; its log is serve.log beside the database (macOS) or journalctl --user -u com.jkb.serve (Linux)\n' ;;
                     *)         warn "unrecognised serve state: $line" ;;
                 esac ;;
             '') : ;;
@@ -1640,11 +1641,12 @@ render_setup_summary() {
 # on a bare one, because the next script added would otherwise forget.
 
 # Activate every unit `jkb service install` wrote. Sets `watcher_state` (`running`/`failed`) for the
-# units, and `serve_state` for the daemon: `up`, `failed`, or `unchecked` when the units did not all
-# start and there was nothing sound to wait for. Two words, because a daemon that could not bind is
-# not a file-sync watcher that is not running, and the summary said exactly that when they shared one.
+# watcher units, and `serve_state` for the daemon's: `up`; `refusing` (listening, but this jkb cannot
+# open the database, so every request is refused); `failed` (its unit did not start, or it wrote no
+# token); `unchecked` (nothing was activated to check). Two words, each judged only by its own units,
+# because a daemon that could not bind is not a file-sync watcher that is not running.
 #
-# EVERY unit, as the binary lists them (`jkb service units`: label, tab, installed path) — not a copy
+# EVERY unit, as the binary lists them (`jkb service units`: label, installed path, role) — not a copy
 # of the list here, which is how a third unit came to be written on both platforms and restarted on
 # one; and not a path derived here either, for the same reason. The reaper is what finishes a landing
 # whose session could not archive its own worktree, so a unit written and never loaded means those
@@ -1659,7 +1661,7 @@ render_setup_summary() {
 # that proof. A unit that loads and then exits (the port taken) would otherwise read "loaded" and fail
 # every container request. JKB_SERVE_READY_WAIT (seconds, default 10) bounds the wait.
 activate_services() {
-    local db="$1" units label path serve_token started_marker waited=0 tab
+    local db="$1" units label path role serve_token started_marker waited=0 tab serve_started=0
     local wait_for="${JKB_SERVE_READY_WAIT:-10}"
     tab="$(printf '\t')"
     watcher_state=running
@@ -1675,24 +1677,28 @@ activate_services() {
     sleep 1
     case "$(uname -s)" in
         Darwin)
-            while IFS="$tab" read -r label path; do
+            while IFS="$tab" read -r label path role; do
                 [ -n "$label" ] || continue
                 launchctl unload "$path" 2>/dev/null || true   # idempotent reload
-                if launchctl load "$path"; then echo "$label loaded (launchd)"; else
-                    warn "could not load $label; activate manually: launchctl load $path"
-                    watcher_state=failed
+                if launchctl load "$path"; then
+                    echo "$label loaded (launchd)"
+                    [ "$role" = serve ] && serve_started=1
+                else
+                    warn "could not load $label; activate manually: launchctl unload $path; launchctl load $path"
+                    if [ "$role" = serve ]; then serve_state=failed; else watcher_state=failed; fi
                 fi
             done <<<"$units" ;;
         Linux)
             if command -v systemctl >/dev/null 2>&1; then
                 systemctl --user daemon-reload || true
-                while IFS="$tab" read -r label path; do
+                while IFS="$tab" read -r label path role; do
                     [ -n "$label" ] || continue
                     if systemctl --user enable "$label" && systemctl --user restart "$label"; then
                         echo "$label enabled (systemd)"
+                        [ "$role" = serve ] && serve_started=1
                     else
-                        warn "could not enable $label; activate manually: systemctl --user enable --now $label"
-                        watcher_state=failed
+                        warn "could not start $label; activate manually: systemctl --user enable $label && systemctl --user restart $label"
+                        if [ "$role" = serve ]; then serve_state=failed; else watcher_state=failed; fi
                     fi
                 done <<<"$units"
             else
@@ -1705,16 +1711,22 @@ activate_services() {
         *) warn "unrecognised platform '$(uname -s)'; the units were written — activate them manually."
            watcher_state=failed ;;
     esac
-    if [ "$watcher_state" = running ]; then
+    if [ "$serve_started" = 1 ]; then
         until [ "$serve_token" -nt "$started_marker" ] || [ "$waited" -ge "$wait_for" ]; do
             sleep 1; waited=$((waited + 1))
         done
-        if [ "$serve_token" -nt "$started_marker" ]; then
+        if ! [ "$serve_token" -nt "$started_marker" ]; then
+            warn "jkb serve did not come up within ${wait_for}s (no new token at $serve_token)"
+            serve_state=failed
+        # A fresh token proves the daemon is LISTENING, not that it can serve: one that cannot open
+        # the database (a newer jkb migrated it) still binds and writes its token, and refuses every
+        # request. It runs this same binary, so this same binary opening the database is the test.
+        elif jkb --db "$db" mq topic ls >/dev/null 2>&1; then
             echo "jkb serve is up (token rotated)"
             serve_state=up
         else
-            warn "jkb serve did not come up within ${wait_for}s (no new token at $serve_token); see serve.log beside the database"
-            serve_state=failed
+            warn "jkb serve is listening but this jkb cannot open $db, so it refuses every request"
+            serve_state=refusing
         fi
     fi
     rm -f "$started_marker"

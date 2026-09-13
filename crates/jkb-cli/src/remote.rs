@@ -142,9 +142,18 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
         },
         Support::Ported => match cli.command {
             Command::Mq { cmd } => {
-                let backend = jkb_daemon::client::RemoteBackend::new(remote, token_file())
-                    .map_err(|e| anyhow::anyhow!("{}", e.message))?
-                    .with_down_marker(home().join(".cache/jkb/remote-unreachable"));
+                let backend = match jkb_daemon::client::RemoteBackend::new(remote, token_file()) {
+                    Ok(backend) => backend,
+                    Err(e) => {
+                        let err = anyhow::anyhow!("{}", e.message);
+                        // The same `--json` rule `mq_cli::run` applies once it has a backend.
+                        if cli.json {
+                            super::mq_cli::print_json_error(&err);
+                        }
+                        return Err(err);
+                    }
+                }
+                .with_down_marker(home().join(".cache/jkb/remote-unreachable"));
                 super::mq_cli::run(&backend, cmd, cli.json)
             }
             _ => bail!("internal: a Ported command with no remote dispatch"),

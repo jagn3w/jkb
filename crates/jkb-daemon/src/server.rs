@@ -149,8 +149,9 @@ struct State {
     serving: Mutex<Serving>,
     /// `None` for a daemon handed an open database, which has nothing to retry.
     opener: Option<Opener>,
-    /// One re-open at a time.
-    opening: tokio::sync::Mutex<()>,
+    /// One re-open at a time — held by the blocking open itself, so a cancelled request cannot let a
+    /// second open start beside it.
+    opening: Arc<tokio::sync::Mutex<()>>,
     reopen_every: Duration,
     token: String,
     ops: Arc<Semaphore>,
@@ -179,8 +180,10 @@ pub fn spawn(db: Db, cfg: &ServeConfig) -> Result<Handle, ServeError> {
 /// would put a supervisor into a restart loop and leave clients with `unavailable` and no reason.
 /// Instead every request is answered with the open's error (`schema_newer` for a database a newer
 /// jkb migrated), and the open is tried again on a request at most every
-/// [`ServeConfig::reopen_every`] — so a failure that passes (a lock held past the busy timeout, a
-/// volume mounted late) ends without anyone restarting the daemon.
+/// [`ServeConfig::reopen_every`] — so a failure that passes (a lock held past the busy timeout during
+/// a long write, say) ends without anyone restarting the daemon. Not every failure is retried: the
+/// token must still be writable at start, and `open` decides what counts as the database (the CLI's
+/// creates a missing one).
 ///
 /// # Errors
 /// As [`spawn`]; a failed open is not one.
@@ -244,7 +247,7 @@ fn start(
     let state = Arc::new(State {
         serving: Mutex::new(serving),
         opener,
-        opening: tokio::sync::Mutex::new(()),
+        opening: Arc::new(tokio::sync::Mutex::new(())),
         reopen_every: cfg.reopen_every,
         token,
         ops: Arc::new(Semaphore::new(cfg.max_ops)),
@@ -452,38 +455,44 @@ async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
         Err((why, false)) => return Err(why),
         Err((_, true)) => {}
     }
-    let _one_at_a_time = state.opening.lock().await;
+    let one_at_a_time = Arc::clone(&state.opening).lock_owned().await;
     // Another request may have re-opened, or failed again, while this one waited.
     match current(state) {
         Ok(ready) => return Ok(ready),
         Err((why, false)) => return Err(why),
         Err((_, true)) => {}
     }
+    // The open, the state it leaves and the guard all live in the blocking task: if this request is
+    // cancelled (its client went away), the open still finishes, records its result, and only then
+    // lets the next one start.
     let opener_state = Arc::clone(state);
-    let opened = tokio::task::spawn_blocking(move || match &opener_state.opener {
-        Some(open) => open(),
-        None => Err(ApiError::with_code(ErrorCode::Internal, "no opener")),
+    tokio::task::spawn_blocking(move || {
+        let _one_at_a_time = one_at_a_time;
+        let opened = match &opener_state.opener {
+            Some(open) => open(),
+            None => Err(ApiError::with_code(ErrorCode::Internal, "no opener")),
+        };
+        let mut serving = opener_state
+            .serving
+            .lock()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "state lock poisoned"))?;
+        match opened {
+            Ok(db) => {
+                eprintln!("jkb serve: the database opened; serving");
+                *serving = Serving::Ready(LocalBackend::new(db.clone()), db.clone());
+                Ok((LocalBackend::new(db.clone()), db))
+            }
+            Err(why) => {
+                *serving = Serving::Failed {
+                    why: why.clone(),
+                    at: std::time::Instant::now(),
+                };
+                Err(why)
+            }
+        }
     })
     .await
-    .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?;
-    let mut serving = state
-        .serving
-        .lock()
-        .map_err(|_| ApiError::with_code(ErrorCode::Internal, "state lock poisoned"))?;
-    match opened {
-        Ok(db) => {
-            eprintln!("jkb serve: the database opened; serving");
-            *serving = Serving::Ready(LocalBackend::new(db.clone()), db.clone());
-            Ok((LocalBackend::new(db.clone()), db))
-        }
-        Err(why) => {
-            *serving = Serving::Failed {
-                why: why.clone(),
-                at: std::time::Instant::now(),
-            };
-            Err(why)
-        }
-    }
+    .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
 }
 
 async fn handle(

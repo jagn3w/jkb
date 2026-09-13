@@ -1058,7 +1058,7 @@ enum ServiceCmd {
     Install,
     /// Remove the installed service unit.
     Uninstall,
-    /// Print every unit `install` writes, one per line as `label<TAB>path` — what setup.sh
+    /// Print every unit `install` writes, one per line as `label<TAB>path<TAB>role` — what setup.sh
     /// activates, so neither the list nor the paths are copied into it by hand.
     Units,
     /// Print where `jkb serve` writes its token for this database (it does so once it is listening).
@@ -6559,7 +6559,8 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
 /// with `unavailable` and no hint. Instead it binds, writes the token, answers each request with the
 /// reason — `schema_newer` when a newer jkb migrated the database (setup.sh restarts the daemon from
 /// that jkb), `unavailable` for any other failure to open it — and tries the open again every few
-/// seconds, so a failure that passes needs no restart (`jkb_daemon::server::spawn_opening`).
+/// seconds, so a failure that passes (a lock held past the busy timeout) needs no restart
+/// (`jkb_daemon::server::spawn_opening`).
 fn cmd_serve(
     db_path: &Path,
     addr: std::net::SocketAddr,

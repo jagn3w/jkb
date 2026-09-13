@@ -202,6 +202,10 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 impl Backend for RemoteBackend {
+    fn schema_newer_clears(&self) -> bool {
+        true
+    }
+
     fn call(&self, request: Request) -> Result<Response, ApiError> {
         if self.recently_unreachable() {
             return Err(ApiError::with_code(

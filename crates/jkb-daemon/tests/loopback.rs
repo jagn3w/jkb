@@ -318,6 +318,10 @@ fn raw_http_is_held_to_the_same_rules() {
 fn a_database_migrated_past_this_build_is_refused() {
     let f = Fixture::new();
     let c = f.client();
+    assert!(
+        c.schema_newer_clears(),
+        "setup.sh restarts a daemon on the newer jkb, so its subscribers wait for that"
+    );
     let future = jkb_core::supported_schema_version() + 1;
     f.db.write_txn("test", move |conn, _| {
         conn.execute(
@@ -467,6 +471,34 @@ fn a_daemon_whose_database_will_not_open_answers_why_and_recovers_when_it_does()
     c.call(Request::MqInspect {})
         .expect("served once the database opens, with no restart");
     h.shutdown();
+}
+
+/// The authentication deadline closes only connections that never authenticated: an authenticated
+/// long-poll held past `read_timeout` still returns normally.
+#[test]
+fn an_authenticated_long_poll_outlives_the_authentication_deadline() {
+    let f = Fixture::with(|cfg| cfg.read_timeout = Duration::from_millis(300));
+    let c = f.client().with_poll_wait(Duration::from_millis(1200));
+    topic_and_group(&c);
+    let started = Instant::now();
+    let polled = c.call(Request::MqPoll {
+        topic: "t".into(),
+        group: "g".into(),
+        max: 10,
+        after: None,
+    });
+    assert_eq!(
+        polled.unwrap(),
+        Response::Messages {
+            messages: Vec::new()
+        },
+        "held for its wait, then answered — not cut at the deadline"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

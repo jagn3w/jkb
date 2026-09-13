@@ -460,6 +460,14 @@ pub trait Backend {
     /// # Errors
     /// An [`ApiError`] describing why the request failed.
     fn call(&self, request: Request) -> Result<Response, ApiError>;
+
+    /// Whether a `schema_newer` refusal from this backend can clear while the caller keeps running.
+    /// A remote daemon is restarted on the newer jkb by `setup.sh`, so it can; in-process it cannot —
+    /// this process's own code is what is too old, and only exiting lets its supervisor start the
+    /// newer binary.
+    fn schema_newer_clears(&self) -> bool {
+        false
+    }
 }
 
 /// Serves requests against a [`Db`] in this process.

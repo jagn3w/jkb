@@ -138,14 +138,21 @@ pub fn uninstall(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Print every unit [`install`] writes for this platform, one per line: its label, a tab, and the
-/// path it is installed at — so setup.sh activates exactly these, and derives no path of its own.
+/// Print every unit [`install`] writes for this platform, one per line, tab-separated: its label, the
+/// path it is installed at, and its role — `serve` for the daemon, `watcher` for the rest — so
+/// setup.sh activates exactly these, derives no path of its own, and reports the daemon on its own
+/// line.
 ///
 /// # Errors
 /// As [`install`], for an unsupported platform or no `HOME`.
 pub fn units(db: &Path) -> Result<()> {
     for (label, path, _) in units_for_platform(db)? {
-        println!("{label}\t{}", path.display());
+        let role = if label == SERVE_LABEL {
+            "serve"
+        } else {
+            "watcher"
+        };
+        println!("{label}\t{}\t{role}", path.display());
     }
     Ok(())
 }

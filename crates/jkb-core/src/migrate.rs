@@ -19,9 +19,10 @@ mod embedded {
 
 /// The newest schema version this build's migrations produce.
 ///
-/// A long-running process (the daemon) compares it with the database's `PRAGMA user_version` per
-/// request: a newer binary may have migrated the database underneath it, and serving that schema with
-/// this code's queries is how a stale daemon writes rows a newer schema does not expect.
+/// Compared with [`applied_version`] — refinery's highest applied migration — by [`refuse_newer`],
+/// which every write transaction asks: a newer binary may have migrated the database underneath a
+/// long-running process, and writing with this code's queries is how it would put rows a newer schema
+/// does not expect.
 #[must_use]
 pub fn supported_version() -> i64 {
     static SUPPORTED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
@@ -42,12 +43,12 @@ pub fn supported_version() -> i64 {
 /// # Errors
 /// [`crate::Error::Sqlite`] if the history cannot be read.
 pub fn applied_version(conn: &Connection) -> Result<i64> {
-    let has_history: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
-         AND name = 'refinery_schema_history')",
-        [],
-        |row| row.get(0),
-    )?;
+    let has_history: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
+             AND name = 'refinery_schema_history')",
+        )?
+        .query_row([], |row| row.get(0))?;
     if !has_history {
         return Ok(0);
     }

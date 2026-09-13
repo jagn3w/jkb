@@ -2935,6 +2935,59 @@ fn notify_needs_no_database() {
         .success();
 }
 
+/// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is
+/// not added to it — even for its one non-event failure, a backend answering with the wrong response.
+#[test]
+fn mq_subscribe_keeps_json_error_lines_out_of_its_event_stream() {
+    use std::io::{Read as _, Write as _};
+    // A "daemon" answering every request `{"result":"sent","seq":1}`: fine for `group_create`, which
+    // ignores the body, and the wrong response for `mq.poll`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"result":"sent","seq":1}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let tmp = TempDir::new().unwrap();
+    let token = tmp.path().join("token");
+    std::fs::write(&token, "t").unwrap();
+    let mut child = jkb_bare()
+        .args(["--json", "mq", "subscribe", "t", "--group", "g"])
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("HOME", tmp.path())
+        .env_remove("JKB_DB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open: EOF on stdin is a clean end, and would come before the poll this test is about.
+    let _stdin = child.stdin.take();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected response to mq.poll"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(r#""error""#),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// Under `--json` a refused `jkb mq` verb puts the refusal on stdout as well as exiting 1 — including
 /// one the CLI finds itself rather than an operation refusing (a topic missing from `mq.inspect`).
 #[test]
@@ -2962,6 +3015,29 @@ fn mq_refusals_are_on_stdout_under_json() {
             .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)));
         assert_eq!(stdout["error"]["code"], "no_such_topic", "{args:?}");
     }
+    // Invalid input, found before any operation is called: `bad_request`, on stdout the same way.
+    let out = jkb(&db)
+        .args([
+            "--json",
+            "mq",
+            "send",
+            "nope",
+            "--key",
+            "k",
+            "--kind",
+            "k.m",
+            "--payload",
+            "{nope",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stdout["error"]["code"], "bad_request", "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--payload is not valid JSON"),
+        "stderr keeps the prose"
+    );
 }
 
 /// `jkb mq` end to end through a real binary: create a topic, send, and consume through
@@ -3267,9 +3343,19 @@ fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
     let units = run(&["service", "units"]);
     let mut written = 0;
     for line in units.lines() {
-        let (label, path) = line
-            .split_once('\t')
-            .unwrap_or_else(|| panic!("not label<TAB>path: {line}"));
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [label, path, role] = fields[..] else {
+            panic!("not label<TAB>path<TAB>role: {line}")
+        };
+        assert_eq!(
+            role,
+            if label == "com.jkb.serve" {
+                "serve"
+            } else {
+                "watcher"
+            },
+            "{line}"
+        );
         let path = Path::new(path);
         assert!(
             path.is_file(),
