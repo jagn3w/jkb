@@ -18,6 +18,19 @@ pub enum Error {
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
 
+    /// The database was migrated by a newer jkb: its schema is past every migration this build has.
+    /// Refused before refinery runs, so the caller can tell "upgrade jkb" from a broken migration.
+    #[error(
+        "the database is at schema {found} and this jkb knows only up to {supported}; it was \
+         migrated by a newer jkb — run that one"
+    )]
+    SchemaNewer {
+        /// The database's `PRAGMA user_version`.
+        found: i64,
+        /// The newest version this build's migrations produce.
+        supported: i64,
+    },
+
     /// A shared-vocabulary error from [`jkb_types`].
     #[error(transparent)]
     Types(#[from] jkb_types::Error),

@@ -151,8 +151,8 @@ fn print_json(v: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn topics(backend: &dyn Backend) -> Result<Vec<Topic>> {
-    match call(backend, Request::MqInspect {}, false)? {
+fn topics(backend: &dyn Backend, json_out: bool) -> Result<Vec<Topic>> {
+    match call(backend, Request::MqInspect {}, json_out)? {
         Response::Topics { topics } => Ok(topics),
         other => bail!("unexpected response to mq.inspect: {other:?}"),
     }
@@ -166,7 +166,7 @@ fn topics(backend: &dyn Backend) -> Result<Vec<Topic>> {
 pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
     match cmd {
         MqCmd::Topic { cmd: TopicCmd::Ls } => {
-            let topics = topics(backend)?;
+            let topics = topics(backend, json_out)?;
             if json_out {
                 return print_json(&topics);
             }
@@ -254,7 +254,7 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
         MqCmd::Group {
             cmd: GroupCmd::Ls { topic },
         } => {
-            let t = topics(backend)?
+            let t = topics(backend, json_out)?
                 .into_iter()
                 .find(|t| t.name == topic)
                 .with_context(|| format!("no such topic: {topic}"))?;
@@ -478,7 +478,9 @@ fn error_event(code: ErrorCode, reason: &str, fatal: bool) -> Value {
 ///
 /// Emits `caught_up` when a poll returns fewer messages than a batch holds — once when the stream
 /// first has nothing more to hand over, and again after each burst — so a consumer can fold a
-/// backlog to its net effect before acting. A locked database (`busy`) is retried, not fatal.
+/// backlog to its net effect before acting. A locked database (`busy`) is retried silently, not fatal;
+/// an unreachable daemon (`unavailable` — restarting, say) is retried too, with one non-fatal error
+/// event per outage so a consumer can show it.
 ///
 /// # Errors
 /// Only for failures outside the protocol; a refused operation is reported as an error event.
@@ -495,6 +497,7 @@ pub fn subscribe(
     let mut emitted: i64 = 0;
     let mut reported_corrupt: Option<i64> = None;
     let mut caught_up_announced = false;
+    let mut outage_reported = false;
     loop {
         loop {
             match inputs.try_recv() {
@@ -518,6 +521,9 @@ pub fn subscribe(
             after: (emitted > 0).then_some(emitted),
         });
         let mut handed_over = false;
+        if polled.is_ok() {
+            outage_reported = false;
+        }
         match polled {
             Ok(Response::Messages { messages }) => {
                 let drained = messages.len() < o.batch;
@@ -550,6 +556,16 @@ pub fn subscribe(
             }
             // Another writer held the lock past the busy timeout. Transient: wait and poll again.
             Err(e) if e.code == ErrorCode::Busy => {}
+            // The daemon is down or restarting. Its position is in the database, so polling again
+            // once it is back resumes exactly where this left off.
+            Err(e) if e.code == ErrorCode::Unavailable => {
+                if !outage_reported {
+                    outage_reported = true;
+                    if !emit(out, &error_event(e.code, &e.message, false)) {
+                        return Ok(0);
+                    }
+                }
+            }
             Err(e) if e.code == ErrorCode::CorruptPayload => {
                 // Reported once; the consumer decides whether to ack past it.
                 if reported_corrupt != e.seq {
@@ -788,6 +804,60 @@ mod tests {
         subscribe(&b, &opts(true), &rx, &mut out).unwrap();
         h.join().unwrap();
         assert!(seqs(&events(&out)).is_empty(), "nothing is redelivered");
+    }
+
+    /// Fails the first `polls` polls with `code`, then serves normally.
+    struct Flaky {
+        inner: LocalBackend,
+        code: jkb_api::ErrorCode,
+        polls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Backend for Flaky {
+        fn call(&self, request: Request) -> Result<jkb_api::Response, jkb_api::ApiError> {
+            use std::sync::atomic::Ordering;
+            if matches!(request, Request::MqPoll { .. })
+                && self
+                    .polls
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(jkb_api::ApiError::with_code(self.code, "transient"));
+            }
+            self.inner.call(request)
+        }
+    }
+
+    #[test]
+    fn a_locked_database_or_an_unreachable_daemon_is_waited_out_not_fatal() {
+        for (code, reported) in [
+            (jkb_api::ErrorCode::Busy, 0),
+            // A daemon restart: said once per outage, not once per failed poll.
+            (jkb_api::ErrorCode::Unavailable, 1),
+        ] {
+            let b = Flaky {
+                inner: backend_with(1),
+                code,
+                polls: 3.into(),
+            };
+            let (tx, rx) = channel();
+            let mut out = Vec::new();
+            let h = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                tx.send(Input::Eof).unwrap();
+            });
+            assert_eq!(
+                subscribe(&b, &opts(false), &rx, &mut out).unwrap(),
+                0,
+                "{code:?}"
+            );
+            h.join().unwrap();
+            let ev = events(&out);
+            let errors: Vec<&Value> = ev.iter().filter(|e| e["event"] == "error").collect();
+            assert_eq!(errors.len(), reported, "{code:?}: {ev:?}");
+            assert!(errors.iter().all(|e| e["fatal"] == false), "{code:?}");
+            assert_eq!(seqs(&ev), vec![1], "{code:?}: delivered once it recovered");
+        }
     }
 
     #[test]

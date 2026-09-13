@@ -1630,6 +1630,79 @@ render_setup_summary() {
 # under scripts/ goes through `jkb_sqlite`, which refuses first; case11 of dev-scripts.test.sh fails
 # on a bare one, because the next script added would otherwise forget.
 
+# Activate every unit `jkb service install` wrote, and set `watcher_state` to `running` or `failed`.
+#
+# EVERY unit, as the binary lists them (`jkb service labels`) — not a copy of the list here, which is
+# how a third unit came to be written on both platforms and restarted on one. The reaper is what
+# finishes a landing whose session could not archive its own worktree, so a unit written and never
+# loaded means those worktrees accumulate for ever — visible only as `jkb doctor` output nobody reads.
+#
+# `enable` then `restart` on systemd, not `enable --now`: that leaves an already-running unit on the
+# OLD binary, and a daemon older than the database it serves refuses every request (schema_newer).
+# launchd's unload/load restarts each one already.
+#
+# Then it waits for `jkb serve` to prove it came up: the daemon writes its token only once its port
+# is bound, so a token newer than a marker taken before activation is that proof. A unit that loads
+# and then exits (the port taken) would otherwise read "loaded" and fail every container request.
+# JKB_SERVE_READY_WAIT (seconds, default 10) bounds the wait.
+activate_services() {
+    local db="$1" labels label serve_token started_marker waited=0
+    local wait_for="${JKB_SERVE_READY_WAIT:-10}"
+    watcher_state=running
+    if ! labels="$(jkb --db "$db" service labels)" || [ -z "$labels" ]; then
+        warn "could not list the service units (jkb service labels)"
+        watcher_state=failed
+        return 0
+    fi
+    serve_token="$(dirname "$db")/daemon/token"
+    started_marker="$(mktemp "${TMPDIR:-/tmp}/jkb-setup.XXXXXX")" || { watcher_state=failed; return 0; }
+    # A token written within this second must still read as newer on a filesystem with 1 s mtimes.
+    sleep 1
+    case "$(uname -s)" in
+        Darwin)
+            for label in $labels; do
+                local plist="$HOME/Library/LaunchAgents/$label.plist"
+                launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
+                if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
+                    warn "could not load $label; activate manually: launchctl load $plist"
+                    watcher_state=failed
+                fi
+            done ;;
+        Linux)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user daemon-reload || true
+                for label in $labels; do
+                    if systemctl --user enable "$label" && systemctl --user restart "$label"; then
+                        echo "$label enabled (systemd)"
+                    else
+                        warn "could not enable $label; activate manually: systemctl --user enable --now $label"
+                        watcher_state=failed
+                    fi
+                done
+            else
+                warn "systemctl not found; activate the printed units manually."
+                watcher_state=failed
+            fi ;;
+        # Reachable only after `jkb service install` succeeded, and that refuses any platform but
+        # macOS and Linux — so "unsupported OS" was the wrong diagnosis for the one state that gets
+        # here: `uname` said something the two arms above did not recognise.
+        *) warn "unrecognised platform '$(uname -s)'; the units were written — activate them manually."
+           watcher_state=failed ;;
+    esac
+    if [ "$watcher_state" = running ]; then
+        until [ "$serve_token" -nt "$started_marker" ] || [ "$waited" -ge "$wait_for" ]; do
+            sleep 1; waited=$((waited + 1))
+        done
+        if [ "$serve_token" -nt "$started_marker" ]; then
+            echo "jkb serve is up (token rotated)"
+        else
+            warn "jkb serve did not come up within ${wait_for}s (no new token at $serve_token); see serve.log beside the database"
+            watcher_state=failed
+        fi
+    fi
+    rm -f "$started_marker"
+}
+
 # shared_fs_kind <hex-magic> — the filesystem name when `stat -f -c %t` names one a database must not
 # live on, empty otherwise. The same set as SHARED in shared_fs.rs: FUSE (measured on the container's
 # binds), 9p, NFS, SMB2, CIFS.

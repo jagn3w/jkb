@@ -45,10 +45,18 @@ pub fn supported_version() -> i64 {
 /// SQLite-recommended way to run schema migrations.
 ///
 /// # Errors
-/// Returns [`crate::Error::Migration`] if a migration fails to apply,
+/// Returns [`crate::Error::SchemaNewer`] for a database already past this build's migrations,
+/// [`crate::Error::Migration`] if a migration fails to apply,
 /// [`crate::Error::ForeignKeyViolation`] if a migration left a dangling foreign-key
 /// reference, or [`crate::Error::Sqlite`] if a PRAGMA or the version marker fails.
 pub fn run(conn: &mut Connection) -> Result<()> {
+    let (found, supported) = (
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+        supported_version(),
+    );
+    if found > supported {
+        return Err(Error::SchemaNewer { found, supported });
+    }
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
     let migrate_result = embedded::migrations::runner().run(conn);

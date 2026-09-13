@@ -1058,6 +1058,9 @@ enum ServiceCmd {
     Install,
     /// Remove the installed service unit.
     Uninstall,
+    /// Print the label of every unit `install` writes, one per line — what setup.sh activates, so
+    /// the list is not copied into it by hand.
+    Labels,
 }
 
 #[derive(Subcommand)]
@@ -1206,6 +1209,11 @@ fn run(cli: Cli) -> Result<()> {
             cli.json,
         );
     }
+    // The daemon opens the database itself, so that a database it cannot serve still gets a daemon
+    // that says why rather than a supervisor restart-loop — see `cmd_serve`.
+    if let Command::Serve { addr, token_file } = cli.command {
+        return cmd_serve(&db_path, addr, token_file);
+    }
     let db = open_db(&db_path)?;
     let json = cli.json;
     let global = cli.global;
@@ -1256,6 +1264,7 @@ fn run(cli: Cli) -> Result<()> {
             ServiceCmd::Print => service::print(&db_path),
             ServiceCmd::Install => service::install(&db_path),
             ServiceCmd::Uninstall => service::uninstall(&db_path),
+            ServiceCmd::Labels => service::labels(&db_path),
         },
         Command::Commands { cmd } => match cmd {
             CommandsCmd::Install => commands::install(),
@@ -1269,7 +1278,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Mq { cmd } => mq_cli::run(&jkb_api::LocalBackend::new(db), cmd, json),
-        Command::Serve { addr, token_file } => cmd_serve(db, &db_path, addr, token_file),
+        Command::Serve { .. } => unreachable!("dispatched before the database is opened"),
         Command::Ls {
             path,
             all,
@@ -6538,8 +6547,13 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
 }
 
 /// `jkb serve`: run the daemon until Ctrl-C.
+///
+/// A database this build cannot open does not stop it. Exiting would put launchd/systemd into a
+/// restart loop — the reap unit's history with a newer branch's migration — and leave every client
+/// with `unavailable` and no hint. Instead it binds, writes the token, and answers each request with
+/// the reason: `schema_newer` when a newer jkb migrated the database (setup.sh restarts the daemon
+/// from that jkb), `unavailable` for any other failure to open it.
 fn cmd_serve(
-    db: Db,
     db_path: &Path,
     addr: std::net::SocketAddr,
     token_file: Option<PathBuf>,
@@ -6551,7 +6565,19 @@ fn cmd_serve(
             .join("daemon/token")
     });
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
-    let handle = jkb_daemon::server::spawn(db, &cfg).context("starting jkb serve")?;
+    let handle = match open_db(db_path) {
+        Ok(db) => jkb_daemon::server::spawn(db, &cfg),
+        Err(e) => {
+            let code = match e.downcast_ref::<jkb_core::Error>() {
+                Some(jkb_core::Error::SchemaNewer { .. }) => jkb_api::ErrorCode::SchemaNewer,
+                _ => jkb_api::ErrorCode::Unavailable,
+            };
+            let why = format!("jkb serve cannot open the database: {e:#}");
+            eprintln!("{why}; answering every request with it until restarted");
+            jkb_daemon::server::spawn_refusing(jkb_api::ApiError::with_code(code, why), &cfg)
+        }
+    }
+    .context("starting jkb serve")?;
     // One line, flushed, that a supervisor log and a test can both read: the address actually
     // bound (a `:0` port is resolved) and where the token went.
     println!(

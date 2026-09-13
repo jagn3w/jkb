@@ -132,43 +132,10 @@ if [ "$do_service" -eq 1 ]; then
   # ~/.config/systemd/user, a full disk, no HOME in the post-merge hook's environment) took
   # the git-hook section below with it, and the repo kept whatever stale or missing
   # post-merge hook it had. The hooks are the one section a partial setup must still reach.
+  # The activation lives in lib.sh (`activate_services`) so a test can run it against stub
+  # service managers — see scripts/tests/services.test.sh.
   if jkb --db "$db" service install; then
-  # BOTH units `service install` writes. The reaper is what finishes a landing whose session
-  # could not archive its own worktree, so a unit that is written and never loaded means those
-  # worktrees accumulate for ever — visible only as `jkb doctor` output nobody reads.
-  case "$(uname -s)" in
-    Darwin)
-      for label in com.jkb.sync com.jkb.reap com.jkb.serve; do
-        plist="$HOME/Library/LaunchAgents/$label.plist"
-        launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
-        if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
-          warn "could not load $label; activate manually: launchctl load $plist"
-          watcher_state=failed
-        fi
-      done ;;
-    Linux)
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user daemon-reload || true
-        for label in com.jkb.sync com.jkb.reap com.jkb.serve; do
-          if systemctl --user enable --now "$label"; then echo "$label enabled (systemd)"; else
-            warn "could not enable $label; activate manually: systemctl --user enable --now $label"
-            watcher_state=failed
-          fi
-        done
-        # `enable --now` leaves an already-running daemon on the OLD binary, and a daemon older than
-        # the database it serves refuses every request (schema_newer). A restart is what a pull
-        # that rebuilt jkb needs; on macOS the unload/load above already does it.
-        systemctl --user restart com.jkb.serve 2>/dev/null || true
-      else
-        warn "systemctl not found; activate the printed units manually."
-        watcher_state=failed
-      fi ;;
-    # Reachable only after `jkb service install` succeeded, and that refuses any platform but
-    # macOS and Linux — so "unsupported OS" was the wrong diagnosis for the one state that
-    # gets here: `uname` said something the two arms above did not recognise.
-    *) warn "unrecognised platform '$(uname -s)'; the units were written — activate them manually."
-       watcher_state=failed ;;
-  esac
+    activate_services "$db"
   else
     # A distinct variable, not `do_service=0`: that is the flag, and reusing it would make the
     # summary below report a failure as "--no-service" — the user's choice, which it was not.

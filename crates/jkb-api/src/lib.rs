@@ -281,7 +281,8 @@ impl Request {
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
-    /// named here (and, by the test that pins them together, in [`Request::OPS`]).
+    /// named here; `every_op_names_its_own_wire_tag_and_is_advertised` checks [`Request::OPS`]
+    /// against the tags serde accepts and each op's name against the tag it serializes with.
     #[must_use]
     pub const fn op(&self) -> &'static str {
         match self {
@@ -437,6 +438,7 @@ impl From<jkb_core::Error> for ApiError {
                     }
                 }
             },
+            jkb_core::Error::SchemaNewer { .. } => ErrorCode::SchemaNewer,
             jkb_core::Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
                 if matches!(
                     f.code,

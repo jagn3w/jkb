@@ -88,6 +88,24 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
             limit: 1,
         },
     ];
+    // OPS against the tags serde actually accepts — read from its unknown-variant error, which lists
+    // them all. Without this, a new variant named in `op()` but in neither OPS nor the samples below
+    // left every assertion here green: the counts still matched.
+    let err = serde_json::from_value::<Request>(json!({ "op": "no.such_op" }))
+        .unwrap_err()
+        .to_string();
+    let accepted: Vec<&str> = err
+        .split_once("expected one of ")
+        .unwrap_or_else(|| panic!("serde's message changed shape: {err}"))
+        .1
+        .split(", ")
+        .map(|s| s.trim_matches('`'))
+        .collect();
+    assert_eq!(
+        accepted,
+        Request::OPS,
+        "OPS is every op the wire accepts, in order"
+    );
     assert_eq!(
         samples.len(),
         Request::OPS.len(),

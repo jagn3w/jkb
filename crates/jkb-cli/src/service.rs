@@ -131,6 +131,17 @@ pub fn uninstall(db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Print the label of every unit [`install`] writes for this platform, one per line.
+///
+/// # Errors
+/// As [`install`], for an unsupported platform or no `HOME`.
+pub fn labels(db: &Path) -> Result<()> {
+    for (label, _, _) in units_for_platform(db)? {
+        println!("{label}");
+    }
+    Ok(())
+}
+
 /// Every `(label, install path, contents)` for the current platform.
 fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
     let exe = std::env::current_exe().context("resolving the jkb executable path")?;

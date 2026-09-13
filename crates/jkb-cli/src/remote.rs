@@ -102,12 +102,23 @@ fn subcommand_name() -> String {
 /// Run `cli` in remote mode against the daemon at `remote`.
 ///
 /// # Errors
-/// A refusal (for `--db`, or a command that may not run remotely), or the command's own error.
+/// A refusal (for `--db` or `JKB_DB`, or a command that may not run remotely), or the command's own
+/// error.
 pub fn run(cli: Cli, remote: &str) -> Result<()> {
     if cli.db.is_some() {
         bail!(
             "--db is refused with JKB_REMOTE set: this process reaches the knowledge base through \
              jkb serve at {remote} and must not open a database itself"
+        );
+    }
+    // The same refusal for the environment's way of naming one. Nothing below reads it, but a
+    // process configured with both is configured two ways at once — the dev container's interim
+    // JKB_DB left in place beside JKB_REMOTE, say — and silently obeying one hides that the other
+    // is still set for every tool that is not jkb.
+    if std::env::var_os("JKB_DB").is_some_and(|v| !v.is_empty()) {
+        bail!(
+            "JKB_DB is set alongside JKB_REMOTE: this process reaches the knowledge base through \
+             jkb serve at {remote} and must not name a database itself; unset one of them"
         );
     }
     match support(&cli.command) {

@@ -67,9 +67,13 @@ on. Without it, a batch of unacked messages comes back from every poll and nothi
 
 Errors carry a stable `code`: `no_such_topic`, `topic_conflict`, `no_such_group`, `queue_full`,
 `too_large`, `invalid`, `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
-it), `bad_request`, `busy` (another writer held the database lock past the busy timeout — transient,
-retry), `internal`. A code a client does not know decodes as `unknown` and is treated like
-`internal`, so a newer host can add codes. Under `--json`, every `jkb mq` verb except `subscribe`
+it), `bad_request`, `busy` (transient — retry: another writer held the database lock past the busy
+timeout, or, over HTTP, the daemon is at a concurrency limit or the group already has a long-poll in
+progress), `internal`. Over HTTP three more: `unauthorized` (a missing or stale token), `schema_newer`
+(a newer `jkb` migrated the database; retrying does not help), and `unavailable` (the daemon cannot
+be reached, something other than the daemon answered, or the daemon cannot open its database). A
+code a client does not know decodes as `unknown` and is treated like `internal`, so a newer host can
+add codes. Under `--json`, every `jkb mq` verb except `subscribe`
 prints a refusal to stdout as `{"error":{"code":…,"message":…}}` as well as exiting 1.
 
 An idle `mq.poll` — nothing past the fetch position, and its `last_poll_at` refreshed within the hour
@@ -116,10 +120,12 @@ never apply.
 - **EOF on stdin ends the subscription**, after processing the acks that preceded it. Keep stdin open
   for as long as you want messages.
 - A closed stdout ends it with status 0.
-- A locked database (`busy`) is retried on the next poll, silently.
+- A locked database or a busy daemon (`busy`) is retried on the next poll, silently.
+- An unreachable daemon (`unavailable` — restarting, say) is retried too, with one non-fatal error
+  event per outage. The position is in the database, so the stream resumes where it stopped.
 - **Startup failures have no events:** a non-zero exit with nothing on stdout means the subscription
-  never started — bad arguments (clap, exit 2) or a database that could not be opened (exit 1) — and
-  stderr says which.
+  never started — bad arguments (clap, exit 2), a database that could not be opened, or in remote
+  mode a daemon that could not be reached (exit 1) — and stderr says which.
 - A group removed while subscribed (it idled out) is recreated from now, with a non-fatal
   `no_such_group` error event that says messages in between were not delivered.
 
@@ -139,12 +145,23 @@ database across the bind mount — reaches the same operations through the host 
 launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts. It:
 
 - refuses an unspecified address (`0.0.0.0`, `::`);
-- mints a 256-bit bearer token each start and writes it, owner-only, tmp+rename, to
-  `<database directory>/daemon/token` (so `~/.jkb/daemon/token` for the default database);
+- mints a 256-bit bearer token each start and writes it, owner-only, to
+  `<database directory>/daemon/token` (so `~/.jkb/daemon/token` for the default database) — after the
+  port is bound, so a fresh token means a listening daemon. That directory is writable from the dev
+  container, so the write is made relative to a directory handle opened without following links,
+  through an `O_EXCL` temp file with a random name, renamed into place: a link planted there cannot
+  redirect it, and a symlinked `daemon/` is refused;
 - refuses every operation, with `schema_newer`, while the database is at a schema this build does not
-  know — a newer `jkb` migrated it; restart the daemon from that build;
+  know — a newer `jkb` migrated it; restart the daemon from that build. Checked before each operation
+  and on each re-poll of a long-poll. A daemon **started** on such a database, or on one it cannot open
+  at all, does not exit (a supervisor would restart-loop it): it binds, writes its token and answers
+  every request with the reason — `schema_newer`, or `unavailable` for any other open failure;
 - holds a 1 MiB body limit, and separate concurrency budgets for operations and long-polls, answering
-  `busy` when one is exhausted.
+  `busy` when one is exhausted. A request past authentication holds its permit from before its body is
+  read;
+- bounds the unauthenticated side too: at most 256 connections (one more is closed on accept), request
+  headers — and idle keep-alive — within 10 s, a body within 10 s, and a pause after a failed accept so
+  running out of descriptors does not spin a core.
 
 **The wire.** Both endpoints need `Authorization: Bearer <token>`. The body is always JSON; clients
 branch on its `code`, the HTTP status is for people and proxies.
@@ -155,7 +172,10 @@ POST /v1/op[?wait_ms=N]   → a response object ({"result":…}), or an error ob
 ```
 
 `wait_ms` (capped at 30 s) turns an empty `mq.poll` into a long-poll: it returns as soon as a message
-arrives — at once for a send the daemon served, within 250 ms for one another host process wrote.
+arrives — at once for a send the daemon served, within 250 ms for one another host process wrote. Any
+other op ignores it. **One long-poll per group at a time**: a second, while the first is held, is
+answered `busy` (design H3's budget rule, so a burst of subscribes to one group cannot occupy the
+poll budget).
 
 **The token keeps out other local processes, not the container's agent**, which can read the file.
 What bounds the agent is the operation set: nothing in it touches a file, a URL or a process on the
@@ -168,17 +188,27 @@ host.
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
 - **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
   `mount`, `ingest`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
-- refuses `--db`.
+- refuses `--db`, and a non-empty `JKB_DB` — a process configured with both names a database two ways
+  at once, and silently obeying one hides the other;
+- treats an error body that is not the daemon's (a proxy's `502`, say) as `unavailable`, and re-reads
+  the token only when the daemon itself answered `unauthorized`.
 
 The table is an exhaustive `match` (`crates/jkb-cli/src/remote.rs`), so a new subcommand does not
 compile until it says which it is. A daemon that cannot be reached is remembered for 5 seconds
 (`~/.cache/jkb/remote-unreachable`), so a burst of short-lived `jkb` processes pays one connect
 timeout, not one each.
 
+`setup.sh` activates every unit `jkb service labels` lists — restarting each, so none keeps running
+an old binary — and then waits up to 10 s for a fresh token as proof the daemon came up
+(`scripts/lib.sh` `activate_services`, pinned by `scripts/tests/services.test.sh`).
+
 Pinned by `crates/jkb-daemon/tests/loopback.rs` (the server and client over real TCP: round trip,
 long-poll wake-ups, token rotation, unspecified-address refusal, body limit, unknown fields, schema
-refusal, the unreachable cache) and `tests/cli.rs`
-`remote_mode_reaches_the_daemon_and_refuses_everything_else` (real binaries on both sides).
+refusal before and during a long-poll, the refusing daemon, one long-poll per group, `wait_ms` on a
+non-poll, the connection cap and read timeouts, a proxy's error, the unreachable cache),
+`crates/jkb-daemon/src/token.rs` (planted links), and `tests/cli.rs`
+`remote_mode_reaches_the_daemon_and_refuses_everything_else` and
+`serve_answers_schema_newer_rather_than_exiting_on_a_newer_database` (real binaries on both sides).
 
 ## Not yet
 

@@ -144,30 +144,60 @@ impl RemoteBackend {
             .timeout(Duration::from_secs(5))
             .send()
             .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
-        decode(resp)
+        decode(resp).map_err(|(e, _)| e)
     }
+
+    /// One request, decoded, with the down marker kept honest: set when jkb serve did not answer
+    /// (no connection, or something in the way answered instead), cleared when it did.
+    fn attempt(&self, request: &Request, token: &str) -> Result<Response, ApiError> {
+        let result = decode(self.send(request, token)?);
+        self.mark_unreachable(matches!(result, Err((_, Answered::NotJkb))));
+        result.map_err(|(e, _)| e)
+    }
+}
+
+/// Who produced an error.
+enum Answered {
+    /// jkb serve itself: the body is its `ApiError`.
+    Jkb,
+    /// Something else — a proxy between here and the host saying the daemon is down, say.
+    NotJkb,
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
     resp: reqwest::blocking::Response,
-) -> Result<T, ApiError> {
+) -> Result<T, (ApiError, Answered)> {
     let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
-    if status.is_success() {
-        serde_json::from_slice(&bytes).map_err(|e| {
-            ApiError::with_code(ErrorCode::Internal, format!("unreadable response: {e}"))
-        })
-    } else {
-        Err(
-            serde_json::from_slice::<ApiError>(&bytes).unwrap_or_else(|_| {
-                ApiError::with_code(
-                    ErrorCode::Internal,
-                    format!("HTTP {status}: {}", String::from_utf8_lossy(&bytes)),
-                )
-            }),
+    let bytes = resp.bytes().map_err(|e| {
+        (
+            ApiError::with_code(ErrorCode::Unavailable, e.to_string()),
+            Answered::NotJkb,
         )
+    })?;
+    if status.is_success() {
+        return serde_json::from_slice(&bytes).map_err(|e| {
+            (
+                ApiError::with_code(ErrorCode::Internal, format!("unreadable response: {e}")),
+                Answered::Jkb,
+            )
+        });
+    }
+    match serde_json::from_slice::<ApiError>(&bytes) {
+        Ok(e) => Err((e, Answered::Jkb)),
+        // Not jkb serve's answer, so not a refusal of the request: the daemon is out of reach.
+        Err(_) => Err((
+            ApiError::with_code(
+                ErrorCode::Unavailable,
+                format!(
+                    "HTTP {status} from something other than jkb serve (a proxy?): {}",
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ),
+            ),
+            Answered::NotJkb,
+        )),
     }
 }
 
@@ -183,14 +213,14 @@ impl Backend for RemoteBackend {
                 ),
             ));
         }
-        let resp = self.send(&request, &self.token(false)?)?;
-        self.mark_unreachable(false);
-        // The token rotates each time the daemon starts: one retry with a freshly read token, and
-        // only for a 401, so a wrong token is never retried in a loop.
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let resp = self.send(&request, &self.token(true)?)?;
-            return decode(resp);
+        // The token rotates each time the daemon starts: one retry with a freshly read token, and only
+        // when jkb serve itself said `unauthorized` (not any 401), so a wrong token is never retried
+        // in a loop.
+        match self.attempt(&request, &self.token(false)?) {
+            Err(e) if e.code == ErrorCode::Unauthorized => {
+                self.attempt(&request, &self.token(true)?)
+            }
+            other => other,
         }
-        decode(resp)
     }
 }

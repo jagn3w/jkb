@@ -1960,6 +1960,7 @@ dependencies = [
  "jkb-api",
  "jkb-core",
  "reqwest 0.13.4",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

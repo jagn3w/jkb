@@ -20,6 +20,9 @@ hyper-util = { version = "0.1.20", features = ["tokio"] }
 jkb-api = { version = "0.1.0", path = "../jkb-api" }
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
 reqwest = { workspace = true }
+# The token is written dirfd-relative (`openat`/`renameat`), which std cannot do; the version jkb-core
+# and jkb-cli already lock.
+rustix = { version = "1.1.4", features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

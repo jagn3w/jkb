@@ -175,7 +175,34 @@ const EXPECT_SET: &[(&str, &str)] = &[
 ];
 
 /// Assert `cmd` carries the whole isolation — both halves of it.
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
 pub fn assert_isolated(what: &str, cmd: &Command) {
+    assert_isolated_dropping(what, cmd, &[]);
+}
+
+/// Remote mode is switched on by the environment alone, so a test run from a shell that has it set —
+/// the dev container sets it — would send every fixture `jkb` to a live daemon instead of the test's
+/// own database, or refuse the command outright. A `jkb` fixture drops these; a bare `git` one has
+/// no reason to.
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+pub const REMOTE_MUST_DROP: &[&str] = &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE"];
+
+/// Drop [`REMOTE_MUST_DROP`] from a command that runs the `jkb` binary.
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+pub fn isolate_remote_env(cmd: &mut Command) {
+    for key in REMOTE_MUST_DROP {
+        cmd.env_remove(key);
+    }
+}
+
+/// [`assert_isolated`] for a fixture that runs `jkb`: the git isolation plus remote mode's variables,
+/// spelled out here as the oracle rather than read from [`REMOTE_MUST_DROP`].
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+pub fn assert_jkb_isolated(what: &str, cmd: &Command) {
+    assert_isolated_dropping(what, cmd, &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE"]);
+}
+
+fn assert_isolated_dropping(what: &str, cmd: &Command, also: &[&str]) {
     let envs: Vec<(String, Option<String>)> = cmd
         .get_envs()
         .map(|(k, v)| {
@@ -192,7 +219,11 @@ pub fn assert_isolated(what: &str, cmd: &Command) {
         .filter(|(_, v)| v.is_none())
         .map(|(k, _)| k.clone())
         .collect();
-    let mut want: Vec<String> = EXPECT_DROPPED.iter().map(|s| (*s).to_owned()).collect();
+    let mut want: Vec<String> = EXPECT_DROPPED
+        .iter()
+        .chain(also)
+        .map(|s| (*s).to_owned())
+        .collect();
     removed.sort();
     want.sort();
     assert_eq!(

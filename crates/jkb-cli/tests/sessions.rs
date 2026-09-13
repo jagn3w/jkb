@@ -53,6 +53,7 @@ impl Fixture {
         // The same isolation the fixture's own git calls get: jkb spawns git, so the
         // developer's shell reaches it through this process just as directly.
         isolate_git_env(&mut cmd);
+        common::isolate_remote_env(&mut cmd);
         // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
         // probed for liveness on the host that issued it, so an unpinned name makes every
         // claim fixture `Unknown` and nothing is ever reclaimed.
@@ -3402,7 +3403,7 @@ fn the_session_fixture_jkb_does_not_inherit_a_repository() {
     // Through the shared assertion, like its two siblings. Left hand-iterating `MUST_DROP` it
     // checked only the REMOVALS — exactly the half-coverage `assert_isolated` was written to
     // end, on the pin guarding every `jkb` spawn in this file.
-    common::assert_isolated("Fixture::jkb", &fx.jkb());
+    common::assert_jkb_isolated("Fixture::jkb", &fx.jkb());
 }
 
 /// The repository-selection scrub, observed by ITS HARM rather than by agreeing lists.

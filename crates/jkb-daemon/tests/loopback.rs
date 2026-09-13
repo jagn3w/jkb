@@ -137,6 +137,11 @@ fn operations_round_trip_over_http_exactly_as_they_do_locally() {
 #[test]
 fn a_long_poll_is_woken_by_a_send_rather_than_waiting_out_its_timeout() {
     // The floor is pushed out past the test, so ONLY the send's wake-up can deliver in time.
+    //
+    // What this does NOT pin: the narrow race `enable()` in `serve_op` closes — a send landing
+    // between the poll's read and its wait. The 300 ms sleep puts the send well inside the wait, and
+    // no sleep can place it in a window of microseconds; deleting `enable()` leaves this green. The
+    // floor bounds that miss at 250 ms in production.
     let f = Fixture::with(|cfg| cfg.poll_floor = Duration::from_mins(1));
     let c = f.client().with_poll_wait(Duration::from_secs(20));
     topic_and_group(&c);
@@ -352,4 +357,230 @@ fn an_unreachable_daemon_is_remembered_briefly_across_clients() {
         started.elapsed() < Duration::from_millis(200),
         "no second connect attempt"
     );
+}
+
+/// A stub HTTP server answering every request with `response`, counting the requests it saw.
+fn stub(response: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (base, seen)
+}
+
+#[test]
+fn an_answer_from_something_other_than_jkb_serve_means_unavailable_not_internal() {
+    // A proxy in the path answers for a daemon that is down. That is not the daemon refusing the
+    // request, so it is `unavailable` — retried by a subscriber, remembered by the down marker —
+    // and it is not a jkb `unauthorized`, so the token is not re-read and the request not re-sent.
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    for response in [
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Gateway",
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+    ] {
+        let (base, seen) = stub(response);
+        let marker = dir.path().join("unreachable");
+        let _ = std::fs::remove_file(&marker);
+        let c = RemoteBackend::new(&base, token.clone())
+            .unwrap()
+            .with_down_marker(marker.clone());
+        let err = c.call(Request::MqInspect {}).unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::Unavailable,
+            "{response}: {}",
+            err.message
+        );
+        assert!(marker.exists(), "{response}: remembered as down");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{response}: sent once"
+        );
+    }
+}
+
+#[test]
+fn a_daemon_that_cannot_serve_its_database_still_answers_with_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("daemon/token");
+    let refusal = jkb_api::ApiError::with_code(ErrorCode::SchemaNewer, "migrated by a newer jkb");
+    let h = jkb_daemon::server::spawn_refusing(
+        refusal,
+        &ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone()),
+    )
+    .unwrap();
+    let c = RemoteBackend::new(&format!("http://{}", h.addr), token).unwrap();
+    assert_eq!(
+        c.call(Request::MqInspect {}).unwrap_err().code,
+        ErrorCode::SchemaNewer
+    );
+    assert_eq!(c.hello().unwrap_err().code, ErrorCode::SchemaNewer);
+    h.shutdown();
+}
+
+#[test]
+fn a_group_holds_one_long_poll_at_a_time() {
+    let f = Fixture::new();
+    let c = f.client();
+    topic_and_group(&c);
+    c.call(Request::MqGroupCreate {
+        topic: "t".into(),
+        group: "other".into(),
+        from_start: true,
+    })
+    .unwrap();
+    let poll = |group: &str| Request::MqPoll {
+        topic: "t".into(),
+        group: group.into(),
+        max: 10,
+        after: None,
+    };
+    let held = {
+        let (base, token) = (f.base.clone(), f.token.clone());
+        std::thread::spawn(move || {
+            RemoteBackend::new(&base, token)
+                .unwrap()
+                .with_poll_wait(Duration::from_secs(3))
+                .call(Request::MqPoll {
+                    topic: "t".into(),
+                    group: "g".into(),
+                    max: 10,
+                    after: None,
+                })
+        })
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let short = f.client().with_poll_wait(Duration::from_millis(300));
+    let err = short.call(poll("g")).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Busy, "{}", err.message);
+    short
+        .call(poll("other"))
+        .expect("another group is not held up");
+    held.join().unwrap().expect("the first poll ends normally");
+    short
+        .call(poll("g"))
+        .expect("released once the first poll returned");
+}
+
+#[test]
+fn wait_ms_holds_only_a_poll() {
+    let f = Fixture::new();
+    let c = f.client();
+    topic_and_group(&c);
+    let token = std::fs::read_to_string(&f.token).unwrap();
+    let started = Instant::now();
+    let r = reqwest::blocking::Client::new()
+        .post(format!("{}/v1/op?wait_ms=5000", f.base))
+        .bearer_auth(token.trim())
+        .body(json!({ "op": "mq.tail", "topic": "t", "limit": 10 }).to_string())
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "an empty tail is answered at once, not held: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_long_poll_notices_a_newer_schema_while_it_waits() {
+    let f = Fixture::new();
+    let c = f.client().with_poll_wait(Duration::from_secs(20));
+    topic_and_group(&c);
+    let db = f.db.clone();
+    let migrator = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        let future = jkb_core::supported_schema_version() + 1;
+        db.write_txn("test", move |conn, _| {
+            conn.pragma_update(None, "user_version", future)?;
+            Ok(())
+        })
+        .unwrap();
+    });
+    let started = Instant::now();
+    let err = c
+        .call(Request::MqPoll {
+            topic: "t".into(),
+            group: "g".into(),
+            max: 10,
+            after: None,
+        })
+        .unwrap_err();
+    migrator.join().unwrap();
+    assert_eq!(err.code, ErrorCode::SchemaNewer);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn connections_are_capped_and_a_silent_one_is_closed() {
+    use std::io::{Read as _, Write as _};
+    let f = Fixture::with(|cfg| {
+        cfg.max_connections = 2;
+        cfg.read_timeout = Duration::from_millis(600);
+    });
+    let addr = f.handle.as_ref().unwrap().addr;
+    let closed_within = |stream: &mut std::net::TcpStream| {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let started = Instant::now();
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        (
+            started.elapsed(),
+            String::from_utf8_lossy(&buf[..n]).into_owned(),
+        )
+    };
+    let mut first = std::net::TcpStream::connect(addr).unwrap();
+    let mut second = std::net::TcpStream::connect(addr).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let mut third = std::net::TcpStream::connect(addr).unwrap();
+    let (took, said) = closed_within(&mut third);
+    assert!(
+        took < Duration::from_millis(500) && said.is_empty(),
+        "over the cap: {took:?} {said}"
+    );
+
+    // An authorized request whose body never finishes is answered within the read timeout.
+    let token = std::fs::read_to_string(&f.token).unwrap();
+    write!(
+        second,
+        "POST /v1/op HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\ncontent-length: 50\r\n\r\n{{",
+        token.trim()
+    )
+    .unwrap();
+    let (took, said) = closed_within(&mut second);
+    assert!(
+        said.starts_with("HTTP/1.1 400") && took < Duration::from_secs(3),
+        "{took:?} {said}"
+    );
+    // Headers that never arrive: the connection is closed after the read timeout.
+    let (took, said) = closed_within(&mut first);
+    assert!(
+        said.is_empty() && took < Duration::from_secs(3),
+        "{took:?} {said}"
+    );
+    drop((first, second));
+    std::thread::sleep(Duration::from_millis(300));
+    f.client()
+        .call(Request::MqInspect {})
+        .expect("slots freed when connections close");
 }

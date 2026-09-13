@@ -31,6 +31,7 @@ fn jkb_bare() -> Command {
     // all — invisible to the crate-wide guard, which keyed on `Command::new(` while this builds
     // its process with `cargo_bin`. Pinned by `the_cli_fixture_does_not_inherit_a_repository`.
     isolate_git_env(&mut cmd);
+    common::isolate_remote_env(&mut cmd);
     // Pin the host these tests' owner ids are compared against. A `host:<pid>` owner is only
     // probed for liveness on the host that issued it — a pid means nothing without one, and
     // `~/.jkb` is shared across the container boundary on purpose — so `host:1234` has to name
@@ -2905,9 +2906,9 @@ fn sync_keeps_two_tasks_files_in_one_directory_apart() {
 fn the_cli_fixture_does_not_inherit_a_repository() {
     let tmp = TempDir::new().unwrap();
     let cmd = jkb(&tmp.path().join("x.db"));
-    common::assert_isolated("the cli fixture", &cmd);
+    common::assert_jkb_isolated("the cli fixture", &cmd);
     // ...and the database-less form remote mode uses, which is where the spawn now lives.
-    common::assert_isolated("the bare cli fixture", &jkb_bare());
+    common::assert_jkb_isolated("the bare cli fixture", &jkb_bare());
 }
 
 /// `notify` must run before the database is opened.
@@ -3167,29 +3168,102 @@ fn task_reap_compacts_the_message_queue() {
     let _ = watch.wait();
 }
 
+/// A `jkb serve` child, killed when dropped — so a failed assertion does not leave a daemon running
+/// past the test.
+struct Daemon(std::process::Child);
+
+impl Daemon {
+    /// Start `jkb serve` on an ephemeral port; the daemon and its `http://` address.
+    fn start(db: &Path, token: &Path) -> (Self, String) {
+        use std::io::BufRead as _;
+        let mut child = jkb(db)
+            .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(token)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let daemon = Self(child);
+        let banner = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let url = banner
+            .split_whitespace()
+            .find(|w| w.starts_with("http://"))
+            .unwrap_or_else(|| panic!("no address in {banner}"))
+            .to_owned();
+        (daemon, url)
+    }
+
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A database a newer jkb migrated does not stop `jkb serve`: exiting would put its supervisor into a
+/// restart loop and tell clients only `unavailable`. It binds and answers every request with why.
+#[test]
+fn serve_answers_schema_newer_rather_than_exiting_on_a_newer_database() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("host.db");
+    {
+        let opened = jkb_core::Db::open(&db).unwrap();
+        let future = jkb_core::supported_schema_version() + 1;
+        opened
+            .write_txn("test", move |conn, _| {
+                conn.pragma_update(None, "user_version", future)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let token = tmp.path().join("daemon/token");
+    let (mut serve, url) = Daemon::start(&db, &token);
+    let out = {
+        let mut cmd = jkb_bare();
+        cmd.args(["--json", "mq", "topic", "ls"])
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", tmp.path())
+            .env_remove("JKB_DB");
+        cmd.output().unwrap()
+    };
+    assert!(
+        !out.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The code, not only the words: `unavailable` would say the same sentence and send a
+    // subscriber into retrying something no retry fixes.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#""code":"schema_newer""#), "{stdout}");
+    assert!(
+        serve.0.try_wait().unwrap().is_none(),
+        "the daemon is still up"
+    );
+    serve.stop();
+}
+
 /// The dev container's path to the knowledge base, end to end through real binaries: `jkb serve` on
 /// one side, `jkb` with `JKB_REMOTE` on the other. Ported commands work through the daemon; every
-/// other command, and `--db`, is refused before it does anything — no database is created.
+/// other command, `--db` and `JKB_DB`, is refused before it does anything — no database is created.
 #[test]
 #[allow(clippy::too_many_lines)] // one end-to-end walk through serve, client and refusals
 fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
-    use std::io::BufRead as _;
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("host.db");
     let token = tmp.path().join("daemon/token");
-    let mut serve = jkb(&db)
-        .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
-        .arg(&token)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut lines = std::io::BufReader::new(serve.stdout.take().unwrap()).lines();
-    let banner = lines.next().unwrap().unwrap();
-    let url = banner
-        .split_whitespace()
-        .find(|w| w.starts_with("http://"))
-        .unwrap_or_else(|| panic!("no address in {banner}"))
-        .to_owned();
+    let (mut serve, url) = Daemon::start(&db, &token);
 
     let client_home = tmp.path().join("container-home");
     std::fs::create_dir_all(&client_home).unwrap();
@@ -3253,6 +3327,21 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
     ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--db is refused"));
+    let out = {
+        let mut cmd = jkb_bare();
+        cmd.args(["mq", "topic", "ls"])
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env("JKB_DB", tmp.path().join("container.db"));
+        cmd.output().unwrap()
+    };
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("JKB_DB is set alongside JKB_REMOTE"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         !tmp.path().join("container.db").exists(),
         "the refusal came before any open"
@@ -3262,8 +3351,7 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
         "remote mode never opened a default database"
     );
 
-    serve.kill().unwrap();
-    let _ = serve.wait();
+    serve.stop();
     // The daemon is gone: the client says so, and remembers it briefly.
     let out = remote(&["mq", "topic", "ls"]);
     assert!(!out.status.success());
