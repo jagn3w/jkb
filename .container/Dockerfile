@@ -129,6 +129,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN mkdir -p /home/vscode/.cargo/target \
              /home/vscode/.cargo/registry \
              /home/vscode/.claude-state \
+             /home/vscode/.local/state/jkb \
              /home/vscode/.claude
 
 # --- VS Code extensions, fetched HERE rather than at connect time ----------------------------

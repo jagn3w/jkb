@@ -652,6 +652,13 @@ open(p, 'w').write(s.replace('mkdir -p /home/vscode/.cargo/target', 'mkdir -p /h
 PYX
 run "the Dockerfile stops pre-creating CARGO_TARGET_DIR" "does not pre-create"
 
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('             /home/vscode/.local/state/jkb \\\n', '', 1))
+PYX
+run "the Dockerfile stops pre-creating a volume that is not CARGO_TARGET_DIR" "does not pre-create volume target"
+
 seed; printf '\nif then fi\n' >> "$work/t/.container/setup.sh"
 run "a container script gains a syntax error" "has a syntax error"
 
@@ -832,7 +839,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=71
+PINNED_BAD_SITES=72
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

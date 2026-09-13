@@ -321,6 +321,24 @@ fi
 # container healthy. The rule is generic — the path every site names must be the same one, and it
 # must fall under a posture write root — so a future edit to any single site is caught here rather
 # than by a build dying inside a container.
+# EVERY named volume's target must be pre-created in the Dockerfile, not just CARGO_TARGET_DIR's.
+# The rule was checked for that one path, and the next volume added (jkb-kb-local, for the
+# container-local knowledge base) skipped it: Docker created it root-owned and `jkb` could not
+# create its database. A rule checked for one call site is a rule the next one forgets.
+precreated="$(awk '/^RUN mkdir -p /{on=1} on{print} on&&!/\\$/{on=0}' "$here/Dockerfile" \
+    | tr ' \\' '\n\n' | grep '^/' | sort -u)"
+unprecreated=()
+while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ "$(dc_type_for_target "$here/container.json" "$t")" = volume ] || continue
+    grep -qx "$t" <<<"$precreated" || unprecreated+=("$t")
+done <<<"$mount_targets"
+if [ ${#unprecreated[@]} -eq 0 ]; then
+    ok "every named volume's target is pre-created in the Dockerfile"
+else
+    bad "Dockerfile does not pre-create volume target(s) ${unprecreated[*]} — Docker creates them root-owned and the container user cannot write them"
+fi
+
 posture="$here/../scripts/auto-mode-posture.json"
 user="$(jq -r '.remoteUser // "root"' <<<"$dc")"
 home="/home/$user"

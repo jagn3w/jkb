@@ -1210,6 +1210,16 @@ while IFS= read -r m; do
 done <<<"$actual"
 assert "knowledge base is mounted" "$kb_mounted"
 
+# The container's OWN database (JKB_DB) must be writable by this user, and must not sit on the
+# host bind. Both failed silently once: the jkb-kb-local volume came up root-owned, so every `jkb`
+# verb died creating the database, and before that JKB_DB pointed through the ~/.jkb bind at the
+# host's database, which a process on each kernel corrupts (.container/sqlite-share-probe.py).
+kb_dir="$(dirname "${JKB_DB:-/nonexistent/jkb.db}")"
+assert "JKB_DB's directory ($kb_dir) is writable by $(id -un)" \
+    "$([ -d "$kb_dir" ] && [ -w "$kb_dir" ] && echo yes || echo no)"
+assert "JKB_DB ($kb_dir) is not on the host bind (a shared SQLite database corrupts)" \
+    "$([ -n "${JKB_DB:-}" ] && [ "$(stat -f -c %T "$kb_dir" 2>/dev/null)" != fuseblk ] && echo yes || echo no)"
+
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.
 # WHAT THE KERNEL HOLDS RIGHT NOW, not what egress happens to do and not what some past raise
