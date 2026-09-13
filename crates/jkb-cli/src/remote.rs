@@ -82,12 +82,13 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-/// The token file: `JKB_REMOTE_TOKEN_FILE`, else the host's default beside `~/.jkb/jkb.db`.
+/// The token file: `JKB_REMOTE_TOKEN_FILE`, else where the host's `jkb serve` writes it for the
+/// default database (`~/.jkb/jkb.db`, seen through the bind) — the same function it uses, not a copy.
 fn token_file() -> PathBuf {
     std::env::var_os("JKB_REMOTE_TOKEN_FILE")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| home().join(".jkb/daemon/token"))
+        .unwrap_or_else(|| super::service::serve_token_path(&home().join(".jkb/jkb.db")))
 }
 
 /// The subcommand as typed, for the refusal message: the first argument that is not a flag. `--db`,

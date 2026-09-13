@@ -24,12 +24,51 @@ mod embedded {
 /// this code's queries is how a stale daemon writes rows a newer schema does not expect.
 #[must_use]
 pub fn supported_version() -> i64 {
-    embedded::migrations::runner()
-        .get_migrations()
-        .iter()
-        .map(|m| i64::from(m.version()))
-        .max()
-        .unwrap_or(0)
+    static SUPPORTED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        embedded::migrations::runner()
+            .get_migrations()
+            .iter()
+            .map(|m| i64::from(m.version()))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// The newest migration applied to this database, from refinery's history table — which each
+/// migration writes inside its own transaction, unlike `PRAGMA user_version`, stamped only after all
+/// of them (and the foreign-key check) finish. 0 for a database never migrated.
+///
+/// # Errors
+/// [`crate::Error::Sqlite`] if the history cannot be read.
+pub fn applied_version(conn: &Connection) -> Result<i64> {
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name = 'refinery_schema_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_history {
+        return Ok(0);
+    }
+    Ok(conn
+        .prepare_cached("SELECT COALESCE(MAX(version), 0) FROM refinery_schema_history")?
+        .query_row([], |row| row.get(0))?)
+}
+
+/// Refuse a database a newer jkb has migrated. [`crate::Db::write_txn`] asks this inside its
+/// IMMEDIATE transaction, so no migration can commit between the question and the write — a
+/// long-lived process (the daemon, the sync watcher) must not write this build's row shapes into a
+/// schema it does not know.
+///
+/// # Errors
+/// [`crate::Error::SchemaNewer`], or [`crate::Error::Sqlite`] if the history cannot be read.
+pub fn refuse_newer(conn: &Connection) -> Result<()> {
+    let (found, supported) = (applied_version(conn)?, supported_version());
+    if found > supported {
+        return Err(Error::SchemaNewer { found, supported });
+    }
+    Ok(())
 }
 
 /// Apply all pending migrations, then stamp `PRAGMA user_version` with the highest
@@ -50,13 +89,7 @@ pub fn supported_version() -> i64 {
 /// [`crate::Error::ForeignKeyViolation`] if a migration left a dangling foreign-key
 /// reference, or [`crate::Error::Sqlite`] if a PRAGMA or the version marker fails.
 pub fn run(conn: &mut Connection) -> Result<()> {
-    let (found, supported) = (
-        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-        supported_version(),
-    );
-    if found > supported {
-        return Err(Error::SchemaNewer { found, supported });
-    }
+    refuse_newer(conn)?;
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
     let migrate_result = embedded::migrations::runner().run(conn);

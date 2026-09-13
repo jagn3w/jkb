@@ -1058,9 +1058,11 @@ enum ServiceCmd {
     Install,
     /// Remove the installed service unit.
     Uninstall,
-    /// Print the label of every unit `install` writes, one per line — what setup.sh activates, so
-    /// the list is not copied into it by hand.
-    Labels,
+    /// Print every unit `install` writes, one per line as `label<TAB>path` — what setup.sh
+    /// activates, so neither the list nor the paths are copied into it by hand.
+    Units,
+    /// Print where `jkb serve` writes its token for this database (it does so once it is listening).
+    TokenPath,
 }
 
 #[derive(Subcommand)]
@@ -1264,7 +1266,11 @@ fn run(cli: Cli) -> Result<()> {
             ServiceCmd::Print => service::print(&db_path),
             ServiceCmd::Install => service::install(&db_path),
             ServiceCmd::Uninstall => service::uninstall(&db_path),
-            ServiceCmd::Labels => service::labels(&db_path),
+            ServiceCmd::Units => service::units(&db_path),
+            ServiceCmd::TokenPath => {
+                println!("{}", service::serve_token_path(&db_path).display());
+                Ok(())
+            }
         },
         Command::Commands { cmd } => match cmd {
             CommandsCmd::Install => commands::install(),
@@ -6550,34 +6556,28 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
 ///
 /// A database this build cannot open does not stop it. Exiting would put launchd/systemd into a
 /// restart loop — the reap unit's history with a newer branch's migration — and leave every client
-/// with `unavailable` and no hint. Instead it binds, writes the token, and answers each request with
-/// the reason: `schema_newer` when a newer jkb migrated the database (setup.sh restarts the daemon
-/// from that jkb), `unavailable` for any other failure to open it.
+/// with `unavailable` and no hint. Instead it binds, writes the token, answers each request with the
+/// reason — `schema_newer` when a newer jkb migrated the database (setup.sh restarts the daemon from
+/// that jkb), `unavailable` for any other failure to open it — and tries the open again every few
+/// seconds, so a failure that passes needs no restart (`jkb_daemon::server::spawn_opening`).
 fn cmd_serve(
     db_path: &Path,
     addr: std::net::SocketAddr,
     token_file: Option<PathBuf>,
 ) -> Result<()> {
-    let token_path = token_file.unwrap_or_else(|| {
-        db_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("daemon/token")
-    });
+    let token_path = token_file.unwrap_or_else(|| service::serve_token_path(db_path));
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
-    let handle = match open_db(db_path) {
-        Ok(db) => jkb_daemon::server::spawn(db, &cfg),
-        Err(e) => {
+    let path = db_path.to_path_buf();
+    let open: jkb_daemon::server::Opener = Box::new(move || {
+        open_db(&path).map_err(|e| {
             let code = match e.downcast_ref::<jkb_core::Error>() {
                 Some(jkb_core::Error::SchemaNewer { .. }) => jkb_api::ErrorCode::SchemaNewer,
                 _ => jkb_api::ErrorCode::Unavailable,
             };
-            let why = format!("jkb serve cannot open the database: {e:#}");
-            eprintln!("{why}; answering every request with it until restarted");
-            jkb_daemon::server::spawn_refusing(jkb_api::ApiError::with_code(code, why), &cfg)
-        }
-    }
-    .context("starting jkb serve")?;
+            jkb_api::ApiError::with_code(code, format!("jkb serve cannot open the database: {e:#}"))
+        })
+    });
+    let handle = jkb_daemon::server::spawn_opening(open, &cfg).context("starting jkb serve")?;
     // One line, flushed, that a supervisor log and a test can both read: the address actually
     // bound (a `:0` port is resolved) and where the token went.
     println!(

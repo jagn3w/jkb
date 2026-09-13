@@ -96,10 +96,17 @@ fn install_units(manager: Manager, units: Vec<Unit>) -> Result<()> {
         // `service install` on every pull that touched `scripts/`.
         crate::atomic::write(&path, unit.as_bytes())?;
         println!("wrote {}", path.display());
+        // A RESTART, not `load` / `enable --now`: those leave an already-running unit on the old
+        // binary, and a daemon older than the database refuses every request (schema_newer). The
+        // same rule as setup.sh's `activate_services`.
         match manager {
-            Manager::Launchd => println!("activate with: launchctl load {}", path.display()),
+            Manager::Launchd => println!(
+                "activate with: launchctl unload {path} 2>/dev/null; launchctl load {path}",
+                path = path.display()
+            ),
             Manager::Systemd => println!(
-                "activate with: systemctl --user daemon-reload && systemctl --user enable --now {label}"
+                "activate with: systemctl --user daemon-reload && systemctl --user enable {label} \
+                 && systemctl --user restart {label}"
             ),
         }
     }
@@ -131,15 +138,26 @@ pub fn uninstall(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Print the label of every unit [`install`] writes for this platform, one per line.
+/// Print every unit [`install`] writes for this platform, one per line: its label, a tab, and the
+/// path it is installed at — so setup.sh activates exactly these, and derives no path of its own.
 ///
 /// # Errors
 /// As [`install`], for an unsupported platform or no `HOME`.
-pub fn labels(db: &Path) -> Result<()> {
-    for (label, _, _) in units_for_platform(db)? {
-        println!("{label}");
+pub fn units(db: &Path) -> Result<()> {
+    for (label, path, _) in units_for_platform(db)? {
+        println!("{label}\t{}", path.display());
     }
     Ok(())
+}
+
+/// Where `jkb serve` writes its token for the database at `db` when not told otherwise: beside the
+/// database, in `daemon/`. The daemon writes it only once its port is bound, which is what setup.sh
+/// waits for.
+#[must_use]
+pub fn serve_token_path(db: &Path) -> PathBuf {
+    db.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("daemon/token")
 }
 
 /// Every `(label, install path, contents)` for the current platform.

@@ -176,7 +176,8 @@ impl Db {
     /// passed via [`WriteMeta`]; the transaction commits iff `f` returns `Ok`.
     ///
     /// # Errors
-    /// Propagates any error from `f` or the transaction machinery.
+    /// [`Error::SchemaNewer`] once a newer jkb has migrated the database; otherwise propagates any
+    /// error from `f` or the transaction machinery.
     pub fn write_txn<T, F>(&self, actor: impl Into<String>, f: F) -> Result<T>
     where
         F: FnOnce(&Connection, &WriteMeta) -> Result<T> + Send + 'static,
@@ -215,6 +216,10 @@ impl Db {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(Error::from)?;
+            // Under the write lock, so no migration commits between this and `f`'s writes: a
+            // process started before a newer jkb migrated the database stops writing here rather
+            // than putting this build's row shapes into a schema it does not know.
+            crate::migrate::refuse_newer(&tx)?;
             let txn_id: i64 = tx
                 .query_row(
                     "SELECT COALESCE(MAX(txn_id), 0) + 1 FROM changelog",
@@ -361,6 +366,31 @@ impl Db {
 mod tests {
     use super::Db;
     use crate::item::{upsert, NewItem};
+
+    /// A process opened before a newer jkb migrated the database stops WRITING — checked inside the
+    /// write transaction, so no migration can land between the check and the write — and can still
+    /// read. `PRAGMA user_version` would not do: it is stamped only after every migration finishes.
+    #[test]
+    fn a_write_after_a_newer_migration_is_refused_and_a_read_is_not() {
+        let db = Db::open_in_memory().unwrap();
+        let future = crate::migrate::supported_version() + 1;
+        db.write_txn("newer jkb", move |conn, _| {
+            conn.execute(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                [future],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let err = db.write_txn("stale", |_, _| Ok(())).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::SchemaNewer { found, .. } if found == future),
+            "{err}"
+        );
+        db.read(|conn| Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?))
+            .expect("reads still work");
+    }
 
     /// A backup to the same path twice must work — `jkb doctor --backup ~/.jkb/backup.db` is a
     /// fixed path, which is what the flag invites and what any cron or pre-migration script

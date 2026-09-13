@@ -39,6 +39,7 @@ link_memory=0
 scaffold_state=created
 extension_state=installed
 watcher_state=running
+serve_state=unchecked
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -140,10 +141,12 @@ if [ "$do_service" -eq 1 ]; then
     # A distinct variable, not `do_service=0`: that is the flag, and reusing it would make the
     # summary below report a failure as "--no-service" — the user's choice, which it was not.
     watcher_state=failed
+    serve_state=unchecked
     warn "could not write the service units — continuing to the git hooks."
   fi
 else
   watcher_state=skipped
+  serve_state=skipped
   warn "skipping watcher service (--no-service)"
 fi
 
@@ -233,4 +236,5 @@ render_setup_summary < <(
   printf 'scaffold=%s %s\n' "$scaffold_state" "$db"
   printf 'extension=%s\n' "$extension_state"
   printf 'watcher=%s\n' "$watcher_state"
+  printf 'serve=%s\n' "$serve_state"
 )

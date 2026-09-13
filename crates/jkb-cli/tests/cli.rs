@@ -2935,6 +2935,35 @@ fn notify_needs_no_database() {
         .success();
 }
 
+/// Under `--json` a refused `jkb mq` verb puts the refusal on stdout as well as exiting 1 — including
+/// one the CLI finds itself rather than an operation refusing (a topic missing from `mq.inspect`).
+#[test]
+fn mq_refusals_are_on_stdout_under_json() {
+    let tmp = TempDir::new().unwrap();
+    let db = db_path(&tmp);
+    for args in [
+        &["--json", "mq", "group", "ls", "nope"][..],
+        &[
+            "--json",
+            "mq",
+            "send",
+            "nope",
+            "--key",
+            "k",
+            "--kind",
+            "k.m",
+            "--payload",
+            "{}",
+        ],
+    ] {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)));
+        assert_eq!(stdout["error"]["code"], "no_such_topic", "{args:?}");
+    }
+}
+
 /// `jkb mq` end to end through a real binary: create a topic, send, and consume through
 /// `jkb mq subscribe`'s NDJSON protocol over pipes, acking on stdin. A second subscription resumes
 /// after the ack, which is the at-least-once contract a daemon in another language relies on.
@@ -3175,10 +3204,16 @@ struct Daemon(std::process::Child);
 impl Daemon {
     /// Start `jkb serve` on an ephemeral port; the daemon and its `http://` address.
     fn start(db: &Path, token: &Path) -> (Self, String) {
+        let mut cmd = jkb(db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(token);
+        Self::spawn(cmd)
+    }
+
+    /// Start `jkb serve` from `cmd` (already carrying its arguments).
+    fn spawn(mut cmd: std::process::Command) -> (Self, String) {
         use std::io::BufRead as _;
-        let mut child = jkb(db)
-            .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
-            .arg(token)
+        let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -3210,6 +3245,75 @@ impl Drop for Daemon {
     }
 }
 
+/// `jkb service units` and `jkb service token-path` are what setup.sh activates and waits for, so they
+/// are checked against the real thing: every unit `install` wrote is listed at the path it was written
+/// to, and `jkb serve` with no `--token-file` writes its token exactly where `token-path` says.
+#[test]
+fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let db = tmp.path().join("kb/jkb.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).env("HOME", &home).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["service", "install"]);
+    let units = run(&["service", "units"]);
+    let mut written = 0;
+    for line in units.lines() {
+        let (label, path) = line
+            .split_once('\t')
+            .unwrap_or_else(|| panic!("not label<TAB>path: {line}"));
+        let path = Path::new(path);
+        assert!(
+            path.is_file(),
+            "{label}: listed at {} but not written there",
+            path.display()
+        );
+        assert_eq!(path.file_stem().unwrap().to_str().unwrap(), label);
+        written += 1;
+    }
+    let on_disk = walkdir_count(&home);
+    assert_eq!(
+        written, on_disk,
+        "every unit written is listed, and nothing else: {units}"
+    );
+    assert!(units.contains("com.jkb.serve\t"), "{units}");
+
+    let token = run(&["service", "token-path"]);
+    let token = Path::new(token.trim());
+    // The documented place, and the one remote mode assumes for `~/.jkb/jkb.db` when
+    // JKB_REMOTE_TOKEN_FILE is unset.
+    assert_eq!(token, db.parent().unwrap().join("daemon/token"));
+    let mut cmd = jkb(&db);
+    cmd.args(["serve", "--addr", "127.0.0.1:0"])
+        .env("HOME", &home);
+    let (mut serve, _) = Daemon::spawn(cmd);
+    assert!(token.is_file(), "no token at {}", token.display());
+    serve.stop();
+}
+
+/// How many files are under `dir`, recursively.
+fn walkdir_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                walkdir_count(&path)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 /// A database a newer jkb migrated does not stop `jkb serve`: exiting would put its supervisor into a
 /// restart loop and tell clients only `unavailable`. It binds and answers every request with why.
 #[test]
@@ -3221,7 +3325,11 @@ fn serve_answers_schema_newer_rather_than_exiting_on_a_newer_database() {
         let future = jkb_core::supported_schema_version() + 1;
         opened
             .write_txn("test", move |conn, _| {
-                conn.pragma_update(None, "user_version", future)?;
+                conn.execute(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                    [future],
+                )?;
                 Ok(())
             })
             .unwrap();

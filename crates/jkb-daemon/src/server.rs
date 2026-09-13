@@ -14,12 +14,16 @@
 //! **Before authentication nothing is bounded by the token**, so the transport is: at most
 //! [`ServeConfig::max_connections`] open connections (one past that is closed on accept), request
 //! headers within [`ServeConfig::read_timeout`] — idle keep-alive connections included, since hyper
-//! runs that timer for every head it waits on — and a body within the same timeout.
+//! runs that timer for every head it waits on — a body within the same timeout, and a connection
+//! that has not presented the token within that timeout is closed whatever it is doing (a client
+//! that pipelines requests and never reads the answers stops hyper's header timer). A refusal before
+//! authentication also closes its connection.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,9 +61,11 @@ pub struct ServeConfig {
     pub poll_floor: Duration,
     /// Open connections, authenticated or not. One past this is closed as soon as it is accepted.
     pub max_connections: usize,
-    /// How long a client may take to send a request's headers, or its body — and how long an idle
-    /// keep-alive connection is kept.
+    /// How long a client may take to send a request's headers, or its body, or to authenticate a new
+    /// connection — and how long an idle keep-alive connection is kept.
     pub read_timeout: Duration,
+    /// How often a daemon whose database could not be opened tries again, on a request.
+    pub reopen_every: Duration,
 }
 
 impl ServeConfig {
@@ -76,6 +82,7 @@ impl ServeConfig {
             poll_floor: Duration::from_millis(250),
             max_connections: 256,
             read_timeout: Duration::from_secs(10),
+            reopen_every: Duration::from_secs(5),
         }
     }
 }
@@ -126,9 +133,25 @@ impl Handle {
     }
 }
 
+/// Opens the database, for a daemon that starts, or keeps trying to start, without one.
+pub type Opener = Box<dyn Fn() -> Result<Db, ApiError> + Send + Sync>;
+
+enum Serving {
+    Ready(LocalBackend, Db),
+    /// The last open failed, `at` then; every request gets `why` until a retry succeeds.
+    Failed {
+        why: ApiError,
+        at: std::time::Instant,
+    },
+}
+
 struct State {
-    /// The database, or — when it could not be served at all — the refusal every request gets.
-    serving: Result<(LocalBackend, Db), ApiError>,
+    serving: Mutex<Serving>,
+    /// `None` for a daemon handed an open database, which has nothing to retry.
+    opener: Option<Opener>,
+    /// One re-open at a time.
+    opening: tokio::sync::Mutex<()>,
+    reopen_every: Duration,
     token: String,
     ops: Arc<Semaphore>,
     polls: Arc<Semaphore>,
@@ -149,21 +172,62 @@ struct State {
 /// # Errors
 /// [`ServeError::Unspecified`] for `0.0.0.0`/`::`, an I/O error binding, or a token write failure.
 pub fn spawn(db: Db, cfg: &ServeConfig) -> Result<Handle, ServeError> {
-    start(Ok((LocalBackend::new(db.clone()), db)), cfg)
+    start(Serving::Ready(LocalBackend::new(db.clone()), db), None, cfg)
 }
 
-/// Bind and answer every authenticated request with `refusal` — for a database this build cannot
-/// serve (one migrated by a newer jkb). Exiting instead would put a supervisor into a restart loop
-/// and leave clients with `unavailable`, which says nothing about the fix.
+/// Like [`spawn`], opening the database with `open` — and serving even when that fails. Exiting
+/// would put a supervisor into a restart loop and leave clients with `unavailable` and no reason.
+/// Instead every request is answered with the open's error (`schema_newer` for a database a newer
+/// jkb migrated), and the open is tried again on a request at most every
+/// [`ServeConfig::reopen_every`] — so a failure that passes (a lock held past the busy timeout, a
+/// volume mounted late) ends without anyone restarting the daemon.
 ///
 /// # Errors
-/// As [`spawn`].
-pub fn spawn_refusing(refusal: ApiError, cfg: &ServeConfig) -> Result<Handle, ServeError> {
-    start(Err(refusal), cfg)
+/// As [`spawn`]; a failed open is not one.
+pub fn spawn_opening(open: Opener, cfg: &ServeConfig) -> Result<Handle, ServeError> {
+    let serving = match open() {
+        Ok(db) => Serving::Ready(LocalBackend::new(db.clone()), db),
+        Err(why) => {
+            eprintln!("jkb serve: {}; retrying on requests", why.message);
+            Serving::Failed {
+                why,
+                at: std::time::Instant::now(),
+            }
+        }
+    };
+    start(serving, Some(open), cfg)
+}
+
+/// Raise this process's soft descriptor limit toward its hard one (launchd's default soft limit is
+/// 256), and return how many connections that leaves room for beside the database's own files.
+fn connection_budget(wanted: usize) -> usize {
+    use rustix::process::{getrlimit, setrlimit, Resource};
+    const RESERVE: u64 = 64;
+    let mut limit = getrlimit(Resource::Nofile);
+    let target = limit.maximum.map_or(4096, |hard| hard.min(4096));
+    if limit.current.is_some_and(|soft| soft < target) {
+        limit.current = Some(target);
+        let _ = setrlimit(Resource::Nofile, limit);
+    }
+    let soft = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+    let room = usize::try_from(soft.saturating_sub(RESERVE)).unwrap_or(usize::MAX);
+    wanted.min(room.max(8))
+}
+
+/// Whether an accept failure is the process running out of something, which every accept will hit
+/// until something is released — rather than one connection's own failure (a peer that reset before
+/// it was accepted), after which the next accept may well succeed.
+fn out_of_resources(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    matches!(
+        Errno::from_io_error(e),
+        Some(Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOMEM)
+    )
 }
 
 fn start(
-    serving: Result<(LocalBackend, Db), ApiError>,
+    serving: Serving,
+    opener: Option<Opener>,
     cfg: &ServeConfig,
 ) -> Result<Handle, ServeError> {
     if cfg.addr.ip().is_unspecified() {
@@ -178,7 +242,10 @@ fn start(
     let token = token::mint()?;
     token::write(&cfg.token_path, &token)?;
     let state = Arc::new(State {
-        serving,
+        serving: Mutex::new(serving),
+        opener,
+        opening: tokio::sync::Mutex::new(()),
+        reopen_every: cfg.reopen_every,
         token,
         ops: Arc::new(Semaphore::new(cfg.max_ops)),
         polls: Arc::new(Semaphore::new(cfg.max_polls)),
@@ -189,7 +256,7 @@ fn start(
         poll_floor: cfg.poll_floor,
         read_timeout: cfg.read_timeout,
     });
-    let connections = Arc::new(Semaphore::new(cfg.max_connections));
+    let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
     let read_timeout = cfg.read_timeout;
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let thread = std::thread::Builder::new()
@@ -200,11 +267,17 @@ fn start(
                     tokio::select! {
                         _ = &mut stop_rx => break,
                         accepted = listener.accept() => {
-                            // Out of descriptors (EMFILE) fails every accept at once until one closes: back
-                            // off rather than spin a core on it.
-                            let Ok((stream, _)) = accepted else {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
+                            let stream = match accepted {
+                                Ok((stream, _)) => stream,
+                                // Out of descriptors fails every accept at once until one closes:
+                                // back off rather than spin a core. A connection's own failure is
+                                // not a reason to slow everyone else's accept.
+                                Err(e) => {
+                                    if out_of_resources(&e) {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    continue;
+                                }
                             };
                             // Over the cap: dropping the stream closes it.
                             let Ok(slot) = Arc::clone(&connections).try_acquire_owned() else {
@@ -213,12 +286,28 @@ fn start(
                             let state = Arc::clone(&state);
                             tokio::spawn(async move {
                                 let _slot = slot;
-                                let service = service_fn(move |req| handle(Arc::clone(&state), req));
-                                let _ = http1::Builder::new()
+                                let authed = Arc::new(AtomicBool::new(false));
+                                let service = {
+                                    let authed = Arc::clone(&authed);
+                                    service_fn(move |req| {
+                                        handle(Arc::clone(&state), Arc::clone(&authed), req)
+                                    })
+                                };
+                                let conn = http1::Builder::new()
                                     .timer(TokioTimer::new())
                                     .header_read_timeout(read_timeout)
-                                    .serve_connection(TokioIo::new(stream), service)
-                                    .await;
+                                    .serve_connection(TokioIo::new(stream), service);
+                                tokio::pin!(conn);
+                                // A connection has `read_timeout` to present the token, whatever it
+                                // does meanwhile; one that has not is dropped, which closes it.
+                                tokio::select! {
+                                    _ = conn.as_mut() => {}
+                                    () = tokio::time::sleep(read_timeout) => {
+                                        if authed.load(Ordering::SeqCst) {
+                                            let _ = conn.await;
+                                        }
+                                    }
+                                }
                             });
                         }
                     }
@@ -238,6 +327,17 @@ fn reply(status: StatusCode, body: &serde_json::Value) -> hyper::Response<Full<B
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
+}
+
+/// A refusal before authentication: the answer, and the connection closed after it, so an
+/// unauthenticated client cannot hold a slot by sending refused requests down a kept-alive connection.
+fn refuse_and_close(e: &ApiError) -> hyper::Response<Full<Bytes>> {
+    let mut response = refuse(e);
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    response
 }
 
 fn refuse(e: &ApiError) -> hyper::Response<Full<Bytes>> {
@@ -283,30 +383,21 @@ fn wait_ms(req: &hyper::Request<Incoming>) -> u64 {
         .unwrap_or(0)
 }
 
-async fn user_version(db: Db) -> Result<i64, ApiError> {
-    tokio::task::spawn_blocking(move || {
-        db.read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?))
-            .map_err(ApiError::from)
-    })
-    .await
-    .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
+async fn blocking_read<T: Send + 'static>(
+    db: &Db,
+    f: impl FnOnce(&rusqlite::Connection) -> jkb_core::Result<T> + Send + 'static,
+) -> Result<T, ApiError> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || db.read(f).map_err(ApiError::from))
+        .await
+        .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
 }
 
-/// Refuse a database a newer jkb has migrated. Asked before every operation — and before every
-/// re-poll of a long-poll, which can outlive the migration that makes it stale.
+/// Refuse a database a newer jkb has migrated. Every write already refuses it inside its own
+/// transaction (`jkb_core::Db::write_txn`); this answers reads the same way, and is asked before
+/// every re-poll of a long-poll too, which can outlive the migration that makes it stale.
 async fn current_schema(db: &Db) -> Result<(), ApiError> {
-    let schema = user_version(db.clone()).await?;
-    let supported = jkb_core::supported_schema_version();
-    if schema > supported {
-        return Err(ApiError::with_code(
-            ErrorCode::SchemaNewer,
-            format!(
-                "the database is at schema {schema} and this jkb serve knows {supported}; restart it \
-                 from the newer jkb (setup.sh does)"
-            ),
-        ));
-    }
-    Ok(())
+    blocking_read(db, jkb_core::refuse_newer_schema).await
 }
 
 /// Holds a group's one long-poll slot; released on drop, including when the client goes away.
@@ -339,8 +430,65 @@ fn busy(why: &str) -> hyper::Response<Full<Bytes>> {
     refuse(&ApiError::with_code(ErrorCode::Busy, why))
 }
 
+/// The database to serve with, re-opening it if the last open failed long enough ago.
+async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
+    let current = |state: &State| -> Result<(LocalBackend, Db), (ApiError, bool)> {
+        let serving = state.serving.lock().map_err(|_| {
+            (
+                ApiError::with_code(ErrorCode::Internal, "state lock poisoned"),
+                false,
+            )
+        })?;
+        match &*serving {
+            Serving::Ready(backend, db) => Ok((backend.clone(), db.clone())),
+            Serving::Failed { why, at } => Err((
+                why.clone(),
+                state.opener.is_some() && at.elapsed() >= state.reopen_every,
+            )),
+        }
+    };
+    match current(state) {
+        Ok(ready) => return Ok(ready),
+        Err((why, false)) => return Err(why),
+        Err((_, true)) => {}
+    }
+    let _one_at_a_time = state.opening.lock().await;
+    // Another request may have re-opened, or failed again, while this one waited.
+    match current(state) {
+        Ok(ready) => return Ok(ready),
+        Err((why, false)) => return Err(why),
+        Err((_, true)) => {}
+    }
+    let opener_state = Arc::clone(state);
+    let opened = tokio::task::spawn_blocking(move || match &opener_state.opener {
+        Some(open) => open(),
+        None => Err(ApiError::with_code(ErrorCode::Internal, "no opener")),
+    })
+    .await
+    .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?;
+    let mut serving = state
+        .serving
+        .lock()
+        .map_err(|_| ApiError::with_code(ErrorCode::Internal, "state lock poisoned"))?;
+    match opened {
+        Ok(db) => {
+            eprintln!("jkb serve: the database opened; serving");
+            *serving = Serving::Ready(LocalBackend::new(db.clone()), db.clone());
+            Ok((LocalBackend::new(db.clone()), db))
+        }
+        Err(why) => {
+            *serving = Serving::Failed {
+                why: why.clone(),
+                at: std::time::Instant::now(),
+            };
+            Err(why)
+        }
+    }
+}
+
 async fn handle(
     state: Arc<State>,
+    authed: Arc<AtomicBool>,
     req: hyper::Request<Incoming>,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
     let route = (req.method().clone(), req.uri().path().to_owned());
@@ -348,21 +496,23 @@ async fn handle(
         (&route.0, route.1.as_str()),
         (&Method::GET, "/v1/hello") | (&Method::POST, "/v1/op")
     ) {
-        return Ok(refuse(&ApiError::bad_request(format!(
+        return Ok(refuse_and_close(&ApiError::bad_request(format!(
             "no such endpoint: {} {}",
             route.0, route.1
         ))));
     }
     if !authorized(&state, &req) {
-        return Ok(refuse(&ApiError::with_code(
+        return Ok(refuse_and_close(&ApiError::with_code(
             ErrorCode::Unauthorized,
             "missing or wrong bearer token (it is rotated each time jkb serve starts)",
         )));
     }
-    let (backend, db) = match &state.serving {
+    authed.store(true, Ordering::SeqCst);
+    let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
-        Err(refusal) => return Ok(refuse(refusal)),
+        Err(refusal) => return Ok(refuse(&refusal)),
     };
+    let (backend, db) = (&backend, &db);
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
     // is asked. A long-poll trades it for a poll permit once it is known to be one.
@@ -370,18 +520,20 @@ async fn handle(
         return Ok(busy("the daemon is at its concurrency limit; retry"));
     };
     if route.0 == Method::GET {
-        return Ok(match user_version(db.clone()).await {
-            Ok(schema) => reply(
-                StatusCode::OK,
-                &json!({
-                    "protocol": crate::PROTOCOL_VERSION,
-                    "schema_version": schema,
-                    "supported_schema": jkb_core::supported_schema_version(),
-                    "ops": Request::OPS,
-                }),
-            ),
-            Err(e) => refuse(&e),
-        });
+        return Ok(
+            match blocking_read(db, jkb_core::applied_schema_version).await {
+                Ok(schema) => reply(
+                    StatusCode::OK,
+                    &json!({
+                        "protocol": crate::PROTOCOL_VERSION,
+                        "schema_version": schema,
+                        "supported_schema": jkb_core::supported_schema_version(),
+                        "ops": Request::OPS,
+                    }),
+                ),
+                Err(e) => refuse(&e),
+            },
+        );
     }
     let asked_wait = Duration::from_millis(wait_ms(&req)).min(state.max_wait);
     let body = match tokio::time::timeout(
@@ -474,5 +626,42 @@ async fn serve_op(
             () = tokio::time::sleep(state.poll_floor) => {}
             () = tokio::time::sleep_until(deadline) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustix::io::Errno;
+
+    use super::{connection_budget, out_of_resources};
+
+    #[test]
+    fn only_running_out_of_something_slows_the_accept_loop() {
+        let err = |e: Errno| std::io::Error::from_raw_os_error(e.raw_os_error());
+        for e in [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM] {
+            assert!(out_of_resources(&err(e)), "{e:?}");
+        }
+        for e in [Errno::CONNABORTED, Errno::CONNRESET, Errno::INTR] {
+            assert!(
+                !out_of_resources(&err(e)),
+                "{e:?}: one connection's failure"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connection_cap_leaves_room_for_the_database_under_the_descriptor_limit() {
+        use rustix::process::{getrlimit, Resource};
+        let budget = connection_budget(usize::MAX);
+        let limit = getrlimit(Resource::Nofile);
+        if let Some(soft) = limit.current {
+            let target = limit.maximum.map_or(4096, |hard| hard.min(4096));
+            assert!(
+                soft >= target,
+                "the soft limit was raised: {soft} < {target}"
+            );
+            assert!(u64::try_from(budget).unwrap() <= soft.saturating_sub(64).max(8));
+        }
+        assert_eq!(connection_budget(3), 3, "a smaller cap is kept");
     }
 }

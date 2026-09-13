@@ -120,20 +120,26 @@ never apply.
 - **EOF on stdin ends the subscription**, after processing the acks that preceded it. Keep stdin open
   for as long as you want messages.
 - A closed stdout ends it with status 0.
-- A locked database or a busy daemon (`busy`) is retried on the next poll, silently.
-- An unreachable daemon (`unavailable` — restarting, say) is retried too, with one non-fatal error
-  event per outage. The position is in the database, so the stream resumes where it stopped.
-- **Startup failures have no events:** a non-zero exit with nothing on stdout means the subscription
-  never started — bad arguments (clap, exit 2), a database that could not be opened, or in remote
-  mode a daemon that could not be reached (exit 1) — and stderr says which.
+- **Transient refusals are waited out, never fatal** — at startup, and for every poll, ack and group
+  recreation alike: `busy` (a locked database, a busy daemon) silently; `unavailable` (the daemon is
+  down or restarting) and `schema_newer` (a newer jkb migrated the database and `setup.sh` has not yet
+  restarted the daemon — tens of seconds on every upgrade) with **one non-fatal error event per
+  outage**. The position is in the database, so the stream resumes where it stopped. An ack sent
+  during an outage is held and applied when the backend answers; under `--at-most-once` a message
+  whose ack could not be applied yet is not emitted, and comes back on the next poll.
+- **Startup failures with no events:** a non-zero exit with nothing on stdout means the subscription
+  never started — bad arguments (clap, exit 2), or in local mode a database that could not be opened
+  (exit 1) — and stderr says which. A refusal of the subscription itself (`no_such_topic`, say) is a
+  fatal error event.
 - A group removed while subscribed (it idled out) is recreated from now, with a non-fatal
   `no_such_group` error event that says messages in between were not delivered.
 
 Pinned end to end through a real binary by `tests/cli.rs`
 `mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack` (delivery, ack, EOF, resume), and in
 `crates/jkb-cli/src/mq_cli.rs`'s tests for `caught_up`, `unreadable` (once, with its seq, moving on
-after an ack), a group recreated mid-stream, a closed stdout, a stdin read failure, bad commands and
-`--at-most-once`.
+after an ack), a group recreated mid-stream, a closed stdout, a stdin read failure, bad commands,
+`--at-most-once`, and each transient path (two outages, startup, a held ack, `--at-most-once` during
+an outage, a regroup during one) against a scripted backend.
 
 ## Over HTTP: `jkb serve` and remote mode
 
@@ -152,16 +158,26 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
   through an `O_EXCL` temp file with a random name, renamed into place: a link planted there cannot
   redirect it, and a symlinked `daemon/` is refused;
 - refuses every operation, with `schema_newer`, while the database is at a schema this build does not
-  know — a newer `jkb` migrated it; restart the daemon from that build. Checked before each operation
-  and on each re-poll of a long-poll. A daemon **started** on such a database, or on one it cannot open
-  at all, does not exit (a supervisor would restart-loop it): it binds, writes its token and answers
-  every request with the reason — `schema_newer`, or `unavailable` for any other open failure;
+  know — a newer `jkb` migrated it; restart the daemon from that build. "Newer" is read from
+  refinery's history table, which each migration writes in its own transaction (`PRAGMA user_version`
+  is stamped only after all of them). Every write refuses it **inside its own IMMEDIATE transaction**
+  (`jkb_core::Db::write_txn`, for every long-lived writer, not only the daemon), so no migration can
+  commit between the check and the write; the daemon also asks before each read and each re-poll of a
+  long-poll;
+- does not exit when it cannot open the database at start (a supervisor would restart-loop it): it
+  binds, writes its token, answers every request with the reason — `schema_newer`, or `unavailable`
+  for any other open failure — and tries the open again on a request at most every 5 s, so a failure
+  that passes (a lock held past the busy timeout, a volume mounted late) needs no restart;
 - holds a 1 MiB body limit, and separate concurrency budgets for operations and long-polls, answering
   `busy` when one is exhausted. A request past authentication holds its permit from before its body is
   read;
-- bounds the unauthenticated side too: at most 256 connections (one more is closed on accept), request
-  headers — and idle keep-alive — within 10 s, a body within 10 s, and a pause after a failed accept so
-  running out of descriptors does not spin a core.
+- bounds the unauthenticated side too: at most 256 connections (one more is closed on accept — and
+  fewer if the descriptor limit, raised toward 4096 at start, leaves less room beside the database's
+  own files; launchd's default soft limit is 256), request headers — and idle keep-alive — within
+  10 s, a body within 10 s, a connection that has not presented the token within 10 s closed whatever
+  it is doing (a client that pipelines and never reads stops hyper's header timer), `Connection:
+  close` on every refusal before authentication, and a pause after an accept that failed for want of
+  descriptors or memory — only then, so a peer resetting its connection does not slow anyone else.
 
 **The wire.** Both endpoints need `Authorization: Bearer <token>`. The body is always JSON; clients
 branch on its `code`, the HTTP status is for people and proxies.
@@ -198,14 +214,20 @@ compile until it says which it is. A daemon that cannot be reached is remembered
 (`~/.cache/jkb/remote-unreachable`), so a burst of short-lived `jkb` processes pays one connect
 timeout, not one each.
 
-`setup.sh` activates every unit `jkb service labels` lists — restarting each, so none keeps running
-an old binary — and then waits up to 10 s for a fresh token as proof the daemon came up
-(`scripts/lib.sh` `activate_services`, pinned by `scripts/tests/services.test.sh`).
+`setup.sh` activates every unit `jkb service units` lists (label and installed path) — restarting
+each, so none keeps running an old binary — and then waits up to 10 s for a fresh token at `jkb
+service token-path` as proof the daemon came up, reported as its own `jkb serve` summary line
+(`scripts/lib.sh` `activate_services`, pinned by `scripts/tests/services.test.sh` against stub
+service managers and by `tests/cli.rs`
+`service_units_and_token_path_name_what_install_and_serve_actually_write` against the real binary).
+`jkb service install` prints the same restart form as its activation advice.
 
 Pinned by `crates/jkb-daemon/tests/loopback.rs` (the server and client over real TCP: round trip,
 long-poll wake-ups, token rotation, unspecified-address refusal, body limit, unknown fields, schema
-refusal before and during a long-poll, the refusing daemon, one long-poll per group, `wait_ms` on a
-non-poll, the connection cap and read timeouts, a proxy's error, the unreachable cache),
+refusal before and during a long-poll, a database that will not open and then does, one long-poll per
+group and its release when the client goes away, `wait_ms` on a non-poll, the connection cap, read
+timeouts and a pipelining client that never authenticates, a proxy's error, the unreachable cache),
+`crates/jkb-core/src/store.rs` (a write after a newer migration),
 `crates/jkb-daemon/src/token.rs` (planted links), and `tests/cli.rs`
 `remote_mode_reaches_the_daemon_and_refuses_everything_else` and
 `serve_answers_schema_newer_rather_than_exiting_on_a_newer_database` (real binaries on both sides).

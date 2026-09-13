@@ -37,5 +37,8 @@ pub mod undo;
 pub mod view;
 
 pub use error::{Error, Result};
-pub use migrate::supported_version as supported_schema_version;
+pub use migrate::{
+    applied_version as applied_schema_version, refuse_newer as refuse_newer_schema,
+    supported_version as supported_schema_version,
+};
 pub use store::{cloud_sync_warning, Db, ExtensionRegistrar, WriteMeta};

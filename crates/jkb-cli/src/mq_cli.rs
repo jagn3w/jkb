@@ -254,10 +254,19 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
         MqCmd::Group {
             cmd: GroupCmd::Ls { topic },
         } => {
-            let t = topics(backend, json_out)?
+            let Some(t) = topics(backend, json_out)?
                 .into_iter()
                 .find(|t| t.name == topic)
-                .with_context(|| format!("no such topic: {topic}"))?;
+            else {
+                // Found missing here rather than refused by an op, and held to the same rule: under
+                // `--json` a refusal is on stdout too.
+                let e =
+                    ApiError::with_code(ErrorCode::NoSuchTopic, format!("no such topic: {topic}"));
+                if json_out {
+                    println!("{}", json!({ "error": e }));
+                }
+                bail!("{}", e.message);
+            };
             if json_out {
                 return print_json(&t.groups);
             }
@@ -468,6 +477,172 @@ fn error_event(code: ErrorCode, reason: &str, fatal: bool) -> Value {
     json!({ "event": "error", "code": code, "reason": reason, "fatal": fatal })
 }
 
+/// Refusals that end by themselves — a lock held past the busy timeout, a daemon restarting, a
+/// daemon older than the database waiting for `setup.sh` to restart it — and so are waited out rather
+/// than ending the stream.
+const fn transient(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::Busy | ErrorCode::Unavailable | ErrorCode::SchemaNewer
+    )
+}
+
+/// What one call came to, with transient refusals already reported.
+enum Called {
+    Done(Response),
+    /// A transient refusal: try again later.
+    Waiting,
+    Refused(ApiError),
+    /// stdout is gone, which ends the stream.
+    StdoutGone,
+}
+
+/// One subscription's connection to its backend and its stdout. Every call goes through
+/// [`Stream::call`], so the transient rule is applied in one place — to the startup `group_create`, a
+/// poll, an ack and a regroup alike.
+struct Stream<'a> {
+    backend: &'a dyn Backend,
+    o: &'a SubscribeOpts,
+    out: &'a mut dyn Write,
+    /// An outage has been reported and has not ended yet.
+    outage: bool,
+    /// An ack not applied yet because the backend was waiting. Acks commit *through* a seq, so one
+    /// pending seq stands for every ack before it.
+    pending_ack: Option<i64>,
+}
+
+impl Stream<'_> {
+    fn emit(&mut self, event: &Value) -> bool {
+        emit(self.out, event)
+    }
+
+    /// Call the backend. A transient refusal is reported once per outage — except `busy`, which is
+    /// ordinary contention and never reported — and an outage ends at the next success.
+    fn call(&mut self, request: Request) -> Called {
+        match self.backend.call(request) {
+            Ok(response) => {
+                self.outage = false;
+                Called::Done(response)
+            }
+            Err(e) if transient(e.code) => {
+                if e.code != ErrorCode::Busy && !self.outage {
+                    self.outage = true;
+                    if !self.emit(&error_event(e.code, &e.message, false)) {
+                        return Called::StdoutGone;
+                    }
+                }
+                Called::Waiting
+            }
+            Err(e) => Called::Refused(e),
+        }
+    }
+
+    /// Apply a held ack, if there is one. `Some(exit code)` when the stream ends.
+    fn flush_ack(&mut self) -> Option<i32> {
+        let seq = self.pending_ack.take()?;
+        self.ack(seq)
+    }
+
+    /// Commit through `seq`, holding it when the backend is waiting. `Some(exit code)` when the
+    /// stream ends.
+    fn ack(&mut self, seq: i64) -> Option<i32> {
+        if let Some(code) = self.flush_ack() {
+            return Some(code);
+        }
+        if let Some(held) = self.pending_ack {
+            // Still waiting: this ack joins the held one.
+            self.pending_ack = Some(held.max(seq));
+            return None;
+        }
+        match self.call(ack(self.o, seq)) {
+            Called::Done(_) => None,
+            Called::Waiting => {
+                self.pending_ack = Some(seq);
+                None
+            }
+            Called::StdoutGone => Some(0),
+            Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => self.regroup(&e),
+            Called::Refused(e) => {
+                (!self.emit(&error_event(e.code, &e.message, false))).then_some(0)
+            }
+        }
+    }
+
+    /// The group was removed after idling. Recreate it from now and say so — one rule, for a poll
+    /// and an ack alike; a backend that is waiting is asked again by the next poll. `Some(exit code)`
+    /// when the subscription cannot go on.
+    fn regroup(&mut self, e: &ApiError) -> Option<i32> {
+        let reason = format!(
+            "{} — the group was removed after idling; recreated from now, and messages sent in \
+             between are not delivered",
+            e.message
+        );
+        match self.call(group_create(self.o, false)) {
+            Called::Done(_) => (!self.emit(&error_event(e.code, &reason, false))).then_some(0),
+            Called::Waiting => None,
+            Called::StdoutGone => Some(0),
+            Called::Refused(again) => {
+                let reason = format!("{reason}; recreating it failed: {}", again.message);
+                self.emit(&error_event(again.code, &reason, true));
+                Some(1)
+            }
+        }
+    }
+
+    /// One stdin command. `Some(exit code)` when the subscription is over.
+    fn input(&mut self, input: Input) -> Option<i32> {
+        match input {
+            Input::Eof => self.flush_ack().or(Some(0)),
+            Input::ReadFailed(why) => {
+                self.emit(&error_event(
+                    ErrorCode::Internal,
+                    &format!("reading stdin: {why}"),
+                    true,
+                ));
+                Some(1)
+            }
+            Input::Bad(line) => {
+                let event = error_event(
+                    ErrorCode::BadRequest,
+                    &format!("not a command: {line}"),
+                    false,
+                );
+                (!self.emit(&event)).then_some(0)
+            }
+            Input::Ack(seq) => self.ack(seq),
+        }
+    }
+
+    /// Create the group if missing, waiting out a transient refusal. `Some(exit code)` when the
+    /// subscription ends before it starts.
+    fn join(&mut self, inputs: &Receiver<Input>) -> Option<i32> {
+        loop {
+            match self.call(group_create(self.o, self.o.from_start)) {
+                Called::Done(_) => return None,
+                Called::Waiting => {
+                    if let Some(code) = self.wait(inputs) {
+                        return Some(code);
+                    }
+                }
+                Called::StdoutGone => return Some(0),
+                Called::Refused(e) => {
+                    self.emit(&error_event(e.code, &e.message, true));
+                    return Some(1);
+                }
+            }
+        }
+    }
+
+    /// Wait up to the poll interval for a command. `Some(exit code)` when the subscription is over.
+    fn wait(&mut self, inputs: &Receiver<Input>) -> Option<i32> {
+        match inputs.recv_timeout(self.o.interval) {
+            Ok(input) => self.input(input),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(0),
+        }
+    }
+}
+
 /// The subscription loop, over any backend, input channel and output — the CLI passes stdin and
 /// stdout. Returns the process exit code: 0 for a clean end (stdin closed, or stdout gone), 1 after
 /// a fatal error event.
@@ -478,9 +653,9 @@ fn error_event(code: ErrorCode, reason: &str, fatal: bool) -> Value {
 ///
 /// Emits `caught_up` when a poll returns fewer messages than a batch holds — once when the stream
 /// first has nothing more to hand over, and again after each burst — so a consumer can fold a
-/// backlog to its net effect before acting. A locked database (`busy`) is retried silently, not fatal;
-/// an unreachable daemon (`unavailable` — restarting, say) is retried too, with one non-fatal error
-/// event per outage so a consumer can show it.
+/// backlog to its net effect before acting. Transient refusals ([`transient`]) are waited out, at
+/// startup too: `busy` silently, `unavailable` and `schema_newer` with one non-fatal error event per
+/// outage. An ack made meanwhile is held and applied once the backend answers.
 ///
 /// # Errors
 /// Only for failures outside the protocol; a refused operation is reported as an error event.
@@ -490,19 +665,24 @@ pub fn subscribe(
     inputs: &Receiver<Input>,
     out: &mut dyn Write,
 ) -> Result<i32> {
-    if let Err(e) = backend.call(group_create(o, o.from_start)) {
-        emit(out, &error_event(e.code, &e.message, true));
-        return Ok(1);
+    let mut s = Stream {
+        backend,
+        o,
+        out,
+        outage: false,
+        pending_ack: None,
+    };
+    if let Some(code) = s.join(inputs) {
+        return Ok(code);
     }
     let mut emitted: i64 = 0;
     let mut reported_corrupt: Option<i64> = None;
     let mut caught_up_announced = false;
-    let mut outage_reported = false;
     loop {
         loop {
             match inputs.try_recv() {
                 Ok(input) => {
-                    if let Some(code) = handle_input(backend, o, input, out) {
+                    if let Some(code) = s.input(input) {
                         return Ok(code);
                     }
                 }
@@ -510,31 +690,40 @@ pub fn subscribe(
                 Err(TryRecvError::Disconnected) => return Ok(0),
             }
         }
+        if let Some(code) = s.flush_ack() {
+            return Ok(code);
+        }
 
         // Fetch after what this run has already handed over, not after the committed position:
         // otherwise a batch of unacked messages comes back on every poll and nothing past it is
         // ever read until the consumer acks.
-        let polled = backend.call(Request::MqPoll {
+        let polled = s.call(Request::MqPoll {
             topic: o.topic.clone(),
             group: o.group.clone(),
             max: o.batch,
             after: (emitted > 0).then_some(emitted),
         });
         let mut handed_over = false;
-        if polled.is_ok() {
-            outage_reported = false;
-        }
         match polled {
-            Ok(Response::Messages { messages }) => {
-                let drained = messages.len() < o.batch;
+            Called::Done(Response::Messages { messages }) => {
+                let mut drained = messages.len() < o.batch;
                 for m in messages {
                     if o.at_most_once {
-                        if let Err(e) = backend.call(ack(o, m.seq)) {
-                            emit(out, &error_event(e.code, &e.message, true));
-                            return Ok(1);
+                        match s.call(ack(o, m.seq)) {
+                            Called::Done(_) => {}
+                            // Not acked, so not emitted: the next poll fetches it again.
+                            Called::Waiting => {
+                                drained = false;
+                                break;
+                            }
+                            Called::StdoutGone => return Ok(0),
+                            Called::Refused(e) => {
+                                s.emit(&error_event(e.code, &e.message, true));
+                                return Ok(1);
+                            }
                         }
                     }
-                    if !emit(out, &message_event(&m)) {
+                    if !s.emit(&message_event(&m)) {
                         return Ok(0);
                     }
                     emitted = m.seq;
@@ -542,55 +731,39 @@ pub fn subscribe(
                 }
                 if drained && (handed_over || !caught_up_announced) {
                     caught_up_announced = true;
-                    if !emit(out, &json!({ "event": "caught_up", "seq": emitted })) {
+                    if !s.emit(&json!({ "event": "caught_up", "seq": emitted })) {
                         return Ok(0);
                     }
                 }
             }
-            Ok(other) => bail!("unexpected response to mq.poll: {other:?}"),
-            Err(e) if e.code == ErrorCode::NoSuchGroup => {
-                if let Some(code) = regroup(backend, o, &e, out) {
+            Called::Done(other) => bail!("unexpected response to mq.poll: {other:?}"),
+            Called::Waiting => {}
+            Called::StdoutGone => return Ok(0),
+            Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => {
+                if let Some(code) = s.regroup(&e) {
                     return Ok(code);
                 }
                 continue;
             }
-            // Another writer held the lock past the busy timeout. Transient: wait and poll again.
-            Err(e) if e.code == ErrorCode::Busy => {}
-            // The daemon is down or restarting. Its position is in the database, so polling again
-            // once it is back resumes exactly where this left off.
-            Err(e) if e.code == ErrorCode::Unavailable => {
-                if !outage_reported {
-                    outage_reported = true;
-                    if !emit(out, &error_event(e.code, &e.message, false)) {
-                        return Ok(0);
-                    }
-                }
-            }
-            Err(e) if e.code == ErrorCode::CorruptPayload => {
+            Called::Refused(e) if e.code == ErrorCode::CorruptPayload => {
                 // Reported once; the consumer decides whether to ack past it.
                 if reported_corrupt != e.seq {
                     reported_corrupt = e.seq;
                     let event = json!({ "event": "unreadable", "seq": e.seq, "reason": e.message });
-                    if !emit(out, &event) {
+                    if !s.emit(&event) {
                         return Ok(0);
                     }
                 }
             }
-            Err(e) => {
-                emit(out, &error_event(e.code, &e.message, true));
+            Called::Refused(e) => {
+                s.emit(&error_event(e.code, &e.message, true));
                 return Ok(1);
             }
         }
 
         if !handed_over {
-            match inputs.recv_timeout(o.interval) {
-                Ok(input) => {
-                    if let Some(code) = handle_input(backend, o, input, out) {
-                        return Ok(code);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+            if let Some(code) = s.wait(inputs) {
+                return Ok(code);
             }
         }
     }
@@ -610,58 +783,6 @@ fn ack(o: &SubscribeOpts, seq: i64) -> Request {
         group: o.group.clone(),
         seq,
     }
-}
-
-/// One stdin command. `Some(exit code)` when the subscription is over.
-fn handle_input(
-    backend: &dyn Backend,
-    o: &SubscribeOpts,
-    input: Input,
-    out: &mut dyn Write,
-) -> Option<i32> {
-    match input {
-        Input::Eof => Some(0),
-        Input::ReadFailed(why) => {
-            emit(
-                out,
-                &error_event(ErrorCode::Internal, &format!("reading stdin: {why}"), true),
-            );
-            Some(1)
-        }
-        Input::Bad(line) => {
-            let event = error_event(
-                ErrorCode::BadRequest,
-                &format!("not a command: {line}"),
-                false,
-            );
-            (!emit(out, &event)).then_some(0)
-        }
-        Input::Ack(seq) => match backend.call(ack(o, seq)) {
-            Ok(_) => None,
-            Err(e) if e.code == ErrorCode::NoSuchGroup => regroup(backend, o, &e, out),
-            Err(e) => (!emit(out, &error_event(e.code, &e.message, false))).then_some(0),
-        },
-    }
-}
-
-/// The group was removed after idling. Recreate it from now and say so — one rule, for a poll and
-/// an ack alike. `Some(exit code)` when the subscription cannot go on.
-fn regroup(
-    backend: &dyn Backend,
-    o: &SubscribeOpts,
-    e: &ApiError,
-    out: &mut dyn Write,
-) -> Option<i32> {
-    let recreated = backend.call(group_create(o, false)).is_ok();
-    let reason = format!(
-        "{} — the group was removed after idling; recreated from now, and messages sent in \
-         between are not delivered",
-        e.message
-    );
-    if !emit(out, &error_event(e.code, &reason, !recreated)) {
-        return Some(0);
-    }
-    (!recreated).then_some(1)
 }
 
 fn message_event(m: &Message) -> Value {
@@ -806,58 +927,155 @@ mod tests {
         assert!(seqs(&events(&out)).is_empty(), "nothing is redelivered");
     }
 
-    /// Fails the first `polls` polls with `code`, then serves normally.
-    struct Flaky {
+    use jkb_api::ErrorCode::{self, Busy, NoSuchGroup, SchemaNewer, Unavailable};
+
+    /// Serves through `inner`, except that the Nth call of an op answers the Nth entry of its script:
+    /// `Some(code)` refuses with it, `None` serves. Past the script, every call serves.
+    struct Scripted {
         inner: LocalBackend,
-        code: jkb_api::ErrorCode,
-        polls: std::sync::atomic::AtomicUsize,
+        script: std::sync::Mutex<
+            std::collections::HashMap<&'static str, std::collections::VecDeque<Option<ErrorCode>>>,
+        >,
     }
 
-    impl Backend for Flaky {
-        fn call(&self, request: Request) -> Result<jkb_api::Response, jkb_api::ApiError> {
-            use std::sync::atomic::Ordering;
-            if matches!(request, Request::MqPoll { .. })
-                && self
-                    .polls
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-            {
-                return Err(jkb_api::ApiError::with_code(self.code, "transient"));
+    impl Scripted {
+        fn new(inner: LocalBackend, script: &[(&'static str, &[Option<ErrorCode>])]) -> Self {
+            Self {
+                inner,
+                script: std::sync::Mutex::new(
+                    script
+                        .iter()
+                        .map(|(op, s)| (*op, s.iter().copied().collect()))
+                        .collect(),
+                ),
             }
-            self.inner.call(request)
+        }
+    }
+
+    impl Backend for Scripted {
+        fn call(&self, request: Request) -> Result<jkb_api::Response, jkb_api::ApiError> {
+            let next = self
+                .script
+                .lock()
+                .unwrap()
+                .get_mut(request.op())
+                .and_then(std::collections::VecDeque::pop_front)
+                .flatten();
+            match next {
+                Some(code) => Err(jkb_api::ApiError::with_code(code, "scripted")),
+                None => self.inner.call(request),
+            }
+        }
+    }
+
+    /// Run a subscription over `b` until stdin closes after `ms`, sending `acks` first; its events.
+    fn run_scripted(
+        b: &dyn Backend,
+        o: &SubscribeOpts,
+        acks: &[(u64, i64)],
+        ms: u64,
+    ) -> (i32, Vec<Value>) {
+        let (tx, rx) = channel();
+        let acks = acks.to_vec();
+        let h = std::thread::spawn(move || {
+            for (at, seq) in acks {
+                std::thread::sleep(Duration::from_millis(at));
+                tx.send(Input::Ack(seq)).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(ms));
+            tx.send(Input::Eof).unwrap();
+        });
+        let mut out = Vec::new();
+        let code = subscribe(b, o, &rx, &mut out).unwrap();
+        h.join().unwrap();
+        (code, events(&out))
+    }
+
+    fn errors(ev: &[Value]) -> Vec<&Value> {
+        ev.iter().filter(|e| e["event"] == "error").collect()
+    }
+
+    fn position(b: &LocalBackend) -> i64 {
+        match b.call(Request::MqInspect {}).unwrap() {
+            jkb_api::Response::Topics { topics } => topics[0].groups[0].position,
+            other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn a_locked_database_or_an_unreachable_daemon_is_waited_out_not_fatal() {
+    fn a_transient_refusal_is_waited_out_and_reported_once_per_outage() {
         for (code, reported) in [
-            (jkb_api::ErrorCode::Busy, 0),
-            // A daemon restart: said once per outage, not once per failed poll.
-            (jkb_api::ErrorCode::Unavailable, 1),
+            // Ordinary contention: never reported.
+            (Busy, 0),
+            // A daemon restart, and a daemon older than the database waiting for its restart: said
+            // once per outage — two outages here, split by a poll that succeeds — never per failure.
+            (Unavailable, 2),
+            (SchemaNewer, 2),
         ] {
-            let b = Flaky {
-                inner: backend_with(1),
-                code,
-                polls: 3.into(),
-            };
-            let (tx, rx) = channel();
-            let mut out = Vec::new();
-            let h = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                tx.send(Input::Eof).unwrap();
-            });
+            let script = [Some(code), Some(code), None, Some(code), Some(code)];
+            let b = Scripted::new(backend_with(1), &[("mq.poll", &script)]);
+            let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+            assert_eq!(exit, 0, "{code:?}: {ev:?}");
+            let errs = errors(&ev);
+            assert_eq!(errs.len(), reported, "{code:?}: {ev:?}");
+            assert!(errs.iter().all(|e| e["fatal"] == false), "{code:?}");
             assert_eq!(
-                subscribe(&b, &opts(false), &rx, &mut out).unwrap(),
-                0,
-                "{code:?}"
+                seqs(&ev),
+                vec![1],
+                "{code:?}: delivered once, after recovering"
             );
-            h.join().unwrap();
-            let ev = events(&out);
-            let errors: Vec<&Value> = ev.iter().filter(|e| e["event"] == "error").collect();
-            assert_eq!(errors.len(), reported, "{code:?}: {ev:?}");
-            assert!(errors.iter().all(|e| e["fatal"] == false), "{code:?}");
-            assert_eq!(seqs(&ev), vec![1], "{code:?}: delivered once it recovered");
         }
+    }
+
+    #[test]
+    fn a_daemon_that_is_down_at_startup_is_waited_for() {
+        let b = Scripted::new(
+            backend_with(1),
+            &[("mq.group_create", &[Some(Unavailable), Some(Unavailable)])],
+        );
+        let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+        assert_eq!(exit, 0, "{ev:?}");
+        assert_eq!(errors(&ev).len(), 1, "{ev:?}");
+        assert_eq!(seqs(&ev), vec![1]);
+    }
+
+    #[test]
+    fn an_ack_made_during_an_outage_is_held_and_applied_after_it() {
+        let inner = backend_with(1);
+        let b = Scripted::new(inner.clone(), &[("mq.ack", &[Some(Unavailable)])]);
+        let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 120);
+        assert_eq!(exit, 0, "{ev:?}");
+        assert!(errors(&ev).iter().all(|e| e["fatal"] == false), "{ev:?}");
+        assert_eq!(position(&inner), 1, "the held ack was applied: {ev:?}");
+    }
+
+    #[test]
+    fn at_most_once_does_not_emit_a_message_it_could_not_ack_yet() {
+        let inner = backend_with(1);
+        let b = Scripted::new(inner.clone(), &[("mq.ack", &[Some(Unavailable)])]);
+        let (exit, ev) = run_scripted(&b, &opts(true), &[], 120);
+        assert_eq!(exit, 0, "{ev:?}");
+        assert_eq!(
+            seqs(&ev),
+            vec![1],
+            "emitted once, after its ack went through"
+        );
+        assert_eq!(position(&inner), 1);
+    }
+
+    #[test]
+    fn a_regroup_that_meets_an_outage_is_tried_again_not_fatal() {
+        let b = Scripted::new(
+            backend_with(1),
+            &[
+                ("mq.poll", &[Some(NoSuchGroup)]),
+                ("mq.group_create", &[None, Some(Unavailable)]),
+            ],
+        );
+        let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+        assert_eq!(exit, 0, "{ev:?}");
+        assert!(errors(&ev).iter().all(|e| e["fatal"] == false), "{ev:?}");
+        assert_eq!(seqs(&ev), vec![1]);
     }
 
     #[test]

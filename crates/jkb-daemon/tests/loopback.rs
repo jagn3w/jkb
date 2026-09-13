@@ -293,13 +293,18 @@ fn raw_http_is_held_to_the_same_rules() {
     // An oversized body is refused before it is parsed.
     let r = post("x".repeat(2 * 1024 * 1024));
     assert_eq!(r.status(), 413);
-    // No token at all.
+    // No token at all — and the connection is closed after the refusal, so an unauthenticated client
+    // cannot keep a slot by sending refused requests down one kept-alive connection.
     let r = http
         .post(format!("{}/v1/op", f.base))
         .body("{}")
         .send()
         .unwrap();
     assert_eq!(r.status(), 401);
+    assert_eq!(
+        r.headers().get("connection").map(|v| v.to_str().unwrap()),
+        Some("close")
+    );
     // No such endpoint.
     let r = http
         .get(format!("{}/etc/passwd", f.base))
@@ -315,7 +320,11 @@ fn a_database_migrated_past_this_build_is_refused() {
     let c = f.client();
     let future = jkb_core::supported_schema_version() + 1;
     f.db.write_txn("test", move |conn, _| {
-        conn.pragma_update(None, "user_version", future)?;
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+            [future],
+        )?;
         Ok(())
     })
     .unwrap();
@@ -323,6 +332,15 @@ fn a_database_migrated_past_this_build_is_refused() {
         c.call(Request::MqInspect {}).unwrap_err().code,
         ErrorCode::SchemaNewer
     );
+    let sent = c.call(Request::MqSend {
+        topic: "t".into(),
+        key: "k".into(),
+        kind: "k.m".into(),
+        payload: json!(1),
+        ttl_ms: None,
+        producer: "test".into(),
+    });
+    assert_eq!(sent.unwrap_err().code, ErrorCode::SchemaNewer);
 }
 
 #[test]
@@ -413,22 +431,110 @@ fn an_answer_from_something_other_than_jkb_serve_means_unavailable_not_internal(
 }
 
 #[test]
-fn a_daemon_that_cannot_serve_its_database_still_answers_with_why() {
+fn a_daemon_whose_database_will_not_open_answers_why_and_recovers_when_it_does() {
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("daemon/token");
-    let refusal = jkb_api::ApiError::with_code(ErrorCode::SchemaNewer, "migrated by a newer jkb");
-    let h = jkb_daemon::server::spawn_refusing(
-        refusal,
-        &ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone()),
-    )
-    .unwrap();
+    let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    let fixed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opener: jkb_daemon::server::Opener = {
+        let (fixed, attempts) = (fixed.clone(), attempts.clone());
+        Box::new(move || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if fixed.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(db.clone())
+            } else {
+                Err(jkb_api::ApiError::with_code(
+                    ErrorCode::SchemaNewer,
+                    "migrated by a newer jkb",
+                ))
+            }
+        })
+    };
+    let mut cfg = ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone());
+    cfg.reopen_every = Duration::from_millis(300);
+    let h = jkb_daemon::server::spawn_opening(opener, &cfg).unwrap();
     let c = RemoteBackend::new(&format!("http://{}", h.addr), token).unwrap();
     assert_eq!(
         c.call(Request::MqInspect {}).unwrap_err().code,
         ErrorCode::SchemaNewer
     );
     assert_eq!(c.hello().unwrap_err().code, ErrorCode::SchemaNewer);
+    let tried = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(tried, 1, "re-opens are rate-limited, not one per request");
+    fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    c.call(Request::MqInspect {})
+        .expect("served once the database opens, with no restart");
     h.shutdown();
+}
+
+#[test]
+fn a_connection_that_never_authenticates_is_closed_even_while_pipelining() {
+    // Two guards close this connection — the refusal's `Connection: close` and the deadline to
+    // authenticate — and this test needs only one of them (measured: it fails with both removed,
+    // passes with either). `raw_http_is_held_to_the_same_rules` pins the first on its own.
+    use std::io::Write as _;
+    // One slot, so a held connection is a lockout the client below would see.
+    let f = Fixture::with(|cfg| {
+        cfg.max_connections = 1;
+        cfg.read_timeout = Duration::from_millis(500);
+    });
+    let addr = f.handle.as_ref().unwrap().addr;
+    let mut hog = std::net::TcpStream::connect(addr).unwrap();
+    // Pipelined unauthenticated requests, never reading an answer: hyper stops reading once its
+    // answers back up, and its header timer never restarts.
+    let burst = "GET /v1/hello HTTP/1.1\r\nhost: x\r\n\r\n".repeat(20_000);
+    let _ = hog.set_write_timeout(Some(Duration::from_millis(200)));
+    let _ = hog.write_all(burst.as_bytes());
+    std::thread::sleep(Duration::from_millis(1200));
+    f.client()
+        .call(Request::MqInspect {})
+        .expect("the hog was closed within the read timeout");
+    drop(hog);
+}
+
+#[test]
+fn a_long_poll_slot_is_released_when_its_client_goes_away() {
+    use std::io::Write as _;
+    let f = Fixture::new();
+    let c = f.client();
+    topic_and_group(&c);
+    let token = std::fs::read_to_string(&f.token).unwrap();
+    let body = json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 10 }).to_string();
+    let mut raw = std::net::TcpStream::connect(f.handle.as_ref().unwrap().addr).unwrap();
+    write!(
+        raw,
+        "POST /v1/op?wait_ms=20000 HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        token.trim(),
+        body.len()
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let short = f.client().with_poll_wait(Duration::from_millis(200));
+    let poll = || {
+        short.call(Request::MqPoll {
+            topic: "t".into(),
+            group: "g".into(),
+            max: 10,
+            after: None,
+        })
+    };
+    assert_eq!(
+        poll().unwrap_err().code,
+        ErrorCode::Busy,
+        "held by the raw poll"
+    );
+    drop(raw);
+    let started = Instant::now();
+    while poll().is_err() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the slot outlived its client"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -506,7 +612,11 @@ fn a_long_poll_notices_a_newer_schema_while_it_waits() {
         std::thread::sleep(Duration::from_millis(400));
         let future = jkb_core::supported_schema_version() + 1;
         db.write_txn("test", move |conn, _| {
-            conn.pragma_update(None, "user_version", future)?;
+            conn.execute(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                [future],
+            )?;
             Ok(())
         })
         .unwrap();

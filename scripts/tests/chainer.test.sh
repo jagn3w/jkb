@@ -1459,6 +1459,10 @@ case15() {
         'watcher=running|running; file edits'
         'watcher=skipped|skipped (--no-service)'
         'watcher=failed|NOT running'
+        'serve=up|jkb serve:  up'
+        'serve=skipped|jkb serve:  skipped'
+        'serve=unchecked|jkb serve:  not checked'
+        'serve=failed|jkb serve:  NOT up'
     )
     for entry in "${table[@]}"; do
         line="${entry%%|*}"; want="${entry#*|}"
@@ -1505,7 +1509,7 @@ case15() {
             *unrecognised*) states_ok=0; unknown="$unknown [$word]" ;;
         esac
     done <<EOF
-$(grep -oE '(scaffold|extension|watcher)_state=[a-z]+' "$setup" | sort -u)
+$(grep -hoE '(scaffold|extension|watcher|serve)_state=[a-z]+' "$setup" "$repo_root/scripts/lib.sh" | sort -u)
 EOF
     [ "$states_ok" = 1 ] \
         && ok "every state word setup.sh can assign has a render arm" \
@@ -1513,7 +1517,7 @@ EOF
 
     # Default arms, as everywhere else in this protocol.
     local defaults_ok=1 noisy=""
-    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways'; do
+    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways' 'serve=sideways'; do
         rendered="$(printf '%s\n' "$line" | render_setup_summary 2>&1)"
         case "$rendered" in
             *unrecognised*) ;;
