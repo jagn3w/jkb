@@ -1525,29 +1525,52 @@ so a disagreement here is invisible exactly when it matters"
 SQLITE_NAMING_ALLOWED=".claude/hooks/block-raw-sqlite.sh"
 
 _bare_sqlite_sites() {
-    local root="$1" f cmd
+    local root="$1" f cmd rel
     cmd="sqli""te3"
     while IFS= read -r f; do
-        [ "${f#"$root"/}" = "$SQLITE_NAMING_ALLOWED" ] && continue
-        # The wrapper's own body is the one sanctioned call.
-        awk -v cmd="$cmd" '
-            /^jkb_sqlite\(\) \{/ { inwrap = 1 }
+        rel="${f#"$root"/}"
+        [ "$rel" = "$SQLITE_NAMING_ALLOWED" ] && continue
+        # The wrapper's own body is the sanctioned call, and ONLY in scripts/lib.sh: a copy of the
+        # function pasted into another script, without the refusal, is exactly what this is for.
+        awk -v cmd="$cmd" -v allow_wrapper="$([ "$rel" = scripts/lib.sh ] && echo 1 || echo 0)" '
+            allow_wrapper == 1 && /^jkb_sqlite\(\) \{/ { inwrap = 1 }
             inwrap && /^\}/ { inwrap = 0; next }
             inwrap { next }
             /^[[:space:]]*#/ { next }
             {
                 line = $0
                 sub(/[[:space:]]#.*$/, "", line)
-                if (match(line, "(^|[;&|({`$[:space:]])" cmd "([[:space:]]|$)")) {
+                # Command position, a path prefix (/usr/bin/…), or quoted; followed by anything
+                # that ends the word — space, quote, redirection, paren or end of line.
+                if (match(line, "(^|[;&|({`$[:space:]/\"'"'"'])" cmd "([[:space:]\"'"'"'<>);]|$)")) {
                     print FILENAME ":" NR
                 }
             }' "$f"
     done < <(shell_sources "$root")
 }
 
+# The one sanctioned call, counted: an empty scan (a broken file list, a renamed wrapper) must not
+# read as "no bare calls".
+_wrapper_calls() {
+    local cmd
+    cmd="sqli""te3"
+    sed -n '/^jkb_sqlite() {/,/^}/p' "$repo_root/scripts/lib.sh" \
+        | grep -cE "^[[:space:]]+$cmd[[:space:]]" || true
+}
+
+# Only the `const SHARED … ];` block, and every entry line must be a hex tuple: an entry spelled any
+# other way would drop out of both extractions and leave the two sets comparing equal.
+_rust_shared_block() {
+    sed -n '/^const SHARED: /,/^\];/p' "$repo_root/crates/jkb-core/src/shared_fs.rs" | sed '1d;$d'
+}
+
 _rust_shared_magics() {
-    grep -oE '\(0x[0-9A-Fa-f_]+, "' "$repo_root/crates/jkb-core/src/shared_fs.rs" \
-        | sed -E 's/^\(0x//; s/, "$//; s/_//g' | tr 'A-F' 'a-f' | sed -E 's/^0+//' | sort
+    _rust_shared_block | grep -oE '^[[:space:]]*\(0x[0-9A-Fa-f_]+, "' \
+        | sed -E 's/^[[:space:]]*\(0x//; s/, "$//; s/_//g' | tr 'A-F' 'a-f' | sed -E 's/^0+//' | sort
+}
+
+_rust_shared_odd_entries() {
+    _rust_shared_block | grep -vE '^[[:space:]]*\(0x[0-9A-Fa-f_]+, "[^"]+"\),[[:space:]]*$' || true
 }
 
 _shell_shared_magics() {
@@ -1555,11 +1578,22 @@ _shell_shared_magics() {
         | grep -oE '^[[:space:]]+[0-9a-f]+\)' | tr -d ' )' | sort
 }
 
+# In the dev container, the host's ~/.jkb is a BIND MOUNT — a mount point in this mount namespace.
+# The live refusal is required there whatever the mount reports; keying it on the known FUSE magic
+# skipped it on exactly the backend the magic list did not know about.
+_jkb_is_a_bind_here() {
+    awk -v want="$1" '$5 == want { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo 2>/dev/null
+}
+
 case11() {
-    local sites rust shell m probe_dir rc
+    local sites rust shell odd m probe_dir rc real_home calls
     sites="$(_bare_sqlite_sites "$repo_root")"
-    if [ -z "$sites" ]; then
-        ok "every database read under scripts/ goes through jkb_sqlite"
+    calls="$(_wrapper_calls)"
+    if [ "$calls" != 1 ]; then
+        fail "shared-db: wrapper" "scripts/lib.sh's jkb_sqlite should hold exactly one call to the \
+database shell and holds $calls — the scan below is not looking at what it thinks it is"
+    elif [ -z "$sites" ]; then
+        ok "every database read under scripts/ goes through jkb_sqlite (the wrapper's one call found)"
     else
         fail "shared-db: bare call" "these run the database shell directly, so the shared-filesystem \
 refusal never runs for them — use jkb_sqlite from scripts/lib.sh: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')"
@@ -1567,7 +1601,11 @@ refusal never runs for them — use jkb_sqlite from scripts/lib.sh: $(sed "s|^$r
 
     rust="$(_rust_shared_magics)"
     shell="$(_shell_shared_magics)"
-    if [ -n "$rust" ] && [ "$rust" = "$shell" ]; then
+    odd="$(_rust_shared_odd_entries)"
+    if [ -n "$odd" ]; then
+        fail "shared-db: unparseable entry" "shared_fs.rs SHARED has an entry that is not a hex tuple, \
+so the drift check below cannot see it: $odd"
+    elif [ -n "$rust" ] && [ "$rust" = "$shell" ]; then
         ok "the shell and Rust refuse the same $(grep -c . <<<"$rust") filesystem magics"
     else
         fail "shared-db: drift" "shared_fs.rs refuses [$(tr '\n' ' ' <<<"$rust")] but lib.sh's \
@@ -1580,24 +1618,39 @@ the CLI would disagree about the same directory"
     [ -z "$(shared_fs_kind ef53)" ] && ok "a local filesystem (ext4) is not refused" \
         || fail "shared-db: ext4 refused" "shared_fs_kind named ext4 as shared"
 
+    # From a LOCAL directory: judged as a relative path, the URI would ask about the working
+    # directory — and from inside the checkout that is itself the shared bind, so the test passed
+    # with the URI rule deleted.
+    (cd "$work" && refuse_shared_db "file:/anything/jkb.db" 2>/dev/null); rc=$?
     if [ "$(uname -s)" != Linux ]; then
         skip "live refusal (not Linux)"
         return 0
     fi
+    [ "$rc" != 0 ] && ok "a file: URI is refused rather than judged as a relative path" \
+        || fail "shared-db: URI allowed" "refuse_shared_db accepted a file: URI, which the database \
+shell opens as a URI while the guard judged the working directory"
+
     probe_dir="$work/local-db"
     mkdir -p "$probe_dir"
     refuse_shared_db "$probe_dir/fresh/jkb.db" 2>/dev/null; rc=$?
     [ "$rc" = 0 ] && ok "a database in a local temp directory is allowed" \
         || fail "shared-db: local refused" "refuse_shared_db returned $rc for $probe_dir"
+
     # The REAL home, not $HOME: the harness points HOME at a scratch directory, which is how this
     # assertion first skipped inside the very container it exists for.
     real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
-    if [ -n "$real_home" ] && [ "$(stat -f -c %t "$real_home/.jkb" 2>/dev/null)" = 65735546 ]; then
+    if [ -n "$real_home" ] && _jkb_is_a_bind_here "$real_home/.jkb"; then
         refuse_shared_db "$real_home/.jkb/jkb.db" 2>/dev/null; rc=$?
         [ "$rc" = 3 ] && ok "inside the container, the host's ~/.jkb/jkb.db is refused" \
-            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for the FUSE ~/.jkb bind"
+            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for the ~/.jkb bind \
+(fs magic $(stat -f -c %t "$real_home/.jkb" 2>/dev/null)) — a shared mount the magic list does not know"
+        ln -s "$real_home/.jkb/refusal-probe-missing.db" "$probe_dir/dangling.db"
+        refuse_shared_db "$probe_dir/dangling.db" 2>/dev/null; rc=$?
+        [ "$rc" = 3 ] && ok "a dangling link from a local directory into the bind is refused" \
+            || fail "shared-db: dangling link allowed" "refuse_shared_db returned $rc for a dangling \
+link into ~/.jkb — SQLite would create the database at the link's target"
     else
-        skip "live bind refusal (~/.jkb is not a FUSE bind here)"
+        skip "live bind refusal (~/.jkb is not a bind mount here)"
     fi
 }
 

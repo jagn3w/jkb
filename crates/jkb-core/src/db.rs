@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::{migrate, Result};
 
@@ -15,12 +15,22 @@ use crate::{migrate, Result};
 /// Refuses first, before `SQLite` creates or touches anything, when the database would live on a
 /// filesystem shared with another kernel ([`crate::shared_fs`]).
 ///
+/// The path is a PATH, never a URI: `refuse` rejects a `file:` string outright. Dropping
+/// `SQLITE_OPEN_URI` from the flags is NOT enough on its own and is kept only as intent — the
+/// bundled `SQLite` is compiled with `-DSQLITE_USE_URI`, and `--db file:/home/vscode/.jkb/jkb.db`
+/// opened the host's database with these very flags (measured in the dev container).
+///
 /// # Errors
 /// Returns an error if the database is on a shared filesystem, or cannot be opened, configured, or
 /// migrated.
 pub fn open<P: AsRef<Path>>(path: P) -> Result<Connection> {
     crate::shared_fs::refuse(path.as_ref())?;
-    let mut conn = Connection::open(path)?;
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
     configure(&conn)?;
     migrate::run(&mut conn)?;
     Ok(conn)
@@ -189,6 +199,30 @@ mod tests {
 
         let this = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
         let this = std::fs::canonicalize(this).unwrap();
+
+        // db.rs is exempt from the scan below only because its one file open is guarded — so that
+        // is asserted rather than assumed: inside `pub fn open`, the refusal comes before the open.
+        // Without this, deleting the refusal line left every test green.
+        let own = std::fs::read_to_string(&this).unwrap();
+        let body_at = own.find("pub fn open<").expect("db::open exists");
+        let body = &own[body_at
+            ..own[body_at..]
+                .find("\n}\n")
+                .map_or(own.len(), |e| body_at + e)];
+        let refuse_at = body.find("shared_fs::refuse(").expect(
+            "db::open must call shared_fs::refuse — without it a database on a shared filesystem opens",
+        );
+        let open_at = body
+            .find("Connection::open")
+            .expect("db::open opens a connection");
+        assert!(
+            refuse_at < open_at,
+            "db::open must refuse BEFORE it opens, or SQLite has already created files"
+        );
+        assert!(
+            !body.contains("SQLITE_OPEN_URI"),
+            "db::open must not accept a URI, or `file:` paths reach a database refuse did not judge"
+        );
         let mut strays = Vec::new();
         for file in files {
             if std::fs::canonicalize(&file).unwrap() == this {

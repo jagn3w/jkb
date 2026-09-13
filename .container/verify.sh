@@ -1217,8 +1217,24 @@ assert "knowledge base is mounted" "$kb_mounted"
 kb_dir="$(dirname "${JKB_DB:-/nonexistent/jkb.db}")"
 assert "JKB_DB's directory ($kb_dir) is writable by $(id -un)" \
     "$([ -d "$kb_dir" ] && [ -w "$kb_dir" ] && echo yes || echo no)"
-assert "JKB_DB ($kb_dir) is not on the host bind (a shared SQLite database corrupts)" \
-    "$([ -n "${JKB_DB:-}" ] && [ "$(stat -f -c %T "$kb_dir" 2>/dev/null)" != fuseblk ] && echo yes || echo no)"
+# Asked of the INSTALLED jkb, not of a third copy of the filesystem rule: jkb-core refuses a database
+# on a filesystem shared with another kernel (crates/jkb-core/src/shared_fs.rs), and scripts/lib.sh
+# applies the same set. A binary built before that refusal opens the host's database from in here
+# — which a review measured, while this file only statted a directory — so the binary itself is
+# asked to open a probe on the bind and must refuse, and to open JKB_DB and must not.
+kb_probe_dir="/home/vscode/.jkb/.verify-refusal-probe-$$"
+kb_refused=no
+if command -v jkb >/dev/null 2>&1; then
+    if ! kb_out="$(jkb --db "$kb_probe_dir/jkb.db" ns ls 2>&1)" \
+        && grep -q "refusing to open a database" <<<"$kb_out" \
+        && [ ! -e "$kb_probe_dir/jkb.db" ]; then
+        kb_refused=yes
+    fi
+fi
+rm -rf -- "$kb_probe_dir"
+assert "the installed jkb refuses a database on the host bind (rebuild it if not: setup.sh)" "$kb_refused"
+assert "the installed jkb opens JKB_DB ($JKB_DB)" \
+    "$([ -n "${JKB_DB:-}" ] && jkb ns ls >/dev/null 2>&1 && echo yes || echo no)"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.

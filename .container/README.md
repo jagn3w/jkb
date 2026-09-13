@@ -779,9 +779,21 @@ into, symlinks resolved), and every script's database read goes through `jkb_sql
 `scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
 on a bare call, on the two sets drifting, and inside the container on the live bind not being
 refused. So a process with `JKB_DB` unset, or `--db ~/.jkb/jkb.db`, gets a refusal instead of the
-host's database. Measured in the container: `jkb --db ~/.jkb/refusal-probe/jkb.db ns ls` exits 1
+host's database — **once the installed `jkb` carries the refusal**: a binary built before it opens
+the host's database from in here (a review measured exactly that), so `setup.sh` must have rebuilt it,
+and `verify.sh` asks the installed binary to open a probe on the bind and requires the refusal.
+`db::open` also refuses any `file:` string: the bundled SQLite is compiled with `-DSQLITE_USE_URI`,
+and `--db file:/home/vscode/.jkb/jkb.db` opened the host's database past a guard that judged a
+relative path — measured, it listed the host's namespaces and touched its `-shm` before this fix. Measured in the container: `jkb --db ~/.jkb/refusal-probe/jkb.db ns ls` exits 1
 naming the FUSE bind and creates no database file (the CLI's `create_dir_all` of the parent still runs
 first, leaving an empty directory).
+
+**Residual, stated.** The guard covers jkb and `jkb_sqlite`. Any *other* SQLite client run in the
+container — `python3 -c 'import sqlite3; sqlite3.connect(".../.jkb/jkb.db")'`, a hand-typed database
+shell — is not jkb and is not refused; `.claude/hooks/block-raw-sqlite.sh` matches only the shell,
+only for agent tool calls, and fails open. What closes that for good is the container not seeing
+the host's database file at all, which is where the host-owned daemon design ends up
+(`openspec/changes/jkb-message-queue/design-r3.md`).
 
 ## A session worktree is an ordinary folder in here
 

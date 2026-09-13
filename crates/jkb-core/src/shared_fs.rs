@@ -12,11 +12,15 @@
 //! truncates a WAL the other side is still writing.
 //!
 //! So the rule lives here, at the one place a database file is opened, rather than in the
-//! container's environment or in each caller: an open that would put a database on such a
-//! filesystem is refused, whatever `JKB_DB` or `--db` says.
+//! container's environment or in each caller: an open that would put a database — or any of its
+//! files — on such a filesystem is refused, whatever `JKB_DB` or `--db` says.
 //!
 //! **Linux only, and that is the argument rather than a gap.** The side that must never open the
 //! host's database is the Linux container; the host's `~/.jkb` is a local disk.
+//!
+//! Residual, stated: this guards jkb and `scripts/lib.sh`'s `jkb_sqlite`. Any other `SQLite`
+//! client run in the container (a Python `sqlite3.connect`, a hand-typed `sqlite3`) is not jkb and
+//! is not guarded; what closes that for good is the container not seeing the file at all.
 
 use std::path::{Path, PathBuf};
 
@@ -28,6 +32,10 @@ use crate::{Error, Result};
 /// `FUSE_SUPER_MAGIC` (`stat -f -c %t` → `65735546`). The rest are the other ways a directory ends
 /// up shared with a different kernel — 9p (colima, podman machine), NFS, and SMB — none of which
 /// shares advisory locks and a page cache with every process that can open the file.
+///
+/// Every entry is a hex tuple on its own line: `scripts/tests/dev-scripts.test.sh` case11 reads
+/// this block to prove `scripts/lib.sh` refuses the same set, and fails on an entry in any other
+/// shape.
 const SHARED: &[(u32, &str)] = &[
     (0x6573_5546, "FUSE (virtiofs, gRPC-FUSE, sshfs)"),
     (0x0102_1997, "9p"),
@@ -35,6 +43,9 @@ const SHARED: &[(u32, &str)] = &[
     (0xFE53_4D42, "SMB2"),
     (0xFF53_4D42, "CIFS"),
 ];
+
+/// Symlink hops followed before a path is treated as unresolvable (the kernel's own limit).
+const MAX_LINK_HOPS: usize = 40;
 
 /// The filesystem name if `f_type` is one a database must not live on.
 fn shared_kind(f_type: u32) -> Option<&'static str> {
@@ -44,75 +55,131 @@ fn shared_kind(f_type: u32) -> Option<&'static str> {
         .map(|&(_, name)| name)
 }
 
-/// The directory whose filesystem the database's files will actually live on.
-///
-/// Not the path as given: `SQLite` resolves a symlinked database to its target and creates
-/// `-wal`/`-shm` beside the *target*, so a link in a local directory pointing into a shared one
-/// must be judged by where it points. And a fresh `--db` path has no file — nor perhaps a parent
-/// — yet, so for a path that does not exist the nearest existing ancestor is asked, which is where
-/// the directories would be created.
-fn directory_to_ask(path: &Path) -> PathBuf {
-    if let Ok(resolved) = std::fs::canonicalize(path) {
-        return resolved
-            .parent()
-            .map_or_else(|| resolved.clone(), Path::to_path_buf);
+/// Follow `path` through symlinks — including a DANGLING one, which `SQLite` also follows and
+/// creates the database at the far end of — to the path whose directory will hold the files.
+/// `None` when the chain does not end within [`MAX_LINK_HOPS`].
+fn follow_links(path: &Path) -> Option<PathBuf> {
+    let mut at = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&at).ok()?;
+                at = if target.is_absolute() {
+                    target
+                } else {
+                    at.parent().unwrap_or_else(|| Path::new(".")).join(target)
+                };
+            }
+            _ => return Some(at),
+        }
     }
-    let mut dir = match path.parent() {
+    None
+}
+
+/// Everything whose filesystem must be judged before `path` is opened as a database.
+///
+/// - the directory the files will be created in — for a path that does not exist yet, its nearest
+///   existing ancestor, which is where the missing directories would be created;
+/// - the database file itself when it exists, and its `-wal`/`-shm`/`-journal` siblings: a single
+///   file bind-mounted from the host into a local directory lives on the host's filesystem while
+///   its directory does not, and `statfs` of the directory cannot see that.
+///
+/// Symlinks are followed first, dangling ones included. `None` when the path cannot be resolved,
+/// which the caller refuses rather than reading as local.
+fn paths_to_ask(path: &Path) -> Option<Vec<PathBuf>> {
+    let target = follow_links(path)?;
+    let mut asks = Vec::new();
+    let mut dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
     loop {
         if let Ok(resolved) = std::fs::canonicalize(&dir) {
-            return resolved;
+            asks.push(resolved);
+            break;
         }
         match dir.parent() {
             Some(p) if !p.as_os_str().is_empty() => dir = p.to_path_buf(),
-            _ => return PathBuf::from("."),
+            _ => {
+                asks.push(PathBuf::from("."));
+                break;
+            }
         }
     }
+    let name = target.file_name()?.to_os_string();
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut file = name.clone();
+        file.push(suffix);
+        let candidate = target.with_file_name(file);
+        if candidate.exists() {
+            asks.push(candidate);
+        }
+    }
+    Some(asks)
 }
 
-/// Refuse a database path on a filesystem shared with another kernel.
+/// Refuse a database path that is a URI, or that is on a filesystem shared with another kernel.
+///
+/// **A `file:` string is refused on every platform, before anything else.** The `SQLite` that
+/// `libsqlite3-sys` bundles is compiled with `-DSQLITE_USE_URI`, so it parses `file:` URIs whatever
+/// flags the open passes. Measured in the dev container: `jkb --db file:/home/vscode/.jkb/jkb.db
+/// ns ls` listed the HOST knowledge base's namespaces and touched its `-shm`, while the statfs
+/// guard below judged a relative directory named `file:` in the working directory. jkb has never
+/// opened a database by URI, so the only safe reading of one is none.
 ///
 /// # Errors
-/// [`Error::SharedFilesystem`] when the directory holding the database is on one of the refused
-/// filesystems, and [`Error::FilesystemUnknown`] when that cannot be established — an unreadable
-/// answer is not spelled as "local".
-#[cfg(target_os = "linux")]
+/// [`Error::UriPath`] for a `file:` string; [`Error::SharedFilesystem`] when the database, one of its
+/// files, or the directory that will hold them is on one of the refused filesystems;
+/// [`Error::FilesystemUnknown`] when that cannot be established — an unreadable answer is not
+/// spelled as "local".
 pub(crate) fn refuse(path: &Path) -> Result<()> {
-    let dir = directory_to_ask(path);
-    let stat = rustix::fs::statfs(&dir).map_err(|e| Error::FilesystemUnknown {
-        path: dir.clone(),
-        reason: e.to_string(),
-    })?;
-    // `f_type` is a kernel long: i64 on 64-bit targets, i32 on 32-bit ones, and the SMB magics
-    // do not fit in an i32. The magic is the low 32 bits either way. The widening is a no-op on
-    // 64-bit, which is what the lint sees; it is not one on the 32-bit targets.
-    #[allow(clippy::useless_conversion)]
-    let wide = i64::from(stat.f_type);
-    // Cannot fail after the mask, and a failure is still not spelled as "local".
-    let Ok(f_type) = u32::try_from(wide & 0xFFFF_FFFF) else {
-        return Err(Error::FilesystemUnknown {
-            path: dir,
-            reason: format!("f_type {wide:#x} is out of range"),
+    if path.as_os_str().to_string_lossy().starts_with("file:") {
+        return Err(Error::UriPath {
+            path: path.to_path_buf(),
         });
-    };
-    match shared_kind(f_type) {
-        Some(kind) => Err(Error::SharedFilesystem { path: dir, kind }),
-        None => Ok(()),
     }
+    refuse_shared(path)
+}
+
+#[cfg(target_os = "linux")]
+fn refuse_shared(path: &Path) -> Result<()> {
+    let unknown = |at: &Path, reason: String| Error::FilesystemUnknown {
+        path: at.to_path_buf(),
+        reason,
+    };
+    let asks = paths_to_ask(path).ok_or_else(|| {
+        unknown(
+            path,
+            format!("its symlinks do not resolve within {MAX_LINK_HOPS} hops"),
+        )
+    })?;
+    for at in asks {
+        let stat = rustix::fs::statfs(&at).map_err(|e| unknown(&at, e.to_string()))?;
+        // `f_type` is a kernel long: i64 on 64-bit targets, i32 on 32-bit ones, and the SMB magics
+        // do not fit in an i32. The magic is the low 32 bits either way. The widening is a no-op
+        // on 64-bit, which is what the lint sees; it is not one on the 32-bit targets.
+        #[allow(clippy::useless_conversion)]
+        let wide = i64::from(stat.f_type);
+        // Cannot fail after the mask, and a failure is still not spelled as "local".
+        let f_type = u32::try_from(wide & 0xFFFF_FFFF)
+            .map_err(|_| unknown(&at, format!("f_type {wide:#x} is out of range")))?;
+        if let Some(kind) = shared_kind(f_type) {
+            return Err(Error::SharedFilesystem { path: at, kind });
+        }
+    }
+    Ok(())
 }
 
 /// Off Linux there is no container kernel to be on the wrong side of.
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) fn refuse(_path: &Path) -> Result<()> {
+fn refuse_shared(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{directory_to_ask, shared_kind, SHARED};
+    use super::{follow_links, paths_to_ask, shared_kind, SHARED};
 
     #[test]
     fn the_measured_fuse_magic_and_the_other_shared_filesystems_are_refused() {
@@ -128,7 +195,7 @@ mod tests {
 
     #[test]
     fn local_filesystems_are_not() {
-        // ext4, overlayfs, tmpfs, btrfs, xfs, apfs-in-a-VM never reports these.
+        // ext4, overlayfs, tmpfs, btrfs, xfs.
         for magic in [0xEF53, 0x794C_7630, 0x0102_1994, 0x9123_683E, 0x5846_5342] {
             assert_eq!(shared_kind(magic), None, "{magic:#x}");
         }
@@ -139,13 +206,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fresh = tmp.path().join("not/yet/created/jkb.db");
         assert_eq!(
-            directory_to_ask(&fresh),
-            std::fs::canonicalize(tmp.path()).unwrap()
+            paths_to_ask(&fresh).unwrap(),
+            vec![std::fs::canonicalize(tmp.path()).unwrap()]
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn an_existing_database_is_judged_by_the_directory_it_resolves_into() {
+    fn an_existing_database_is_judged_by_where_it_resolves_and_by_each_of_its_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let real_dir = tmp.path().join("real");
         let link_dir = tmp.path().join("links");
@@ -153,15 +221,65 @@ mod tests {
         std::fs::create_dir_all(&link_dir).unwrap();
         let target = real_dir.join("jkb.db");
         std::fs::write(&target, b"").unwrap();
+        std::fs::write(real_dir.join("jkb.db-wal"), b"").unwrap();
         let link = link_dir.join("jkb.db");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        #[cfg(unix)]
+
+        let asks = paths_to_ask(&link).unwrap();
+        let real = std::fs::canonicalize(&real_dir).unwrap();
         assert_eq!(
-            directory_to_ask(&link),
-            std::fs::canonicalize(&real_dir).unwrap(),
-            "SQLite puts -wal/-shm beside the link's target, so that is the directory to ask"
+            asks[0], real,
+            "SQLite puts -wal/-shm beside the link's target"
         );
+        // The file and its WAL are asked about themselves: a single-file bind mount is invisible
+        // to statfs of the directory it sits in.
+        assert!(asks.iter().any(|p| p.ends_with("real/jkb.db")), "{asks:?}");
+        assert!(
+            asks.iter().any(|p| p.ends_with("real/jkb.db-wal")),
+            "{asks:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_judged_by_where_it_points_not_where_it_sits() {
+        // SQLite follows a dangling link and creates the database at its target, so judging the
+        // link's own (local) directory would let it create one on a shared filesystem.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let far = tmp.path().join("far/away");
+        std::fs::create_dir_all(&far).unwrap();
+        let near = tmp.path().join("near");
+        std::fs::create_dir_all(&near).unwrap();
+        let link = near.join("jkb.db");
+        std::os::unix::fs::symlink(far.join("missing.db"), &link).unwrap();
+
+        assert_eq!(follow_links(&link).unwrap(), far.join("missing.db"));
+        assert_eq!(
+            paths_to_ask(&link).unwrap(),
+            vec![std::fs::canonicalize(&far).unwrap()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_is_unresolvable_not_local() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("a.db");
+        let b = tmp.path().join("b.db");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert_eq!(paths_to_ask(&a), None);
+    }
+
+    #[test]
+    fn a_uri_is_refused_before_any_filesystem_is_asked() {
+        // Relative to a LOCAL working directory the statfs guard would pass it; SQLite would then
+        // open the URI's path — the host's database, when run in the container.
+        let err = super::refuse(std::path::Path::new(
+            "file:/home/vscode/.jkb/jkb.db?mode=rw",
+        ))
+        .expect_err("a file: URI must never reach SQLite");
+        assert!(matches!(err, crate::Error::UriPath { .. }), "{err}");
     }
 
     #[cfg(target_os = "linux")]

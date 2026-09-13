@@ -1646,31 +1646,50 @@ shared_fs_kind() {
 }
 
 # refuse_shared_db <db-path> — 0 when the database may be opened here, non-zero (with the reason on
-# stderr) when its directory is on a shared filesystem or that cannot be established. Judged where
-# SQLite would put its files: the symlink-resolved file when it exists, else the nearest existing
-# ancestor. Linux only — the host side of the boundary is a local disk.
+# stderr) when it, one of its files, or the directory that will hold them is on a shared filesystem,
+# or that cannot be established. The same judgement as shared_fs.rs:
+#   - a `file:` URI is refused outright: the database shell accepts one, and judging it as a relative
+#     path would ask about the working directory instead of the database;
+#   - symlinks are followed, DANGLING ones included (`readlink -m`), because SQLite creates the
+#     database at the far end of a dangling link;
+#   - the nearest existing ancestor of the resolved path is asked, and so are the file and its
+#     -wal/-shm/-journal when they exist — a single file bind-mounted from the host into a local
+#     directory is invisible to statfs of that directory.
+# Linux only — the host side of the boundary is a local disk.
 refuse_shared_db() {
-    local db="$1" dir magic kind
+    local db="$1" target dir at magic kind asks=()
     if [ "$(uname -s)" != Linux ]; then return 0; fi
-    if [ -e "$db" ]; then
-        if ! dir="$(dirname "$(readlink -f "$db")")"; then dir=""; fi
-    else
-        dir="$(dirname "$db")"
-        while [ ! -d "$dir" ] && [ "$dir" != / ] && [ "$dir" != . ]; do
-            dir="$(dirname "$dir")"
-        done
-    fi
-    if [ -z "$dir" ] || ! magic="$(stat -f -c %t "$dir" 2>/dev/null)"; then
-        printf 'refusing to open %s: cannot tell what filesystem it is on\n' "$db" >&2
+    case "$db" in
+        file:*)
+            printf 'refusing to open %s: a URI is not a path this guard can judge\n' "$db" >&2
+            return 2 ;;
+        *) : ;;
+    esac
+    if ! target="$(readlink -m -- "$db" 2>/dev/null)" || [ -z "$target" ]; then
+        printf 'refusing to open %s: cannot resolve where it points\n' "$db" >&2
         return 2
     fi
-    kind="$(shared_fs_kind "$magic")"
-    if [ -n "$kind" ]; then
-        printf 'refusing to open %s: %s is on a %s filesystem shared with another kernel, ' \
-            "$db" "$dir" "$kind" >&2
-        printf 'where SQLite locks and WAL do not work (see .container/sqlite-share-probe.py)\n' >&2
-        return 3
-    fi
+    dir="$(dirname "$target")"
+    while [ ! -d "$dir" ] && [ "$dir" != / ]; do
+        dir="$(dirname "$dir")"
+    done
+    asks+=("$dir")
+    for at in "$target" "$target-wal" "$target-shm" "$target-journal"; do
+        if [ -e "$at" ]; then asks+=("$at"); fi
+    done
+    for at in "${asks[@]}"; do
+        if ! magic="$(stat -f -c %t -- "$at" 2>/dev/null)"; then
+            printf 'refusing to open %s: cannot tell what filesystem %s is on\n' "$db" "$at" >&2
+            return 2
+        fi
+        kind="$(shared_fs_kind "$magic")"
+        if [ -n "$kind" ]; then
+            printf 'refusing to open %s: %s is on a %s filesystem shared with another kernel, ' \
+                "$db" "$at" "$kind" >&2
+            printf 'where SQLite locks and WAL do not work (see .container/sqlite-share-probe.py)\n' >&2
+            return 3
+        fi
+    done
     return 0
 }
 

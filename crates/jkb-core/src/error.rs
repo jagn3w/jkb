@@ -46,6 +46,18 @@ pub enum Error {
         kind: &'static str,
     },
 
+    /// The database path is a `file:` URI, which the bundled `SQLite` parses as a URI whatever the
+    /// open's flags — so no path guard can judge what it names (design r3.2 H1).
+    #[error(
+        "refusing to open {}: jkb opens database PATHS, never `file:` URIs (SQLite would parse it as \
+         a URI and open whatever it names, past the shared-filesystem guard)",
+        path.display()
+    )]
+    UriPath {
+        /// The rejected string.
+        path: std::path::PathBuf,
+    },
+
     /// Whether the database's directory is on a shared filesystem could not be established.
     #[error("cannot tell what filesystem {} is on ({reason}); refusing to open a database there", path.display())]
     FilesystemUnknown {
