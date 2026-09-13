@@ -1511,9 +1511,99 @@ so a disagreement here is invisible exactly when it matters"
     fi
 }
 
+# --- 11. no database is opened on a filesystem shared with another kernel ---------------------
+# `sqlite3` opens read-write and checkpoints on close, so a script "only reading" jkb.db from the dev
+# container truncates a WAL the host is writing: measured, a process on each side of the bind
+# corrupted a database within 38 commits (.container/sqlite-share-probe.py). The rule lives in one
+# wrapper (`jkb_sqlite`, scripts/lib.sh) and this case fails on a call that bypasses it, on the
+# wrapper's magic set drifting from the Rust one (crates/jkb-core/src/shared_fs.rs), and — where the
+# suite runs inside the container — on the live bind not being refused.
+#
+# The command name is assembled from pieces so this file never contains the shape it scans for.
+# THE ONE FILE ALLOWED TO NAME IT, pinned by equality like AMBIENT_ALLOWED: the PreToolUse hook that
+# denies the database shell has to spell the command in its matcher and its deny message.
+SQLITE_NAMING_ALLOWED=".claude/hooks/block-raw-sqlite.sh"
+
+_bare_sqlite_sites() {
+    local root="$1" f cmd
+    cmd="sqli""te3"
+    while IFS= read -r f; do
+        [ "${f#"$root"/}" = "$SQLITE_NAMING_ALLOWED" ] && continue
+        # The wrapper's own body is the one sanctioned call.
+        awk -v cmd="$cmd" '
+            /^jkb_sqlite\(\) \{/ { inwrap = 1 }
+            inwrap && /^\}/ { inwrap = 0; next }
+            inwrap { next }
+            /^[[:space:]]*#/ { next }
+            {
+                line = $0
+                sub(/[[:space:]]#.*$/, "", line)
+                if (match(line, "(^|[;&|({`$[:space:]])" cmd "([[:space:]]|$)")) {
+                    print FILENAME ":" NR
+                }
+            }' "$f"
+    done < <(shell_sources "$root")
+}
+
+_rust_shared_magics() {
+    grep -oE '\(0x[0-9A-Fa-f_]+, "' "$repo_root/crates/jkb-core/src/shared_fs.rs" \
+        | sed -E 's/^\(0x//; s/, "$//; s/_//g' | tr 'A-F' 'a-f' | sed -E 's/^0+//' | sort
+}
+
+_shell_shared_magics() {
+    sed -n '/^shared_fs_kind() {/,/^}/p' "$repo_root/scripts/lib.sh" \
+        | grep -oE '^[[:space:]]+[0-9a-f]+\)' | tr -d ' )' | sort
+}
+
+case11() {
+    local sites rust shell m probe_dir rc
+    sites="$(_bare_sqlite_sites "$repo_root")"
+    if [ -z "$sites" ]; then
+        ok "every database read under scripts/ goes through jkb_sqlite"
+    else
+        fail "shared-db: bare call" "these run the database shell directly, so the shared-filesystem \
+refusal never runs for them — use jkb_sqlite from scripts/lib.sh: $(sed "s|^$repo_root/||" <<<"$sites" | tr '\n' ' ')"
+    fi
+
+    rust="$(_rust_shared_magics)"
+    shell="$(_shell_shared_magics)"
+    if [ -n "$rust" ] && [ "$rust" = "$shell" ]; then
+        ok "the shell and Rust refuse the same $(grep -c . <<<"$rust") filesystem magics"
+    else
+        fail "shared-db: drift" "shared_fs.rs refuses [$(tr '\n' ' ' <<<"$rust")] but lib.sh's \
+shared_fs_kind refuses [$(tr '\n' ' ' <<<"$shell")] — two copies of one rule, and a script and \
+the CLI would disagree about the same directory"
+    fi
+    for m in $rust; do
+        [ -n "$(shared_fs_kind "$m")" ] || fail "shared-db: unmapped $m" "shared_fs_kind names nothing for $m"
+    done
+    [ -z "$(shared_fs_kind ef53)" ] && ok "a local filesystem (ext4) is not refused" \
+        || fail "shared-db: ext4 refused" "shared_fs_kind named ext4 as shared"
+
+    if [ "$(uname -s)" != Linux ]; then
+        skip "live refusal (not Linux)"
+        return 0
+    fi
+    probe_dir="$work/local-db"
+    mkdir -p "$probe_dir"
+    refuse_shared_db "$probe_dir/fresh/jkb.db" 2>/dev/null; rc=$?
+    [ "$rc" = 0 ] && ok "a database in a local temp directory is allowed" \
+        || fail "shared-db: local refused" "refuse_shared_db returned $rc for $probe_dir"
+    # The REAL home, not $HOME: the harness points HOME at a scratch directory, which is how this
+    # assertion first skipped inside the very container it exists for.
+    real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+    if [ -n "$real_home" ] && [ "$(stat -f -c %t "$real_home/.jkb" 2>/dev/null)" = 65735546 ]; then
+        refuse_shared_db "$real_home/.jkb/jkb.db" 2>/dev/null; rc=$?
+        [ "$rc" = 3 ] && ok "inside the container, the host's ~/.jkb/jkb.db is refused" \
+            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for the FUSE ~/.jkb bind"
+    else
+        skip "live bind refusal (~/.jkb is not a FUSE bind here)"
+    fi
+}
+
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11
 
 finish

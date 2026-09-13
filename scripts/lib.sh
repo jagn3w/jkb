@@ -1622,6 +1622,66 @@ render_setup_summary() {
     done
 }
 
+# --- a database on a shared filesystem ------------------------------------------------------
+# The shell half of `crates/jkb-core/src/shared_fs.rs`, and the same rule. `sqlite3` opens a
+# database read-write and checkpoints on close, so a script that "only reads" jkb.db from inside the
+# dev container truncates a WAL the host is still writing — measured, a process on each side of the
+# bind corrupted a database within 38 commits (.container/sqlite-share-probe.py). EVERY `sqlite3`
+# under scripts/ goes through `jkb_sqlite`, which refuses first; case11 of dev-scripts.test.sh fails
+# on a bare one, because the next script added would otherwise forget.
+
+# shared_fs_kind <hex-magic> — the filesystem name when `stat -f -c %t` names one a database must not
+# live on, empty otherwise. The same set as SHARED in shared_fs.rs: FUSE (measured on the container's
+# binds), 9p, NFS, SMB2, CIFS.
+shared_fs_kind() {
+    case "$1" in
+        65735546) printf 'FUSE (virtiofs, gRPC-FUSE, sshfs)\n' ;;
+        1021997) printf '9p\n' ;;
+        6969) printf 'NFS\n' ;;
+        fe534d42) printf 'SMB2\n' ;;
+        ff534d42) printf 'CIFS\n' ;;
+        *) : ;;
+    esac
+    return 0
+}
+
+# refuse_shared_db <db-path> — 0 when the database may be opened here, non-zero (with the reason on
+# stderr) when its directory is on a shared filesystem or that cannot be established. Judged where
+# SQLite would put its files: the symlink-resolved file when it exists, else the nearest existing
+# ancestor. Linux only — the host side of the boundary is a local disk.
+refuse_shared_db() {
+    local db="$1" dir magic kind
+    if [ "$(uname -s)" != Linux ]; then return 0; fi
+    if [ -e "$db" ]; then
+        if ! dir="$(dirname "$(readlink -f "$db")")"; then dir=""; fi
+    else
+        dir="$(dirname "$db")"
+        while [ ! -d "$dir" ] && [ "$dir" != / ] && [ "$dir" != . ]; do
+            dir="$(dirname "$dir")"
+        done
+    fi
+    if [ -z "$dir" ] || ! magic="$(stat -f -c %t "$dir" 2>/dev/null)"; then
+        printf 'refusing to open %s: cannot tell what filesystem it is on\n' "$db" >&2
+        return 2
+    fi
+    kind="$(shared_fs_kind "$magic")"
+    if [ -n "$kind" ]; then
+        printf 'refusing to open %s: %s is on a %s filesystem shared with another kernel, ' \
+            "$db" "$dir" "$kind" >&2
+        printf 'where SQLite locks and WAL do not work (see .container/sqlite-share-probe.py)\n' >&2
+        return 3
+    fi
+    return 0
+}
+
+# jkb_sqlite <db> <sql> [sqlite3 options…] — `sqlite3 [options] <db> <sql>`, after refuse_shared_db.
+jkb_sqlite() {
+    local db="$1" sql="$2"
+    shift 2
+    if ! refuse_shared_db "$db"; then return 3; fi
+    sqlite3 "$@" "$db" "$sql"
+}
+
 # --- the repo's shell -----------------------------------------------------------------------
 # shell_sources — every shell file in the repo, one per line.
 #

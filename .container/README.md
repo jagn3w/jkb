@@ -772,7 +772,16 @@ host daemon over one allowed TCP port, sending typed database operations (never 
 commands, which would run gates and git on the host, outside this sandbox). Until that exists,
 the separate database is what keeps the two sides from corrupting each other.
 
-Residual: a process that runs with `JKB_DB` unset falls back to `~/.jkb/jkb.db`, the host's.
+**Enforced, not just configured.** `JKB_DB` is only a default, so the rule also lives where a
+database is opened: `jkb-core`'s `db::open` refuses a database whose directory is on a FUSE, 9p, NFS
+or SMB filesystem (`crates/jkb-core/src/shared_fs.rs`, statfs of the directory SQLite would write
+into, symlinks resolved), and every script's database read goes through `jkb_sqlite` in
+`scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
+on a bare call, on the two sets drifting, and inside the container on the live bind not being
+refused. So a process with `JKB_DB` unset, or `--db ~/.jkb/jkb.db`, gets a refusal instead of the
+host's database. Measured in the container: `jkb --db ~/.jkb/refusal-probe/jkb.db ns ls` exits 1
+naming the FUSE bind and creates no database file (the CLI's `create_dir_all` of the parent still runs
+first, leaving an empty directory).
 
 ## A session worktree is an ordinary folder in here
 

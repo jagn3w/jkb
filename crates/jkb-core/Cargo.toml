@@ -19,6 +19,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 unicode-normalization = "0.1.25"
 
+# `statfs`, for refusing a database on a filesystem shared with another kernel (src/shared_fs.rs).
+# The same version jkb-cli already locks, so nothing new is fetched.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile = "3.27.0"

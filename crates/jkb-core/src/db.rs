@@ -12,9 +12,14 @@ use crate::{migrate, Result};
 /// Open (or create) a jkb database at `path`, configure PRAGMAs, and apply any
 /// pending migrations.
 ///
+/// Refuses first, before `SQLite` creates or touches anything, when the database would live on a
+/// filesystem shared with another kernel ([`crate::shared_fs`]).
+///
 /// # Errors
-/// Returns an error if the database cannot be opened, configured, or migrated.
+/// Returns an error if the database is on a shared filesystem, or cannot be opened, configured, or
+/// migrated.
 pub fn open<P: AsRef<Path>>(path: P) -> Result<Connection> {
+    crate::shared_fs::refuse(path.as_ref())?;
     let mut conn = Connection::open(path)?;
     configure(&conn)?;
     migrate::run(&mut conn)?;
@@ -149,6 +154,63 @@ mod tests {
         // External-content FTS5 self-consistency check must pass.
         conn.execute_batch("INSERT INTO fts_items(fts_items) VALUES('integrity-check');")
             .unwrap();
+    }
+
+    /// `db::open` is the only place a database FILE is opened, so the shared-filesystem refusal it
+    /// runs first (`shared_fs::refuse`) covers every process. A `Connection::open(path)` anywhere
+    /// else in the workspace would open a database the refusal never saw — on the container kernel,
+    /// the host's database, which a process on each side corrupts. In-memory opens touch no file.
+    ///
+    /// A string scan, not a parse: an aliased import (`use rusqlite::Connection as C`) would
+    /// evade it, and is stated rather than guarded.
+    #[test]
+    fn no_database_file_is_opened_outside_db_rs() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        walk(&crates, &mut files);
+        assert!(
+            files.len() > 50,
+            "scanned {} files; the walk is broken",
+            files.len()
+        );
+
+        let this = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
+        let this = std::fs::canonicalize(this).unwrap();
+        let mut strays = Vec::new();
+        for file in files {
+            if std::fs::canonicalize(&file).unwrap() == this {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).unwrap();
+            for (i, line) in src.lines().enumerate() {
+                let mut rest = line;
+                while let Some(at) = rest.find("Connection::open") {
+                    let tail = &rest[at + "Connection::open".len()..];
+                    if !tail.starts_with("_in_memory") {
+                        strays.push(format!("{}:{}", file.display(), i + 1));
+                    }
+                    rest = tail;
+                }
+            }
+        }
+        assert!(
+            strays.is_empty(),
+            "a database file is opened outside db::open, so the shared-filesystem refusal never \
+             runs for it — route it through jkb_core::Db: {strays:?}"
+        );
     }
 
     #[test]

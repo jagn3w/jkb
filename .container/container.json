@@ -120,8 +120,9 @@
     // The container-local knowledge base (the jkb-kb-local volume), NEVER the host's
     // ~/.jkb/jkb.db: a jkb process on each side of the bind corrupts it (see the mounts above).
     // Even a read is unsafe — jkb opens read-write, and closing a WAL connection it believes is the
-    // last one checkpoints and truncates a WAL the host is still using. Residual: a process that
-    // runs with JKB_DB unset falls back to ~/.jkb/jkb.db.
+    // last one checkpoints and truncates a WAL the host is still using. A process with JKB_DB unset
+    // falls back to ~/.jkb/jkb.db and is REFUSED there: jkb-core's db::open rejects a database on a
+    // FUSE filesystem (crates/jkb-core/src/shared_fs.rs).
     "JKB_DB": "/home/vscode/.local/state/jkb/jkb.db",
     // See the target/ volume above: keeps cargo's output off the bind mount.
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",

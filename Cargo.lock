@@ -1920,6 +1920,7 @@ dependencies = [
  "proptest",
  "refinery",
  "rusqlite",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",

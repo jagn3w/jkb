@@ -43,6 +43,11 @@ fi
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
+# `jkb_sqlite` — every database read here goes through it, so a run inside the dev container refuses
+# the host's database instead of checkpointing a WAL the host is writing (scripts/lib.sh).
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
+
 # =====================================================================
 # FILE view — per-task disk marker vs KB status for one tasks.md
 # =====================================================================
@@ -54,6 +59,9 @@ file_view() {
     fi
     [ -f "$file" ] || { echo "no such file: $file" >&2; exit 1; }
     [ -f "$db" ]   || { echo "no such db: $db" >&2; exit 1; }
+    # Once, up front: the per-query refusals would otherwise read as "no sync_state row" and as KB
+    # data captured into $kb, which is a wrong answer rather than a refusal.
+    refuse_shared_db "$db" || exit 3
 
     local abs uri uri_sql
     abs=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
@@ -66,20 +74,18 @@ file_view() {
     echo
 
     echo "=== sync_state ==="
-    sqlite3 -header -column "$db" \
-        "SELECT status, substr(last_synced_hash,1,12) AS last_hash,
+    jkb_sqlite "$db" "SELECT status, substr(last_synced_hash,1,12) AS last_hash,
                 substr(base_blob_hash,1,12)  AS base_hash,
                 substr(quarantine_blob_hash,1,12) AS quar_hash,
                 parse_error, updated_at
-         FROM sync_state WHERE uri = '$uri_sql';" 2>&1 \
+         FROM sync_state WHERE uri = '$uri_sql';" -header -column 2>&1 \
       || echo "(no sync_state row — file not yet synced)"
     echo
 
     local kb
-    kb=$(sqlite3 -separator $'\t' "$db" \
-        "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
+    kb=$(jkb_sqlite "$db" "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
          FROM bindings b JOIN items i ON i.id = b.item_id
-         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" 2>&1 || true)
+         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" -separator $'\t' 2>&1 || true)
 
     echo "=== tasks (disk marker | kb status) ==="
     printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"

@@ -9,6 +9,7 @@ mod changelog;
 mod db;
 mod error;
 mod migrate;
+mod shared_fs;
 mod store;
 
 pub mod binding;

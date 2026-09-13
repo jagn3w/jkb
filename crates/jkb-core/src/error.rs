@@ -30,6 +30,31 @@ pub enum Error {
     #[error("database writer has stopped")]
     WriterClosed,
 
+    /// The database would live on a filesystem shared with another kernel, where `SQLite`'s locks
+    /// and wal-index do not hold (design r3.2 H1).
+    #[error(
+        "refusing to open a database in {} — it is on a {kind} filesystem shared with another \
+         kernel, where SQLite's locks and WAL index do not work: measured, a process on each side \
+         corrupted a database within 38 commits (.container/sqlite-share-probe.py). Use a database \
+         on a local disk (set JKB_DB or --db), or reach the host's knowledge base through its daemon",
+        path.display()
+    )]
+    SharedFilesystem {
+        /// The directory whose filesystem was judged.
+        path: std::path::PathBuf,
+        /// Which shared filesystem it is.
+        kind: &'static str,
+    },
+
+    /// Whether the database's directory is on a shared filesystem could not be established.
+    #[error("cannot tell what filesystem {} is on ({reason}); refusing to open a database there", path.display())]
+    FilesystemUnknown {
+        /// The directory that was asked.
+        path: std::path::PathBuf,
+        /// Why `statfs` failed.
+        reason: String,
+    },
+
     /// A schema migration left the database with dangling foreign-key references
     /// (detected by the post-migration `foreign_key_check`).
     #[error("migration left {0} foreign-key violation(s); database integrity check failed")]
