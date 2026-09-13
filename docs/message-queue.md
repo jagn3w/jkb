@@ -67,7 +67,17 @@ on. Without it, a batch of unacked messages comes back from every poll and nothi
 
 Errors carry a stable `code`: `no_such_topic`, `topic_conflict`, `no_such_group`, `queue_full`,
 `too_large`, `invalid`, `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
-it), `bad_request`, `internal`.
+it), `bad_request`, `busy` (another writer held the database lock past the busy timeout — transient,
+retry), `internal`. A code a client does not know decodes as `unknown` and is treated like
+`internal`, so a newer host can add codes. Under `--json`, every `jkb mq` verb except `subscribe`
+prints a refusal to stdout as `{"error":{"code":…,"message":…}}` as well as exiting 1.
+
+An idle `mq.poll` — nothing past the fetch position, and its `last_poll_at` refreshed within the hour
+(or a quarter of the topic's idle period, whichever is shorter) — is answered by a read and takes no
+write lock, so an idle subscriber does not contend with every other writer several times a second.
+
+`mq.tail` shows a message whose stored payload does not parse with its raw text and
+`"unreadable": true`, rather than stopping at it.
 
 ## `jkb mq subscribe` — the consumer stream
 
@@ -82,10 +92,19 @@ jkb mq subscribe <topic> --group <name> [--from-start] [--at-most-once] [--batch
 - `{"event":"message","message":{"seq":…,"key":…,"kind":…,"payload":…,"producer":…,"enqueued_at":…,"expires_at":…,"expired":…}}`
 - `{"event":"unreadable","seq":…,"reason":…}` — a stored payload that does not parse; reported once.
   Ack its `seq` to move past it.
+- `{"event":"caught_up","seq":…}` — the last poll returned less than a full batch: everything
+  available up to `seq` has been handed over. Emitted once when the stream first has nothing more,
+  and again after each burst. A consumer that folds messages (the notifier folds post/withdraw pairs
+  per notification) acts at this boundary rather than guessing with a timeout.
 - `{"event":"error","code":…,"reason":…,"fatal":bool}` — `fatal: true` is followed by exit status 1.
 
+**Consumers must ignore event types and fields they do not know.** Events and fields are only ever
+added; a strict decoder breaks on the first new one.
+
 **stdin, one command per line:** `{"ack":<seq>}` commits the group's position through `seq`. Anything
-else is answered with a non-fatal `bad_request` error event.
+else — including a line that is not UTF-8 — is answered with a non-fatal `bad_request` error event. A
+failure to READ stdin is fatal (exit 1), never treated as EOF, since acks after it would silently
+never apply.
 
 **Semantics.**
 
@@ -97,10 +116,18 @@ else is answered with a non-fatal `bad_request` error event.
 - **EOF on stdin ends the subscription**, after processing the acks that preceded it. Keep stdin open
   for as long as you want messages.
 - A closed stdout ends it with status 0.
+- A locked database (`busy`) is retried on the next poll, silently.
+- **Startup failures have no events:** a non-zero exit with nothing on stdout means the subscription
+  never started — bad arguments (clap, exit 2) or a database that could not be opened (exit 1) — and
+  stderr says which.
 - A group removed while subscribed (it idled out) is recreated from now, with a non-fatal
   `no_such_group` error event that says messages in between were not delivered.
 
-Pinned end to end by `tests/cli.rs` `mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack`.
+Pinned end to end through a real binary by `tests/cli.rs`
+`mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack` (delivery, ack, EOF, resume), and in
+`crates/jkb-cli/src/mq_cli.rs`'s tests for `caught_up`, `unreadable` (once, with its seq, moving on
+after an ack), a group recreated mid-stream, a closed stdout, a stdin read failure, bad commands and
+`--at-most-once`.
 
 ## Not yet
 

@@ -927,7 +927,9 @@ enum TaskCmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Archive session worktrees a landing could not move, and delete aged-out archives.
+    /// Archive session worktrees a landing could not move, and delete aged-out archives. Also
+    /// compacts the message queue (idle groups, consumed-and-expired messages); `--dry-run` skips
+    /// the compaction, and a database that cannot be opened stops only the compaction.
     ///
     /// A session cannot remove its OWN worktree — Claude Code protects a project's `.claude`
     /// policy files from the agent whose policy they are, and the refusal propagates up to the
@@ -1155,7 +1157,9 @@ fn run(cli: Cli) -> Result<()> {
     // binary does not know — routine across branches here. The host's `com.jkb.reap` unit is
     // whichever binary `setup.sh` last installed, so that divergence turned the one process that
     // finishes every deferred landing into a launchd restart-loop, with the only symptom in
-    // reap.log. It works from the record store beside the database, and needs nothing else.
+    // reap.log. The sweep works from the record store beside the database. The message queue's
+    // compaction, which this command also runs, DOES open the database — separately, per pass, in
+    // `compact_queue`, where a failure is reported and never stops the sweep.
     if let Command::Task {
         cmd: cmd @ TaskCmd::Reap { .. },
     } = cli.command
@@ -3227,8 +3231,8 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               must-fix finding open — anything at priority <= 1, so !p0 blocks
                               as well as !p1. --no-review records a waiver.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
-  jkb task reap               finish landings that could not move their own worktree, and
-                              delete archives past 30 days. A session may not unlink its own
+  jkb task reap               finish landings that could not move their own worktree, delete
+                              archives past 30 days, and compact the message queue. A session may not unlink its own
                               .claude policy files, so it cannot archive itself — land records
                               it and this, run anywhere else, finishes it. The watcher service
                               installed by `jkb service install` runs it on a timer.
@@ -6453,16 +6457,9 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         }
     }
     if !watch {
-        report_reap(
-            &archive::reap(db_path, retain_days, dry_run)?,
-            dry_run,
-            json,
-        );
-        if !dry_run {
-            if let Some(line) = compact_queue(db_path) {
-                println!("{line}");
-            }
-        }
+        let report = archive::reap(db_path, retain_days, dry_run)?;
+        let compaction = (!dry_run).then(|| compact_queue(db_path));
+        report_reap(&report, dry_run, json, compaction.as_ref());
         return Ok(());
     }
     // The service form. Ctrl-C stops it, the same shared-flag shape `sync --watch` uses.
@@ -6476,18 +6473,24 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     // is a log nobody reads the rest of; saying it once, and again when it changes, is the whole
     // of the signal.
     let mut last_observed = String::new();
-    let mut last_compaction = String::new();
+    let mut last_compaction_failure = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        // The queue's compaction rides the same timer (design r3.2 Q3). Printed only when it did
-        // something or its failure changed, for the same reason as the sweep's silence below.
+        // The queue's compaction rides the same timer (design r3.2 Q3). Work done is always
+        // printed — two passes that each reaped one message are two events, not a repeat. Only a
+        // FAILURE is silenced while unchanged, for the same reason as the sweep's silence below.
         if !dry_run {
-            if let Some(line) = compact_queue(db_path) {
-                if line != last_compaction {
-                    println!("{line}");
+            let c = compact_queue(db_path);
+            match &c {
+                Compaction::Failed(why) if *why == last_compaction_failure => {}
+                Compaction::Failed(why) => {
+                    last_compaction_failure.clone_from(why);
+                    print_compaction(&c, json);
                 }
-                last_compaction = line;
-            } else {
-                last_compaction.clear();
+                Compaction::Did(_) => {
+                    last_compaction_failure.clear();
+                    print_compaction(&c, json);
+                }
+                Compaction::Quiet => last_compaction_failure.clear(),
             }
         }
         match archive::reap(db_path, retain_days, dry_run) {
@@ -6496,7 +6499,7 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
             Ok(r) if r.is_empty() && r.observed() == last_observed => {}
             Ok(r) => {
                 last_observed = r.observed();
-                report_reap(&r, dry_run, json);
+                report_reap(&r, dry_run, json, None);
             }
             // A sweep that failed must not stop the service — the next one may well succeed, and
             // this is the process that finishes every deferred landing on the machine.
@@ -6513,38 +6516,71 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// One compaction pass of the message queue, for the reap service. `None` when there is nothing to
-/// say; a line when it reaped or removed something, or could not run.
+/// What one compaction pass of the message queue did.
+enum Compaction {
+    /// Nothing to reap or remove.
+    Quiet,
+    /// Reaped or removed something; the summary.
+    Did(String),
+    /// Could not run; why.
+    Failed(String),
+}
+
+fn print_compaction(c: &Compaction, json: bool) {
+    let (outcome, detail) = match c {
+        Compaction::Quiet => return,
+        Compaction::Did(d) => ("compacted", d),
+        Compaction::Failed(d) => ("failed", d),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "mq_compact": { "outcome": outcome, "detail": detail } })
+        );
+    } else {
+        println!("mq compact: {detail}");
+    }
+}
+
+/// One compaction pass of the message queue, for the reap service.
 ///
 /// It opens the database itself and never lets that failure reach the sweep. The sweep deliberately
 /// does not open the database — a schema this binary does not know would put the service into a
 /// restart loop — and compaction must not reintroduce that dependency through the back door.
 /// Compaction is a no-op for a topic compacted within its own interval, so asking every pass is
 /// cheap; "every few days" is the queue's rule, not this timer's.
-fn compact_queue(db_path: &Path) -> Option<String> {
+fn compact_queue(db_path: &Path) -> Compaction {
     use jkb_api::{Backend as _, Response};
     let db = match open_db(db_path) {
         Ok(db) => db,
-        Err(e) => return Some(format!("mq compact: not run ({e:#})")),
+        Err(e) => return Compaction::Failed(format!("not run ({e:#})")),
     };
     match jkb_api::LocalBackend::new(db).call(jkb_api::Request::MqCompact { force: false }) {
         Ok(Response::Compacted {
             messages_reaped,
             groups_removed,
             ..
-        }) if messages_reaped > 0 || groups_removed > 0 => Some(format!(
-            "mq compact: reaped {messages_reaped} message(s), removed {groups_removed} idle group(s)"
+        }) if messages_reaped > 0 || groups_removed > 0 => Compaction::Did(format!(
+            "reaped {messages_reaped} message(s), removed {groups_removed} idle group(s)"
         )),
-        Ok(_) => None,
-        Err(e) => Some(format!("mq compact: {}", e.message)),
+        Ok(_) => Compaction::Quiet,
+        Err(e) => Compaction::Failed(e.message),
     }
 }
 
-fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
+fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Option<&Compaction>) {
     if json {
+        // The queue's compaction rides in the same object: a second JSON document after this one
+        // made `jkb --json task reap`'s stdout neither JSON nor NDJSON.
+        let mq_compact = match compaction {
+            None | Some(Compaction::Quiet) => serde_json::Value::Null,
+            Some(Compaction::Did(d)) => serde_json::json!({ "outcome": "compacted", "detail": d }),
+            Some(Compaction::Failed(d)) => serde_json::json!({ "outcome": "failed", "detail": d }),
+        };
         println!(
             "{}",
             serde_json::json!({
+                "mq_compact": mq_compact,
                 "dry_run": dry_run,
                 "archived": r.archived.iter()
                     .map(|(uid, p)| serde_json::json!({ "uid": uid, "archive": p.display().to_string() }))
@@ -6625,6 +6661,9 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
             r.retained.len(),
             human_bytes(r.retained.iter().map(|p| archive::dir_size(p)).sum())
         );
+    }
+    if let Some(c) = compaction {
+        print_compaction(c, false);
     }
 }
 
@@ -7493,7 +7532,7 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
     }
     if fix {
         match archive::reap(db_path, archive::RETAIN_DAYS, false) {
-            Ok(r) => report_reap(&r, false, false),
+            Ok(r) => report_reap(&r, false, false, None),
             Err(e) => println!("  sweep failed: {e}"),
         }
     } else if !awaiting.is_empty() {

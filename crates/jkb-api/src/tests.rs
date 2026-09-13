@@ -25,7 +25,7 @@ fn a_request_is_an_op_tagged_object_and_round_trips() {
     assert_eq!(wire["op"], "mq.send");
     assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), r);
     assert_eq!(
-        serde_json::to_value(Request::MqInspect).unwrap(),
+        serde_json::to_value(Request::MqInspect {}).unwrap(),
         json!({ "op": "mq.inspect" })
     );
 }
@@ -43,6 +43,58 @@ fn an_unknown_op_or_field_is_refused_rather_than_ignored() {
         "op": "mq.topic_create", "topic": "t", "spec": { "max_bytes": 5, "retention": "7d" }
     }))
     .is_err());
+    // A field-less op too: as a unit variant this parsed and answered for every topic.
+    assert!(
+        serde_json::from_value::<Request>(json!({ "op": "mq.inspect", "topic": "x" })).is_err()
+    );
+    assert!(serde_json::from_value::<Request>(json!({ "op": "mq.inspect" })).is_ok());
+}
+
+#[test]
+fn an_error_code_from_a_newer_peer_decodes_as_unknown() {
+    let e: ApiError =
+        serde_json::from_value(json!({ "code": "rate_limited", "message": "slow down" })).unwrap();
+    assert_eq!(e.code, ErrorCode::Unknown);
+}
+
+#[test]
+fn a_corrupt_payload_is_reported_with_its_seq() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    call(&b, json!({ "op": "mq.topic_create", "topic": "t" })).unwrap();
+    call(
+        &b,
+        json!({ "op": "mq.group_create", "topic": "t", "group": "g", "from_start": true }),
+    )
+    .unwrap();
+    let Response::Sent { seq } = call(
+        &b,
+        json!({ "op": "mq.send", "topic": "t", "key": "k", "kind": "a", "payload": 1, "producer": "p" }),
+    )
+    .unwrap() else {
+        panic!("expected Sent")
+    };
+    db.write_txn("t", move |c, _| {
+        c.execute("UPDATE mq_messages SET payload = 'x' WHERE seq = ?1", [seq])?;
+        Ok(())
+    })
+    .unwrap();
+    let err = call(
+        &b,
+        json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 5 }),
+    )
+    .unwrap_err();
+    assert_eq!((err.code, err.seq), (ErrorCode::CorruptPayload, Some(seq)));
+    assert_eq!(serde_json::to_value(&err).unwrap()["seq"], seq);
+}
+
+#[test]
+fn a_locked_database_is_busy_not_internal() {
+    let err = ApiError::from(jkb_core::Error::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+        Some("database is locked".to_owned()),
+    )));
+    assert_eq!(err.code, ErrorCode::Busy);
 }
 
 #[test]
@@ -155,4 +207,40 @@ fn an_omitted_spec_field_takes_the_default() {
     assert_eq!(spec.max_messages, 3);
     assert_eq!(spec.max_bytes, jkb_core::mq::DEFAULT_MAX_BYTES);
     assert_eq!(spec.group_idle_ms, jkb_core::mq::DEFAULT_GROUP_IDLE_MS);
+}
+
+#[test]
+fn an_idle_poll_is_answered_without_a_write() {
+    // Observed through last_poll_at: the (writing) core poll refreshes it every time, so an unchanged
+    // value proves the backend answered the second poll from a read.
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    call(&b, json!({ "op": "mq.topic_create", "topic": "t" })).unwrap();
+    call(
+        &b,
+        json!({ "op": "mq.group_create", "topic": "t", "group": "g" }),
+    )
+    .unwrap();
+    let last_poll = || {
+        db.read(|c| {
+            Ok(c.query_row("SELECT last_poll_at FROM mq_groups", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?)
+        })
+        .unwrap()
+    };
+    call(
+        &b,
+        json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 5 }),
+    )
+    .unwrap();
+    let first = last_poll();
+    assert!(first.is_some(), "the first poll records itself");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    call(
+        &b,
+        json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 5 }),
+    )
+    .unwrap();
+    assert_eq!(last_poll(), first, "an idle poll took the write lock");
 }

@@ -3042,14 +3042,15 @@ fn mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack() {
     );
 }
 
-/// The reap service compacts the queue on its pass — and an unopenable database stops only the
-/// compaction, never the sweep.
+/// The reap service compacts the queue on its pass — and a database it cannot open stops only the
+/// compaction, never the sweep: not a garbage file, but a real database carrying a migration this
+/// binary does not know, which is the divergence the sweep was made schema-independent for.
 #[test]
 fn task_reap_compacts_the_message_queue() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("x.db");
-    let run = |args: &[&str]| {
-        let out = jkb(&db).args(args).output().unwrap();
+    let run = |db: &std::path::Path, args: &[&str]| {
+        let out = jkb(db).args(args).output().unwrap();
         assert!(
             out.status.success(),
             "{args:?}: {}",
@@ -3057,19 +3058,25 @@ fn task_reap_compacts_the_message_queue() {
         );
         String::from_utf8(out.stdout).unwrap()
     };
-    run(&["mq", "topic", "create", "t", "--default-ttl-ms", "1"]);
-    run(&["mq", "group", "create", "t", "g", "--from-start"]);
-    let seq = run(&[
-        "mq",
-        "send",
-        "t",
-        "--key",
-        "k",
-        "--kind",
-        "k.m",
-        "--payload",
-        "1",
-    ]);
+    run(
+        &db,
+        &["mq", "topic", "create", "t", "--default-ttl-ms", "1"],
+    );
+    run(&db, &["mq", "group", "create", "t", "g", "--from-start"]);
+    let seq = run(
+        &db,
+        &[
+            "mq",
+            "send",
+            "t",
+            "--key",
+            "k",
+            "--kind",
+            "k.m",
+            "--payload",
+            "1",
+        ],
+    );
     // Ack through a short subscription: the ack line is read before EOF ends it.
     let mut child = jkb(&db)
         .args([
@@ -3093,16 +3100,60 @@ fn task_reap_compacts_the_message_queue() {
     assert!(child.wait().unwrap().success());
     std::thread::sleep(std::time::Duration::from_millis(5));
 
-    let reap = run(&["task", "reap"]);
+    let reap = run(&db, &["task", "reap"]);
+    assert!(
+        reap.contains("nothing to reap"),
+        "the sweep reported: {reap}"
+    );
     assert!(reap.contains("mq compact: reaped 1 message(s)"), "{reap}");
 
-    let not_a_db = tmp.path().join("garbage.db");
-    std::fs::write(&not_a_db, b"not sqlite").unwrap();
-    let out = jkb(&not_a_db).args(["task", "reap"]).output().unwrap();
+    // `--json` is ONE document, with the compaction inside it.
+    let json = run(&db, &["--json", "task", "reap"]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("a single JSON document");
+    assert!(v.get("mq_compact").is_some(), "{v}");
+
+    // A database from a newer binary: refinery refuses to open it, and the sweep still runs.
+    let newer = tmp.path().join("newer.db");
+    run(&newer, &["mq", "topic", "ls"]);
+    // Through jkb_core::Db, never a raw rusqlite open: db::open is the one sanctioned opener.
+    jkb_core::Db::open(&newer)
+        .unwrap()
+        .write_txn("test", |conn, _| {
+            conn.execute(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (9999, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let out = jkb(&newer).args(["task", "reap"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "the sweep still ran: {}",
+        "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("mq compact: not run"));
+    assert!(
+        stdout.contains("nothing to reap"),
+        "the sweep ran: {stdout}"
+    );
+    assert!(stdout.contains("mq compact: not run"), "{stdout}");
+
+    // And under --watch, where compaction runs FIRST each pass, its failure does not end the service.
+    let mut watch = jkb(&newer)
+        .args(["task", "reap", "--watch", "--interval-secs", "60"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(watch.stdout.take().unwrap()));
+    let first = lines.next().unwrap().unwrap();
+    assert!(first.contains("mq compact: not run"), "{first}");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        watch.try_wait().unwrap().is_none(),
+        "the service is still running"
+    );
+    watch.kill().unwrap();
+    let _ = watch.wait();
 }

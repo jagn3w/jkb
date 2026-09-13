@@ -758,10 +758,13 @@ The container follow-up bucket. Design in `.container/README.md`; the container 
   `/run/jkb-egress-failed`, cleared only by a successful raise, so `verify.sh` — which runs as
   `vscode` and cannot ask iptables anything — observes what the firewall DID rather than what
   egress happens to do.
-- **`jkb task reap` no longer opens the database.** It touches no rows, but ran through the
+- **`jkb task reap`'s sweep no longer opens the database.** It touches no rows, but ran through the
   dispatch that migrates first — so the shared-`jkb.db` divergence this project documents as
   routine turned the one process that finishes every deferred landing into a launchd restart-loop,
-  with the only symptom in `reap.log`.
+  with the only symptom in `reap.log`. *Partly superseded:* the command now also compacts the
+  message queue, which does open the database — separately, each pass, where a failure is reported
+  and never stops the sweep (`docs/message-queue.md`; pinned by `task_reap_compacts_the_message_queue`
+  against a database carrying a migration the binary does not know).
 - **`gitrepo::deletions_only`** tells a part-way removal from work in progress. The second land
   attempt refused with *"it has uncommitted changes — commit them in the session first"*, which
   over 152 deletions means committing the wreckage. Asked as four whitespace-free git questions,

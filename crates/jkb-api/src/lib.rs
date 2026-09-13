@@ -95,8 +95,12 @@ pub enum Request {
         force: bool,
     },
     /// Every topic's holdings and groups.
+    ///
+    /// An EMPTY STRUCT variant, not a unit one: serde ignores extra keys on a unit variant of an
+    /// internally tagged enum even under `deny_unknown_fields`, so `{"op":"mq.inspect","topic":…}`
+    /// parsed and answered for every topic. Every field-less op must be written this way.
     #[serde(rename = "mq.inspect")]
-    MqInspect,
+    MqInspect {},
     /// The newest messages a topic holds, oldest first, without touching any group.
     #[serde(rename = "mq.tail")]
     MqTail {
@@ -163,6 +167,9 @@ pub struct Message {
     pub expires_at: Option<i64>,
     /// Whether it had expired when read. Delivered anyway.
     pub expired: bool,
+    /// Only from `mq.tail`: the stored payload does not parse and `payload` is its raw text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable: bool,
 }
 
 impl From<mq::Delivered> for Message {
@@ -176,6 +183,7 @@ impl From<mq::Delivered> for Message {
             enqueued_at: d.enqueued_at,
             expires_at: d.expires_at,
             expired: d.expired,
+            unreadable: d.unreadable,
         }
     }
 }
@@ -325,8 +333,13 @@ pub enum ErrorCode {
     CorruptPayload,
     /// The request itself could not be read.
     BadRequest,
+    /// The database was locked by another writer for longer than the busy timeout. Transient: retry.
+    Busy,
     /// Anything else: a database or internal failure.
     Internal,
+    /// A code this build does not know, from a newer peer. Clients treat it like `internal`.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a request failed.
@@ -362,6 +375,8 @@ impl From<jkb_core::Error> for ApiError {
     fn from(e: jkb_core::Error) -> Self {
         let message = e.to_string();
         let code = match &e {
+            // Exhaustive on purpose (QueueError is not `#[non_exhaustive]`): a new refusal must
+            // choose its wire code here rather than reach clients as `internal`.
             jkb_core::Error::Queue(q) => match q {
                 QueueError::NoSuchTopic(_) => ErrorCode::NoSuchTopic,
                 QueueError::TopicConflict(_) => ErrorCode::TopicConflict,
@@ -370,6 +385,7 @@ impl From<jkb_core::Error> for ApiError {
                 QueueError::TooLarge { .. } => ErrorCode::TooLarge,
                 QueueError::Invalid { .. } => ErrorCode::Invalid,
                 QueueError::AckBeyondEnd { .. } => ErrorCode::AckBeyondEnd,
+                QueueError::Corrupt(_) => ErrorCode::Internal,
                 QueueError::CorruptPayload { seq, .. } => {
                     return Self {
                         code: ErrorCode::CorruptPayload,
@@ -377,8 +393,15 @@ impl From<jkb_core::Error> for ApiError {
                         seq: Some(*seq),
                     }
                 }
-                _ => ErrorCode::Internal,
             },
+            jkb_core::Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
+                if matches!(
+                    f.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                ErrorCode::Busy
+            }
             _ => ErrorCode::Internal,
         };
         Self::new(code, message)
@@ -411,6 +434,7 @@ impl LocalBackend {
 const ACTOR: &str = "jkb-api";
 
 impl Backend for LocalBackend {
+    #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
     fn call(&self, request: Request) -> Result<Response, ApiError> {
         let now = mq::now_ms();
         let created = |c: Created| Response::Created {
@@ -463,16 +487,29 @@ impl Backend for LocalBackend {
                 group,
                 max,
                 after,
-            } => Response::Messages {
-                messages: self
+            } => {
+                // Asked with a read first: an idle subscriber polls several times a second, and a
+                // poll that hands nothing over and has no touch due must not take the write lock.
+                let (t, g) = (topic.clone(), group.clone());
+                if !self
                     .db
-                    .write_txn(ACTOR, move |c, m| {
-                        mq::poll(c, m, &topic, &group, max, after, now)
-                    })?
-                    .into_iter()
-                    .map(Message::from)
-                    .collect(),
-            },
+                    .read(move |c| mq::poll_needed(c, &t, &g, after, now))?
+                {
+                    return Ok(Response::Messages {
+                        messages: Vec::new(),
+                    });
+                }
+                Response::Messages {
+                    messages: self
+                        .db
+                        .write_txn(ACTOR, move |c, m| {
+                            mq::poll(c, m, &topic, &group, max, after, now)
+                        })?
+                        .into_iter()
+                        .map(Message::from)
+                        .collect(),
+                }
+            }
             Request::MqAck { topic, group, seq } => Response::Position {
                 position: self
                     .db
@@ -489,7 +526,7 @@ impl Backend for LocalBackend {
                     groups_removed: r.groups_removed,
                 }
             }
-            Request::MqInspect => Response::Topics {
+            Request::MqInspect {} => Response::Topics {
                 topics: self
                     .db
                     .read(mq::inspect)?

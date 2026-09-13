@@ -8,7 +8,7 @@
 //! line on stdin. The protocol is specified in `docs/message-queue.md`, and pinned end to end by
 //! `tests/cli.rs` driving a real `jkb` through pipes.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead as _, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
@@ -134,12 +134,16 @@ pub enum GroupCmd {
     },
 }
 
-fn api(e: &ApiError) -> anyhow::Error {
-    anyhow!("{}", e.message)
-}
-
-fn call(backend: &dyn Backend, request: Request) -> Result<Response> {
-    backend.call(request).map_err(|e| api(&e))
+/// Call the backend; a refusal becomes an error, and under `--json` it is ALSO printed to stdout as
+/// `{"error":{"code":…,"message":…}}` — so a scripted producer can branch on `queue_full` versus
+/// `no_such_topic` rather than on stderr prose and a shared exit status of 1.
+fn call(backend: &dyn Backend, request: Request, json_out: bool) -> Result<Response> {
+    backend.call(request).map_err(|e| {
+        if json_out {
+            println!("{}", json!({ "error": e }));
+        }
+        anyhow!("{}", e.message)
+    })
 }
 
 fn print_json(v: &impl serde::Serialize) -> Result<()> {
@@ -148,7 +152,7 @@ fn print_json(v: &impl serde::Serialize) -> Result<()> {
 }
 
 fn topics(backend: &dyn Backend) -> Result<Vec<Topic>> {
-    match call(backend, Request::MqInspect)? {
+    match call(backend, Request::MqInspect {}, false)? {
         Response::Topics { topics } => Ok(topics),
         other => bail!("unexpected response to mq.inspect: {other:?}"),
     }
@@ -208,6 +212,7 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
                     topic: topic.clone(),
                     spec,
                 },
+                json_out,
             )?;
             if json_out {
                 return print_json(&r);
@@ -233,6 +238,7 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
                     group: group.clone(),
                     from_start,
                 },
+                json_out,
             )?;
             if json_out {
                 return print_json(&r);
@@ -299,6 +305,7 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
                     ttl_ms,
                     producer: producer.unwrap_or_else(|| format!("jkb-cli:{}", std::process::id())),
                 },
+                json_out,
             )?;
             if json_out {
                 return print_json(&r);
@@ -309,7 +316,8 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
             Ok(())
         }
         MqCmd::Tail { topic, limit } => {
-            let Response::Messages { messages } = call(backend, Request::MqTail { topic, limit })?
+            let Response::Messages { messages } =
+                call(backend, Request::MqTail { topic, limit }, json_out)?
             else {
                 bail!("unexpected response to mq.tail");
             };
@@ -329,7 +337,7 @@ pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
             Ok(())
         }
         MqCmd::Compact { force } => {
-            let r = call(backend, Request::MqCompact { force })?;
+            let r = call(backend, Request::MqCompact { force }, json_out)?;
             if json_out {
                 return print_json(&r);
             }
@@ -405,10 +413,12 @@ pub struct SubscribeOpts {
 pub enum Input {
     /// `{"ack": <seq>}`.
     Ack(i64),
-    /// A line that is not a command this protocol knows.
+    /// A line that is not a command this protocol knows (including one that is not UTF-8).
     Bad(String),
     /// stdin closed.
     Eof,
+    /// Reading stdin failed. Not EOF: acks sent after it would silently never apply.
+    ReadFailed(String),
 }
 
 /// Parse one stdin line.
@@ -426,16 +436,26 @@ pub fn parse_input(line: &str) -> Input {
 fn spawn_stdin_reader() -> Receiver<Input> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            if line.trim().is_empty() {
-                continue;
-            }
-            if tx.send(parse_input(&line)).is_err() {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let input = match stdin.read_until(b'\n', &mut buf) {
+                Ok(0) => Input::Eof,
+                // Bytes, not `lines()`: a line that is not UTF-8 is a bad command to report, not a
+                // read error that ends the stream and silently drops every ack after it.
+                Ok(_) => match std::str::from_utf8(&buf) {
+                    Ok(line) if line.trim().is_empty() => continue,
+                    Ok(line) => parse_input(line),
+                    Err(_) => Input::Bad(String::from_utf8_lossy(&buf).trim_end().to_owned()),
+                },
+                Err(e) => Input::ReadFailed(e.to_string()),
+            };
+            let last = matches!(input, Input::Eof | Input::ReadFailed(_));
+            if tx.send(input).is_err() || last {
                 return;
             }
         }
-        let _ = tx.send(Input::Eof);
     });
     rx
 }
@@ -452,8 +472,13 @@ fn error_event(code: ErrorCode, reason: &str, fatal: bool) -> Value {
 /// stdout. Returns the process exit code: 0 for a clean end (stdin closed, or stdout gone), 1 after
 /// a fatal error event.
 ///
-/// Never emits a message twice in one run: an unacked message comes back from every poll, so the
-/// loop remembers the highest seq it has emitted and skips what it has already handed over.
+/// Never emits a message twice in one run: each poll asks for what comes after the last seq this run
+/// emitted (`after`, the fetch position), not after the committed position, which is where unacked
+/// messages still sit.
+///
+/// Emits `caught_up` when a poll returns fewer messages than a batch holds — once when the stream
+/// first has nothing more to hand over, and again after each burst — so a consumer can fold a
+/// backlog to its net effect before acting. A locked database (`busy`) is retried, not fatal.
 ///
 /// # Errors
 /// Only for failures outside the protocol; a refused operation is reported as an error event.
@@ -469,6 +494,7 @@ pub fn subscribe(
     }
     let mut emitted: i64 = 0;
     let mut reported_corrupt: Option<i64> = None;
+    let mut caught_up_announced = false;
     loop {
         loop {
             match inputs.try_recv() {
@@ -494,6 +520,7 @@ pub fn subscribe(
         let mut handed_over = false;
         match polled {
             Ok(Response::Messages { messages }) => {
+                let drained = messages.len() < o.batch;
                 for m in messages {
                     if o.at_most_once {
                         if let Err(e) = backend.call(ack(o, m.seq)) {
@@ -507,6 +534,12 @@ pub fn subscribe(
                     emitted = m.seq;
                     handed_over = true;
                 }
+                if drained && (handed_over || !caught_up_announced) {
+                    caught_up_announced = true;
+                    if !emit(out, &json!({ "event": "caught_up", "seq": emitted })) {
+                        return Ok(0);
+                    }
+                }
             }
             Ok(other) => bail!("unexpected response to mq.poll: {other:?}"),
             Err(e) if e.code == ErrorCode::NoSuchGroup => {
@@ -515,6 +548,8 @@ pub fn subscribe(
                 }
                 continue;
             }
+            // Another writer held the lock past the busy timeout. Transient: wait and poll again.
+            Err(e) if e.code == ErrorCode::Busy => {}
             Err(e) if e.code == ErrorCode::CorruptPayload => {
                 // Reported once; the consumer decides whether to ack past it.
                 if reported_corrupt != e.seq {
@@ -570,6 +605,13 @@ fn handle_input(
 ) -> Option<i32> {
     match input {
         Input::Eof => Some(0),
+        Input::ReadFailed(why) => {
+            emit(
+                out,
+                &error_event(ErrorCode::Internal, &format!("reading stdin: {why}"), true),
+            );
+            Some(1)
+        }
         Input::Bad(line) => {
             let event = error_event(
                 ErrorCode::BadRequest,
@@ -768,6 +810,173 @@ mod tests {
         assert_eq!(errors[1]["code"], "ack_beyond_end");
         assert!(errors.iter().all(|e| e["fatal"] == false));
         assert_eq!(seqs(&ev), vec![1]);
+    }
+
+    fn run_for(b: &LocalBackend, o: &SubscribeOpts, ms: u64) -> Vec<Value> {
+        let (tx, rx) = channel();
+        let mut out = Vec::new();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            let _ = tx.send(Input::Eof);
+        });
+        subscribe(b, o, &rx, &mut out).unwrap();
+        h.join().unwrap();
+        events(&out)
+    }
+
+    #[test]
+    fn caught_up_marks_the_end_of_a_backlog_and_of_each_burst() {
+        let b = backend_with(5);
+        let ev = run_for(&b, &opts(false), 60);
+        let kinds: Vec<&str> = ev.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        // batch 2: [1,2] [3,4] [5]+caught_up, then idle polls announce nothing more.
+        assert_eq!(
+            kinds,
+            vec![
+                "message",
+                "message",
+                "message",
+                "message",
+                "message",
+                "caught_up"
+            ]
+        );
+        assert_eq!(ev[5]["seq"], 5);
+        // An empty topic announces caught_up once, straight away.
+        let b = backend_with(0);
+        let ev = run_for(&b, &opts(false), 40);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            (ev[0]["event"].clone(), ev[0]["seq"].clone()),
+            (json!("caught_up"), json!(0))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_message_is_reported_once_with_its_seq_and_an_ack_moves_past_it() {
+        let db = Db::open_in_memory().unwrap();
+        let b = LocalBackend::new(db.clone());
+        b.call(Request::MqTopicCreate {
+            topic: "t".to_owned(),
+            spec: jkb_api::SpecInput::default(),
+        })
+        .unwrap();
+        b.call(Request::MqGroupCreate {
+            topic: "t".to_owned(),
+            group: "g".to_owned(),
+            from_start: true,
+        })
+        .unwrap();
+        for i in 0..2 {
+            b.call(Request::MqSend {
+                topic: "t".to_owned(),
+                key: "k".to_owned(),
+                kind: "k.m".to_owned(),
+                payload: json!(i),
+                ttl_ms: None,
+                producer: "test".to_owned(),
+            })
+            .unwrap();
+        }
+        db.write_txn("t", |c, _| {
+            c.execute("UPDATE mq_messages SET payload = 'x' WHERE seq = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let (tx, rx) = channel();
+        let mut out = Vec::new();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(Input::Ack(1)).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(Input::Eof).unwrap();
+        });
+        subscribe(&b, &opts(false), &rx, &mut out).unwrap();
+        h.join().unwrap();
+        let ev = events(&out);
+        let unreadable: Vec<&Value> = ev.iter().filter(|e| e["event"] == "unreadable").collect();
+        assert_eq!(unreadable.len(), 1, "reported once, not every poll: {ev:?}");
+        assert_eq!(unreadable[0]["seq"], 1);
+        assert_eq!(seqs(&ev), vec![2], "after the ack, the stream moves on");
+    }
+
+    #[test]
+    fn a_group_removed_mid_stream_is_recreated_with_a_non_fatal_event() {
+        let db = Db::open_in_memory().unwrap();
+        let b = LocalBackend::new(db.clone());
+        b.call(Request::MqTopicCreate {
+            topic: "t".to_owned(),
+            spec: jkb_api::SpecInput::default(),
+        })
+        .unwrap();
+        let (tx, rx) = channel();
+        let mut out = Vec::new();
+        let db2 = db.clone();
+        let b2 = b.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            db2.write_txn("t", |c, _| {
+                c.execute("DELETE FROM mq_groups", [])?;
+                Ok(())
+            })
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            b2.call(Request::MqSend {
+                topic: "t".to_owned(),
+                key: "k".to_owned(),
+                kind: "k.m".to_owned(),
+                payload: json!("after"),
+                ttl_ms: None,
+                producer: "test".to_owned(),
+            })
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            tx.send(Input::Eof).unwrap();
+        });
+        assert_eq!(subscribe(&b, &opts(false), &rx, &mut out).unwrap(), 0);
+        h.join().unwrap();
+        let ev = events(&out);
+        let err = ev
+            .iter()
+            .find(|e| e["event"] == "error")
+            .expect("an error event");
+        assert_eq!(
+            (err["code"].clone(), err["fatal"].clone()),
+            (json!("no_such_group"), json!(false))
+        );
+        assert_eq!(
+            ev.iter().filter(|e| e["event"] == "message").count(),
+            1,
+            "and it keeps delivering"
+        );
+    }
+
+    struct Closed;
+    impl std::io::Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_stdout_ends_the_subscription_cleanly() {
+        let b = backend_with(3);
+        let (_tx, rx) = channel();
+        assert_eq!(subscribe(&b, &opts(false), &rx, &mut Closed).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_stdin_read_failure_is_fatal_not_eof() {
+        let b = backend_with(0);
+        let (tx, rx) = channel();
+        tx.send(Input::ReadFailed("boom".to_owned())).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(subscribe(&b, &opts(false), &rx, &mut out).unwrap(), 1);
+        let ev = events(&out);
+        assert_eq!(ev.last().unwrap()["fatal"], true);
     }
 
     #[test]

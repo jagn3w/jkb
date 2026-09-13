@@ -2,8 +2,8 @@ use proptest::prelude::*;
 use serde_json::json;
 
 use super::{
-    ack, compact, group_create, inspect, now_ms, poll, send, tail, topic_create, Created,
-    Delivered, Draft, QueueError, Start, TopicSpec,
+    ack, compact, group_create, inspect, now_ms, poll, poll_needed, send, tail, topic_create,
+    Created, Delivered, Draft, QueueError, Start, TopicSpec,
 };
 use crate::{Db, Error};
 
@@ -433,6 +433,15 @@ fn every_draft_and_spec_guard_refuses_with_a_named_error() {
         refuse(draft("\0host/a", 1)),
         QueueError::Invalid { what: "key", .. }
     ));
+    let mut d = draft("k", 1);
+    d.producer = "p\0".to_owned();
+    assert!(matches!(
+        refuse(d),
+        QueueError::Invalid {
+            what: "producer",
+            ..
+        }
+    ));
 
     let long = "t".repeat(super::MAX_NAME_BYTES + 1);
     let err = db
@@ -605,6 +614,38 @@ fn a_fetch_position_past_the_committed_one_reads_on_without_acking() {
 }
 
 #[test]
+fn an_idle_poll_needs_no_write_until_its_touch_is_due() {
+    let spec = TopicSpec {
+        group_idle_ms: 400,
+        ..TopicSpec::default()
+    };
+    let db = db_with_topic(spec);
+    do_group(&db, "g", Start::FromStart, T0);
+    let needed = |now: i64, after: Option<i64>| {
+        db.read(move |c| poll_needed(c, "t", "g", after, now))
+            .unwrap()
+    };
+    assert!(
+        needed(T0, None),
+        "never polled: the first poll records itself"
+    );
+    do_poll(&db, "g", 10, T0);
+    assert!(
+        !needed(T0 + 1, None),
+        "nothing new and just touched: no write"
+    );
+    // The touch is due at a quarter of the idle period here, so a live consumer outlives compaction.
+    assert!(needed(T0 + 100, None));
+    let s = do_send(&db, draft("k", 1), T0 + 2).unwrap();
+    assert!(needed(T0 + 3, None), "a message to hand over");
+    assert!(!needed(T0 + 3, Some(s)), "…but not past the fetch position");
+    let err = db
+        .read(|c| poll_needed(c, "t", "ghost", None, T0))
+        .unwrap_err();
+    assert!(matches!(queue_err(err), QueueError::NoSuchGroup { .. }));
+}
+
+#[test]
 fn tail_shows_the_newest_messages_oldest_first_without_moving_any_group() {
     let db = db_with_topic(TopicSpec::default());
     do_group(&db, "g", Start::FromStart, T0);
@@ -620,6 +661,21 @@ fn tail_shows_the_newest_messages_oldest_first_without_moving_any_group() {
     );
     let err = db.read(|c| tail(c, "missing", 2, T0)).unwrap_err();
     assert!(matches!(queue_err(err), QueueError::NoSuchTopic(_)));
+
+    // An unreadable payload is shown, flagged, and does not hide the newer messages after it.
+    let bad = seqs[3];
+    db.write_txn("t", move |c, _| {
+        c.execute(
+            "UPDATE mq_messages SET payload = 'nope' WHERE seq = ?1",
+            [bad],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let got = db.read(|c| tail(c, "t", 2, T0)).unwrap();
+    assert_eq!(got.len(), 2);
+    assert!(got[0].unreadable && !got[1].unreadable);
+    assert_eq!(got[0].payload, serde_json::json!("nope"));
 }
 
 // --- the reaping rules, against a model ------------------------------------------------------

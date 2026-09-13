@@ -1890,6 +1890,7 @@ name = "jkb-api"
 version = "0.1.0"
 dependencies = [
  "jkb-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

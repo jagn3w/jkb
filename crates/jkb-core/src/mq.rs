@@ -57,8 +57,11 @@ pub const DEFAULT_COMPACT_EVERY_MS: i64 = 3 * DAY_MS;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Why a queue operation was refused.
+///
+/// Deliberately NOT `#[non_exhaustive]`: `jkb-api` maps every variant to a stable wire code, and an
+/// exhaustive match there is what makes a new refusal decide its code instead of arriving at clients
+/// as `internal`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum QueueError {
     /// The topic does not exist. Producers never create one implicitly: a topic's type and caps
     /// are decided once, by [`topic_create`].
@@ -247,6 +250,9 @@ pub struct Delivered {
     pub expires_at: Option<i64>,
     /// Whether it had expired at the poll. Delivered anyway: a TTL never skips anything.
     pub expired: bool,
+    /// Only from [`tail`]: the stored payload does not parse, and `payload` holds its raw text. A
+    /// poll never hands such a message over (it names it with [`QueueError::CorruptPayload`]).
+    pub unreadable: bool,
 }
 
 /// What [`compact`] did.
@@ -526,8 +532,11 @@ fn validate_draft(
     }
     // One rule, here: the table's `length(key) > 0` CHECK stops counting at a NUL, so a key starting
     // with one would pass `is_empty` and then fail as a raw SQLite error.
-    if draft.key.contains('\0') || draft.producer.contains('\0') {
+    if draft.key.contains('\0') {
         return Err(invalid("key", "contains NUL"));
+    }
+    if draft.producer.contains('\0') {
+        return Err(invalid("producer", "contains NUL"));
     }
     if draft.key.len() > MAX_KEY_BYTES {
         return Err(too_large("key", draft.key.len(), MAX_KEY_BYTES));
@@ -680,10 +689,10 @@ pub fn poll(
 }
 
 /// The newest `limit` messages a topic holds, oldest first, without touching any group — for
-/// `jkb mq tail`. Same payload handling as [`poll`].
+/// `jkb mq tail`. A payload that does not parse is returned flagged [`Delivered::unreadable`].
 ///
 /// # Errors
-/// [`QueueError::NoSuchTopic`], [`QueueError::CorruptPayload`], or a database error.
+/// [`QueueError::NoSuchTopic`], or a database error.
 pub fn tail(conn: &Connection, topic: &str, limit: usize, now: i64) -> Result<Vec<Delivered>> {
     let (topic_id, _) = topic_row(conn, topic)?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -695,7 +704,20 @@ pub fn tail(conn: &Connection, topic: &str, limit: usize, now: i64) -> Result<Ve
         params![topic_id, limit],
         now,
     )?;
-    parse_payloads(topic, rows)
+    // A diagnostic view, so an unreadable payload is SHOWN (raw text, flagged) rather than ending
+    // the listing: stopping at it would hide exactly the newest messages someone tailed to see.
+    Ok(rows
+        .into_iter()
+        .map(|mut d| {
+            if let Value::String(text) = &d.payload {
+                match serde_json::from_str(text) {
+                    Ok(value) => d.payload = value,
+                    Err(_) => d.unreadable = true,
+                }
+            }
+            d
+        })
+        .collect())
 }
 
 /// Rows of `seq, key, kind, payload, producer, enqueued_at, expires_at`, with the payload still its
@@ -720,6 +742,7 @@ fn message_rows(
                 enqueued_at: r.get(5)?,
                 expires_at,
                 expired: expires_at.is_some_and(|at| at <= now),
+                unreadable: false,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
@@ -752,6 +775,49 @@ fn parse_payloads(topic: &str, rows: Vec<Delivered>) -> Result<Vec<Delivered>> {
         }
     }
     Ok(out)
+}
+
+/// How often [`poll`] refreshes a group's `last_poll_at` when it hands nothing over: at most every
+/// hour, and at most a quarter of the topic's `group_idle_ms`, so a live consumer is never removed as
+/// idle. Refreshing on every empty poll made an idle subscriber take the write lock four times a
+/// second to rewrite a value compaction reads at day resolution.
+pub const POLL_TOUCH_MS: i64 = 60 * 60 * 1000;
+
+/// Whether a [`poll`] with these arguments has anything to do — messages to hand over, or a
+/// `last_poll_at` due a refresh. A read, so an idle consumer can ask without taking the write lock;
+/// callers skip the (writing) poll when it answers `false`.
+///
+/// # Errors
+/// [`QueueError::NoSuchTopic`], [`QueueError::NoSuchGroup`], or a database error — the same refusals
+/// the poll itself would give.
+pub fn poll_needed(
+    conn: &Connection,
+    topic: &str,
+    group: &str,
+    after: Option<i64>,
+    now: i64,
+) -> Result<bool> {
+    let (topic_id, spec) = topic_row(conn, topic)?;
+    let (position, last_poll_at): (i64, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT position, last_poll_at FROM mq_groups WHERE topic_id = ?1 AND name = ?2",
+        )?
+        .query_row(params![topic_id, group], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or_else(|| QueueError::NoSuchGroup {
+            topic: topic.to_owned(),
+            group: group.to_owned(),
+        })?;
+    let touch_every = POLL_TOUCH_MS.min((spec.group_idle_ms / 4).max(1));
+    if last_poll_at.is_none_or(|at| now.saturating_sub(at) >= touch_every) {
+        return Ok(true);
+    }
+    let from = position.max(after.unwrap_or(0));
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM mq_messages WHERE topic_id = ?1 AND seq > ?2)",
+        )?
+        .query_row(params![topic_id, from], |r| r.get(0))?)
 }
 
 /// Commit the group's position through `seq` (cumulative; never moves backwards). Returns the
