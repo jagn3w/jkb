@@ -3038,6 +3038,30 @@ fn mq_refusals_are_on_stdout_under_json() {
         String::from_utf8_lossy(&out.stderr).contains("--payload is not valid JSON"),
         "stderr keeps the prose"
     );
+    // A database a newer jkb migrated, met before any operation runs: `schema_newer`, on stdout too.
+    let newer = tmp.path().join("newer.db");
+    {
+        let opened = jkb_core::Db::open(&newer).unwrap();
+        let future = jkb_core::supported_schema_version() + 1;
+        opened
+            .write_txn("test", move |conn, _| {
+                conn.execute(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                     VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                    [future],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let out = jkb(&newer)
+        .args(["--json", "mq", "topic", "ls"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(stdout["error"]["code"], "schema_newer", "{stdout}");
 }
 
 /// `jkb mq` end to end through a real binary: create a topic, send, and consume through
@@ -3371,6 +3395,20 @@ fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
         "every unit written is listed, and nothing else: {units}"
     );
     assert!(units.contains("com.jkb.serve\t"), "{units}");
+
+    // The unit passes no `--addr`, which is what makes serve's default the address to ask.
+    let serve_unit = units
+        .lines()
+        .find_map(|l| l.strip_prefix("com.jkb.serve\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .unwrap();
+    assert!(!std::fs::read_to_string(serve_unit)
+        .unwrap()
+        .contains("--addr"));
+    assert_eq!(
+        run(&["service", "serve-url"]).trim(),
+        format!("http://{}", jkb_daemon::DEFAULT_ADDR)
+    );
 
     let token = run(&["service", "token-path"]);
     let token = Path::new(token.trim());

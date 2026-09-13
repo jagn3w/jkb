@@ -18,9 +18,9 @@ new_workdir
 
 # stubs <os> — a fresh bin dir of stub `jkb`, `uname`, `systemctl` and `launchctl` on PATH.
 # `jkb service units` prints each of $STUB_LABELS with a path under $HOME/units (or fails with
-# STUB_LABELS_FAIL=1), `jkb service token-path` a path under the stub KB, and `jkb mq topic ls` (the
-# database check) fails with STUB_DB_REFUSES=1; every manager call is logged
-# to $log; starting `com.jkb.serve` writes its token unless STUB_SERVE_DOWN=1, and a unit
+# STUB_LABELS_FAIL=1), `jkb service token-path` a path under the stub KB, and the remote-mode
+# `jkb --json mq topic ls` asked of the daemon answers as STUB_DAEMON_SAYS (ok | schema_newer |
+# other); every manager call is logged to $log; starting `com.jkb.serve` writes its token unless STUB_SERVE_DOWN=1, and a unit
 # named in STUB_BROKEN fails to start. STUB_SERVE_DELAY (Linux) delays the token like a slow start.
 stubs() {
     local os="$1"
@@ -34,8 +34,18 @@ case "$3 $4" in
         role=watcher; [ "$l" = com.jkb.serve ] && role=serve
         printf '%s\t%s\t%s\n' "$l" "$HOME/units/$l.unit" "$role"
     done ;;
-    "mq topic") if [ "${STUB_DB_REFUSES:-0}" = 1 ]; then exit 1; fi ;;
     "service token-path") printf '%s\n' "$STUB_KB/daemon/token" ;;
+    "service serve-url") printf 'http://127.0.0.1:7117\n' ;;
+    *)
+        # `--json mq topic ls` in remote mode: the daemon's answer, as STUB_DAEMON_SAYS scripts it.
+        if [ "$1 $2 $3 $4" = "--json mq topic ls" ]; then
+            [ -z "${JKB_DB:-}" ] || { echo "JKB_DB leaked into remote mode" >&2; exit 9; }
+            case "${STUB_DAEMON_SAYS:-ok}" in
+                ok) echo '[]' ;;
+                schema_newer) echo '{"error":{"code":"schema_newer","message":"newer"}}'; exit 1 ;;
+                *) echo '{"error":{"code":"unavailable","message":"busy starting"}}'; exit 1 ;;
+            esac
+        fi ;;
 esac
 EOF
     printf '#!/usr/bin/env bash\necho %s\n' "$os" >"$bin/uname"
@@ -71,6 +81,8 @@ activate() {
     (
         PATH="$bin:$PATH" HOME="${bin%/bin}"
         export JKB_SERVE_READY_WAIT=2
+        # As setup.sh has it: the daemon must be asked without it (remote mode refuses JKB_DB).
+        export JKB_DB="$db"
         activate_services "$db" >/dev/null 2>&1
         echo "$watcher_state $serve_state"
     )
@@ -138,9 +150,15 @@ case4b() {
     [ "$state" = "running failed" ] && ok "a serve unit that will not restart: serve failed, the watcher running" \
         || fail "serve broken: state" "got '$state'"
     stubs Linux
-    state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_DB_REFUSES=1 activate)"
-    [ "$state" = "running refusing" ] && ok "a daemon listening over a database it cannot open: refusing, not up" \
+    state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_DAEMON_SAYS=schema_newer activate)"
+    [ "$state" = "failed refusing" ] \
+        && ok "a daemon answering schema_newer: refusing, and the watcher (same jkb) failed too" \
         || fail "serve refusing: state" "got '$state'"
+    stubs Linux
+    state="$(STUB_LABELS="com.jkb.sync com.jkb.serve" STUB_DAEMON_SAYS=other activate)"
+    [ "$state" = "running undecided" ] \
+        && ok "any other answer decides nothing: undecided, not refusing" \
+        || fail "serve undecided: state" "got '$state'"
 }
 
 # --- 5. launchd: every listed unit is loaded from the path jkb names ------------------------------------------------

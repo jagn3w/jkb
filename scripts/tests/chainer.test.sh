@@ -1464,6 +1464,7 @@ case15() {
         'serve=unchecked|jkb serve:  not checked'
         'serve=failed|jkb serve:  NOT up'
         'serve=refusing|REFUSING every request'
+        'serve=undecided|could not confirm it serves'
     )
     for entry in "${table[@]}"; do
         line="${entry%%|*}"; want="${entry#*|}"

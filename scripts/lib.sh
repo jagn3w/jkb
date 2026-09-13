@@ -1575,6 +1575,7 @@ render_git_hooks_report() {
 #   scaffold=<state> [detail]  created | untouched | skipped | failed
 #   extension=<state>          installed | skipped | failed
 #   watcher=<state>            running | skipped | failed
+#   serve=<state>              up | refusing | undecided | failed | unchecked | skipped
 #
 # Every `case` has a default arm that warns, so a state added to the producer with no arm here
 # surfaces at runtime instead of vanishing.
@@ -1622,7 +1623,8 @@ render_setup_summary() {
                     skipped)   printf '  • jkb serve:  skipped (--no-service)\n' ;;
                     # Not "failed": nothing was activated, so there was nothing to check.
                     unchecked) printf '  • jkb serve:  not checked (no unit was activated; see the warnings above)\n' ;;
-                    refusing)  printf '  • jkb serve:  listening but REFUSING every request (this jkb cannot open the database; see the warnings above)\n' ;;
+                    refusing)  printf '  • jkb serve:  listening but REFUSING every request (a newer jkb migrated the database; see the warnings above)\n' ;;
+                    undecided) printf '  • jkb serve:  listening; could not confirm it serves (see the warnings above)\n' ;;
                     failed)    printf '  • jkb serve:  NOT up; its log is serve.log beside the database (macOS) or journalctl --user -u com.jkb.serve (Linux)\n' ;;
                     *)         warn "unrecognised serve state: $line" ;;
                 esac ;;
@@ -1641,10 +1643,12 @@ render_setup_summary() {
 # on a bare one, because the next script added would otherwise forget.
 
 # Activate every unit `jkb service install` wrote. Sets `watcher_state` (`running`/`failed`) for the
-# watcher units, and `serve_state` for the daemon's: `up`; `refusing` (listening, but this jkb cannot
-# open the database, so every request is refused); `failed` (its unit did not start, or it wrote no
-# token); `unchecked` (nothing was activated to check). Two words, each judged only by its own units,
-# because a daemon that could not bind is not a file-sync watcher that is not running.
+# watcher units, and `serve_state` for the daemon's: `up`; `refusing` (listening, and answering that a
+# newer jkb migrated the database — which the watcher, the same binary, cannot open either, so it is
+# marked failed too); `undecided` (listening, but its answer was neither — the reason is warned);
+# `failed` (its unit did not start, or it wrote no token); `unchecked` (nothing was activated to
+# check). Two words, each judged by its own units, because a daemon that could not bind is not a
+# file-sync watcher that is not running.
 #
 # EVERY unit, as the binary lists them (`jkb service units`: label, installed path, role) — not a copy
 # of the list here, which is how a third unit came to be written on both platforms and restarted on
@@ -1661,14 +1665,15 @@ render_setup_summary() {
 # that proof. A unit that loads and then exits (the port taken) would otherwise read "loaded" and fail
 # every container request. JKB_SERVE_READY_WAIT (seconds, default 10) bounds the wait.
 activate_services() {
-    local db="$1" units label path role serve_token started_marker waited=0 tab serve_started=0
+    local db="$1" units label path role serve_token serve_url started_marker waited=0 tab serve_started=0
     local wait_for="${JKB_SERVE_READY_WAIT:-10}"
     tab="$(printf '\t')"
     watcher_state=running
     serve_state=unchecked
     if ! units="$(jkb --db "$db" service units)" || [ -z "$units" ] \
-        || ! serve_token="$(jkb --db "$db" service token-path)" || [ -z "$serve_token" ]; then
-        warn "could not list the service units (jkb service units / token-path)"
+        || ! serve_token="$(jkb --db "$db" service token-path)" || [ -z "$serve_token" ] \
+        || ! serve_url="$(jkb --db "$db" service serve-url)" || [ -z "$serve_url" ]; then
+        warn "could not list the service units (jkb service units / token-path / serve-url)"
         watcher_state=failed
         return 0
     fi
@@ -1719,14 +1724,30 @@ activate_services() {
             warn "jkb serve did not come up within ${wait_for}s (no new token at $serve_token)"
             serve_state=failed
         # A fresh token proves the daemon is LISTENING, not that it can serve: one that cannot open
-        # the database (a newer jkb migrated it) still binds and writes its token, and refuses every
-        # request. It runs this same binary, so this same binary opening the database is the test.
-        elif jkb --db "$db" mq topic ls >/dev/null 2>&1; then
-            echo "jkb serve is up (token rotated)"
-            serve_state=up
+        # the database still binds and writes its token, and refuses every request. So ask IT — through
+        # remote mode, as the container does — and judge by the code it answers. An open by this shell
+        # would measure a different process (another user's permissions, a lock of its own), and a
+        # failure that is neither a success nor `schema_newer` decides nothing.
         else
-            warn "jkb serve is listening but this jkb cannot open $db, so it refuses every request"
-            serve_state=refusing
+            local answer probe_home
+            probe_home="$(mktemp -d "${TMPDIR:-/tmp}/jkb-setup-home.XXXXXX")" || probe_home=""
+            # A private HOME: remote mode's 5 s "unreachable" marker must not answer for the daemon.
+            if answer="$(env -u JKB_DB HOME="${probe_home:-$HOME}" JKB_REMOTE="$serve_url" \
+                    JKB_REMOTE_TOKEN_FILE="$serve_token" jkb --json mq topic ls 2>&1)"; then
+                echo "jkb serve is up (token rotated, and it answered)"
+                serve_state=up
+            else
+                case "$answer" in
+                    *'"code":"schema_newer"'*)
+                        warn "jkb serve is listening but refuses every request: a newer jkb migrated $db. The watcher runs this same jkb and cannot open it either."
+                        serve_state=refusing
+                        watcher_state=failed ;;
+                    *)
+                        warn "jkb serve is listening, but asking it failed: $answer"
+                        serve_state=undecided ;;
+                esac
+            fi
+            [ -z "$probe_home" ] || rm -rf "$probe_home"
         fi
     fi
     rm -f "$started_marker"

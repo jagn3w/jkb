@@ -501,6 +501,59 @@ fn an_authenticated_long_poll_outlives_the_authentication_deadline() {
     );
 }
 
+/// One re-open at a time even when the request that started it goes away mid-open: the open holds the
+/// guard itself, so a second request waits for it rather than starting another beside it.
+#[test]
+fn a_re_open_is_single_flight_even_when_its_request_is_cancelled() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("daemon/token");
+    let (inflight, most) = (
+        std::sync::Arc::new(AtomicUsize::new(0)),
+        std::sync::Arc::new(AtomicUsize::new(0)),
+    );
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let opener: jkb_daemon::server::Opener = {
+        let (inflight, most, calls) = (inflight.clone(), most.clone(), calls.clone());
+        Box::new(move || {
+            // The first open, at start, fails at once; each re-open is slow, and fails too.
+            if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(600));
+                inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+            Err(jkb_api::ApiError::with_code(
+                ErrorCode::Unavailable,
+                "not yet",
+            ))
+        })
+    };
+    let mut cfg = ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone());
+    cfg.reopen_every = Duration::ZERO;
+    let h = jkb_daemon::server::spawn_opening(opener, &cfg).unwrap();
+    let secret = std::fs::read_to_string(&token).unwrap();
+    // A raw request that starts a re-open, then goes away while it runs.
+    let mut first = std::net::TcpStream::connect(h.addr).unwrap();
+    write!(
+        first,
+        "GET /v1/hello HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n\r\n",
+        secret.trim()
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    drop(first);
+    std::thread::sleep(Duration::from_millis(100));
+    let c = RemoteBackend::new(&format!("http://{}", h.addr), token).unwrap();
+    assert_eq!(
+        c.call(Request::MqInspect {}).unwrap_err().code,
+        ErrorCode::Unavailable
+    );
+    assert_eq!(most.load(Ordering::SeqCst), 1, "two re-opens ran at once");
+    h.shutdown();
+}
+
 #[test]
 fn a_connection_that_never_authenticates_is_closed_even_while_pipelining() {
     // Two guards close this connection — the refusal's `Connection: close` and the deadline to

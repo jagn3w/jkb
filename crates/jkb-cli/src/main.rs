@@ -1063,6 +1063,8 @@ enum ServiceCmd {
     Units,
     /// Print where `jkb serve` writes its token for this database (it does so once it is listening).
     TokenPath,
+    /// Print the address the `com.jkb.serve` unit listens on, as a `JKB_REMOTE` URL.
+    ServeUrl,
 }
 
 #[derive(Subcommand)]
@@ -1216,7 +1218,19 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Serve { addr, token_file } = cli.command {
         return cmd_serve(&db_path, addr, token_file);
     }
-    let db = open_db(&db_path)?;
+    let db = match open_db(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            // `jkb mq`'s `--json` rule covers a database that will not open too: a scripted producer
+            // branches on `schema_newer` whichever side of the open it meets it on.
+            if let Command::Mq { cmd } = &cli.command {
+                if cli.json {
+                    mq_cli::print_open_failure(cmd, &e);
+                }
+            }
+            return Err(e);
+        }
+    };
     let json = cli.json;
     let global = cli.global;
 
@@ -1267,6 +1281,11 @@ fn run(cli: Cli) -> Result<()> {
             ServiceCmd::Install => service::install(&db_path),
             ServiceCmd::Uninstall => service::uninstall(&db_path),
             ServiceCmd::Units => service::units(&db_path),
+            ServiceCmd::ServeUrl => {
+                // The unit passes no `--addr`, so it listens on serve's default.
+                println!("http://{}", jkb_daemon::DEFAULT_ADDR);
+                Ok(())
+            }
             ServiceCmd::TokenPath => {
                 println!("{}", service::serve_token_path(&db_path).display());
                 Ok(())

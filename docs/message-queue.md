@@ -78,7 +78,8 @@ something other than the daemon answered, or the daemon cannot open its database
 does not know decodes as `unknown` and is treated like `internal`, so a newer host can add codes.
 Under `--json`, every `jkb mq` verb except `subscribe` (whose stdout is its event stream) prints any
 failure to stdout as `{"error":{"code":…,"message":…}}` as well as exiting 1 — a refusal with its own
-code, invalid input as `bad_request`, anything else as `internal`.
+code, invalid input as `bad_request`, a local database that will not open as `schema_newer` or
+`unavailable`, anything else as `internal`.
 
 An idle `mq.poll` — nothing past the fetch position, and its `last_poll_at` refreshed within the hour
 (or a quarter of the topic's idle period, whichever is shorter) — is answered by a read and takes no
@@ -136,8 +137,16 @@ never apply.
   could be created, which is never sent against a group that does not exist yet (that would
   "recreate" it from now and lose `--from-start`); under `--at-most-once` a message whose ack could
   not be applied yet is not emitted, and comes back on the next poll.
-- **In local mode `schema_newer` is fatal**: the subscriber itself is older than the database, and
-  exiting is what lets its supervisor start the newer binary.
+- **In local mode `schema_newer` is fatal**, on a poll or an ack alike: the subscriber itself is
+  older than the database, and exiting is what lets its supervisor start the newer binary.
+- **Any refusal not handled where it arises is fatal.** Each call names the refusals it handles — an
+  ack: `no_such_group` (recreate) and the refusals about that ack alone (`ack_beyond_end`, `invalid`,
+  `bad_request`, reported as non-fatal events); a poll: `no_such_group` and `corrupt_payload` — and
+  everything else that is not transient ends the stream with a fatal event. A code added later is
+  fatal until someone decides otherwise, never silently taken for a harmless one.
+- An outage ends when a call succeeds, unless an ack it began with is still held; the event that gives
+  up on a held ack at EOF carries the code of the refusal that held it. Stdin closing while the group
+  cannot be created yet still creates it and applies a held ack, within the same 10 s.
 - **Startup failures with no events:** a non-zero exit with nothing on stdout means the subscription
   never started — bad arguments (clap, exit 2), or in local mode a database that could not be opened
   (exit 1) — and stderr says which. A refusal of the subscription itself (`no_such_topic`, say) is a
@@ -230,9 +239,11 @@ timeout, not one each.
 
 `setup.sh` activates every unit `jkb service units` lists (label, installed path, role) — restarting
 each, so none keeps running an old binary. When the daemon's unit starts, it waits up to 10 s for a
-fresh token at `jkb service token-path` as proof the daemon is listening, then checks that this same
-`jkb` can open the database — a daemon that cannot still listens and refuses everything, reported as
-`refusing`, not `up`. Each unit's failure is reported under its own role — the daemon's on its own
+fresh token at `jkb service token-path` as proof the daemon is listening, then **asks the daemon
+itself** (remote mode, at `jkb service serve-url`, as the container would) and judges by its answer:
+success is `up`; `schema_newer` is `refusing` — and the watcher, the same binary, is marked failed
+too, since it cannot open the database either; any other failure is `undecided`, with the answer in
+the warning. An open by the setup shell would measure a different process. Each unit's failure is reported under its own role — the daemon's on its own
 `jkb serve` summary line, the watcher units' on the watcher line
 (`scripts/lib.sh` `activate_services`, pinned by `scripts/tests/services.test.sh` against stub
 service managers and by `tests/cli.rs`
