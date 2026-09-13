@@ -376,6 +376,11 @@ fn inspect_reports_holdings_backlog_and_the_oldest_unconsumed() {
     assert_eq!((t.messages, t.bytes), (2, 32));
     assert_eq!(t.oldest_unconsumed_at, Some(T0 + 7));
     assert_eq!((t.groups[0].position, t.groups[0].backlog), (a, 1));
+    assert_eq!(t.groups[0].created_at, T0);
+    assert_eq!(t.compacted_at, None);
+    db.write_txn("t", |c, m| compact(c, m, T0 + 9, true))
+        .unwrap();
+    assert_eq!(db.read(inspect).unwrap()[0].compacted_at, Some(T0 + 9));
 }
 
 #[test]
@@ -397,35 +402,235 @@ fn messages_are_transport_and_never_reach_the_changelog() {
     assert_eq!(logged, 0);
 }
 
+#[test]
+fn every_draft_and_spec_guard_refuses_with_a_named_error() {
+    let db = db_with_topic(TopicSpec::default());
+    let refuse = |d: Draft| queue_err(do_send(&db, d, T0).unwrap_err());
+
+    let mut d = draft("k", 1);
+    d.kind = "bad kind".to_owned();
+    assert!(matches!(
+        refuse(d),
+        QueueError::Invalid { what: "kind", .. }
+    ));
+    let mut d = draft("k", 1);
+    d.producer = "p".repeat(super::MAX_NAME_BYTES + 1);
+    assert!(matches!(
+        refuse(d),
+        QueueError::TooLarge {
+            what: "producer",
+            ..
+        }
+    ));
+    let mut d = draft("k", 1);
+    d.ttl_ms = Some(-5);
+    assert!(matches!(
+        refuse(d),
+        QueueError::Invalid { what: "ttl_ms", .. }
+    ));
+    // A NUL would pass `is_empty` and then fail the table's CHECK as a raw SQLite error.
+    assert!(matches!(
+        refuse(draft("\0host/a", 1)),
+        QueueError::Invalid { what: "key", .. }
+    ));
+
+    let long = "t".repeat(super::MAX_NAME_BYTES + 1);
+    let err = db
+        .write_txn("t", move |c, m| {
+            topic_create(c, m, &long, &TopicSpec::default(), T0)
+        })
+        .unwrap_err();
+    assert!(matches!(
+        queue_err(err),
+        QueueError::TooLarge {
+            what: "topic name",
+            ..
+        }
+    ));
+    for spec in [
+        TopicSpec {
+            max_messages: 0,
+            ..TopicSpec::default()
+        },
+        TopicSpec {
+            max_bytes: 0,
+            ..TopicSpec::default()
+        },
+        TopicSpec {
+            default_ttl_ms: Some(0),
+            ..TopicSpec::default()
+        },
+        TopicSpec {
+            group_idle_ms: -1,
+            ..TopicSpec::default()
+        },
+        TopicSpec {
+            compact_every_ms: 0,
+            ..TopicSpec::default()
+        },
+    ] {
+        let err = db
+            .write_txn("t", move |c, m| topic_create(c, m, "other", &spec, T0))
+            .unwrap_err();
+        assert!(
+            matches!(queue_err(err), QueueError::Invalid { .. }),
+            "spec refused by name, not by a CHECK"
+        );
+    }
+}
+
+#[test]
+fn a_payload_that_would_not_parse_back_is_refused_at_send() {
+    // serde_json serializes any depth but parses at most 128 levels; stored, this would fail every
+    // poll of the topic for ever.
+    let db = db_with_topic(TopicSpec::default());
+    let mut deep = json!(0);
+    for _ in 0..200 {
+        deep = json!([deep]);
+    }
+    let mut d = draft("k", 1);
+    d.payload = deep;
+    assert!(matches!(
+        queue_err(do_send(&db, d, T0).unwrap_err()),
+        QueueError::Invalid {
+            what: "payload",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_corrupt_stored_payload_is_named_by_seq_and_can_be_acked_past() {
+    let db = db_with_topic(TopicSpec::default());
+    do_group(&db, "g", Start::FromStart, T0);
+    let good = do_send(&db, draft("k", 1), T0).unwrap();
+    let bad = do_send(&db, draft("k", 2), T0).unwrap();
+    let after = do_send(&db, draft("k", 3), T0).unwrap();
+    db.write_txn("t", move |c, _| {
+        c.execute(
+            "UPDATE mq_messages SET payload = 'not json' WHERE seq = ?1",
+            [bad],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Everything before it is still handed over...
+    let got = do_poll(&db, "g", 10, T0);
+    assert_eq!(got.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![good]);
+    do_ack(&db, "g", good, T0).unwrap();
+    // ...then it is named, so the consumer can step over it.
+    let err = db
+        .write_txn("t", |c, m| poll(c, m, "t", "g", 10, T0))
+        .unwrap_err();
+    assert_eq!(
+        queue_err(err),
+        QueueError::CorruptPayload {
+            topic: "t".to_owned(),
+            seq: bad,
+            why: "expected ident at line 1 column 2".to_owned()
+        }
+    );
+    do_ack(&db, "g", bad, T0).unwrap();
+    assert_eq!(do_poll(&db, "g", 10, T0)[0].seq, after);
+}
+
+#[test]
+fn one_send_reaps_as_many_consumed_messages_as_it_needs() {
+    let spec = TopicSpec {
+        max_bytes: 64,
+        ..TopicSpec::default()
+    };
+    let db = db_with_topic(spec);
+    do_group(&db, "g", Start::FromStart, T0);
+    let small: Vec<i64> = (0..3)
+        .map(|n| do_send(&db, draft("k", n), T0).unwrap())
+        .collect();
+    do_ack(&db, "g", small[2], T0).unwrap();
+    // 48 bytes held, all consumed. A 40-byte message needs two of them gone, not one.
+    let mut big = draft("k", 0);
+    big.payload = json!("x".repeat(29));
+    let seq = do_send(&db, big, T0).unwrap();
+    assert_eq!(held_seqs(&db), vec![small[2], seq]);
+}
+
+#[test]
+fn a_refused_send_reports_what_the_topic_really_holds() {
+    let spec = TopicSpec {
+        max_bytes: 60,
+        ..TopicSpec::default()
+    };
+    let db = db_with_topic(spec);
+    do_group(&db, "g", Start::FromStart, T0);
+    let a = do_send(&db, draft("k", 1), T0).unwrap();
+    do_send(&db, draft("k", 2), T0).unwrap();
+    do_send(&db, draft("k", 3), T0).unwrap();
+    do_ack(&db, "g", a, T0).unwrap();
+    // 48 held, 16 consumed: reaping `a` frees too little for 40 bytes, so nothing is reaped.
+    let mut big = draft("k", 0);
+    big.payload = json!("x".repeat(29));
+    let err = queue_err(do_send(&db, big, T0).unwrap_err());
+    assert_eq!(
+        err,
+        QueueError::QueueFull {
+            topic: "t".to_owned(),
+            messages: 3,
+            bytes: 48
+        },
+        "the refusal reports the held totals, not an in-memory reap the rollback undid"
+    );
+    assert_eq!(held_seqs(&db).len(), 3);
+}
+
 // --- the reaping rules, against a model ------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum Step {
-    Send { ttl: Option<i64> },
-    Ack { group: usize, back: usize },
+    Send {
+        ttl: Option<i64>,
+        pad: usize,
+    },
+    Ack {
+        group: usize,
+        back: usize,
+        stale: bool,
+    },
     Advance(i64),
     Compact,
 }
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     let step = prop_oneof![
-        4 => proptest::option::of(1i64..50).prop_map(|ttl| Step::Send { ttl }),
-        3 => (0usize..2, 0usize..4).prop_map(|(group, back)| Step::Ack { group, back }),
+        4 => (proptest::option::of(1i64..50), 0usize..40).prop_map(|(ttl, pad)| Step::Send { ttl, pad }),
+        3 => (0usize..2, 0usize..4, proptest::bool::weighted(0.2))
+            .prop_map(|(group, back, stale)| Step::Ack { group, back, stale }),
         1 => (1i64..40).prop_map(Step::Advance),
         1 => Just(Step::Compact),
     ];
     prop::collection::vec(step, 0..60)
 }
 
+fn held_rows(db: &Db) -> Vec<(i64, i64)> {
+    db.read(|c| {
+        Ok(c.prepare("SELECT seq, size FROM mq_messages ORDER BY seq")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    })
+    .unwrap()
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// Nothing unconsumed is ever reaped; a full topic refuses exactly when nothing consumed is left
-    /// to reap; positions never move backwards; delivery is in seq order.
+    /// Against a model, with varied message sizes and both caps reachable: nothing unconsumed is ever
+    /// reaped; a send succeeds exactly when reaping what every group consumed makes room, and the caps
+    /// hold afterwards; positions never move backwards, even for a stale ack; delivery is in seq order.
     #[test]
     fn reaping_never_loses_an_unconsumed_message(steps in steps()) {
         const GROUPS: [&str; 2] = ["a", "b"];
-        let spec = TopicSpec { max_messages: 5, ..TopicSpec::default() };
+        const MAX_MESSAGES: i64 = 6;
+        const MAX_BYTES: i64 = 160;
+        let spec = TopicSpec { max_messages: MAX_MESSAGES, max_bytes: MAX_BYTES, ..TopicSpec::default() };
         let db = db_with_topic(spec);
         for g in GROUPS {
             do_group(&db, g, Start::FromStart, T0);
@@ -433,48 +638,66 @@ proptest! {
         let mut now = T0;
         let mut positions = [0i64; 2];
         for step in steps {
-            let before = held_seqs(&db);
+            let before = held_rows(&db);
+            let through = positions.iter().copied().min().unwrap_or(0);
             match step {
-                Step::Send { ttl } => {
+                Step::Send { ttl, pad } => {
                     let mut d = draft("k", 0);
                     d.ttl_ms = ttl;
-                    let through = positions.iter().copied().min().unwrap_or(0);
+                    d.payload = json!("x".repeat(pad));
+                    let size = i64::try_from(1 + 8 + serde_json::to_string(&d.payload).unwrap().len()).unwrap();
+                    // The model: reap consumed rows oldest-first until it fits, if that can.
+                    let mut msgs = i64::try_from(before.len()).unwrap();
+                    let mut bytes: i64 = before.iter().map(|r| r.1).sum();
+                    for &(seq, sz) in &before {
+                        if msgs < MAX_MESSAGES && bytes + size <= MAX_BYTES { break; }
+                        if seq > through { break; }
+                        msgs -= 1;
+                        bytes -= sz;
+                    }
+                    let room = msgs < MAX_MESSAGES && bytes + size <= MAX_BYTES;
                     match do_send(&db, d, now) {
                         Ok(seq) => {
-                            let after = held_seqs(&db);
-                            prop_assert_eq!(after.last().copied(), Some(seq));
-                            for gone in before.iter().filter(|s| !after.contains(s)) {
-                                prop_assert!(*gone <= through, "reaped unconsumed seq {}", gone);
+                            prop_assert!(room, "sent though the model had no room");
+                            let after = held_rows(&db);
+                            prop_assert_eq!(after.last().map(|r| r.0), Some(seq));
+                            prop_assert!(i64::try_from(after.len()).unwrap() <= MAX_MESSAGES);
+                            prop_assert!(after.iter().map(|r| r.1).sum::<i64>() <= MAX_BYTES);
+                            for gone in before.iter().filter(|r| !after.contains(r)) {
+                                prop_assert!(gone.0 <= through, "reaped unconsumed seq {}", gone.0);
                             }
                         }
                         Err(e) => {
-                            // Bound first: `prop_assert!` formats its expression, and `{ .. }`
-                            // reads as a format placeholder.
                             let full = matches!(queue_err(e), QueueError::QueueFull { .. });
                             prop_assert!(full, "a refused send must be QueueFull");
-                            prop_assert_eq!(before.len(), 5);
-                            prop_assert!(before.iter().all(|s| *s > through),
-                                "refused while seq <= {} could have been reaped", through);
+                            prop_assert!(!room, "refused though reaping consumed messages made room");
+                            prop_assert_eq!(held_rows(&db), before, "a refusal reaps nothing");
                         }
                     }
                 }
-                Step::Ack { group, back } => {
+                Step::Ack { group, back, stale } => {
                     let delivered = do_poll(&db, GROUPS[group], 10, now);
                     prop_assert!(delivered.windows(2).all(|w| w[0].seq < w[1].seq));
-                    if let Some(pick) = delivered.len().checked_sub(back + 1) {
-                        let seq = delivered[pick].seq;
+                    let seq = if stale {
+                        // BELOW the position: re-acking the position itself cannot tell `max` from
+                        // plain assignment.
+                        Some((positions[group] - 1).max(0))
+                    } else {
+                        delivered.len().checked_sub(back + 1).map(|i| delivered[i].seq)
+                    };
+                    if let Some(seq) = seq {
                         let pos = do_ack(&db, GROUPS[group], seq, now).unwrap();
-                        prop_assert!(pos >= positions[group]);
+                        prop_assert!(pos >= positions[group], "position moved back");
+                        prop_assert_eq!(pos, positions[group].max(seq));
                         positions[group] = pos;
                     }
                 }
                 Step::Advance(ms) => now += ms,
                 Step::Compact => {
-                    let through = positions.iter().copied().min().unwrap_or(0);
                     db.write_txn("t", move |c, m| compact(c, m, now, true)).unwrap();
-                    let after = held_seqs(&db);
-                    for gone in before.iter().filter(|s| !after.contains(s)) {
-                        prop_assert!(*gone <= through, "compaction reaped unconsumed seq {}", gone);
+                    let after = held_rows(&db);
+                    for gone in before.iter().filter(|r| !after.contains(r)) {
+                        prop_assert!(gone.0 <= through, "compaction reaped unconsumed seq {}", gone.0);
                     }
                 }
             }
@@ -485,10 +708,11 @@ proptest! {
 // --- two processes ---------------------------------------------------------------------------
 
 /// A later-committed message always has a higher seq, across processes — `SQLite` admits one write
-/// transaction at a time and holds its lock to commit. If a reader could ever be handed a seq lower
-/// than one it has already seen, a cumulative ack would silently skip it; this drives two writer
-/// processes against one database while this process polls and acks, and fails on the first such
-/// inversion, and on any message from either writer not delivered.
+/// transaction at a time and holds its lock to commit. If one ever committed below the reader's acked
+/// position, the reader would never be handed it: poll only looks past the position. So the guard for
+/// the cross-process claim is that **every writer's every message is delivered**, counted per writer;
+/// the in-order assertion catches a delivery bug within one process. Watched failing with `poll`
+/// skipping one seq.
 #[test]
 fn two_processes_never_hand_a_reader_a_lower_seq() {
     const PER_WRITER: u64 = 150;
@@ -525,6 +749,7 @@ fn two_processes_never_hand_a_reader_a_lower_seq() {
 
     let mut last = 0i64;
     let mut seen = 0u64;
+    let mut per_writer = [0u64; 2];
     let mut done = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
     while seen < 2 * PER_WRITER {
@@ -544,6 +769,11 @@ fn two_processes_never_hand_a_reader_a_lower_seq() {
             );
             last = d.seq;
             seen += 1;
+            match d.key.as_str() {
+                "writer-0" => per_writer[0] += 1,
+                "writer-1" => per_writer[1] += 1,
+                other => panic!("unexpected key {other}"),
+            }
         }
         if let Some(d) = batch.last() {
             let seq = d.seq;
@@ -562,9 +792,9 @@ fn two_processes_never_hand_a_reader_a_lower_seq() {
         assert!(w.wait().unwrap().success(), "a writer process failed");
     }
     assert_eq!(
-        seen,
-        2 * PER_WRITER,
-        "every message from both writers was delivered"
+        per_writer,
+        [PER_WRITER, PER_WRITER],
+        "every message from each writer was delivered — a lost one is what a cross-process inversion looks like"
     );
 }
 

@@ -13,10 +13,13 @@
 //! commit — across every process on one kernel. So no message can commit after a message allocated
 //! a higher `seq`: a later-committed message always has a higher one. (That is `SQLite`'s writer lock
 //! doing it, not jkb's `BEGIN IMMEDIATE`, which decides only when the lock is taken; design r3.1 named
-//! the wrong mechanism.) Gaps are possible — a rolled-back insert — reordering is not, and so a
-//! cumulative [`ack`] is sound. Exercised across two processes by
-//! `two_processes_never_hand_a_reader_a_lower_seq`, which fails on any delivery that hands a reader
-//! a lower `seq` than one it already saw (watched failing with `poll` ordered descending).
+//! the wrong mechanism.) A topic's seqs have gaps — the sequence is shared by every topic, and
+//! reaped messages leave holes; a rolled-back insert's seq is reused, which is harmless — but they
+//! are never reordered, and so a cumulative [`ack`] is sound. Exercised across two processes by
+//! `two_processes_never_hand_a_reader_a_lower_seq`. Its guard for the cross-process claim is the
+//! per-writer delivery count: a message committed with a seq below the reader's acked position is
+//! never handed over, so an inversion shows up as a lost message, not as an out-of-order one
+//! (watched failing with `poll` skipping one seq).
 //!
 //! **Reaping (the user's rules, 2026-09-13).** Expired messages are still delivered — a TTL never
 //! skips anything, it only makes a message *eligible* to be reaped. A message is reaped only when
@@ -73,18 +76,18 @@ pub enum QueueError {
         /// The group.
         group: String,
     },
-    /// The topic is at its cap and nothing in it may be reaped: every remaining message is unread
-    /// by at least one group (or the topic has no groups at all).
+    /// The topic is at its cap and reaping everything every group has consumed would still not
+    /// make room — the rest is unread by at least one group, or the topic has no groups at all.
     #[error(
-        "topic {topic} is full ({messages} messages, {bytes} bytes) and nothing in it has been \
-         consumed by every group"
+        "topic {topic} is full ({messages} messages, {bytes} bytes held) and reaping what every \
+         group has consumed would not make room"
     )]
     QueueFull {
         /// The topic.
         topic: String,
-        /// Messages held.
+        /// Messages held when the send was refused (the refused send reaps nothing).
         messages: i64,
-        /// Bytes held.
+        /// Bytes held when the send was refused.
         bytes: i64,
     },
     /// A payload, key or name over its limit, or a message larger than its topic's whole cap.
@@ -105,8 +108,12 @@ pub enum QueueError {
         /// Why.
         why: String,
     },
-    /// An ack beyond the newest message the topic has ever held would pre-consume the future.
-    #[error("cannot ack seq {seq} on topic {topic}: nothing past {high} has been sent")]
+    /// An ack beyond both the newest message the topic currently holds and the group's own position
+    /// would pre-consume the future.
+    #[error(
+        "cannot ack seq {seq} on topic {topic}: the newest it can be acked through is {high} (the \
+         newest message it holds, or the group's position)"
+    )]
     AckBeyondEnd {
         /// The topic.
         topic: String,
@@ -118,6 +125,18 @@ pub enum QueueError {
     /// A stored row that should be valid is not.
     #[error("corrupt queue row: {0}")]
     Corrupt(String),
+    /// The first message a poll would hand over has a payload that does not parse. Named by `seq`
+    /// so the consumer can ack past it; `send` refuses anything that would not parse back, so this
+    /// needs a row written some other way.
+    #[error("message {seq} on topic {topic} has an unreadable payload: {why}")]
+    CorruptPayload {
+        /// The topic.
+        topic: String,
+        /// The message.
+        seq: i64,
+        /// The parse error.
+        why: String,
+    },
 }
 
 /// How a topic's messages are consumed. A closed set: adding `Work` or `Compacted` (design Q9) must
@@ -250,6 +269,8 @@ pub struct GroupReport {
     pub name: String,
     /// Its committed position.
     pub position: i64,
+    /// When it was created (Unix ms) — the idle clock's start when it has never polled or acked.
+    pub created_at: i64,
     /// Messages after its position.
     pub backlog: i64,
     /// Last poll (Unix ms), if any.
@@ -271,6 +292,9 @@ pub struct TopicReport {
     pub bytes: i64,
     /// The highest seq it holds, if any.
     pub newest_seq: Option<i64>,
+    /// When [`compact`] last ran for it (Unix ms), if ever — a reap service that is not running shows
+    /// up here.
+    pub compacted_at: Option<i64>,
     /// When the oldest message not yet consumed by every group was enqueued, if any.
     pub oldest_unconsumed_at: Option<i64>,
     /// Its groups, by name.
@@ -500,6 +524,11 @@ fn validate_draft(
     if draft.key.is_empty() {
         return Err(invalid("key", "empty"));
     }
+    // One rule, here: the table's `length(key) > 0` CHECK stops counting at a NUL, so a key starting
+    // with one would pass `is_empty` and then fail as a raw SQLite error.
+    if draft.key.contains('\0') || draft.producer.contains('\0') {
+        return Err(invalid("key", "contains NUL"));
+    }
     if draft.key.len() > MAX_KEY_BYTES {
         return Err(too_large("key", draft.key.len(), MAX_KEY_BYTES));
     }
@@ -514,6 +543,12 @@ fn validate_draft(
         serde_json::to_string(&draft.payload).map_err(|e| invalid("payload", e.to_string()))?;
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(too_large("payload", payload.len(), MAX_PAYLOAD_BYTES));
+    }
+    // What is sent must come back out. serde_json serializes any depth but parses at most 128 levels,
+    // so a deeply nested value would be stored and then fail every poll of the topic — which, never
+    // consumed, is never reaped, and fills the topic. Refused here instead.
+    if let Err(e) = serde_json::from_str::<Value>(&payload) {
+        return Err(invalid("payload", format!("would not parse back: {e}")));
     }
     let size = draft.key.len() + draft.kind.len() + payload.len();
     let size_i = i64::try_from(size).unwrap_or(i64::MAX);
@@ -532,44 +567,44 @@ fn make_room(
     spec: &TopicSpec,
     size: i64,
 ) -> Result<()> {
-    let (mut messages, mut bytes) = holdings(conn, topic_id)?;
+    let (held_messages, held_bytes) = holdings(conn, topic_id)?;
     let fits = |messages: i64, bytes: i64| {
         messages < spec.max_messages && bytes.saturating_add(size) <= spec.max_bytes
     };
-    if fits(messages, bytes) {
+    if fits(held_messages, held_bytes) {
         return Ok(());
     }
+    let (mut messages, mut bytes) = (held_messages, held_bytes);
+    let mut cutoff = None;
     if let Some(through) = consumed_through(conn, topic_id)? {
-        let candidates: Vec<(i64, i64)> = conn
-            .prepare_cached(
-                "SELECT seq, size FROM mq_messages WHERE topic_id = ?1 AND seq <= ?2 ORDER BY seq",
-            )?
-            .query_map(params![topic_id, through], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut cutoff = None;
-        for (seq, sz) in candidates {
-            if fits(messages, bytes) {
-                break;
-            }
+        // Walked lazily, oldest first, stopping as soon as the message fits: at a steady cap a send
+        // frees one slot, and collecting the whole consumed range to use its first row made every
+        // such send read up to `max_messages` rows.
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, size FROM mq_messages WHERE topic_id = ?1 AND seq <= ?2 ORDER BY seq",
+        )?;
+        let mut rows = stmt.query(params![topic_id, through])?;
+        while !fits(messages, bytes) {
+            let Some(row) = rows.next()? else { break };
             messages -= 1;
-            bytes -= sz;
-            cutoff = Some(seq);
-        }
-        if let Some(cutoff) = cutoff {
-            conn.prepare_cached("DELETE FROM mq_messages WHERE topic_id = ?1 AND seq <= ?2")?
-                .execute(params![topic_id, cutoff])?;
+            bytes -= row.get::<_, i64>(1)?;
+            cutoff = Some(row.get::<_, i64>(0)?);
         }
     }
-    if fits(messages, bytes) {
-        Ok(())
-    } else {
-        Err(QueueError::QueueFull {
+    if !fits(messages, bytes) {
+        // Nothing is deleted on refusal, so the held totals are the ones reported.
+        return Err(QueueError::QueueFull {
             topic: topic.to_owned(),
-            messages,
-            bytes,
+            messages: held_messages,
+            bytes: held_bytes,
         }
-        .into())
+        .into());
     }
+    if let Some(cutoff) = cutoff {
+        conn.prepare_cached("DELETE FROM mq_messages WHERE topic_id = ?1 AND seq <= ?2")?
+            .execute(params![topic_id, cutoff])?;
+    }
+    Ok(())
 }
 
 /// Create a consumer group. Idempotent: an existing group keeps its position, whatever `start`
@@ -610,8 +645,8 @@ pub fn group_create(
 /// what keeps an idle-but-alive consumer's group from being removed), so it is a write.
 ///
 /// # Errors
-/// [`QueueError::NoSuchTopic`], [`QueueError::NoSuchGroup`], [`QueueError::Corrupt`] for a stored
-/// payload that no longer parses, or a database error.
+/// [`QueueError::NoSuchTopic`], [`QueueError::NoSuchGroup`], [`QueueError::CorruptPayload`] when the
+/// first message to hand over has a payload that does not parse, or a database error.
 pub fn poll(
     conn: &Connection,
     _meta: &WriteMeta,
@@ -648,16 +683,32 @@ pub fn poll(
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    rows.into_iter()
-        .map(|mut d| {
-            let Value::String(text) = &d.payload else {
-                return Err(QueueError::Corrupt(format!("seq {} payload", d.seq)).into());
-            };
-            d.payload = serde_json::from_str(text)
-                .map_err(|e| QueueError::Corrupt(format!("seq {} payload: {e}", d.seq)))?;
-            Ok(d)
-        })
-        .collect()
+    // A payload that does not parse ends the batch just before it, so everything earlier is still
+    // handed over; when it is the FIRST message, the error names its seq so the consumer can ack past
+    // it rather than the whole topic wedging behind it.
+    let mut out = Vec::with_capacity(rows.len());
+    for mut d in rows {
+        let parsed = match &d.payload {
+            Value::String(text) => serde_json::from_str(text).map_err(|e| e.to_string()),
+            _ => Err("not stored as text".to_owned()),
+        };
+        match parsed {
+            Ok(value) => {
+                d.payload = value;
+                out.push(d);
+            }
+            Err(_) if !out.is_empty() => break,
+            Err(why) => {
+                return Err(QueueError::CorruptPayload {
+                    topic: topic.to_owned(),
+                    seq: d.seq,
+                    why,
+                }
+                .into())
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Commit the group's position through `seq` (cumulative; never moves backwards). Returns the
@@ -760,6 +811,9 @@ pub fn inspect(conn: &Connection) -> Result<Vec<TopicReport>> {
         let newest_seq: Option<i64> = conn
             .prepare_cached("SELECT MAX(seq) FROM mq_messages WHERE topic_id = ?1")?
             .query_row([topic_id], |r| r.get(0))?;
+        let compacted_at: Option<i64> = conn
+            .prepare_cached("SELECT compacted_at FROM mq_topics WHERE id = ?1")?
+            .query_row([topic_id], |r| r.get(0))?;
         let through = consumed_through(conn, topic_id)?.unwrap_or(0);
         let oldest_unconsumed_at: Option<i64> = conn
             .prepare_cached(
@@ -772,7 +826,8 @@ pub fn inspect(conn: &Connection) -> Result<Vec<TopicReport>> {
             .prepare_cached(
                 "SELECT g.name, g.position, g.last_poll_at, g.last_ack_at, \
                         (SELECT COUNT(*) FROM mq_messages m \
-                         WHERE m.topic_id = g.topic_id AND m.seq > g.position) \
+                         WHERE m.topic_id = g.topic_id AND m.seq > g.position), \
+                        g.created_at \
                  FROM mq_groups g WHERE g.topic_id = ?1 ORDER BY g.name",
             )?
             .query_map([topic_id], |r| {
@@ -782,6 +837,7 @@ pub fn inspect(conn: &Connection) -> Result<Vec<TopicReport>> {
                     last_poll_at: r.get(2)?,
                     last_ack_at: r.get(3)?,
                     backlog: r.get(4)?,
+                    created_at: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -791,6 +847,7 @@ pub fn inspect(conn: &Connection) -> Result<Vec<TopicReport>> {
             messages,
             bytes,
             newest_seq,
+            compacted_at,
             oldest_unconsumed_at,
             groups,
         });

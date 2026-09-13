@@ -7,8 +7,9 @@
 --
 -- ORDER COMES FROM `seq`, NEVER FROM A CLOCK. `seq` is AUTOINCREMENT, allocated inside the inserting
 -- transaction, and SQLite admits one write transaction at a time, holding its lock until commit,
--- across every process on one kernel: a later-committed message always has a higher `seq`. Gaps
--- are possible (a rolled-back insert); reordering is not. Times are metadata for TTL and reaping.
+-- across every process on one kernel: a later-committed message always has a higher `seq`. A
+-- topic's seqs have gaps (one sequence serves every topic; reaping leaves holes; a rolled-back
+-- insert's seq is reused, harmlessly); reordering never happens. Times are metadata for TTL/reaping.
 --
 -- TIMES ARE INTEGER MILLISECONDS since the Unix epoch, unlike the ISO text elsewhere in this
 -- schema, because every use is arithmetic — `expires_at <= now`, idle for N days — and the caller
