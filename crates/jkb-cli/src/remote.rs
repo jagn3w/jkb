@@ -106,21 +106,29 @@ fn subcommand_name() -> String {
 /// A refusal (for `--db` or `JKB_DB`, or a command that may not run remotely), or the command's own
 /// error.
 pub fn run(cli: Cli, remote: &str) -> Result<()> {
+    // A refusal here is a `jkb mq` verb's failure too, so it keeps that verb's `--json` rule.
+    let refuse = |message: String| {
+        let err = super::mq_cli::refused(jkb_api::ErrorCode::BadRequest, message);
+        if let (true, Command::Mq { cmd }) = (cli.json, &cli.command) {
+            super::mq_cli::print_failure(cmd, &err);
+        }
+        Err(err)
+    };
     if cli.db.is_some() {
-        bail!(
+        return refuse(format!(
             "--db is refused with JKB_REMOTE set: this process reaches the knowledge base through \
              jkb serve at {remote} and must not open a database itself"
-        );
+        ));
     }
     // The same refusal for the environment's way of naming one. Nothing below reads it, but a
     // process configured with both is configured two ways at once — the dev container's interim
     // JKB_DB left in place beside JKB_REMOTE, say — and silently obeying one hides that the other
     // is still set for every tool that is not jkb.
     if std::env::var_os("JKB_DB").is_some_and(|v| !v.is_empty()) {
-        bail!(
+        return refuse(format!(
             "JKB_DB is set alongside JKB_REMOTE: this process reaches the knowledge base through \
              jkb serve at {remote} and must not name a database itself; unset one of them"
-        );
+        ));
     }
     match support(&cli.command) {
         Support::Refused(why) => bail!(
@@ -145,10 +153,10 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 let backend = match jkb_daemon::client::RemoteBackend::new(remote, token_file()) {
                     Ok(backend) => backend,
                     Err(e) => {
-                        let err = anyhow::anyhow!("{}", e.message);
+                        let err = super::mq_cli::refused(e.code, e.message);
                         // The same `--json` rule `mq_cli::run` applies once it has a backend.
                         if cli.json {
-                            super::mq_cli::print_json_error(&err);
+                            super::mq_cli::print_failure(&cmd, &err);
                         }
                         return Err(err);
                     }

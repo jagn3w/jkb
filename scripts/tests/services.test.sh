@@ -35,11 +35,17 @@ case "$3 $4" in
         printf '%s\t%s\t%s\n' "$l" "$HOME/units/$l.unit" "$role"
     done ;;
     "service token-path") printf '%s\n' "$STUB_KB/daemon/token" ;;
-    "service serve-url") printf 'http://127.0.0.1:7117\n' ;;
+    "service serve-url")
+        if [ "${STUB_SERVE_URL_FAIL:-0}" = 1 ]; then exit 1; fi
+        printf 'http://127.0.0.1:7117\n' ;;
     *)
         # `--json mq topic ls` in remote mode: the daemon's answer, as STUB_DAEMON_SAYS scripts it.
         if [ "$1 $2 $3 $4" = "--json mq topic ls" ]; then
             [ -z "${JKB_DB:-}" ] || { echo "JKB_DB leaked into remote mode" >&2; exit 9; }
+            # Asked as the container asks the daemon, or it is not the daemon being asked.
+            [ "${JKB_REMOTE:-}" = http://127.0.0.1:7117 ] || { echo "not remote: '${JKB_REMOTE:-}'"; exit 8; }
+            [ "${JKB_REMOTE_TOKEN_FILE:-}" = "$STUB_KB/daemon/token" ] || { echo "wrong token file"; exit 8; }
+            [ "$HOME" != "$STUB_FIXTURE_HOME" ] || { echo "the real HOME's unreachable marker"; exit 8; }
             case "${STUB_DAEMON_SAYS:-ok}" in
                 ok) echo '[]' ;;
                 schema_newer) echo '{"error":{"code":"schema_newer","message":"newer"}}'; exit 1 ;;
@@ -72,7 +78,7 @@ esac
 exit 0
 EOF
     chmod +x "$bin"/*
-    export STUB_LOG="$log" STUB_KB="$(dirname "$db")"
+    export STUB_LOG="$log" STUB_KB="$(dirname "$db")" STUB_FIXTURE_HOME="${bin%/bin}"
 }
 
 # activate — run activate_services under the stubs, in a subshell so PATH and state stay local;
@@ -134,6 +140,15 @@ case3() {
         || fail "labels: calls" "$(cat "$log")"
 }
 
+# --- 3b. no address to ask the daemon at: nothing is started ---------------------------------
+case3b() {
+    stubs Linux
+    local state
+    state="$(STUB_LABELS="com.jkb.serve" STUB_SERVE_URL_FAIL=1 activate)"
+    [ "$state" = "failed unchecked" ] && ok "serve-url unavailable: failed, serve unchecked" \
+        || fail "serve-url: state" "got '$state'"
+}
+
 # --- 4. one unit failing to start fails the step -----------------------------------------------
 case4() {
     stubs Linux
@@ -178,6 +193,6 @@ case5() {
 }
 
 echo "==> activate_services: every unit, restarted, and serve proven up"
-run_cases case1 case2 case3 case4 case4b case5
+run_cases case1 case2 case3 case3b case4 case4b case5
 
 finish

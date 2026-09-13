@@ -1218,6 +1218,26 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Serve { addr, token_file } = cli.command {
         return cmd_serve(&db_path, addr, token_file);
     }
+    // `jkb service` writes and describes units; it reads no rows. Opened first, a database a newer jkb
+    // migrated stopped setup.sh at `service install` — so it never started the daemon that would
+    // have said `schema_newer`, and reported the watcher as unwritable instead.
+    if let Command::Service { cmd } = cli.command {
+        return match cmd {
+            ServiceCmd::Print => service::print(&db_path),
+            ServiceCmd::Install => service::install(&db_path),
+            ServiceCmd::Uninstall => service::uninstall(&db_path),
+            ServiceCmd::Units => service::units(&db_path),
+            ServiceCmd::ServeUrl => {
+                // The unit passes no `--addr`, so it listens on serve's default.
+                println!("http://{}", jkb_daemon::DEFAULT_ADDR);
+                Ok(())
+            }
+            ServiceCmd::TokenPath => {
+                println!("{}", service::serve_token_path(&db_path).display());
+                Ok(())
+            }
+        };
+    }
     let db = match open_db(&db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -1225,7 +1245,8 @@ fn run(cli: Cli) -> Result<()> {
             // branches on `schema_newer` whichever side of the open it meets it on.
             if let Command::Mq { cmd } = &cli.command {
                 if cli.json {
-                    mq_cli::print_open_failure(cmd, &e);
+                    let code = mq_cli::open_failure_code(&e);
+                    mq_cli::print_failure(cmd, &mq_cli::refused(code, format!("{e:#}")));
                 }
             }
             return Err(e);
@@ -1276,21 +1297,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Staging { cmd } => match cmd {
             StagingCmd::Ls { all } => cmd_staging_ls(&db, all, cli.json),
         },
-        Command::Service { cmd } => match cmd {
-            ServiceCmd::Print => service::print(&db_path),
-            ServiceCmd::Install => service::install(&db_path),
-            ServiceCmd::Uninstall => service::uninstall(&db_path),
-            ServiceCmd::Units => service::units(&db_path),
-            ServiceCmd::ServeUrl => {
-                // The unit passes no `--addr`, so it listens on serve's default.
-                println!("http://{}", jkb_daemon::DEFAULT_ADDR);
-                Ok(())
-            }
-            ServiceCmd::TokenPath => {
-                println!("{}", service::serve_token_path(&db_path).display());
-                Ok(())
-            }
-        },
         Command::Commands { cmd } => match cmd {
             CommandsCmd::Install => commands::install(),
             CommandsCmd::Uninstall => commands::uninstall(),
@@ -1303,7 +1309,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Mq { cmd } => mq_cli::run(&jkb_api::LocalBackend::new(db), cmd, json),
-        Command::Serve { .. } => unreachable!("dispatched before the database is opened"),
+        Command::Serve { .. } | Command::Service { .. } => {
+            unreachable!("dispatched before the database is opened")
+        }
         Command::Ls {
             path,
             all,
@@ -6590,11 +6598,10 @@ fn cmd_serve(
     let path = db_path.to_path_buf();
     let open: jkb_daemon::server::Opener = Box::new(move || {
         open_db(&path).map_err(|e| {
-            let code = match e.downcast_ref::<jkb_core::Error>() {
-                Some(jkb_core::Error::SchemaNewer { .. }) => jkb_api::ErrorCode::SchemaNewer,
-                _ => jkb_api::ErrorCode::Unavailable,
-            };
-            jkb_api::ApiError::with_code(code, format!("jkb serve cannot open the database: {e:#}"))
+            jkb_api::ApiError::with_code(
+                mq_cli::open_failure_code(&e),
+                format!("jkb serve cannot open the database: {e:#}"),
+            )
         })
     });
     let handle = jkb_daemon::server::spawn_opening(open, &cfg).context("starting jkb serve")?;

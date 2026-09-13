@@ -3062,6 +3062,36 @@ fn mq_refusals_are_on_stdout_under_json() {
     let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
     assert_eq!(stdout["error"]["code"], "schema_newer", "{stdout}");
+    // ...but not onto `subscribe`'s event stream, whose failure to start has no event.
+    let out = jkb(&newer)
+        .args(["--json", "mq", "subscribe", "t", "--group", "g"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // A database that will not open for any other reason: `unavailable`.
+    let not_a_dir = tmp.path().join("a-file");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let out = jkb(&not_a_dir.join("jkb.db"))
+        .args(["--json", "mq", "topic", "ls"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(stdout["error"]["code"], "unavailable", "{stdout}");
+    // `jkb service` reads no rows, so a newer database does not stop it — setup.sh depends on that
+    // to start, and then ask, the daemon.
+    let out = jkb(&newer).args(["service", "serve-url"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `jkb mq` end to end through a real binary: create a topic, send, and consume through
@@ -3559,6 +3589,18 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
     ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--db is refused"));
+    // The same refusal keeps `--json`'s rule: an error line on stdout.
+    let out = remote(&[
+        "--json",
+        "--db",
+        tmp.path().join("container.db").to_str().unwrap(),
+        "mq",
+        "topic",
+        "ls",
+    ]);
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(stdout["error"]["code"], "bad_request", "{stdout}");
     let out = {
         let mut cmd = jkb_bare();
         cmd.args(["mq", "topic", "ls"])

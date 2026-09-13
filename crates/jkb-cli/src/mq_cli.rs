@@ -180,32 +180,46 @@ fn topics(backend: &dyn Backend) -> Result<Vec<Topic>> {
 /// # Errors
 /// A refused operation, unreadable input, or a failure writing output.
 pub fn run(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
-    let stream = matches!(cmd, MqCmd::Subscribe { .. });
+    let prints = prints_json_errors(&cmd);
     let result = dispatch(backend, cmd, json_out);
-    if json_out && !stream {
-        if let Err(e) = &result {
-            print_json_error(e);
-        }
+    if let (true, Err(e)) = (json_out && prints, &result) {
+        print_json_error(e);
     }
     result
 }
 
-/// Under `--json`, the error line for a database that would not open before `cmd` ran: `schema_newer`
-/// when a newer jkb migrated it, `unavailable` otherwise. Nothing for `subscribe`, whose stdout is its
-/// event stream and whose failure to start has no event (see the protocol doc).
-pub fn print_open_failure(cmd: &MqCmd, e: &anyhow::Error) {
-    if matches!(cmd, MqCmd::Subscribe { .. }) {
-        return;
-    }
-    let code = match e.downcast_ref::<jkb_core::Error>() {
+/// The wire code for a database that would not open: `schema_newer` when a newer jkb migrated it,
+/// `unavailable` otherwise. One mapping, for the daemon's answer and a local `jkb --json mq` alike.
+#[must_use]
+pub fn open_failure_code(e: &anyhow::Error) -> ErrorCode {
+    match e.downcast_ref::<jkb_core::Error>() {
         Some(jkb_core::Error::SchemaNewer { .. }) => ErrorCode::SchemaNewer,
         _ => ErrorCode::Unavailable,
-    };
-    print_json_error(&refusal(code, format!("{e:#}")));
+    }
+}
+
+/// A refusal with `code`, for [`print_failure`] to print as that code.
+pub fn refused(code: ErrorCode, message: impl Into<String>) -> anyhow::Error {
+    refusal(code, message)
+}
+
+/// Under `--json`, the error line for `cmd` failing with `e` — wherever that failure arose: in the
+/// verb, at a database that would not open, or at a remote-mode refusal. The ONE place the rule
+/// lives, `subscribe`'s exclusion with it: its stdout is its event stream, and its failure to start
+/// has no event (see the protocol doc).
+pub fn print_failure(cmd: &MqCmd, e: &anyhow::Error) {
+    if prints_json_errors(cmd) {
+        print_json_error(e);
+    }
+}
+
+/// Every verb but `subscribe`, whose stdout is its event stream.
+const fn prints_json_errors(cmd: &MqCmd) -> bool {
+    !matches!(cmd, MqCmd::Subscribe { .. })
 }
 
 /// `{"error":{"code":…,"message":…}}` on stdout for `e`: a [`Refusal`]'s own error, else `internal`.
-pub fn print_json_error(e: &anyhow::Error) {
+fn print_json_error(e: &anyhow::Error) {
     let api = e.downcast_ref::<Refusal>().map_or_else(
         || ApiError::with_code(ErrorCode::Internal, format!("{e:#}")),
         |r| r.0.clone(),
@@ -553,6 +567,14 @@ const ACK_REFUSALS: &[ErrorCode] = &[
     ErrorCode::BadRequest,
 ];
 
+/// What a regroup came to.
+enum Regroup {
+    Created,
+    /// The backend is waiting: try again after the interval, not at once.
+    Waiting,
+    Over(i32),
+}
+
 /// What one call came to.
 enum Called {
     Done(Response),
@@ -645,28 +667,45 @@ impl Stream<'_> {
                 None
             }
             Called::Over(code) => Some(code),
-            Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => self.regroup(&e),
+            Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => match self.regroup(&e) {
+                Regroup::Created | Regroup::Waiting => None,
+                Regroup::Over(code) => Some(code),
+            },
             // About this ack alone: reported, and the stream goes on.
-            Called::Refused(e) => {
+            Called::Refused(e)
+                if matches!(
+                    e.code,
+                    ErrorCode::AckBeyondEnd | ErrorCode::Invalid | ErrorCode::BadRequest
+                ) =>
+            {
                 (!self.emit(&error_event(e.code, &e.message, false))).then_some(0)
             }
+            Called::Refused(e) => Some(self.fatal(&e)),
         }
     }
 
+    /// A refusal a call site listed but has no arm for: the list and the arms drifted. Fatal, like
+    /// any other unhandled refusal — never a panic.
+    fn fatal(&mut self, e: &ApiError) -> i32 {
+        self.emit(&error_event(e.code, &e.message, true));
+        1
+    }
+
     /// The group was removed after idling. Recreate it from now and say so — one rule, for a poll
-    /// and an ack alike; a backend that is waiting is asked again by the next poll. `Some(exit code)`
-    /// when the subscription cannot go on.
-    fn regroup(&mut self, e: &ApiError) -> Option<i32> {
+    /// and an ack alike; a backend that is waiting is asked again by the next poll, after the usual
+    /// interval.
+    fn regroup(&mut self, e: &ApiError) -> Regroup {
         let reason = format!(
             "{} — the group was removed after idling; recreated from now, and messages sent in \
              between are not delivered",
             e.message
         );
         match self.call(group_create(self.o, false), &[]) {
-            Called::Done(_) => (!self.emit(&error_event(e.code, &reason, false))).then_some(0),
-            Called::Waiting => None,
-            Called::Over(code) => Some(code),
-            Called::Refused(_) => unreachable!("no refusal is handled here"),
+            Called::Done(_) if self.emit(&error_event(e.code, &reason, false)) => Regroup::Created,
+            Called::Done(_) => Regroup::Over(0),
+            Called::Waiting => Regroup::Waiting,
+            Called::Over(code) => Regroup::Over(code),
+            Called::Refused(again) => Regroup::Over(self.fatal(&again)),
         }
     }
 
@@ -685,7 +724,12 @@ impl Stream<'_> {
     /// `eof_ack_wait`, because EOF is the documented way to stop and the acks before it are promised.
     /// One that still cannot be applied ends the stream with a fatal event naming it, never silently.
     fn finish(&mut self) -> Option<i32> {
-        let deadline = std::time::Instant::now() + self.o.eof_ack_wait;
+        self.finish_by(std::time::Instant::now() + self.o.eof_ack_wait)
+    }
+
+    /// [`Stream::finish`] against a deadline already running — `join`'s, when stdin closed before
+    /// the group could be created, so the two phases share one `eof_ack_wait`.
+    fn finish_by(&mut self, deadline: std::time::Instant) -> Option<i32> {
         loop {
             if let Some(code) = self.flush_ack() {
                 return Some(code);
@@ -735,9 +779,9 @@ impl Stream<'_> {
         let mut closing: Option<std::time::Instant> = None;
         loop {
             match self.call(group_create(self.o, self.o.from_start), &[]) {
-                Called::Done(_) => return closing.and_then(|_| self.finish()),
+                Called::Done(_) => return closing.and_then(|deadline| self.finish_by(deadline)),
                 Called::Over(code) => return Some(code),
-                Called::Refused(_) => unreachable!("no refusal is handled here"),
+                Called::Refused(e) => return Some(self.fatal(&e)),
                 Called::Waiting => {}
             }
             if let Some(deadline) = closing {
@@ -857,7 +901,7 @@ pub fn subscribe(
                                 break;
                             }
                             Called::Over(code) => return Ok(code),
-                            Called::Refused(_) => unreachable!("no refusal is handled here"),
+                            Called::Refused(e) => return Ok(s.fatal(&e)),
                         }
                     }
                     if !s.emit(&message_event(&m)) {
@@ -876,14 +920,16 @@ pub fn subscribe(
             Called::Done(other) => bail!("unexpected response to mq.poll: {other:?}"),
             Called::Waiting => {}
             Called::Over(code) => return Ok(code),
-            Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => {
-                if let Some(code) = s.regroup(&e) {
-                    return Ok(code);
-                }
-                continue;
-            }
-            Called::Refused(e) => {
-                // `corrupt_payload`: reported once; the consumer decides whether to ack past it.
+            Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => match s.regroup(&e) {
+                // Poll the recreated group at once.
+                Regroup::Created => continue,
+                // Fall through to the interval: straight back to a poll would hot-loop two requests
+                // against a daemon that is refusing for being busy.
+                Regroup::Waiting => {}
+                Regroup::Over(code) => return Ok(code),
+            },
+            Called::Refused(e) if e.code == ErrorCode::CorruptPayload => {
+                // Reported once; the consumer decides whether to ack past it.
                 if reported_corrupt != e.seq {
                     reported_corrupt = e.seq;
                     let event = json!({ "event": "unreadable", "seq": e.seq, "reason": e.message });
@@ -892,6 +938,7 @@ pub fn subscribe(
                     }
                 }
             }
+            Called::Refused(e) => return Ok(s.fatal(&e)),
         }
 
         if !handed_over {
@@ -1069,6 +1116,8 @@ mod tests {
         inner: LocalBackend,
         /// Answers [`Backend::schema_newer_clears`] as a remote daemon would.
         remote: bool,
+        /// How many times each op was called.
+        calls: std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
         script: std::sync::Mutex<
             std::collections::HashMap<&'static str, std::collections::VecDeque<Option<ErrorCode>>>,
         >,
@@ -1079,6 +1128,7 @@ mod tests {
             Self {
                 inner,
                 remote: false,
+                calls: std::sync::Mutex::default(),
                 script: std::sync::Mutex::new(
                     script
                         .iter()
@@ -1102,6 +1152,7 @@ mod tests {
         }
 
         fn call(&self, request: Request) -> Result<jkb_api::Response, jkb_api::ApiError> {
+            *self.calls.lock().unwrap().entry(request.op()).or_default() += 1;
             let next = self
                 .script
                 .lock()
@@ -1193,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outage_ends_when_the_refused_op_succeeds_not_when_any_op_does() {
+    fn an_outage_begun_by_a_held_ack_ends_only_when_the_ack_succeeds() {
         // Acks refused for a while, polls answered throughout (a read can pass while writes cannot):
         // one outage, one event — not one per poll that happened to succeed in between.
         let inner = backend_with(1);
@@ -1318,6 +1369,52 @@ mod tests {
         let errs = errors(&ev);
         assert_eq!(errs.len(), 2, "one per outage: {ev:?}");
         assert!(errs.iter().all(|e| e["fatal"] == false));
+    }
+
+    #[test]
+    fn a_regroup_the_backend_is_too_busy_for_waits_the_interval_before_polling_again() {
+        let b = Scripted::new(
+            backend_with(1),
+            &[
+                ("mq.poll", &[Some(NoSuchGroup); 5000]),
+                (
+                    "mq.group_create",
+                    &[None]
+                        .into_iter()
+                        .chain([Some(Busy); 5000])
+                        .collect::<Vec<_>>(),
+                ),
+            ],
+        );
+        let (exit, ev) = run_scripted(&b, &opts(false), &[], 100);
+        assert_eq!(exit, 0, "{ev:?}");
+        let polls = b.calls.lock().unwrap()["mq.poll"];
+        // At a 5 ms interval, 100 ms is ~20 polls; straight back to the poll it was thousands.
+        assert!(polls < 100, "{polls} polls in 100 ms");
+    }
+
+    #[test]
+    fn stdin_closing_during_a_startup_outage_spends_one_wait_not_two() {
+        let refused_create = [Some(Unavailable); 60];
+        let refused_ack = vec![Some(Unavailable); 100_000];
+        let b = Scripted::new(
+            backend_with(1),
+            &[
+                ("mq.group_create", &refused_create),
+                ("mq.ack", &refused_ack),
+            ],
+        );
+        let o = SubscribeOpts {
+            eof_ack_wait: Duration::from_millis(400),
+            ..opts(false)
+        };
+        let started = std::time::Instant::now();
+        let (exit, ev) = run_scripted(&b, &o, &[(0, 1)], 0);
+        let took = started.elapsed();
+        assert_eq!(exit, 1, "{ev:?}");
+        // The group comes up late in the wait and the ack never applies: given up at ~400 ms, not
+        // after a second full wait on top.
+        assert!(took < Duration::from_millis(650), "{took:?}");
     }
 
     #[test]

@@ -131,8 +131,8 @@ never apply.
   recreation alike: `busy` (a locked database, a busy daemon) silently; `unavailable` (the daemon is
   down or restarting), and in remote mode `schema_newer` (`setup.sh` has not yet restarted the
   daemon — tens of seconds on every upgrade), with **one non-fatal error event per outage**. An outage
-  ends when the operation it refused succeeds, not when any does — a read can pass while writes are
-  refused. The position is in the database, so the stream resumes where it stopped. An ack sent
+  ends when a call succeeds — unless it began with an ack that is still held, which only that ack
+  succeeding ends (a poll, a read, can pass while the ack, a write, is refused). The position is in the database, so the stream resumes where it stopped. An ack sent
   during an outage is held and applied when the backend answers — including one sent before the group
   could be created, which is never sent against a group that does not exist yet (that would
   "recreate" it from now and lose `--from-start`); under `--at-most-once` a message whose ack could
@@ -144,9 +144,10 @@ never apply.
   `bad_request`, reported as non-fatal events); a poll: `no_such_group` and `corrupt_payload` — and
   everything else that is not transient ends the stream with a fatal event. A code added later is
   fatal until someone decides otherwise, never silently taken for a harmless one.
-- An outage ends when a call succeeds, unless an ack it began with is still held; the event that gives
-  up on a held ack at EOF carries the code of the refusal that held it. Stdin closing while the group
-  cannot be created yet still creates it and applies a held ack, within the same 10 s.
+- The event that gives up on a held ack at EOF carries the code of the refusal that held it. Stdin
+  closing while the group cannot be created yet still creates it and applies a held ack, both within
+  one 10 s wait. A group recreation the backend is too busy for is retried after the poll interval,
+  never straight away.
 - **Startup failures with no events:** a non-zero exit with nothing on stdout means the subscription
   never started — bad arguments (clap, exit 2), or in local mode a database that could not be opened
   (exit 1) — and stderr says which. A refusal of the subscription itself (`no_such_topic`, say) is a
@@ -158,8 +159,10 @@ Pinned end to end through a real binary by `tests/cli.rs`
 `mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack` (delivery, ack, EOF, resume), and in
 `crates/jkb-cli/src/mq_cli.rs`'s tests for `caught_up`, `unreadable` (once, with its seq, moving on
 after an ack), a group recreated mid-stream, a closed stdout, a stdin read failure, bad commands,
-`--at-most-once`, and each transient path (two outages, startup, a held ack, `--at-most-once` during
-an outage, a regroup during one) against a scripted backend.
+`--at-most-once`, and each transient path against a scripted backend: two outages, startup, a held
+ack (applied after, and at EOF within one wait or given up loudly with its code), `--at-most-once`
+during an outage, a regroup during one (and its interval), an ack read before the group exists, an
+outage whose op is abandoned, an in-process `schema_newer`, and an unhandled refusal on an ack.
 
 ## Over HTTP: `jkb serve` and remote mode
 
