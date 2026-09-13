@@ -745,13 +745,34 @@ is the VM's memory limit, not a broken toolchain. Raise the runtime's memory (Do
 Resources pane, `colima start --memory`), or cap parallelism with `CARGO_BUILD_JOBS=2`, which
 lowers peak usage far more than it costs in wall-clock.
 
-## `~/.jkb` is shared with the host, deliberately
+## The knowledge base is NOT shared with the host — measured, not assumed
 
-The knowledge base is bind-mounted, so the container and the host see the same database — which is
-the point, and every write goes through the audited writer-actor, so damage is undoable. The
-consequence to know about is the usual one: the DB migrates in place, so a container `jkb` built
-from a branch with a newer migration will lock the host binary out until it is rebuilt. Point
-`JKB_DB` at a container-local path if you would rather they were independent.
+`~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs), but the container's `jkb`
+uses its **own** database: `JKB_DB=/home/vscode/.local/state/jkb/jkb.db`, on the `jkb-kb-local`
+volume. It starts empty; the host's tasks and namespaces are not visible in here.
+
+This reverses the original decision to share `~/.jkb/jkb.db`, because sharing it corrupts it.
+SQLite's WAL mode needs every process to share two things: POSIX advisory locks on the database
+and its `-shm` file, and a `MAP_SHARED` mapping of `-shm` (the wal-index). Across this bind mount
+(virtiofs, Docker Desktop on macOS), `.container/sqlite-share-probe.py` measured both, with one process on
+each kernel, on 2026-09-13:
+
+| probe | same kernel | container → macOS |
+|---|---|---|
+| fcntl write lock held; other side asks `F_GETLK` and tries `F_SETLK` | seen, refused | **unlocked, acquired** |
+| counter written 2,514 times through `MAP_SHARED`; other side samples its mapping | all seen | **2 distinct values, ended at 10** |
+| 4 writers + a checkpointer per side, jkb's pragmas, 45 s | 100k+ rows, `integrity_check` ok | **malformed after 38 commits** |
+
+A rollback journal does not help — it relies on the same locks. And a container *reader* is not
+safe either: `jkb` opens read-write, and closing a WAL connection that believes it is the last one
+checkpoints and truncates a WAL the host is still writing.
+
+The intended end state is that **the host owns `jkb.db`** and the container reaches it through a
+host daemon over one allowed TCP port, sending typed database operations (never whole CLI
+commands, which would run gates and git on the host, outside this sandbox). Until that exists,
+the separate database is what keeps the two sides from corrupting each other.
+
+Residual: a process that runs with `JKB_DB` unset falls back to `~/.jkb/jkb.db`, the host's.
 
 ## A session worktree is an ordinary folder in here
 

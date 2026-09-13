@@ -83,6 +83,7 @@
         "allowRead": [
           "~/repos",
           "~/.jkb",
+          "~/.local/state/jkb",
           "~/.cargo",
           "~/.rustup",
           "~/.local/bin",
@@ -114,6 +115,7 @@
         "allowWrite": [
           "~/repos",
           "~/.jkb",
+          "~/.local/state/jkb",
           "~/.cargo",
           "~/.rustup",
           "~/Library/Caches",

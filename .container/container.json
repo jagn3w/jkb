@@ -82,9 +82,17 @@
     // open whichever checkout you want, including a `jkb task work` session inside one.
     "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
 
-    // The knowledge base. Shared with the host deliberately — it is the point of jkb — and every
-    // write to it goes through the audited writer-actor, so damage here is undoable.
+    // The host's ~/.jkb: auto-memory (`claude-memory/`), worktree archives, logs. NOT the knowledge
+    // base any more — see the volume below and JKB_DB. A SQLite database cannot be shared across
+    // this bind: measured (.container/sqlite-share-probe.py, 2026-09-13), an fcntl lock taken in here is
+    // invisible on macOS and a MAP_SHARED mapping is not shared, so WAL's write lock and wal-index
+    // both break, and two writers corrupted a scratch database within 38 commits.
     "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
+
+    // The container's OWN knowledge base, until the host owns jkb.db and the container reaches it
+    // through a host daemon. A volume, so it survives a rebuild and reaches nothing of the host's.
+    // It starts empty: tasks and namespaces in the host's KB are not visible in here.
+    "source=jkb-kb-local,target=/home/vscode/.local/state/jkb,type=volume",
 
     // NO credential mount, deliberately. `~/.claude/.credentials.json` is Linux/WSL-only — on
     // macOS the credentials live in the Keychain and the file does not exist, and a bind mount
@@ -109,8 +117,12 @@
   ],
 
   "containerEnv": {
-    // Keep the posture's own paths meaningful inside the container.
-    "JKB_DB": "/home/vscode/.jkb/jkb.db",
+    // The container-local knowledge base (the jkb-kb-local volume), NEVER the host's
+    // ~/.jkb/jkb.db: a jkb process on each side of the bind corrupts it (see the mounts above).
+    // Even a read is unsafe — jkb opens read-write, and closing a WAL connection it believes is the
+    // last one checkpoints and truncates a WAL the host is still using. Residual: a process that
+    // runs with JKB_DB unset falls back to ~/.jkb/jkb.db.
+    "JKB_DB": "/home/vscode/.local/state/jkb/jkb.db",
     // See the target/ volume above: keeps cargo's output off the bind mount.
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",
     // THE ONE ESCAPE FROM THE EGRESS BOOT GATE (D50.6), off by default and declared here on
