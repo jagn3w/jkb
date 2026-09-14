@@ -43,3 +43,15 @@ pub use migrate::{
     supported_version as supported_schema_version,
 };
 pub use store::{cloud_sync_warning, Db, ExtensionRegistrar, WriteMeta};
+
+/// Refuse a path on a filesystem shared with another kernel — the rule `Db::open` applies to a
+/// database, offered for the other file whose writer must be the host: `jkb serve`'s token, which
+/// the dev container sees through the `~/.jkb` bind. A daemon started in the container would
+/// otherwise overwrite the host daemon's live token and lock every client out.
+///
+/// # Errors
+/// As the database refusal: [`Error::UriPath`], [`Error::SharedFilesystem`], or
+/// [`Error::FilesystemUnknown`] when the filesystem cannot be established.
+pub fn refuse_shared_filesystem(path: &std::path::Path) -> Result<()> {
+    shared_fs::refuse(path)
+}

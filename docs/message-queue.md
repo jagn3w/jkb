@@ -62,7 +62,7 @@ routinely built from different checkouts.
 | `mq.tail` | `topic`, `limit` | `messages` {`messages`} |
 | `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
 | `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
-| `notify.gone` | `session`, `owner` | `notified` {…} |
+| `notify.gone` | `session`, `owner`, `instance` (as `notify.open_sessions` reported them) | `notified` {…} |
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
 effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
@@ -183,9 +183,11 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
 
 - refuses an unspecified address (`0.0.0.0`, `::`);
 - mints a 256-bit bearer token each start and writes it, owner-only, to
-  `~/.jkb/daemon/token` whichever database it serves (its readers — the notification hook, the dev
-  container through the `~/.jkb` bind — cannot know the database; beside it, a `--db` host's clients
-  never authenticated) — after the
+  `~/.jkb/daemon/<port>/token` whichever database it serves — keyed by what a client knows: the
+  notification hook and the dev container (through the `~/.jkb` bind) know the address, never the
+  database, and one path per home let a second daemon overwrite the first's live token. The default
+  path is refused on a filesystem shared with another kernel, so a `jkb serve` run inside the
+  container cannot replace the host daemon's token; `--token-file` overrides both — after the
   port is bound, so a fresh token means a listening daemon. That directory is writable from the dev
   container, so the write is made relative to a directory handle opened without following links,
   through an `O_EXCL` temp file with a random name, renamed into place: a link planted there cannot
@@ -234,7 +236,7 @@ What bounds the agent is the operation set: nothing in it touches a file, a URL 
 host.
 
 **Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
-`~/.jkb/daemon/token`), `jkb`:
+`~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
 - runs `jkb mq …` through the daemon;
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;

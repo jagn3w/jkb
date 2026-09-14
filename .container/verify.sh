@@ -1374,7 +1374,8 @@ esac
 # whole path a client takes, not just the port. `--noproxy '*'`: this runs outside the nested
 # sandbox, and a proxy variable in the environment would test the proxy instead of the rule.
 # The header goes through a file descriptor so the token is never in this process's argv.
-daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/token}"
+# Keyed by the daemon's port (`~/.jkb/daemon/<port>/token`), which is how a client finds it.
+daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/${daemon_at##*:}/token}"
 # NO TOKEN IS A NOTE, NOT A FAILURE, for as long as nothing in here depends on the daemon: until the
 # cutover (tasks S6) the container's jkb uses its own database, so a host that never ran setup.sh is
 # not a broken container. It is also what mutate-verify.sh's scratch ~/.jkb and the CI runner look

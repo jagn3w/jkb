@@ -208,13 +208,18 @@ case "$*" in
             conflict) echo '{"error":{"code":"topic_conflict","message":"different spec"}}'; exit 1 ;;
             *) echo '{"error":{"code":"schema_newer","message":"newer"}}'; exit 1 ;;
         esac ;;
-    *"mq group ls claude/notify") printf '%s\n' "${STUB_GROUPS:-[]}" ;;
+    *"mq group ls claude/notify")
+        [ "${STUB_GROUPS_FAIL:-0}" = 1 ] && { echo '{"error":{"code":"schema_newer","message":"newer"}}'; exit 1; }
+        printf '%s\n' "${STUB_GROUPS:-[]}" ;;
     *) exit 3 ;;
 esac
 STUB
     cat >"$nbin/launchctl" <<'STUB'
 #!/usr/bin/env bash
-[ "$1 $2" = "list com.jkb.notifier" ] && [ "${STUB_UNLOADED:-0}" != 1 ]
+[ "$1 $2" = "list com.jkb.notifier" ] && [ "${STUB_UNLOADED:-0}" != 1 ] || exit 1
+printf '{\n\t"Label" = "com.jkb.notifier";\n'
+[ "${STUB_NOPID:-0}" = 1 ] || printf '\t"PID" = 4321;\n'
+printf '};\n'
 STUB
     chmod +x "$nbin/jkb" "$nbin/launchctl"
 }
@@ -239,17 +244,30 @@ case6() {
     [ "$got" = unnamed ] && ok "a jkb that cannot name the topic: unnamed" || fail "topic unnamed" "got '$got'"
 }
 
-# --- 7. the notifier: loaded is not enough, something must have joined the topic ----------------------
+# --- 7. the notifier: reported no stronger than it was checked --------------------------------------
 case7() {
     notify_stub
     local got
-    got="$(in_lib STUB_UNLOADED=1 -- 'check_notifier_agent /db claude/notify com.jkb.notifier; echo "$notifier_state"')"
-    [ "$got" = not-loaded ] && ok "no agent: not-loaded" || fail "agent unloaded" "got '$got'"
-    got="$(in_lib 'STUB_GROUPS=[{"name":"macos-notifier","position":0}]' -- 'check_notifier_agent /db claude/notify com.jkb.notifier; echo "$notifier_state"')"
-    [ "$got" = subscribed ] && ok "a loaded agent whose group joined: subscribed" || fail "agent subscribed" "got '$got'"
-    got="$(in_lib JKB_NOTIFIER_READY_WAIT=0 -- 'check_notifier_agent /db claude/notify com.jkb.notifier; echo "$notifier_state"')"
-    [ "$got" = not-subscribed ] && ok "a loaded agent with no group on the topic: not-subscribed, not healthy" \
+    report() { in_lib "$@" -- 'report_notifier /db "$TS" claude/notify com.jkb.notifier "$DS"; echo "$notifier_state $notifier_pid"'; }
+    got="$(report TS=ready DS=1 STUB_UNLOADED=1)"
+    [ "$got" = "not-loaded " ] && ok "no agent: not-loaded" || fail "agent unloaded" "got '$got'"
+    got="$(report TS=ready DS=1 STUB_NOPID=1)"
+    [ "$got" = "not-running " ] && ok "an agent loaded with no process: not-running, whatever the group says" \
+        || fail "agent not running" "got '$got'"
+    got="$(report TS=ready DS=1 'STUB_GROUPS=[{"name":"macos-notifier","position":0}]')"
+    [ "$got" = "subscribed 4321" ] && ok "a running agent whose group joined: subscribed, with its pid" || fail "agent subscribed" "got '$got'"
+    got="$(report TS=conflict DS=1 JKB_NOTIFIER_READY_WAIT=0)"
+    [ "$got" = "not-subscribed 4321" ] && ok "a running agent with no group on the topic: not-subscribed" \
         || fail "agent not subscribed" "got '$got'"
+    got="$(report TS=ready DS=1 STUB_GROUPS_FAIL=1)"
+    [ "$got" = "undecided 4321" ] && ok "a group list that could not be read: undecided, not 'no group'" \
+        || fail "agent undecided" "got '$got'"
+    for ts in unnamed failed; do
+        got="$(report TS=$ts DS=1)"
+        [ "$got" = "no-topic " ] && ok "topic $ts: no-topic, and no agent is claimed" || fail "topic $ts" "got '$got'"
+    done
+    got="$(report TS=ready DS=0)"
+    [ "$got" = "skipped " ] && ok "--no-service: skipped" || fail "agent skipped" "got '$got'"
 }
 
 # --- 8. --no-service keeps the notifier's agent off too -------------------------------------------------

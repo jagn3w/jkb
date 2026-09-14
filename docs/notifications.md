@@ -52,18 +52,23 @@ nothing more until that seq is acked, so waiting for `caught_up` there deadlocke
 stdout has reached EOF, and the next starts only once that run's batch is off the screen — keyed on the
 exit alone, a dead run's last post could land after the next run withdrew it. A failing subscription is
 retried with backoff (1 s doubling to 30 s, reset only after a run that really started lasted a
-minute), and only the first failure and the recovery are logged, so `notifier.log` does not grow a
-line per retry for as long as a failure lasts.
+minute), and only the first failure — with what the child wrote to stderr, or why it could not start —
+and the recovery are logged, so `notifier.log` does not grow a line per retry for as long as a
+failure lasts. Each run restarts once however many of its end signals arrive.
 
 **A topic nobody reads is not written to.** A message no group consumes is never reapable, so a topic
 with no groups fills to its 10,000-message cap and then refuses every hook call. On a machine with no
 notifier that is the topic's whole life. So the machine still moves the record but sends only while
 `claude/notify` has a group — and the only group is the notifier's (`macos-notifier`, created from
 now by its `jkb mq subscribe`), so only a Mac running the agent receives anything. `scripts/setup.sh`
-creates the topic on every platform, because a producer never creates one, and on macOS reports the
-notifier healthy only when its agent is loaded **and** the topic has a group — the question the daemon
-asks — not merely when an authorized bundle is on disk, which since r3.2 displays nothing by itself
-(`check_notifier_agent` in `scripts/lib.sh`; stage-5 review). `--no-service` leaves the agent off.
+creates the topic on every platform, because a producer never creates one. On macOS it reports only
+what it checked (`report_notifier` in `scripts/lib.sh`): the agent has a running process (a PID from
+`launchctl list`, not merely "loaded", which a crash-looping agent also is) and the topic has a consumer
+group — the question the daemon asks. That is deliberately not "notifications are shown": a group
+outlives its consumer by 7 idle days, and a running notifier can have a failing subscription (its
+`notifier.log` says). What it rules out is the two states setup once reported as healthy — an
+authorized bundle with no agent, and an agent loaded but not running (both stage-5 reviews). A group
+list that cannot be read is `undecided`, never "no group". `--no-service` leaves the agent off.
 
 **The hook never opens a database, and has no local fallback.** It runs after every tool call, and
 opening the database costs ~110 ms (design N7) — worse, a database a newer migration locked this
@@ -78,8 +83,11 @@ against a daemon that accepts and never answers), nothing on stdout, and every f
 cannot fill the disk. The address is `JKB_REMOTE` if set, else `JKB_DAEMON_ADDR` (the dev container
 sets it to `host.docker.internal:7117`; `.container/check-config.sh` reads that variable's name out of
 `remote.rs` and holds the value to the firewall's opening), else `jkb serve`'s default loopback. The
-token is `~/.jkb/daemon/token` **whichever database the daemon serves** — beside the database, a host
-set up with `--db` wrote it where no client looked. The hook runs even where remote mode would refuse
+token is `~/.jkb/daemon/<port>/token`, **keyed by what a client knows** — the daemon's address, never
+its database: beside the database, a host set up with `--db` wrote it where no client looked, and one
+path per home let a second daemon on another port overwrite the first's live token. `jkb serve`
+refuses its default token path on a filesystem shared with another kernel, so a daemon started inside
+the dev container cannot replace the host daemon's token through the `~/.jkb` bind. The hook runs even where remote mode would refuse
 (`JKB_REMOTE` beside `JKB_DB`), since it opens no database. **Only a failed connect marks the daemon
 down** for the 5 s other clients skip it: a request that connected and then outran the hook's 1 s
 reached a daemon busy on a write lock, and marking that down made the next permission prompt give up

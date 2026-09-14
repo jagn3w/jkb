@@ -313,15 +313,19 @@ else
   # The path this drives is the INSTALLED daemon and agent: the lifecycle table runs in com.jkb.serve
   # (the jkb setup.sh last installed, not this checkout's) and display in com.jkb.notifier. So both are
   # checked first, and a failure below names what is missing rather than reading 'expected 1, got 0'.
+  #
+  # ASKED OF THE DAEMON, in remote mode, never by opening the database: this checkout's jkb in local
+  # mode would migrate the real database past the installed daemon, which would then refuse
+  # everything and leave the real pipeline broken until a reinstall (stage-5 re-review).
   live_topic=$("$repo_target/jkb" notify topic 2>/dev/null)
-  if ! grep -q '"name"' <<<"$("$repo_target/jkb" --json mq group ls "$live_topic" 2>/dev/null)"; then
-    fail "live round-trip: $live_topic has no consumer group — is com.jkb.notifier running? (setup.sh)"
-  fi
-  live_hello=$(curl -s --max-time 2 \
-    -H "Authorization: Bearer $(cat "$("$repo_target/jkb" service token-path 2>/dev/null)" 2>/dev/null)" \
-    "$("$repo_target/jkb" service serve-url 2>/dev/null)/v1/hello")
+  live_url=$("$repo_target/jkb" service serve-url 2>/dev/null)
+  live_token=$("$repo_target/jkb" service token-path 2>/dev/null)
+  live_hello=$(curl -s --max-time 2 -H "Authorization: Bearer $(cat "$live_token" 2>/dev/null)" "$live_url/v1/hello")
   if ! grep -q '"protocol"' <<<"$live_hello"; then
-    fail "live round-trip: jkb serve does not answer — is com.jkb.serve running? (setup.sh)"
+    fail "live round-trip: jkb serve does not answer at $live_url — is com.jkb.serve running? (setup.sh)"
+  elif ! grep -q '"name"' <<<"$(env -u JKB_DB JKB_REMOTE="$live_url" JKB_REMOTE_TOKEN_FILE="$live_token" \
+      "$repo_target/jkb" --json mq group ls "$live_topic" 2>/dev/null)"; then
+    fail "live round-trip: $live_topic has no consumer group — is com.jkb.notifier running? (setup.sh)"
   fi
 
   # Claude needs permission.

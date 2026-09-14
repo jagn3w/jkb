@@ -631,7 +631,10 @@ run "the host daemon's name does not resolve at the raise" "did not resolve when
 # is a note there; planting a wrong one makes it ask, and nothing that answers — the Mac's real daemon
 # with a 401, or no daemon at all on a CI runner — may be reported as jkb serve answering. Same image
 # and flags as the control; the only difference is a file in the scratch knowledge-base bind.
-mkdir -p "$scratch/jkb/daemon" && printf 'not-the-token\n' > "$scratch/jkb/daemon/token"
+# At the path a client of the firewall's daemon port reads (`~/.jkb/daemon/<port>/token`).
+daemon_port="$(sed -n 's/^DAEMON_PORT=\([0-9][0-9]*\)$/\1/p' "$REPO/.container/egress-lib.sh" | head -1)"
+[ -n "$daemon_port" ] || { echo "could not read DAEMON_PORT from egress-lib.sh" >&2; exit 2; }
+mkdir -p "$scratch/jkb/daemon/$daemon_port" && printf 'not-the-token\n' > "$scratch/jkb/daemon/$daemon_port/token"
 run "the daemon token on the bind does not authenticate" "does not answer at" \
     "${HEALTHY[@]}"
 rm -rf "$scratch/jkb/daemon"

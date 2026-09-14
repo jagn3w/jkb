@@ -34,6 +34,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# Defined before the flag loop, so `--agent-label` answers it without running this script again —
+# `"$0" --agent-label` failed under a bare-name or non-executable invocation, taking every mode with it.
+agent_label=com.jkb.notifier
 quiet=0
 check_only=0
 print_agent=0
@@ -46,7 +49,7 @@ while [ "$#" -gt 0 ]; do
     --quiet) quiet=1 ;;
     --check) check_only=1 ;;
     --print-agent) print_agent=1 ;;
-    --agent-label) echo com.jkb.notifier; exit 0 ;;
+    --agent-label) echo "$agent_label"; exit 0 ;;
     --no-agent) agent=0 ;;
     --jkb) jkb_bin="${2:?--jkb needs a path}"; shift ;;
     --db) db="${2:?--db needs a path}"; shift ;;
@@ -117,7 +120,6 @@ check_plist() {
 }
 
 # --- the launchd agent -----------------------------------------------------------------------
-agent_label="$("$0" --agent-label)"
 agent_plist="$HOME/Library/LaunchAgents/$agent_label.plist"
 
 xml_escape() { # the five XML entities, for a value inside <string>

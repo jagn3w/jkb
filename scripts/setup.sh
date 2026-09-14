@@ -204,6 +204,7 @@ provision_notify_topic "$db"
 #     so it must be requested interactively rather than in passing here;
 #   - the sticky "Alerts" style is a per-app setting no API can set.
 notifier_state=not-macos
+notifier_pid=""
 if [ "$(uname -s)" = "Darwin" ]; then
   say "sticky notifications"
   # "Did this build succeed" and "what notifier is installed, in what state" are separate
@@ -234,13 +235,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
          echo "    jkb Notifier > Alerts  (banners auto-hide; only Alerts waits for you)" ;;
     esac
   fi
-  if [ "$do_service" -ne 1 ]; then
-    notifier_state=skipped
-  elif [ -n "$notify_topic" ]; then
-    check_notifier_agent "$db" "$notify_topic" "$("$repo_root/scripts/build-notifier.sh" --agent-label)"
-  else
-    notifier_state=not-subscribed
-  fi
+  report_notifier "$db" "$notify_topic_state" "$notify_topic" \
+    "$(bash "$repo_root/scripts/build-notifier.sh" --agent-label)" "$do_service"
 fi
 
 say "setup complete"
@@ -256,5 +252,5 @@ render_setup_summary < <(
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
-  printf 'notifier=%s\n' "$notifier_state"
+  printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

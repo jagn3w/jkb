@@ -317,18 +317,17 @@ fn hook() {
         append_log(&log, &[format!("reading the hook payload: {e}")]);
         return;
     }
-    let backend = match jkb_daemon::client::RemoteBackend::new(
-        &crate::remote::daemon_url(),
-        crate::remote::token_file(),
-    )
-    .and_then(|b| b.with_deadlines(CONNECT, TOTAL))
-    {
-        Ok(b) => b.with_down_marker(crate::remote::down_marker()),
-        Err(e) => {
-            append_log(&log, &[failure("client", &e)]);
-            return;
-        }
-    };
+    let url = crate::remote::daemon_url();
+    let backend =
+        match jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
+            .and_then(|b| b.with_deadlines(CONNECT, TOTAL))
+        {
+            Ok(b) => b.with_down_marker(crate::remote::down_marker()),
+            Err(e) => {
+                append_log(&log, &[failure("client", &e)]);
+                return;
+            }
+        };
     let failures = handle(
         &raw,
         &Edge {

@@ -1576,6 +1576,9 @@ render_git_hooks_report() {
 #   extension=<state>          installed | skipped | failed
 #   watcher=<state>            running | skipped | failed
 #   serve=<state>              up | refusing | undecided | failed | unchecked | skipped
+#   topic=<state> <name>       ready | conflict | unnamed | failed
+#   notifier=<state> [pid]     subscribed | not-subscribed | not-running | not-loaded | no-topic |
+#                              undecided | skipped | not-macos
 #
 # Every `case` has a default arm that warns, so a state added to the producer with no arm here
 # surfaces at runtime instead of vanishing.
@@ -1638,9 +1641,12 @@ render_setup_summary() {
                 esac ;;
             notifier=*)
                 case "$state" in
-                    subscribed)     printf '  • notifier:   running and subscribed; permission notifications are shown\n' ;;
-                    not-subscribed) printf '  • notifier:   loaded but NOT subscribed; nothing is shown (see notifier.log)\n' ;;
-                    not-loaded)     printf '  • notifier:   NOT running; nothing is shown (see the warnings above)\n' ;;
+                    subscribed)     printf '  • notifier:   running (pid %s); the topic has a consumer group\n' "$detail" ;;
+                    not-subscribed) printf '  • notifier:   running, but NOTHING subscribed to the topic; nothing is shown (see notifier.log)\n' ;;
+                    not-running)    printf '  • notifier:   loaded but NOT running; nothing is shown (see notifier.log)\n' ;;
+                    not-loaded)     printf '  • notifier:   NOT loaded; nothing is shown (see the warnings above)\n' ;;
+                    no-topic)       printf '  • notifier:   not checked — there is no topic for it to read\n' ;;
+                    undecided)      printf '  • notifier:   running; could not read whether it subscribed (see the warnings above)\n' ;;
                     skipped)        printf '  • notifier:   skipped (--no-service)\n' ;;
                     not-macos)      printf '  • notifier:   none on this platform; a Mac running com.jkb.notifier shows them\n' ;;
                     *)              warn "unrecognised notifier state: $line" ;;
@@ -1698,31 +1704,54 @@ build_notifier() {
     "$builder" "${flags[@]}"
 }
 
-# check_notifier_agent <db> <topic> <label> — on macOS, whether the notifier that displays
-# notifications is actually consuming: its launchd agent is loaded, and the topic has a consumer
-# group within JKB_NOTIFIER_READY_WAIT (default 10) seconds. A group, not a group NAME, because that
-# is exactly what the daemon asks before it sends anything (jkb_core::notify: a topic with no group is
-# not written to). Sets `notifier_state`:
-#   subscribed      the agent is loaded and the topic has a group
-#   not-subscribed  the agent is loaded but nothing joined the topic — nothing will be shown
+# report_notifier <db> <topic-state> <topic> <label> <do_service> — on macOS, what can be established
+# about the notifier that displays notifications, stated no stronger than it was checked. Sets
+# `notifier_state` and `notifier_pid`:
+#   subscribed      its launchd agent has a running process (a PID), and the topic has a consumer group
+#   not-subscribed  running, but the topic has no group — nothing will be shown
+#   not-running     loaded, with no process (crash-looping, or exited)
 #   not-loaded      no agent — nothing will be shown, however authorized the bundle is
-# It exists because an authorized bundle on disk is NOT the feature any more: since r3.2 the agent is
-# the only thing that displays, and setup used to report healthy on the bundle alone.
-check_notifier_agent() {
-    local db="$1" topic="$2" label="$3" waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups=""
-    if ! launchctl list "$label" >/dev/null 2>&1; then
+#   no-topic        the topic could not be created or named, so nothing was checked
+#   undecided       the group list could not be read (a jkb error, not an empty list)
+#   skipped         --no-service
+# `subscribed` is NOT "notifications are shown": a group outlives its consumer by the idle period
+# (7 days), and a running notifier may have a failing subscription (its notifier.log says). What it
+# rules out is the two states setup used to report as healthy — a bundle with no agent, and an agent
+# loaded but not running (both stage-5 reviews). A group, not a group NAME, because that is what the
+# daemon asks before it sends anything.
+report_notifier() {
+    local db="$1" topic_state="$2" topic="$3" label="$4" do_service="$5"
+    local listing waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups rc
+    notifier_pid=""
+    if [ "$do_service" != 1 ]; then notifier_state=skipped; return 0; fi
+    case "$topic_state" in
+        ready|conflict) ;;
+        *) notifier_state=no-topic; return 0 ;;
+    esac
+    if ! listing="$(launchctl list "$label" 2>/dev/null)"; then
         notifier_state=not-loaded
         warn "the $label agent is not loaded — permission notifications will not be shown"
         return 0
     fi
+    notifier_pid="$(sed -n 's/^[[:space:]]*"PID" = \([0-9][0-9]*\);$/\1/p' <<<"$listing" | head -1)"
+    if [ -z "$notifier_pid" ]; then
+        notifier_state=not-running
+        warn "$label is loaded but not running — see notifier.log beside the database"
+        return 0
+    fi
     while :; do
-        groups="$(jkb --db "$db" --json mq group ls "$topic" 2>/dev/null)" || groups=""
+        groups="$(jkb --db "$db" --json mq group ls "$topic" 2>/dev/null)" && rc=0 || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            notifier_state=undecided
+            warn "could not list the consumer groups of $topic, so whether the notifier subscribed is unknown: $groups"
+            return 0
+        fi
         case "$groups" in *'"name"'*) notifier_state=subscribed; return 0 ;; esac
         [ "$waited" -ge "$wait_for" ] && break
         sleep 1; waited=$((waited + 1))
     done
     notifier_state=not-subscribed
-    warn "$label is loaded but nothing has subscribed to $topic within ${wait_for}s — see notifier.log beside the database"
+    warn "$label is running but nothing has subscribed to $topic within ${wait_for}s — see notifier.log beside the database"
 }
 
 # --- a database on a shared filesystem ------------------------------------------------------

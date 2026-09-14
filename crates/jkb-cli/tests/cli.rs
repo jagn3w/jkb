@@ -2958,10 +2958,12 @@ fn notify_hook_request(
 ) -> (String, TempDir) {
     use std::io::{Read as _, Write as _};
     let dir = TempDir::new().expect("tempdir");
-    std::fs::create_dir_all(dir.path().join(".jkb/daemon")).unwrap();
-    std::fs::write(dir.path().join(".jkb/daemon/token"), "tok").unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    // Where a daemon on that port writes its token: the client finds it by the port it was sent to.
+    let token_dir = dir.path().join(format!(".jkb/daemon/{}", addr.port()));
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join("token"), "tok").unwrap();
     // Non-blocking with a deadline: a hook that looked anywhere else must fail its test, not hang it.
     listener.set_nonblocking(true).unwrap();
     let seen = std::thread::spawn(move || {
@@ -3010,7 +3012,7 @@ fn notify_hook_request(
 }
 
 /// The hook finds the daemon where the environment says — `JKB_DAEMON_ADDR`, which is how the dev
-/// container points it at the host — and presents the token from `~/.jkb/daemon/token`. Checked
+/// container points it at the host — and presents the token from `~/.jkb/daemon/<port>/token`. Checked
 /// through the real binary against a listener that records the request, since a hook that looked
 /// anywhere else would fail just as silently as one that found nothing.
 #[test]
@@ -3552,14 +3554,21 @@ fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
     let token = run(&["service", "token-path"]);
     let token = Path::new(token.trim());
     // The documented place, and the one remote mode and the notification hook assume when
-    // JKB_REMOTE_TOKEN_FILE is unset — in the home, NOT beside this non-default database, which no
-    // client can know.
-    assert_eq!(token, home.join(".jkb/daemon/token"));
+    // JKB_REMOTE_TOKEN_FILE is unset — in the home, keyed by the unit's port, NOT beside this
+    // non-default database, which no client can know.
+    let default_port = jkb_daemon::DEFAULT_ADDR.rsplit(':').next().unwrap();
+    assert_eq!(
+        token,
+        home.join(format!(".jkb/daemon/{default_port}/token"))
+    );
+    // ...and a daemon writes where that rule says for ITS port — so two in one home cannot overwrite
+    // each other's live token. (The unit's own port is not bound here; port 0 is keyed as 0.)
     let mut cmd = jkb(&db);
     cmd.args(["serve", "--addr", "127.0.0.1:0"])
         .env("HOME", &home);
     let (mut serve, _) = Daemon::spawn(cmd);
-    assert!(token.is_file(), "no token at {}", token.display());
+    let written = home.join(".jkb/daemon/0/token");
+    assert!(written.is_file(), "no token at {}", written.display());
     serve.stop();
 }
 

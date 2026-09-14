@@ -131,7 +131,7 @@ pub enum Request {
         /// The `claude` process's pid, or empty when the hook had none it could trust.
         #[serde(default)]
         owner: String,
-        /// The pid namespace `owner` belongs to.
+        /// Where `owner` means something: `host[#boot][/pidns]`, built by `jkb notify hook`.
         #[serde(default)]
         instance: String,
     },
@@ -189,7 +189,7 @@ pub struct NotifySession {
     pub tool: String,
     /// The owner pid the hook recorded, or empty.
     pub owner: String,
-    /// The pid namespace that pid belongs to.
+    /// Where that pid means something: `host[#boot][/pidns]`.
     pub instance: String,
     /// When the record was last written (Unix ms).
     pub updated_at: i64,

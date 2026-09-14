@@ -213,7 +213,9 @@ enum Command {
         /// Where to listen. An unspecified address (0.0.0.0, ::) is refused.
         #[arg(long, default_value = jkb_daemon::DEFAULT_ADDR)]
         addr: std::net::SocketAddr,
-        /// Where to write the token (default: `~/.jkb/daemon/token`, whichever database is served).
+        /// Where to write the token (default: `~/.jkb/daemon/<port>/token`, whichever database is
+        /// served; refused on a filesystem shared with another kernel, such as the dev container's
+        /// view of the host's `~/.jkb`).
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
@@ -1155,21 +1157,20 @@ fn run(cli: Cli) -> Result<()> {
     // never open a database — on the dev container's kernel that is the host's `jkb.db`, which a
     // process on each side of the bind corrupts — so every command either goes to the daemon or is
     // refused here, at dispatch, before it has run git, written a file or opened anything.
-    if let Some(remote) = remote::target() {
-        return remote::run(cli, &remote);
-    }
-
-    // Commands that touch NO database are dispatched before it is opened, and this is
-    // structural rather than a remembered ordering: `open_db` verifies fifteen migrations and
-    // spawns the writer thread — 110 ms against the real database — and `notify hook` runs after
-    // EVERY tool call, which is the cost design N7 measured and rejected. Worse than slow: when a
-    // newer branch's migration locks an older binary out of the shared database (a documented
-    // state), `open_db` returns Err and the arm below is never reached, so nothing posts and —
-    // the expensive half — nothing ever withdraws, leaving an Alerts-style notification on screen
-    // for good.
+    // `notify` FIRST, ahead of remote mode too — the one dispatch, not one per mode. It touches no
+    // database in any mode: `open_db` verifies the migrations and spawns the writer thread — 110 ms
+    // against the real database — and `notify hook` runs after EVERY tool call, the cost design N7
+    // measured and rejected; and when a newer branch's migration locks an older binary out of the
+    // database, `open_db` fails and nothing would ever withdraw. Ahead of remote mode because remote
+    // mode's refusals (`JKB_DB` beside `JKB_REMOTE`) exit before the hook can log, onto a stderr
+    // the shim discards — every notification lost silently (stage-5 review).
     if let Command::Notify { cmd } = &cli.command {
         notify::run(cmd);
         return Ok(());
+    }
+
+    if let Some(remote) = remote::target() {
+        return remote::run(cli, &remote);
     }
 
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
@@ -1234,7 +1235,11 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             ServiceCmd::TokenPath => {
-                println!("{}", service::serve_token_path().display());
+                // The unit passes no `--addr`, so its token is keyed by serve's default port.
+                let port = jkb_daemon::DEFAULT_ADDR
+                    .parse::<std::net::SocketAddr>()
+                    .map_or(7117, |a| a.port());
+                println!("{}", service::serve_token_path(port).display());
                 Ok(())
             }
         };
@@ -6597,7 +6602,7 @@ fn cmd_serve(
     addr: std::net::SocketAddr,
     token_file: Option<PathBuf>,
 ) -> Result<()> {
-    let token_path = token_file.unwrap_or_else(service::serve_token_path);
+    let token_path = serve_token_for(token_file, addr.port(), jkb_core::refuse_shared_filesystem)?;
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
     let path = db_path.to_path_buf();
     let open: jkb_daemon::server::Opener = Box::new(move || {
@@ -6627,6 +6632,31 @@ fn cmd_serve(
     let _ = rx.recv();
     handle.shutdown();
     Ok(())
+}
+
+/// The token path `jkb serve` writes: the one it was given, or the default for its port — which is
+/// refused on a filesystem shared with another kernel. Inside the dev container `~/.jkb` IS the
+/// host's, through a bind, so a `jkb serve` run there (an agent's smoke test, say) replaced the host
+/// daemon's live token: the host daemon kept the old one in memory, and every client — the Mac's
+/// notifier, every hook — read the new one and was refused until the host daemon restarted. An
+/// explicit `--token-file` is the caller's own decision and is not second-guessed.
+fn serve_token_for(
+    explicit: Option<PathBuf>,
+    port: u16,
+    refuse: impl Fn(&Path) -> jkb_core::Result<()>,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let path = service::serve_token_path(port);
+    refuse(&path).with_context(|| {
+        format!(
+            "jkb serve would write its token to {}, which another kernel's jkb serve may own (the \
+             dev container sees the host's ~/.jkb); run jkb serve on the host, or pass --token-file",
+            path.display()
+        )
+    })?;
+    Ok(path)
 }
 
 /// What one compaction pass of the message queue did.
@@ -8711,6 +8741,30 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `jkb serve`'s default token path is refused where the refusal says so, and an explicit one is
+    /// the caller's decision. The refusal itself is `jkb_core`'s shared-filesystem rule, measured in
+    /// the dev container against the `~/.jkb` bind (FUSE).
+    #[test]
+    fn a_default_token_on_a_shared_filesystem_is_refused_and_an_explicit_one_is_not() {
+        let shared = |p: &std::path::Path| -> jkb_core::Result<()> {
+            Err(jkb_core::Error::SharedFilesystem {
+                path: p.to_path_buf(),
+                kind: "FUSE",
+            })
+        };
+        let local = |_: &std::path::Path| -> jkb_core::Result<()> { Ok(()) };
+        let err = super::serve_token_for(None, 7117, shared).unwrap_err();
+        assert!(format!("{err:#}").contains("--token-file"), "{err:#}");
+        assert!(super::serve_token_for(None, 7117, local)
+            .unwrap()
+            .ends_with(".jkb/daemon/7117/token"));
+        let given = std::path::PathBuf::from("/x/token");
+        assert_eq!(
+            super::serve_token_for(Some(given.clone()), 7117, shared).unwrap(),
+            given
+        );
+    }
+
     use super::GUIDE;
     use jkb_types::TaskStatus;
 

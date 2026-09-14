@@ -126,6 +126,23 @@ fn the_instance_is_the_host_and_the_container_boot() {
     );
 }
 
+/// **What the running process actually sends carries its own pid namespace.** `instance_from`'s table
+/// above passes the namespace in; this pins that `instance()` reads it — reverting that one argument
+/// to `None` left every other test green while a `claude` in a nested sandbox would again probe the
+/// outer namespace's pids and withdraw every live prompt (stage-5 re-review). Linux only: macOS has
+/// no `/proc`, and its instance is the hostname alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_instance_sent_ends_with_this_process_s_pid_namespace() {
+    let ns = std::fs::read_link("/proc/self/ns/pid").expect("a pid namespace link on Linux");
+    let ns = ns.to_string_lossy();
+    let mine = super::instance();
+    assert!(
+        mine.ends_with(&format!("/{ns}")),
+        "{mine:?} does not end with this process's namespace {ns:?}"
+    );
+}
+
 fn record(owner: &str, instance: &str) -> NotifySession {
     NotifySession {
         session: "s".into(),

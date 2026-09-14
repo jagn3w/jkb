@@ -157,20 +157,21 @@ pub fn units(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Where `jkb serve` writes its token when not told otherwise: `~/.jkb/daemon/token`, **whichever
-/// database it serves**. The daemon writes it only once its port is bound, which is what setup.sh
-/// waits for.
+/// Where `jkb serve` listening on `port` writes its token when not told otherwise:
+/// `~/.jkb/daemon/<port>/token`, **whichever database it serves**. The daemon writes it only once its
+/// port is bound, which is what setup.sh waits for.
 ///
-/// Per home, not beside the database, because its readers cannot know the database: the notification
-/// hook opens none, and the dev container sees the host's `~/.jkb` through a bind while its own
-/// `JKB_DB` names a container-local file. Beside the database, a host set up with `--db ~/kb/jkb.db`
-/// wrote `~/kb/daemon/token` and every client looked in `~/.jkb/daemon/token` and never
-/// authenticated. One home runs one daemon anyway: they would share its port.
+/// **Keyed by what a client knows.** A client knows the daemon's address and never its database:
+/// the notification hook opens none, and the dev container sees the host's `~/.jkb` through a bind
+/// while its own `JKB_DB` names a container-local file. Beside the database, a host set up with
+/// `--db ~/kb/jkb.db` wrote `~/kb/daemon/token` where no client looked. One path per home instead let
+/// a second daemon on another port overwrite the first's live token, locking out every client of
+/// the first (both found by the stage-5 reviews). The port is what separates two daemons in one home.
 #[must_use]
-pub fn serve_token_path() -> PathBuf {
+pub fn serve_token_path(port: u16) -> PathBuf {
     std::env::var_os("HOME")
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join(".jkb/daemon/token")
+        .join(format!(".jkb/daemon/{port}/token"))
 }
 
 /// Every `(label, install path, contents)` for the current platform.

@@ -539,8 +539,20 @@ final class Run {
     /// Set only once the process actually started, so a binary that cannot be launched never counts
     /// as a run that lasted.
     var startedAt: Date?
+    /// Set by the first `finish` that acts. Both end signals can arrive after a launch failure too —
+    /// the catch block and the pipe's EOF — and each scheduling a restart doubled the restarts every
+    /// cycle (stage-5 re-review).
+    var finishing = false
+    /// The end of what the child wrote to stderr (or why it could not start), logged only if this run
+    /// is the first of a failure — never once per retry into a log nothing rotates.
+    var stderrTail = Data()
 
     init(consumer: Consumer) { self.consumer = consumer }
+
+    func noteStderr(_ data: Data) {
+        stderrTail.append(data)
+        if stderrTail.count > 4096 { stderrTail = Data(stderrTail.suffix(4096)) }
+    }
 }
 
 final class Subscription {
@@ -563,9 +575,10 @@ final class Subscription {
         p.arguments = args
         let out = Pipe()
         let inp = Pipe()
+        let err = Pipe()
         p.standardOutput = out
         p.standardInput = inp
-        p.standardError = FileHandle.standardError
+        p.standardError = err
         let input = inp.fileHandleForWriting
         let run = Run(
             consumer: Consumer(display: CenterDisplay()) { seq in
@@ -588,6 +601,14 @@ final class Subscription {
             }
             DispatchQueue.main.async { run.consumer.receive(data) }
         }
+        err.fileHandleForReading.readabilityHandler = { h in
+            let data = h.availableData
+            if data.isEmpty {
+                h.readabilityHandler = nil
+                return
+            }
+            DispatchQueue.main.async { run.noteStderr(data) }
+        }
         p.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async {
                 run.exited = proc.terminationStatus
@@ -604,19 +625,27 @@ final class Subscription {
                 self.backoff = 1
             }
         } catch {
-            log("could not run \(jkb): \(error.localizedDescription)")
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
+            run.noteStderr(Data("could not run \(jkb): \(error.localizedDescription)\n".utf8))
             run.exited = -1
             run.eof = true
             finish(run)
         }
     }
 
-    /// Called on each of a run's two end signals; acts once both have arrived and its batch is done.
+    /// Called on each of a run's two end signals; acts once, when both have arrived.
     func finish(_ run: Run) {
-        guard let status = run.exited, run.eof else { return }
+        guard let status = run.exited, run.eof, !run.finishing else { return }
+        run.finishing = true
+        restartWhenIdle(run, status: status)
+    }
+
+    /// Restart once the run's last batch has left the screen.
+    private func restartWhenIdle(_ run: Run, status: Int32) {
         if run.consumer.isBusy {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.finish(run)
+                self?.restartWhenIdle(run, status: status)
             }
             return
         }
@@ -626,7 +655,11 @@ final class Subscription {
         }
         failures += 1
         if failures == 1 {
-            log("the subscription ended (status \(status)); restarting, quietly until it recovers")
+            let said = String(decoding: run.stderrTail, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            log(
+                "the subscription ended (status \(status)); restarting, quietly until it recovers"
+                    + (said.isEmpty ? "" : ": \(said)"))
         }
         let delay = backoff
         backoff = min(backoff * 2, 30)

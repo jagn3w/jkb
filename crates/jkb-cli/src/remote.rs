@@ -117,15 +117,34 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-/// The token file: `JKB_REMOTE_TOKEN_FILE`, else where the host's `jkb serve` writes it
-/// (`~/.jkb/daemon/token`, seen through the bind in the container) — the same function it uses, not
-/// a copy.
+/// The token file for the daemon at `url`: `JKB_REMOTE_TOKEN_FILE`, else where a `jkb serve` on that
+/// URL's port writes it (`~/.jkb/daemon/<port>/token`, seen through the bind in the container) — the
+/// same function it uses, not a copy.
 #[must_use]
-pub fn token_file() -> PathBuf {
+pub fn token_file(url: &str) -> PathBuf {
     std::env::var_os("JKB_REMOTE_TOKEN_FILE")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(super::service::serve_token_path)
+        .unwrap_or_else(|| super::service::serve_token_path(port_of(url)))
+}
+
+/// The port in a daemon URL (`http://host:port[/…]`), or `jkb serve`'s default when it names none.
+fn port_of(url: &str) -> u16 {
+    let default = jkb_daemon::DEFAULT_ADDR
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7117);
+    let authority = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(default)
 }
 
 /// The subcommand as typed, for the refusal message: the first argument that is not a flag. `--db`,
@@ -143,14 +162,6 @@ fn subcommand_name() -> String {
 /// A refusal (for `--db` or `JKB_DB`, or a command that may not run remotely), or the command's own
 /// error.
 pub fn run(cli: Cli, remote: &str) -> Result<()> {
-    // The notification hook first, ahead of every refusal below. It opens no database in any mode,
-    // so `--db`/`JKB_DB` beside `JKB_REMOTE` configure nothing it uses — and a hook refused here
-    // exits 1 with its message on a stderr the shim discards, before the hook can log, so every
-    // notification from that shell was lost with nothing written anywhere. (Stage-5 review.)
-    if let Command::Notify { cmd } = &cli.command {
-        super::notify::run(cmd);
-        return Ok(());
-    }
     // A refusal here is a `jkb mq` verb's failure too, so it keeps that verb's `--json` rule.
     let refuse = |message: String| {
         let err = super::mq_cli::refused(jkb_api::ErrorCode::BadRequest, message);
@@ -194,18 +205,19 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
         },
         Support::Ported => match cli.command {
             Command::Mq { cmd } => {
-                let backend = match jkb_daemon::client::RemoteBackend::new(remote, token_file()) {
-                    Ok(backend) => backend,
-                    Err(e) => {
-                        let err = super::mq_cli::refused(e.code, e.message);
-                        // The same `--json` rule `mq_cli::run` applies once it has a backend.
-                        if cli.json {
-                            super::mq_cli::print_failure(&cmd, &err);
+                let backend =
+                    match jkb_daemon::client::RemoteBackend::new(remote, token_file(remote)) {
+                        Ok(backend) => backend,
+                        Err(e) => {
+                            let err = super::mq_cli::refused(e.code, e.message);
+                            // The same `--json` rule `mq_cli::run` applies once it has a backend.
+                            if cli.json {
+                                super::mq_cli::print_failure(&cmd, &err);
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
                     }
-                }
-                .with_down_marker(down_marker());
+                    .with_down_marker(down_marker());
                 super::mq_cli::run(&backend, cmd, cli.json)
             }
             _ => bail!("internal: a Ported command with no remote dispatch"),
@@ -217,8 +229,21 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{daemon_url_from, support, Support};
+    use super::{daemon_url_from, port_of, support, Support};
     use crate::Cli;
+
+    #[test]
+    fn the_token_is_found_by_the_port_the_url_names() {
+        assert_eq!(port_of("http://host.docker.internal:7117"), 7117);
+        assert_eq!(port_of("http://127.0.0.1:7200/"), 7200);
+        assert_eq!(port_of("127.0.0.1:7300"), 7300);
+        assert_eq!(port_of("http://[::1]:7400"), 7400);
+        assert_eq!(
+            port_of("http://localhost"),
+            7117,
+            "no port: serve's default"
+        );
+    }
 
     #[test]
     fn the_daemon_is_remote_mode_s_then_the_configured_one_then_this_host_s() {

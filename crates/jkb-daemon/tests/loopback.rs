@@ -830,8 +830,9 @@ fn connections_are_capped_and_a_silent_one_is_closed() {
 #[test]
 fn a_notification_event_wakes_a_long_poll_like_a_send() {
     // `notify.event` puts its effects on `claude/notify` inside the daemon, so it must announce them
-    // as `mq.send` does (`Request::may_send`) — or a consumer's long-poll hears about a permission
-    // prompt only at the floor. The floor is pushed out past the test, so only the wake can deliver.
+    // as `mq.send` does (`Response::announces_a_send`) — or a consumer's long-poll hears about a
+    // permission prompt only at the floor. The floor is pushed out past the test, so only the wake
+    // can deliver.
     let f = Fixture::with(|cfg| cfg.poll_floor = Duration::from_mins(1));
     let c = f.client().with_poll_wait(Duration::from_secs(20));
     c.call(Request::MqTopicCreate {
