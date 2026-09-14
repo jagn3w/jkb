@@ -590,6 +590,40 @@ run "auto-memory is not linked into the shared store" "auto-memory is not linked
 run "the firewall cannot resolve any allowlisted domain" "the live chain denies everything and has no allowlist" \
     --dns 127.0.0.1 "${HEALTHY[@]}"
 
+# THE HOST DAEMON'S OPENING (design r3.2 H5), broken the three ways the raise can get it wrong and
+# watched by verify.sh's kernel-state arm for each. Mutants of the INSTALLED scripts, because what
+# is being broken is what root runs at start, which no docker flag reaches. Each checks its own edit
+# landed (`! cmp`) and still parses, so a moved target is BUILD-FAILED rather than an unmutated image
+# reported as a guard that did not fire.
+#
+# WIDE: the raise stops keeping the daemon's address out of `allowed`. The posture names the host
+# alias (so the nested sandbox's proxy can reach it), so without the keep-out the address lands in a
+# port-less set and every port on the host's loopback is open to the container.
+mutant jkb-dev-daemon-wide "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i 's|if ipset test \"\$DAEMON_SET-new\" \"\$ip\" >/dev/null 2>&1; then|if false; then|' /usr/local/bin/init-firewall.sh && ! cmp -s /tmp/fw.orig /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
+run "the firewall puts the host daemon's address in the allowlist" "opens EVERY port on the host's loopback" \
+    "${HEALTHY[@]}"
+
+# ABSENT: the raise never installs the port rule.
+mutant jkb-dev-daemon-absent "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i '/-A OUTPUT \$RULE_DAEMON/d' /usr/local/bin/init-firewall.sh && ! cmp -s /tmp/fw.orig /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
+run "the firewall installs no rule for the host daemon" "has no rule for jkb serve on the host" \
+    "${HEALTHY[@]}"
+
+# UNRESOLVED: the name the raise looks up resolves to nothing. Done in the installed library rather
+# than by dropping --add-host, because Docker Desktop resolves the alias without that flag (measured),
+# so on the machine this is developed on that mutation would change nothing and report MISSED.
+mutant jkb-dev-daemon-unresolved "cp /usr/local/bin/egress-lib.sh /tmp/lib.orig && sed -i 's/^DAEMON_HOST=.*/DAEMON_HOST=no-such-host.invalid/' /usr/local/bin/egress-lib.sh && ! cmp -s /tmp/lib.orig /usr/local/bin/egress-lib.sh && bash -n /usr/local/bin/egress-lib.sh"
+run "the host daemon's name does not resolve at the raise" "did not resolve when the firewall was raised" \
+    "${HEALTHY[@]}"
+
+# A TOKEN THAT DOES NOT AUTHENTICATE. The control's scratch ~/.jkb has no token, so the answer check
+# is a note there; planting a wrong one makes it ask, and nothing that answers — the Mac's real daemon
+# with a 401, or no daemon at all on a CI runner — may be reported as jkb serve answering. Same image
+# and flags as the control; the only difference is a file in the scratch knowledge-base bind.
+mkdir -p "$scratch/jkb/daemon" && printf 'not-the-token\n' > "$scratch/jkb/daemon/token"
+run "the daemon token on the bind does not authenticate" "does not answer at" \
+    "${HEALTHY[@]}"
+rm -rf "$scratch/jkb/daemon"
+
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
 # Dockerfile removes it; this puts it back and requires verify.sh to notice.

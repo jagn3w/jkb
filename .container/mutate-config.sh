@@ -42,6 +42,9 @@ seed() {
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
     cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
+    # ...and jkb-daemon's DEFAULT_ADDR, which check-config.sh holds the firewall's daemon port to.
+    mkdir -p "$work/t/crates/jkb-daemon/src"
+    cp "$repo/crates/jkb-daemon/src/lib.rs" "$work/t/crates/jkb-daemon/src/"
     # The manifest is what lets mutated() see a DELETION or a MODE CHANGE. Taken here rather than
     # derived from a list, so it still covers a file added to seed() tomorrow.
     tree_manifest > "$work/manifest"
@@ -290,6 +293,67 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('VERDICT_STATES="allowlisted', 'NOT_THE_STATES="allowlisted', 1))
 PYX
 run "the library stops declaring its states" "no longer declares VERDICT_STATES"
+
+# THE HOST DAEMON'S OPENING (design r3.2 H5). One mutation per property check-config.sh holds, and
+# the port and host ones mutate ONE side so the pair disagrees rather than moving together.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert "    wide)       bad " in s, "mutation target absent"
+open(p, 'w').write(s.replace("    wide)       bad ", "    broad)      bad ", 1))
+PYX
+run "verify.sh loses the arm for a daemon state" "has no case arm for the 'wide' daemon state"
+
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert 'DAEMON_STATES="port' in s, "mutation target absent"
+open(p, 'w').write(s.replace('DAEMON_STATES="port', 'NOT_DAEMON_STATES="port', 1))
+PYX
+run "the library stops declaring the daemon states" "no longer declares DAEMON_STATES"
+
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert "\nDAEMON_PORT=7117\n" in s, "mutation target absent"
+open(p, 'w').write(s.replace("\nDAEMON_PORT=7117\n", "\nDAEMON_PORT=7118\n", 1))
+PYX
+run "the firewall opens a port the daemon does not bind" "but jkb serve binds 7117"
+
+seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert 'DEFAULT_ADDR: &str = "127.0.0.1:' in s, "mutation target absent"
+open(p, 'w').write(s.replace('DEFAULT_ADDR: &str = "127.0.0.1:', 'DEFAULT_ADDR: &str = "localhost:', 1))
+PYX
+run "the daemon's port can no longer be read" "could not read the daemon port"
+
+seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "iptables -w 5 -A OUTPUT $RULE_DAEMON"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "iptables -w 5 -A OUTPUT -p tcp -m set --match-set jkb-daemon dst -j ACCEPT", 1))
+PYX
+run "the raise spells the daemon rule itself, without its port" "init-firewall.sh spells an OUTPUT rule inline"
+
+seed; jq '.require.sandbox.network.allowedDomains |= map(select(. != "host.docker.internal"))' \
+    "$work/t/scripts/auto-mode-posture.json" > "$work/p.json" && mv "$work/p.json" "$work/t/scripts/auto-mode-posture.json"
+run "the posture stops naming the host daemon" "does not name host.docker.internal"
+
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert "\nDAEMON_HOST=host.docker.internal\n" in s, "mutation target absent"
+open(p, 'w').write(s.replace("\nDAEMON_HOST=host.docker.internal\n", "\nDAEMON_HOST=\"$(printf host.docker.internal)\"\n", 1))
+PYX
+run "the daemon's host can no longer be read" "no longer declares DAEMON_HOST"
+
+seed; jq_dc '.runArgs |= map(select(. != "--label" and (startswith("devcontainer.metadata=") | not)))'
+run "the VS Code metadata label is dropped" "carry no devcontainer.metadata label"
+
+seed; sub_dc '\"onAutoForward\":\"ignore\"' '\"onAutoForward\":\"notify\"'
+run "the label lets VS Code forward the daemon port" "does not set portsAttributes"
 
 # THE PROBE AND THE RAISE MUST STATE ONE RULE. Re-inlining the spec on the probe side is exactly
 # what shipped: `--match-set allowed-new` is the staging set, destroyed before the raise returns, so
@@ -839,7 +903,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=72
+PINNED_BAD_SITES=80
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

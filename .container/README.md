@@ -769,8 +769,9 @@ checkpoints and truncates a WAL the host is still writing.
 
 The intended end state is that **the host owns `jkb.db`** and the container reaches it through a
 host daemon over one allowed TCP port, sending typed database operations (never whole CLI
-commands, which would run gates and git on the host, outside this sandbox). Until that exists,
-the separate database is what keeps the two sides from corrupting each other.
+commands, which would run gates and git on the host, outside this sandbox). The daemon and the port
+exist now (next section); until every command the container uses is ported to it, the separate
+database is what keeps the two sides from corrupting each other.
 
 **Enforced, not just configured.** `JKB_DB` is only a default, so the rule also lives where a
 database is created or opened: `jkb-core`'s `db::open` and `Db::backup` refuse any `file:` URI, and
@@ -799,6 +800,55 @@ shell — is not jkb and is not refused; `.claude/hooks/block-raw-sqlite.sh` mat
 only for agent tool calls, and fails open. What closes that for good is the container not seeing
 the host's database file at all, which is where the host-owned daemon design ends up
 (`openspec/changes/jkb-message-queue/design-r3.md`).
+
+## The one opening to the host: `jkb serve` on port 7117
+
+The host's `jkb serve` (`com.jkb.serve`, installed by `scripts/setup.sh` on the host) listens on the
+host's `127.0.0.1:7117` and nowhere else. The container reaches it as `host.docker.internal:7117`.
+Measured on the Mac, 2026-09-14, Docker Desktop 4.87.0:
+
+| probe | result |
+|---|---|
+| plain `curlimages/curl` container → `host.docker.internal:7117/v1/hello`, no token | `401` — Docker Desktop forwards the alias to the host's **loopback**, so the daemon need not listen on anything wider |
+| the same with `-4`, and with `--add-host=host.docker.internal:host-gateway` | `401`, `401` |
+| `getent ahostsv4 host.docker.internal`, plain container and `jkb-dev` | `192.168.65.254` in both (v6 `fdc4:f303:9324::254` first) |
+| `jkb-dev` before the rule, `curl -4` | "Connection refused" after 1 ms — this firewall's REJECT |
+| inside the Claude Bash sandbox | the alias does not resolve (`getent` exit 2); its proxy resolves on the sandbox's behalf |
+
+**Port-only, never a posture domain's address.** Docker Desktop forwards that alias to the host's
+loopback on *every* port, and the IP allowlist (`allowed`) is `hash:net` with no port. So the host's
+address in `allowed` would open every service listening on the Mac's loopback to this container.
+`init-firewall.sh` resolves the alias into its own set (`jkb-daemon`) first, installs
+`RULE_DAEMON` (`-p tcp --dport 7117 -m set --match-set jkb-daemon dst -j ACCEPT`), and keeps any
+address in that set out of `allowed` **by address**, so a second name for the host cannot walk past a
+rule keyed on one spelling. The alias is still in the posture's `allowedDomains`: that is what lets
+the nested sandbox's proxy tunnel to it, and the firewall is what stops the same entry widening the
+coarse layer. `egress-status.sh` reports the opening as `daemon=port|unresolved|absent|wide`, and
+`verify.sh` fails on anything but `port`.
+
+**What `verify.sh` asks, both directions.** The kernel's answer above; then the daemon's own answer
+(`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes); then that
+`host.docker.internal:7118` is refused at connect. A missing token is a **note**, not a failure, until
+the container depends on the daemon (tasks S6): the harness's scratch `~/.jkb` and a CI runner have no
+daemon, and a host that never ran `setup.sh` is not a broken container. **Unmeasured:** whether
+Docker Desktop's forwarder answers a connection to a *closed* host port with something other than a
+refusal. If it refuses too, the 7118 probe cannot tell a port-only rule from a wide one on the Mac, and
+only the kernel's `wide` answer does; `mutate-verify.sh`'s wide mutant is where that shows.
+
+**`--add-host=host.docker.internal:host-gateway` is pinned** although Docker Desktop does not need it
+(measured, above): a Linux engine resolves the alias only with it, and CI raises this firewall on one.
+On a Linux *host* the daemon would also have to listen where the bridge can reach it, which is not done.
+
+**VS Code must not forward 7117.** Measured on the Mac, 2026-09-14: something in the container
+listened on 7117, VS Code auto-forwarded it, and so held the **host's** `127.0.0.1:7117` ("Code
+Helper" in `lsof`). `com.jkb.serve` crash-looped on `Address already in use` in `~/.jkb/serve.log`,
+and connections to the port hung. The container therefore carries a `devcontainer.metadata` label
+setting `portsAttributes."7117".onAutoForward` to `ignore`, which attaching reads (it reads nothing
+from `container.json`) — **whether attaching honours it is not yet measured**. `jkb serve` names the
+condition itself now: the refusal gives the `lsof` command and this cause.
+
+Changing any of this takes a **rebuild** (`./.container/run.sh --rm && ./.container/run.sh --build`):
+the firewall, its library and the posture snapshot are installed into the image and read at create.
 
 ## A session worktree is an ordinary folder in here
 

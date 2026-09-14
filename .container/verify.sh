@@ -1337,6 +1337,61 @@ else
     bad "egress to an allowlisted host is blocked — the firewall is too tight to work in"
 fi
 
+# 5b. The one opening to the host: `jkb serve` (design r3.2 H5). BOTH DIRECTIONS again, and the
+#     kernel's answer first, for the same reason as above: a daemon that is down and a rule that is
+#     missing look identical from a curl.
+#
+# `wide` is the one that matters most and the one no curl to the daemon's port can see: the daemon
+# answers either way, and every OTHER port on the host's loopback answers too.
+eg_daemon="$(kv_field daemon "$eg_probe")"
+case "$eg_daemon" in
+    port)       ok "the firewall opens the host daemon's port and no other host port ($DAEMON_HOST:$DAEMON_PORT)" ;;
+    unresolved) bad "$DAEMON_HOST did not resolve when the firewall was raised, so no address is open for jkb serve on the host — re-run init-firewall.sh; on Linux add --add-host=$DAEMON_HOST:host-gateway" ;;
+    absent)     bad "the firewall has no rule for jkb serve on the host ($DAEMON_HOST:$DAEMON_PORT), so this container cannot reach the knowledge base" ;;
+    wide)       bad "the host's address is in the egress allowlist, which opens EVERY port on the host's loopback to this container — jkb serve must be reached through its port-only rule alone" ;;
+    *)          bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it" ;;
+esac
+
+# ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
+# writes it, which is also what the container's `jkb` in remote mode will read — so this is the
+# whole path a client takes, not just the port. `--noproxy '*'`: this runs outside the nested
+# sandbox, and a proxy variable in the environment would test the proxy instead of the rule.
+# The header goes through a file descriptor so the token is never in this process's argv.
+daemon_url="http://$DAEMON_HOST:$DAEMON_PORT"
+daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/token}"
+# NO TOKEN IS A NOTE, NOT A FAILURE, for as long as nothing in here depends on the daemon: until the
+# cutover (tasks S6) the container's jkb uses its own database, so a host that never ran setup.sh is
+# not a broken container. It is also what mutate-verify.sh's scratch ~/.jkb and the CI runner look
+# like — neither has a host daemon — and the kernel's answer above is still asserted there. A token
+# that IS present is a host that installed the daemon, so one that does not answer is a failure.
+if [ ! -r "$daemon_token" ]; then
+    note "there is no daemon token at $daemon_token, so jkb serve on the host was not asked — run ./scripts/setup.sh on the host to install com.jkb.serve"
+else
+    daemon_hello="$(curl -sS --noproxy '*' -m 5 \
+        -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$daemon_token" 2>/dev/null)") \
+        "$daemon_url/v1/hello" 2>/dev/null)" || daemon_hello=""
+    case "$daemon_hello" in
+        *'"protocol"'*) ok "jkb serve on the host answers this container, authenticated by the token on the ~/.jkb bind" ;;
+        *) bad "jkb serve on the host does not answer at $daemon_url with the token from $daemon_token — is com.jkb.serve running there? Its log is ~/.jkb/serve.log on the host; a VS Code port forward holding $DAEMON_PORT on the host is one measured cause" ;;
+    esac
+fi
+
+# THE OTHER DIRECTION: a host port that is NOT the daemon's is refused at connect. curl's exit 7 is
+# "could not connect" — what this firewall's REJECT produces (measured from jkb-dev, 2026-09-14:
+# "Connection refused" after 1 ms). Any other outcome means something past the firewall answered.
+# 7118 is arbitrary: nothing need listen there for the check to discriminate, PROVIDED the runtime's
+# forwarder answers an unfiltered connection to a closed host port with something other than a
+# refusal — measured by the `wide` mutation in mutate-verify.sh, which must see this line fail.
+other_port=$((DAEMON_PORT + 1))
+curl -sS --noproxy '*' -m 5 -o /dev/null "http://$DAEMON_HOST:$other_port/" 2>/dev/null
+case $? in
+    7) ok "a host port other than the daemon's is refused at connect ($DAEMON_HOST:$other_port)" ;;
+    # Not resolving says nothing about the rule, so it is not reported as a widening; the kernel
+    # answer above already names the unresolved state.
+    6) bad "$DAEMON_HOST does not resolve in here, so whether other host ports are refused could not be asked" ;;
+    *) bad "a host port other than the daemon's was not refused at connect ($DAEMON_HOST:$other_port) — the firewall's opening to the host is wider than jkb serve's port" ;;
+esac
+
 # 6. The inner posture. `check` is the drift rule from D48; here it also proves the posture
 #    survived being installed into a fresh container HOME.
 if "$mem_repo/scripts/auto-mode.sh" check >/dev/null 2>&1; then

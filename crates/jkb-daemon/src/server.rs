@@ -96,6 +96,18 @@ pub enum ServeError {
          interface; name the one address to bind"
     )]
     Unspecified(SocketAddr),
+    /// Another process holds the address. Named apart from [`ServeError::Io`] because the cause is
+    /// outside jkb and the bare OS message sends nobody to it: measured on the Mac (2026-09-14), a
+    /// VS Code window attached to the dev container forwarded the container's port 7117 to the
+    /// host's loopback, and `com.jkb.serve` crash-looped on "Address already in use" for as long as
+    /// the window stayed open.
+    #[error(
+        "{0} is already in use by another process, so jkb serve cannot listen there. Find it with \
+         `lsof -nP -iTCP:{port} -sTCP:LISTEN`; a VS Code window forwarding the dev container's port \
+         {port} to this host is one measured cause (stop forwarding it in the Ports view)",
+        port = .0.port()
+    )]
+    AddrInUse(SocketAddr),
     /// Binding or runtime setup failed.
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -171,7 +183,8 @@ struct State {
 /// daemon behind it.
 ///
 /// # Errors
-/// [`ServeError::Unspecified`] for `0.0.0.0`/`::`, an I/O error binding, or a token write failure.
+/// [`ServeError::Unspecified`] for `0.0.0.0`/`::`, [`ServeError::AddrInUse`] when another process
+/// holds the address, another I/O error binding, or a token write failure.
 pub fn spawn(db: Db, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     start(Serving::Ready(LocalBackend::new(db.clone()), db), None, cfg)
 }
@@ -240,7 +253,12 @@ fn start(
         .enable_all()
         .thread_name("jkb-serve")
         .build()?;
-    let listener = runtime.block_on(tokio::net::TcpListener::bind(cfg.addr))?;
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind(cfg.addr))
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => ServeError::AddrInUse(cfg.addr),
+            _ => ServeError::Io(e),
+        })?;
     let addr = listener.local_addr()?;
     let token = token::mint()?;
     token::write(&cfg.token_path, &token)?;

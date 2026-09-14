@@ -530,6 +530,65 @@ else
     [ "$states_ok" -eq 1 ] && ok "both readers handle every verdict state ($verdict_states)"
 fi
 
+# THE HOST DAEMON'S OPENING (design r3.2 H5), four properties no container is needed to read.
+#
+# `repo_top`, not `root`: `root` is reassigned by the allowWrite loop above, and a check reading it
+# here would look for the daemon's source under a posture path and report the port unreadable.
+repo_top="$(cd "$here/.." && pwd)"
+
+# 1. verify.sh handles every daemon state — the VERDICT_STATES rule, for the second vocabulary.
+daemon_states="$(grep -oE '^(readonly )?DAEMON_STATES="[^"]*"' "$here/egress-lib.sh" 2>/dev/null \
+                 | head -1 | sed 's/.*="//; s/"$//')"
+if [ -z "$daemon_states" ]; then
+    bad "egress-lib.sh no longer declares DAEMON_STATES — the check that verify.sh handles every daemon state is now checking nothing"
+else
+    dstates_ok=1
+    for st in $daemon_states; do
+        grep -qE "^[[:space:]]*(\*\|)?$st\)" "$here/verify.sh" 2>/dev/null \
+            || { bad "verify.sh has no case arm for the '$st' daemon state — it would report it as unestablished"; dstates_ok=0; }
+    done
+    [ "$dstates_ok" -eq 1 ] && ok "verify.sh handles every daemon state ($daemon_states)"
+fi
+
+# 2. The port the firewall opens is the port the daemon binds. Two spellings in two languages, so
+#    one is read out of each and compared; an empty read on either side is a failure, never a match.
+fw_port="$(grep -oE '^DAEMON_PORT=[0-9]+$' "$here/egress-lib.sh" 2>/dev/null | head -1 | cut -d= -f2)"
+rs_port="$(grep -oE 'DEFAULT_ADDR: &str = "127\.0\.0\.1:[0-9]+"' "$repo_top/crates/jkb-daemon/src/lib.rs" 2>/dev/null \
+           | head -1 | sed 's/.*://; s/"$//')"
+if [ -z "$fw_port" ] || [ -z "$rs_port" ]; then
+    bad "could not read the daemon port from both egress-lib.sh (DAEMON_PORT='$fw_port') and jkb-daemon's DEFAULT_ADDR ('$rs_port') — the check that the firewall opens the port jkb serve binds is checking nothing"
+elif [ "$fw_port" != "$rs_port" ]; then
+    bad "egress-lib.sh opens DAEMON_PORT=$fw_port but jkb serve binds $rs_port (crates/jkb-daemon/src/lib.rs) — the container could not reach the daemon"
+else
+    ok "the firewall opens the port jkb serve binds ($fw_port)"
+fi
+
+# 3. The nested sandbox can reach it: its proxy tunnels only to allowedDomains, and the firewall
+#    keeps that same entry out of the IP allowlist by address, so the one entry serves both layers.
+fw_host="$(grep -oE '^DAEMON_HOST=[A-Za-z0-9.-]+$' "$here/egress-lib.sh" 2>/dev/null | head -1 | cut -d= -f2)"
+if [ -z "$fw_host" ]; then
+    bad "egress-lib.sh no longer declares DAEMON_HOST — the check that the sandbox may reach the daemon is checking nothing"
+elif jq -e --arg h "$fw_host" '.require.sandbox.network.allowedDomains | index($h)' \
+        "$repo_top/scripts/auto-mode-posture.json" >/dev/null 2>&1; then
+    ok "the posture lets the nested sandbox's proxy reach the host daemon ($fw_host)"
+else
+    bad "scripts/auto-mode-posture.json's allowedDomains does not name $fw_host — jkb run from Bash in the nested sandbox could not reach the host daemon"
+fi
+
+# 4. VS Code does not forward the daemon's port. Measured on the Mac, 2026-09-14: after something in
+#    here listened on 7117, VS Code held the HOST'S 127.0.0.1:7117, so com.jkb.serve crash-looped on
+#    EADDRINUSE and connections hung. Attaching reads no `portsAttributes` from this file, so it is
+#    carried as the `devcontainer.metadata` label on the container, which attaching does read.
+dc_args="$(dc_run_args "$here/container.json" "$repo_top" 2>/dev/null)" || dc_args=""
+dc_meta="$(grep -A1 -xF -- '--label' <<<"$dc_args" | sed -n 's/^devcontainer\.metadata=//p' | head -1)"
+if [ -z "$dc_meta" ]; then
+    bad "container.json's runArgs carry no devcontainer.metadata label — VS Code would auto-forward the daemon port and take the host's 127.0.0.1:${fw_port:-7117} from com.jkb.serve"
+elif jq -e --arg p "${fw_port:-}" 'any(.[]; .portsAttributes[$p].onAutoForward == "ignore")' <<<"$dc_meta" >/dev/null 2>&1; then
+    ok "VS Code is told not to forward the daemon port (${fw_port})"
+else
+    bad "the devcontainer.metadata label does not set portsAttributes.\"${fw_port:-?}\".onAutoForward to ignore — VS Code would auto-forward the daemon port and take the host's 127.0.0.1:${fw_port:-?} from com.jkb.serve"
+fi
+
 # THE PROBE LOOKS FOR THE RULE THE RAISE INSTALLS. init-firewall.sh installs the chain with
 # `iptables -A OUTPUT <spec>` and egress-lib.sh reads it back with `iptables -C OUTPUT <spec>`;
 # spelled separately those are two statements that have to agree, and they did not — the probe

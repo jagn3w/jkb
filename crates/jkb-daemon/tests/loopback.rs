@@ -263,6 +263,28 @@ fn an_unspecified_address_is_refused() {
     }
 }
 
+// The Mac failure of 2026-09-14: something else held the port, and the daemon said only "Address
+// already in use". The refusal must name the port and how to find the holder — and write no token,
+// or a client would find a fresh token with no daemon behind it.
+#[test]
+fn a_port_held_by_another_process_is_named_with_how_to_find_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = holder.local_addr().unwrap();
+    let token = dir.path().join("daemon/token");
+    let err = spawn(db, &ServeConfig::new(addr, token.clone()))
+        .err()
+        .expect("refused");
+    assert!(matches!(err, ServeError::AddrInUse(a) if a == addr), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("lsof -nP -iTCP:{} -sTCP:LISTEN", addr.port())),
+        "{msg}"
+    );
+    assert!(!token.exists(), "a token was written with no daemon behind it");
+}
+
 #[test]
 fn raw_http_is_held_to_the_same_rules() {
     let f = Fixture::new();

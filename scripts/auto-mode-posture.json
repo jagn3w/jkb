@@ -54,6 +54,7 @@
         "allowedDomains": [
           "localhost",
           "127.0.0.1",
+          "host.docker.internal",
           "api.anthropic.com",
           "github.com",
           "api.github.com",

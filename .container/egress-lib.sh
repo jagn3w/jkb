@@ -73,6 +73,25 @@ probe_state() { # probe_state <v4chain> <v6chain> <v6path> <allowlist> -> allowl
     verdict_state "$v4" "$v6" "$bounded"
 }
 
+# THE DAEMON OPENING'S VOCABULARY, beside the function that produces it, for the same reason as
+# VERDICT_STATES: check-config.sh requires verify.sh to carry an arm for each. It is a separate
+# answer from the verdict, not a fourth verdict — a missing or wide daemon rule leaves egress
+# bounded, and the boot gate is about whether egress is bounded.
+DAEMON_STATES="port unresolved absent wide"
+
+# WHAT THE DAEMON OPENING IS, from three measurements. Pure, so every combination is a self-test row.
+#   rule      yes | no   $RULE_DAEMON is in the v4 OUTPUT chain
+#   members   <n>        addresses in $DAEMON_SET
+#   in_allow  <n>        daemon addresses that are ALSO in `allowed`, i.e. open on every port
+# `wide` is decided first: an address in `allowed` is open on every port whether or not the port rule
+# exists. A count that is not a number was not measured, and an unmeasured `in_allow` is `wide` —
+# never read as "none are".
+daemon_from() { # daemon_from <rule> <members> <in_allow> -> port|unresolved|absent|wide
+    if [ "$3" != 0 ]; then printf 'wide'; return; fi
+    if [ "$1" != yes ]; then printf 'absent'; return; fi
+    case "$2" in ''|*[!0-9]*|0) printf 'unresolved' ;; *) printf 'port' ;; esac
+}
+
 # --- the record, and the one parser for it ------------------------------------------------------
 #
 # The kernel says WHAT the state is (egress-status.sh); it cannot say WHY it is not allowlisted —
@@ -145,6 +164,27 @@ ns_pair() { # ns_pair <ns-dir> -> sets NS_PID / NS_MNT; either is empty if that 
 RULE_V4_REJECT="-j REJECT --reject-with icmp-port-unreachable"
 RULE_V6_REJECT="-j REJECT"
 RULE_ALLOWLIST="-m set --match-set allowed dst -j ACCEPT"
+
+# --- the one opening to the host: `jkb serve` (design r3.2 H5) ----------------------------------
+#
+# The host owns jkb.db and serves typed operations on one loopback port; this container reaches it
+# through Docker Desktop's host alias, which forwards to the HOST'S 127.0.0.1. Measured on the Mac,
+# 2026-09-14, Docker Desktop 4.87.0: a plain container got `401` from host.docker.internal:7117 with
+# the daemon bound to 127.0.0.1 only, over `-4` too, with or without `--add-host=…:host-gateway`.
+#
+# ITS OWN SET, MATCHED WITH ITS PORT, NEVER A MEMBER OF `allowed`. Docker Desktop forwards that alias
+# to the host's loopback on EVERY port, and `allowed` is hash:net with no port: an address in it is
+# open on all of them, so a posture domain resolving to the host would hand this container every
+# service listening on the Mac's loopback. The raise therefore keeps any daemon address out of
+# `allowed` whatever name it arrived under, and `daemon_state` reports `wide` if one is in there.
+#
+# The port is jkb-daemon's DEFAULT_ADDR (crates/jkb-daemon/src/lib.rs); check-config.sh holds the
+# two to one value. The alias is also in the posture's allowedDomains, which is what lets the
+# nested sandbox's proxy tunnel to it — the same entry this raise refuses to widen.
+DAEMON_HOST=host.docker.internal
+DAEMON_PORT=7117
+DAEMON_SET=jkb-daemon
+RULE_DAEMON="-p tcp --dport $DAEMON_PORT -m set --match-set $DAEMON_SET dst -j ACCEPT"
 
 # --- the measurements (impure, injectable) ------------------------------------------------------
 
@@ -231,6 +271,33 @@ allowlist_state() { # -> yes|no
     fi
 }
 
+# The daemon opening, from the live chain and sets. Root, like the other probes (egress-status.sh).
+#
+# WHICH ADDRESSES ARE TESTED against `allowed`: the set's members AND the alias resolved now. The
+# second is what catches the widening when the port-only set is empty — a raise that put the host
+# into `allowed` and never built $DAEMON_SET is exactly the state to report, not to miss.
+#
+# `ipset test` exits non-zero both for "not in the set" and for "no such set", so the set's existence
+# is established first rather than read out of that exit code. An `allowed` that does not exist holds
+# nothing — a deny-all raise leaves none — and that is a measurement, not a failed one.
+daemon_state() { # -> port|unresolved|absent|wide
+    local rule=no members="" resolved="" n=0 wide=0 ip
+    if command -v iptables >/dev/null 2>&1 \
+       && iptables -w 5 -C OUTPUT $RULE_DAEMON >/dev/null 2>&1; then
+        rule=yes
+    fi
+    members="$(ipset save "$DAEMON_SET" 2>/dev/null | awk '$1 == "add" { print $3 }')" || members=""
+    resolved="$(getent ahostsv4 "$DAEMON_HOST" 2>/dev/null | awk '{ print $1 }')" || resolved=""
+    n="$(printf '%s\n' "$members" | grep -c .)" || n=0
+    if ipset save allowed >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [ -n "$ip" ] || continue
+            if ipset test allowed "$ip" >/dev/null 2>&1; then wide=$((wide + 1)); fi
+        done <<<"$(printf '%s\n%s\n' "$members" "$resolved" | sort -u)"
+    fi
+    daemon_from "$rule" "$n" "$wide"
+}
+
 # --- self-test ----------------------------------------------------------------------------------
 # Sourced by two scripts and by nothing else that could exercise it, so it carries its own. Every
 # assertion here is pure or file-injected: no iptables, no root, no /proc.
@@ -302,6 +369,32 @@ bounded open   open   no  unfiltered
 open    denied open   yes unfiltered
 open    denied absent yes unfiltered
 open    open   open   no  unfiltered
+TABLE
+
+    # ...and the daemon opening, from the three things its probe measures. The `wide` rows with a
+    # port rule and a populated set are the ones that matter: that is a raise that did everything
+    # else right and still opened every port on the host.
+    echo "==> egress-lib self-test: the daemon opening"
+    in_daemon_vocab() { # in_daemon_vocab <state>
+        case " $DAEMON_STATES " in *" $1 "*) ;;
+            *) fails=$((fails+1)); printf '  \033[31mFAIL\033[0m daemon_from returned %s, which is not in DAEMON_STATES\n' "$1" ;;
+        esac
+    }
+    while read -r rule members in_allow want; do
+        [ -n "${rule:-}" ] || continue
+        got="$(daemon_from "$rule" "$members" "$in_allow")"
+        eq "daemon_from $rule $members $in_allow -> $want" "$got" "$want"
+        in_daemon_vocab "$got"
+    done <<'TABLE'
+yes 1   0   port
+yes 2   0   port
+yes 0   0   unresolved
+yes wat 0   unresolved
+no  1   0   absent
+no  0   0   absent
+yes 1   1   wide
+no  0   1   wide
+yes 1   wat wide
 TABLE
 
     # `in_vocab` MUST BE ABLE TO REJECT SOMETHING. Every row above hands it a value `eq` has
@@ -381,7 +474,7 @@ TABLE
     # where the regression landed — it reaches v6_path_state only when the v6 chain is not denied,
     # which is the no-ip6tables case, so on a machine with ip6tables this row passes trivially and
     # the injected-path rows above are what cover it.
-    for fn in v6_state v4_chain_state v6_chain_state allowlist_state; do
+    for fn in v6_state v4_chain_state v6_chain_state allowlist_state daemon_state; do
         got="$(under_trap "$fn")"
         case "$got" in *TRAP*) fails=$((fails+1))
                 printf '  \033[31mFAIL\033[0m %s tripped the caller'"'"'s ERR trap\n' "$fn" ;;

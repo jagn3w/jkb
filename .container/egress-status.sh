@@ -39,12 +39,15 @@ set -uo pipefail
 # Reports what was MEASURED alongside the state it implies. `v6=absent` and `v6=denied` both make a
 # container bounded, and an operator needs to be able to tell them apart — one is a rule, the other
 # is a network with nowhere to go. Defined above the self-test because that is what exercises it.
-report() { # report <v4chain> <v6chain> <v6path> <allowlist>
+report() { # report <v4chain> <v6chain> <v6path> <allowlist> <daemon>
     local v6
     v6="$(v6_from "$2" "$3")"
     printf 'state=%s\n' "$(probe_state "$1" "$2" "$3" "$4")"
     printf 'v4=%s\n'    "$1"
     printf 'v6=%s\n'    "$v6"
+    # The host daemon's opening (egress-lib.sh's `daemon_state`). A separate line, not folded into
+    # `state`: the boot gate reads `state`, and a missing daemon rule leaves egress bounded.
+    printf 'daemon=%s\n' "$5"
 }
 
 if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
@@ -61,17 +64,20 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # asserted is the FORMAT; routing the assertion through the parser would test `report` composed
     # with `kv_field`, and a break in the parser would cancel against a break in the writer and the
     # row would still pass. Same reason the tables above are literal rather than re-derived.
-    out="$(report bounded denied absent yes)"
+    out="$(report bounded denied absent yes port)"
     eq "state is the first line"      "$(printf '%s\n' "$out" | sed -n 's/^state=//p')" "allowlisted"
     eq "v4 is reported"               "$(printf '%s\n' "$out" | sed -n 's/^v4=//p')"    "bounded"
     eq "v6 is reported as measured"   "$(printf '%s\n' "$out" | sed -n 's/^v6=//p')"    "denied"
-    out="$(report open open open no)"
+    out="$(report open open open no absent)"
     eq "an unbounded chain is unfiltered" "$(printf '%s\n' "$out" | sed -n 's/^state=//p')" "unfiltered"
     # v6 is reported as what was MEASURED, not as the word the rule collapsed it to: an operator
     # needs to know whether v6 was denied or merely had nowhere to go.
-    out="$(report bounded open absent no)"
+    out="$(report bounded open absent no wide)"
     eq "no v6 path is reported as absent" "$(printf '%s\n' "$out" | sed -n 's/^v6=//p')" "absent"
     eq "...and the state is denied"       "$(printf '%s\n' "$out" | sed -n 's/^state=//p')" "denied"
+    # The daemon line is reported as given, and it does not move `state`: a wide daemon opening is
+    # verify.sh's to fail, not a reason for the boot gate to refuse a bounded chain.
+    eq "the daemon opening is reported"   "$(printf '%s\n' "$out" | sed -n 's/^daemon=//p')" "wide"
 
     ( "$0" some-argument >/dev/null 2>&1 ); eq "an argument is refused" "$?" "2"
 
@@ -88,4 +94,4 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-report "$(v4_chain_state)" "$(v6_chain_state)" "$(v6_path_state)" "$(allowlist_state)"
+report "$(v4_chain_state)" "$(v6_chain_state)" "$(v6_path_state)" "$(allowlist_state)" "$(daemon_state)"

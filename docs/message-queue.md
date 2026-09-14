@@ -267,7 +267,9 @@ migration's lock),
 
 ## Not yet
 
-- Wiring the container to the daemon (firewall port, host alias, `JKB_REMOTE`) — stage S4.
+- `JKB_REMOTE` set in the container — at the cutover (tasks S6), not before: remote mode refuses
+  `JKB_DB` and every unported command, and the container's agents still need both. The network path
+  it will take already exists; see `.container/README.md`, "The one opening to the host".
 - Porting the agent read and task-mutate command sets to operations — stage S6.
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.
 - A native, non-subprocess client (Swift) — it would speak the HTTP protocol above.

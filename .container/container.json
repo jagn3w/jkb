@@ -62,7 +62,21 @@
     // should not take the machine down with it. PID 1 REAPS so that this is a bound on runaway
     // work rather than one ordinary use walks into on its own — see entrypoint.sh's exec, and
     // note that `--init` is deliberately NOT the way that is done here.
-    "--pids-limit", "4096"
+    "--pids-limit", "4096",
+
+    // The host alias, pinned. Docker Desktop resolves it without this (measured on the Mac,
+    // 2026-09-14: `401` from the daemon with and without the flag, the same 192.168.65.254 either
+    // way), so there it changes nothing; a Linux engine resolves it ONLY with it, and that is where
+    // CI raises this firewall. egress-lib.sh's DAEMON_HOST is this name.
+    "--add-host=host.docker.internal:host-gateway",
+
+    // VS Code must NOT forward the host daemon's port. Measured on the Mac, 2026-09-14: something in
+    // here listened on 7117, VS Code auto-forwarded it and so held the HOST'S 127.0.0.1:7117, and
+    // `jkb serve` (com.jkb.serve) crash-looped on "Address already in use" while every connection to
+    // the port hung. Attaching reads nothing from this file, but it does read the
+    // `devcontainer.metadata` label on the container, which is where this goes. The port is
+    // egress-lib.sh's DAEMON_PORT, and check-config.sh holds the label to it.
+    "--label", "devcontainer.metadata=[{\"portsAttributes\":{\"7117\":{\"label\":\"jkb serve (host)\",\"onAutoForward\":\"ignore\"}}}]"
   ],
 
   // THE MOUNT LIST IS THE SECURITY BOUNDARY. Everything absent from it does not exist inside the
