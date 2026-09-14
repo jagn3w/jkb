@@ -12,6 +12,12 @@
 #   4. register  Launch Services. Without this the framework answers "Notifications are not
 #                allowed for this application" no matter how the bundle is signed.
 #
+# Then it installs and (re)loads the launchd agent `com.jkb.notifier`, which runs the bundle's binary
+# as `jkb-notifier serve`: the consumer of jkb's `claude/notify` queue (design r3.2 N2). The agent
+# points at the BUNDLE's binary, never a copy, so the notification centre finds the identifier; it
+# is given the `jkb` to subscribe with, the database, and the topic — asked of that `jkb`
+# (`jkb notify topic`), so the name is spelled once, in jkb_core::notify::TOPIC.
+#
 # Idempotent: safe to re-run, and `scripts/setup.sh` does on every pull.
 #
 # **Where it installs is not this script's decision.** The destination comes from
@@ -20,18 +26,28 @@
 # banners and the feature silently is not there. There is deliberately no --prefix — a flag that
 # installs somewhere the hook does not look is a way to produce exactly that state.
 #
-# Flags: --check (verify the plist/path agreement and stop; runs on any OS), --quiet, -h/--help.
+# Flags: --check (verify the plist/path agreement and stop; runs on any OS), --print-agent (print
+# the launchd agent and stop; runs on any OS), --jkb <path> (default: `jkb` on PATH), --db <path>
+# (default: $JKB_DB, else ~/.jkb/jkb.db), --no-agent, --quiet, -h/--help.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 quiet=0
 check_only=0
+print_agent=0
+agent=1
+jkb_bin=""
+db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --quiet) quiet=1 ;;
     --check) check_only=1 ;;
-    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --print-agent) print_agent=1 ;;
+    --no-agent) agent=0 ;;
+    --jkb) jkb_bin="${2:?--jkb needs a path}"; shift ;;
+    --db) db="${2:?--db needs a path}"; shift ;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -96,6 +112,74 @@ check_plist() {
   return "$rc"
 }
 
+# --- the launchd agent -----------------------------------------------------------------------
+agent_label=com.jkb.notifier
+agent_plist="$HOME/Library/LaunchAgents/$agent_label.plist"
+
+xml_escape() { # the five XML entities, for a value inside <string>
+  # sed, not ${v//&/&amp;}: bash 5.2's patsub_replacement turns `&` in a replacement into the match.
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' -e "s/'/\\&apos;/g"
+}
+
+# agent_plist_for <notifier> <jkb> <db> <topic> — the agent, as text. `KeepAlive`, because a consumer
+# that is not running is a permission prompt nobody sees; `jkb-notifier serve` restarts its own
+# subscription, so launchd restarts only the notifier itself. Logs beside the database, like
+# com.jkb.serve's serve.log.
+agent_plist_for() {
+  local log
+  log="$(dirname "$3")/notifier.log"
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$agent_label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$(xml_escape "$1")</string>
+        <string>serve</string>
+        <string>--jkb</string>
+        <string>$(xml_escape "$2")</string>
+        <string>--db</string>
+        <string>$(xml_escape "$3")</string>
+        <string>--topic</string>
+        <string>$(xml_escape "$4")</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$(xml_escape "$log")</string>
+    <key>StandardErrorPath</key>
+    <string>$(xml_escape "$log")</string>
+</dict>
+</plist>
+PLIST
+}
+
+# The jkb the agent subscribes with, and the topic that jkb names. Both are asked, never assumed: an
+# agent pointing at a jkb that predates `notify topic` would subscribe to nothing, for ever.
+resolve_agent_inputs() {
+  [ -n "$jkb_bin" ] || jkb_bin="$(command -v jkb 2>/dev/null || true)"
+  if [ -z "$jkb_bin" ] || [ ! -x "$jkb_bin" ]; then
+    echo "no jkb found (pass --jkb) — cannot write the $agent_label agent" >&2
+    return 1
+  fi
+  if ! topic="$("$jkb_bin" notify topic 2>/dev/null)" || [ -z "$topic" ]; then
+    echo "$jkb_bin does not answer 'jkb notify topic' (older than this checkout?) — cannot write the $agent_label agent" >&2
+    return 1
+  fi
+}
+
+if [ "$print_agent" -eq 1 ]; then
+  resolve_agent_inputs || exit 1
+  agent_plist_for "$target" "$jkb_bin" "$db" "$topic"
+  exit 0
+fi
+
 # The consistency check on its own, buildable-or-not and macOS-or-not, so `scripts/tests/notify-hook.test.sh`
 # can assert the real rule rather than re-implementing it in a second place. Answered before the
 # Darwin gate below, which is the whole point — this is the arm CI reaches.
@@ -148,6 +232,24 @@ elif ! "$lsregister" -f "$app"; then
 fi
 
 note "  • notifier:   $app"
+
+# Step 5, the agent. Written atomically — launchd may be reading it — and reloaded, not just loaded:
+# `load` leaves an agent already running on the binary this build just replaced.
+if [ "$agent" -eq 1 ]; then
+  if resolve_agent_inputs; then
+    mkdir -p "$(dirname "$agent_plist")" "$(dirname "$db")"
+    agent_plist_for "$target" "$jkb_bin" "$db" "$topic" > "$agent_plist.tmp.$$"
+    mv -f "$agent_plist.tmp.$$" "$agent_plist"
+    launchctl unload "$agent_plist" 2>/dev/null || true
+    if launchctl load "$agent_plist"; then
+      note "  • agent:      $agent_label loaded ($agent_plist)"
+    else
+      echo "warning: could not load $agent_label; activate manually: launchctl load '$agent_plist'" >&2
+    fi
+  else
+    echo "warning: the $agent_label agent was not installed, so nothing displays jkb's notifications" >&2
+  fi
+fi
 # Report rather than assume. `status` is the same read `setup.sh` and the hook rely on, so if it
 # cannot answer here it could not have answered them either.
 if state=$("$target" status 2>/dev/null); then

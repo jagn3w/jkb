@@ -833,6 +833,14 @@ entry widening the coarse layer. `egress-status.sh` reports the opening as
 anything but `port`. "No other host port" means beyond DNS: the older rules accept 53 to any address,
 the host's included.
 
+**The notification hook uses it today** (design r3.2 N1), ahead of the S6 cutover: `jkb notify hook`
+reaches the daemon at `JKB_DAEMON_ADDR` (`containerEnv`, `host.docker.internal:7117` — `host:port`
+with no scheme, because `lib.sh`'s `dc_strip` cannot tell a URL's `//` from a comment). It is not
+remote mode and opens no database; without it the hook would look on the container's own loopback and
+every notification from in here would be lost with nothing to say so. `check-config.sh` holds the
+value to `DAEMON_HOST`/`DAEMON_PORT`, and `mutate-config.sh` drifts and drops it. Changing it needs a
+rebuild, like the rest of `containerEnv`. See [docs/notifications.md](../docs/notifications.md).
+
 **What `verify.sh` asks.** The kernel's answer above, at the address the *image* names; then the
 daemon's own answer (`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes).
 A missing token is a **note**, not a failure, until the container depends on the daemon (tasks S6):

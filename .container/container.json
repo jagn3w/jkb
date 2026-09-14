@@ -138,6 +138,14 @@
     // falls back to ~/.jkb/jkb.db and is REFUSED there: jkb-core's db::open rejects a database on a
     // FUSE filesystem (crates/jkb-core/src/shared_fs.rs).
     "JKB_DB": "/home/vscode/.local/state/jkb/jkb.db",
+    // Where the notification hook reaches `jkb serve` on the host (`jkb notify hook`; resolved by
+    // daemon_url in crates/jkb-cli/src/remote.rs). NOT remote mode — that is JKB_REMOTE, at the S6
+    // cutover — only the address of the one opening init-firewall.sh makes, and check-config.sh
+    // holds it to egress-lib.sh's DAEMON_HOST and DAEMON_PORT. Without it the hook would look for
+    // the daemon on the container's own loopback and every notification from in here would be
+    // lost, silently. host:port with no scheme, like jkb serve's own --addr: this file's comment
+    // stripper (lib.sh dc_strip) cannot tell a URL's // from a comment.
+    "JKB_DAEMON_ADDR": "host.docker.internal:7117",
     // See the target/ volume above: keeps cargo's output off the bind mount.
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",
     // THE ONE ESCAPE FROM THE EGRESS BOOT GATE (D50.6), off by default and declared here on

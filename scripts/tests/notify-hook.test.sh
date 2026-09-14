@@ -112,16 +112,12 @@ for ev in Notification PostToolUse UserPromptSubmit Stop SessionEnd; do
   check "$ev is silent on stdout" "$hook_out" ""
 done
 
-# 3. It delegates, and hands over the notifier path rather than making jkb look it up — the
-#    location stays spelled once, here, because setup.sh and build-notifier.sh already ask for it
-#    and both run where jkb may not be built yet.
+# 3. It delegates. It no longer hands over a notifier path: since r3.2 N1 `jkb notify hook` only
+#    tells `jkb serve` what happened, and the notifier runs on its own as `jkb-notifier serve`.
 : > "$tmp/jkbcalls"
 hook_run "$PAYLOAD" "$tmp/goodjkb:/usr/bin:/bin"
 check "the shim delegates to jkb notify hook" \
   "$(head -1 "$tmp/jkbcalls" | sed 's/ *$//')" "notify hook"
-check "and passes the notifier path it resolved" \
-  "$(sed -n 's/^notifier=//p' "$tmp/jkbcalls" | head -1)" \
-  "$(bash "$hook" --notifier-path)"
 
 # The owner is the session's, and jkb CANNOT ask for it — its own parent is this shim, which
 # exits milliseconds later. Recording that made every record read as provably dead, so the next
@@ -173,6 +169,26 @@ check "the install path is one find_notifier searches" \
 "$(cd "$(dirname "$0")/../.." && pwd)/scripts/build-notifier.sh" --check --quiet >/dev/null 2>&1
 check "the plist declares the executable the install path names" "$?" "0"
 
+# 12c'. The launchd agent build-notifier.sh installs, printed rather than installed — so it is
+#      checked on the Linux runner too. It must run the binary at the install path (the bundle's, or
+#      the notification centre refuses it), subscribe with the jkb it was given to the topic THAT jkb
+#      names, and survive a database path that is not XML-safe.
+mkdir -p "$tmp/topicjkb" "$tmp/oldtopicjkb"
+printf '#!/bin/sh\n[ "$1 $2" = "notify topic" ] && echo claude/notify\n' > "$tmp/topicjkb/jkb"
+printf '#!/bin/sh\nexit 2\n' > "$tmp/oldtopicjkb/jkb"
+chmod +x "$tmp/topicjkb/jkb" "$tmp/oldtopicjkb/jkb"
+builder="$(cd "$(dirname "$0")/../.." && pwd)/scripts/build-notifier.sh"
+agent=$(env -u JKB_NOTIFIER HOME="$tmp/agenthome" "$builder" --print-agent --jkb "$tmp/topicjkb/jkb" \
+  --db "$tmp/d b&<x>/jkb.db" 2>/dev/null)
+check "the agent prints" "$?" "0"
+check "the agent runs the bundle's binary" \
+  "$(grep -c "<string>$tmp/agenthome/Applications/jkb Notifier.app/Contents/MacOS/jkb-notifier</string>" <<<"$agent" | tr -d ' ')" "1"
+check "as serve, with the jkb, database and topic it was given" \
+  "$(tr -d ' \n' <<<"$agent" | grep -c "<string>serve</string><string>--jkb</string><string>$tmp/topicjkb/jkb</string><string>--db</string><string>$tmp/db&amp;&lt;x&gt;/jkb.db</string><string>--topic</string><string>claude/notify</string>" | tr -d ' ')" "1"
+check "and is kept alive" "$(grep -c '<key>KeepAlive</key>' <<<"$agent" | tr -d ' ')" "1"
+HOME="$tmp/agenthome" "$builder" --print-agent --jkb "$tmp/oldtopicjkb/jkb" >/dev/null 2>&1
+check "a jkb that cannot name the topic writes no agent" "$?" "1"
+
 # 12d. The hook's events and `.claude/settings.json`'s registrations, diffed BOTH ways. The hook
 #      can act only on events Claude Code is told to send it, and that registration lives in a file
 #      the hook cannot see — so an event handled but unregistered does nothing, and one registered
@@ -192,16 +208,61 @@ check "every event the hook handles is registered in settings.json" \
 # The names also appear in the Rust dispatcher, which the shim cannot see. `jkb notify events`
 # prints what it answers to, so all THREE spellings are diffed rather than two — renaming the
 # `"SessionStart"` literal in `hook()` disabled the sweep permanently with every check green.
-if [ -x "$(cd "$(dirname "$0")/../.." && pwd)/target/debug/jkb" ]; then
-  rust_events=$("$(cd "$(dirname "$0")/../.." && pwd)/target/debug/jkb" notify events 2>/dev/null | sort)
+# Under CARGO_TARGET_DIR when it is set — the dev container sets it — or this compared a stale binary.
+built_jkb="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target}/debug/jkb"
+if [ -x "$built_jkb" ]; then
+  rust_events=$("$built_jkb" notify events 2>/dev/null | sort)
   check "the hook's events and jkb's agree" \
     "$(comm -3 <(printf '%s\n' "$handled") <(printf '%s\n' "$rust_events") | tr -d '[:space:]')" ""
 else
-  printf '  --  %s\n' "jkb events cross-check (target/debug/jkb not built)"
+  printf '  --  %s\n' "jkb events cross-check ($built_jkb not built)"
 fi
 
 check "every event registered in settings.json is handled by the hook" \
   "$(comm -13 <(printf '%s\n' "$handled") <(printf '%s\n' "$registered") | tr '\n' ' ' | sed 's/ *$//')" ""
+
+# 12e. The queue consumer's fold, stale marking and acks, and the fallback banner's quoting — the
+#      parts of `jkb-notifier serve` that decide what reaches the screen. Compiled from source rather
+#      than run from an installed bundle, which may be older than this checkout; `serve --dry-run`
+#      touches no notification centre, so no bundle is needed. macOS only (swiftc, osacompile).
+echo "==> jkb-notifier serve (dry run)"
+if ! command -v swiftc >/dev/null 2>&1; then
+  printf '  --  %s\n' "skipped (no swiftc — macOS with the Xcode Command Line Tools)"
+elif ! swiftc -swift-version 5 -o "$tmp/jkb-notifier" \
+    "$(cd "$(dirname "$0")/../.." && pwd)/macos/notifier/main.swift" 2>"$tmp/swiftc.err"; then
+  fail "macos/notifier/main.swift does not compile: $(head -5 "$tmp/swiftc.err")"
+else
+  msg() { # msg <seq> <kind> <id> <enqueued_at> <expired>
+    printf '{"event":"message","message":{"seq":%s,"key":"session/x","kind":"%s","payload":{"id":"%s","session":"x","title":"Claude Code","subtitle":"wt","body":"needs Bash"},"producer":"p","enqueued_at":%s,"expires_at":null,"expired":%s,"future_field":1}}\n' "$@"
+  }
+  served=$({
+    msg 1 notify.post jkb-claude-a 1000 false
+    msg 2 notify.withdraw jkb-claude-a 1000 false
+    msg 3 notify.post jkb-claude-b 0 true
+    msg 4 some.other_kind jkb-claude-z 0 false
+    printf '{"event":"a_future_event"}\n'
+    printf '{"event":"caught_up","seq":4}\n'
+    msg 5 notify.post jkb-claude-c 50000000 false
+    printf '{"event":"unreadable","seq":6,"reason":"x"}\n'
+    printf '{"event":"caught_up","seq":6}\n'
+    msg 7 notify.post jkb-claude-d 50000000 false
+  } | "$tmp/jkb-notifier" serve --dry-run --now-ms 50400000 2>/dev/null)
+  check "a burst folds to its net effect, marks a stale post with its age, and is acked after" \
+    "$served" "$(printf '%s\n' \
+      'remove jkb-claude-a' \
+      'post jkb-claude-b Claude Code | wt · stale, 14h ago | needs Bash' \
+      '{"ack":4}' \
+      'post jkb-claude-c Claude Code | wt | needs Bash' \
+      '{"ack":6}')"
+  script=$("$tmp/jkb-notifier" banner-script --title 'Claude Code' --subtitle 'w"t' \
+    --body "$(printf 'say "hi" \\ now\nplease')")
+  check "the fallback banner's AppleScript escapes and folds" \
+    "$script" 'display notification "say \"hi\" \\ now please" with title "Claude Code" subtitle "w\"t"'
+  if command -v osacompile >/dev/null 2>&1; then
+    osacompile -o "$tmp/banner.scpt" -e "$script" 2>"$tmp/osacompile.err"
+    check "and it compiles" "$?" "0"
+  fi
+fi
 
 # 13. The live round-trip against the real notifier bundle. Withdrawing a delivered notification
 #     is the one behaviour that justifies shipping our own notifier at all, and no stub can show
@@ -222,11 +283,18 @@ else
   # (hook -> notifier -> notification centre) uncovered, and that seam is the whole feature.
   live_sid="hook-selftest-$$"
   live_id="jkb-claude-$live_sid"
-  delivered() { "$live_bin" list 2>/dev/null | grep -c "^$live_id\$" | tr -d ' '; }
+  # The path is asynchronous since r3.2 — hook, jkb serve, the queue, then the com.jkb.notifier agent
+  # polling it — so each assertion waits up to 5 s for the state it expects before reading it once.
+  delivered_now() { "$live_bin" list 2>/dev/null | grep -c "^$live_id\$" | tr -d ' '; }
+  delivered() { # delivered <expected> -> the count, once it matches or 5 s have passed
+    local i=0
+    until [ "$(delivered_now)" = "$1" ] || [ "$i" -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
+    delivered_now
+  }
   # Driven against THIS CHECKOUT's jkb, not whatever is installed. The shim delegates to the
   # first `jkb` on PATH, and an installed binary predating `notify` silently does nothing — which
   # is precisely what this test saw the first time it ran against the shim.
-  repo_target="$(cd "$(dirname "$0")/../.." && pwd)/target/debug"
+  repo_target="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target}/debug"
   if [ ! -x "$repo_target/jkb" ]; then
     fail "live round-trip: $repo_target/jkb is not built — run ./scripts/build.sh"
     live_bin=""
@@ -237,21 +305,22 @@ else
 
   # Claude needs permission.
   live "$(payload Notification "$live_sid" "$PROMPT")"
-  check "the Notification hook posts a real notification" "$(delivered)" "1"
+  check "the Notification hook posts a real notification" "$(delivered 1)" "1"
 
   # A DIFFERENT tool finishing first — the batched-call case — must leave it up.
   live "$(payload PostToolUse "$live_sid" '' Read)"
-  check "a concurrent tool leaves the real notification up" "$(delivered)" "1"
+  sleep 1  # long enough for a wrong withdrawal to have arrived
+  check "a concurrent tool leaves the real notification up" "$(delivered_now)" "1"
 
   # You grant it; the tool runs; PostToolUse fires for THAT tool. The pair the change exists for.
   live "$(payload PostToolUse "$live_sid" '' Bash)"
-  check "granting permission withdraws it" "$(delivered)" "0"
+  check "granting permission withdraws it" "$(delivered 0)" "0"
 
   # The other half: the idle-waiting notification, cleared by typing rather than by a tool.
   live "$(payload Notification "$live_sid" 'Claude is waiting for your input')"
-  check "the idle notification posts" "$(delivered)" "1"
+  check "the idle notification posts" "$(delivered 1)" "1"
   live "$(payload UserPromptSubmit "$live_sid" '')"
-  check "typing a prompt withdraws it" "$(delivered)" "0"
+  check "typing a prompt withdraws it" "$(delivered 0)" "0"
 
   # NOTE: `list` reports DELIVERED notifications, which includes one that has hidden its banner
   # and is resting in Notification Center. So nothing above proves the notification stayed

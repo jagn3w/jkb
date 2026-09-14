@@ -2935,7 +2935,7 @@ fn notify_needs_no_database() {
     assert_cmd::Command::from_std(jkb(&not_a_db))
         .args(["notify", "hook"])
         .env("HOME", dir.path())
-        .env("JKB_DAEMON_URL", format!("http://{closed}"))
+        .env("JKB_DAEMON_ADDR", closed.to_string())
         .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
         .assert()
         .success()
@@ -2948,6 +2948,74 @@ fn notify_needs_no_database() {
     let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))
         .expect("the failure is logged");
     assert!(log.contains("notify.event: Unavailable"), "{log}");
+}
+
+/// The hook finds the daemon where the environment says — `JKB_DAEMON_ADDR`, which is how the dev
+/// container points it at the host — and presents the token from `~/.jkb/daemon/token`. Checked
+/// through the real binary against a listener that records the request, since a hook that looked
+/// anywhere else would fail just as silently as one that found nothing.
+#[test]
+fn notify_hook_sends_to_the_daemon_the_environment_names() {
+    use std::io::{Read as _, Write as _};
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join(".jkb/daemon")).unwrap();
+    std::fs::write(dir.path().join(".jkb/daemon/token"), "tok").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Non-blocking with a deadline: a hook that looked anywhere else must fail this test, not hang it.
+    listener.set_nonblocking(true).unwrap();
+    let seen = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => return String::from("<no request reached the named daemon>"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = vec![0u8; 16 * 1024];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let body = r#"{"result":"notified","state":"absent","moved":true,"effects":[],"sent":0}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+
+    assert_cmd::Command::from_std(jkb_bare())
+        .args(["notify", "hook"])
+        .env("HOME", dir.path())
+        .env("JKB_DAEMON_ADDR", addr.to_string())
+        .env("JKB_HOOK_OWNER", "4242")
+        .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
+        .assert()
+        .success()
+        .stdout("");
+    let request = seen.join().unwrap();
+    assert!(request.starts_with("POST /v1/op "), "{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer tok"),
+        "{request}"
+    );
+    assert!(request.contains(r#""op":"notify.event""#), "{request}");
+    assert!(request.contains(r#""event":"turn_ended""#), "{request}");
+    assert!(
+        !dir.path().join(".jkb/logs/notify-hook.log").exists(),
+        "an answered request logs nothing"
+    );
 }
 
 /// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is

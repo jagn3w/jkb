@@ -72,6 +72,9 @@ enum NotifyCmd {
     /// Print the Claude Code hook events this command answers to, for the registration
     /// cross-check in `scripts/tests/notify-hook.test.sh`.
     Events,
+    /// Print the queue topic notifications are sent on, for `scripts/setup.sh` (which creates it) and
+    /// `scripts/build-notifier.sh` (whose agent subscribes to it) — so the name is spelled once.
+    Topic,
 }
 
 #[derive(Subcommand)]

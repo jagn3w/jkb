@@ -186,8 +186,22 @@ fi
 
 # --- notifications -------------------------------------------------------------------
 # `.claude/hooks/notify-sticky.sh` makes Claude Code's "needs your permission" notification stay
-# on screen and withdraws it when you answer. Withdrawing needs a notifier we own (macos/notifier,
-# on Apple's UserNotifications framework), so this builds it — no third-party binary, no download.
+# on screen and withdraws it when you answer. The hook tells `jkb serve`, whose notification machine
+# sends posts and withdrawals on a queue topic (design r3.2 N1); on macOS `jkb-notifier serve`
+# consumes it. Withdrawing needs a notifier we own (macos/notifier, on Apple's UserNotifications
+# framework), so this builds it — no third-party binary, no download.
+#
+# The TOPIC is created on every platform: a producer never creates one, and the hook in a Linux dev
+# container still reaches a Mac's daemon. Nothing fills it where nobody consumes — the machine sends
+# only to a topic with a consumer group, and the group is the notifier's, so only a Mac has one.
+say "notification topic"
+if notify_topic="$(jkb notify topic 2>/dev/null)" && [ -n "$notify_topic" ]; then
+  jkb --db "$db" mq topic create "$notify_topic" >/dev/null \
+    && echo "  • $notify_topic ready" \
+    || warn "could not create the $notify_topic topic — notifications will not be sent"
+else
+  warn "this jkb does not name the notification topic (jkb notify topic) — notifications will not be sent"
+fi
 #
 # The two things this CANNOT do for you are reported rather than assumed, because a hook that
 # posts nothing, or posts self-hiding banners, looks exactly like a broken hook:
@@ -202,7 +216,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # installed, which is the usual case, since build-notifier.sh bails at its `swiftc` guard before
   # touching the existing one — and it suppressed the two manual-step instructions, so a machine
   # that really was unauthorized was told nothing.
-  "$repo_root/scripts/build-notifier.sh" || warn "could not rebuild the notifier (any existing one is untouched)"
+  # --jkb and --db: the agent it installs (com.jkb.notifier) subscribes with this jkb, to this
+  # database — the one every other service here was installed against.
+  "$repo_root/scripts/build-notifier.sh" --jkb "$(command -v jkb)" --db "$db" \
+    || warn "could not rebuild the notifier (any existing one is untouched)"
 
   # Asked of the hook itself, so this reports on exactly the binary the hook will use. A second
   # copy of the search list here would eventually disagree with it, and the disagreement reads
@@ -210,7 +227,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   nb=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --find-notifier 2>/dev/null || true)
   state=$([ -n "$nb" ] && "$nb" status 2>/dev/null || true)
   if [ -z "$nb" ]; then
-    warn "no notifier installed — permission notifications will fire but auto-hide"
+    warn "no notifier installed — permission notifications will not be shown (nothing consumes the queue)"
   else
     case "$state" in
       *authorization=authorized*) ;;

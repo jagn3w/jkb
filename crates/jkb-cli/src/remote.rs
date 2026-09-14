@@ -82,22 +82,21 @@ pub fn target() -> Option<String> {
 
 /// Where `jkb serve` is, for a process that talks to it without being in remote mode — the
 /// notification hook, which never opens a database in any mode. `JKB_REMOTE` when set; else
-/// `JKB_DAEMON_URL`, which the dev container sets to the host (`.container/container.json`,
-/// checked against the firewall's opening by `.container/check-config.sh`); else the address
-/// `jkb serve` binds by default, which is the host's own loopback.
+/// `JKB_DAEMON_ADDR` (`host:port`, the shape of `jkb serve --addr`), which the dev container sets to
+/// the host (`.container/container.json`, checked against the firewall's opening by
+/// `.container/check-config.sh`); else the address `jkb serve` binds by default, the host's own
+/// loopback.
 #[must_use]
 pub fn daemon_url() -> String {
-    daemon_url_from(target(), std::env::var("JKB_DAEMON_URL").ok())
+    daemon_url_from(target(), std::env::var("JKB_DAEMON_ADDR").ok())
 }
 
-fn daemon_url_from(remote: Option<String>, configured: Option<String>) -> String {
-    remote
-        .or_else(|| {
-            configured
-                .map(|v| v.trim().to_owned())
-                .filter(|v| !v.is_empty())
-        })
-        .unwrap_or_else(|| format!("http://{}", jkb_daemon::DEFAULT_ADDR))
+fn daemon_url_from(remote: Option<String>, addr: Option<String>) -> String {
+    let addr = addr
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| jkb_daemon::DEFAULT_ADDR.to_owned());
+    remote.unwrap_or_else(|| format!("http://{addr}"))
 }
 
 /// The file whose recent modification means the daemon was just unreachable, shared by every
@@ -212,11 +211,8 @@ mod tests {
     #[test]
     fn the_daemon_is_remote_mode_s_then_the_configured_one_then_this_host_s() {
         let s = |v: &str| Some(v.to_owned());
-        assert_eq!(
-            daemon_url_from(s("http://r:1"), s("http://c:2")),
-            "http://r:1"
-        );
-        assert_eq!(daemon_url_from(None, s(" http://c:2 ")), "http://c:2");
+        assert_eq!(daemon_url_from(s("http://r:1"), s("c:2")), "http://r:1");
+        assert_eq!(daemon_url_from(None, s(" c:2 ")), "http://c:2");
         assert_eq!(
             daemon_url_from(None, s("  ")),
             format!("http://{}", jkb_daemon::DEFAULT_ADDR),

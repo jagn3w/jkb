@@ -51,6 +51,7 @@ pub fn run(cmd: &NotifyCmd) {
                 println!("{name}");
             }
         }
+        NotifyCmd::Topic => println!("{}", jkb_core::notify::TOPIC),
         NotifyCmd::Hook => hook(),
     }
 }

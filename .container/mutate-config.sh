@@ -361,6 +361,12 @@ run "the VS Code metadata label is dropped" "carry no devcontainer.metadata labe
 seed; sub_dc '\"onAutoForward\":\"ignore\"' '\"onAutoForward\":\"notify\"'
 run "the label lets VS Code forward the daemon port" "does not set portsAttributes"
 
+seed; sub_dc '"JKB_DAEMON_ADDR": "host.docker.internal:7117",' '"JKB_DAEMON_ADDR": "host.docker.internal:7118",'
+run "the notification hook is pointed at a port the firewall does not open" "but the firewall opens host.docker.internal:7117"
+
+seed; sub_dc '"JKB_DAEMON_ADDR": "host.docker.internal:7117",' ''
+run "the notification hook is not told where the daemon is" "sets no JKB_DAEMON_ADDR"
+
 # THE PROBE AND THE RAISE MUST STATE ONE RULE. Re-inlining the spec on the probe side is exactly
 # what shipped: `--match-set allowed-new` is the staging set, destroyed before the raise returns, so
 # allowlist_state could never answer `yes`. Mutating ONE side is the point — a mutation that
@@ -909,7 +915,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=82
+PINNED_BAD_SITES=84
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

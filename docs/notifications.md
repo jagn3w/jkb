@@ -1,28 +1,112 @@
 # Permission notifications
 
-Claude Code's "needs your permission" notification, made sticky and self-clearing: the hook
-(`.claude/hooks/notify-sticky.sh`), the lifecycle table that decides post/withdraw
-(`crates/jkb-cli/src/notify.rs`, design `openspec/changes/jkb-notification-lifecycle/`), and the
-macOS notifier we build for the withdraw half (`macos/notifier/`, `scripts/build-notifier.sh`).
-Read this before touching any of them.
+Claude Code's "needs your permission" notification, made sticky and self-clearing. The pieces, in the
+order an event passes through them:
+
+1. the hook shim `.claude/hooks/notify-sticky.sh`, which hands the payload to
+2. `jkb notify hook` (`crates/jkb-cli/src/notify.rs`), a client of `jkb serve` that never opens a
+   database, which sends one `notify.event` to
+3. the daemon, where the lifecycle table (`crates/jkb-core/src/notify.rs`, design
+   `openspec/changes/jkb-notification-lifecycle/`) runs against its record of the session
+   (`notify_sessions`) and sends posts and withdrawals on the `claude/notify` queue topic, consumed by
+4. `jkb-notifier serve` (`macos/notifier/`, built and installed as the launchd agent
+   `com.jkb.notifier` by `scripts/build-notifier.sh`), which displays them.
+
+Steps 2–4 are design r3.2 N1/N2 (`openspec/changes/jkb-message-queue/design-r3.md`); the queue's own
+rules are in [message-queue.md](message-queue.md). Read this before touching any of them.
+
+## Where it runs, and why it moved (r3.2, 2026-09-14)
+
+**The hook decides nothing and performs nothing any more.** Until r3.2 the hook ran the table itself
+and exec'd the notifier per effect, with a marker file per session in its `$TMPDIR`. That works only
+where the hook can reach the Mac's notification centre, and the dev container cannot — a hook in there
+posted nothing at all. The fix is the substrate the message-queue change built: the hook tells the
+daemon what it observed, the daemon decides against its own record, and a consumer on the Mac
+displays. A hook in the container and one on the host now take the same path.
+
+**The record and the sends are one transaction.** The old plan-ordering rule — screen effects before
+record effects, and `perform` stops at the first it cannot carry out — existed because a subprocess
+and a marker file could half-apply a plan. Inside one `write_txn` a plan applies whole or not at all:
+a send the queue refuses leaves the record as it was. The ordering is kept (and still walked by
+`plans_change_the_screen_before_the_record`) because it costs nothing.
+
+**`Banner` and `notifier_usable` left the machine.** Whether a post can be *displayed* — installed,
+authorized, alert style not `none` — is a fact about the Mac, which a producer in a container cannot
+ask. `Needed` now always plans `[Post, Remember]`, and `jkb-notifier serve` decides per batch: through
+the notification centre by id when usable, else a plain `osascript` banner. **Behaviour change,
+stated:** the banner fallback used to need nothing installed; it now needs the notifier agent running,
+because the agent is what reads the queue. With no agent, nothing is shown.
+
+**The blind sweeps stayed, for a different reason.** `Stop`/`SessionEnd` from `absent` still send a
+withdrawal. The record can no longer disagree with what was *sent*, but the screen is a consumer's,
+across a queue: a consumer whose withdraw hit a notification centre that never answered has already
+acked it (after 10 s, so it cannot wedge). One withdrawal per turn bounds that to the turn.
+
+**A topic nobody reads is not written to.** A message no group consumes is never reapable, so a topic
+with no groups fills to its 10,000-message cap and then refuses every hook call. On a machine with no
+notifier that is the topic's whole life. So the machine still moves the record but sends only while
+`claude/notify` has a group — and the only group is the notifier's (`macos-notifier`, created from
+now by its `jkb mq subscribe`), so only a Mac running the agent receives anything. `scripts/setup.sh`
+creates the topic on every platform, because a producer never creates one.
+
+**The hook never opens a database, and has no local fallback.** It runs after every tool call, and
+opening the database costs ~110 ms (design N7) — worse, a database a newer migration locked this
+binary out of would stop every withdrawal. `tests/cli.rs` `notify_needs_no_database` pins it, now
+with the daemon unreachable. So when `jkb serve` is down, notifications stop and the hook stays silent
+(design R1's residual). Design N1 had the host hook fall back to opening the database locally; that
+contradicted N7 and the pinned test, and was not built.
+
+**Bounded and silent.** 200 ms to connect, 1 s per request (`RemoteBackend::with_deadlines`, pinned
+against a daemon that accepts and never answers), nothing on stdout, and every failure appended to
+`~/.jkb/logs/notify-hook.log`, which is moved aside to `.log.1` at 256 KiB so a daemon that stays down
+cannot fill the disk. The address is `JKB_REMOTE` if set, else `JKB_DAEMON_ADDR` (the dev container
+sets it to `host.docker.internal:7117`; `.container/check-config.sh` holds it to the firewall's
+opening), else `jkb serve`'s default loopback. **Not yet measured:** the round trip from the container
+on the Mac.
+
+**The sweep is the producer's, because only the producer can probe a pid.** At `SessionStart` the hook
+asks `notify.open_sessions`, decides for each record whether its session is provably gone, and sends
+`notify.gone` for those. A record is gone when (a) it was written from **this instance** and its owner
+pid is dead by `kill(pid, 0)` (`EPERM` counts as alive), or (b) it was written from **another boot of
+this same container**. The instance is the hostname, plus — in the container — the pid namespace the
+entrypoint recorded in `JKB_NS_MARKER`; a container keeps its hostname across `docker stop`/`start`
+but writes a new marker, and runs one boot at a time. The marker rather than `/proc/self/ns/pid`,
+because a nested sandbox with its own pid namespace would otherwise look like another boot of a
+container that is still running. Everything else — the host seen from a container, another
+container, a record with no owner — is `Unknown`, and `Unknown` never withdraws.
+
+**`notify.gone` carries the owner it probed**, and the daemon withdraws only if the record still names
+it. `claude --resume` keeps the session id and runs a new process; a session resumed between the
+sweep's read and its withdrawal would otherwise lose a live prompt. Pinned by
+`the_sweep_spares_a_session_resumed_after_it_looked`.
+
+**Residuals, stated:** a *rebuilt* container gets a new hostname, so notifications its sessions left
+cannot be proved gone from anywhere and stay until dismissed by hand (as before r3.2, whose markers
+died with the container). Two containers given the same `--hostname` would read as each other's
+earlier boot. Any process that can reach the port and read the token can post and withdraw
+notifications (design R1).
+
+## The hook, the table and the notifier
 
 **The `.claude/` hooks are code, and `cargo test` never reaches them** — `scripts/tests/notify-hook.test.sh`
 is their suite, run first by `check.sh` and by CI (bash + `jq` only, so it passes on the Linux
-runner). `notify-sticky.sh` takes its notifier and state directory from `JKB_NOTIFIER` /
-`JKB_NOTIFY_STATE`, which is what lets the macOS half be driven by a recorder stub. **Portable
+runner). It also checks the launchd agent `build-notifier.sh --print-agent` writes, and — on macOS,
+where `swiftc` exists — compiles `macos/notifier/main.swift` and drives `serve --dry-run` (the fold,
+stale marking and acks) and the fallback banner's AppleScript through `osacompile`. **Portable
 means portable:** every macOS-only tool it touches is `command -v`-guarded, and the plist check
 goes through `scripts/build-notifier.sh --check` — which answers *before* its own Darwin gate and
 reads the plist with `awk` — so the assertion is live on the Linux runner rather than skipped
 there. It once called `/usr/libexec/PlistBuddy` directly, whose `|| echo MISSING` fallback turned
 *cannot read* into a wrong **value** and reddened CI on every push. The live
-post-then-withdraw round-trip against the real bundle is opt-in behind `JKB_HOOK_LIVE_TEST=1`, for
+post-then-withdraw round-trip — through the hook, the running `jkb serve` and the running
+`com.jkb.notifier` agent to the real notification centre — is opt-in behind `JKB_HOOK_LIVE_TEST=1`, for
 the same reason the ollama and Chrome smokes are `#[ignore]`d — it puts a real notification on
 screen, and a gate that runs before every commit must not flash one.
 
 **Permission notifications are sticky and self-clearing.** A banner that hides after a few
 seconds is exactly wrong for "Claude needs your permission": the session sits blocked until you
-happen to look. `.claude/hooks/notify-sticky.sh` posts on `Notification` under an id derived from
-`session_id` and withdraws that id on `PostToolUse`/`UserPromptSubmit`/`Stop`/`SessionEnd` — **the
+happen to look. The table posts on `Notification` under an id derived from `session_id` and
+withdraws that id on `PostToolUse`/`UserPromptSubmit`/`Stop`/`SessionEnd` — **the
 id comes from the session, so dismissing owns no pid and no window handle**, and parallel worktree
 sessions (D36) cannot clear each other's. `PostToolUse` is the closest observable "permission was
 given" (`PreToolUse` runs *before* the prompt), so granting a slow command clears on completion,
@@ -35,19 +119,21 @@ left the session blocked with nothing on screen, which is the state the hook exi
 So the events are split by how far each can be trusted: a **tool** event withdraws only when the
 finished tool is the one the prompt named (read out of the notification message, since the payload
 names no tool); a **user** event withdraws unconditionally; and `Stop`/`SessionEnd` **sweep without
-consulting the marker at all**. The sweep is what makes every failure above temporary — including
-a marker that could never be written, which otherwise short-circuits every gated event and leaves
-an `alert`-style notification, which waits forever by design, on screen after the session ends.
+consulting the record at all**. The sweep is what makes every failure above temporary — before r3.2
+including a marker file that could never be written, and since then a consumer whose withdrawal did
+not reach the screen — either of which would otherwise leave an `alert`-style notification, which
+waits forever by design, on screen after the session ends.
 Residual, stated rather than guarded: two calls to the *same* tool, one allowlisted and one
 prompting, are indistinguishable, so the first to finish withdraws; the sweep bounds it to the
 turn.
 
-**The one file it keeps is a per-session marker** (`$TMPDIR/jkb-claude-notify/<session>`, or
-`JKB_NOTIFY_STATE`), holding the prompted tool's name. It exists because `PostToolUse` fires after
-*every* tool call and that path must be a stat rather than an exec. A failed withdraw does **not**
-re-arm it: the only realistic non-zero exit is a 10s timeout against a wedged notification centre,
-so retrying per tool call would add that to each one, with the reason swallowed. The retry is the
-sweep, bounded by construction.
+**The per-session marker file is superseded by the daemon's `notify_sessions` record** (r3.2). The
+marker (`$TMPDIR/jkb-claude-notify/<session>`) held the prompted tool's name, and existed because
+`PostToolUse` fires after *every* tool call and that path had to be a stat rather than an exec. It
+is now one HTTP round trip instead, and the record lives beside the queue it is transacted with. The
+old marker could also be orphaned by a container restart, taking the only memory of a notification
+with it; the record cannot. The retry for a failed withdraw is still the turn-end sweep, bounded by
+construction.
 
 **The notifier is ours (`macos/notifier/`), and the withdraw half is what forced that.** Nothing
 shipping on macOS both stays up and takes itself down: `osascript` cannot withdraw what it posted,
@@ -72,8 +158,9 @@ the authorization prompt **dies with the process that raised it**, so `authorize
 sticky **Alerts** style (a per-app System Settings choice; `banner` hides itself). `jkb-notifier
 status` reads both back — which terminal-notifier could not — so setup says which is missing.
 `post` **refuses** when unauthorized rather than succeeding invisibly (macOS accepts it, displays
-nothing and returns no error), and the hook falls back to a plain `osascript` banner, so behaviour
-is never worse than before this existed. `NSUserNotificationAlertStyle` in `Info.plist` is
+nothing and returns no error); `serve` asks the same question per batch and falls back to a plain
+`osascript` banner, with the escaping the Rust hook's `banner_script` had — which matters more now,
+because the text can come from inside the dev container. `NSUserNotificationAlertStyle` in `Info.plist` is
 deliberately absent: it is the legacy key, ignored by the modern framework — also measured.
 
 **Do not try to set the alert style in code** — this was attempted and abandoned on purpose. It

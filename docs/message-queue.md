@@ -60,6 +60,14 @@ routinely built from different checkouts.
 | `mq.compact` | `force?` | `compacted` {…counts} |
 | `mq.inspect` | — | `topics` {`topics`} |
 | `mq.tail` | `topic`, `limit` | `messages` {`messages`} |
+| `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
+| `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
+| `notify.gone` | `session`, `owner` | `notified` {…} |
+
+The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
+effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
+12 h) and `notify.withdraw` (`id`, `session`; no TTL), keyed `session/<id>` — and only while the topic
+has a consumer group. [notifications.md](notifications.md) is their record.
 
 `after` is the consumer's **fetch position**, separate from its committed one as in Kafka: a consumer
 that has handed messages on but not yet acked them polls with `after` set to the last seq it handed
@@ -272,4 +280,5 @@ migration's lock),
   it will take already exists; see `.container/README.md`, "The one opening to the host".
 - Porting the agent read and task-mutate command sets to operations — stage S6.
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.
-- A native, non-subprocess client (Swift) — it would speak the HTTP protocol above.
+- A native, non-subprocess client (Swift) — it would speak the HTTP protocol above. `jkb-notifier
+  serve`, the first consumer, runs `jkb mq subscribe` as a child for now (design N2).

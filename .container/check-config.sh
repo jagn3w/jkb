@@ -602,6 +602,20 @@ else
     bad "the devcontainer.metadata label does not set portsAttributes.\"${fw_port:-?}\".onAutoForward to ignore — VS Code would auto-forward the daemon port and take the host's 127.0.0.1:${fw_port:-?} from com.jkb.serve"
 fi
 
+# 5. The notification hook is told the address the firewall opens. `jkb notify hook` reaches the
+#    daemon at JKB_DAEMON_ADDR and, without it, at the container's OWN loopback — where nothing listens,
+#    so every notification from in here is lost with nothing on screen to say so (the hook is silent
+#    by design). Held to the same two constants the firewall reads, not to a copy of them.
+dc_env="$(dc_container_env "$here/container.json" "$repo_top" 2>/dev/null)" || dc_env=""
+daemon_addr="$(sed -n 's/^JKB_DAEMON_ADDR=//p' <<<"$dc_env" | head -1)"
+if [ -z "$daemon_addr" ]; then
+    bad "container.json's containerEnv sets no JKB_DAEMON_ADDR — the notification hook would look for jkb serve on the container's own loopback and every notification from the container would be lost"
+elif [ "$daemon_addr" != "${fw_host:-?}:${fw_port:-?}" ]; then
+    bad "container.json's JKB_DAEMON_ADDR is $daemon_addr but the firewall opens ${fw_host:-<unread>}:${fw_port:-<unread>} (egress-lib.sh) — the notification hook would be refused"
+else
+    ok "the notification hook is pointed at the address the firewall opens ($daemon_addr)"
+fi
+
 # THE PROBE LOOKS FOR THE RULE THE RAISE INSTALLS. init-firewall.sh installs the chain with
 # `iptables -A OUTPUT <spec>` and egress-lib.sh reads it back with `iptables -C OUTPUT <spec>`;
 # spelled separately those are two statements that have to agree, and they did not — the probe
