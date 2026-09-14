@@ -87,7 +87,7 @@ pub fn hostname_for_test() -> String {
 /// running on it would answer, so `host:pid` owner ids from either side compared EQUAL and the
 /// container's pid namespace was probed as if it were this one. A rule whose two sides answer the
 /// same name is not a rule, so the last resort is `uname`, which names the machine.
-fn hostname() -> String {
+pub fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("HOST").ok())

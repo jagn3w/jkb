@@ -15,9 +15,11 @@
 //! or an unknown request field is refused (`deny_unknown_fields`), response fields are only ever
 //! added, and an op never changes meaning — a changed meaning is a new op name.
 //!
-//! Stage 2 ships the message-queue ops (`mq.*`). The notification and agent read/write sets follow.
+//! Stage 2 shipped the message-queue ops (`mq.*`), stage 5 the notification ops (`notify.*`); the
+//! agent read/write sets follow.
 
 use jkb_core::mq::{self, Created, Draft, QueueError, Start, TopicSpec};
+use jkb_core::notify::{self, NotifEvent, Observation};
 use jkb_core::Db;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +111,86 @@ pub enum Request {
         /// At most this many.
         limit: usize,
     },
+    /// One Claude Code hook event, as the hook observed it. The daemon runs the notification
+    /// machine against its record of the session and sends the effects on `claude/notify`.
+    #[serde(rename = "notify.event")]
+    NotifyEvent {
+        /// The session id, sanitized to `[A-Za-z0-9_-]` (anything else is refused).
+        session: String,
+        /// What happened.
+        event: HookEvent,
+        /// The tool that just finished (`PostToolUse`), if any.
+        #[serde(default)]
+        tool: String,
+        /// The notification text (`Notification`), if any.
+        #[serde(default)]
+        message: String,
+        /// The session's working directory.
+        #[serde(default)]
+        cwd: String,
+        /// The `claude` process's pid, or empty when the hook had none it could trust.
+        #[serde(default)]
+        owner: String,
+        /// The pid namespace `owner` belongs to.
+        #[serde(default)]
+        instance: String,
+    },
+    /// Every notification the daemon holds a record of, for a producer's `SessionStart` sweep.
+    #[serde(rename = "notify.open_sessions")]
+    NotifyOpenSessions {},
+    /// A producer probed `owner` and found it gone: withdraw the session's notification, but only
+    /// if the record still names that owner.
+    #[serde(rename = "notify.gone")]
+    NotifyGone {
+        /// The session.
+        session: String,
+        /// The owner pid that was probed.
+        owner: String,
+    },
+}
+
+/// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
+/// with the owner it probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// `Notification`.
+    Needed,
+    /// `PostToolUse`.
+    ToolFinished,
+    /// `UserPromptSubmit`.
+    UserActed,
+    /// `Stop`.
+    TurnEnded,
+    /// `SessionEnd`.
+    SessionEnded,
+}
+
+impl From<HookEvent> for NotifEvent {
+    fn from(e: HookEvent) -> Self {
+        match e {
+            HookEvent::Needed => Self::Needed,
+            HookEvent::ToolFinished => Self::ToolFinished,
+            HookEvent::UserActed => Self::UserActed,
+            HookEvent::TurnEnded => Self::TurnEnded,
+            HookEvent::SessionEnded => Self::SessionEnded,
+        }
+    }
+}
+
+/// A notification record as `notify.open_sessions` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifySession {
+    /// The session.
+    pub session: String,
+    /// The tool the prompt named, or empty.
+    pub tool: String,
+    /// The owner pid the hook recorded, or empty.
+    pub owner: String,
+    /// The pid namespace that pid belongs to.
+    pub instance: String,
+    /// When the record was last written (Unix ms).
+    pub updated_at: i64,
 }
 
 /// A topic spec as a request carries it: every field optional, defaults from [`TopicSpec`].
@@ -278,6 +360,9 @@ impl Request {
         "mq.compact",
         "mq.inspect",
         "mq.tail",
+        "notify.event",
+        "notify.open_sessions",
+        "notify.gone",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -294,6 +379,27 @@ impl Request {
             Self::MqCompact { .. } => "mq.compact",
             Self::MqInspect {} => "mq.inspect",
             Self::MqTail { .. } => "mq.tail",
+            Self::NotifyEvent { .. } => "notify.event",
+            Self::NotifyOpenSessions {} => "notify.open_sessions",
+            Self::NotifyGone { .. } => "notify.gone",
+        }
+    }
+
+    /// Whether serving this request can put a message on a topic, so a daemon holding long-polls
+    /// wakes them. Exhaustive, so an op that sends cannot be added without saying so — a send the
+    /// daemon did not announce is delivered only by its slower `data_version` floor.
+    #[must_use]
+    pub const fn may_send(&self) -> bool {
+        match self {
+            Self::MqSend { .. } | Self::NotifyEvent { .. } | Self::NotifyGone { .. } => true,
+            Self::MqTopicCreate { .. }
+            | Self::MqGroupCreate { .. }
+            | Self::MqPoll { .. }
+            | Self::MqAck { .. }
+            | Self::MqCompact { .. }
+            | Self::MqInspect {}
+            | Self::MqTail { .. }
+            | Self::NotifyOpenSessions {} => false,
         }
     }
 }
@@ -338,6 +444,37 @@ pub enum Response {
         /// By name.
         topics: Vec<Topic>,
     },
+    /// A `notify.event` or `notify.gone`: what the notification machine did.
+    Notified {
+        /// The session's state afterwards (`absent`, `awaiting_tool`, `awaiting_user`).
+        state: String,
+        /// Whether a transition fired.
+        moved: bool,
+        /// The plan carried out, in order (`post`, `withdraw`, `remember`, `forget`).
+        effects: Vec<String>,
+        /// Why nothing moved, when something refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<String>,
+        /// Messages sent — none when `claude/notify` has no consumer group.
+        sent: usize,
+    },
+    /// A `notify.open_sessions`.
+    Sessions {
+        /// By session.
+        sessions: Vec<NotifySession>,
+    },
+}
+
+impl From<notify::Applied> for Response {
+    fn from(a: notify::Applied) -> Self {
+        Self::Notified {
+            state: a.state.as_str().to_owned(),
+            moved: a.moved,
+            effects: a.effects.iter().map(|e| e.as_str().to_owned()).collect(),
+            refusal: a.refusal,
+            sent: a.sent,
+        }
+    }
 }
 
 /// A stable error code, so a client in another process — or another version — can branch on it
@@ -595,6 +732,46 @@ impl Backend for LocalBackend {
                     .map(Message::from)
                     .collect(),
             },
+            Request::NotifyEvent {
+                session,
+                event,
+                tool,
+                message,
+                cwd,
+                owner,
+                instance,
+            } => {
+                let obs = Observation {
+                    session,
+                    event: event.into(),
+                    finished_tool: tool,
+                    message,
+                    cwd,
+                    owner,
+                    instance,
+                };
+                self.db
+                    .write_txn(ACTOR, move |c, m| notify::observe(c, m, &obs, now))?
+                    .into()
+            }
+            Request::NotifyOpenSessions {} => Response::Sessions {
+                sessions: self
+                    .db
+                    .read(notify::open_sessions)?
+                    .into_iter()
+                    .map(|r| NotifySession {
+                        session: r.session,
+                        tool: r.tool,
+                        owner: r.owner,
+                        instance: r.instance,
+                        updated_at: r.updated_at,
+                    })
+                    .collect(),
+            },
+            Request::NotifyGone { session, owner } => self
+                .db
+                .write_txn(ACTOR, move |c, m| notify::gone(c, m, &session, &owner, now))?
+                .into(),
         })
     }
 }

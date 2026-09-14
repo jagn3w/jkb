@@ -24,6 +24,7 @@ pub mod item;
 pub mod lifecycle;
 pub mod mount;
 pub mod mq;
+pub mod notify;
 pub mod ns;
 pub mod nstype;
 pub mod placement;

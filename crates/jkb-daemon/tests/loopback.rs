@@ -826,3 +826,96 @@ fn connections_are_capped_and_a_silent_one_is_closed() {
         .call(Request::MqInspect {})
         .expect("slots freed when connections close");
 }
+
+#[test]
+fn a_notification_event_wakes_a_long_poll_like_a_send() {
+    // `notify.event` puts its effects on `claude/notify` inside the daemon, so it must announce them
+    // as `mq.send` does (`Request::may_send`) — or a consumer's long-poll hears about a permission
+    // prompt only at the floor. The floor is pushed out past the test, so only the wake can deliver.
+    let f = Fixture::with(|cfg| cfg.poll_floor = Duration::from_mins(1));
+    let c = f.client().with_poll_wait(Duration::from_secs(20));
+    c.call(Request::MqTopicCreate {
+        topic: jkb_core::notify::TOPIC.into(),
+        spec: SpecInput::default(),
+    })
+    .unwrap();
+    c.call(Request::MqGroupCreate {
+        topic: jkb_core::notify::TOPIC.into(),
+        group: "g".into(),
+        from_start: true,
+    })
+    .unwrap();
+    let base = f.base.clone();
+    let token = f.token.clone();
+    let producer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        RemoteBackend::new(&base, token)
+            .unwrap()
+            .call(Request::NotifyEvent {
+                session: "s1".into(),
+                event: jkb_api::HookEvent::Needed,
+                tool: String::new(),
+                message: "Claude needs your permission to use Bash".into(),
+                cwd: "/w/wt".into(),
+                owner: "4242".into(),
+                instance: "host".into(),
+            })
+            .unwrap()
+    });
+    let started = Instant::now();
+    let Response::Messages { messages } = c
+        .call(Request::MqPoll {
+            topic: jkb_core::notify::TOPIC.into(),
+            group: "g".into(),
+            max: 10,
+            after: None,
+        })
+        .unwrap()
+    else {
+        panic!("expected messages")
+    };
+    let Response::Notified { sent, .. } = producer.join().unwrap() else {
+        panic!("expected notified")
+    };
+    assert_eq!(sent, 1);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].kind, jkb_core::notify::KIND_POST);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "woken by the event, not the 20 s wait: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_hook_deadline_bounds_a_daemon_that_accepts_and_never_answers() {
+    // A hook blocks the Claude Code session for as long as it runs. A daemon wedged mid-request
+    // accepts the connection, so the connect timeout does not help; the total deadline must.
+    use std::io::Read as _;
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            held.push(stream);
+        }
+    });
+    let c = RemoteBackend::new(&base, token)
+        .unwrap()
+        .with_deadlines(Duration::from_millis(200), Duration::from_millis(700))
+        .unwrap();
+    let started = Instant::now();
+    let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "bounded by the total deadline, not the default 30 s: {:?}",
+        started.elapsed()
+    );
+}

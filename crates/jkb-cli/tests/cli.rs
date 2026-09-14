@@ -2911,28 +2911,43 @@ fn the_cli_fixture_does_not_inherit_a_repository() {
     common::assert_jkb_isolated("the bare cli fixture", &jkb_bare());
 }
 
-/// `notify` must run before the database is opened.
+/// `notify` never opens a database.
 ///
-/// It fires after EVERY tool call, and `open_db` verifies fifteen migrations and starts the
-/// writer thread — measured at 110 ms against the real database, the cost design N7 rejected.
-/// The sharper half is correctness: when a newer branch's migration locks an older binary out of
-/// the shared database — a state CLAUDE.md documents — opening it fails, and if that happened
-/// first the hook would post nothing and, worse, never withdraw, leaving a sticky notification on
-/// screen for good. Pointed at a file that is not a database at all, which is the strongest form
-/// of "this open would fail".
+/// It fires after EVERY tool call, and `open_db` verifies the migrations and starts the writer
+/// thread — measured at 110 ms against the real database, the cost design N7 rejected. The sharper
+/// half is correctness: when a newer branch's migration locks an older binary out of the database,
+/// opening it fails, and a hook that opened it first would never withdraw, leaving a sticky
+/// notification on screen for good. Since r3.2 N1 the hook is only a client of `jkb serve`, so this
+/// also pins that it stays one: pointed at a file that is not a database at all, with the daemon
+/// unreachable, it exits 0, prints nothing, and logs why.
 #[test]
 fn notify_needs_no_database() {
     let dir = TempDir::new().expect("tempdir");
     let not_a_db = dir.path().join("not-a-database");
     std::fs::write(&not_a_db, b"this is not a sqlite file").expect("write");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
 
     // Wrapped in `assert_cmd::Command` because the payload arrives on stdin, but built by the
     // `jkb` fixture so the spawn inherits no repository selection.
     assert_cmd::Command::from_std(jkb(&not_a_db))
         .args(["notify", "hook"])
+        .env("HOME", dir.path())
+        .env("JKB_DAEMON_URL", format!("http://{closed}"))
         .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
         .assert()
-        .success();
+        .success()
+        .stdout("");
+    assert_eq!(
+        std::fs::read(&not_a_db).unwrap(),
+        b"this is not a sqlite file",
+        "the file named as a database is untouched"
+    );
+    let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))
+        .expect("the failure is logged");
+    assert!(log.contains("notify.event: Unavailable"), "{log}");
 }
 
 /// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is

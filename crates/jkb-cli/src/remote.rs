@@ -80,13 +80,41 @@ pub fn target() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Where `jkb serve` is, for a process that talks to it without being in remote mode — the
+/// notification hook, which never opens a database in any mode. `JKB_REMOTE` when set; else
+/// `JKB_DAEMON_URL`, which the dev container sets to the host (`.container/container.json`,
+/// checked against the firewall's opening by `.container/check-config.sh`); else the address
+/// `jkb serve` binds by default, which is the host's own loopback.
+#[must_use]
+pub fn daemon_url() -> String {
+    daemon_url_from(target(), std::env::var("JKB_DAEMON_URL").ok())
+}
+
+fn daemon_url_from(remote: Option<String>, configured: Option<String>) -> String {
+    remote
+        .or_else(|| {
+            configured
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(|| format!("http://{}", jkb_daemon::DEFAULT_ADDR))
+}
+
+/// The file whose recent modification means the daemon was just unreachable, shared by every
+/// client in this home so a burst of short-lived processes pays one connect timeout.
+#[must_use]
+pub fn down_marker() -> PathBuf {
+    home().join(".cache/jkb/remote-unreachable")
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 /// The token file: `JKB_REMOTE_TOKEN_FILE`, else where the host's `jkb serve` writes it for the
 /// default database (`~/.jkb/jkb.db`, seen through the bind) — the same function it uses, not a copy.
-fn token_file() -> PathBuf {
+#[must_use]
+pub fn token_file() -> PathBuf {
     std::env::var_os("JKB_REMOTE_TOKEN_FILE")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
@@ -138,7 +166,10 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             subcommand_name()
         ),
         Support::NoDatabase => match cli.command {
-            Command::Notify { cmd } => super::notify::run(&cmd),
+            Command::Notify { cmd } => {
+                super::notify::run(&cmd);
+                Ok(())
+            }
             Command::Guide => {
                 super::cmd_guide();
                 Ok(())
@@ -163,7 +194,7 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                         return Err(err);
                     }
                 }
-                .with_down_marker(home().join(".cache/jkb/remote-unreachable"));
+                .with_down_marker(down_marker());
                 super::mq_cli::run(&backend, cmd, cli.json)
             }
             _ => bail!("internal: a Ported command with no remote dispatch"),
@@ -175,8 +206,27 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{support, Support};
+    use super::{daemon_url_from, support, Support};
     use crate::Cli;
+
+    #[test]
+    fn the_daemon_is_remote_mode_s_then_the_configured_one_then_this_host_s() {
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(
+            daemon_url_from(s("http://r:1"), s("http://c:2")),
+            "http://r:1"
+        );
+        assert_eq!(daemon_url_from(None, s(" http://c:2 ")), "http://c:2");
+        assert_eq!(
+            daemon_url_from(None, s("  ")),
+            format!("http://{}", jkb_daemon::DEFAULT_ADDR),
+            "an empty setting is no setting"
+        );
+        assert_eq!(
+            daemon_url_from(None, None),
+            format!("http://{}", jkb_daemon::DEFAULT_ADDR)
+        );
+    }
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("jkb").chain(args.iter().copied())).unwrap()

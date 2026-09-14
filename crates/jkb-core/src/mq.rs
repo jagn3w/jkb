@@ -432,6 +432,17 @@ fn consumed_through(conn: &Connection, topic_id: i64) -> Result<Option<i64>> {
         .query_row([topic_id], |r| r.get(0))?)
 }
 
+/// How many consumer groups `topic` has.
+///
+/// # Errors
+/// [`QueueError::NoSuchTopic`], or a database error.
+pub fn group_count(conn: &Connection, topic: &str) -> Result<i64> {
+    let (topic_id, _) = topic_row(conn, topic)?;
+    Ok(conn
+        .prepare_cached("SELECT COUNT(*) FROM mq_groups WHERE topic_id = ?1")?
+        .query_row([topic_id], |r| r.get(0))?)
+}
+
 /// Create a topic. Idempotent for an identical spec; a different spec is refused rather than
 /// silently kept or overwritten, since both would leave a producer or consumer wrong about the caps.
 ///

@@ -182,10 +182,11 @@ pub fn assert_isolated(what: &str, cmd: &Command) {
 
 /// Remote mode is switched on by the environment alone, so a test run from a shell that has it set —
 /// the dev container sets it — would send every fixture `jkb` to a live daemon instead of the test's
-/// own database, or refuse the command outright. A `jkb` fixture drops these; a bare `git` one has
-/// no reason to.
+/// own database, or refuse the command outright. `JKB_DAEMON_URL` is the notification hook's way of
+/// naming a daemon (the dev container sets that too), and a fixture's `notify hook` must not post to
+/// a real one. A `jkb` fixture drops these; a bare `git` one has no reason to.
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
-pub const REMOTE_MUST_DROP: &[&str] = &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE"];
+pub const REMOTE_MUST_DROP: &[&str] = &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE", "JKB_DAEMON_URL"];
 
 /// Drop [`REMOTE_MUST_DROP`] from a command that runs the `jkb` binary.
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
@@ -199,7 +200,11 @@ pub fn isolate_remote_env(cmd: &mut Command) {
 /// spelled out here as the oracle rather than read from [`REMOTE_MUST_DROP`].
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
 pub fn assert_jkb_isolated(what: &str, cmd: &Command) {
-    assert_isolated_dropping(what, cmd, &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE"]);
+    assert_isolated_dropping(
+        what,
+        cmd,
+        &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE", "JKB_DAEMON_URL"],
+    );
 }
 
 fn assert_isolated_dropping(what: &str, cmd: &Command, also: &[&str]) {

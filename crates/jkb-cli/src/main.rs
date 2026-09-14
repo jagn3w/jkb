@@ -65,13 +65,10 @@ struct Cli {
 /// `jkb notify` verbs.
 #[derive(Subcommand)]
 enum NotifyCmd {
-    /// Read a hook payload on stdin and print the decision as JSON, performing nothing.
-    /// The dry run: `hook` is what carries the plan out.
-    Plan,
-    /// Read a hook payload on stdin, decide, and carry it out. What the hook shim calls.
+    /// Read a hook payload on stdin and send it to `jkb serve`, which decides what the notification
+    /// does; at `SessionStart`, withdraw what provably-gone sessions left. What the hook shim calls.
+    /// Silent: failures go to `~/.jkb/logs/notify-hook.log`.
     Hook,
-    /// Withdraw notifications left behind by sessions that are provably gone.
-    Sweep,
     /// Print the Claude Code hook events this command answers to, for the registration
     /// cross-check in `scripts/tests/notify-hook.test.sh`.
     Events,
@@ -1168,7 +1165,8 @@ fn run(cli: Cli) -> Result<()> {
     // the expensive half — nothing ever withdraws, leaving an Alerts-style notification on screen
     // for good.
     if let Command::Notify { cmd } = &cli.command {
-        return notify::run(cmd);
+        notify::run(cmd);
+        return Ok(());
     }
 
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
@@ -1260,7 +1258,10 @@ fn run(cli: Cli) -> Result<()> {
         // that ever stops happening, not a silent fallthrough to the database path. Which of the
         // two runs is pinned by `notify_needs_no_database` in tests/cli.rs, so the fast path is
         // load-bearing rather than an optimisation someone can quietly drop.
-        Command::Notify { cmd } => notify::run(&cmd),
+        Command::Notify { cmd } => {
+            notify::run(&cmd);
+            Ok(())
+        }
         Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
         Command::Query {
             terms,

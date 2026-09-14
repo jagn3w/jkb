@@ -646,7 +646,7 @@ async fn serve_op(
     request: Request,
     wait: Duration,
 ) -> Result<Response, ApiError> {
-    let is_send = matches!(request, Request::MqSend { .. });
+    let is_send = request.may_send();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         // Registered BEFORE the poll, so a send that lands between the poll and the wait still wakes

@@ -87,6 +87,20 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
             topic: "t".into(),
             limit: 1,
         },
+        Request::NotifyEvent {
+            session: "s".into(),
+            event: super::HookEvent::Needed,
+            tool: String::new(),
+            message: String::new(),
+            cwd: String::new(),
+            owner: String::new(),
+            instance: String::new(),
+        },
+        Request::NotifyOpenSessions {},
+        Request::NotifyGone {
+            session: "s".into(),
+            owner: "1".into(),
+        },
     ];
     // OPS against the tags serde actually accepts — read from its unknown-variant error, which lists
     // them all. Without this, a new variant named in `op()` but in neither OPS nor the samples below
@@ -314,4 +328,93 @@ fn an_idle_poll_is_answered_without_a_write() {
     )
     .unwrap();
     assert_eq!(last_poll(), first, "an idle poll took the write lock");
+}
+
+/// The notification ops, served in-process: the wire names of events and effects, the record the
+/// sweep reads, and the refusals a container's hook can meet.
+#[test]
+fn notify_ops_run_the_machine_and_report_what_it_did() {
+    let b = backend();
+    call(
+        &b,
+        json!({ "op": "mq.topic_create", "topic": "claude/notify" }),
+    )
+    .unwrap();
+    call(
+        &b,
+        json!({ "op": "mq.group_create", "topic": "claude/notify", "group": "g" }),
+    )
+    .unwrap();
+
+    let posted = call(
+        &b,
+        json!({
+            "op": "notify.event", "session": "s1", "event": "needed",
+            "message": "Claude needs your permission to use Bash", "cwd": "/w/wt",
+            "owner": "4242", "instance": "host"
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&posted).unwrap(),
+        json!({
+            "result": "notified", "state": "awaiting_tool", "moved": true,
+            "effects": ["post", "remember"], "sent": 1
+        })
+    );
+
+    let Response::Sessions { sessions } =
+        call(&b, json!({ "op": "notify.open_sessions" })).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    assert_eq!((sessions.len(), sessions[0].owner.as_str()), (1, "4242"));
+
+    // A mismatched tool does not move it; the refusal says why.
+    let Response::Notified { moved, refusal, .. } = call(
+        &b,
+        json!({ "op": "notify.event", "session": "s1", "event": "tool_finished", "tool": "Read" }),
+    )
+    .unwrap() else {
+        panic!("expected notified")
+    };
+    assert!(!moved);
+    assert!(refusal.is_some());
+
+    let Response::Notified { effects, .. } = call(
+        &b,
+        json!({ "op": "notify.gone", "session": "s1", "owner": "4242" }),
+    )
+    .unwrap() else {
+        panic!("expected notified")
+    };
+    assert_eq!(effects, ["withdraw", "forget"]);
+
+    // `session_gone` is not a hook event on the wire, and a malformed session is `invalid`.
+    assert!(serde_json::from_value::<Request>(
+        json!({ "op": "notify.event", "session": "s1", "event": "session_gone" })
+    )
+    .is_err());
+    let err = call(
+        &b,
+        json!({ "op": "notify.event", "session": "../x", "event": "needed" }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+}
+
+#[test]
+fn only_ops_that_can_put_a_message_on_a_topic_wake_subscribers() {
+    let sends = |v: serde_json::Value| serde_json::from_value::<Request>(v).unwrap().may_send();
+    assert!(sends(
+        json!({ "op": "mq.send", "topic": "t", "key": "k", "kind": "k", "payload": 1, "producer": "p" })
+    ));
+    assert!(sends(
+        json!({ "op": "notify.event", "session": "s", "event": "turn_ended" })
+    ));
+    assert!(sends(
+        json!({ "op": "notify.gone", "session": "s", "owner": "1" })
+    ));
+    assert!(!sends(json!({ "op": "notify.open_sessions" })));
+    assert!(!sends(json!({ "op": "mq.inspect" })));
 }

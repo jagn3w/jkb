@@ -20,7 +20,16 @@ pub struct RemoteBackend {
     token: Mutex<Option<String>>,
     client: reqwest::blocking::Client,
     poll_wait: Duration,
+    /// How long a request may take beyond any long-poll wait.
+    op_timeout: Duration,
     down_marker: Option<PathBuf>,
+}
+
+fn http_client(connect: Duration) -> Result<reqwest::blocking::Client, ApiError> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(connect)
+        .build()
+        .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))
 }
 
 impl RemoteBackend {
@@ -30,18 +39,27 @@ impl RemoteBackend {
     /// # Errors
     /// An [`ErrorCode::Internal`] error if the HTTP client cannot be built.
     pub fn new(base: &str, token_file: PathBuf) -> Result<Self, ApiError> {
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(1))
-            .build()
-            .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?;
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
             token_file,
             token: Mutex::new(None),
-            client,
+            client: http_client(Duration::from_secs(1))?,
             poll_wait: Duration::from_secs(2),
+            op_timeout: Duration::from_secs(30),
             down_marker: None,
         })
+    }
+
+    /// Tighter deadlines, for a caller that must not be held up — a Claude Code hook, which runs on
+    /// every tool call and blocks the session while it runs: at most `connect` to connect and `total`
+    /// for a whole request (beyond any long-poll wait).
+    ///
+    /// # Errors
+    /// An [`ErrorCode::Internal`] error if the HTTP client cannot be rebuilt.
+    pub fn with_deadlines(mut self, connect: Duration, total: Duration) -> Result<Self, ApiError> {
+        self.client = http_client(connect)?;
+        self.op_timeout = total;
+        Ok(self)
     }
 
     /// How long an `mq.poll` may be held by the daemon when it has nothing to hand over.
@@ -118,7 +136,7 @@ impl RemoteBackend {
             .post(url)
             .bearer_auth(token)
             .json(request)
-            .timeout(wait + Duration::from_secs(30))
+            .timeout(wait + self.op_timeout)
             .send()
             .map_err(|e| {
                 if e.is_connect() || e.is_timeout() {
