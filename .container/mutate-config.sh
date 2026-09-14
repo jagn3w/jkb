@@ -299,8 +299,8 @@ run "the library stops declaring its states" "no longer declares VERDICT_STATES"
 seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-assert "    wide)       bad " in s, "mutation target absent"
-open(p, 'w').write(s.replace("    wide)       bad ", "    broad)      bad ", 1))
+assert "    wide)       $dm_bad " in s, "mutation target absent"
+open(p, 'w').write(s.replace("    wide)       $dm_bad ", "    broad)      $dm_bad ", 1))
 PYX
 run "verify.sh loses the arm for a daemon state" "has no case arm for the 'wide' daemon state"
 
@@ -348,6 +348,12 @@ assert "\nDAEMON_HOST=host.docker.internal\n" in s, "mutation target absent"
 open(p, 'w').write(s.replace("\nDAEMON_HOST=host.docker.internal\n", "\nDAEMON_HOST=\"$(printf host.docker.internal)\"\n", 1))
 PYX
 run "the daemon's host can no longer be read" "no longer declares DAEMON_HOST"
+
+seed; sub_dc '"--add-host=host.docker.internal:host-gateway",' '"--add-host=host.internal:host-gateway",'
+run "the pinned --add-host names a different host" "but egress-lib.sh looks up DAEMON_HOST"
+
+seed; sub_dc '"--add-host=host.docker.internal:host-gateway",' ''
+run "the --add-host pin is dropped" "pin no --add-host"
 
 seed; jq_dc '.runArgs |= map(select(. != "--label" and (startswith("devcontainer.metadata=") | not)))'
 run "the VS Code metadata label is dropped" "carry no devcontainer.metadata label"
@@ -903,7 +909,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=80
+PINNED_BAD_SITES=82
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

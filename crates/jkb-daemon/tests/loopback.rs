@@ -276,13 +276,38 @@ fn a_port_held_by_another_process_is_named_with_how_to_find_it() {
     let err = spawn(db, &ServeConfig::new(addr, token.clone()))
         .err()
         .expect("refused");
-    assert!(matches!(err, ServeError::AddrInUse(a) if a == addr), "{err}");
+    assert!(
+        matches!(err, ServeError::AddrInUse(a) if a == addr),
+        "{err}"
+    );
     let msg = err.to_string();
     assert!(
         msg.contains(&format!("lsof -nP -iTCP:{} -sTCP:LISTEN", addr.port())),
         "{msg}"
     );
-    assert!(!token.exists(), "a token was written with no daemon behind it");
+    assert!(
+        !token.exists(),
+        "a token was written with no daemon behind it"
+    );
+
+    // ...and a daemon that opens its own database must not open it first: under a supervisor that
+    // restarts it for as long as the port is held, that is a migration attempt per restart.
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = opens.clone();
+    let path = dir.path().join("jkb.db");
+    let opener: jkb_daemon::server::Opener = Box::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Db::open(&path).map_err(jkb_api::ApiError::from)
+    });
+    let err = jkb_daemon::server::spawn_opening(opener, &ServeConfig::new(addr, token.clone()))
+        .err()
+        .expect("refused");
+    assert!(matches!(err, ServeError::AddrInUse(_)), "{err}");
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the database was opened by a daemon that could not listen"
+    );
 }
 
 #[test]

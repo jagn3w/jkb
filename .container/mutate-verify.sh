@@ -403,13 +403,16 @@ run() { # run <label> <expect-substring> <docker args...>
 # container, the second hit a DNS blip on verify.sh's live curl, and the matcher was then shown a
 # BROKEN container while the harness printed "shown to discriminate".
 judge() { # judge <label> <expect> <output> <rc>
-  local label="$1" expect="$2" out="$3" rc="$4"
+  local label="$1" expect="$2" out="$3" rc="$4" want_rc="${WANT_RC:-}"
   # A mutation is CAUGHT only when the subject FAILS and says why, with both on the SAME line:
   # `assert()` prints the same label on its ok and fail paths, so matching the label alone reported
   # guards as caught while they were deleted. Fixed-string, because the regex form escaped only
   # some ERE metacharacters and silently mis-matched "host bind source(s) parsed"; `-e`, because an
   # expect may start with a dash, which grep would otherwise read as an option.
-  if [ "$rc" -ne 0 ] && grep -q "FAIL" <<<"$(grep -F -e "$expect" <<<"$out")"; then
+  # ...and, where the run names one (WANT_RC), with that exit code: verify.sh's 3 means every failure
+  # was accepted, and a check that forgets to say so turns it into 1 with the same FAIL lines.
+  if [ "$rc" -ne 0 ] && { [ -z "$want_rc" ] || [ "$rc" = "$want_rc" ]; } \
+     && grep -q "FAIL" <<<"$(grep -F -e "$expect" <<<"$out")"; then
     caught=$((caught+1))
     # The EXPECT, not the count. Coverage is a property of which failure paths in verify.sh were
     # driven, and several mutations legitimately share one — so counting mutations answers a
@@ -418,7 +421,7 @@ judge() { # judge <label> <expect> <output> <rc>
     printf '  CAUGHT   %s\n' "$label"
   else
     fails=$((fails+1))
-    printf '  MISSED   %s  (verify.sh exit %s; wanted a FAIL line mentioning: %s)\n' "$label" "$rc" "$expect"
+    printf '  MISSED   %s  (verify.sh exit %s%s; wanted a FAIL line mentioning: %s)\n' "$label" "$rc" "${want_rc:+, wanted exit $want_rc}" "$expect"
     sed 's/^/           /' <<<"$out" | grep -E "FAIL|passed|failed" | head -3
   fi
 }
@@ -501,7 +504,10 @@ fi
 # never run, and this mutation would report MISSED for ever — the tooling outcome its own comment
 # above says it exists to avoid. Dropped as a unit and re-added last instead, so there is one.
 without 'NET_ADMIN' 'JKB_EGRESS_ACCEPT_UNFILTERED'
-run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
+# EXIT 3, not merely non-zero: every failure on this container is a consequence of the override, so
+# verify.sh must report "accepted" (3) rather than "fix them" (1). A new check that forgot accept_bad
+# here — the host-daemon arms did, in bc0228a — leaves the FAIL line in place and only moves the code.
+WANT_RC=3 run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
     "${MUT[@]}" --env JKB_EGRESS_ACCEPT_UNFILTERED=1
 # The one REPLACEMENT rather than a subtraction: `--user` is removed as a unit and re-added, so a
 # second `--user` cannot be left for docker's last-wins rule to resolve.
@@ -596,10 +602,12 @@ run "the firewall cannot resolve any allowlisted domain" "the live chain denies 
 # landed (`! cmp`) and still parses, so a moved target is BUILD-FAILED rather than an unmutated image
 # reported as a guard that did not fire.
 #
-# WIDE: the raise stops keeping the daemon's address out of `allowed`. The posture names the host
-# alias (so the nested sandbox's proxy can reach it), so without the keep-out the address lands in a
-# port-less set and every port on the host's loopback is open to the container.
-mutant jkb-dev-daemon-wide "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i 's|if ipset test \"\$DAEMON_SET-new\" \"\$ip\" >/dev/null 2>&1; then|if false; then|' /usr/local/bin/init-firewall.sh && ! cmp -s /tmp/fw.orig /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
+# WIDE: the raise stops keeping the daemon's address out of `allowed` — both halves of the keep-out,
+# the alias skipped by name and any address in the daemon set skipped by address, because either one
+# alone still holds the posture's alias out. The posture names the alias (so the nested sandbox's
+# proxy can reach it), so without the keep-out the address lands in a port-less set and every port
+# on the host's loopback is open to the container.
+mutant jkb-dev-daemon-wide "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i -e 's|if ipset test \"\$DAEMON_SET-new\" \"\$ip\" >/dev/null 2>&1; then|if false; then|' -e '/^ *\"\$DAEMON_HOST\") skipped+=/d' /usr/local/bin/init-firewall.sh && ! grep -q 'DAEMON_HOST\") skipped' /usr/local/bin/init-firewall.sh && grep -q 'if false; then' /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
 run "the firewall puts the host daemon's address in the allowlist" "opens EVERY port on the host's loopback" \
     "${HEALTHY[@]}"
 
@@ -608,10 +616,14 @@ mutant jkb-dev-daemon-absent "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig &&
 run "the firewall installs no rule for the host daemon" "has no rule for jkb serve on the host" \
     "${HEALTHY[@]}"
 
-# UNRESOLVED: the name the raise looks up resolves to nothing. Done in the installed library rather
-# than by dropping --add-host, because Docker Desktop resolves the alias without that flag (measured),
-# so on the machine this is developed on that mutation would change nothing and report MISSED.
-mutant jkb-dev-daemon-unresolved "cp /usr/local/bin/egress-lib.sh /tmp/lib.orig && sed -i 's/^DAEMON_HOST=.*/DAEMON_HOST=no-such-host.invalid/' /usr/local/bin/egress-lib.sh && ! cmp -s /tmp/lib.orig /usr/local/bin/egress-lib.sh && bash -n /usr/local/bin/egress-lib.sh"
+# UNRESOLVED: the RAISE's lookup of the daemon's address comes back empty, and nothing else changes —
+# the probe still resolves the real alias. Only init-firewall.sh's lookup is mutated: mutating the
+# shared library's DAEMON_HOST moved the probe too, so a raise that had widened `allowed` through the
+# posture's alias was reported as `unresolved` rather than `wide` (review of bc0228a). Not done by
+# dropping --add-host either: Docker Desktop resolves the alias without it (measured), so that would
+# change nothing on the machine this is developed on. With the alias also skipped by name, an empty
+# lookup must leave the host out of `allowed` — `unresolved`, and never `wide`.
+mutant jkb-dev-daemon-unresolved "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i 's|getent ahostsv4 \"\$DAEMON_HOST\"|getent ahostsv4 no-such-host.invalid|' /usr/local/bin/init-firewall.sh && ! cmp -s /tmp/fw.orig /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
 run "the host daemon's name does not resolve at the raise" "did not resolve when the firewall was raised" \
     "${HEALTHY[@]}"
 

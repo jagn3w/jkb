@@ -365,6 +365,12 @@ while IFS= read -r domain; do
         # precisely by hostname, and inventing an IP range here would be a guess presented as a rule.
         \**) skipped+=("$domain"); continue ;;
         localhost|127.0.0.1|::1) continue ;;   # loopback never leaves the container
+        # The host daemon's alias, BY NAME as well as by address (below). The address check alone
+        # has a hole exactly when it matters least visibly: if the daemon lookup above came back
+        # empty (a transient resolver failure) while this one succeeds, there is no address to keep
+        # out, and the host lands in `allowed` open on every port. The name is the one entry the
+        # posture carries on purpose, so it never reaches `allowed` whatever the lookups did.
+        "$DAEMON_HOST") skipped+=("$domain (the host daemon: port $DAEMON_PORT only)"); continue ;;
     esac
     # `|| ips=""` IS THE WHOLE POINT of this line, not tidiness. `getent` exits 2 for a name with
     # no A record and `pipefail` carries that out of the pipeline; a BARE assignment is a simple
@@ -421,7 +427,7 @@ say "allowed $resolved addresses from $declared domains"
 [ ${#skipped[@]} -eq 0 ] || say "not pinned at the IP layer (the sandbox matches these by name): ${skipped[*]}"
 [ ${#kept_out[@]} -eq 0 ] || say "kept out of the allowlist, as the host daemon's port-only address: ${kept_out[*]}"
 if [ "$daemon_n" -gt 0 ]; then
-    say "the host daemon (jkb serve) is reachable on $DAEMON_HOST:$DAEMON_PORT only — no other host port"
+    say "the host daemon (jkb serve) is reachable on $DAEMON_HOST:$DAEMON_PORT — no other host port beyond DNS (53, open to any address)"
 else
     say "NOTE: $DAEMON_HOST did not resolve, so jkb serve on the host is unreachable from here."
     say "      Egress is otherwise unchanged. On Linux, add --add-host=$DAEMON_HOST:host-gateway."

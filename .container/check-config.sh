@@ -575,6 +575,19 @@ else
     bad "scripts/auto-mode-posture.json's allowedDomains does not name $fw_host — jkb run from Bash in the nested sandbox could not reach the host daemon"
 fi
 
+# 3b. A Linux engine resolves that name only through --add-host, so the pinned flag must name the
+#     host the firewall looks up; a rename on one side leaves CI's raise `unresolved` with every
+#     static gate green.
+dc_args_h="$(dc_run_args "$here/container.json" "$repo_top" 2>/dev/null)" || dc_args_h=""
+add_host="$(sed -n 's/^--add-host=\([^:]*\):host-gateway$/\1/p' <<<"$dc_args_h" | head -1)"
+if [ -z "$add_host" ]; then
+    bad "container.json's runArgs pin no --add-host=<name>:host-gateway — a Linux engine would not resolve ${fw_host:-the daemon host}, and the firewall's daemon rule would hold no address"
+elif [ "$add_host" != "${fw_host:-}" ]; then
+    bad "container.json pins --add-host for $add_host but egress-lib.sh looks up DAEMON_HOST=${fw_host:-<unread>} — on a Linux engine the daemon rule would hold no address"
+else
+    ok "the pinned --add-host names the host the firewall looks up ($add_host)"
+fi
+
 # 4. VS Code does not forward the daemon's port. Measured on the Mac, 2026-09-14: after something in
 #    here listened on 7117, VS Code held the HOST'S 127.0.0.1:7117, so com.jkb.serve crash-looped on
 #    EADDRINUSE and connections hung. Attaching reads no `portsAttributes` from this file, so it is

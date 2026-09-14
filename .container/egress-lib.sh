@@ -277,11 +277,17 @@ allowlist_state() { # -> yes|no
 # second is what catches the widening when the port-only set is empty — a raise that put the host
 # into `allowed` and never built $DAEMON_SET is exactly the state to report, not to miss.
 #
-# `ipset test` exits non-zero both for "not in the set" and for "no such set", so the set's existence
-# is established first rather than read out of that exit code. An `allowed` that does not exist holds
-# nothing — a deny-all raise leaves none — and that is a measurement, not a failed one.
+# A READ THAT FAILED IS NOT "NOT IN THE SET". `ipset test` exits 1 both for an address that is not a
+# member and for an error, so the two are told apart by what it says: "is NOT in set" is the only
+# answer counted as outside. Anything else leaves `in_allow` unmeasured, which `daemon_from` reads as
+# `wide` — a probe that cannot tell must not report the opening as port-only. A missing `allowed` set
+# is a measurement (it holds nothing), told apart the same way from a save that failed for another
+# reason.
+# Both phrases are libipset's own format strings, read out of libipset.so.13 (ipset v7.19, the image's)
+# with `strings`: " is NOT in set %s." and "The set with the given name does not exist". A rewording
+# upstream makes this report `wide`, loudly — the direction a probe is allowed to be wrong in.
 daemon_state() { # -> port|unresolved|absent|wide
-    local rule=no members="" resolved="" n=0 wide=0 ip
+    local rule=no members="" resolved="" n=0 in_allow=0 ip out rc
     if command -v iptables >/dev/null 2>&1 \
        && iptables -w 5 -C OUTPUT $RULE_DAEMON >/dev/null 2>&1; then
         rule=yes
@@ -289,13 +295,21 @@ daemon_state() { # -> port|unresolved|absent|wide
     members="$(ipset save "$DAEMON_SET" 2>/dev/null | awk '$1 == "add" { print $3 }')" || members=""
     resolved="$(getent ahostsv4 "$DAEMON_HOST" 2>/dev/null | awk '{ print $1 }')" || resolved=""
     n="$(printf '%s\n' "$members" | grep -c .)" || n=0
-    if ipset save allowed >/dev/null 2>&1; then
+    rc=0; out="$(ipset save allowed 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
         while IFS= read -r ip; do
             [ -n "$ip" ] || continue
-            if ipset test allowed "$ip" >/dev/null 2>&1; then wide=$((wide + 1)); fi
+            rc=0; out="$(ipset test allowed "$ip" 2>&1)" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                [ "$in_allow" = unmeasured ] || in_allow=$((in_allow + 1))
+            else
+                case "$out" in *"is NOT in set"*) ;; *) in_allow=unmeasured ;; esac
+            fi
         done <<<"$(printf '%s\n%s\n' "$members" "$resolved" | sort -u)"
+    else
+        case "$out" in *"does not exist"*) ;; *) in_allow=unmeasured ;; esac
     fi
-    daemon_from "$rule" "$n" "$wide"
+    daemon_from "$rule" "$n" "$in_allow"
 }
 
 # --- self-test ----------------------------------------------------------------------------------

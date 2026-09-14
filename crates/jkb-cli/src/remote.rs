@@ -1,8 +1,10 @@
 //! Remote mode: `jkb` in a process that must not open a database (design r3.2 H2).
 //!
 //! Set `JKB_REMOTE=http://<host>:<port>` and every command either reaches the knowledge base through
-//! `jkb serve` or is refused — before it has done anything. The dev container sets it, because a
-//! process on the container's kernel opening the host's `jkb.db` corrupts it.
+//! `jkb serve` or is refused — before it has done anything. It is for the dev container, because a
+//! process on the container's kernel opening the host's `jkb.db` corrupts it — but the container
+//! does not set it yet: that waits for the cutover (tasks S6), since remote mode refuses `JKB_DB` and
+//! every unported command, and the container's agents still use both.
 //!
 //! **The table is a `match`, not a list.** [`support`] names every [`Command`] with no wildcard arm,
 //! so adding a subcommand does not compile until somebody decides whether it may run remotely. A

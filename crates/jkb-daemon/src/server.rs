@@ -186,7 +186,7 @@ struct State {
 /// [`ServeError::Unspecified`] for `0.0.0.0`/`::`, [`ServeError::AddrInUse`] when another process
 /// holds the address, another I/O error binding, or a token write failure.
 pub fn spawn(db: Db, cfg: &ServeConfig) -> Result<Handle, ServeError> {
-    start(Serving::Ready(LocalBackend::new(db.clone()), db), None, cfg)
+    start(Source::Db(db), cfg)
 }
 
 /// Like [`spawn`], opening the database with `open` — and serving even when that fails. Exiting
@@ -201,7 +201,20 @@ pub fn spawn(db: Db, cfg: &ServeConfig) -> Result<Handle, ServeError> {
 /// # Errors
 /// As [`spawn`]; a failed open is not one.
 pub fn spawn_opening(open: Opener, cfg: &ServeConfig) -> Result<Handle, ServeError> {
-    let serving = match open() {
+    start(Source::Opener(open), cfg)
+}
+
+/// Where the database being served comes from.
+enum Source {
+    /// Already open ([`spawn`]).
+    Db(Db),
+    /// Opened by the daemon, and re-opened while that fails ([`spawn_opening`]).
+    Opener(Opener),
+}
+
+/// The first open for [`Source::Opener`]: a failure is served, not returned.
+fn first_open(open: &Opener) -> Serving {
+    match open() {
         Ok(db) => Serving::Ready(LocalBackend::new(db.clone()), db),
         Err(why) => {
             eprintln!("jkb serve: {}; retrying on requests", why.message);
@@ -210,8 +223,7 @@ pub fn spawn_opening(open: Opener, cfg: &ServeConfig) -> Result<Handle, ServeErr
                 at: std::time::Instant::now(),
             }
         }
-    };
-    start(serving, Some(open), cfg)
+    }
 }
 
 /// Raise this process's soft descriptor limit toward its hard one (launchd's default soft limit is
@@ -241,11 +253,11 @@ fn out_of_resources(e: &std::io::Error) -> bool {
     )
 }
 
-fn start(
-    serving: Serving,
-    opener: Option<Opener>,
-    cfg: &ServeConfig,
-) -> Result<Handle, ServeError> {
+/// Bind, then open, then write the token. The database is opened only once the port is held: a
+/// daemon that cannot listen (another process on the port, restarted by its supervisor for as long
+/// as that lasts) must not open and migrate the database on every attempt, nor log a "retrying on
+/// requests" it will never serve.
+fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     if cfg.addr.ip().is_unspecified() {
         return Err(ServeError::Unspecified(cfg.addr));
     }
@@ -260,6 +272,10 @@ fn start(
             _ => ServeError::Io(e),
         })?;
     let addr = listener.local_addr()?;
+    let (serving, opener) = match source {
+        Source::Db(db) => (Serving::Ready(LocalBackend::new(db.clone()), db), None),
+        Source::Opener(open) => (first_open(&open), Some(open)),
+    };
     let token = token::mint()?;
     token::write(&cfg.token_path, &token)?;
     let state = Arc::new(State {

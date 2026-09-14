@@ -820,21 +820,31 @@ Measured on the Mac, 2026-09-14, Docker Desktop 4.87.0:
 loopback on *every* port, and the IP allowlist (`allowed`) is `hash:net` with no port. So the host's
 address in `allowed` would open every service listening on the Mac's loopback to this container.
 `init-firewall.sh` resolves the alias into its own set (`jkb-daemon`) first, installs
-`RULE_DAEMON` (`-p tcp --dport 7117 -m set --match-set jkb-daemon dst -j ACCEPT`), and keeps any
-address in that set out of `allowed` **by address**, so a second name for the host cannot walk past a
-rule keyed on one spelling. The alias is still in the posture's `allowedDomains`: that is what lets
-the nested sandbox's proxy tunnel to it, and the firewall is what stops the same entry widening the
-coarse layer. `egress-status.sh` reports the opening as `daemon=port|unresolved|absent|wide`, and
-`verify.sh` fails on anything but `port`.
+`RULE_DAEMON` (`-p tcp --dport 7117 -m set --match-set jkb-daemon dst -j ACCEPT`), and keeps the host
+out of `allowed` two ways: the alias **by name** (it never reaches `allowed`, even when the daemon
+lookup came back empty while the posture's lookup of the same name did not — the hole a review of
+`bc0228a` found), and any address in the daemon set **by address**, so a second name for the host
+cannot walk past a rule keyed on one spelling. **Residual:** a *different* name resolving to the host
+during a raise whose daemon lookup failed still lands in `allowed`; `verify.sh` reports that as
+`wide`, because the probe re-resolves the alias. The alias is still in the posture's `allowedDomains`:
+that is what lets the nested sandbox's proxy tunnel to it, and the firewall is what stops the same
+entry widening the coarse layer. `egress-status.sh` reports the opening as
+`daemon=port|unresolved|absent|wide` and the `daemon_at` it is about, and `verify.sh` fails on
+anything but `port`. "No other host port" means beyond DNS: the older rules accept 53 to any address,
+the host's included.
 
-**What `verify.sh` asks, both directions.** The kernel's answer above; then the daemon's own answer
-(`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes); then that
-`host.docker.internal:7118` is refused at connect. A missing token is a **note**, not a failure, until
-the container depends on the daemon (tasks S6): the harness's scratch `~/.jkb` and a CI runner have no
-daemon, and a host that never ran `setup.sh` is not a broken container. **Unmeasured:** whether
-Docker Desktop's forwarder answers a connection to a *closed* host port with something other than a
-refusal. If it refuses too, the 7118 probe cannot tell a port-only rule from a wide one on the Mac, and
-only the kernel's `wide` answer does; `mutate-verify.sh`'s wide mutant is where that shows.
+**What `verify.sh` asks.** The kernel's answer above, at the address the *image* names; then the
+daemon's own answer (`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes).
+A missing token is a **note**, not a failure, until the container depends on the daemon (tasks S6):
+the harness's scratch `~/.jkb` and a CI runner have no daemon, and a host that never ran `setup.sh` is
+not a broken container. A token that exists but cannot be read is a failure. With the egress override
+armed and no firewall, the daemon failures are accepted ones, so `verify.sh` still exits 3.
+
+**The other direction is the kernel's `wide` answer, not a curl.** A probe of `host.docker.internal:7118`
+expecting a refusal was written and removed: on a Linux engine a closed host port refuses whether or
+not the rule is wide, so it passed in exactly the state it existed for, and no mutation could show it
+firing. The `wide` state is read from the live sets instead — `ipset test` against `allowed`, where a
+read that fails for any reason but "is NOT in set" counts as wide.
 
 **`--add-host=host.docker.internal:host-gateway` is pinned** although Docker Desktop does not need it
 (measured, above): a Linux engine resolves the alias only with it, and CI raises this firewall on one.
