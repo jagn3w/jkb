@@ -814,6 +814,7 @@ Measured on the Mac, 2026-09-14, Docker Desktop 4.87.0:
 | `getent ahostsv4 host.docker.internal`, plain container and `jkb-dev` | `192.168.65.254` in both (v6 `fdc4:f303:9324::254` first) |
 | `jkb-dev` before the rule, `curl -4` | "Connection refused" after 1 ms — this firewall's REJECT |
 | inside the Claude Bash sandbox | the alias does not resolve (`getent` exit 2); its proxy resolves on the sandbox's behalf |
+| the same sandbox, through its proxy, rebuilt container, alias in the installed posture | `/v1/hello` `401` without the token, the hello JSON with it; `:7118` `502`; `jkb --json mq topic ls` in remote mode `[]` |
 
 **Port-only, never a posture domain's address.** Docker Desktop forwards that alias to the host's
 loopback on *every* port, and the IP allowlist (`allowed`) is `hash:net` with no port. So the host's
