@@ -106,11 +106,13 @@ fn daemon_url_from(remote: Option<String>, addr: Option<String>) -> String {
     remote.unwrap_or_else(|| format!("http://{addr}"))
 }
 
-/// The file whose recent modification means the daemon was just unreachable, shared by every
-/// client in this home so a burst of short-lived processes pays one connect timeout.
+/// The file whose recent modification means the daemon at `url` was just unreachable, shared by
+/// every client of that daemon in this home so a burst of short-lived processes pays one connect
+/// timeout. Keyed by port like the token: one marker per home let a daemon that was down on one port
+/// make every client of another — a permission prompt's hook among them — give up untried.
 #[must_use]
-pub fn down_marker() -> PathBuf {
-    home().join(".cache/jkb/remote-unreachable")
+pub fn down_marker(url: &str) -> PathBuf {
+    home().join(format!(".cache/jkb/remote-unreachable-{}", port_of(url)))
 }
 
 fn home() -> PathBuf {
@@ -128,23 +130,26 @@ pub fn token_file(url: &str) -> PathBuf {
         .unwrap_or_else(|| super::service::serve_token_path(port_of(url)))
 }
 
-/// The port in a daemon URL (`http://host:port[/…]`), or `jkb serve`'s default when it names none.
+/// The port a client of `url` connects to (`http://host:port[/…]`) — and so the port its token and
+/// down marker are keyed by. A URL naming none gets its **scheme's** default, 80 or 443, because that
+/// is where the HTTP client connects: defaulting to serve's port sent the real daemon's token to
+/// whatever listened on :80 (stage-5 review). Such a daemon has no token at `daemon/80/token`, so the
+/// failure names the path.
 fn port_of(url: &str) -> u16 {
-    let default = jkb_daemon::DEFAULT_ADDR
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(7117);
-    let authority = url
-        .split_once("://")
-        .map_or(url, |(_, rest)| rest)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    authority
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let authority = rest.split('/').next().unwrap_or_default();
+    // An IPv6 literal's colons are inside its brackets.
+    let after_host = authority
+        .rsplit_once(']')
+        .map_or(authority, |(_, tail)| tail);
+    after_host
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse().ok())
-        .unwrap_or(default)
+        .unwrap_or(if scheme.eq_ignore_ascii_case("https") {
+            443
+        } else {
+            80
+        })
 }
 
 /// The subcommand as typed, for the refusal message: the first argument that is not a flag. `--db`,
@@ -217,7 +222,7 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                             return Err(err);
                         }
                     }
-                    .with_down_marker(down_marker());
+                    .with_down_marker(down_marker(remote));
                 super::mq_cli::run(&backend, cmd, cli.json)
             }
             _ => bail!("internal: a Ported command with no remote dispatch"),
@@ -240,8 +245,19 @@ mod tests {
         assert_eq!(port_of("http://[::1]:7400"), 7400);
         assert_eq!(
             port_of("http://localhost"),
-            7117,
-            "no port: serve's default"
+            80,
+            "no port: where the client connects, not serve's default"
+        );
+        assert_eq!(port_of("https://h/"), 443);
+        assert_eq!(
+            port_of("http://[::1]"),
+            80,
+            "a v6 literal's colons are not a port"
+        );
+        assert_ne!(
+            super::down_marker("http://127.0.0.1:7117"),
+            super::down_marker("http://127.0.0.1:7200"),
+            "one daemon being down says nothing about another"
         );
     }
 

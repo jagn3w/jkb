@@ -1645,7 +1645,7 @@ render_setup_summary() {
                     not-subscribed) printf '  • notifier:   running, but NOTHING subscribed to the topic; nothing is shown (see notifier.log)\n' ;;
                     not-running)    printf '  • notifier:   loaded but NOT running; nothing is shown (see notifier.log)\n' ;;
                     not-loaded)     printf '  • notifier:   NOT loaded; nothing is shown (see the warnings above)\n' ;;
-                    no-topic)       printf '  • notifier:   not checked — there is no topic for it to read\n' ;;
+                    no-topic)       printf '  • notifier:   running (pid %s); not checked further — this jkb cannot name the topic\n' "$detail" ;;
                     undecided)      printf '  • notifier:   running; could not read whether it subscribed (see the warnings above)\n' ;;
                     skipped)        printf '  • notifier:   skipped (--no-service)\n' ;;
                     not-macos)      printf '  • notifier:   none on this platform; a Mac running com.jkb.notifier shows them\n' ;;
@@ -1711,8 +1711,8 @@ build_notifier() {
 #   not-subscribed  running, but the topic has no group — nothing will be shown
 #   not-running     loaded, with no process (crash-looping, or exited)
 #   not-loaded      no agent — nothing will be shown, however authorized the bundle is
-#   no-topic        the topic could not be created or named, so nothing was checked
-#   undecided       the group list could not be read (a jkb error, not an empty list)
+#   no-topic        running, but this jkb cannot name the topic, so there is nothing to ask
+#   undecided       running, but the group list could not be read, or the topic not confirmed
 #   skipped         --no-service
 # `subscribed` is NOT "notifications are shown": a group outlives its consumer by the idle period
 # (7 days), and a running notifier may have a failing subscription (its notifier.log says). What it
@@ -1724,10 +1724,8 @@ report_notifier() {
     local listing waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups rc
     notifier_pid=""
     if [ "$do_service" != 1 ]; then notifier_state=skipped; return 0; fi
-    case "$topic_state" in
-        ready|conflict) ;;
-        *) notifier_state=no-topic; return 0 ;;
-    esac
+    # The agent's own state first: it does not depend on the topic, and a topic create that failed
+    # this run (a lock timeout) must not hide a notifier that is not running (stage-5 review).
     if ! listing="$(launchctl list "$label" 2>/dev/null)"; then
         notifier_state=not-loaded
         warn "the $label agent is not loaded — permission notifications will not be shown"
@@ -1739,6 +1737,15 @@ report_notifier() {
         warn "$label is loaded but not running — see notifier.log beside the database"
         return 0
     fi
+    case "$topic_state" in
+        ready|conflict) ;;
+        # Nothing to ask the group list about: this jkb cannot name the topic.
+        unnamed) notifier_state=no-topic; return 0 ;;
+        # The topic may well exist — only its create failed this run — so this is an unknown, not "no".
+        *) notifier_state=undecided
+           warn "the notification topic could not be confirmed this run, so whether the notifier subscribed is unknown"
+           return 0 ;;
+    esac
     while :; do
         groups="$(jkb --db "$db" --json mq group ls "$topic" 2>/dev/null)" && rc=0 || rc=$?
         if [ "$rc" -ne 0 ]; then

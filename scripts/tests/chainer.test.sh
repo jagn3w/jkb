@@ -1473,7 +1473,7 @@ case15() {
         'notifier=not-subscribed |NOTHING subscribed'
         'notifier=not-running |loaded but NOT running'
         'notifier=not-loaded |NOT loaded'
-        'notifier=no-topic |no topic for it to read'
+        'notifier=no-topic 4321|cannot name the topic'
         'notifier=undecided |could not read whether it subscribed'
         'notifier=skipped|skipped (--no-service)'
         'notifier=not-macos|none on this platform'

@@ -323,9 +323,16 @@ else
   live_hello=$(curl -s --max-time 2 -H "Authorization: Bearer $(cat "$live_token" 2>/dev/null)" "$live_url/v1/hello")
   if ! grep -q '"protocol"' <<<"$live_hello"; then
     fail "live round-trip: jkb serve does not answer at $live_url — is com.jkb.serve running? (setup.sh)"
-  elif ! grep -q '"name"' <<<"$(env -u JKB_DB JKB_REMOTE="$live_url" JKB_REMOTE_TOKEN_FILE="$live_token" \
-      "$repo_target/jkb" --json mq group ls "$live_topic" 2>/dev/null)"; then
-    fail "live round-trip: $live_topic has no consumer group — is com.jkb.notifier running? (setup.sh)"
+  else
+    # A private HOME, so a stale unreachable marker in the real one cannot answer for the daemon; and
+    # a refusal is reported as a refusal, not as an empty group list.
+    live_groups=$(env -u JKB_DB HOME="$tmp/livehome" JKB_REMOTE="$live_url" JKB_REMOTE_TOKEN_FILE="$live_token" \
+      "$repo_target/jkb" --json mq group ls "$live_topic" 2>&1) && live_rc=0 || live_rc=$?
+    if [ "$live_rc" -ne 0 ]; then
+      fail "live round-trip: could not ask the daemon for $live_topic's groups: $live_groups"
+    elif ! grep -q '"name"' <<<"$live_groups"; then
+      fail "live round-trip: $live_topic has no consumer group — is com.jkb.notifier running? (setup.sh)"
+    fi
   fi
 
   # Claude needs permission.

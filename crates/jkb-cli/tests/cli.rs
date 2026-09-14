@@ -3562,12 +3562,19 @@ fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
         home.join(format!(".jkb/daemon/{default_port}/token"))
     );
     // ...and a daemon writes where that rule says for ITS port — so two in one home cannot overwrite
-    // each other's live token. (The unit's own port is not bound here; port 0 is keyed as 0.)
+    // each other's live token. The unit's own port is not bound here, so a free one is (port 0 has no
+    // default token path and is refused without --token-file).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let mut cmd = jkb(&db);
-    cmd.args(["serve", "--addr", "127.0.0.1:0"])
-        .env("HOME", &home);
+    cmd.args(["serve", "--addr", &format!("127.0.0.1:{port}")])
+        .env("HOME", &home)
+        .env_remove("JKB_NS_MARKER");
     let (mut serve, _) = Daemon::spawn(cmd);
-    let written = home.join(".jkb/daemon/0/token");
+    let written = home.join(format!(".jkb/daemon/{port}/token"));
     assert!(written.is_file(), "no token at {}", written.display());
     serve.stop();
 }

@@ -322,7 +322,7 @@ fn hook() {
         match jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
             .and_then(|b| b.with_deadlines(CONNECT, TOTAL))
         {
-            Ok(b) => b.with_down_marker(crate::remote::down_marker()),
+            Ok(b) => b.with_down_marker(crate::remote::down_marker(&url)),
             Err(e) => {
                 append_log(&log, &[failure("client", &e)]);
                 return;

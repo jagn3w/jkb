@@ -262,10 +262,15 @@ case7() {
     got="$(report TS=ready DS=1 STUB_GROUPS_FAIL=1)"
     [ "$got" = "undecided 4321" ] && ok "a group list that could not be read: undecided, not 'no group'" \
         || fail "agent undecided" "got '$got'"
-    for ts in unnamed failed; do
-        got="$(report TS=$ts DS=1)"
-        [ "$got" = "no-topic " ] && ok "topic $ts: no-topic, and no agent is claimed" || fail "topic $ts" "got '$got'"
-    done
+    got="$(report TS=unnamed DS=1)"
+    [ "$got" = "no-topic 4321" ] && ok "a topic this jkb cannot name: no-topic, after the agent was checked" \
+        || fail "topic unnamed" "got '$got'"
+    got="$(report TS=failed DS=1)"
+    [ "$got" = "undecided 4321" ] && ok "a topic create that failed this run: undecided, not 'no topic'" \
+        || fail "topic failed" "got '$got'"
+    got="$(report TS=failed DS=1 STUB_NOPID=1)"
+    [ "$got" = "not-running " ] && ok "and a failed topic does not hide a notifier that is not running" \
+        || fail "topic failed, agent down" "got '$got'"
     got="$(report TS=ready DS=0)"
     [ "$got" = "skipped " ] && ok "--no-service: skipped" || fail "agent skipped" "got '$got'"
 }

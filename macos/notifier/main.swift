@@ -536,6 +536,9 @@ final class Run {
     let consumer: Consumer
     var exited: Int32?
     var eof = false
+    /// stderr's EOF too: the child's last `error: …` can reach the main queue after its exit and
+    /// stdout's EOF, and a first-failure line logged before it loses the only explanation.
+    var errEOF = false
     /// Set only once the process actually started, so a binary that cannot be launched never counts
     /// as a run that lasted.
     var startedAt: Date?
@@ -601,10 +604,14 @@ final class Subscription {
             }
             DispatchQueue.main.async { run.consumer.receive(data) }
         }
-        err.fileHandleForReading.readabilityHandler = { h in
+        err.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
             if data.isEmpty {
                 h.readabilityHandler = nil
+                DispatchQueue.main.async {
+                    run.errEOF = true
+                    self?.finish(run)
+                }
                 return
             }
             DispatchQueue.main.async { run.noteStderr(data) }
@@ -630,13 +637,15 @@ final class Subscription {
             run.noteStderr(Data("could not run \(jkb): \(error.localizedDescription)\n".utf8))
             run.exited = -1
             run.eof = true
+            run.errEOF = true
             finish(run)
         }
     }
 
-    /// Called on each of a run's two end signals; acts once, when both have arrived.
+    /// Called on each of a run's end signals — exit, stdout EOF, stderr EOF; acts once, when all have
+    /// arrived.
     func finish(_ run: Run) {
-        guard let status = run.exited, run.eof, !run.finishing else { return }
+        guard let status = run.exited, run.eof, run.errEOF, !run.finishing else { return }
         run.finishing = true
         restartWhenIdle(run, status: status)
     }

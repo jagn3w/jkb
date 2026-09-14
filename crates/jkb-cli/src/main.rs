@@ -1153,12 +1153,11 @@ fn main() {
 
 #[allow(clippy::too_many_lines)] // a flat command dispatcher; one arm per subcommand
 fn run(cli: Cli) -> Result<()> {
-    // REMOTE MODE FIRST, before anything with a side effect. With JKB_REMOTE set this process must
-    // never open a database — on the dev container's kernel that is the host's `jkb.db`, which a
-    // process on each side of the bind corrupts — so every command either goes to the daemon or is
-    // refused here, at dispatch, before it has run git, written a file or opened anything.
-    // `notify` FIRST, ahead of remote mode too — the one dispatch, not one per mode. It touches no
-    // database in any mode: `open_db` verifies the migrations and spawns the writer thread — 110 ms
+    // THE ORDER, in one place. (1) `notify`, in every mode — the one dispatch, not one per mode.
+    // (2) Remote mode, before anything else with a side effect. (3) Everything that opens a database.
+    //
+    // (1) `notify` touches no database in any mode, so it is safe ahead of remote mode — its only
+    // writes are its own log and the daemon-unreachable marker. It must be: `open_db` verifies the migrations and spawns the writer thread — 110 ms
     // against the real database — and `notify hook` runs after EVERY tool call, the cost design N7
     // measured and rejected; and when a newer branch's migration locks an older binary out of the
     // database, `open_db` fails and nothing would ever withdraw. Ahead of remote mode because remote
@@ -1169,6 +1168,10 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
+    // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
+    // every other command either goes to the daemon or is refused here, at dispatch, before it has
+    // run git, written a file or opened anything.
     if let Some(remote) = remote::target() {
         return remote::run(cli, &remote);
     }
@@ -6602,7 +6605,12 @@ fn cmd_serve(
     addr: std::net::SocketAddr,
     token_file: Option<PathBuf>,
 ) -> Result<()> {
-    let token_path = serve_token_for(token_file, addr.port(), jkb_core::refuse_shared_filesystem)?;
+    let token_path = serve_token_for(
+        token_file,
+        addr.port(),
+        std::env::var_os("JKB_NS_MARKER").is_some(),
+        jkb_core::refuse_shared_filesystem,
+    )?;
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
     let path = db_path.to_path_buf();
     let open: jkb_daemon::server::Opener = Box::new(move || {
@@ -6634,21 +6642,44 @@ fn cmd_serve(
     Ok(())
 }
 
-/// The token path `jkb serve` writes: the one it was given, or the default for its port — which is
-/// refused on a filesystem shared with another kernel. Inside the dev container `~/.jkb` IS the
-/// host's, through a bind, so a `jkb serve` run there (an agent's smoke test, say) replaced the host
-/// daemon's live token: the host daemon kept the old one in memory, and every client — the Mac's
-/// notifier, every hook — read the new one and was refused until the host daemon restarted. An
-/// explicit `--token-file` is the caller's own decision and is not second-guessed.
+/// The token path `jkb serve` writes: the one it was given, or the default for its port.
+///
+/// The default is refused in two cases, and an explicit `--token-file` in neither — it is the
+/// caller's own decision.
+///
+/// * **Inside the dev container** (its image sets `JKB_NS_MARKER`), or **on a filesystem shared with
+///   another kernel.** There `~/.jkb` IS the host's, through a bind, so a `jkb serve` run inside (an
+///   agent's smoke test, say) replaced the host daemon's live token: the host daemon kept the old one
+///   in memory, and every client — the Mac's notifier, every hook — was refused until it restarted.
+///   The filesystem type alone misses a native-Linux engine, whose bind is the host's own ext4
+///   (stage-5 review); the marker is the container saying what it is. Residual: another container,
+///   with no marker, on a native-Linux bind.
+/// * **Port 0.** The port is chosen at bind, so `daemon/0/token` is a path no client can derive, and
+///   two such daemons would overwrite each other's.
 fn serve_token_for(
     explicit: Option<PathBuf>,
     port: u16,
+    in_container: bool,
     refuse: impl Fn(&Path) -> jkb_core::Result<()>,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
+    if port == 0 {
+        anyhow::bail!(
+            "jkb serve on port 0 has no default token path a client could find (the port is chosen \
+             at bind); pass --token-file"
+        );
+    }
     let path = service::serve_token_path(port);
+    if in_container {
+        anyhow::bail!(
+            "jkb serve would write its token to {}, and this is the dev container (JKB_NS_MARKER is \
+             set), whose ~/.jkb is the host's — the host's jkb serve owns that token; run jkb serve \
+             on the host, or pass --token-file",
+            path.display()
+        );
+    }
     refuse(&path).with_context(|| {
         format!(
             "jkb serve would write its token to {}, which another kernel's jkb serve may own (the \
@@ -8753,14 +8784,21 @@ mod tests {
             })
         };
         let local = |_: &std::path::Path| -> jkb_core::Result<()> { Ok(()) };
-        let err = super::serve_token_for(None, 7117, shared).unwrap_err();
+        let err = super::serve_token_for(None, 7117, false, shared).unwrap_err();
         assert!(format!("{err:#}").contains("--token-file"), "{err:#}");
-        assert!(super::serve_token_for(None, 7117, local)
+        assert!(super::serve_token_for(None, 7117, false, local)
             .unwrap()
             .ends_with(".jkb/daemon/7117/token"));
+        let err = super::serve_token_for(None, 7117, true, local).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dev container"),
+            "the container marker refuses on a local filesystem too (a native-Linux bind): {err:#}"
+        );
+        let err = super::serve_token_for(None, 0, false, local).unwrap_err();
+        assert!(format!("{err:#}").contains("port 0"), "{err:#}");
         let given = std::path::PathBuf::from("/x/token");
         assert_eq!(
-            super::serve_token_for(Some(given.clone()), 7117, shared).unwrap(),
+            super::serve_token_for(Some(given.clone()), 0, true, shared).unwrap(),
             given
         );
     }

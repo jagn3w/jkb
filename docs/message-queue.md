@@ -186,8 +186,9 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
   `~/.jkb/daemon/<port>/token` whichever database it serves — keyed by what a client knows: the
   notification hook and the dev container (through the `~/.jkb` bind) know the address, never the
   database, and one path per home let a second daemon overwrite the first's live token. The default
-  path is refused on a filesystem shared with another kernel, so a `jkb serve` run inside the
-  container cannot replace the host daemon's token; `--token-file` overrides both — after the
+  path is refused inside the dev container (`JKB_NS_MARKER`) and on a filesystem shared with another
+  kernel, so a `jkb serve` run inside cannot replace the host daemon's token, and for port 0, whose
+  port no client can know in advance; `--token-file` overrides all three — after the
   port is bound, so a fresh token means a listening daemon. That directory is writable from the dev
   container, so the write is made relative to a directory handle opened without following links,
   through an `O_EXCL` temp file with a random name, renamed into place: a link planted there cannot

@@ -86,8 +86,12 @@ sets it to `host.docker.internal:7117`; `.container/check-config.sh` reads that 
 token is `~/.jkb/daemon/<port>/token`, **keyed by what a client knows** — the daemon's address, never
 its database: beside the database, a host set up with `--db` wrote it where no client looked, and one
 path per home let a second daemon on another port overwrite the first's live token. `jkb serve`
-refuses its default token path on a filesystem shared with another kernel, so a daemon started inside
-the dev container cannot replace the host daemon's token through the `~/.jkb` bind. The hook runs even where remote mode would refuse
+refuses its default token path inside the dev container (its image sets `JKB_NS_MARKER`) and on a
+filesystem shared with another kernel, so a daemon started in there cannot replace the host daemon's
+token through the `~/.jkb` bind — the filesystem check alone missed a native-Linux engine, whose bind
+is plain ext4. Residual: a different container, with no marker, on a native-Linux bind. Port 0 has no
+default token path (no client could derive it) and needs `--token-file`. The daemon-unreachable
+marker is keyed by port too. The hook runs even where remote mode would refuse
 (`JKB_REMOTE` beside `JKB_DB`), since it opens no database. **Only a failed connect marks the daemon
 down** for the 5 s other clients skip it: a request that connected and then outran the hook's 1 s
 reached a daemon busy on a write lock, and marking that down made the next permission prompt give up
