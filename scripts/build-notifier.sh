@@ -21,14 +21,16 @@
 # Idempotent: safe to re-run, and `scripts/setup.sh` does on every pull.
 #
 # **Where it installs is not this script's decision.** The destination comes from
-# `.claude/hooks/notify-sticky.sh --notifier-path`, the one place the location is written down,
-# because the consumer failing to find the bundle is invisible: the hook just falls back to plain
-# banners and the feature silently is not there. There is deliberately no --prefix — a flag that
-# installs somewhere the hook does not look is a way to produce exactly that state.
+# `.claude/hooks/notify-sticky.sh --notifier-path`, the one place the location is written down. The
+# agent below runs exactly that binary — the bundle's, since the notification centre refuses a process
+# outside one — and setup.sh reports on exactly that binary, so a bundle installed anywhere else would
+# be one nothing runs and nothing checks: the feature silently not there. There is deliberately no
+# --prefix, which would be a way to produce exactly that state.
 #
 # Flags: --check (verify the plist/path agreement and stop; runs on any OS), --print-agent (print
-# the launchd agent and stop; runs on any OS), --jkb <path> (default: `jkb` on PATH), --db <path>
-# (default: $JKB_DB, else ~/.jkb/jkb.db), --no-agent, --quiet, -h/--help.
+# the launchd agent and stop; runs on any OS), --agent-label (print the agent's launchd label and
+# stop), --jkb <path> (default: `jkb` on PATH), --db <path> (default: $JKB_DB, else ~/.jkb/jkb.db),
+# --no-agent, --quiet, -h/--help.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -44,10 +46,12 @@ while [ "$#" -gt 0 ]; do
     --quiet) quiet=1 ;;
     --check) check_only=1 ;;
     --print-agent) print_agent=1 ;;
+    --agent-label) echo com.jkb.notifier; exit 0 ;;
     --no-agent) agent=0 ;;
     --jkb) jkb_bin="${2:?--jkb needs a path}"; shift ;;
     --db) db="${2:?--db needs a path}"; shift ;;
-    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Derived, not a pinned range: the header grows (the pinned `2,33p` ended on `set -euo pipefail`).
+    -h|--help) sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -113,7 +117,7 @@ check_plist() {
 }
 
 # --- the launchd agent -----------------------------------------------------------------------
-agent_label=com.jkb.notifier
+agent_label="$("$0" --agent-label)"
 agent_plist="$HOME/Library/LaunchAgents/$agent_label.plist"
 
 xml_escape() { # the five XML entities, for a value inside <string>
@@ -162,8 +166,17 @@ PLIST
 
 # The jkb the agent subscribes with, and the topic that jkb names. Both are asked, never assumed: an
 # agent pointing at a jkb that predates `notify topic` would subscribe to nothing, for ever.
+absolute() { # launchd runs an agent from `/`, so a relative path in its plist means a different file
+  case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "${1#./}" ;; esac
+}
+
 resolve_agent_inputs() {
   [ -n "$jkb_bin" ] || jkb_bin="$(command -v jkb 2>/dev/null || true)"
+  # Absolute before anything is written: `jkb service install` makes com.jkb.serve's database
+  # absolute, and an agent given `kb/jkb.db` subscribed against `/kb/jkb.db` — a different database,
+  # so it never joined the topic the daemon sends on — while this script reported it loaded.
+  [ -z "$jkb_bin" ] || jkb_bin="$(absolute "$jkb_bin")"
+  db="$(absolute "$db")"
   if [ -z "$jkb_bin" ] || [ ! -x "$jkb_bin" ]; then
     echo "no jkb found (pass --jkb) — cannot write the $agent_label agent" >&2
     return 1

@@ -37,7 +37,9 @@ use crate::NotifyCmd;
 /// How long the hook waits to connect to the daemon.
 pub const CONNECT: Duration = Duration::from_millis(200);
 
-/// How long one request may take, and how long the `SessionStart` sweep may take in all.
+/// How long one request may take. The `SessionStart` sweep starts no request once this has passed,
+/// so it is bounded by about twice this (a request started just before the deadline runs its own
+/// full `TOTAL`) — once per session, where every other event is bounded by one.
 pub const TOTAL: Duration = Duration::from_secs(1);
 
 /// The log grows to this, then starts again beside its predecessor (`.1`).
@@ -151,49 +153,78 @@ fn owner_from(raw: &str, parent: u32, me: u32) -> String {
     pid.to_string()
 }
 
-/// Where this process's pids mean something: the machine's name, and — in the dev container — the
-/// container's boot, read from the namespace marker its entrypoint writes (`JKB_NS_MARKER`,
-/// `.container/README.md`, "The discriminator is namespace identity").
+/// Where this process's pids mean something, as `host[#boot][/pidns]`:
+///
+/// * `host` — the machine's name;
+/// * `boot` — in the dev container, the container's boot: the pid namespace its entrypoint recorded
+///   in the marker (`JKB_NS_MARKER`, `.container/README.md`, "The discriminator is namespace
+///   identity");
+/// * `pidns` — the pid namespace **this process** is in (`/proc/self/ns/pid`), where there is one.
 ///
 /// The boot is what lets a sweep prove a whole container instance gone: a container keeps its
 /// hostname across `docker stop`/`start` but its entrypoint writes a new marker, and one container
 /// runs one boot at a time — so a record from the same host with a different boot names processes
-/// that no longer exist anywhere. Every process in the container reads the same marker, nested
-/// sandboxes included (`bwrap --bind / /` keeps it visible), which is why this is the marker and not
-/// `/proc/self/ns/pid`: a sandbox with its own pid namespace would otherwise look like another boot
-/// of a container that is still running.
+/// that no longer exist anywhere. The marker is readable from nested sandboxes too (`bwrap --bind / /`),
+/// so every process of a boot agrees on it.
+///
+/// **The process's own namespace is what makes a pid probe sound.** A nested sandbox shares the
+/// hostname and the marker but not the pid namespace — measured in the Bash sandbox,
+/// `/proc/self/ns/pid` was `pid:[4026532823]` while the marker said `pid:[4026532556]` — so without
+/// it a `claude` started in a sandbox would have read the outer sessions' records as its own
+/// instance, probed their pids in a namespace where they do not exist, and withdrawn every live
+/// prompt in the container. With it, two instances are equal only when a pid means the same process
+/// in both. (Found by the stage-5 review.)
 fn instance() -> String {
     let boot = std::env::var_os("JKB_NS_MARKER").and_then(|p| std::fs::read_to_string(p).ok());
-    instance_from(&crate::owner::hostname(), boot.as_deref())
+    let pidns = std::fs::read_link("/proc/self/ns/pid")
+        .ok()
+        .map(|l| l.to_string_lossy().into_owned());
+    instance_from(&crate::owner::hostname(), boot.as_deref(), pidns.as_deref())
 }
 
-/// The instance string, from its parts. `host`, or `host#<pid namespace>`.
-fn instance_from(host: &str, marker: Option<&str>) -> String {
+/// The instance string, from its parts. Each part is cleaned of control characters and of the two
+/// separators, and bounded, so the whole stays inside the daemon's 150-byte limit.
+fn instance_from(host: &str, marker: Option<&str>, pidns: Option<&str>) -> String {
     let clean = |s: &str| -> String {
         s.chars()
-            .filter(|c| !c.is_control() && *c != '#')
-            .take(64)
+            .filter(|c| !c.is_control() && *c != '#' && *c != '/')
+            .take(48)
             .collect()
     };
-    let boot = marker.and_then(|m| {
-        m.lines()
-            .find_map(|l| l.strip_prefix("pid="))
-            .map(clean)
-            .filter(|b| !b.is_empty())
-    });
-    match boot {
-        Some(boot) => format!("{}#{boot}", clean(host)),
-        None => clean(host),
+    let mut out = clean(host);
+    if let Some(boot) = marker
+        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("pid=")))
+        .map(clean)
+        .filter(|b| !b.is_empty())
+    {
+        out.push('#');
+        out.push_str(&boot);
+    }
+    if let Some(ns) = pidns.map(clean).filter(|n| !n.is_empty()) {
+        out.push('/');
+        out.push_str(&ns);
+    }
+    out
+}
+
+/// An instance string's host and boot.
+fn host_and_boot(instance: &str) -> (&str, Option<&str>) {
+    let without_ns = instance.split_once('/').map_or(instance, |(head, _)| head);
+    match without_ns.split_once('#') {
+        Some((host, boot)) => (host, Some(boot)),
+        None => (without_ns, None),
     }
 }
 
 /// Whether a notification record's session is provably gone, as seen from this process.
 ///
-/// * **The same instance:** its owner pid means something here, so probe it — by the kernel, with
-///   `EPERM` counted as alive ([`crate::owner::pid_alive`]).
-/// * **Another boot of this same container:** every process of that boot is gone.
-/// * **Anything else** — the host from a container, another container, a record with no owner — is
-///   [`Fact::Unknown`]: nothing here can establish it, and `Unknown` never withdraws.
+/// * **The same instance** — same host, boot and pid namespace: its owner pid means the same process
+///   here, so probe it — by the kernel, with `EPERM` counted as alive ([`crate::owner::pid_alive`]).
+/// * **Another boot of this same container** — same host, both with a boot, the boots differ: every
+///   process of that boot is gone, whatever namespace either side is in.
+/// * **Anything else** — the host from a container, another container, a nested sandbox of this
+///   boot, a record with no owner — is [`Fact::Unknown`]: nothing here can establish it, and
+///   `Unknown` never withdraws.
 fn verdict(record: &jkb_api::NotifySession, mine: &str, probe: impl Fn(u32) -> Fact) -> Fact {
     let Ok(pid) = record.owner.parse::<u32>() else {
         return Fact::Unknown;
@@ -204,8 +235,12 @@ fn verdict(record: &jkb_api::NotifySession, mine: &str, probe: impl Fn(u32) -> F
             _ => Fact::Unknown,
         };
     }
-    match (record.instance.split_once('#'), mine.split_once('#')) {
-        (Some((their_host, _)), Some((my_host, _))) if their_host == my_host => Fact::No,
+    match (host_and_boot(&record.instance), host_and_boot(mine)) {
+        ((their_host, Some(theirs)), (my_host, Some(ours)))
+            if their_host == my_host && theirs != ours =>
+        {
+            Fact::No
+        }
         _ => Fact::Unknown,
     }
 }
@@ -239,8 +274,9 @@ fn failure(op: &str, e: &ApiError) -> String {
     format!("{op}: {:?}: {}", e.code, e.message)
 }
 
-/// The `SessionStart` sweep: withdraw what provably-gone sessions left on screen. Bounded by
-/// [`TOTAL`] overall, not per call — whatever is left is swept by the next session to start.
+/// The `SessionStart` sweep: withdraw what provably-gone sessions left on screen. It starts no request
+/// after [`TOTAL`] has passed, so it ends within about twice that; whatever is left is swept by the
+/// next session to start.
 fn sweep(edge: &Edge<'_>) -> Vec<String> {
     let started = Instant::now();
     let sessions = match edge.backend.call(Request::NotifyOpenSessions {}) {
@@ -258,11 +294,13 @@ fn sweep(edge: &Edge<'_>) -> Vec<String> {
                 .push("notify.gone: the sweep ran out of time; the next session resumes it".into());
             break;
         }
-        // The owner goes back with the request: the daemon withdraws only if the record still names
-        // it, so a session resumed since `open_sessions` keeps its prompt.
+        // What the verdict was computed from goes back with the request: the daemon withdraws only if
+        // the record still names that owner in that instance, so a session resumed since
+        // `open_sessions` keeps its prompt.
         if let Err(e) = edge.backend.call(Request::NotifyGone {
             session: record.session,
             owner: record.owner,
+            instance: record.instance,
         }) {
             failures.push(failure("notify.gone", &e));
         }

@@ -646,7 +646,6 @@ async fn serve_op(
     request: Request,
     wait: Duration,
 ) -> Result<Response, ApiError> {
-    let is_send = request.may_send();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         // Registered BEFORE the poll, so a send that lands between the poll and the wait still wakes
@@ -657,7 +656,7 @@ async fn serve_op(
         woken.as_mut().enable();
         current_schema(db).await?;
         let response = call(backend, request.clone()).await?;
-        if is_send {
+        if response.announces_a_send() {
             state.sent.notify_waiters();
         }
         let empty = matches!(&response, Response::Messages { messages } if messages.is_empty());

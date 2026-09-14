@@ -188,6 +188,12 @@ check "as serve, with the jkb, database and topic it was given" \
 check "and is kept alive" "$(grep -c '<key>KeepAlive</key>' <<<"$agent" | tr -d ' ')" "1"
 HOME="$tmp/agenthome" "$builder" --print-agent --jkb "$tmp/oldtopicjkb/jkb" >/dev/null 2>&1
 check "a jkb that cannot name the topic writes no agent" "$?" "1"
+# launchd runs an agent from `/`: relative paths must be made absolute, or the notifier subscribes to
+# a different database than the daemon sends on (stage-5 review).
+rel_agent=$(cd "$tmp" && env -u JKB_NOTIFIER HOME="$tmp/agenthome" "$builder" --print-agent \
+  --jkb ./topicjkb/jkb --db kb/jkb.db 2>/dev/null)
+check "relative --jkb and --db are written absolute" \
+  "$(grep -cE "<string>($tmp/topicjkb/jkb|$tmp/kb/jkb.db|$tmp/kb/notifier.log)</string>" <<<"$rel_agent" | tr -d ' ')" "4"
 
 # 12d. The hook's events and `.claude/settings.json`'s registrations, diffed BOTH ways. The hook
 #      can act only on events Claude Code is told to send it, and that registration lives in a file
@@ -243,8 +249,9 @@ else
     printf '{"event":"a_future_event"}\n'
     printf '{"event":"caught_up","seq":4}\n'
     msg 5 notify.post jkb-claude-c 50000000 false
+    # No caught_up after it: the real subscriber sends nothing more until an unreadable row is acked,
+    # so the consumer must end the batch here itself (the stage-5 review's deadlock).
     printf '{"event":"unreadable","seq":6,"reason":"x"}\n'
-    printf '{"event":"caught_up","seq":6}\n'
     msg 7 notify.post jkb-claude-d 50000000 false
   } | "$tmp/jkb-notifier" serve --dry-run --now-ms 50400000 2>/dev/null)
   check "a burst folds to its net effect, marks a stale post with its age, and is acked after" \
@@ -302,6 +309,20 @@ else
   live() { printf '%s' "$1" | PATH="$repo_target:$PATH" bash "$hook"; }
 
   printf '  --  %s\n' "style: $("$live_bin" status 2>/dev/null)"
+
+  # The path this drives is the INSTALLED daemon and agent: the lifecycle table runs in com.jkb.serve
+  # (the jkb setup.sh last installed, not this checkout's) and display in com.jkb.notifier. So both are
+  # checked first, and a failure below names what is missing rather than reading 'expected 1, got 0'.
+  live_topic=$("$repo_target/jkb" notify topic 2>/dev/null)
+  if ! grep -q '"name"' <<<"$("$repo_target/jkb" --json mq group ls "$live_topic" 2>/dev/null)"; then
+    fail "live round-trip: $live_topic has no consumer group — is com.jkb.notifier running? (setup.sh)"
+  fi
+  live_hello=$(curl -s --max-time 2 \
+    -H "Authorization: Bearer $(cat "$("$repo_target/jkb" service token-path 2>/dev/null)" 2>/dev/null)" \
+    "$("$repo_target/jkb" service serve-url 2>/dev/null)/v1/hello")
+  if ! grep -q '"protocol"' <<<"$live_hello"; then
+    fail "live round-trip: jkb serve does not answer — is com.jkb.serve running? (setup.sh)"
+  fi
 
   # Claude needs permission.
   live "$(payload Notification "$live_sid" "$PROMPT")"

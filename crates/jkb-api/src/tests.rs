@@ -100,6 +100,7 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
         Request::NotifyGone {
             session: "s".into(),
             owner: "1".into(),
+            instance: "h".into(),
         },
     ];
     // OPS against the tags serde actually accepts — read from its unknown-variant error, which lists
@@ -383,7 +384,7 @@ fn notify_ops_run_the_machine_and_report_what_it_did() {
 
     let Response::Notified { effects, .. } = call(
         &b,
-        json!({ "op": "notify.gone", "session": "s1", "owner": "4242" }),
+        json!({ "op": "notify.gone", "session": "s1", "owner": "4242", "instance": "host" }),
     )
     .unwrap() else {
         panic!("expected notified")
@@ -404,17 +405,43 @@ fn notify_ops_run_the_machine_and_report_what_it_did() {
 }
 
 #[test]
-fn only_ops_that_can_put_a_message_on_a_topic_wake_subscribers() {
-    let sends = |v: serde_json::Value| serde_json::from_value::<Request>(v).unwrap().may_send();
-    assert!(sends(
-        json!({ "op": "mq.send", "topic": "t", "key": "k", "kind": "k", "payload": 1, "producer": "p" })
-    ));
-    assert!(sends(
-        json!({ "op": "notify.event", "session": "s", "event": "turn_ended" })
-    ));
-    assert!(sends(
-        json!({ "op": "notify.gone", "session": "s", "owner": "1" })
-    ));
-    assert!(!sends(json!({ "op": "notify.open_sessions" })));
-    assert!(!sends(json!({ "op": "mq.inspect" })));
+fn only_an_answer_that_sent_something_wakes_subscribers() {
+    let b = backend();
+    call(
+        &b,
+        json!({ "op": "mq.topic_create", "topic": "claude/notify" }),
+    )
+    .unwrap();
+    let absent = call(
+        &b,
+        json!({ "op": "notify.event", "session": "s", "event": "tool_finished", "tool": "Bash" }),
+    )
+    .unwrap();
+    assert!(
+        !absent.announces_a_send(),
+        "the commonest event there is — a tool finishing with nothing on screen — sends nothing: {absent:?}"
+    );
+    call(
+        &b,
+        json!({ "op": "mq.group_create", "topic": "claude/notify", "group": "g" }),
+    )
+    .unwrap();
+    let swept = call(
+        &b,
+        json!({ "op": "notify.event", "session": "s", "event": "turn_ended" }),
+    )
+    .unwrap();
+    assert!(swept.announces_a_send(), "{swept:?}");
+    let sent = call(
+        &b,
+        json!({ "op": "mq.send", "topic": "claude/notify", "key": "k", "kind": "k", "payload": 1, "producer": "p" }),
+    )
+    .unwrap();
+    assert!(sent.announces_a_send());
+    assert!(!call(&b, json!({ "op": "notify.open_sessions" }))
+        .unwrap()
+        .announces_a_send());
+    assert!(!call(&b, json!({ "op": "mq.inspect" }))
+        .unwrap()
+        .announces_a_send());
 }

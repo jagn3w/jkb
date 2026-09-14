@@ -139,7 +139,12 @@ impl RemoteBackend {
             .timeout(wait + self.op_timeout)
             .send()
             .map_err(|e| {
-                if e.is_connect() || e.is_timeout() {
+                // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
+                // timeout, which reqwest reports as a connect error. A request that connected and
+                // then ran past its deadline reached a daemon that is busy (a write lock held by
+                // another process), and marking that down made every other client — a hook for a
+                // permission prompt among them — give up without trying for the next few seconds.
+                if e.is_connect() {
                     self.mark_unreachable(true);
                 }
                 ApiError::with_code(

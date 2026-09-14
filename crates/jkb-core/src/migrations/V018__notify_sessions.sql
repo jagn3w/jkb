@@ -8,7 +8,8 @@
 --
 -- `owner` and `instance` are for the `SessionStart` sweep, which runs in the PRODUCER's process
 -- (only it can probe the pid): `owner` is the `claude` process's pid as the hook saw it, `instance`
--- names the pid namespace that number belongs to (`jkb_core::notify::Instance`).
+-- names where that number means something: `host[#boot][/pidns]`, built and compared by the hook
+-- (`instance_from` / `verdict` in crates/jkb-cli/src/notify.rs; docs/notifications.md). Opaque here.
 --
 -- Deliberately NOT changelogged, like the queue itself: this is transport state, and `jkb undo`
 -- reaching into it would resurrect or erase a notification.

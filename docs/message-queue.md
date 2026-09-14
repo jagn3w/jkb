@@ -183,7 +183,9 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
 
 - refuses an unspecified address (`0.0.0.0`, `::`);
 - mints a 256-bit bearer token each start and writes it, owner-only, to
-  `<database directory>/daemon/token` (so `~/.jkb/daemon/token` for the default database) — after the
+  `~/.jkb/daemon/token` whichever database it serves (its readers — the notification hook, the dev
+  container through the `~/.jkb` bind — cannot know the database; beside it, a `--db` host's clients
+  never authenticated) — after the
   port is bound, so a fresh token means a listening daemon. That directory is writable from the dev
   container, so the write is made relative to a directory handle opened without following links,
   through an `O_EXCL` temp file with a random name, renamed into place: a link planted there cannot

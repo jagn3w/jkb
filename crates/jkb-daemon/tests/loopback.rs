@@ -906,10 +906,12 @@ fn a_hook_deadline_bounds_a_daemon_that_accepts_and_never_answers() {
             held.push(stream);
         }
     });
+    let marker = dir.path().join("unreachable");
     let c = RemoteBackend::new(&base, token)
         .unwrap()
         .with_deadlines(Duration::from_millis(200), Duration::from_millis(700))
-        .unwrap();
+        .unwrap()
+        .with_down_marker(marker.clone());
     let started = Instant::now();
     let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
@@ -917,5 +919,11 @@ fn a_hook_deadline_bounds_a_daemon_that_accepts_and_never_answers() {
         started.elapsed() < Duration::from_secs(3),
         "bounded by the total deadline, not the default 30 s: {:?}",
         started.elapsed()
+    );
+    // ...and a daemon that CONNECTED and was slow is busy, not down. Marking it down made every
+    // other hook in the next few seconds — a permission prompt's among them — give up untried.
+    assert!(
+        !marker.exists(),
+        "a timeout after connecting must not mark the daemon unreachable"
     );
 }

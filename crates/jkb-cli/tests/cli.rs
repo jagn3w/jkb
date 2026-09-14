@@ -2950,19 +2950,19 @@ fn notify_needs_no_database() {
     assert!(log.contains("notify.event: Unavailable"), "{log}");
 }
 
-/// The hook finds the daemon where the environment says — `JKB_DAEMON_ADDR`, which is how the dev
-/// container points it at the host — and presents the token from `~/.jkb/daemon/token`. Checked
-/// through the real binary against a listener that records the request, since a hook that looked
-/// anywhere else would fail just as silently as one that found nothing.
-#[test]
-fn notify_hook_sends_to_the_daemon_the_environment_names() {
+/// Run `jkb notify hook` on a `Stop` payload with `envs` set and a home holding a token, against a
+/// listener that records the one request it is sent. Returns what the listener received, and the home.
+fn notify_hook_request(
+    envs: &[(&str, &str)],
+    addr_env: &dyn Fn(&str) -> Vec<(String, String)>,
+) -> (String, TempDir) {
     use std::io::{Read as _, Write as _};
     let dir = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(dir.path().join(".jkb/daemon")).unwrap();
     std::fs::write(dir.path().join(".jkb/daemon/token"), "tok").unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    // Non-blocking with a deadline: a hook that looked anywhere else must fail this test, not hang it.
+    // Non-blocking with a deadline: a hook that looked anywhere else must fail its test, not hang it.
     listener.set_nonblocking(true).unwrap();
     let seen = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2992,17 +2992,32 @@ fn notify_hook_sends_to_the_daemon_the_environment_names() {
         );
         String::from_utf8_lossy(&buf[..n]).into_owned()
     });
-
-    assert_cmd::Command::from_std(jkb_bare())
-        .args(["notify", "hook"])
+    let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+    cmd.args(["notify", "hook"])
         .env("HOME", dir.path())
-        .env("JKB_DAEMON_ADDR", addr.to_string())
-        .env("JKB_HOOK_OWNER", "4242")
-        .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
+        .env("JKB_HOOK_OWNER", "4242");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    for (k, v) in addr_env(&addr.to_string()) {
+        cmd.env(k, v);
+    }
+    cmd.write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
         .assert()
         .success()
         .stdout("");
-    let request = seen.join().unwrap();
+    (seen.join().unwrap(), dir)
+}
+
+/// The hook finds the daemon where the environment says — `JKB_DAEMON_ADDR`, which is how the dev
+/// container points it at the host — and presents the token from `~/.jkb/daemon/token`. Checked
+/// through the real binary against a listener that records the request, since a hook that looked
+/// anywhere else would fail just as silently as one that found nothing.
+#[test]
+fn notify_hook_sends_to_the_daemon_the_environment_names() {
+    let (request, home) = notify_hook_request(&[], &|addr| {
+        vec![("JKB_DAEMON_ADDR".to_owned(), addr.to_owned())]
+    });
     assert!(request.starts_with("POST /v1/op "), "{request}");
     assert!(
         request
@@ -3013,9 +3028,20 @@ fn notify_hook_sends_to_the_daemon_the_environment_names() {
     assert!(request.contains(r#""op":"notify.event""#), "{request}");
     assert!(request.contains(r#""event":"turn_ended""#), "{request}");
     assert!(
-        !dir.path().join(".jkb/logs/notify-hook.log").exists(),
+        !home.path().join(".jkb/logs/notify-hook.log").exists(),
         "an answered request logs nothing"
     );
+}
+
+/// With `JKB_REMOTE` and `JKB_DB` both set — remote mode's refusal for every other command — the hook
+/// still runs: it opens no database, and a refusal at dispatch exits before it can log, on a stderr
+/// the shim throws away. Found by the stage-5 review.
+#[test]
+fn notify_hook_runs_under_remote_mode_s_refusals() {
+    let (request, _home) = notify_hook_request(&[("JKB_DB", "/nonexistent/jkb.db")], &|addr| {
+        vec![("JKB_REMOTE".to_owned(), format!("http://{addr}"))]
+    });
+    assert!(request.contains(r#""op":"notify.event""#), "{request}");
 }
 
 /// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is
@@ -3525,9 +3551,10 @@ fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
 
     let token = run(&["service", "token-path"]);
     let token = Path::new(token.trim());
-    // The documented place, and the one remote mode assumes for `~/.jkb/jkb.db` when
-    // JKB_REMOTE_TOKEN_FILE is unset.
-    assert_eq!(token, db.parent().unwrap().join("daemon/token"));
+    // The documented place, and the one remote mode and the notification hook assume when
+    // JKB_REMOTE_TOKEN_FILE is unset — in the home, NOT beside this non-default database, which no
+    // client can know.
+    assert_eq!(token, home.join(".jkb/daemon/token"));
     let mut cmd = jkb(&db);
     cmd.args(["serve", "--addr", "127.0.0.1:0"])
         .env("HOME", &home);

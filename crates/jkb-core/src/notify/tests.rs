@@ -450,15 +450,24 @@ fn gone_withdraws_only_the_owner_that_was_probed() {
     apply(&db, needed("s1")).unwrap();
 
     let stale = db
-        .write_txn("t", |c, m| gone(c, m, "s1", "9999", T0))
+        .write_txn("t", |c, m| gone(c, m, "s1", "9999", "host-a", T0))
         .unwrap();
     assert!(!stale.moved);
     assert!(stale.refusal.is_some());
     assert_eq!(records(&db).len(), 1, "a changed record is left alone");
     assert_eq!(sent(&db).len(), 1);
 
+    let other_boot = db
+        .write_txn("t", |c, m| gone(c, m, "s1", "4242", "host-b", T0))
+        .unwrap();
+    assert!(
+        !other_boot.moved,
+        "the same pid in another instance is another process: {other_boot:?}"
+    );
+    assert_eq!(records(&db).len(), 1);
+
     let out = db
-        .write_txn("t", |c, m| gone(c, m, "s1", "4242", T0))
+        .write_txn("t", |c, m| gone(c, m, "s1", "4242", "host-a", T0))
         .unwrap();
     assert!(out.moved, "{out:?}");
     assert_eq!(out.effects, [NotifEffect::Withdraw, NotifEffect::Forget]);
@@ -466,7 +475,7 @@ fn gone_withdraws_only_the_owner_that_was_probed() {
     assert_eq!(sent(&db)[1].kind, KIND_WITHDRAW);
 
     let again = db
-        .write_txn("t", |c, m| gone(c, m, "s1", "4242", T0))
+        .write_txn("t", |c, m| gone(c, m, "s1", "4242", "host-a", T0))
         .unwrap();
     assert!(!again.moved, "nothing left to withdraw");
     assert_eq!(sent(&db).len(), 2);
@@ -484,7 +493,9 @@ fn gone_refuses_a_record_with_no_owner() {
         },
     )
     .unwrap();
-    let out = db.write_txn("t", |c, m| gone(c, m, "s1", "", T0)).unwrap();
+    let out = db
+        .write_txn("t", |c, m| gone(c, m, "s1", "", "host-a", T0))
+        .unwrap();
     assert!(!out.moved, "{out:?}");
     assert_eq!(records(&db).len(), 1);
 }

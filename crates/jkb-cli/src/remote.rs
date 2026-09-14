@@ -82,14 +82,21 @@ pub fn target() -> Option<String> {
 
 /// Where `jkb serve` is, for a process that talks to it without being in remote mode — the
 /// notification hook, which never opens a database in any mode. `JKB_REMOTE` when set; else
-/// `JKB_DAEMON_ADDR` (`host:port`, the shape of `jkb serve --addr`), which the dev container sets to
+/// [`DAEMON_ADDR_VAR`] (`host:port`, the shape of `jkb serve --addr`), which the dev container sets to
 /// the host (`.container/container.json`, checked against the firewall's opening by
 /// `.container/check-config.sh`); else the address `jkb serve` binds by default, the host's own
 /// loopback.
 #[must_use]
 pub fn daemon_url() -> String {
-    daemon_url_from(target(), std::env::var("JKB_DAEMON_ADDR").ok())
+    daemon_url_from(target(), std::env::var(DAEMON_ADDR_VAR).ok())
 }
+
+/// The variable naming the daemon's address for a process not in remote mode. Spelled once:
+/// `.container/check-config.sh` reads the name from this line and holds `container.json`'s
+/// `containerEnv` to it, because a rename here with the config left behind sends every hook in the
+/// container to its own loopback, silently — which happened once, mid-change, as
+/// `JKB_DAEMON_URL`.
+pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_ADDR";
 
 fn daemon_url_from(remote: Option<String>, addr: Option<String>) -> String {
     let addr = addr
@@ -110,14 +117,15 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-/// The token file: `JKB_REMOTE_TOKEN_FILE`, else where the host's `jkb serve` writes it for the
-/// default database (`~/.jkb/jkb.db`, seen through the bind) — the same function it uses, not a copy.
+/// The token file: `JKB_REMOTE_TOKEN_FILE`, else where the host's `jkb serve` writes it
+/// (`~/.jkb/daemon/token`, seen through the bind in the container) — the same function it uses, not
+/// a copy.
 #[must_use]
 pub fn token_file() -> PathBuf {
     std::env::var_os("JKB_REMOTE_TOKEN_FILE")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| super::service::serve_token_path(&home().join(".jkb/jkb.db")))
+        .unwrap_or_else(super::service::serve_token_path)
 }
 
 /// The subcommand as typed, for the refusal message: the first argument that is not a flag. `--db`,
@@ -135,6 +143,14 @@ fn subcommand_name() -> String {
 /// A refusal (for `--db` or `JKB_DB`, or a command that may not run remotely), or the command's own
 /// error.
 pub fn run(cli: Cli, remote: &str) -> Result<()> {
+    // The notification hook first, ahead of every refusal below. It opens no database in any mode,
+    // so `--db`/`JKB_DB` beside `JKB_REMOTE` configure nothing it uses — and a hook refused here
+    // exits 1 with its message on a stderr the shim discards, before the hook can log, so every
+    // notification from that shell was lost with nothing written anywhere. (Stage-5 review.)
+    if let Command::Notify { cmd } = &cli.command {
+        super::notify::run(cmd);
+        return Ok(());
+    }
     // A refusal here is a `jkb mq` verb's failure too, so it keeps that verb's `--json` rule.
     let refuse = |message: String| {
         let err = super::mq_cli::refused(jkb_api::ErrorCode::BadRequest, message);
@@ -165,10 +181,6 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             subcommand_name()
         ),
         Support::NoDatabase => match cli.command {
-            Command::Notify { cmd } => {
-                super::notify::run(&cmd);
-                Ok(())
-            }
             Command::Guide => {
                 super::cmd_guide();
                 Ok(())

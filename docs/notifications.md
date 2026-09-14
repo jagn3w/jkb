@@ -40,14 +40,30 @@ because the agent is what reads the queue. With no agent, nothing is shown.
 **The blind sweeps stayed, for a different reason.** `Stop`/`SessionEnd` from `absent` still send a
 withdrawal. The record can no longer disagree with what was *sent*, but the screen is a consumer's,
 across a queue: a consumer whose withdraw hit a notification centre that never answered has already
-acked it (after 10 s, so it cannot wedge). One withdrawal per turn bounds that to the turn.
+acked it (after 10 s — a deadline armed before the first call to the centre, so a centre that never
+answers even the settings read cannot wedge the consumer). One withdrawal per turn bounds that to the
+turn.
+
+**How the consumer reads the stream.** `jkb-notifier serve` folds each burst to its net effect per
+notification id and acks it only after display, so a crash redelivers rather than loses. A burst ends
+at `caught_up` **or at `unreadable`**: `jkb mq subscribe` reports an unreadable row once and then sends
+nothing more until that seq is acked, so waiting for `caught_up` there deadlocked on one corrupt row
+(stage-5 review). A run of the subscription is over only when its process has exited **and** its
+stdout has reached EOF, and the next starts only once that run's batch is off the screen — keyed on the
+exit alone, a dead run's last post could land after the next run withdrew it. A failing subscription is
+retried with backoff (1 s doubling to 30 s, reset only after a run that really started lasted a
+minute), and only the first failure and the recovery are logged, so `notifier.log` does not grow a
+line per retry for as long as a failure lasts.
 
 **A topic nobody reads is not written to.** A message no group consumes is never reapable, so a topic
 with no groups fills to its 10,000-message cap and then refuses every hook call. On a machine with no
 notifier that is the topic's whole life. So the machine still moves the record but sends only while
 `claude/notify` has a group — and the only group is the notifier's (`macos-notifier`, created from
 now by its `jkb mq subscribe`), so only a Mac running the agent receives anything. `scripts/setup.sh`
-creates the topic on every platform, because a producer never creates one.
+creates the topic on every platform, because a producer never creates one, and on macOS reports the
+notifier healthy only when its agent is loaded **and** the topic has a group — the question the daemon
+asks — not merely when an authorized bundle is on disk, which since r3.2 displays nothing by itself
+(`check_notifier_agent` in `scripts/lib.sh`; stage-5 review). `--no-service` leaves the agent off.
 
 **The hook never opens a database, and has no local fallback.** It runs after every tool call, and
 opening the database costs ~110 ms (design N7) — worse, a database a newer migration locked this
@@ -60,25 +76,37 @@ contradicted N7 and the pinned test, and was not built.
 against a daemon that accepts and never answers), nothing on stdout, and every failure appended to
 `~/.jkb/logs/notify-hook.log`, which is moved aside to `.log.1` at 256 KiB so a daemon that stays down
 cannot fill the disk. The address is `JKB_REMOTE` if set, else `JKB_DAEMON_ADDR` (the dev container
-sets it to `host.docker.internal:7117`; `.container/check-config.sh` holds it to the firewall's
-opening), else `jkb serve`'s default loopback. **Not yet measured:** the round trip from the container
-on the Mac.
+sets it to `host.docker.internal:7117`; `.container/check-config.sh` reads that variable's name out of
+`remote.rs` and holds the value to the firewall's opening), else `jkb serve`'s default loopback. The
+token is `~/.jkb/daemon/token` **whichever database the daemon serves** — beside the database, a host
+set up with `--db` wrote it where no client looked. The hook runs even where remote mode would refuse
+(`JKB_REMOTE` beside `JKB_DB`), since it opens no database. **Only a failed connect marks the daemon
+down** for the 5 s other clients skip it: a request that connected and then outran the hook's 1 s
+reached a daemon busy on a write lock, and marking that down made the next permission prompt give up
+untried. **Not yet measured:** the round trip from the container on the Mac.
 
 **The sweep is the producer's, because only the producer can probe a pid.** At `SessionStart` the hook
 asks `notify.open_sessions`, decides for each record whether its session is provably gone, and sends
 `notify.gone` for those. A record is gone when (a) it was written from **this instance** and its owner
 pid is dead by `kill(pid, 0)` (`EPERM` counts as alive), or (b) it was written from **another boot of
-this same container**. The instance is the hostname, plus — in the container — the pid namespace the
-entrypoint recorded in `JKB_NS_MARKER`; a container keeps its hostname across `docker stop`/`start`
-but writes a new marker, and runs one boot at a time. The marker rather than `/proc/self/ns/pid`,
-because a nested sandbox with its own pid namespace would otherwise look like another boot of a
-container that is still running. Everything else — the host seen from a container, another
-container, a record with no owner — is `Unknown`, and `Unknown` never withdraws.
+this same container**. The instance is `host[#boot][/pidns]`: the hostname; in the container, the
+boot — the pid namespace the entrypoint recorded in `JKB_NS_MARKER`; and the pid namespace the
+writing process is actually in. A container keeps its hostname across `docker stop`/`start` but writes
+a new marker, and runs one boot at a time, so a different boot on the same host is gone. **The
+process's own namespace is what makes rule (a) sound:** a nested sandbox shares the hostname and the
+marker but not the pid namespace (measured in the Bash sandbox: `pid:[4026532823]` against the
+marker's `pid:[4026532556]`), so without it a `claude` started in a sandbox would have probed the
+outer sessions' pids where they do not exist and withdrawn every live prompt in the container — the
+stage-5 review's finding. Everything else — the host seen from a container, another container, a
+nested sandbox of this boot, a record with no owner — is `Unknown`, and `Unknown` never withdraws. The
+sweep starts no request once 1 s has passed, so `SessionStart` is bounded by about 2 s.
 
-**`notify.gone` carries the owner it probed**, and the daemon withdraws only if the record still names
-it. `claude --resume` keeps the session id and runs a new process; a session resumed between the
-sweep's read and its withdrawal would otherwise lose a live prompt. Pinned by
-`the_sweep_spares_a_session_resumed_after_it_looked`.
+**`notify.gone` carries the owner and instance it judged**, and the daemon withdraws only if the
+record still names both. `claude --resume` keeps the session id and runs a new process; a session
+resumed between the sweep's read and its withdrawal would otherwise lose a live prompt. The owner
+alone was not enough: after a container restart a resumed session can draw the same pid in the new
+boot. Pinned by `the_sweep_spares_a_session_resumed_after_it_looked` and
+`gone_withdraws_only_the_owner_that_was_probed`.
 
 **Residuals, stated:** a *rebuilt* container gets a new hostname, so notifications its sessions left
 cannot be proved gone from anywhere and stay until dismissed by hand (as before r3.2, whose markers

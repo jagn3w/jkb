@@ -1465,6 +1465,15 @@ case15() {
         'serve=failed|jkb serve:  NOT up'
         'serve=refusing|REFUSING every request'
         'serve=undecided|could not confirm it serves'
+        'topic=ready claude/notify|topic:      claude/notify ready'
+        'topic=conflict claude/notify|different limits; used as it is'
+        'topic=unnamed |cannot name it'
+        'topic=failed claude/notify|NOT created'
+        'notifier=subscribed|running and subscribed'
+        'notifier=not-subscribed|NOT subscribed'
+        'notifier=not-loaded|NOT running'
+        'notifier=skipped|skipped (--no-service)'
+        'notifier=not-macos|none on this platform'
     )
     for entry in "${table[@]}"; do
         line="${entry%%|*}"; want="${entry#*|}"
@@ -1511,7 +1520,8 @@ case15() {
             *unrecognised*) states_ok=0; unknown="$unknown [$word]" ;;
         esac
     done <<EOF
-$(grep -hoE '(scaffold|extension|watcher|serve)_state=[a-z]+' "$setup" "$repo_root/scripts/lib.sh" | sort -u)
+$(grep -hoE '(scaffold|extension|watcher|serve|notify_topic|notifier)_state=[a-z-]+' "$setup" "$repo_root/scripts/lib.sh" \
+    | sed 's/^notify_topic_state=/topic_state=/' | sort -u)
 EOF
     [ "$states_ok" = 1 ] \
         && ok "every state word setup.sh can assign has a render arm" \
@@ -1519,7 +1529,7 @@ EOF
 
     # Default arms, as everywhere else in this protocol.
     local defaults_ok=1 noisy=""
-    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways' 'serve=sideways'; do
+    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways' 'serve=sideways' 'topic=sideways' 'notifier=sideways'; do
         rendered="$(printf '%s\n' "$line" | render_setup_summary 2>&1)"
         case "$rendered" in
             *unrecognised*) ;;

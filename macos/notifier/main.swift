@@ -363,6 +363,16 @@ struct CenterDisplay: Display {
             done()
             return
         }
+        // A notification centre that never answers must not wedge the consumer, so the deadline is
+        // armed BEFORE the first call to it — the settings read included, which is where a hung
+        // usernoted stops answering first. (It was armed inside that call's completion, so the one
+        // case it existed for never reached it. Stage-5 review.) After the window the batch is acked
+        // anyway: redelivering it would wedge the same way, and the blind withdrawal at every turn's
+        // end bounds a lost one to the turn.
+        let finished = Once(done)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            if finished.run() { log("the notification centre did not answer within 10s") }
+        }
         withSettings { s in
             // The rule the hook used to apply before it posted: macOS accepts an unauthorized post,
             // and one to an app whose style is `none`, without error and shows nothing.
@@ -395,14 +405,7 @@ struct CenterDisplay: Display {
             // the moment it has left the process.
             group.enter()
             center.getDeliveredNotifications { _ in group.leave() }
-            // A notification centre that never answers must not wedge the consumer. After the
-            // window the batch is acked anyway: redelivering it would wedge the same way, and the
-            // blind withdrawal at every turn's end bounds a lost one to the turn.
-            let finished = Once(done)
             group.notify(queue: .main) { finished.run() }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-                if finished.run() { log("the notification centre did not answer within 10s") }
-            }
         }
     }
 }
@@ -468,8 +471,15 @@ final class Consumer {
             pending.append(m)
             pendingSeq = max(pendingSeq ?? seq, seq)
         case "unreadable":
-            // Nothing to display; acked with its batch, which is how the stream moves past it.
+            // A batch boundary, not just a seq to fold in. `jkb mq subscribe` reports an unreadable
+            // row once and then sends nothing more — no `caught_up` either — until its seq is acked,
+            // so waiting for `caught_up` here deadlocked: every notification after one corrupt row
+            // was never shown, with the process alive and launchd seeing nothing wrong. (Stage-5
+            // review.) Nothing to display for it; acking it with the batch before it is how the
+            // stream moves past it.
             if let seq = int64(event["seq"]) { pendingSeq = max(pendingSeq ?? seq, seq) }
+            caughtUp = true
+            flush()
         case "caught_up":
             caughtUp = true
             flush()
@@ -516,16 +526,31 @@ func serveDryRun() -> Never {
 /// that ends — `jkb` upgraded under it, a fatal error, a database a newer jkb migrated — is started
 /// again after a backoff that resets once one has run for a minute.
 ///
-/// **Each run gets its own `Consumer`**, so a partial line or a half-folded burst from a run that
-/// died cannot be mixed into the next one's; what it had not acked is delivered again by the next
-/// run. The next run starts only once the last one's batch has left the screen, so a post from the
-/// old run cannot land after a withdrawal from the new one.
+/// **Each run gets its own `Consumer`**, so a partial line or a half-folded burst from a run that died
+/// cannot be mixed into the next one's; what it had not acked is delivered again by the next run.
+/// **A run is over only when its process has exited AND its stdout has reached EOF**, and the next
+/// starts only once that run's last batch has left the screen. The two signals reach the main queue
+/// in no fixed order; keyed on the exit alone, a dead run's final burst could still be displayed
+/// after the next run had redelivered and withdrawn it, leaving a stale post up. (Stage-5 review.)
+final class Run {
+    let consumer: Consumer
+    var exited: Int32?
+    var eof = false
+    /// Set only once the process actually started, so a binary that cannot be launched never counts
+    /// as a run that lasted.
+    var startedAt: Date?
+
+    init(consumer: Consumer) { self.consumer = consumer }
+}
+
 final class Subscription {
     let jkb: String
     let args: [String]
-    private var consumer: Consumer?
     private var backoff: TimeInterval = 1
-    private var startedAt = Date()
+    /// Consecutive runs that ended within a minute. A persistent failure — a missing jkb, a database a
+    /// newer migration locked — would otherwise log a line per restart, for as long as it lasts, into
+    /// a log nothing rotates; so only the first failure and the recovery are logged.
+    private var failures = 0
 
     init(jkb: String, args: [String]) {
         self.jkb = jkb
@@ -542,45 +567,67 @@ final class Subscription {
         p.standardInput = inp
         p.standardError = FileHandle.standardError
         let input = inp.fileHandleForWriting
-        let consumer = Consumer(display: CenterDisplay()) { seq in
-            // Throws (rather than raising) on a pipe the child has closed; SIGPIPE is ignored.
-            do {
-                try input.write(contentsOf: Data("{\"ack\":\(seq)}\n".utf8))
-            } catch {
-                log("ack \(seq) not sent: \(error.localizedDescription)")
-            }
-        }
-        self.consumer = consumer
-        out.fileHandleForReading.readabilityHandler = { h in
+        let run = Run(
+            consumer: Consumer(display: CenterDisplay()) { seq in
+                // Throws (rather than raising) on a pipe the child has closed; SIGPIPE is ignored.
+                do {
+                    try input.write(contentsOf: Data("{\"ack\":\(seq)}\n".utf8))
+                } catch {
+                    log("ack \(seq) not sent: \(error.localizedDescription)")
+                }
+            })
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
             if data.isEmpty {
-                h.readabilityHandler = nil  // EOF
+                h.readabilityHandler = nil
+                DispatchQueue.main.async {
+                    run.eof = true
+                    self?.finish(run)
+                }
                 return
             }
-            DispatchQueue.main.async { consumer.receive(data) }
+            DispatchQueue.main.async { run.consumer.receive(data) }
         }
         p.terminationHandler = { [weak self] proc in
-            DispatchQueue.main.async { self?.ended(status: proc.terminationStatus) }
+            DispatchQueue.main.async {
+                run.exited = proc.terminationStatus
+                self?.finish(run)
+            }
         }
         do {
             try p.run()
-            startedAt = Date()
+            run.startedAt = Date()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard let self = self, run.exited == nil, self.failures > 0 else { return }
+                log("the subscription has been up for a minute after \(self.failures) failed run(s)")
+                self.failures = 0
+                self.backoff = 1
+            }
         } catch {
             log("could not run \(jkb): \(error.localizedDescription)")
-            ended(status: -1)
+            run.exited = -1
+            run.eof = true
+            finish(run)
         }
     }
 
-    func ended(status: Int32) {
-        if consumer?.isBusy == true {
+    /// Called on each of a run's two end signals; acts once both have arrived and its batch is done.
+    func finish(_ run: Run) {
+        guard let status = run.exited, run.eof else { return }
+        if run.consumer.isBusy {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.ended(status: status)
+                self?.finish(run)
             }
             return
         }
-        consumer = nil
-        if Date().timeIntervalSince(startedAt) > 60 { backoff = 1 }
-        log("the subscription ended (status \(status)); restarting in \(Int(backoff))s")
+        if let started = run.startedAt, Date().timeIntervalSince(started) > 60 {
+            backoff = 1
+            failures = 0
+        }
+        failures += 1
+        if failures == 1 {
+            log("the subscription ended (status \(status)); restarting, quietly until it recovers")
+        }
         let delay = backoff
         backoff = min(backoff * 2, 30)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.start() }

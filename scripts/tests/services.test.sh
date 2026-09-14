@@ -192,7 +192,83 @@ case5() {
         || fail "darwin: serve broken" "got '$state'"
 }
 
-echo "==> activate_services: every unit, restarted, and serve proven up"
-run_cases case1 case2 case3 case3b case4 case4b case5
+# --- 6. the notification topic: created, or reported for what it is --------------------------------
+# notify_stub — a bin dir whose `jkb` names the topic unless STUB_UNNAMED=1, answers `topic create` as
+# STUB_CREATE (ok | conflict | other), and `group ls` as STUB_GROUPS; `launchctl list` succeeds unless
+# STUB_UNLOADED=1.
+notify_stub() {
+    nbin="$work/notify-$RANDOM/bin"; mkdir -p "$nbin"
+    cat >"$nbin/jkb" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    "notify topic") [ "${STUB_UNNAMED:-0}" = 1 ] && exit 2; echo claude/notify ;;
+    *"mq topic create claude/notify")
+        case "${STUB_CREATE:-ok}" in
+            ok) echo '{"created":true}' ;;
+            conflict) echo '{"error":{"code":"topic_conflict","message":"different spec"}}'; exit 1 ;;
+            *) echo '{"error":{"code":"schema_newer","message":"newer"}}'; exit 1 ;;
+        esac ;;
+    *"mq group ls claude/notify") printf '%s\n' "${STUB_GROUPS:-[]}" ;;
+    *) exit 3 ;;
+esac
+STUB
+    cat >"$nbin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+[ "$1 $2" = "list com.jkb.notifier" ] && [ "${STUB_UNLOADED:-0}" != 1 ]
+STUB
+    chmod +x "$nbin/jkb" "$nbin/launchctl"
+}
+
+# in_lib <env...> -- <shell snippet> — run a snippet with lib.sh sourced and the stubs first on PATH.
+in_lib() {
+    local -a envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done
+    shift
+    env PATH="$nbin:$PATH" "${envs[@]}" bash -c ". \"\$1\"; $1" _ "$repo_root/scripts/lib.sh" 2>/dev/null
+}
+
+case6() {
+    notify_stub
+    local got want
+    for want in "ok ready" "conflict conflict" "other failed"; do
+        got="$(in_lib STUB_CREATE="${want%% *}" -- 'provision_notify_topic /db; echo "$notify_topic_state $notify_topic"')"
+        [ "$got" = "${want#* } claude/notify" ] && ok "topic create answering ${want%% *}: ${want#* }" \
+            || fail "topic ${want%% *}" "got '$got'"
+    done
+    got="$(in_lib STUB_UNNAMED=1 -- 'provision_notify_topic /db; echo "$notify_topic_state"')"
+    [ "$got" = unnamed ] && ok "a jkb that cannot name the topic: unnamed" || fail "topic unnamed" "got '$got'"
+}
+
+# --- 7. the notifier: loaded is not enough, something must have joined the topic ----------------------
+case7() {
+    notify_stub
+    local got
+    got="$(in_lib STUB_UNLOADED=1 -- 'check_notifier_agent /db claude/notify com.jkb.notifier; echo "$notifier_state"')"
+    [ "$got" = not-loaded ] && ok "no agent: not-loaded" || fail "agent unloaded" "got '$got'"
+    got="$(in_lib 'STUB_GROUPS=[{"name":"macos-notifier","position":0}]' -- 'check_notifier_agent /db claude/notify com.jkb.notifier; echo "$notifier_state"')"
+    [ "$got" = subscribed ] && ok "a loaded agent whose group joined: subscribed" || fail "agent subscribed" "got '$got'"
+    got="$(in_lib JKB_NOTIFIER_READY_WAIT=0 -- 'check_notifier_agent /db claude/notify com.jkb.notifier; echo "$notifier_state"')"
+    [ "$got" = not-subscribed ] && ok "a loaded agent with no group on the topic: not-subscribed, not healthy" \
+        || fail "agent not subscribed" "got '$got'"
+}
+
+# --- 8. --no-service keeps the notifier's agent off too -------------------------------------------------
+case8() {
+    notify_stub
+    local builder="$nbin/build-notifier.sh" got
+    printf '#!/usr/bin/env bash\nprintf "%%s " "$@" >"%s"\n' "$nbin/args" >"$builder"
+    chmod +x "$builder"
+    in_lib -- "build_notifier '$builder' /kb/jkb.db 1" >/dev/null
+    got="$(cat "$nbin/args")"
+    [ "$got" = "--jkb $nbin/jkb --db /kb/jkb.db " ] && ok "services on: the agent is built with this jkb and database" \
+        || fail "build_notifier on" "got '$got'"
+    in_lib -- "build_notifier '$builder' /kb/jkb.db 0" >/dev/null
+    got="$(cat "$nbin/args")"
+    [ "$got" = "--jkb $nbin/jkb --db /kb/jkb.db --no-agent " ] && ok "--no-service: --no-agent" \
+        || fail "build_notifier no-agent" "got '$got'"
+}
+
+echo "==> activate_services, and the notification topic and notifier agent setup.sh reports"
+run_cases case1 case2 case3 case3b case4 case4b case5 case6 case7 case8
 
 finish

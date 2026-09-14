@@ -138,14 +138,16 @@ pub enum Request {
     /// Every notification the daemon holds a record of, for a producer's `SessionStart` sweep.
     #[serde(rename = "notify.open_sessions")]
     NotifyOpenSessions {},
-    /// A producer probed `owner` and found it gone: withdraw the session's notification, but only
-    /// if the record still names that owner.
+    /// A producer judged the session gone from its record: withdraw the notification, but only if
+    /// the record still names the owner and instance that judgement was made from.
     #[serde(rename = "notify.gone")]
     NotifyGone {
         /// The session.
         session: String,
-        /// The owner pid that was probed.
+        /// The record's owner pid, as the producer read it.
         owner: String,
+        /// The record's instance, as the producer read it.
+        instance: String,
     },
 }
 
@@ -384,24 +386,6 @@ impl Request {
             Self::NotifyGone { .. } => "notify.gone",
         }
     }
-
-    /// Whether serving this request can put a message on a topic, so a daemon holding long-polls
-    /// wakes them. Exhaustive, so an op that sends cannot be added without saying so — a send the
-    /// daemon did not announce is delivered only by its slower `data_version` floor.
-    #[must_use]
-    pub const fn may_send(&self) -> bool {
-        match self {
-            Self::MqSend { .. } | Self::NotifyEvent { .. } | Self::NotifyGone { .. } => true,
-            Self::MqTopicCreate { .. }
-            | Self::MqGroupCreate { .. }
-            | Self::MqPoll { .. }
-            | Self::MqAck { .. }
-            | Self::MqCompact { .. }
-            | Self::MqInspect {}
-            | Self::MqTail { .. }
-            | Self::NotifyOpenSessions {} => false,
-        }
-    }
 }
 
 /// The answer to a [`Request`]. Serialized with a `"result"` tag.
@@ -463,6 +447,28 @@ pub enum Response {
         /// By session.
         sessions: Vec<NotifySession>,
     },
+}
+
+impl Response {
+    /// Whether this answer reports a message put on a topic, so a daemon holding long-polls wakes
+    /// them. Asked of what was DONE, not of the request's type: most `notify.event`s — every tool
+    /// call from every session with nothing on screen — send nothing, and waking every subscriber for
+    /// each made them all re-poll for no message. Exhaustive, so a new answer that can carry a send
+    /// must say so; one the daemon did not announce is delivered only by its slower `data_version`
+    /// floor.
+    #[must_use]
+    pub const fn announces_a_send(&self) -> bool {
+        match self {
+            Self::Sent { .. } => true,
+            Self::Notified { sent, .. } => *sent > 0,
+            Self::Created { .. }
+            | Self::Messages { .. }
+            | Self::Position { .. }
+            | Self::Compacted { .. }
+            | Self::Topics { .. }
+            | Self::Sessions { .. } => false,
+        }
+    }
 }
 
 impl From<notify::Applied> for Response {
@@ -768,9 +774,15 @@ impl Backend for LocalBackend {
                     })
                     .collect(),
             },
-            Request::NotifyGone { session, owner } => self
+            Request::NotifyGone {
+                session,
+                owner,
+                instance,
+            } => self
                 .db
-                .write_txn(ACTOR, move |c, m| notify::gone(c, m, &session, &owner, now))?
+                .write_txn(ACTOR, move |c, m| {
+                    notify::gone(c, m, &session, &owner, &instance, now)
+                })?
                 .into(),
         })
     }

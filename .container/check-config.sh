@@ -605,13 +605,19 @@ fi
 # 5. The notification hook is told the address the firewall opens. `jkb notify hook` reaches the
 #    daemon at JKB_DAEMON_ADDR and, without it, at the container's OWN loopback — where nothing listens,
 #    so every notification from in here is lost with nothing on screen to say so (the hook is silent
-#    by design). Held to the same two constants the firewall reads, not to a copy of them.
+#    by design). Held to the same two constants the firewall reads, not to a copy of them — and the
+#    variable's NAME is read out of the binary's source, because it drifted once (JKB_DAEMON_URL in
+#    the code, nothing in the config) with every check here green.
 dc_env="$(dc_container_env "$here/container.json" "$repo_top" 2>/dev/null)" || dc_env=""
-daemon_addr="$(sed -n 's/^JKB_DAEMON_ADDR=//p' <<<"$dc_env" | head -1)"
-if [ -z "$daemon_addr" ]; then
-    bad "container.json's containerEnv sets no JKB_DAEMON_ADDR — the notification hook would look for jkb serve on the container's own loopback and every notification from the container would be lost"
+addr_var="$(grep -oE 'pub const DAEMON_ADDR_VAR: &str = "[A-Z_]+"' "$repo_top/crates/jkb-cli/src/remote.rs" 2>/dev/null \
+    | head -1 | sed 's/.*"\([A-Z_]*\)"/\1/')"
+daemon_addr="$( [ -n "$addr_var" ] && sed -n "s/^$addr_var=//p" <<<"$dc_env" | head -1)"
+if [ -z "$addr_var" ]; then
+    bad "could not read DAEMON_ADDR_VAR from crates/jkb-cli/src/remote.rs — the check that the container names the daemon in the variable the hook reads is checking nothing"
+elif [ -z "$daemon_addr" ]; then
+    bad "container.json's containerEnv sets no $addr_var (the variable jkb notify hook reads) — the notification hook would look for jkb serve on the container's own loopback and every notification from the container would be lost"
 elif [ "$daemon_addr" != "${fw_host:-?}:${fw_port:-?}" ]; then
-    bad "container.json's JKB_DAEMON_ADDR is $daemon_addr but the firewall opens ${fw_host:-<unread>}:${fw_port:-<unread>} (egress-lib.sh) — the notification hook would be refused"
+    bad "container.json's $addr_var is $daemon_addr but the firewall opens ${fw_host:-<unread>}:${fw_port:-<unread>} (egress-lib.sh) — the notification hook would be refused"
 else
     ok "the notification hook is pointed at the address the firewall opens ($daemon_addr)"
 fi

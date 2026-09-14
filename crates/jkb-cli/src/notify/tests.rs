@@ -106,17 +106,24 @@ fn an_owner_that_dies_with_this_call_is_refused() {
 /// cleaned so it can neither break a log line nor forge the `#` that separates the two.
 #[test]
 fn the_instance_is_the_host_and_the_container_boot() {
-    assert_eq!(instance_from("mac", None), "mac");
+    assert_eq!(instance_from("mac", None, None), "mac", "macOS: no /proc");
     assert_eq!(
-        instance_from("c7b8", Some("pid=pid:[4026532556]\nmnt=mnt:[4026532553]\n")),
-        "c7b8#pid:[4026532556]"
+        instance_from(
+            "c7b8",
+            Some("pid=pid:[4026532556]\nmnt=mnt:[4026532553]\n"),
+            Some("pid:[4026532556]")
+        ),
+        "c7b8#pid:[4026532556]/pid:[4026532556]"
     );
     assert_eq!(
-        instance_from("c7b8", Some("mnt=mnt:[1]\n")),
-        "c7b8",
+        instance_from("c7b8", Some("mnt=mnt:[1]\n"), Some("pid:[7]")),
+        "c7b8/pid:[7]",
         "a marker without a pid line names no boot"
     );
-    assert_eq!(instance_from("a#b\n", Some("pid=x#y\u{7}")), "ab#xy");
+    assert_eq!(
+        instance_from("a#b/\n", Some("pid=x#y/\u{7}"), Some("n/s")),
+        "ab#xy/ns"
+    );
 }
 
 fn record(owner: &str, instance: &str) -> NotifySession {
@@ -133,7 +140,7 @@ fn record(owner: &str, instance: &str) -> NotifySession {
 /// so everything short of proof is `Unknown`.
 #[test]
 fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
-    let me = "c7b8#pid:[2]";
+    let me = "c7b8#pid:[2]/pid:[2]";
     let dead = |_| Fact::No;
     let alive = |_| Fact::Yes;
     let unknown = |_| Fact::Unknown;
@@ -150,14 +157,23 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
         "a probe that could not answer proves nothing"
     );
     assert_eq!(
-        verdict(&record("10", "c7b8#pid:[1]"), me, alive),
+        verdict(&record("10", "c7b8#pid:[1]/pid:[1]"), me, alive),
         Fact::No,
         "another boot of this container: its processes are gone, whatever a pid here says"
     );
+    assert_eq!(
+        verdict(&record("10", "c7b8#pid:[1]/pid:[9]"), me, alive),
+        Fact::No,
+        "...including a nested sandbox of that earlier boot"
+    );
     for (other, why) in [
         ("mac", "the host, seen from a container"),
-        ("d9e0#pid:[1]", "another container"),
-        ("c7b8", "this host with no boot recorded"),
+        ("d9e0#pid:[1]/pid:[1]", "another container"),
+        ("c7b8/pid:[2]", "this host with no boot recorded"),
+        (
+            "c7b8#pid:[2]/pid:[9]",
+            "a nested sandbox of THIS boot: its pids are not this namespace's (the review's case)",
+        ),
     ] {
         assert_eq!(
             verdict(&record("10", other), me, dead),
@@ -166,9 +182,14 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
         );
     }
     assert_eq!(
-        verdict(&record("10", "c7b8#pid:[1]"), "c7b8", dead),
+        verdict(&record("10", "c7b8#pid:[1]/pid:[1]"), "c7b8/pid:[3]", dead),
         Fact::Unknown,
         "a process with no boot of its own cannot call another boot earlier"
+    );
+    assert_eq!(
+        verdict(&record("10", me), "c7b8#pid:[2]/pid:[9]", dead),
+        Fact::Unknown,
+        "and a nested sandbox cannot probe the outer namespace's pids either"
     );
     assert_eq!(
         verdict(&record("", me), me, dead),

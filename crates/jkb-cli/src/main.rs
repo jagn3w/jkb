@@ -213,7 +213,7 @@ enum Command {
         /// Where to listen. An unspecified address (0.0.0.0, ::) is refused.
         #[arg(long, default_value = jkb_daemon::DEFAULT_ADDR)]
         addr: std::net::SocketAddr,
-        /// Where to write the token (default: `<database directory>/daemon/token`).
+        /// Where to write the token (default: `~/.jkb/daemon/token`, whichever database is served).
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
@@ -1234,7 +1234,7 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             ServiceCmd::TokenPath => {
-                println!("{}", service::serve_token_path(&db_path).display());
+                println!("{}", service::serve_token_path().display());
                 Ok(())
             }
         };
@@ -6597,7 +6597,7 @@ fn cmd_serve(
     addr: std::net::SocketAddr,
     token_file: Option<PathBuf>,
 ) -> Result<()> {
-    let token_path = token_file.unwrap_or_else(|| service::serve_token_path(db_path));
+    let token_path = token_file.unwrap_or_else(service::serve_token_path);
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
     let path = db_path.to_path_buf();
     let open: jkb_daemon::server::Opener = Box::new(move || {

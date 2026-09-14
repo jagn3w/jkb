@@ -1628,10 +1628,101 @@ render_setup_summary() {
                     failed)    printf '  • jkb serve:  NOT up; its log is serve.log beside the database (macOS) or journalctl --user -u com.jkb.serve (Linux)\n' ;;
                     *)         warn "unrecognised serve state: $line" ;;
                 esac ;;
+            topic=*)
+                case "$state" in
+                    ready)    printf '  • topic:      %s ready\n' "$detail" ;;
+                    conflict) printf '  • topic:      %s exists with different limits; used as it is\n' "$detail" ;;
+                    unnamed)  printf '  • topic:      NOT created — this jkb cannot name it; notifications will not be sent\n' ;;
+                    failed)   printf '  • topic:      NOT created; notifications will not be sent (see the warnings above)\n' ;;
+                    *)        warn "unrecognised topic state: $line" ;;
+                esac ;;
+            notifier=*)
+                case "$state" in
+                    subscribed)     printf '  • notifier:   running and subscribed; permission notifications are shown\n' ;;
+                    not-subscribed) printf '  • notifier:   loaded but NOT subscribed; nothing is shown (see notifier.log)\n' ;;
+                    not-loaded)     printf '  • notifier:   NOT running; nothing is shown (see the warnings above)\n' ;;
+                    skipped)        printf '  • notifier:   skipped (--no-service)\n' ;;
+                    not-macos)      printf '  • notifier:   none on this platform; a Mac running com.jkb.notifier shows them\n' ;;
+                    *)              warn "unrecognised notifier state: $line" ;;
+                esac ;;
             '') : ;;
             *) warn "unrecognised summary line: $line" ;;
         esac
     done
+}
+
+# --- notifications: the queue topic and its consumer -----------------------------------------
+# Both halves of setup.sh's notification section, here rather than inline for the reason every
+# section of setup.sh has moved here: nothing executes setup.sh, so an arm written there is reachable
+# from no test (scripts/tests/services.test.sh drives these against stubs).
+
+# provision_notify_topic <db> — create the topic the notification machine sends on. Sets
+# `notify_topic` (its name, asked of jkb so it is spelled once, in jkb_core::notify::TOPIC) and
+# `notify_topic_state`:
+#   ready     created now, or already there with these limits
+#   conflict  already there with different limits — it is USED as it is, so notifications still flow
+#   unnamed   this jkb cannot name it (older than the checkout)
+#   failed    anything else; nothing is sent while the topic is missing
+provision_notify_topic() {
+    local db="$1" out
+    notify_topic=""
+    notify_topic_state=failed
+    if ! notify_topic="$(jkb notify topic 2>/dev/null)" || [ -z "$notify_topic" ]; then
+        notify_topic_state=unnamed
+        warn "this jkb does not name the notification topic (jkb notify topic) — notifications will not be sent"
+        return 0
+    fi
+    # --json, so a refusal arrives as a code rather than as prose to match.
+    if out="$(jkb --db "$db" --json mq topic create "$notify_topic" 2>/dev/null)"; then
+        notify_topic_state=ready
+        return 0
+    fi
+    case "$out" in
+        *'"code":"topic_conflict"'*)
+            notify_topic_state=conflict
+            warn "$notify_topic already exists with different limits; it is used as it is" ;;
+        *)
+            warn "could not create the $notify_topic topic — notifications will not be sent: $out" ;;
+    esac
+}
+
+# build_notifier <build-notifier.sh> <db> <do_service> — build the notifier and install its agent.
+# --jkb and --db, because the agent (com.jkb.notifier) subscribes with this jkb, to this database —
+# the one every other service was installed against. With do_service=0 (`setup.sh --no-service`)
+# the agent is left off like every other background service: it keeps a subscription open against
+# the database for as long as it runs, and the post-merge hook would recreate it on every pull.
+build_notifier() {
+    local builder="$1" db="$2" do_service="$3"
+    local -a flags=(--jkb "$(command -v jkb)" --db "$db")
+    [ "$do_service" = 1 ] || flags+=(--no-agent)
+    "$builder" "${flags[@]}"
+}
+
+# check_notifier_agent <db> <topic> <label> — on macOS, whether the notifier that displays
+# notifications is actually consuming: its launchd agent is loaded, and the topic has a consumer
+# group within JKB_NOTIFIER_READY_WAIT (default 10) seconds. A group, not a group NAME, because that
+# is exactly what the daemon asks before it sends anything (jkb_core::notify: a topic with no group is
+# not written to). Sets `notifier_state`:
+#   subscribed      the agent is loaded and the topic has a group
+#   not-subscribed  the agent is loaded but nothing joined the topic — nothing will be shown
+#   not-loaded      no agent — nothing will be shown, however authorized the bundle is
+# It exists because an authorized bundle on disk is NOT the feature any more: since r3.2 the agent is
+# the only thing that displays, and setup used to report healthy on the bundle alone.
+check_notifier_agent() {
+    local db="$1" topic="$2" label="$3" waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups=""
+    if ! launchctl list "$label" >/dev/null 2>&1; then
+        notifier_state=not-loaded
+        warn "the $label agent is not loaded — permission notifications will not be shown"
+        return 0
+    fi
+    while :; do
+        groups="$(jkb --db "$db" --json mq group ls "$topic" 2>/dev/null)" || groups=""
+        case "$groups" in *'"name"'*) notifier_state=subscribed; return 0 ;; esac
+        [ "$waited" -ge "$wait_for" ] && break
+        sleep 1; waited=$((waited + 1))
+    done
+    notifier_state=not-subscribed
+    warn "$label is loaded but nothing has subscribed to $topic within ${wait_for}s — see notifier.log beside the database"
 }
 
 # --- a database on a shared filesystem ------------------------------------------------------

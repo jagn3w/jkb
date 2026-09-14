@@ -1662,6 +1662,8 @@ mod tests {
         );
 
         let mut stray: Vec<String> = Vec::new();
+        let mut exempted: std::collections::HashSet<(&str, &str)> =
+            std::collections::HashSet::new();
         let mut found = 0usize;
         for path in &files {
             let Ok(src) = std::fs::read_to_string(path) else {
@@ -1705,11 +1707,12 @@ mod tests {
                 if SCRUBBERS.iter().any(|&(f, n)| f == here.0 && n == here.1) {
                     continue;
                 }
-                if let Some(&(_, _, why)) = NOT_REPO_AWARE
+                if let Some(&(f, n, why)) = NOT_REPO_AWARE
                     .iter()
                     .find(|&&(f, n, _)| f == here.0 && n == here.1)
                 {
                     let _ = why;
+                    exempted.insert((f, n));
                     continue;
                 }
                 stray.push(format!("{rel}:{} in `{enclosing}`", i + 1));
@@ -1718,6 +1721,17 @@ mod tests {
         assert!(
             found >= 6,
             "found {found} spawns; the scan is broken, not the code"
+        );
+        // An exemption that matched no spawn is not harmless: it pre-approves whatever spawn is
+        // next written under that (file, fn) name. One outlived its test's deletion this way, with
+        // the scan green (stage-5 review).
+        let stale: Vec<_> = NOT_REPO_AWARE
+            .iter()
+            .filter(|&&(f, n, _)| !exempted.contains(&(f, n)))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "NOT_REPO_AWARE names spawns that no longer exist; remove them: {stale:?}"
         );
 
         every_exemption_names_a_test_that_observes_it(root, &files, SCRUBBERS);

@@ -195,19 +195,15 @@ fi
 # container still reaches a Mac's daemon. Nothing fills it where nobody consumes — the machine sends
 # only to a topic with a consumer group, and the group is the notifier's, so only a Mac has one.
 say "notification topic"
-if notify_topic="$(jkb notify topic 2>/dev/null)" && [ -n "$notify_topic" ]; then
-  jkb --db "$db" mq topic create "$notify_topic" >/dev/null \
-    && echo "  • $notify_topic ready" \
-    || warn "could not create the $notify_topic topic — notifications will not be sent"
-else
-  warn "this jkb does not name the notification topic (jkb notify topic) — notifications will not be sent"
-fi
+provision_notify_topic "$db"
+[ "$notify_topic_state" = ready ] && echo "  • $notify_topic ready"
 #
 # The two things this CANNOT do for you are reported rather than assumed, because a hook that
 # posts nothing, or posts self-hiding banners, looks exactly like a broken hook:
 #   - authorization is a one-time user grant, and the prompt dies with the process that raised it,
 #     so it must be requested interactively rather than in passing here;
 #   - the sticky "Alerts" style is a per-app setting no API can set.
+notifier_state=not-macos
 if [ "$(uname -s)" = "Darwin" ]; then
   say "sticky notifications"
   # "Did this build succeed" and "what notifier is installed, in what state" are separate
@@ -216,18 +212,16 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # installed, which is the usual case, since build-notifier.sh bails at its `swiftc` guard before
   # touching the existing one — and it suppressed the two manual-step instructions, so a machine
   # that really was unauthorized was told nothing.
-  # --jkb and --db: the agent it installs (com.jkb.notifier) subscribes with this jkb, to this
-  # database — the one every other service here was installed against.
-  "$repo_root/scripts/build-notifier.sh" --jkb "$(command -v jkb)" --db "$db" \
+  #
+  build_notifier "$repo_root/scripts/build-notifier.sh" "$db" "$do_service" \
     || warn "could not rebuild the notifier (any existing one is untouched)"
 
-  # Asked of the hook itself, so this reports on exactly the binary the hook will use. A second
-  # copy of the search list here would eventually disagree with it, and the disagreement reads
-  # as a broken notifier rather than as the drift it is.
-  nb=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --find-notifier 2>/dev/null || true)
-  state=$([ -n "$nb" ] && "$nb" status 2>/dev/null || true)
-  if [ -z "$nb" ]; then
-    warn "no notifier installed — permission notifications will not be shown (nothing consumes the queue)"
+  # Asked about the binary the AGENT runs (`--notifier-path`), not whichever bundle `--find-notifier`
+  # would pick: the agent is what displays, and a second bundle elsewhere is not.
+  nb=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --notifier-path 2>/dev/null || true)
+  state=$([ -x "$nb" ] && "$nb" status 2>/dev/null || true)
+  if [ ! -x "$nb" ]; then
+    warn "no notifier installed at $nb — permission notifications will not be shown"
   else
     case "$state" in
       *authorization=authorized*) ;;
@@ -239,6 +233,13 @@ if [ "$(uname -s)" = "Darwin" ]; then
       *) echo "  • for STICKY notifications, set: System Settings > Notifications >"
          echo "    jkb Notifier > Alerts  (banners auto-hide; only Alerts waits for you)" ;;
     esac
+  fi
+  if [ "$do_service" -ne 1 ]; then
+    notifier_state=skipped
+  elif [ -n "$notify_topic" ]; then
+    check_notifier_agent "$db" "$notify_topic" "$("$repo_root/scripts/build-notifier.sh" --agent-label)"
+  else
+    notifier_state=not-subscribed
   fi
 fi
 
@@ -254,4 +255,6 @@ render_setup_summary < <(
   printf 'extension=%s\n' "$extension_state"
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
+  printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
+  printf 'notifier=%s\n' "$notifier_state"
 )

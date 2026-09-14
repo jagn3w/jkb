@@ -453,7 +453,7 @@ pub struct Observation {
     pub cwd: String,
     /// The `claude` process's pid as the hook saw it, or empty when it had none it could trust.
     pub owner: String,
-    /// The pid namespace `owner` belongs to (see `jkb notify`'s sweep).
+    /// Where `owner` means something, `host[#boot][/pidns]` (built by `jkb notify hook`). Opaque here.
     pub instance: String,
 }
 
@@ -740,11 +740,13 @@ pub fn open_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
 
 /// A producer has proved `session` gone: withdraw its notification and forget it.
 ///
-/// **Only if the record still names `owner`** — the pid the producer probed. Between reading
-/// [`open_sessions`] and calling this, the session can be resumed (`claude --resume` keeps the id
-/// and runs a new process) and post again; withdrawing then would take a live prompt off the
-/// screen, which is the harm this feature exists to prevent. A record that changed, or is gone,
-/// is left alone and reported as not moved.
+/// **Only if the record still names the `owner` and `instance` the producer judged** — everything its
+/// verdict was computed from. Between reading [`open_sessions`] and calling this, the session can be
+/// resumed (`claude --resume` keeps the id and runs a new process) and post again; withdrawing then
+/// would take a live prompt off the screen, which is the harm this feature exists to prevent. The
+/// owner alone was not enough: after a container restart a resumed session can draw the SAME pid in
+/// the new boot, and a sweep that judged the old boot's record gone would then match the new one.
+/// A record that changed, or is gone, is left alone and reported as not moved.
 ///
 /// # Errors
 /// [`QueueError::Invalid`] for an unsanitized session or malformed owner; a send's refusal; or a
@@ -754,12 +756,15 @@ pub fn gone(
     meta: &WriteMeta,
     session: &str,
     owner: &str,
+    instance: &str,
     now: i64,
 ) -> Result<Applied> {
     check_session(session)?;
-    check_owner_and_instance(owner, "")?;
+    check_owner_and_instance(owner, instance)?;
     let rec = record(conn, session)?;
-    let still = rec.as_ref().filter(|r| r.owner == owner);
+    let still = rec
+        .as_ref()
+        .filter(|r| r.owner == owner && r.instance == instance);
     let ctx = NotifCtx {
         at: state_of(still),
         tool_named: still.is_some_and(|r| !r.tool.is_empty()),

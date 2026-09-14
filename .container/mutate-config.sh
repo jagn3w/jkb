@@ -45,6 +45,9 @@ seed() {
     # ...and jkb-daemon's DEFAULT_ADDR, which check-config.sh holds the firewall's daemon port to.
     mkdir -p "$work/t/crates/jkb-daemon/src"
     cp "$repo/crates/jkb-daemon/src/lib.rs" "$work/t/crates/jkb-daemon/src/"
+    # ...and jkb-cli's remote.rs, which names the variable the notification hook reads.
+    mkdir -p "$work/t/crates/jkb-cli/src"
+    cp "$repo/crates/jkb-cli/src/remote.rs" "$work/t/crates/jkb-cli/src/"
     # The manifest is what lets mutated() see a DELETION or a MODE CHANGE. Taken here rather than
     # derived from a list, so it still covers a file added to seed() tomorrow.
     tree_manifest > "$work/manifest"
@@ -366,6 +369,24 @@ run "the notification hook is pointed at a port the firewall does not open" "but
 
 seed; sub_dc '"JKB_DAEMON_ADDR": "host.docker.internal:7117",' ''
 run "the notification hook is not told where the daemon is" "sets no JKB_DAEMON_ADDR"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_ADDR";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_HOST";', 1))
+PYX
+run "the hook reads a variable the container does not set" "sets no JKB_DAEMON_HOST"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_ADDR";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const DAEMON_ADDR_VAR: &str = concat!("JKB_", "DAEMON_ADDR");', 1))
+PYX
+run "the hook's variable name can no longer be read" "could not read DAEMON_ADDR_VAR"
 
 # THE PROBE AND THE RAISE MUST STATE ONE RULE. Re-inlining the spec on the probe side is exactly
 # what shipped: `--match-set allowed-new` is the staging set, destroyed before the raise returns, so
@@ -915,7 +936,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=84
+PINNED_BAD_SITES=85
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
