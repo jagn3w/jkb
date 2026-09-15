@@ -196,17 +196,13 @@ pub fn edges_from_many(
     if srcs.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; srcs.len()].join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT src_item_id, dst_item_id FROM edges
-         WHERE type = ? AND src_item_id IN ({placeholders})
-         ORDER BY src_item_id, dst_item_id"
-    );
-    let mut params: Vec<SqlValue> = Vec::with_capacity(srcs.len() + 1);
-    params.push(SqlValue::Text(edge_type.as_str().to_owned()));
-    params.extend(srcs.iter().map(|id| SqlValue::Integer(id.get())));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
+         WHERE type = ?1 AND src_item_id IN (SELECT value FROM json_each(?2))
+         ORDER BY src_item_id, dst_item_id",
+    )?;
+    let ids = crate::sql::json_ids(srcs.iter().map(|id| id.get()));
+    let rows = stmt.query_map(rusqlite::params![edge_type.as_str(), ids], |r| {
         Ok((
             ItemId::new(r.get::<_, i64>(0)?),
             ItemId::new(r.get::<_, i64>(1)?),

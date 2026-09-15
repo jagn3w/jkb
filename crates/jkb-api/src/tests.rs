@@ -887,12 +887,18 @@ fn a_tree_stops_at_its_node_cap_and_says_so() {
     })
     .unwrap();
     let b = LocalBackend::new(db);
-    let Response::Tree { nodes, truncated } =
-        call(&b, json!({ "op": "kb.tree", "path": "w" })).unwrap()
+    let Response::Tree {
+        nodes,
+        truncated,
+        at_node_cap,
+    } = call(&b, json!({ "op": "kb.tree", "path": "w" })).unwrap()
     else {
         panic!("kb.tree answers with nodes")
     };
-    assert!(truncated);
+    assert!(
+        truncated && at_node_cap,
+        "cut, and by the cap rather than the budget"
+    );
     assert_eq!(
         count(&nodes),
         super::kb::MAX_TREE_NODES,
@@ -1208,7 +1214,7 @@ fn every_op_is_served_on_the_connection_its_class_names() {
 }
 
 #[test]
-fn the_ready_frontier_is_ordered_and_limited_before_any_body_is_loaded() {
+fn the_ready_frontier_is_in_priority_order_and_honours_its_limit() {
     use jkb_core::task;
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
@@ -1237,4 +1243,23 @@ fn the_ready_frontier_is_ordered_and_limited_before_any_body_is_loaded() {
     };
     assert_eq!(uids(None), ["task:high", "task:low", "task:none"]);
     assert_eq!(uids(Some(2)), ["task:high", "task:low"]);
+}
+
+#[test]
+fn a_task_larger_than_the_budget_is_shown_whole_and_not_called_cut() {
+    use jkb_core::task;
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        task::create(c, m, &task::NewTask::new("task:huge", "x".repeat(10_000)))?;
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db).with_read_budget(256);
+    let Response::Task { task, truncated } =
+        call(&b, json!({ "op": "task.show", "uid": "huge" })).unwrap()
+    else {
+        panic!("task.show answers with a task")
+    };
+    assert_eq!(task.item.content.map(|c| c.len()), Some(10_000));
+    assert!(!truncated, "no subtask was dropped, so nothing was cut");
 }

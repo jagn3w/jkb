@@ -734,17 +734,16 @@ pub fn ready(conn: &Connection, scope: Scope, tags: &[TagPred]) -> Result<Vec<Ta
     load_ordered(conn, &ids)
 }
 
-/// Load the given items as [`TaskRow`]s, ordered by priority then due (nulls last).
 /// The ready frontier's order: priority (ascending, nulls last), then due date (ascending, nulls
 /// last), then id. One copy, for [`load_ordered`] and [`ready_ids`].
 const READY_ORDER: &str = "priority IS NULL, priority ASC, due IS NULL, date(due) ASC, id";
 
+/// Load the given items as [`TaskRow`]s, ordered by priority then due (nulls last).
 fn load_ordered(conn: &Connection, ids: &[ItemId]) -> Result<Vec<TaskRow>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    // The ids as one JSON array rather than a placeholder each: SQLite refuses more than 32,766
-    // variables, which a frontier that large reached.
+    // One bound list (`sql::json_ids`), never a placeholder per id.
     let sql = format!(
         "SELECT id, uid, content, status, priority, due FROM items
          WHERE id IN (SELECT value FROM json_each(?1))
@@ -778,8 +777,7 @@ fn ready_query(scope: Scope, tags: &[TagPred]) -> Query {
 }
 
 fn ids_json(ids: &[ItemId]) -> String {
-    let ids: Vec<i64> = ids.iter().map(|id| id.get()).collect();
-    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned())
+    crate::sql::json_ids(ids.iter().map(|id| id.get()))
 }
 
 /// The ready frontier's ids, in [`ready`]'s order, at most `limit` of them — ordered and cut in SQL
@@ -890,6 +888,46 @@ fn bad(token: &str, expected: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// `ready_ids` is the frontier `ready` lists, in `ready`'s order, cut by its limit — over mixed
+    /// priorities, due dates and nulls, where the tie-breaks are. And `ready`'s own load takes more
+    /// ids than `SQLite` has variables.
+    #[test]
+    fn ready_ids_orders_and_limits_as_ready_does() {
+        use crate::query::Scope;
+        let db = crate::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            for (uid, priority, due) in [
+                ("task:a", Some(2), Some("2026-10-01")),
+                ("task:b", Some(2), None),
+                ("task:c", None, Some("2026-09-01")),
+                ("task:d", Some(1), Some("2026-12-01")),
+                ("task:e", None, None),
+                ("task:f", Some(2), Some("2026-09-15")),
+                ("task:g", Some(1), Some("2026-12-01")),
+            ] {
+                let mut t = super::NewTask::new(uid, uid);
+                t.priority = priority;
+                t.due = due.map(str::to_owned);
+                super::create(c, m, &t)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        db.read(|c| {
+            let listed: Vec<_> = super::ready(c, Scope::All, &[])?
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(listed.len(), 7);
+            assert_eq!(super::ready_ids(c, Scope::All, &[], None)?, listed);
+            assert_eq!(super::ready_ids(c, Scope::All, &[], Some(3))?, listed[..3]);
+            let many: Vec<_> = (1..=40_000).map(jkb_types::ItemId::new).collect();
+            assert_eq!(super::load_ordered(c, &many)?.len(), 7);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// A finished task must not keep a claim. `jkb task start` claims and
     /// `jkb task close-merged` completes, so without this every auto-closed task turned up
     /// as an orphaned claim in `doctor` — the manual cleanup that automation was removing.

@@ -132,22 +132,16 @@ pub fn child_counts(
     if parents.is_empty() {
         return Ok(out);
     }
-    let placeholders = (1..=parents.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Placeholders are generated from a count; every value is bound.
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT c.parent_item_id, COUNT(*),
                 SUM(CASE WHEN i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
                          THEN 1 ELSE 0 END)
            FROM containment c JOIN items i ON i.id = c.child_item_id
-          WHERE c.parent_item_id IN ({placeholders})
-          GROUP BY c.parent_item_id"
-    );
-    let params: Vec<rusqlite::types::Value> = parents.iter().map(|p| p.get().into()).collect();
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+          WHERE c.parent_item_id IN (SELECT value FROM json_each(?1))
+          GROUP BY c.parent_item_id",
+    )?;
+    let ids = crate::sql::json_ids(parents.iter().map(|p| p.get()));
+    let rows = stmt.query_map([ids], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,

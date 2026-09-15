@@ -478,7 +478,7 @@ pub fn query_items(
             )?;
             let ordered = stmt
                 .query_map(
-                    rusqlite::params![serde_json::to_string(&ids).unwrap_or_default(), limit],
+                    rusqlite::params![jkb_core::sql::json_ids(ids.iter().copied()), limit],
                     |r| Ok(ItemId::new(r.get(0)?)),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -782,7 +782,7 @@ pub fn ls(
 /// subtask de-duplicated out of its namespace listing would be unreachable — to `depth` levels,
 /// never more than [`MAX_TREE_DEPTH`] (`None` asks for that). A node whose reference is one of its
 /// own ancestors' is listed but not descended into. The walk stops, cut short, at a node that does
-/// not fit `budget` or past [`MAX_TREE_NODES`]; the returned flag says whether it did.
+/// not fit `budget` or past [`MAX_TREE_NODES`]; the returned [`TreeCut`] says which, if either.
 ///
 /// # Errors
 /// Returns an error if a read fails.
@@ -792,13 +792,13 @@ pub fn tree(
     all: bool,
     depth: Option<usize>,
     budget: &mut Budget,
-) -> jkb_core::Result<(Vec<TreeNode>, bool)> {
+) -> jkb_core::Result<(Vec<TreeNode>, TreeCut)> {
     let mut walk = TreeWalk {
         conn,
         all,
         ancestors: path.map(str::to_owned).into_iter().collect(),
         listed: 0,
-        cut: false,
+        cut: TreeCut::Whole,
         budget,
     };
     let nodes = walk.level(
@@ -808,6 +808,20 @@ pub fn tree(
     Ok((nodes, walk.cut))
 }
 
+/// Whether, and where, a tree walk stopped early. Kept apart because the two are lifted differently:
+/// the byte budget is the daemon's, so the host lists the whole tree, while the node cap is the same
+/// everywhere — a notice that told a remote user to run a capped tree on the host sent them to the
+/// same cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeCut {
+    /// Nothing was cut.
+    Whole,
+    /// The read's byte budget ran out.
+    Budget,
+    /// [`MAX_TREE_NODES`] were listed.
+    NodeCap,
+}
+
 struct TreeWalk<'c, 'b> {
     conn: &'c Connection,
     all: bool,
@@ -815,8 +829,8 @@ struct TreeWalk<'c, 'b> {
     ancestors: Vec<String>,
     /// Nodes listed so far.
     listed: usize,
-    /// The walk stopped early.
-    cut: bool,
+    /// Whether, and why, the walk stopped early.
+    cut: TreeCut,
     budget: &'b mut Budget,
 }
 
@@ -824,8 +838,15 @@ impl TreeWalk<'_, '_> {
     fn level(&mut self, path: Option<&str>, depth: usize) -> jkb_core::Result<Vec<TreeNode>> {
         let mut out = Vec::new();
         for child in children(self.conn, path, self.all)? {
-            if self.cut || self.listed >= MAX_TREE_NODES || !self.budget.take(&child) {
-                self.cut = true;
+            if self.cut != TreeCut::Whole {
+                break;
+            }
+            if self.listed >= MAX_TREE_NODES {
+                self.cut = TreeCut::NodeCap;
+                break;
+            }
+            if !self.budget.take(&child) {
+                self.cut = TreeCut::Budget;
                 break;
             }
             self.listed += 1;
@@ -1066,8 +1087,8 @@ impl Embedder for NoEmbedder {
 }
 
 /// `task.show`: a task (or any item a task reference names) in full, with its recent transitions and
-/// its subtasks — as many as fit `budget` once the task itself is charged. The task is shown whatever
-/// its size: it is what was asked for.
+/// its subtasks — as many as fit `budget`. The task itself is shown whatever its size and is not
+/// charged, so `truncated` means exactly that subtasks were dropped.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`] when the reference names no item; else a failed read.
@@ -1113,7 +1134,8 @@ pub fn task_show(
             .collect(),
         subtasks: Vec::new(),
     };
-    let _ = budget.take(&detail.item);
+    // The task itself is not charged: it is what was asked for, and charging a large body marked the
+    // answer cut when no subtask had been dropped at all.
     task::subtasks_each(conn, id, |t| {
         let summary = SubtaskSummary {
             title: label(&t.uid, t.title.as_deref()),

@@ -217,9 +217,10 @@ impl Query {
             params.extend(self.exclude_kinds.iter().cloned().map(Value::Text));
         }
         if !self.ids.is_empty() {
-            let placeholders = vec!["?"; self.ids.len()].join(", ");
-            clauses.push(format!("i.id IN ({placeholders})"));
-            params.extend(self.ids.iter().map(|id| Value::Integer(id.get())));
+            clauses.push("i.id IN (SELECT value FROM json_each(?))".to_owned());
+            params.push(Value::Text(crate::sql::json_ids(
+                self.ids.iter().map(|id| id.get()),
+            )));
         }
         if let Some(status) = &self.status {
             clauses.push("i.status = ?".to_owned());
@@ -284,11 +285,12 @@ impl Query {
                 // A scope that resolves to no namespaces matches nothing.
                 clauses.push("1 = 0".to_owned());
             } else {
-                let placeholders = vec!["?"; ids.len()].join(", ");
-                clauses.push(format!(
-                    "i.id IN (SELECT item_id FROM placements WHERE namespace_id IN ({placeholders}))"
-                ));
-                params.extend(ids.into_iter().map(Value::Integer));
+                clauses.push(
+                    "i.id IN (SELECT item_id FROM placements
+                              WHERE namespace_id IN (SELECT value FROM json_each(?)))"
+                        .to_owned(),
+                );
+                params.push(Value::Text(crate::sql::json_ids(ids)));
             }
         }
         Ok(())

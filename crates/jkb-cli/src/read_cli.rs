@@ -157,17 +157,26 @@ impl<'a> Reads<'a> {
             .backend
             .call(request)
             .map_err(|e: ApiError| anyhow::Error::msg(e.message))?;
-        if response.truncated() {
-            // Through the daemon it is its byte budget, and the host is unbounded; on the host only a
-            // tree's node cap cuts, which running it elsewhere does not lift.
-            let notice = if self.remote {
-                "jkb: this answer was cut short at the daemon's read budget — narrow it (a path or a \
-                 query), or run it on the host"
-            } else {
-                "jkb: this answer was cut short — narrow it (a path or a query)"
-            };
+        // What cut it decides what lifts it: the daemon's byte budget is lifted on the host, which has
+        // none; a tree's node cap is the same everywhere.
+        let notice = match &response {
+            Response::Tree {
+                at_node_cap: true, ..
+            } => Some(format!(
+                "jkb: this tree stopped at {} nodes — root it at a path, or lower --depth",
+                jkb_api::kb::MAX_TREE_NODES
+            )),
+            r if r.truncated() && self.remote => Some(
+                "jkb: this answer was cut short at the daemon's read budget — narrow it, or run it on \
+                 the host"
+                    .to_owned(),
+            ),
+            r if r.truncated() => Some("jkb: this answer was cut short — narrow it".to_owned()),
+            _ => None,
+        };
+        if let Some(notice) = notice {
             eprintln!("{notice}");
-            self.notices.borrow_mut().push(notice.to_owned());
+            self.notices.borrow_mut().push(notice);
         }
         Ok(response)
     }
@@ -846,9 +855,11 @@ mod tests {
                     rows: Vec::new(),
                     truncated: true,
                 },
-                Request::KbTree { .. } => Response::Tree {
+                Request::KbTree { depth, .. } => Response::Tree {
                     nodes: Vec::new(),
                     truncated: true,
+                    // `--depth 3` asks for a node-cap cut; any other depth, a budget cut.
+                    at_node_cap: depth == Some(3),
                 },
                 Request::KbGrep { .. } => Response::GrepHits {
                     answer: GrepAnswer {
@@ -908,6 +919,7 @@ mod tests {
             vec!["search", "x"],
             vec!["ls"],
             vec!["tree"],
+            vec!["tree", "--depth", "3"],
             vec!["grep", "x"],
             vec!["task", "next"],
             vec!["task", "show", "t"],
@@ -922,10 +934,16 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{args:?}: {e:#}"));
                 let notices = reads.notices.borrow();
                 assert_eq!(notices.len(), 1, "{args:?} (remote {remote}): {notices:?}");
+                let node_cap = args == ["tree", "--depth", "3"];
                 assert_eq!(
                     notices[0].contains("run it on the host"),
-                    remote,
+                    remote && !node_cap,
                     "{args:?}: only the daemon's budget is lifted by running it on the host"
+                );
+                assert_eq!(
+                    notices[0].contains("nodes"),
+                    node_cap,
+                    "{args:?}: {notices:?}"
                 );
             }
         }

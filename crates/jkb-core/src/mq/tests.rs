@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::{
     ack, compact, group_create, inspect, now_ms, poll, poll_needed, send, tail, topic_create,
-    Created, Delivered, Draft, QueueError, Start, TopicSpec,
+    Created, Delivered, Draft, QueueError, Start, TopicSpec, MAX_BATCH,
 };
 use crate::{Db, Error};
 
@@ -915,4 +915,28 @@ fn writer_process() {
         db.write_txn("writer", move |c, m| send(c, m, "t", &d, now_ms()))
             .unwrap();
     }
+}
+
+/// A poll or tail over a topic holding more than [`MAX_BATCH`] messages reads at most that many: both
+/// run on the daemon's writer beside the notification hook, whatever the topic's creator let it hold.
+#[test]
+fn a_batch_is_bounded_whatever_it_asks_for() {
+    let db = db_with_topic(TopicSpec::default());
+    for n in 0..300 {
+        do_send(&db, draft("k", n), 1_000).unwrap();
+    }
+    do_group(&db, "g", Start::FromStart, 1_000);
+    assert_eq!(do_poll(&db, "g", usize::MAX, 1_000).len(), MAX_BATCH);
+    let refused = db.read(|c| tail(c, "t", MAX_BATCH + 1, 1_000)).unwrap_err();
+    assert!(
+        matches!(
+            queue_err(refused),
+            QueueError::Invalid { what: "limit", .. }
+        ),
+        "a tail past the batch is refused"
+    );
+    assert_eq!(
+        db.read(|c| tail(c, "t", MAX_BATCH, 1_000)).unwrap().len(),
+        MAX_BATCH
+    );
 }

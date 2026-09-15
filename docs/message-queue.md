@@ -119,10 +119,15 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   long-polls, so queued reads cannot hold the op permits a hook's write needs. A permit is released
   only when its call has returned on its blocking thread and hyper has written or dropped the answer:
   released with the request's future, a client that asked and hung up grew the reader's queue while
-  the budget read empty. Pinned by `every_op_is_served_on_the_connection_its_class_names` (each op's
+  the budget read empty. The answer is handed to hyper in 64 KiB frames, because given one frame it
+  copied the whole answer into its buffer and dropped the body — and the permit — before sending a
+  byte (measured: a loopback client that never read got its permit straight back). And a write that
+  makes no progress for `write_stall` (10 s) closes its connection, since hyper has no write timeout:
+  without it a client that stopped reading kept its permit until the daemon restarted. Pinned by `every_op_is_served_on_the_connection_its_class_names` (each op's
   class against the test's own list; with the writer held every read answers, with the reader held
   every other op does; no op is refused as a write to the read-only connection),
-  `a_permit_outlives_a_cancelled_request_until_its_call_returns` and
+  `a_permit_outlives_a_cancelled_request_until_its_call_returns`,
+  `an_unread_answer_holds_its_permit_until_the_write_deadline` and
   `reads_have_their_own_permits_and_a_bounded_answer`.
 - **Every read that lists is bounded by one byte budget** (`kb::Budget`), charged row by row with
   what each row serializes to, so the answer is a prefix of the full one and says `truncated`. The
@@ -131,18 +136,22 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   measured in the wrong unit — chunks of context, while a document hit's context is its whole body;
   bytes of line text, while each line carries its own JSON — or missing (`kb.query` with no limit).
   Not bounded, stated: `kb.cat` and `task.show`'s own body are the one item asked for; a namespace's
-  children are gathered before they are sorted and charged; and the queue's reads are outside the
-  budget — `mq.tail` answers up to its `limit` of what a topic holds, and a topic's `max_bytes` is
-  whatever its creator asked, a container included (a residual of stage S2's ops, not this one's).
-  The frontier (`task.ready`) and a task's subtasks are ordered and limited over ids, or streamed, so
-  no body is loaded that the answer does not keep (`task::ready_ids`, `task::subtasks_each`). The other bounds are on
+  children are gathered before they are sorted and charged; and the queue's reads, which stay on the
+  writer, are bounded instead by `mq::MAX_BATCH` (256): a poll hands over at most that many and a
+  tail asking for more is refused, so neither reads more than about 16 MiB of payload however large
+  its topic's creator — a container included — let it grow. The frontier (`task.ready`) is ordered
+  and limited over ids, and a task's subtasks are streamed, so at most one body is held at a time
+  (`task::ready_ids`, `task::subtasks_each`). Every unbounded id or uri list in `jkb-core` is bound
+  as one JSON parameter (`sql::json_ids`), since a placeholder per element failed past `SQLite`'s
+  32,766 variables. The other bounds are on
   work rather than answer size: `kb.search` takes at most 1000 hits (the hybrid route, served only
   where there is an embedder, fuses from twice the limit) and 50 chunks of context either side;
   `kb.grep` refuses an empty pattern and reads items one at a time (`item::grep_each`), counting
   past the budget, and `-c`/`-l` ask for no lines; `jkb recent` orders and limits on the server
   (`order: updated_desc`); `kb.tree` descends at most 48 levels (each is two levels of JSON, and
   serde_json refuses past 128), not into a node whose reference is one of its ancestors', and stops
-  after 10,000 nodes. Pinned by `every_listing_read_stays_within_its_budget_and_says_when_it_was_cut`
+  after 10,000 nodes — a cut the answer names apart (`at_node_cap`), since unlike the budget no host
+  lifts it. Pinned by `every_listing_read_stays_within_its_budget_and_says_when_it_was_cut`
   across all ten listing reads; each guard was checked by removing it.
 
 `after` is the consumer's **fetch position**, separate from its committed one as in Kafka: a consumer

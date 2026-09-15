@@ -971,3 +971,71 @@ fn reads_have_their_own_permits_and_a_bounded_answer() {
     };
     assert!(truncated && rows.len() < 100, "{} rows", rows.len());
 }
+
+/// A response body keeps its request's permit until it is written, and a client that never reads it
+/// keeps that permit only until the write deadline closes the connection — not until the daemon
+/// restarts, which is what a body holding a permit meant before there was a deadline.
+#[test]
+fn an_unread_answer_holds_its_permit_until_the_write_deadline() {
+    use std::io::Write as _;
+    let f = Fixture::with(|cfg| {
+        cfg.max_reads = 1;
+        cfg.write_stall = Duration::from_secs(3);
+    });
+    // `kb.cat` answers with the whole body, unbudgeted: far more than any socket buffer holds.
+    f.db.write_txn("t", |c, m| {
+        jkb_core::item::upsert(
+            c,
+            m,
+            &jkb_core::item::NewItem {
+                uid: "doc:big".into(),
+                kind: "note".into(),
+                content: Some("x".repeat(16 * 1024 * 1024)),
+                content_hash: None,
+                mime: None,
+            },
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+    let token = std::fs::read_to_string(&f.token).unwrap();
+    let addr = f.base.trim_start_matches("http://");
+    let mut stalled = std::net::TcpStream::connect(addr).unwrap();
+    let body = r#"{"op":"kb.cat","uid":"doc:big"}"#;
+    write!(
+        stalled,
+        "POST /v1/op HTTP/1.1\r\nHost: jkb\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        token.trim(),
+        body.len()
+    )
+    .unwrap();
+    // Never read. Give the daemon time to finish the call itself, so what holds the permit next is the
+    // unwritten answer rather than the read still running.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let c = f.client();
+    let ls = || {
+        c.call(Request::KbLs {
+            path: None,
+            all: false,
+            recursive: false,
+        })
+    };
+    let refused = ls().unwrap_err();
+    assert_eq!(
+        refused.code,
+        ErrorCode::Busy,
+        "the unwritten answer still holds the one read permit: {refused:?}"
+    );
+    let started = Instant::now();
+    loop {
+        match ls() {
+            Ok(_) => break,
+            Err(e) if e.code == ErrorCode::Busy && started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("after {:?}: {e:?}", started.elapsed()),
+        }
+    }
+    drop(stalled);
+}

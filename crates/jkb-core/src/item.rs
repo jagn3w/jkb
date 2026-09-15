@@ -304,18 +304,12 @@ pub fn get_many(conn: &Connection, items: &[ItemId]) -> Result<HashMap<ItemId, I
     if items.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; items.len()].join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, uid, kind, content, content_hash, mime, status, resolution, priority, due,
                 created_at, updated_at
-         FROM items WHERE id IN ({placeholders})"
-    );
-    let params: Vec<rusqlite::types::Value> = items
-        .iter()
-        .map(|id| rusqlite::types::Value::Integer(id.get()))
-        .collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+         FROM items WHERE id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map([crate::sql::json_ids(items.iter().map(|i| i.get()))], |r| {
         Ok(ItemMeta {
             id: ItemId::new(r.get(0)?),
             uid: r.get(1)?,
@@ -711,20 +705,14 @@ pub fn derived_from(
     if children.is_empty() {
         return Ok(out);
     }
-    let placeholders = (1..=children.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Placeholders are generated from a count; every value is bound.
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT src_item_id, dst_item_id FROM edges
-          WHERE type = 'derived_from' AND src_item_id IN ({placeholders})"
-    );
-    let params: Vec<rusqlite::types::Value> = children.iter().map(|c| c.get().into()).collect();
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-    })?;
+          WHERE type = 'derived_from' AND src_item_id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map(
+        [crate::sql::json_ids(children.iter().map(|c| c.get()))],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )?;
     for row in rows {
         let (child, source) = row?;
         out.entry(ItemId::new(child))
@@ -810,21 +798,15 @@ pub fn derived_kind_counts(
     if parents.is_empty() {
         return Ok(out);
     }
-    // Placeholders are generated from a count; every value is bound.
-    let placeholders = (2..2 + parents.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.dst_item_id, COUNT(*) FROM edges e
          JOIN items i ON i.id = e.src_item_id
-         WHERE e.type = 'derived_from' AND i.kind = ?1 AND e.dst_item_id IN ({placeholders})
-         GROUP BY e.dst_item_id"
-    );
-    let mut params: Vec<rusqlite::types::Value> = vec![kind.to_owned().into()];
-    params.extend(parents.iter().map(|p| p.get().into()));
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+         WHERE e.type = 'derived_from' AND i.kind = ?1
+           AND e.dst_item_id IN (SELECT value FROM json_each(?2))
+         GROUP BY e.dst_item_id",
+    )?;
+    let ids = crate::sql::json_ids(parents.iter().map(|p| p.get()));
+    let rows = stmt.query_map(params![kind, ids], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
     })?;
     for row in rows {

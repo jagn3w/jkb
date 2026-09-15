@@ -659,9 +659,12 @@ pub enum Response {
     Tree {
         /// The top level.
         nodes: Vec<kb::TreeNode>,
-        /// Cut short at the read's budget ([`kb::Budget`]).
+        /// Cut short, at the read's budget ([`kb::Budget`]) or the node cap.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        /// Cut at [`kb::MAX_TREE_NODES`] — a cut no backend lifts, unlike the budget's.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_node_cap: bool,
     },
     /// A `task.subtasks`.
     Children {
@@ -1160,9 +1163,13 @@ impl Backend for LocalBackend {
                 Response::Listing { rows, truncated }
             }
             Request::KbTree { path, all, depth } => {
-                let (nodes, truncated) =
+                let (nodes, cut) =
                     db.read(move |c| kb::tree(c, path.as_deref(), all, depth, &mut budget))?;
-                Response::Tree { nodes, truncated }
+                Response::Tree {
+                    nodes,
+                    truncated: cut != kb::TreeCut::Whole,
+                    at_node_cap: cut == kb::TreeCut::NodeCap,
+                }
             }
             Request::KbCat { uid } => Response::Content {
                 content: db.read_with(move |c| kb::cat(c, &uid))?,

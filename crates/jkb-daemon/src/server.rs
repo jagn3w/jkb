@@ -73,6 +73,11 @@ pub struct ServeConfig {
     pub read_timeout: Duration,
     /// How often a daemon whose database could not be opened tries again, on a request.
     pub reopen_every: Duration,
+    /// How long a response write may make no progress before its connection is closed. A response
+    /// body keeps the permit its request ran under until it is written ([`Held`]), and hyper has no
+    /// write timeout of its own — so without this a client that stopped reading kept a permit until
+    /// the daemon restarted, and enough of them refused the notification hook's every request.
+    pub write_stall: Duration,
 }
 
 impl ServeConfig {
@@ -92,6 +97,7 @@ impl ServeConfig {
             max_connections: 256,
             read_timeout: Duration::from_secs(10),
             reopen_every: Duration::from_secs(5),
+            write_stall: Duration::from_secs(10),
         }
     }
 }
@@ -328,6 +334,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
     let read_timeout = cfg.read_timeout;
+    let write_stall = cfg.write_stall;
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("jkb-serve-accept".to_owned())
@@ -353,32 +360,13 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
                             let Ok(slot) = Arc::clone(&connections).try_acquire_owned() else {
                                 continue;
                             };
-                            let state = Arc::clone(&state);
-                            tokio::spawn(async move {
-                                let _slot = slot;
-                                let authed = Arc::new(AtomicBool::new(false));
-                                let service = {
-                                    let authed = Arc::clone(&authed);
-                                    service_fn(move |req| {
-                                        respond(Arc::clone(&state), Arc::clone(&authed), req)
-                                    })
-                                };
-                                let conn = http1::Builder::new()
-                                    .timer(TokioTimer::new())
-                                    .header_read_timeout(read_timeout)
-                                    .serve_connection(TokioIo::new(stream), service);
-                                tokio::pin!(conn);
-                                // A connection has `read_timeout` to present the token, whatever it
-                                // does meanwhile; one that has not is dropped, which closes it.
-                                tokio::select! {
-                                    _ = conn.as_mut() => {}
-                                    () = tokio::time::sleep(read_timeout) => {
-                                        if authed.load(Ordering::SeqCst) {
-                                            let _ = conn.await;
-                                        }
-                                    }
-                                }
-                            });
+                            tokio::spawn(serve_connection(
+                                stream,
+                                Arc::clone(&state),
+                                slot,
+                                read_timeout,
+                                write_stall,
+                            ));
                         }
                     }
                 }
@@ -566,6 +554,103 @@ async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
     .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
 }
 
+/// A stream whose writes fail with `TimedOut` once one has made no progress for its deadline — the
+/// write timeout hyper does not have ([`ServeConfig::write_stall`]). The failed write ends the
+/// connection, which drops the response body and the permit it holds.
+struct WriteDeadline<S> {
+    inner: S,
+    stall: Duration,
+    /// Armed by a write that could not proceed; cleared by one that did.
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteDeadline<S> {
+    const fn new(inner: S, stall: Duration) -> Self {
+        Self {
+            inner,
+            stall,
+            stalled: None,
+        }
+    }
+
+    /// `result` as a write's outcome: progress disarms the deadline; no progress arms it, and past it
+    /// is an error.
+    fn judge<T>(
+        &mut self,
+        result: std::task::Poll<std::io::Result<T>>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future as _;
+        if result.is_ready() {
+            self.stalled = None;
+            return result;
+        }
+        let stall = self.stall;
+        let deadline = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client stopped reading its response",
+            )));
+        }
+        std::task::Poll::Pending
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteDeadline<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.judge(result, cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.judge(result, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_flush(cx);
+        this.judge(result, cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// A permit shared by everything that must finish before it is released.
 type Permit = Arc<tokio::sync::OwnedSemaphorePermit>;
 
@@ -573,9 +658,28 @@ type Permit = Arc<tokio::sync::OwnedSemaphorePermit>;
 /// client that went away. An answer is in memory until then — up to a read's whole budget — so it
 /// counts against the budget that admitted it: released when the handler returned, 256 connections
 /// that asked for large reads and never read the socket held every answer with every permit free.
+///
+/// **Handed to hyper in [`Held::CHUNK`] frames.** hyper pulls a body's next frame only once its write
+/// buffer has room, but it takes a whole frame when it does: given the answer as one frame it copied
+/// all of it into its buffer at once and dropped the body — and the permit — before a byte was sent,
+/// which a loopback test measured as the permit coming straight back for a client that never read.
 struct Held {
     body: Full<Bytes>,
+    /// What of the body's data has not been handed over yet.
+    rest: Bytes,
     _permit: Option<Permit>,
+}
+
+impl Held {
+    const CHUNK: usize = 64 * 1024;
+
+    const fn new(body: Full<Bytes>, permit: Option<Permit>) -> Self {
+        Self {
+            body,
+            rest: Bytes::new(),
+            _permit: permit,
+        }
+    }
 }
 
 impl hyper::body::Body for Held {
@@ -586,15 +690,71 @@ impl hyper::body::Body for Held {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
-        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+        let this = self.get_mut();
+        loop {
+            if !this.rest.is_empty() {
+                let n = this.rest.len().min(Self::CHUNK);
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                    this.rest.split_to(n),
+                ))));
+            }
+            match std::pin::Pin::new(&mut this.body).poll_frame(cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => this.rest = data,
+                    Err(frame) => return std::task::Poll::Ready(Some(Ok(frame))),
+                },
+                other => return other,
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
+        self.rest.is_empty() && self.body.is_end_stream()
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.body.size_hint()
+        let inner = self.body.size_hint();
+        let rest = self.rest.len() as u64;
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(inner.lower() + rest);
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper + rest);
+        }
+        hint
+    }
+}
+
+/// One accepted connection, served until it closes. It has `read_timeout` to present the token,
+/// whatever it does meanwhile; one that has not is dropped, which closes it. `slot` is its place under
+/// the connection cap, released when it ends.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    state: Arc<State>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    read_timeout: Duration,
+    write_stall: Duration,
+) {
+    let _slot = slot;
+    let authed = Arc::new(AtomicBool::new(false));
+    let service = {
+        let authed = Arc::clone(&authed);
+        service_fn(move |req| respond(Arc::clone(&state), Arc::clone(&authed), req))
+    };
+    let conn = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(read_timeout)
+        .serve_connection(
+            TokioIo::new(WriteDeadline::new(stream, write_stall)),
+            service,
+        );
+    tokio::pin!(conn);
+    tokio::select! {
+        _ = conn.as_mut() => {}
+        () = tokio::time::sleep(read_timeout) => {
+            if authed.load(Ordering::SeqCst) {
+                let _ = conn.await;
+            }
+        }
     }
 }
 
@@ -606,10 +766,7 @@ async fn respond(
 ) -> Result<hyper::Response<Held>, Infallible> {
     let mut permit = None;
     let response = handle(state, authed, req, &mut permit).await?;
-    Ok(response.map(|body| Held {
-        body,
-        _permit: permit,
-    }))
+    Ok(response.map(|body| Held::new(body, permit)))
 }
 
 /// `held` is left holding the permit the request ran under, for the response body to keep.
@@ -866,10 +1023,10 @@ mod tests {
         });
 
         let permit = std::sync::Arc::new(budget.clone().try_acquire_owned().unwrap());
-        let body = Held {
-            body: http_body_util::Full::new(bytes::Bytes::from_static(b"answer")),
-            _permit: Some(permit),
-        };
+        let body = Held::new(
+            http_body_util::Full::new(bytes::Bytes::from_static(b"answer")),
+            Some(permit),
+        );
         assert_eq!(
             budget.available_permits(),
             0,

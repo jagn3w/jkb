@@ -41,6 +41,12 @@ use crate::{Result, WriteMeta};
 
 /// Largest accepted payload, in bytes of its JSON text.
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+/// The most messages one [`poll`] hands over or one [`tail`] reads. Both run on the daemon's writer,
+/// beside the notification hook's 1 s round trip, and each message is parsed from up to
+/// [`MAX_PAYLOAD_BYTES`]: this keeps the worst read near 16 MiB rather than whatever a topic's creator
+/// allowed it to hold. A poll asking for more gets this many (a batch may always be short); a tail
+/// asking for more is refused.
+pub const MAX_BATCH: usize = 256;
 /// Largest accepted key, in bytes.
 pub const MAX_KEY_BYTES: usize = 512;
 /// Largest accepted topic, group, kind or producer name, in bytes.
@@ -688,7 +694,7 @@ pub fn poll(
         "UPDATE mq_groups SET last_poll_at = ?1 WHERE topic_id = ?2 AND name = ?3",
     )?
     .execute(params![now, topic_id, group])?;
-    let limit = i64::try_from(max).unwrap_or(i64::MAX);
+    let limit = i64::try_from(max.min(MAX_BATCH)).unwrap_or(i64::MAX);
     let rows = message_rows(
         conn,
         "SELECT seq, key, kind, payload, producer, enqueued_at, expires_at FROM mq_messages \
@@ -703,8 +709,12 @@ pub fn poll(
 /// `jkb mq tail`. A payload that does not parse is returned flagged [`Delivered::unreadable`].
 ///
 /// # Errors
-/// [`QueueError::NoSuchTopic`], or a database error.
+/// [`QueueError::Invalid`] for a limit over [`MAX_BATCH`], [`QueueError::NoSuchTopic`], or a database
+/// error.
 pub fn tail(conn: &Connection, topic: &str, limit: usize, now: i64) -> Result<Vec<Delivered>> {
+    if limit > MAX_BATCH {
+        return Err(invalid("limit", format!("at most {MAX_BATCH} messages")).into());
+    }
     let (topic_id, _) = topic_row(conn, topic)?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = message_rows(

@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::ItemId;
@@ -193,20 +193,20 @@ pub fn applications_for(
     if items.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; items.len()].join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT item_id, facet, value FROM tag_applications
-         WHERE item_id IN ({placeholders}) ORDER BY item_id, facet, value"
-    );
-    let params: Vec<Value> = items.iter().map(|id| Value::Integer(id.get())).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
-        Ok((
-            ItemId::new(r.get::<_, i64>(0)?),
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
+         WHERE item_id IN (SELECT value FROM json_each(?1)) ORDER BY item_id, facet, value",
+    )?;
+    let rows = stmt.query_map(
+        [crate::sql::json_ids(items.iter().map(|id| id.get()))],
+        |r| {
+            Ok((
+                ItemId::new(r.get::<_, i64>(0)?),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )?;
     for row in rows {
         let (id, facet, value) = row?;
         out.entry(id).or_default().push((facet, value));

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{ItemId, SyncMode};
@@ -98,10 +98,10 @@ pub fn items_for_uris(conn: &Connection, uris: &[String]) -> Result<HashMap<Stri
     if uris.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; uris.len()].join(", ");
-    let sql = format!("SELECT uri, item_id FROM bindings WHERE uri IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(uris.iter()), |row| {
+    let mut stmt = conn.prepare_cached(
+        "SELECT uri, item_id FROM bindings WHERE uri IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map([crate::sql::json_strings(uris)], |row| {
         Ok((row.get::<_, String>(0)?, ItemId::new(row.get::<_, i64>(1)?)))
     })?;
     for row in rows {
