@@ -221,16 +221,6 @@ impl<'a> Ops<'a> {
             namespace,
             raw: (!self.remote).then_some(raw),
         });
-        if self.remote {
-            let size = serde_json::to_vec(&request)?.len();
-            if size > jkb_daemon::MAX_BODY_BYTES {
-                bail!(
-                    "{source}'s text makes a {size}-byte request, more than the {} bytes the daemon \
-                     accepts in one request; run it on the host",
-                    jkb_daemon::MAX_BODY_BYTES
-                );
-            }
-        }
         let ingested = match self.call(request)? {
             Response::Ingested { ingested } => ingested,
             other => return unexpected("ingest.text", &other),

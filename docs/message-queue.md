@@ -181,7 +181,9 @@ the ingestion's idempotency key, and captures it through the same `Pipeline::ing
   (`IngestAsk::raw`, `#[serde(skip)]`, so never on the wire): the document is `b3:<hash of the bytes>`
   and the bytes are its blob, exactly as a host ingest always was, so re-ingesting a file ingested
   before this op is still a no-op. Through the daemon there are no bytes, so the document is addressed
-  by `jkb_ingest::text_address` — the blake3 of the text behind a domain prefix — and no blob is stored.
+  by `jkb_ingest::text_address` — blake3 of the text in key-derivation mode under its own context, which
+  no plain hash of any bytes equals (review 2: a prefix-and-text hash was matched by a file whose bytes
+  began with the prefix) — and no blob is stored.
   Not by a hash the client names, which would let it choose the uid its text is filed under; and not by
   the text's plain hash either (review 1): a UTF-8 file's text is its bytes, so a container sending a
   host file's bytes as text took the uid and ingestion row the host's own ingest of that file resumes
@@ -193,10 +195,11 @@ the ingestion's idempotency key, and captures it through the same `Pipeline::ing
   the vectors exist (written by `index --pending`, which keys no ingestion) a repeat marks the ingestion
   complete and answers `embedded: true`. Nothing runs `index --pending` on its own yet (tasks F5).
 - **Size and load.** The request is bounded by the daemon's body cap (`jkb_daemon::MAX_BODY_BYTES`, 1 MiB),
-  which the CLI checks before sending — a body many times the cap was otherwise cut off mid-upload and
-  reported as a daemon that could not be reached. A capture at the cap holds the single writer for
-  over 100 ms, so ingests run under a budget of their own (`max_ingests`, 2) in place of an op permit,
-  refused `busy` past it, rather than queue ahead of the notification hook's writes.
+  which `RemoteBackend` checks before sending any op — a body many times the cap was otherwise cut off
+  mid-upload and reported as a daemon that could not be reached. A capture at the cap holds the single
+  writer for about half a second (measured by the stage-6.3 review: 457 ms release, Linux), so ingests
+  run one at a time under a budget of their own (`max_ingests`, 1) in place of an op permit, refused
+  `busy` past it, rather than queue ahead of the notification hook's writes, which have 1 s.
 - **Answer.** `namespace` is where the document is — for one ingested before, where that ingest put it.
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
@@ -417,8 +420,8 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
   that passes (a lock held past the busy timeout during a long write) needs no restart. Not every
   start-up failure is retried: an unwritable token directory still stops it, and a database file that
   does not exist yet is created, as every `jkb` command does;
-- holds a 1 MiB body limit, and separate concurrency budgets for operations, long-polls and the agent
-  read set (see its paragraph above), answering `busy` when one is exhausted. A request past authentication holds its permit from before its body is
+- holds a 1 MiB body limit, and separate concurrency budgets for operations, long-polls, the agent
+  read set and `ingest.text` (see their paragraphs above), answering `busy` when one is exhausted. A request past authentication holds its permit from before its body is
   read;
 - bounds the unauthenticated side too: at most 256 connections (one more is closed on accept — and
   fewer if the descriptor limit, raised toward 4096 at start, leaves less room beside the database's

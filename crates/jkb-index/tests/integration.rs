@@ -694,3 +694,25 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
         "the repair did not install the trigger, so the database is still orphaning rows"
     );
 }
+
+/// A lookup of more ids than `SQLite` binds in one statement (32,766) answers them all: a resume of a
+/// capture with that many chunks asked for every one at once, and failed on every run.
+#[test]
+fn vectors_for_answers_more_ids_than_one_statement_can_bind() {
+    let db = open_db();
+    let n = 33_000_i64;
+    let found = db
+        .write_txn("test", move |conn, _| {
+            let vector = VectorIndexer::new(FakeEmbedder::arc("fake", 2));
+            vector.ensure_ready(conn).unwrap();
+            for id in 1..=n {
+                vector
+                    .upsert_vector(conn, ItemId::new(id), &[1.0, 0.5])
+                    .unwrap();
+            }
+            let ids: Vec<ItemId> = (1..=n).map(ItemId::new).collect();
+            Ok(vector.vectors_for(conn, &ids).unwrap().len())
+        })
+        .unwrap();
+    assert_eq!(found, usize::try_from(n).unwrap());
+}

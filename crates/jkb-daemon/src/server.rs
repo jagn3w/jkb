@@ -54,9 +54,11 @@ pub struct ServeConfig {
     pub max_ops: usize,
     /// Concurrent long-polls — a separate budget, so subscribers cannot starve a hook's request.
     pub max_polls: usize,
-    /// Concurrent `ingest.text` requests — a fourth budget, in place of an op permit as a read's is: one
-    /// capture of a body at the cap holds the single writer for over 100 ms, so a burst of them on op
-    /// permits held it for seconds while the notification hook's writes, with 1 s to answer, queued.
+    /// Concurrent `ingest.text` requests — a fourth budget, in place of an op permit as a read's is. One
+    /// capture of a body at the cap holds the single writer for about half a second (measured by the
+    /// stage-6.3 review with a loopback test, release build, Linux dev container: a ~1 MiB ingest 457 ms,
+    /// a topic create issued during it waiting up to 472 ms; with two in flight, up to 841 ms), and the
+    /// notification hook's writes have 1 s. So one at a time: two left a hook write most of its deadline.
     pub max_ingests: usize,
     /// Concurrent read-set requests (`Request::is_agent_read`) — a third budget. The reads run one at a time
     /// on the reader connection, so a burst of them otherwise held every op permit while queued and a
@@ -95,7 +97,7 @@ impl ServeConfig {
             max_ops: 64,
             max_polls: 32,
             max_reads: 16,
-            max_ingests: 2,
+            max_ingests: 1,
             read_budget_bytes: 16 * 1024 * 1024,
             max_wait: Duration::from_secs(30),
             poll_floor: Duration::from_millis(250),

@@ -52,7 +52,8 @@ pub struct Outcome {
     /// Whether the source's items are vector-embedded (false if the embedder was
     /// down — the source is still captured and keyword-searchable).
     pub embedded: bool,
-    /// True if this source was already fully ingested (the call was a no-op).
+    /// True if an earlier run captured this source, so this call wrote no items — it may still have
+    /// written vectors, or marked a capture embedded since complete.
     pub already_ingested: bool,
     /// Non-fatal warnings (e.g. near-empty extraction, embedder unavailable).
     pub warnings: Vec<String>,
@@ -286,8 +287,8 @@ impl Pipeline {
                 None => None,
             };
 
-            // Whatever the state, a run that has the source bytes keeps them: a resume of a capture made
-            // without them then leaves the blob its document is addressed by.
+            // Whatever the state, a run that has the source bytes keeps them, so a blob removed out of band
+            // is restored by the next ingest of its source.
             if let Some(raw) = &raw {
                 blob::store(conn, &hash, raw, Some(&mime))?;
             }
@@ -684,17 +685,17 @@ impl IndexReport {
     }
 }
 
-/// The address of a document known only by its `text`: the blake3 of the text behind a domain prefix no
-/// file's bytes begin with by accident, so it never equals the address of any source's bytes. A client's
-/// text and a host file are then two documents even when the file's text is its bytes, and a client
-/// cannot take the uid, the ingestion row or the resume a host file's ingest would use.
+/// The address of a document known only by its `text`: blake3 in key-derivation mode under a context of
+/// its own, which no plain blake3 of any bytes can equal — so a client's text and a host file are two
+/// documents even when the file's text is its bytes, and a client cannot take the uid, the ingestion row
+/// or the resume a host file's ingest would use. A hash of a prefix and the text was not that: a file
+/// whose bytes began with the prefix hashed to the same address, and one the container wrote for the host
+/// to ingest later landed in the container's capture (stage-6.3 review 2).
 #[must_use]
 pub fn text_address(text: &str) -> String {
-    const DOMAIN: &[u8] = b"jkb ingest.text\0";
-    let mut bytes = Vec::with_capacity(DOMAIN.len() + text.len());
-    bytes.extend_from_slice(DOMAIN);
-    bytes.extend_from_slice(text.as_bytes());
-    blob::hash_bytes(&bytes)
+    let mut hasher = blake3::Hasher::new_derive_key("jkb 2026-09-15 ingest.text document address");
+    hasher.update(text.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// The chunk items derived from `document`, via the `derived_from` edge ingest writes.

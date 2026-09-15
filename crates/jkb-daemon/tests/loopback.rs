@@ -977,6 +977,10 @@ fn reads_have_their_own_permits_and_a_bounded_answer() {
 /// writes.
 #[test]
 fn ingests_have_their_own_permits() {
+    // One at a time by default: a capture at the body cap holds the writer about half a second, and two
+    // left a hook's write most of its 1 s (measured by the stage-6.3 review; see `max_ingests`).
+    let defaults = ServeConfig::new("127.0.0.1:0".parse().unwrap(), "token".into());
+    assert_eq!(defaults.max_ingests, 1);
     let f = Fixture::with(|cfg| cfg.max_ingests = 0);
     let c = f.client();
     let refused = c

@@ -132,10 +132,25 @@ impl RemoteBackend {
         } else {
             format!("{}/v1/op?wait_ms={}", self.base, wait.as_millis())
         };
+        // Refused here, before any of it is sent: the daemon refuses a body past its cap by closing the
+        // connection mid-upload, and a body many times the cap then read as a daemon out of reach.
+        let body = serde_json::to_vec(request)
+            .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?;
+        if body.len() > crate::MAX_BODY_BYTES {
+            return Err(ApiError::with_code(
+                ErrorCode::TooLarge,
+                format!(
+                    "a {}-byte request, more than the {} bytes jkb serve accepts in one",
+                    body.len(),
+                    crate::MAX_BODY_BYTES
+                ),
+            ));
+        }
         self.client
             .post(url)
             .bearer_auth(token)
-            .json(request)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .timeout(wait + self.op_timeout)
             .send()
             .map_err(|e| {
