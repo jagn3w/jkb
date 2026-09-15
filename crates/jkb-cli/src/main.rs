@@ -1546,7 +1546,7 @@ fn local_reads(db: &Db, command: Command, global: bool, json: bool) -> Result<()
     if matches!(command, Command::Search { .. }) {
         backend = backend.with_embedder(embedder()?);
     }
-    read_cli::Reads::new(&backend, global, json, SearchRoute::Hybrid).run(command)
+    read_cli::Reads::new(&backend, global, json, false).run(command)
 }
 
 /// The ambient namespace for the current directory, unless `--global`.

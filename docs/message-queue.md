@@ -70,12 +70,15 @@ routinely built from different checkouts.
 | `kb.cat` | `uid` | `content` {`content`} |
 | `kb.grep` | `pattern` (non-empty), `scope?`, `ignore_case?`, `mode?` (`lines`\|`names`\|`count`) | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}], `count`, `truncated`} |
 
-Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`) carries
-`truncated: true` when the read's budget cut it, and omits the field otherwise.
 | `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` (≤ 50) | `search_hits` {`hits`} |
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
 | `task.subtasks` | `uid`, `all?` | `children` {`children`} |
+
+Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`) and `grep_hits`
+carries `truncated: true` when the read was cut — at its byte budget, or a tree at its node cap — and
+omits the field otherwise. `jkb task show --json` gained a `subtasks` array (`uid`, `title`,
+`status`) with this op, so a cut it reports refers to something in the document.
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
 effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
@@ -106,20 +109,33 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   `LocalBackend::with_reader`). `Db` runs every call on one thread, so a container's long read — a
   wide grep, a deep tree — held up every write behind it, the notification hook's 1 s round trip
   included (pinned by `a_long_read_on_the_reader_does_not_hold_up_a_write`: a 1.5 s read, and the
-  write beside it under 0.7 s). Which ops are reads is said once, by `Request::is_read`: the backend
-  picks the connection from it — no dispatch arm chooses — and `jkb serve` counts reads against a
-  **third permit budget** (`max_reads`, 16) beside ops and long-polls, since reads queue on the one
-  reader and otherwise held the op permits a hook's write needs. Pinned by
-  `every_op_is_served_on_the_connection_its_class_names` (with the writer held, every read answers;
-  no op is refused as a write to the read-only connection) and `reads_have_their_own_permits_and_a_bounded_answer`.
+  write beside it under 0.7 s). Which ops go there is said once, by `Request::is_agent_read` — the
+  read set (`kb.*`, `task.ready`/`show`/`subtasks`), **not** every op that does not write: the reader
+  serves one call at a time behind a client's greps, so the queue's and the hook's own short reads
+  (`mq.inspect`, `mq.tail`, `notify.open_sessions`, whose `SessionStart` sweep has 1 s) stay on the
+  writer. Classing by "does not write" put that sweep behind a container's grep, and a third review
+  caught it. The backend picks the connection from the class — no dispatch arm chooses — and `jkb
+  serve` counts the read set against a **third permit budget** (`max_reads`, 16) beside ops and
+  long-polls, so queued reads cannot hold the op permits a hook's write needs. A permit is released
+  only when its call has returned on its blocking thread and hyper has written or dropped the answer:
+  released with the request's future, a client that asked and hung up grew the reader's queue while
+  the budget read empty. Pinned by `every_op_is_served_on_the_connection_its_class_names` (each op's
+  class against the test's own list; with the writer held every read answers, with the reader held
+  every other op does; no op is refused as a write to the read-only connection),
+  `a_permit_outlives_a_cancelled_request_until_its_call_returns` and
+  `reads_have_their_own_permits_and_a_bounded_answer`.
 - **Every read that lists is bounded by one byte budget** (`kb::Budget`), charged row by row with
   what each row serializes to, so the answer is a prefix of the full one and says `truncated`. The
   daemon gives each read 16 MiB (`read_budget_bytes`); the host CLI's is unlimited, and the CLI says
   on stderr when an answer was cut. It replaced per-op caps, each of which a second review found
   measured in the wrong unit — chunks of context, while a document hit's context is its whole body;
   bytes of line text, while each line carries its own JSON — or missing (`kb.query` with no limit).
-  Not bounded, stated: `kb.cat` and `task.show`'s own body are the one item asked for, and a
-  namespace's children are gathered before they are sorted and charged. The other bounds are on
+  Not bounded, stated: `kb.cat` and `task.show`'s own body are the one item asked for; a namespace's
+  children are gathered before they are sorted and charged; and the queue's reads are outside the
+  budget — `mq.tail` answers up to its `limit` of what a topic holds, and a topic's `max_bytes` is
+  whatever its creator asked, a container included (a residual of stage S2's ops, not this one's).
+  The frontier (`task.ready`) and a task's subtasks are ordered and limited over ids, or streamed, so
+  no body is loaded that the answer does not keep (`task::ready_ids`, `task::subtasks_each`). The other bounds are on
   work rather than answer size: `kb.search` takes at most 1000 hits (the hybrid route, served only
   where there is an embedder, fuses from twice the limit) and 50 chunks of context either side;
   `kb.grep` refuses an empty pattern and reads items one at a time (`item::grep_each`), counting
@@ -267,8 +283,8 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
   that passes (a lock held past the busy timeout during a long write) needs no restart. Not every
   start-up failure is retried: an unwritable token directory still stops it, and a database file that
   does not exist yet is created, as every `jkb` command does;
-- holds a 1 MiB body limit, and separate concurrency budgets for operations and long-polls, answering
-  `busy` when one is exhausted. A request past authentication holds its permit from before its body is
+- holds a 1 MiB body limit, and separate concurrency budgets for operations, long-polls and the agent
+  read set (see its paragraph above), answering `busy` when one is exhausted. A request past authentication holds its permit from before its body is
   read;
 - bounds the unauthenticated side too: at most 256 connections (one more is closed on accept — and
   fewer if the descriptor limit, raised toward 4096 at start, leaves less room beside the database's

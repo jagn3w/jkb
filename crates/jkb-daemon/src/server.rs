@@ -54,7 +54,7 @@ pub struct ServeConfig {
     pub max_ops: usize,
     /// Concurrent long-polls — a separate budget, so subscribers cannot starve a hook's request.
     pub max_polls: usize,
-    /// Concurrent read-set requests (`Request::is_read`) — a third budget. The reads run one at a time
+    /// Concurrent read-set requests (`Request::is_agent_read`) — a third budget. The reads run one at a time
     /// on the reader connection, so a burst of them otherwise held every op permit while queued and a
     /// hook's write was refused `busy`.
     pub max_reads: usize,
@@ -360,7 +360,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
                                 let service = {
                                     let authed = Arc::clone(&authed);
                                     service_fn(move |req| {
-                                        handle(Arc::clone(&state), Arc::clone(&authed), req)
+                                        respond(Arc::clone(&state), Arc::clone(&authed), req)
                                     })
                                 };
                                 let conn = http1::Builder::new()
@@ -566,10 +566,58 @@ async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
     .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
 }
 
+/// A permit shared by everything that must finish before it is released.
+type Permit = Arc<tokio::sync::OwnedSemaphorePermit>;
+
+/// A response body that keeps its request's permit until hyper has written it, or dropped it for a
+/// client that went away. An answer is in memory until then — up to a read's whole budget — so it
+/// counts against the budget that admitted it: released when the handler returned, 256 connections
+/// that asked for large reads and never read the socket held every answer with every permit free.
+struct Held {
+    body: Full<Bytes>,
+    _permit: Option<Permit>,
+}
+
+impl hyper::body::Body for Held {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// One request's response, its body holding the permit the request ran under ([`Held`]).
+async fn respond(
+    state: Arc<State>,
+    authed: Arc<AtomicBool>,
+    req: hyper::Request<Incoming>,
+) -> Result<hyper::Response<Held>, Infallible> {
+    let mut permit = None;
+    let response = handle(state, authed, req, &mut permit).await?;
+    Ok(response.map(|body| Held {
+        body,
+        _permit: permit,
+    }))
+}
+
+/// `held` is left holding the permit the request ran under, for the response body to keep.
 async fn handle(
     state: Arc<State>,
     authed: Arc<AtomicBool>,
     req: hyper::Request<Incoming>,
+    held: &mut Option<Permit>,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
     let route = (req.method().clone(), req.uri().path().to_owned());
     if !matches!(
@@ -640,19 +688,23 @@ async fn handle(
         Ok(r) => r,
         Err(e) => return Ok(refuse(&ApiError::bad_request(e.to_string()))),
     };
-    let (_permit, _slot, wait) = match permit_for(&state, &request, asked_wait, op_permit) {
+    let (permit, _slot, wait) = match permit_for(&state, &request, asked_wait, op_permit) {
         Ok(granted) => granted,
         Err(refusal) => return Ok(refuse(&refusal)),
     };
-    Ok(match serve_op(&state, backend, db, request, wait).await {
-        Ok(response) => reply(StatusCode::OK, &json!(response)),
-        Err(e) => refuse(&e),
-    })
+    let permit: Permit = Arc::new(permit);
+    *held = Some(Arc::clone(&permit));
+    Ok(
+        match serve_op(&state, backend, db, request, wait, &permit).await {
+            Ok(response) => reply(StatusCode::OK, &json!(response)),
+            Err(e) => refuse(&e),
+        },
+    )
 }
 
 /// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with
 /// its long-poll slot and wait: a long-poll waits under the poll budget, one per group; a read
-/// (`Request::is_read`) queues on the one reader connection, so it waits under the read budget rather
+/// (`Request::is_agent_read`) queues on the one reader connection, so it waits under the read budget rather
 /// than holding an op permit a hook's write needs; anything else keeps the op permit.
 fn permit_for<'s>(
     state: &'s State,
@@ -684,7 +736,7 @@ fn permit_for<'s>(
             drop(op_permit);
             Ok((poll_permit, Some(slot), asked_wait))
         }
-        _ if request.is_read() => {
+        _ if request.is_agent_read() => {
             let Ok(read_permit) = Arc::clone(&state.reads).try_acquire_owned() else {
                 return Err(busy("the daemon is at its read limit; retry".to_owned()));
             };
@@ -695,11 +747,22 @@ fn permit_for<'s>(
     }
 }
 
-async fn call(backend: &LocalBackend, request: Request) -> Result<Response, ApiError> {
+/// Serve `request` on a blocking thread, which holds `permit` until the call returns. Not the awaiting
+/// future: hyper drops that when its client goes away, and a permit released then let a client that
+/// connects, asks for a long read and hangs up grow the reader's queue without bound while the
+/// budget read empty.
+async fn call(
+    backend: &LocalBackend,
+    request: Request,
+    permit: Permit,
+) -> Result<Response, ApiError> {
     let backend = backend.clone();
-    tokio::task::spawn_blocking(move || backend.call(request))
-        .await
-        .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        backend.call(request)
+    })
+    .await
+    .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
 }
 
 async fn serve_op(
@@ -708,6 +771,7 @@ async fn serve_op(
     db: &Db,
     request: Request,
     wait: Duration,
+    permit: &Permit,
 ) -> Result<Response, ApiError> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -718,7 +782,7 @@ async fn serve_op(
         tokio::pin!(woken);
         woken.as_mut().enable();
         current_schema(db).await?;
-        let response = call(backend, request.clone()).await?;
+        let response = call(backend, request.clone(), Arc::clone(permit)).await?;
         if response.announces_a_send() {
             state.sent.notify_waiters();
         }
@@ -738,7 +802,82 @@ async fn serve_op(
 mod tests {
     use rustix::io::Errno;
 
-    use super::{backend_for, connection_budget, out_of_resources};
+    use super::{backend_for, call, connection_budget, out_of_resources, Held};
+
+    /// A permit is released only when everything its request started has finished: the call on its
+    /// blocking thread, though the client and its handler are gone, and the body hyper writes.
+    #[test]
+    fn a_permit_outlives_a_cancelled_request_until_its_call_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let backend = backend_for(&db, 1024 * 1024);
+        let reads = backend.reads().clone();
+        let (held, holding) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            reads
+                .read(move |_| {
+                    held.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        holding.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        runtime.block_on(async {
+            let permit = std::sync::Arc::new(budget.clone().try_acquire_owned().unwrap());
+            let queued = tokio::spawn({
+                let backend = backend.clone();
+                async move {
+                    call(
+                        &backend,
+                        jkb_api::Request::KbLs {
+                            path: None,
+                            all: false,
+                            recursive: false,
+                        },
+                        permit,
+                    )
+                    .await
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            queued.abort();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                budget.available_permits(),
+                0,
+                "the client went away, but its read is still queued on the reader"
+            );
+        });
+        blocker.join().unwrap();
+        runtime.block_on(async {
+            for _ in 0..50 {
+                if budget.available_permits() == 1 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the permit was never released after the read ran");
+        });
+
+        let permit = std::sync::Arc::new(budget.clone().try_acquire_owned().unwrap());
+        let body = Held {
+            body: http_body_util::Full::new(bytes::Bytes::from_static(b"answer")),
+            _permit: Some(permit),
+        };
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "held while the body is unwritten"
+        );
+        drop(body);
+        assert_eq!(budget.available_permits(), 1);
+    }
 
     /// The daemon serves the read set on a connection of its own — the `query_only` one, so a write
     /// through it is refused — rather than on the writer every notification waits on.

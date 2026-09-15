@@ -1115,7 +1115,7 @@ fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
 }
 
 // Which ops read is stated here, apart from the classification under test: filtering on
-// `is_read` itself dropped a read misclassed as a write from the very loop meant to catch it.
+// `is_agent_read` itself dropped a read misclassed as a write from the very loop meant to catch it.
 const READS: &[&str] = &[
     "kb.ambient",
     "kb.query",
@@ -1127,14 +1127,11 @@ const READS: &[&str] = &[
     "task.ready",
     "task.show",
     "task.subtasks",
-    "mq.inspect",
-    "mq.tail",
-    "notify.open_sessions",
 ];
 
 #[test]
 fn every_op_is_served_on_the_connection_its_class_names() {
-    // `Request::is_read` alone chooses. A read left on the writer waits behind whatever holds it; a
+    // `Request::is_agent_read` alone chooses. A read left on the writer waits behind whatever holds it; a
     // write classed as a read fails on the `query_only` reader. So: no op is refused as a write to a
     // read-only database, and with the writer's thread held every read still answers at once.
     let dir = tempfile::tempdir().unwrap();
@@ -1165,7 +1162,7 @@ fn every_op_is_served_on_the_connection_its_class_names() {
     holding.recv().unwrap();
     for request in samples() {
         assert_eq!(
-            request.is_read(),
+            request.is_agent_read(),
             READS.contains(&request.op()),
             "{} is classed wrongly",
             request.op()
@@ -1182,4 +1179,62 @@ fn every_op_is_served_on_the_connection_its_class_names() {
         );
     }
     blocker.join().unwrap();
+
+    // And the other way: with the reader held — a container's long grep — every op outside the read
+    // set still answers at once. The hook's `notify.open_sessions` sweep has 1 s.
+    let reader = b.reads.clone();
+    let (held, holding) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        reader
+            .read(move |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.recv().unwrap();
+    for request in samples().into_iter().filter(|r| !READS.contains(&r.op())) {
+        let op = request.op();
+        let at = std::time::Instant::now();
+        let _ = b.call(request);
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "{op} waited {:?} behind the reader",
+            at.elapsed()
+        );
+    }
+    blocker.join().unwrap();
+}
+
+#[test]
+fn the_ready_frontier_is_ordered_and_limited_before_any_body_is_loaded() {
+    use jkb_core::task;
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        for (uid, priority) in [
+            ("task:low", Some(3)),
+            ("task:none", None),
+            ("task:high", Some(1)),
+        ] {
+            let mut t = task::NewTask::new(uid, uid);
+            t.priority = priority;
+            t.home = "tasks/f".into();
+            task::create(c, m, &t)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let uids = |limit: Option<usize>| match call(
+        &b,
+        json!({ "op": "task.ready", "dsl": "", "default_scope": "tasks/f", "limit": limit }),
+    )
+    .unwrap()
+    {
+        Response::Items { items, .. } => items.into_iter().map(|i| i.uid).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(uids(None), ["task:high", "task:low", "task:none"]);
+    assert_eq!(uids(Some(2)), ["task:high", "task:low"]);
 }

@@ -14,8 +14,7 @@
 //! [`QuickAdd`], which [`NewTask::from_quick_add`] lifts into a create spec with the
 //! default home (`tasks/inbox`) and `managed:` binding.
 
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, TaskStatus};
@@ -350,6 +349,24 @@ pub fn add_subtask(
 /// # Errors
 /// Returns an error if the query fails.
 pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
+    let mut out = Vec::new();
+    subtasks_each(conn, parent, |row| {
+        out.push(row);
+        true
+    })?;
+    Ok(out)
+}
+
+/// [`subtasks`], handing each row to `each` as it is read — so a caller keeping only part of each
+/// (a title) holds one body at a time. `each` returns whether to continue.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn subtasks_each(
+    conn: &Connection,
+    parent: ItemId,
+    mut each: impl FnMut(TaskRow) -> bool,
+) -> Result<()> {
     // Reads containment, not the edge: containment is where a node lives (design D35).
     let mut stmt = conn.prepare_cached(
         "SELECT i.id, i.uid, i.content, i.status, i.priority, i.due
@@ -367,8 +384,12 @@ pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
             due: r.get(5)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    for row in rows {
+        if !each(row?) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Whether every subtask of `parent` has reached a terminal status (`done`/`cancelled`).
@@ -709,32 +730,29 @@ pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Option<ItemId>>
 /// # Errors
 /// Returns an error if evaluation or the ordered load fails.
 pub fn ready(conn: &Connection, scope: Scope, tags: &[TagPred]) -> Result<Vec<TaskRow>> {
-    let query = Query {
-        kind: Some("task".to_owned()),
-        ready: true,
-        scope,
-        tags: tags.to_vec(),
-        ..Query::default()
-    };
-    let ids = query.evaluate(conn)?;
+    let ids = ready_query(scope, tags).evaluate(conn)?;
     load_ordered(conn, &ids)
 }
 
 /// Load the given items as [`TaskRow`]s, ordered by priority then due (nulls last).
+/// The ready frontier's order: priority (ascending, nulls last), then due date (ascending, nulls
+/// last), then id. One copy, for [`load_ordered`] and [`ready_ids`].
+const READY_ORDER: &str = "priority IS NULL, priority ASC, due IS NULL, date(due) ASC, id";
+
 fn load_ordered(conn: &Connection, ids: &[ItemId]) -> Result<Vec<TaskRow>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = vec!["?"; ids.len()].join(", ");
+    // The ids as one JSON array rather than a placeholder each: SQLite refuses more than 32,766
+    // variables, which a frontier that large reached.
     let sql = format!(
         "SELECT id, uid, content, status, priority, due FROM items
-         WHERE id IN ({placeholders})
-         ORDER BY priority IS NULL, priority ASC, due IS NULL, date(due) ASC, id"
+         WHERE id IN (SELECT value FROM json_each(?1))
+         ORDER BY {READY_ORDER}"
     );
-    let params: Vec<Value> = ids.iter().map(|id| Value::Integer(id.get())).collect();
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
+        .query_map([ids_json(ids)], |row| {
             Ok(TaskRow {
                 id: ItemId::new(row.get(0)?),
                 uid: row.get(1)?,
@@ -743,6 +761,48 @@ fn load_ordered(conn: &Connection, ids: &[ItemId]) -> Result<Vec<TaskRow>> {
                 priority: row.get(4)?,
                 due: row.get(5)?,
             })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The frontier's structural filter — the one [`ready`] and [`ready_ids`] both evaluate.
+fn ready_query(scope: Scope, tags: &[TagPred]) -> Query {
+    Query {
+        kind: Some("task".to_owned()),
+        ready: true,
+        scope,
+        tags: tags.to_vec(),
+        ..Query::default()
+    }
+}
+
+fn ids_json(ids: &[ItemId]) -> String {
+    let ids: Vec<i64> = ids.iter().map(|id| id.get()).collect();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The ready frontier's ids, in [`ready`]'s order, at most `limit` of them — ordered and cut in SQL
+/// without loading a single body, for a caller that loads the rows it keeps one at a time.
+///
+/// # Errors
+/// Returns an error if evaluation or the ordering query fails.
+pub fn ready_ids(
+    conn: &Connection,
+    scope: Scope,
+    tags: &[TagPred],
+    limit: Option<usize>,
+) -> Result<Vec<ItemId>> {
+    let ids = ready_query(scope, tags).evaluate(conn)?;
+    let limit = limit.map_or(-1, |l| i64::try_from(l).unwrap_or(i64::MAX));
+    let sql = format!(
+        "SELECT id FROM items WHERE id IN (SELECT value FROM json_each(?1))
+         ORDER BY {READY_ORDER} LIMIT ?2"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params![ids_json(&ids), limit], |row| {
+            Ok(ItemId::new(row.get(0)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)

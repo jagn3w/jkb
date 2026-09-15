@@ -531,13 +531,19 @@ impl Request {
         }
     }
 
-    /// Whether this op only reads — the one place that says so. [`LocalBackend`] serves it on its
-    /// reader and within its read budget, and `jkb serve` counts it against its read permits, from
-    /// this answer; no dispatch arm chooses. Exhaustive, so a new op must say. A write classed as a
-    /// read fails against the daemon's `query_only` reader rather than writing somewhere unguarded
-    /// (`every_op_is_served_on_the_connection_its_class_names`).
+    /// Whether this op is in the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`) — the one
+    /// place that says so. [`LocalBackend`] serves it on its reader and within its read budget, and
+    /// `jkb serve` counts it against its read permits, from this answer; no dispatch arm chooses.
+    ///
+    /// **Not "every op that does not write".** The reader serves one call at a time, and what queues
+    /// there is a client's reads — a grep over the whole knowledge base among them. The queue's and the
+    /// notification hook's own reads (`mq.inspect`, `mq.tail`, `notify.open_sessions`) are short and
+    /// latency-bound — a `SessionStart` sweep has 1 s — so they stay on the writer, which runs only such
+    /// ops; classing them by "does not write" put the sweep behind a container's grep (stage-6.1 review).
+    /// Exhaustive, so a new op must say. A write classed here fails against the daemon's `query_only`
+    /// reader rather than writing somewhere unguarded (`every_op_is_served_on_the_connection_its_class_names`).
     #[must_use]
-    pub const fn is_read(&self) -> bool {
+    pub const fn is_agent_read(&self) -> bool {
         match self {
             Self::KbAmbient { .. }
             | Self::KbQuery { .. }
@@ -548,17 +554,17 @@ impl Request {
             | Self::KbSearch { .. }
             | Self::TaskReady { .. }
             | Self::TaskShow { .. }
-            | Self::TaskSubtasks { .. }
-            | Self::MqInspect {}
-            | Self::MqTail { .. }
-            | Self::NotifyOpenSessions {} => true,
+            | Self::TaskSubtasks { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
             | Self::MqCompact { .. }
+            | Self::MqInspect {}
+            | Self::MqTail { .. }
             | Self::NotifyEvent { .. }
+            | Self::NotifyOpenSessions {}
             | Self::NotifyGone { .. } => false,
         }
     }
@@ -695,6 +701,33 @@ pub enum Response {
 }
 
 impl Response {
+    /// Whether this answer was cut short at its read's budget ([`kb::Budget`]) or, for a tree, its
+    /// node cap — asked once by a client rather than remembered in each place it takes one apart.
+    /// Exhaustive, so a new answer that can be cut must say.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        match self {
+            Self::Items { truncated, .. }
+            | Self::Listing { truncated, .. }
+            | Self::Tree { truncated, .. }
+            | Self::Children { truncated, .. }
+            | Self::SearchHits { truncated, .. }
+            | Self::Task { truncated, .. } => *truncated,
+            Self::GrepHits { answer } => answer.truncated,
+            Self::Created { .. }
+            | Self::Sent { .. }
+            | Self::Messages { .. }
+            | Self::Position { .. }
+            | Self::Compacted { .. }
+            | Self::Topics { .. }
+            | Self::Notified { .. }
+            | Self::Sessions { .. }
+            | Self::Ambient { .. }
+            | Self::Count { .. }
+            | Self::Content { .. } => false,
+        }
+    }
+
     /// Whether this answer reports a message put on a topic, so a daemon holding long-polls wakes
     /// them. Asked of what was DONE, not of the request's type: most `notify.event`s — every tool
     /// call from every session with nothing on screen — send nothing, and waking every subscriber for
@@ -942,7 +975,7 @@ impl Backend for LocalBackend {
     fn call(&self, request: Request) -> Result<Response, ApiError> {
         let now = mq::now_ms();
         // Chosen here, once, from the op's class — no arm picks a connection or a budget.
-        let db = if request.is_read() {
+        let db = if request.is_agent_read() {
             &self.reads
         } else {
             &self.db

@@ -50,25 +50,33 @@ pub struct Reads<'a> {
     backend: &'a dyn Backend,
     global: bool,
     json: bool,
-    /// The route `jkb search` takes when `--route` is not given: hybrid where the backend embeds,
-    /// FTS through the daemon, which does not.
-    default_route: SearchRoute,
+    /// Served by `jkb serve` rather than in this process: the daemon budgets reads and embeds no
+    /// search text.
+    remote: bool,
+    /// Notices printed on stderr, kept so a test can see them.
+    notices: std::cell::RefCell<Vec<String>>,
 }
 
 impl<'a> Reads<'a> {
-    /// Reads through `backend`.
+    /// Reads through `backend`, which is the daemon's when `remote`.
     #[must_use]
-    pub const fn new(
-        backend: &'a dyn Backend,
-        global: bool,
-        json: bool,
-        default_route: SearchRoute,
-    ) -> Self {
+    pub const fn new(backend: &'a dyn Backend, global: bool, json: bool, remote: bool) -> Self {
         Self {
             backend,
             global,
             json,
-            default_route,
+            remote,
+            notices: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The route `jkb search` takes when `--route` is not given: hybrid where this process embeds, FTS
+    /// through the daemon, which does not.
+    const fn default_route(&self) -> SearchRoute {
+        if self.remote {
+            SearchRoute::Fts
+        } else {
+            SearchRoute::Hybrid
         }
     }
 
@@ -90,7 +98,7 @@ impl<'a> Reads<'a> {
                 context,
             } => self.search(
                 &terms.join(" "),
-                route.map_or(self.default_route, Into::into),
+                route.map_or(self.default_route(), Into::into),
                 limit,
                 context,
             ),
@@ -142,10 +150,26 @@ impl<'a> Reads<'a> {
         }
     }
 
+    /// Every op goes through here, so a cut answer is reported here — once, for every command, rather
+    /// than in each place an answer is taken apart, where one arm could forget.
     fn call(&self, request: Request) -> Result<Response> {
-        self.backend
+        let response = self
+            .backend
             .call(request)
-            .map_err(|e: ApiError| anyhow::Error::msg(e.message))
+            .map_err(|e: ApiError| anyhow::Error::msg(e.message))?;
+        if response.truncated() {
+            // Through the daemon it is its byte budget, and the host is unbounded; on the host only a
+            // tree's node cap cuts, which running it elsewhere does not lift.
+            let notice = if self.remote {
+                "jkb: this answer was cut short at the daemon's read budget — narrow it (a path or a \
+                 query), or run it on the host"
+            } else {
+                "jkb: this answer was cut short — narrow it (a path or a query)"
+            };
+            eprintln!("{notice}");
+            self.notices.borrow_mut().push(notice.to_owned());
+        }
+        Ok(response)
     }
 
     /// The ambient namespace for this process's working directory, unless `--global`.
@@ -169,10 +193,7 @@ impl<'a> Reads<'a> {
     fn items(&self, request: Request) -> Result<Vec<ItemRow>> {
         let op = request.op();
         match self.call(request)? {
-            Response::Items { items, truncated } => {
-                cut_short(truncated);
-                Ok(items)
-            }
+            Response::Items { items, .. } => Ok(items),
             other => unexpected(op, &other),
         }
     }
@@ -268,10 +289,7 @@ impl<'a> Reads<'a> {
             limit,
             context,
         })? {
-            Response::SearchHits { hits, truncated } => {
-                cut_short(truncated);
-                hits
-            }
+            Response::SearchHits { hits, .. } => hits,
             other => return unexpected("kb.search", &other),
         };
         if self.json {
@@ -339,10 +357,7 @@ impl<'a> Reads<'a> {
             all: opts.all,
             recursive: opts.recursive,
         })? {
-            Response::Listing { rows, truncated } => {
-                cut_short(truncated);
-                rows
-            }
+            Response::Listing { rows, .. } => rows,
             other => return unexpected("kb.ls", &other),
         };
         if opts.time {
@@ -369,10 +384,7 @@ impl<'a> Reads<'a> {
             all,
             depth: Some(depth.unwrap_or(DEFAULT_TREE_DEPTH)),
         })? {
-            Response::Tree { nodes, truncated } => {
-                cut_short(truncated);
-                nodes
-            }
+            Response::Tree { nodes, .. } => nodes,
             other => return unexpected("kb.tree", &other),
         };
         if self.json {
@@ -457,7 +469,6 @@ impl<'a> Reads<'a> {
             }
         }
         if answer.truncated {
-            cut_short(true);
             eprintln!("jkb: {} items matched in all", answer.count);
         }
         if answer.count == 0 {
@@ -501,16 +512,13 @@ impl<'a> Reads<'a> {
     }
 
     fn task_show(&self, uid: &str) -> Result<()> {
-        let task = match self.call(Request::TaskShow {
+        let (task, truncated) = match self.call(Request::TaskShow {
             uid: uid.to_owned(),
         })? {
-            Response::Task { task, truncated } => {
-                cut_short(truncated);
-                task
-            }
+            Response::Task { task, truncated } => (task, truncated),
             other => return unexpected("task.show", &other),
         };
-        print_task(&task, self.json)
+        print_task(&task, truncated, self.json)
     }
 
     /// `jkb task subtasks <uid>`: a parent's children, shaped exactly like `jkb ls` output, so the
@@ -520,13 +528,7 @@ impl<'a> Reads<'a> {
             uid: uid.to_owned(),
             all,
         })? {
-            Response::Children {
-                children,
-                truncated,
-            } => {
-                cut_short(truncated);
-                children
-            }
+            Response::Children { children, .. } => children,
             other => return unexpected("task.subtasks", &other),
         };
         if self.json {
@@ -543,17 +545,6 @@ impl<'a> Reads<'a> {
             }
         }
         Ok(())
-    }
-}
-
-/// Say on stderr that an answer is a prefix: the daemon bounds every read (`jkb_api::kb::Budget`), and
-/// an agent reading a listing with no end marker would take it for all there is.
-fn cut_short(truncated: bool) {
-    if truncated {
-        eprintln!(
-            "jkb: this answer was cut short at the daemon's read budget — narrow it (a path, a query, \
-             --limit) or run it on the host"
-        );
     }
 }
 
@@ -721,7 +712,7 @@ fn print_tree(nodes: &[TreeNode], prefix: &str) {
 /// `jkb task show`: the task's fields, its recent transitions inside the header block, the body, and
 /// — human output only — its subtasks, since a parent is off the ready frontier until they are all
 /// terminal and "why isn't this actionable?" must be answerable from the command that shows it.
-fn print_task(task: &TaskDetail, json: bool) -> Result<()> {
+fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
     let item = &task.item;
     let transitions: Vec<serde_json::Value> = task
         .transitions
@@ -753,6 +744,11 @@ fn print_task(task: &TaskDetail, json: bool) -> Result<()> {
                 .map(|t| serde_json::json!({ "facet": t.facet, "value": t.value }))
                 .collect::<Vec<_>>(),
             "transitions": transitions,
+            // Additive: a `--json` consumer can see why a task is off the frontier too, and a notice
+            // that the subtasks were cut refers to something in the document.
+            "subtasks": task.subtasks.iter()
+                .map(|t| serde_json::json!({ "uid": t.uid, "title": t.title, "status": t.status }))
+                .collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -797,13 +793,22 @@ fn print_task(task: &TaskDetail, json: bool) -> Result<()> {
     }
     println!();
     println!("{}", item.content.as_deref().unwrap_or("(no content)"));
-    if !task.subtasks.is_empty() {
+    if !task.subtasks.is_empty() || truncated {
         let open = task
             .subtasks
             .iter()
             .filter(|t| !jkb_types::TaskStatus::is_terminal_str(t.status.as_deref()))
             .count();
-        println!("\nsubtasks ({open} open of {}):", task.subtasks.len());
+        if truncated {
+            // A prefix: its counts are lower bounds, and a verdict on the whole list is not drawn
+            // from part of it.
+            println!(
+                "\nsubtasks (the first {}, {open} open; the list was cut short):",
+                task.subtasks.len()
+            );
+        } else {
+            println!("\nsubtasks ({open} open of {}):", task.subtasks.len());
+        }
         for t in &task.subtasks {
             let status = t.status.as_deref().unwrap_or("?");
             println!("  [{status:^12}] {} — {}", t.uid, first_line(&t.title));
@@ -813,4 +818,116 @@ fn print_task(task: &TaskDetail, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+    use jkb_api::kb::{GrepAnswer, GrepHit, ItemDetail, TaskDetail};
+    use jkb_api::{ApiError, Backend, Request, Response};
+
+    use super::Reads;
+    use crate::Cli;
+
+    /// Answers every read with a cut answer of the right shape.
+    struct CutShort;
+
+    impl Backend for CutShort {
+        fn call(&self, request: Request) -> Result<Response, ApiError> {
+            Ok(match request {
+                Request::KbAmbient { .. } => Response::Ambient {
+                    namespace: Some("repos/x".into()),
+                },
+                Request::KbQuery { .. } | Request::TaskReady { .. } => Response::Items {
+                    items: Vec::new(),
+                    truncated: true,
+                },
+                Request::KbLs { .. } => Response::Listing {
+                    rows: Vec::new(),
+                    truncated: true,
+                },
+                Request::KbTree { .. } => Response::Tree {
+                    nodes: Vec::new(),
+                    truncated: true,
+                },
+                Request::KbGrep { .. } => Response::GrepHits {
+                    answer: GrepAnswer {
+                        hits: vec![GrepHit {
+                            uid: "u".into(),
+                            kind: "note".into(),
+                            lines: Vec::new(),
+                        }],
+                        count: 2,
+                        truncated: true,
+                    },
+                },
+                Request::KbSearch { .. } => Response::SearchHits {
+                    hits: Vec::new(),
+                    truncated: true,
+                },
+                Request::TaskShow { .. } => Response::Task {
+                    task: Box::new(TaskDetail {
+                        item: ItemDetail {
+                            id: 1,
+                            uid: "task:t".into(),
+                            kind: "task".into(),
+                            status: None,
+                            priority: None,
+                            due: None,
+                            namespace: None,
+                            content: None,
+                            tags: Vec::new(),
+                        },
+                        transitions: Vec::new(),
+                        subtasks: Vec::new(),
+                    }),
+                    truncated: true,
+                },
+                Request::TaskSubtasks { .. } => Response::Children {
+                    children: Vec::new(),
+                    truncated: true,
+                },
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "not scripted: {}",
+                        other.op()
+                    )))
+                }
+            })
+        }
+    }
+
+    /// Every listing command says when its answer was cut — asked of each command, because a notice
+    /// taken apart per command was one arm's to forget.
+    #[test]
+    fn every_listing_command_reports_a_cut_answer() {
+        for args in [
+            vec!["query", "kind:task"],
+            vec!["find", "--kind", "task"],
+            vec!["recent"],
+            vec!["search", "x"],
+            vec!["ls"],
+            vec!["tree"],
+            vec!["grep", "x"],
+            vec!["task", "next"],
+            vec!["task", "show", "t"],
+            vec!["task", "subtasks", "t"],
+        ] {
+            for remote in [true, false] {
+                let cli = Cli::try_parse_from(std::iter::once("jkb").chain(args.iter().copied()))
+                    .unwrap();
+                let reads = Reads::new(&CutShort, false, false, remote);
+                reads
+                    .run(cli.command)
+                    .unwrap_or_else(|e| panic!("{args:?}: {e:#}"));
+                let notices = reads.notices.borrow();
+                assert_eq!(notices.len(), 1, "{args:?} (remote {remote}): {notices:?}");
+                assert_eq!(
+                    notices[0].contains("run it on the host"),
+                    remote,
+                    "{args:?}: only the daemon's budget is lifted by running it on the host"
+                );
+            }
+        }
+    }
 }

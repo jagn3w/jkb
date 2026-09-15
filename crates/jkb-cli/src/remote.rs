@@ -238,14 +238,9 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             };
             match cli.command {
                 Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
-                // FTS by default: the daemon embeds no query text (`jkb_api::kb::search`).
-                command if super::read_cli::handles(&command) => super::read_cli::Reads::new(
-                    &backend,
-                    cli.global,
-                    cli.json,
-                    jkb_api::kb::SearchRoute::Fts,
-                )
-                .run(command),
+                command if super::read_cli::handles(&command) => {
+                    super::read_cli::Reads::new(&backend, cli.global, cli.json, true).run(command)
+                }
                 _ => bail!("internal: a Ported command with no remote dispatch"),
             }
         }

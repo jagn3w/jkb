@@ -512,11 +512,9 @@ pub fn ready(
     budget: &mut Budget,
 ) -> jkb_core::Result<Vec<ItemRow>> {
     let q = scoped(dsl, default_scope)?;
-    let mut rows = task::ready(conn, q.scope, &q.tags)?;
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
+    // Ordered and limited over ids alone, then loaded a row at a time within the budget: loading the
+    // frontier first held every task's body before `limit` cut it to one.
+    let ids = task::ready_ids(conn, q.scope, &q.tags, limit)?;
     item_rows(conn, &ids, budget)
 }
 
@@ -1116,17 +1114,18 @@ pub fn task_show(
         subtasks: Vec::new(),
     };
     let _ = budget.take(&detail.item);
-    for t in task::subtasks(conn, id)? {
+    task::subtasks_each(conn, id, |t| {
         let summary = SubtaskSummary {
             title: label(&t.uid, t.title.as_deref()),
             uid: t.uid,
             status: t.status,
         };
         if !budget.take(&summary) {
-            break;
+            return false;
         }
         detail.subtasks.push(summary);
-    }
+        true
+    })?;
     Ok(detail)
 }
 
