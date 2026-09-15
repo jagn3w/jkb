@@ -127,18 +127,28 @@ pub fn get(conn: &Connection, namespace: NamespaceId) -> Result<Option<Mount>> {
 }
 
 /// The `file://` mount whose directory covers `path` most closely, with its namespace path. `None` when
-/// no mount covers it; of two mounts over one directory, the first listed. The one copy of this lookup:
-/// [`ambient_namespace`], `binding::serializer_for` and `jkb_sync::filed_task_problem` all find a path's
-/// mount by it, so cwd scoping and the tasks-file rules cannot pick different mounts.
+/// no mount covers it. The one copy of this lookup: [`ambient_namespace`], `binding::serializer_for` and
+/// `jkb_sync::filed_task_problem` all find a path's mount by it.
+///
+/// Two mounts may cover one directory (`jkb mount create` allows it, and a repo is commonly mounted as
+/// documents and as tasks). Between those, a mount whose serializer is `prefer` wins, then the lowest
+/// namespace path — the order `jkb mount ls` lists them in. It was the order rows came back from an
+/// unordered query, so a `tasks` line could be judged by the `document` mount beside it and skip the
+/// tasks-file rules.
 ///
 /// # Errors
 /// Returns an error if the query fails.
-pub fn covering(conn: &Connection, path: &Path) -> Result<Option<(String, Mount)>> {
+pub fn covering(
+    conn: &Connection,
+    path: &Path,
+    prefer: Option<&str>,
+) -> Result<Option<(String, Mount)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT n.path, m.backing_uri, m.sync_mode, m.serializer, m.include_glob, m.exclude_glob,
                 m.conflict_policy
          FROM mounts m JOIN namespaces n ON n.id = m.namespace_id
-         WHERE m.backing_uri LIKE 'file://%'",
+         WHERE m.backing_uri LIKE 'file://%'
+         ORDER BY n.path",
     )?;
     let mounts = stmt
         .query_map([], |row| {
@@ -155,14 +165,16 @@ pub fn covering(conn: &Connection, path: &Path) -> Result<Option<(String, Mount)
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut best: Option<(usize, String, Mount)> = None;
+    // Ranked by (directory length, preferred serializer); ties keep the first by path.
+    let mut best: Option<((usize, bool), String, Mount)> = None;
     for (ns, mount) in mounts {
         let Some(dir) = mount.backing_uri.strip_prefix("file://") else {
             continue;
         };
         let dir = dir.trim_end_matches('/');
-        if path.starts_with(dir) && best.as_ref().is_none_or(|(len, _, _)| dir.len() > *len) {
-            best = Some((dir.len(), ns, mount));
+        let rank = (dir.len(), prefer == Some(mount.serializer.as_str()));
+        if path.starts_with(dir) && best.as_ref().is_none_or(|(best, _, _)| rank > *best) {
+            best = Some((rank, ns, mount));
         }
     }
     Ok(best.map(|(_, ns, mount)| (ns, mount)))
@@ -255,7 +267,7 @@ pub fn tasks_file_for(conn: &Connection, home_ns: &str) -> Result<Option<String>
 /// # Errors
 /// Returns an error if the query fails.
 pub fn ambient_namespace(conn: &Connection, fs_path: &Path) -> Result<Option<String>> {
-    Ok(covering(conn, fs_path)?.map(|(ns_path, _)| ns_path))
+    Ok(covering(conn, fs_path, None)?.map(|(ns_path, _)| ns_path))
 }
 
 #[cfg(test)]
@@ -264,6 +276,50 @@ mod tests {
     use crate::{ns, Db};
     use jkb_types::{ConflictPolicy, SyncMode};
     use std::path::Path;
+
+    /// Two mounts over one directory resolve the same way every time: the preferred serializer, then
+    /// the lowest namespace path, whatever order the rows were created in.
+    #[test]
+    fn two_mounts_over_one_directory_resolve_by_a_stated_rule() {
+        for order in [["tasks/jkb", "repos/jkb"], ["repos/jkb", "tasks/jkb"]] {
+            let db = Db::open_in_memory().unwrap();
+            db.write_txn("t", move |c, m| {
+                for path in order {
+                    let serializer = if path.starts_with("tasks") {
+                        "tasks"
+                    } else {
+                        "document"
+                    };
+                    let id = ns::ensure(c, path)?;
+                    create(
+                        c,
+                        m,
+                        id,
+                        "file:///r/jkb",
+                        SyncMode::Bidirectional,
+                        serializer,
+                        None,
+                        None,
+                        ConflictPolicy::Manual,
+                    )?;
+                }
+                let file = Path::new("/r/jkb/tasks.md");
+                assert_eq!(
+                    super::covering(c, file, Some("tasks"))?
+                        .map(|(ns, _)| ns)
+                        .as_deref(),
+                    Some("tasks/jkb")
+                );
+                assert_eq!(
+                    super::covering(c, file, None)?.map(|(ns, _)| ns).as_deref(),
+                    Some("repos/jkb")
+                );
+                assert_eq!(ambient_namespace(c, file)?.as_deref(), Some("repos/jkb"));
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
 
     #[test]
     fn creating_a_mount_marks_the_namespace_and_roundtrips() {

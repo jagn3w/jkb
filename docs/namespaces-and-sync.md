@@ -216,22 +216,26 @@ a child process) and, because a bound path is no longer filtered before it is re
 `a_bound_file_reached_through_a_link_stays_flagged_naming_the_link`, which fail when the engine goes
 back to following links. Not verified on macOS here — the tests ran on Linux.
 
-## A task's `^id` is lowercase letters, digits and dashes in any script
+## A task's `^id` is read in the alphabet `slug` mints it in
 
-**Decided (stage-6.2 review 6, 2026-09-15):** the `tasks` serializer reads `^id` as an identity when
-it is lowercase letters, digits and dashes in any script (non-ASCII characters that are not uppercase,
-whitespace or control), not only ASCII.
+**Decided (stage-6.2 reviews 6 and 7, 2026-09-15):** the `tasks` serializer reads `^id` as an identity
+when every character is a dash or satisfies `jkb_core::dsl::is_slug_char` — a letter or digit already in
+lowercase in any script (including one with no lowercase form, such as `ℝ`), or a combining mark — and
+`dsl::slug` emits nothing outside that set. One predicate, owned beside the minter.
 
-Why: `mint_id` slugs a title with the Unicode-aware `dsl::slug`, so `Café résumé cleanup` mints
-`café-résumé-cleanup-e0b106`, `修复` mints `修复-108866`, and `İstanbul` a lowercase with a combining dot.
-The parser's ASCII-only rule read each stamped id back as title words, minted another and stamped it
-too: measured over three parse/render passes, each such task took a new id every pass and its line grew
-a `^id` per sync. Nothing noticed until the task-write line check refused every write to such a task.
-Widening the reader rather than ASCII-folding the minter keeps every id already stored, and the
-existing rule that trailing anchors collapse to the left-most heals a churned line to its first id.
-ASCII punctuation and uppercase in any script still end an id. Pinned by
-`a_title_in_any_script_keeps_one_id_across_syncs` and, through the ops,
-`a_task_titled_in_any_script_is_filed_and_written_like_any_other`.
+Why: `mint_id` slugs a title with the Unicode-aware `slug`, so `Café résumé cleanup` mints
+`café-résumé-cleanup-e0b106`, `修复` mints `修复-108866`. The parser's ASCII-only rule read each stamped
+id back as title words, minted another and stamped it too: measured over three parse/render passes,
+such a task took a new id every pass and its line grew a `^id` per sync. Nothing noticed until the
+task-write line check refused every write to such a task. Review 6 widened the reader to "non-ASCII,
+not uppercase, not whitespace" — too wide: a title's trailing `^🎉` became an identity, so a file an
+older build had settled changed ids, or was quarantined for a duplicate `^🎉`; and too narrow for
+`prove-ℝ-…`, which `slug` emits and the reader still refused (reproduced churning). Reading exactly the
+minter's alphabet fixes both: an id the minter makes always comes back, and anything the old reader took
+as title text and the minter never makes (emoji, punctuation, format characters, uppercase) still is.
+Every stored id is kept, and a churned line heals to its first id by the existing left-most-anchor rule.
+Pinned by `slug_keeps_unicode_alphanumerics`, `a_title_in_any_script_keeps_one_id_across_syncs` and,
+through the ops, `a_task_titled_in_any_script_is_filed_and_written_like_any_other`.
 
 ## A file's document lives on its journal row, not in the namespace tree (D45)
 

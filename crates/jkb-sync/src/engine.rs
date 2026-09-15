@@ -696,7 +696,7 @@ pub fn filed_task_problem(conn: &Connection, item: ItemId) -> Result<Option<Stri
         )));
     }
     let path = PathBuf::from(file);
-    let Some((mount_ns, mount)) = mount::covering(conn, &path)? else {
+    let Some((mount_ns, mount)) = mount::covering(conn, &path, Some("tasks"))? else {
         return Ok(None);
     };
     let Some(dir) = mount.backing_uri.strip_prefix("file://") else {

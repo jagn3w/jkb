@@ -1943,11 +1943,37 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         problem.as_deref().is_some_and(|p| p.contains("due date")),
         "the planted line is unreadable: {problem:?}"
     );
+    // Except onto another line: the old line's problem does not excuse the new one.
+    let e = call(
+        &host,
+        json!({ "op": "task.bind", "uid": inside, "sync": format!("file:///Users/u/repos/in/tasks.md#{}", other.trim_start_matches("task:")) }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("already another task's"), "{e:?}");
     for request in writes {
         call(&host, request.clone()).unwrap_or_else(|e| panic!("{request}: {e:?}"));
     }
 
-    // A write that takes the offending value away passes, and each field is judged on its own.
+    call(
+        &host,
+        json!({ "op": "task.set", "uid": inside, "due": "2026-07-15" }),
+    )
+    .expect("a write that takes the offending value away passes");
+}
+
+/// Each field a tasks.md line cannot carry is refused on its own, and the refusal rolls the write back.
+#[test]
+fn each_value_a_tasks_md_line_cannot_carry_is_refused_naming_its_field() {
+    let (db, inside, _outside, _managed) = mutate_fixture();
+    let host = LocalBackend::new(db.clone());
+    let Response::Added { added } = call(
+        &host,
+        json!({ "op": "task.add", "text": "other +repos/in" }),
+    )
+    .unwrap() else {
+        panic!("added")
+    };
+    let other = added.uid;
     call(
         &host,
         json!({ "op": "task.set", "uid": inside, "due": "2026-07-15" }),
@@ -1989,6 +2015,34 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         panic!("task")
     };
     assert_eq!(task.item.due.as_deref(), Some("2026-07-15"), "rolled back");
+}
+
+/// A repo mounted twice — as documents and as tasks — still holds its tasks' lines to the tasks file's
+/// rules: the `tasks` mount owns a `#<local id>` line, whichever mount sorts first.
+#[test]
+fn a_directory_mounted_as_documents_too_still_judges_its_task_lines() {
+    let (db, inside, _outside, _managed) = mutate_fixture();
+    db.write_txn("t", |c, m| {
+        let id = jkb_core::ns::ensure(c, "repos/aaa")?;
+        jkb_core::mount::create(
+            c,
+            m,
+            id,
+            "file:///Users/u/repos/in",
+            jkb_types::SyncMode::Bidirectional,
+            "document",
+            None,
+            None,
+            jkb_types::ConflictPolicy::Manual,
+        )
+    })
+    .unwrap();
+    let e = call(
+        &LocalBackend::new(db.clone()),
+        json!({ "op": "task.set", "uid": inside, "due": "2026-07-15 17:00" }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("due date"), "{e:?}");
 }
 
 /// A title in any script files and round-trips: its minted id keeps the title's letters, and the

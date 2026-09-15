@@ -765,20 +765,16 @@ fn split_trailing_anchor(rest: &str) -> (&str, Option<String>) {
     }
 }
 
-/// Whether `s` is a local id: non-empty lowercase letters, digits and dashes — in any script, since
-/// [`mint_id`] slugs a title with the Unicode-aware [`slug`]. ASCII-only, this rejected the ids it had
-/// just minted for `Café`, `修复` or `İstanbul` (whose lowercase carries a combining dot): each sync read
-/// the stamped `^id` back as title words, minted another, and stamped that too, so the task changed
-/// identity on every pass. Anything ASCII but `[a-z0-9-]` still ends an id, as do uppercase letters and
-/// whitespace in any script.
+/// Whether `s` is a local id: non-empty, every character a dash or one [`slug`] emits
+/// ([`jkb_core::dsl::is_slug_char`]), since [`mint_id`] builds an id from a slug. ASCII-only, this
+/// rejected the ids it had just minted for `Café`, `修复` or `İstanbul`: each sync read the stamped
+/// `^id` back as title words, minted another and stamped that too, so the task changed identity on
+/// every pass. Emoji, punctuation, uppercase and format characters still end an id, so a title's
+/// trailing `^🎉` stays text as it always was.
 fn is_uri_safe(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().all(|c| {
-            c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || c == '-'
-                || (!c.is_ascii() && !c.is_uppercase() && !c.is_whitespace() && !c.is_control())
-        })
+        && s.chars()
+            .all(|c| c == '-' || jkb_core::dsl::is_slug_char(c))
 }
 
 /// Parse a header line `#{1,6} text`, returning `(level, text)`. Only lines starting
@@ -977,12 +973,37 @@ mod tests {
             "byte-stable"
         );
 
+        // A letter with no lowercase form is in a minted id, so it is read back too.
+        let proof = TasksSerializer
+            .parse("- [ ] Prove ℝ is complete\n".as_bytes())
+            .unwrap();
+        let restamped = TasksSerializer
+            .parse(&TasksSerializer.render(&proof).unwrap())
+            .unwrap();
+        assert_eq!(proof.items, restamped.items);
+        // What no slug holds is title text as before, so a file an older version settled keeps its ids.
+        let party = TasksSerializer
+            .parse(
+                "- [ ] Celebrate launch ^🎉 ^celebrate-launch-208309\n- [ ] Tell the team ^🎉\n"
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(party.items[0].local_id, "celebrate-launch-208309");
+        assert_eq!(party.items[0].content, "Celebrate launch ^🎉");
+        assert_eq!(party.items[1].content, "Tell the team ^🎉");
+
         let churned = "- [ ] 修复 ^修复-108866 ^修复-修复-108866-85d000\n";
         let healed = TasksSerializer.parse(churned.as_bytes()).unwrap();
         assert_eq!(healed.items[0].local_id, "修复-108866");
         assert_eq!(healed.items[0].content, "修复");
-        // Still not an id: uppercase in any script, ASCII punctuation.
-        for title in ["Fix ^Fix", "Fix ^fix_login", "Fix ^Über"] {
+        // Still not an id: uppercase in any script, punctuation, emoji.
+        for title in [
+            "Fix ^Fix",
+            "Fix ^fix_login",
+            "Fix ^Über",
+            "Fix ^修复。",
+            "Fix ^—",
+        ] {
             let doc = TasksSerializer
                 .parse(format!("- [ ] {title}\n").as_bytes())
                 .unwrap();

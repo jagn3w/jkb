@@ -1068,8 +1068,16 @@ fn task_write<T: Send + 'static>(
         + 'static,
 ) -> Result<T, ApiError> {
     db.write_txn_with(actor, move |c, m| {
-        let before = tasks::line_problem(c, &uid)?;
+        let (line, before) = (tasks::line_of(c, &uid)?, tasks::line_problem(c, &uid)?);
         let out = op(c, m, &uid)?;
+        // A write that moves the task to another line (`task.bind`) is judged as a new line: excused by
+        // the old line's problem, a bind from an unreadable line onto another task's `#id` put two tasks
+        // on one line, and the next export dropped one of them.
+        let before = if tasks::line_of(c, &uid)? == line {
+            before
+        } else {
+            None
+        };
         tasks::check_line(c, &uid, before.as_deref())?;
         Ok(out)
     })

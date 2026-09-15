@@ -613,6 +613,17 @@ pub fn bind(
     Ok(())
 }
 
+/// The binding uri of `reference` — the line it is written to, when it is file-backed.
+///
+/// # Errors
+/// A failed read.
+pub fn line_of(conn: &Connection, reference: &str) -> Result<Option<String>, ApiError> {
+    let Some(id) = task::resolve_ref(conn, reference)? else {
+        return Ok(None);
+    };
+    Ok(binding::get(conn, id)?.map(|b| b.uri))
+}
+
 /// Why `reference`'s line in its tasks.md would not come back from the file as the knowledge base holds
 /// it (`jkb_sync::filed_task_problem`); `None` when it would, or when it is in no tasks file.
 ///

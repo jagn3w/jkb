@@ -273,7 +273,13 @@ pub fn serializer_for(conn: &Connection, item: ItemId) -> Result<Option<String>>
             return Ok(Some(journal.serializer));
         }
     }
-    Ok(crate::mount::covering(conn, std::path::Path::new(&path))?.map(|(_, m)| m.serializer))
+    // A `#<local id>` binding is a multi-item serializer's, so between two mounts over its directory the
+    // `tasks` one owns it.
+    let prefer = (bound.uri.strip_prefix("file://") != Some(path.as_str())).then_some("tasks");
+    Ok(
+        crate::mount::covering(conn, std::path::Path::new(&path), prefer)?
+            .map(|(_, m)| m.serializer),
+    )
 }
 
 /// # Errors

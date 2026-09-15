@@ -142,6 +142,9 @@ pub fn unquote_unescape(s: &str) -> String {
 ///
 /// This is the single source of truth for slugging so a task minted via the CLI, the MCP
 /// server, or file sync derives the same slug from the same title.
+///
+/// Every character it emits but `-` satisfies [`is_slug_char`], which is how a reader recognises a
+/// slug it minted — checked over every `char` by `every_alphanumeric_lowercases_into_the_slug_alphabet`.
 #[must_use]
 pub fn slug(text: &str) -> String {
     let mut out = String::new();
@@ -156,6 +159,20 @@ pub fn slug(text: &str) -> String {
         }
     }
     out.trim_matches('-').to_owned()
+}
+
+/// Whether `c` is a character [`slug`] emits other than `-`: a letter or digit already in lowercase —
+/// in any script, and including one with no lowercase form such as `ℝ` — or a combining mark, which
+/// lowercasing can produce (`İ` lowercases to `i` and U+0307).
+///
+/// The one definition of a slug's alphabet, so a reader of minted ids — the `tasks` serializer's `^id`
+/// — accepts exactly what the minter makes: ASCII-only, it rejected `café-…` and churned the id on every
+/// sync; widened past this, it took a trailing `^🎉` in a title as an identity and quarantined a file
+/// with two of them; short of it, it rejected `prove-ℝ-…`.
+#[must_use]
+pub fn is_slug_char(c: char) -> bool {
+    (c.is_alphanumeric() && c.to_lowercase().eq(std::iter::once(c)))
+        || unicode_normalization::char::is_combining_mark(c)
 }
 
 /// Resolve `\"`→`"` and `\\`→`\`; any other `\x` is kept verbatim (a literal backslash
@@ -215,6 +232,19 @@ mod tests {
         assert_eq!(slug("--- !!! ---"), "");
     }
 
+    /// `slug` emits the lowercase of any alphanumeric, so the alphabet a reader accepts must hold all of
+    /// them — over every `char`, since a Unicode update to the toolchain's tables could change it.
+    #[test]
+    fn every_alphanumeric_lowercases_into_the_slug_alphabet() {
+        let outside: Vec<(char, char)> = (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase().map(move |l| (c, l)))
+            .filter(|&(_, l)| !super::is_slug_char(l))
+            .collect();
+        assert!(outside.is_empty(), "{outside:?}");
+    }
+
     #[test]
     fn slug_keeps_unicode_alphanumerics() {
         use super::slug;
@@ -222,6 +252,28 @@ mod tests {
         // would), so the same title slugs identically on every path.
         assert_eq!(slug("Café Résumé"), "café-résumé");
         assert_eq!(slug("naïve Ångström"), "naïve-ångström");
+        assert_eq!(slug("Prove ℝ is complete"), "prove-ℝ-is-complete");
+        assert_eq!(slug("İstanbul"), "i\u{307}stanbul");
+        // Every character but `-` is in the slug alphabet a reader recognises.
+        for title in [
+            "Prove ℝ is complete",
+            "𝐀𝐏𝐈 docs",
+            "İstanbul ǅemal ẞtraße",
+            "修复解析器。",
+            "Celebrate 🎉 launch",
+            "zero\u{200B}width — “quoted”",
+        ] {
+            assert!(
+                slug(title)
+                    .chars()
+                    .all(|c| c == '-' || super::is_slug_char(c)),
+                "{title:?} → {:?}",
+                slug(title)
+            );
+        }
+        for not_slug in ['🎉', '—', '”', '。', '\u{200B}', 'A', 'Ü', '_', ' '] {
+            assert!(!super::is_slug_char(not_slug), "{not_slug:?}");
+        }
     }
 
     #[test]
