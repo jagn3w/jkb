@@ -224,11 +224,15 @@ once per debounce — each mount's watcher asks the changelog what was written p
 (`sync_state::writes_since`). When anyone but sync itself (`sync_state::SYNC_ACTOR`) has written, a
 pass is owed, and it runs at most once per three debounces (`DatabaseWrites`, which keeps a write that
 lands between passes owed): it reconciles the bound files whose knowledge-base render no longer hashes
-to their last-synced hash (`engine::sync_kb_changes`) — read-only to decide, so a write elsewhere costs a
-render per bound file, not an archive and a transaction each. Also reconciled: a never-synced bound file,
-a file whose check fails (so the failure lands on it), and one flagged by a refusal, whose remedy is a
-database write. Left to the disk: a `conflict` and a quarantined parse failure. An import-only mount is
-skipped. Read-only filesystem events (open, read, close after reading) are dropped in the watcher's
+to their last-synced hash (`engine::sync_kb_changes`) — read-only to decide, one short read per file so
+writers interleave, so a write elsewhere costs a render per bound file, not an archive and a transaction
+each. Judged by `FileState::from_journal`: a never-synced file is reconciled; a `Blocked` one (a refusal,
+whose remedy is a database write, or a failure) and a file whose check fails are reconciled when what
+they are judged on — the render's hash or the error — differs from the watcher's record of the last time
+(`FlaggedJudgements`), so a flag stays standing without a reconcile, a changelog row and a log line on
+every pass (review 2), yet clears when its remedy lands. Left to the disk: a `conflict` and a quarantined
+parse failure. An import-only mount is skipped. The spacing between passes is measured from when the
+last one ended. Read-only filesystem events (open, read, close after reading) are dropped in the watcher's
 callback, and one burst of events is coalesced for at most ten debounces.
 
 Why: the watcher heard only the filesystem, so a task edited through `jkb` — on the host, or since the
@@ -253,7 +257,8 @@ next pass. Pinned by `writes_since_counts_what_others_wrote_and_passes_sync_s_ow
 `the_watcher_exports_a_database_edit_without_a_file_event` (reading the file faster than the debounce,
 and writing another file under the mount faster still, while it waits), `a_read_only_access_is_not_a_change`,
 `a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync`,
-`a_refused_file_is_re_judged_after_its_database_remedy` and
+`a_refused_file_is_re_judged_after_its_database_remedy` (and not before),
+`a_file_whose_check_fails_is_flagged_once_and_does_not_stop_the_pass` and
 `database_passes_are_spaced_and_a_write_between_them_is_kept`. Not verified on macOS here.
 
 ## A task's `^id` is read in the alphabet `slug` mints it in

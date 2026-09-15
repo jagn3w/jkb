@@ -2855,10 +2855,11 @@ fn a_database_edit_is_exported_to_its_file_and_to_no_other() {
     fs::write(&edited, TASKS_MD).unwrap();
     fs::write(&untouched, "## Other\n- [ ] Leave me be ^leave\n").unwrap();
     let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
     sync(&db, "docs/plan").unwrap();
     assert!(
-        jkb_sync::sync_kb_changes(&db, "docs/plan")
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
             .unwrap()
             .results
             .is_empty(),
@@ -2866,7 +2867,7 @@ fn a_database_edit_is_exported_to_its_file_and_to_no_other() {
     );
 
     kb_set_status(&db, &format!("{}#setup", uri_for(&edited)), "done");
-    let report = jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+    let report = jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
     assert_eq!(report.results.len(), 1, "{report:?}");
     assert_eq!(report.results[0].path, edited);
     assert_eq!(report.count(Outcome::Exported), 1, "{report:?}");
@@ -2874,7 +2875,7 @@ fn a_database_edit_is_exported_to_its_file_and_to_no_other() {
         .unwrap()
         .contains("- [x] Set up CI ^setup"));
     assert!(
-        jkb_sync::sync_kb_changes(&db, "docs/plan")
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
             .unwrap()
             .results
             .is_empty(),
@@ -2891,7 +2892,7 @@ fn a_database_edit_is_exported_to_its_file_and_to_no_other() {
     );
     kb_set_status(&db, &format!("{}#leave", uri_for(&untouched)), "done");
     assert!(
-        jkb_sync::sync_kb_changes(&db, "docs/plan")
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
             .unwrap()
             .results
             .is_empty(),
@@ -2978,6 +2979,7 @@ fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
         let file = dir.path().join("tasks.md");
         fs::write(&file, TASKS_MD).unwrap();
         let db = Db::open_in_memory().unwrap();
+        let mut judged = jkb_sync::FlaggedJudgements::default();
         mount_dir(
             &db,
             "docs/plan",
@@ -3001,7 +3003,7 @@ fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
         );
         kb_set_status(&db, &format!("{}#setup", uri_for(&file)), "done");
         let before = db.read(jkb_core::sync_state::latest_write).unwrap();
-        let report = jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+        let report = jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
         let exported = fs::read_to_string(&file)
             .unwrap()
             .contains("- [x] Set up CI ^setup");
@@ -3022,6 +3024,7 @@ fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
     let dir = real_tempdir();
     fs::write(dir.path().join("tasks.md"), TASKS_MD).unwrap();
     let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
     sync(&db, "docs/plan").unwrap();
     let fresh = dir.path().join("later/tasks.md");
@@ -3033,7 +3036,7 @@ fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
         task::create(conn, meta, &new).map(|_| ())
     })
     .unwrap();
-    jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
     assert!(
         fs::read_to_string(&fresh).is_ok_and(|t| t.contains("Born in the database ^born")),
         "{:?}",
@@ -3053,6 +3056,7 @@ fn a_refused_file_is_re_judged_after_its_database_remedy() {
     )
     .unwrap();
     let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
     sync(&db, "docs/plan").unwrap();
     let placement: (i64, i64, i64) = db
@@ -3069,12 +3073,26 @@ fn a_refused_file_is_re_judged_after_its_database_remedy() {
         })
         .unwrap();
     assert_eq!(
-        jkb_sync::sync_kb_changes(&db, "docs/plan")
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
             .unwrap()
             .count(Outcome::Refused),
         1
     );
     assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "needs_attention");
+    // Another write elsewhere, with nothing changed for this file: judged on the same render, it is not
+    // reconciled — and so not re-archived, re-refused and re-logged — again.
+    db.write_txn("cli", |conn, _| {
+        jkb_core::ns::ensure(conn, "elsewhere")?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "a file still refused for the same reason is not reconciled on every pass"
+    );
 
     // The remedy: put the placement back, in the database.
     db.write_txn("cli", move |conn, meta| {
@@ -3088,11 +3106,63 @@ fn a_refused_file_is_re_judged_after_its_database_remedy() {
         )
     })
     .unwrap();
-    jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
     assert_eq!(
         journal(&db, &uri_for(&tasks)).unwrap().0,
         "ok",
         "the flag clears once the remedy is applied"
     );
     assert!(fs::read_to_string(&tasks).unwrap().contains("- [x] and me"));
+}
+
+/// A file whose check fails is reconciled so the failure is recorded against it, the files after it are
+/// still exported, and a second pass does not reconcile it again while the failure stands.
+#[test]
+fn a_file_whose_check_fails_is_flagged_once_and_does_not_stop_the_pass() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    let broken = dir.path().join("a/tasks.md");
+    let edited = dir.path().join("b/tasks.md");
+    fs::write(&broken, "## A\n- [ ] one ^one\n").unwrap();
+    fs::write(&edited, TASKS_MD).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    // A serializer override this build does not know: the check of `a/tasks.md` cannot render it.
+    let broken_uri = format!("{}#one", uri_for(&broken));
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &broken_uri)?.expect("task");
+        binding::set(
+            conn,
+            meta,
+            id,
+            &broken_uri,
+            Some(SyncMode::Bidirectional),
+            Some("no-such"),
+        )
+    })
+    .unwrap();
+    kb_set_status(&db, &format!("{}#setup", uri_for(&edited)), "done");
+
+    let report = jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert!(
+        fs::read_to_string(&edited)
+            .unwrap()
+            .contains("- [x] Set up CI ^setup"),
+        "the file after the failing one is exported: {report:?}"
+    );
+    assert_eq!(report.failed().len(), 1, "{report:?}");
+    assert_eq!(
+        journal(&db, &uri_for(&broken)).unwrap().0,
+        "needs_attention"
+    );
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "not reconciled again while the same failure stands"
+    );
 }

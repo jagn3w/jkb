@@ -358,6 +358,20 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
     reconcile_all(db, &ctx, relevant)
 }
 
+/// What a caller of [`sync_kb_changes`] last judged each **flagged** bound file on, so a file that
+/// stays flagged is reconciled once per change to it rather than on every pass.
+///
+/// A flagged file's knowledge-base side cannot be judged against its last-synced hash — the refusal or
+/// failure that flagged it is why that hash is stale — so it was reconciled on every pass: re-archived,
+/// refused again, re-flagged with a changelog row holding its whole document twice, and logged, about
+/// once a second for as long as a fleet kept writing (stage-6.3a review 2). Keyed by what the pass saw
+/// — the render's hash, or the check's error — so the remedy, which changes one of them, is still
+/// re-judged. Kept by the watcher for as long as it runs; a fresh one re-judges every flagged file once.
+#[derive(Debug, Default)]
+pub struct FlaggedJudgements {
+    seen: HashMap<PathBuf, String>,
+}
+
 /// Reconcile the bound files under `mount_ns` whose knowledge-base side has changed since they were last
 /// synced — a task edited by `jkb task` on the host, or by a dev container through `jkb serve` — and
 /// no others.
@@ -368,19 +382,27 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
 /// reached the `tasks.md` the dev container was reading. [`crate::watch`] runs this when the changelog
 /// shows a write by anyone but sync.
 ///
-/// Which files is decided read-only and exactly as a reconcile would: the file's knowledge-base render
-/// is hashed against the last-synced hash on its journal row, and only a file that differs is
-/// reconciled — so a write elsewhere in the database costs a render per bound file, not an archive and
-/// a write transaction each. Also reconciled: a file never synced; a file whose check fails, so the
-/// reconcile records that failure against it rather than the pass ending before the files after it;
-/// and a file flagged `needs_attention` by a **refusal** — its remedy is a database write (`jkb task
-/// place … --home` after an undo dropped a placement), and skipped, it stayed flagged, and exported
-/// nothing, after the user did what it said. Left to a disk change or a full sync: a `conflict`, and a
-/// quarantined parse failure (a stashed file), whose remedies are on disk.
+/// Which files is decided read-only, one short read per file so writers interleave, by the file's
+/// journal state ([`FileState::from_journal`]):
+/// - `Settled`: its knowledge-base render hashed against its last-synced hash; reconciled if they differ,
+///   so a write elsewhere costs a render per bound file, not an archive and a transaction each.
+/// - `Untracked` (never synced): reconciled.
+/// - `Blocked` — a refusal, or a failure: reconciled when what it is judged on (its render's hash, or
+///   its check's error) differs from `judged`'s record of the last time. Its remedy is a database write
+///   (`jkb task place … --home` after an undo dropped a placement), so skipping it outright left the flag
+///   standing after the user did what it said; reconciling it every time re-flagged it every pass.
+/// - `Conflicted`, `Quarantined`: left to a disk change or a full sync, whose remedies are on disk.
+///
+/// A `Settled` file whose check fails is judged like a flagged one, so the reconcile records the failure
+/// against it once, rather than the pass ending before the files after it.
 ///
 /// # Errors
 /// As [`sync`]. Per-file failures are in the report.
-pub fn sync_kb_changes(db: &Db, mount_ns: &str) -> Result<SyncReport> {
+pub fn sync_kb_changes(
+    db: &Db,
+    mount_ns: &str,
+    judged: &mut FlaggedJudgements,
+) -> Result<SyncReport> {
     let ctx = load_ctx(db, mount_ns)?;
     if !ctx.exports() {
         return Ok(SyncReport::default());
@@ -390,36 +412,82 @@ pub fn sync_kb_changes(db: &Db, mount_ns: &str) -> Result<SyncReport> {
         .into_iter()
         .filter(|path| filter.accepts_bound(&ctx.dir, path))
         .collect();
-    let judged = ctx.clone();
-    let changed = db.read_with::<Vec<PathBuf>, Error, _>(move |conn| {
-        let mut changed = Vec::new();
-        for path in bound {
-            if kb_side_changed(conn, &judged, &path).unwrap_or(true) {
+    let mut changed = Vec::new();
+    for path in bound {
+        let (at, file) = (ctx.clone(), path.clone());
+        let verdict =
+            db.read_with::<KbSide, Error, _>(move |conn| Ok(judge_kb_side(conn, &at, &file)))?;
+        match verdict {
+            KbSide::Unchanged => {
+                judged.seen.remove(&path);
+            }
+            // Recorded as it is reconciled: if the reconcile flags it, the next pass judging it on the
+            // same render leaves it alone rather than reconciling it once more.
+            KbSide::Changed(key) => {
+                judged.seen.insert(path.clone(), key);
                 changed.push(path);
             }
+            KbSide::Flagged(key) => {
+                if judged.seen.get(&path) != Some(&key) {
+                    judged.seen.insert(path.clone(), key);
+                    changed.push(path);
+                }
+            }
         }
-        Ok(changed)
-    })?;
+    }
     if changed.is_empty() {
         return Ok(SyncReport::default());
     }
     reconcile_all(db, &ctx, changed)
 }
 
-/// Whether `path`'s knowledge-base side needs reconciling after a database write — see
-/// [`sync_kb_changes`] for which files do.
-fn kb_side_changed(conn: &Connection, ctx: &Ctx, path: &Path) -> Result<bool> {
+/// What a database pass concludes about one bound file's knowledge-base side.
+enum KbSide {
+    /// Nothing to reconcile.
+    Unchanged,
+    /// Reconcile it; judged on this key.
+    Changed(String),
+    /// Flagged, or its check failed: reconcile it if this key differs from the last judgement's.
+    Flagged(String),
+}
+
+/// Judge `path`'s knowledge-base side — see [`sync_kb_changes`].
+fn judge_kb_side(conn: &Connection, ctx: &Ctx, path: &Path) -> KbSide {
     let bare_uri = file_uri(path);
-    let journal = sync_state::get(conn, &bare_uri)?;
-    let base = match &journal {
-        None => return Ok(true),
-        Some(j) if j.status == "conflict" || j.quarantine_blob_hash.is_some() => return Ok(false),
-        Some(j) if j.status != "ok" => return Ok(true),
-        Some(j) => j.last_synced_hash.clone(),
+    let render = |journal: Option<&sync_state::SyncState>| -> Result<String> {
+        let (_, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
+        let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal)?;
+        Ok(hash(&serializer.render(&kb_doc)?))
     };
-    let (_, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
-    let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
-    Ok(base.as_deref() != Some(hash(&serializer.render(&kb_doc)?).as_str()))
+    let key = |rendered: Result<String>| match rendered {
+        Ok(hash) => format!("render {hash}"),
+        Err(e) => format!("error {e}"),
+    };
+    let journal = match sync_state::get(conn, &bare_uri) {
+        Ok(journal) => journal,
+        Err(e) => return KbSide::Flagged(key(Err(e.into()))),
+    };
+    let state = FileState::from_journal(
+        journal.as_ref().map(|j| j.status.as_str()),
+        journal
+            .as_ref()
+            .is_some_and(|j| j.quarantine_blob_hash.is_some()),
+    );
+    match state {
+        FileState::Untracked => KbSide::Changed(key(render(None))),
+        FileState::Conflicted | FileState::Quarantined => KbSide::Unchanged,
+        FileState::Blocked => KbSide::Flagged(key(render(journal.as_ref()))),
+        FileState::Settled => match render(journal.as_ref()) {
+            Ok(rendered)
+                if journal.as_ref().and_then(|j| j.last_synced_hash.as_deref())
+                    == Some(rendered.as_str()) =>
+            {
+                KbSide::Unchanged
+            }
+            Ok(rendered) => KbSide::Changed(key(Ok(rendered))),
+            Err(e) => KbSide::Flagged(key(Err(e))),
+        },
+    }
 }
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.

@@ -125,7 +125,11 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
         // edited through `jkb`, and asked only on an idle tick it waited out any file churn.
         database.poll(db, mount_ns, debounce);
         if database.pass_due(debounce.saturating_mul(EXPORT_TICKS)) {
-            debt.targeted_pass(run_pass(mount_ns, || engine::sync_kb_changes(db, mount_ns)));
+            let judged = &mut database.judged;
+            debt.targeted_pass(run_pass(mount_ns, || {
+                engine::sync_kb_changes(db, mount_ns, judged)
+            }));
+            database.passed();
         }
     }
     Ok(())
@@ -202,6 +206,8 @@ struct DatabaseWrites {
     polled: Instant,
     passed: Option<Instant>,
     failing: bool,
+    /// What each flagged bound file was last judged on, so it is reconciled once per change.
+    judged: engine::FlaggedJudgements,
 }
 
 impl DatabaseWrites {
@@ -212,6 +218,7 @@ impl DatabaseWrites {
             polled: Instant::now(),
             passed: None,
             failing: false,
+            judged: engine::FlaggedJudgements::default(),
         }
     }
 
@@ -237,15 +244,18 @@ impl DatabaseWrites {
         }
     }
 
-    /// Whether a pass over database changes is owed and `spacing` has passed since the last; taking it
-    /// discharges the debt, so a write during the pass is owed again by the next poll.
-    fn pass_due(&mut self, spacing: Duration) -> bool {
-        if !self.owed || self.passed.is_some_and(|at| at.elapsed() < spacing) {
-            return false;
-        }
+    /// Whether a pass over database changes is owed and `spacing` has passed since the last one ended.
+    fn pass_due(&self, spacing: Duration) -> bool {
+        self.owed && self.passed.is_none_or(|at| at.elapsed() >= spacing)
+    }
+
+    /// A pass has run: the debt is discharged — a write during it is owed again by the next poll, which
+    /// reads past the mark taken before it — and the spacing is measured from **now**, when it ended.
+    /// From its start, a pass longer than the spacing was followed at once by the next, the unspaced
+    /// cost the spacing exists to prevent ([`RetryDebt`] measures from the finish for the same reason).
+    fn passed(&mut self) {
         self.owed = false;
         self.passed = Some(Instant::now());
-        true
     }
 }
 
@@ -509,12 +519,24 @@ mod tests {
         assert!(!writes.pass_due(BASE), "nothing written, nothing owed");
         writes.owed = true;
         assert!(writes.pass_due(BASE), "the first owed pass runs at once");
+        // A pass that takes longer than the spacing: the next is measured from its end.
+        std::thread::sleep(BASE * 2);
+        writes.passed();
         writes.owed = true;
-        assert!(!writes.pass_due(BASE), "a second inside the spacing waits");
+        assert!(
+            !writes.pass_due(BASE),
+            "a second inside the spacing after the last pass ENDED waits"
+        );
         assert!(writes.owed, "and stays owed");
         std::thread::sleep(BASE);
         assert!(writes.pass_due(BASE), "then runs");
+        writes.passed();
         assert!(!writes.owed);
+        writes.owed = true;
+        assert!(
+            !writes.pass_due(BASE),
+            "every pass restarts the spacing, not only the first"
+        );
     }
 
     /// A debt nothing owes is never due, however long the watcher idles.
