@@ -4,7 +4,10 @@
 //!
 //! Events carry the paths that changed, so a burst reconciles just those files via
 //! [`crate::sync_paths`] rather than re-scanning the whole mount — important once a
-//! mount backs a large tree. Only two situations fall back to a full [`crate::sync`]:
+//! mount backs a large tree. A change made in the **database** raises no filesystem event, so each
+//! idle tick also asks the changelog whether anyone but sync has written since the last look, and if so
+//! reconciles the bound files whose knowledge-base side changed ([`crate::sync_kb_changes`]).
+//! Only two situations fall back to a full [`crate::sync`]:
 //! the initial reconcile on startup (to catch drift from while the watcher was off),
 //! and a watcher error or dropped-events signal (`need_rescan`), where we can no
 //! longer trust the incremental path list.
@@ -22,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use notify::{Event, RecursiveMode, Watcher};
 
-use jkb_core::{mount, Db};
+use jkb_core::{mount, sync_state, Db};
 
 use crate::{engine, Error, Result};
 
@@ -45,7 +48,14 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     // inside the directories it binds — made the recursive watch walk and subscribe to the host
     // directories it pointed at, and turned their activity into events under the mount.
     let mut watcher = notify::RecommendedWatcher::new(
-        move |res| {
+        move |res: notify::Result<Event>| {
+            // A read changes nothing, and is dropped here rather than in the loop: counted there,
+            // any process reading a file under the mount — an editor, a grep, this watcher's own
+            // reconcile — kept the debounce from ever going quiet, so the idle tick that asks about
+            // database changes never came.
+            if res.as_ref().is_ok_and(|event| is_read_only(event.kind)) {
+                return;
+            }
             // A closed receiver just means we're shutting down; ignore the send error.
             let _ = tx.send(res);
         },
@@ -55,6 +65,8 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     // relevance filtering happens in `sync_paths` against the mount's include/exclude.
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
+    // Read before the first pass, so a write that lands during it is still seen afterwards.
+    let mut seen = db.read(|conn| sync_state::writes_since(conn, 0))?.latest;
     let mut debt = RetryDebt::new(
         run_pass(mount_ns, || engine::sync(db, mount_ns)),
         debounce.saturating_mul(RETRY_TICKS),
@@ -85,7 +97,25 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
             }
             // An idle tick still settles a debt. Without this the retry only ever fired if a
             // file happened to change, which is the one condition a failed pass cannot rely on.
-            Err(RecvTimeoutError::Timeout) => debt.due().then_some(Work::Full),
+            // Otherwise it asks whether the database changed under the bound files: nothing else
+            // reports a task edited through `jkb` rather than in its file.
+            Err(RecvTimeoutError::Timeout) => {
+                if debt.due() {
+                    Some(Work::Full)
+                } else {
+                    let writes = db.read(move |conn| sync_state::writes_since(conn, seen));
+                    match writes {
+                        Ok(writes) => {
+                            seen = writes.latest;
+                            writes.by_others.then_some(Work::KbChanges)
+                        }
+                        Err(e) => {
+                            eprintln!("sync {mount_ns}: could not read the changelog ({e})");
+                            None
+                        }
+                    }
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
@@ -97,6 +127,9 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 debt.targeted_pass(run_pass(mount_ns, || {
                     engine::sync_paths(db, mount_ns, &paths)
                 }));
+            }
+            Some(Work::KbChanges) => {
+                debt.targeted_pass(run_pass(mount_ns, || engine::sync_kb_changes(db, mount_ns)));
             }
             None => {}
         }
@@ -173,6 +206,8 @@ enum Work {
     Full,
     /// Reconcile exactly these paths.
     Paths(Vec<PathBuf>),
+    /// Reconcile the bound files whose knowledge-base side changed: something other than sync wrote.
+    KbChanges,
 }
 
 /// Run one reconcile pass, reporting whatever happens. **Never returns an error.**
@@ -312,6 +347,22 @@ fn collect(res: notify::Result<Event>, paths: &mut BTreeSet<PathBuf>) -> bool {
     }
 }
 
+/// Whether `kind` is an access that cannot have changed the file: an open, a read, a close after
+/// reading. A close after writing is not — it ends a write.
+///
+/// Linux's inotify backend subscribes to opens, so the reconcile's own read of a file raised an event
+/// asking for another reconcile of it, at every debounce, for as long as the watcher ran. That loop
+/// re-reconciled every recently read file, which hid on Linux that nothing exported a change made in
+/// the database; on macOS, whose events carry no opens, the edit simply never reached the file.
+fn is_read_only(kind: notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    matches!(
+        kind,
+        notify::EventKind::Access(access)
+            if !matches!(access, AccessKind::Close(AccessMode::Write))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RetryDebt, MAX_RETRY};
@@ -374,6 +425,22 @@ mod tests {
             debt.full_pass(true);
         }
         assert_eq!(debt.after, MAX_RETRY, "backoff did not settle at the cap");
+    }
+
+    /// Opening or reading a file is not a change to it; closing it after a write is.
+    #[test]
+    fn a_read_only_access_is_not_a_change() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, EventKind};
+        assert!(super::is_read_only(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(super::is_read_only(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!super::is_read_only(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(!super::is_read_only(EventKind::Create(CreateKind::File)));
     }
 
     /// A debt nothing owes is never due, however long the watcher idles.

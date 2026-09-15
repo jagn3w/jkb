@@ -2841,3 +2841,105 @@ fn a_flagged_unbound_file_behind_a_link_is_settled() {
         "the row behind the link is settled"
     );
 }
+
+/// A task changed in the database — not in its file — is written to its file by the next pass over
+/// what changed there, and only that file: nothing else touched is reconciled, and a second pass finds
+/// nothing.
+#[test]
+fn a_database_edit_is_exported_to_its_file_and_to_no_other() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    let edited = dir.path().join("a/tasks.md");
+    let untouched = dir.path().join("b/tasks.md");
+    fs::write(&edited, TASKS_MD).unwrap();
+    fs::write(&untouched, "## Other\n- [ ] Leave me be ^leave\n").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan")
+            .unwrap()
+            .results
+            .is_empty(),
+        "nothing changed yet"
+    );
+
+    kb_set_status(&db, &format!("{}#setup", uri_for(&edited)), "done");
+    let report = jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+    assert_eq!(report.results.len(), 1, "{report:?}");
+    assert_eq!(report.results[0].path, edited);
+    assert_eq!(report.count(Outcome::Exported), 1, "{report:?}");
+    assert!(fs::read_to_string(&edited)
+        .unwrap()
+        .contains("- [x] Set up CI ^setup"));
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan")
+            .unwrap()
+            .results
+            .is_empty(),
+        "settled"
+    );
+
+    // A flagged file is left to the reconcile that settles its flag: broken on disk, then edited in the
+    // database, it is not rewritten from here.
+    fs::write(&untouched, "## Other\n- [ ] one ^dup\n- [ ] two ^dup\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        journal(&db, &uri_for(&untouched)).unwrap().0,
+        "needs_attention"
+    );
+    kb_set_status(&db, &format!("{}#leave", uri_for(&untouched)), "done");
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan")
+            .unwrap()
+            .results
+            .is_empty(),
+        "a flagged file is not reconciled by a database change"
+    );
+    assert!(fs::read_to_string(&untouched).unwrap().contains("^dup"));
+}
+
+/// The watcher writes a database edit to its file with no filesystem event to prompt it: a task edited
+/// through `jkb` on the host, or by a container through `jkb serve`, used to stay out of its file until
+/// the file changed on disk or the watcher restarted.
+#[test]
+fn the_watcher_exports_a_database_edit_without_a_file_event() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let db = db.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            jkb_sync::watch(&db, "docs/plan", Duration::from_millis(20), &stop)
+        })
+    };
+    let uri = format!("{}#setup", uri_for(&file));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while status_of(&db, &uri).is_none() {
+        assert!(std::time::Instant::now() < deadline, "initial reconcile");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    kb_set_status(&db, &uri, "done");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&file)
+        .unwrap()
+        .contains("- [x] Set up CI ^setup")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the edit never reached the file: {}",
+            fs::read_to_string(&file).unwrap()
+        );
+        // Read faster than the debounce: a watcher that counted a read as activity never went quiet
+        // long enough to ask about the database — as with an editor or a grep reading the file.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().unwrap().unwrap();
+}

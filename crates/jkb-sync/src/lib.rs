@@ -19,7 +19,7 @@ mod serializers;
 mod watch;
 
 pub use engine::{
-    backing_dir, file_uri, filed_task_problem, sync, sync_paths, sync_with_policy,
+    backing_dir, file_uri, filed_task_problem, sync, sync_kb_changes, sync_paths, sync_with_policy,
     tasks_mount_file, FileResult, Outcome, SyncReport,
 };
 pub use error::{Error, Result};

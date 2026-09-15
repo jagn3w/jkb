@@ -181,7 +181,8 @@ link at the file or any directory above it, reads only a regular file (non-block
 hang the watcher), and writes a temporary file beside the target and `renameat`s it into place — which
 replaces whatever is at the name rather than writing through it, and keeps an existing file's mode.
 
-Why: the host's `jkb sync --watch` writes a bound file whenever the knowledge base changes, and since
+Why: the host's `jkb sync --watch` writes a bound file whenever the knowledge base changes (since the
+section below; before it, at the next event on that file), and since
 the task-mutate set a dev container can make those changes through `jkb serve`. The container can also
 write inside the host directories it binds. With plain `std::fs::write`, replacing a bound `tasks.md`
 under `~/repos` with a link to `~/.zshrc` and then editing the task turned the next sync into the
@@ -215,6 +216,33 @@ a child process) and, because a bound path is no longer filtered before it is re
 `sync_never_writes_through_a_symlink_planted_at_a_bound_file` and
 `a_bound_file_reached_through_a_link_stays_flagged_naming_the_link`, which fail when the engine goes
 back to following links. Not verified on macOS here — the tests ran on Linux.
+
+## The watcher exports a change made in the database, not only one made on disk
+
+**Decided (2026-09-15, after the user saw it on the host):** each mount's watcher polls the changelog on
+its idle tick (`sync_state::writes_since`, reading only entries past its last look). When anyone but
+sync itself (`sync_state::SYNC_ACTOR`) has written, it reconciles the bound files whose knowledge-base
+render no longer hashes to their last-synced hash (`engine::sync_kb_changes`) — read-only to decide,
+so a write elsewhere costs a render per bound file, not an archive and a transaction each. Files flagged
+`conflict`/`needs_attention` are left to the reconcile that settles their flag. Read-only filesystem
+events (open, read, close after reading) are dropped in the watcher's callback.
+
+Why: the watcher heard only the filesystem, so a task edited through `jkb` — on the host, or since the
+task-mutate set by a dev container through `jkb serve` — stayed out of its file until that file changed
+on disk or the watcher restarted. The user edited F1 in this change's `tasks.md` on the host through
+`jkb`; the database had it, the file never did. Nothing had ever triggered that export. Two things hid it:
+on Linux, notify's inotify backend reports opens, so each reconcile's own read of a file raised an event
+that reconciled it again at every debounce — a loop that exported database edits by accident, in every
+Linux test — while macOS's FSEvents carry no opens, so the Mac showed the real behaviour. And counting
+those reads as activity let any reader faster than the debounce (an editor, a grep, a test polling for
+the result) keep the loop from ever going idle.
+
+Sync's own writes do not count, or every pass would trigger the next. What that leaves: a mount's
+`ensure_all_mirrors` (a sync write) that changes another mount's render is not seen until that mount's
+next pass. Pinned by `writes_since_counts_what_others_wrote_and_passes_sync_s_own`,
+`a_database_edit_is_exported_to_its_file_and_to_no_other`,
+`the_watcher_exports_a_database_edit_without_a_file_event` (reading the file faster than the debounce
+while it waits) and `a_read_only_access_is_not_a_change`. Not verified on macOS here.
 
 ## A task's `^id` is read in the alphabet `slug` mints it in
 

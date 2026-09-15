@@ -316,7 +316,7 @@ fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
     if stale.is_empty() {
         return Ok(0);
     }
-    db.write_txn_with::<usize, Error, _>("sync", move |conn, meta| {
+    db.write_txn_with::<usize, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
         let mut cleared = 0;
         for uri in &stale {
             if sync_state::settle(conn, meta, uri)? {
@@ -358,6 +358,60 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
     reconcile_all(db, &ctx, relevant)
 }
 
+/// Reconcile the bound files under `mount_ns` whose knowledge-base side has changed since they were last
+/// synced — a task edited by `jkb task` on the host, or by a dev container through `jkb serve` — and
+/// no others.
+///
+/// A file watcher hears only the filesystem. A change made in the database raises no event, so before
+/// this the edit sat in the knowledge base until that file happened to change on disk or the watcher
+/// restarted, while the file went on showing the old line: an F1 edited on the host through `jkb` never
+/// reached the `tasks.md` the dev container was reading. [`crate::watch`] runs this when the changelog
+/// shows a write by anyone but sync.
+///
+/// Which files is decided read-only and exactly as a reconcile would: the file's knowledge-base render
+/// is hashed against the last-synced hash on its journal row, and only a file that differs is
+/// reconciled — so a write elsewhere in the database costs a render per bound file, not an archive and
+/// a write transaction each. A file never synced is reconciled; one flagged `conflict` or
+/// `needs_attention` is left to the reconcile a disk change or a full sync gives it, which is where its
+/// flag is settled.
+///
+/// # Errors
+/// As [`sync`]. Per-file failures are in the report.
+pub fn sync_kb_changes(db: &Db, mount_ns: &str) -> Result<SyncReport> {
+    let ctx = load_ctx(db, mount_ns)?;
+    if !ctx.exports() {
+        return Ok(SyncReport::default());
+    }
+    let filter = Filter::build(&read_globs(db, mount_ns)?)?;
+    let bound: Vec<PathBuf> = bound_paths(db, &ctx)?
+        .into_iter()
+        .filter(|path| filter.accepts_bound(&ctx.dir, path))
+        .collect();
+    let judged = ctx.clone();
+    let changed = db.read_with::<Vec<PathBuf>, Error, _>(move |conn| {
+        let mut changed = Vec::new();
+        for path in bound {
+            let bare_uri = file_uri(&path);
+            let journal = sync_state::get(conn, &bare_uri)?;
+            let base = match &journal {
+                None => None,
+                Some(j) if j.status != "ok" => continue,
+                Some(j) => j.last_synced_hash.clone(),
+            };
+            let (_, serializer) = resolve_serializer(conn, &judged, &bare_uri)?;
+            let kb_doc = assemble_kb_doc(conn, &judged, &path, &bare_uri, journal.as_ref())?;
+            if base.as_deref() != Some(hash(&serializer.render(&kb_doc)?).as_str()) {
+                changed.push(path);
+            }
+        }
+        Ok(changed)
+    })?;
+    if changed.is_empty() {
+        return Ok(SyncReport::default());
+    }
+    reconcile_all(db, &ctx, changed)
+}
+
 /// Reconcile each path in its own audited transaction, collecting the outcomes.
 fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
     let mut results = Vec::with_capacity(paths.len());
@@ -383,11 +437,12 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
             Err(e) => {
                 let reason = format!("could not archive the current bytes before syncing: {e}");
                 let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
-                let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
-                    let uri = file_uri(&p2);
-                    let prev = sync_state::get(conn, &uri)?;
-                    flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                });
+                let _ =
+                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                        let uri = file_uri(&p2);
+                        let prev = sync_state::get(conn, &uri)?;
+                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
+                    });
                 results.push(FileResult {
                     path,
                     outcome: Outcome::Failed,
@@ -404,9 +459,10 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // mount, whose serializer does not quarantine — returned `Err` out of the watcher
         // thread. `watch_all` then blocked joining the other threads until stop, launchd never
         // restarted the still-alive process, and that mount silently stopped syncing forever.
-        let outcome = db.write_txn_with::<Outcome, Error, _>("sync", move |conn, meta| {
-            reconcile(conn, meta, &ctx, &p, archived)
-        });
+        let outcome = db
+            .write_txn_with::<Outcome, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                reconcile(conn, meta, &ctx, &p, archived)
+            });
         let (outcome, reason) = match outcome {
             Ok(o) => (o, outcome_reason(db, &path)?),
             Err(e) => {
@@ -415,11 +471,12 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
                 // `jkb doctor` — leaving one stderr line under the watcher as its only trace.
                 let (p2, msg) = (path.clone(), e.to_string());
                 let ser = ser_name.clone();
-                let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
-                    let uri = file_uri(&p2);
-                    let prev = sync_state::get(conn, &uri)?;
-                    flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                });
+                let _ =
+                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                        let uri = file_uri(&p2);
+                        let prev = sync_state::get(conn, &uri)?;
+                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
+                    });
                 (Outcome::Failed, Some(e.to_string()))
             }
         };
@@ -435,7 +492,7 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
     // its own commit and spin (the file-watch feedback loop).
     let imported = results.iter().any(|r| brought_items_in(r.outcome));
     if imported {
-        db.write_txn_with::<usize, Error, _>("sync", |conn, meta| {
+        db.write_txn_with::<usize, Error, _>(sync_state::SYNC_ACTOR, |conn, meta| {
             Ok(task::ensure_all_mirrors(conn, meta)?)
         })?;
     }
@@ -473,7 +530,7 @@ fn archive_current_bytes(db: &Db, path: &Path) -> Result<Option<Vec<u8>>> {
         return Ok(Some(bytes));
     }
     let stored = bytes.clone();
-    db.write_txn_with::<(), Error, _>("sync", move |conn, _meta| {
+    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, _meta| {
         blob::store(conn, &blob::hash_bytes(&stored), &stored, None)?;
         Ok(())
     })?;

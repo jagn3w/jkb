@@ -257,6 +257,39 @@ pub fn flagged_under(conn: &Connection, dir: &Path) -> Result<Vec<SyncState>> {
         .collect())
 }
 
+/// The changelog actor every write of the sync engine is recorded under.
+pub const SYNC_ACTOR: &str = "sync";
+
+/// What the changelog holds past a watcher's last look: the newest entry's id, and whether any entry
+/// since `after` was written by someone other than [`SYNC_ACTOR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Writes {
+    /// The newest changelog id, or `after` when there is none newer.
+    pub latest: i64,
+    /// Something other than sync wrote since `after`.
+    pub by_others: bool,
+}
+
+/// The changelog past `after` (`0` for all of it), for a file watcher asking whether the knowledge
+/// base changed under a bound file — a task edited by `jkb task` on the host, or by a container
+/// through `jkb serve` — which no filesystem event reports. Sync's own writes do not count: they
+/// are the result of reconciling, and counting them would have every pass trigger the next. Reads only
+/// the entries since `after`, so a watcher polling on each idle tick pays for what is new.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn writes_since(conn: &Connection, after: i64) -> Result<Writes> {
+    let (latest, by_others): (Option<i64>, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT max(id), max(coalesce(actor, '') <> ?2) FROM changelog WHERE id > ?1",
+        )?
+        .query_row(params![after, SYNC_ACTOR], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(Writes {
+        latest: latest.unwrap_or(after),
+        by_others: by_others == Some(1),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{get, needs_attention, upsert, SyncStateWrite};
@@ -353,5 +386,54 @@ mod tests {
             .read(|conn| Ok(conn.query_row("SELECT count(*) FROM sync_state", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Sync's own writes move the mark but are not a change for the watcher; anyone else's is.
+    #[test]
+    fn writes_since_counts_what_others_wrote_and_passes_sync_s_own() {
+        let db = Db::open_in_memory().unwrap();
+        let start = db.read(|c| super::writes_since(c, 0)).unwrap().latest;
+        let write = |actor: &'static str| {
+            db.write_txn(actor, move |c, m| {
+                crate::ns::ensure(c, "a")?;
+                crate::item::upsert(
+                    c,
+                    m,
+                    &crate::item::NewItem {
+                        uid: format!("u:{actor}:{}", m.txn_id),
+                        kind: "note".into(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        };
+        write(super::SYNC_ACTOR);
+        let after_sync = db.read(move |c| super::writes_since(c, start)).unwrap();
+        assert!(
+            after_sync.latest > start && !after_sync.by_others,
+            "{after_sync:?}"
+        );
+        write("cli");
+        let after_cli = db
+            .read(move |c| super::writes_since(c, after_sync.latest))
+            .unwrap();
+        assert!(
+            after_cli.latest > after_sync.latest && after_cli.by_others,
+            "{after_cli:?}"
+        );
+        let quiet = db
+            .read(move |c| super::writes_since(c, after_cli.latest))
+            .unwrap();
+        assert_eq!(
+            quiet,
+            super::Writes {
+                latest: after_cli.latest,
+                by_others: false
+            }
+        );
     }
 }
