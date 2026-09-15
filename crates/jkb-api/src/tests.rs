@@ -1881,6 +1881,99 @@ fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_parses_in_linear_
     );
 }
 
+/// A tasks-file task's line must come back from the file whatever field a write changed: a due date, a
+/// tag or a namespace with a space in it rendered a line the next import read back as another title,
+/// clearing the field.
+#[test]
+fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
+    let (db, inside, _outside, _managed) = mutate_fixture();
+    let host = LocalBackend::new(db.clone());
+    let Response::Added { added } = call(
+        &host,
+        json!({ "op": "task.add", "text": "other +repos/in" }),
+    )
+    .unwrap() else {
+        panic!("added")
+    };
+    let other = added.uid;
+    let uid = inside.clone();
+    let uri = db
+        .write_txn("t", move |c, m| {
+            let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
+            // Planted below the ops, as a writer that never asked the file could have left it.
+            jkb_core::task::set_due(c, m, id, Some("next week"))?;
+            Ok(jkb_core::binding::get(c, id)?.expect("bound").uri)
+        })
+        .unwrap();
+    let writes = vec![
+        json!({ "op": "task.set", "uid": inside, "priority": 1 }),
+        json!({ "op": "task.edit", "uid": inside, "text": "more", "append": true }),
+        json!({ "op": "task.tag", "uid": inside, "facet_value": "size=s", "mode": "add" }),
+        json!({ "op": "task.depend", "uid": inside, "dep": other }),
+        json!({ "op": "task.undepend", "uid": inside, "dep": other }),
+        json!({ "op": "task.place", "uid": inside, "ns": "elsewhere" }),
+        json!({ "op": "task.unplace", "uid": inside, "ns": "elsewhere" }),
+        json!({ "op": "task.bind", "uid": inside, "sync": uri }),
+        json!({ "op": "task.claim", "uid": inside, "owner": "agent:a" }),
+        json!({ "op": "task.release", "uid": inside, "owner": "agent:a" }),
+    ];
+    // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
+    let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();
+    covered.push("task.add");
+    covered.sort_unstable();
+    let mut task_writes: Vec<&str> = samples()
+        .iter()
+        .map(super::Request::op)
+        .filter(|op| op.starts_with("task.") && !READS.contains(op))
+        .collect();
+    task_writes.sort_unstable();
+    assert_eq!(covered, task_writes);
+    for request in writes {
+        let e = call(&host, request.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{request}: {e:?}");
+        assert!(e.message.contains("due date"), "{request}: {e:?}");
+    }
+
+    // A write that takes the offending value away passes, and each field is judged on its own.
+    call(
+        &host,
+        json!({ "op": "task.set", "uid": inside, "due": "2026-07-15" }),
+    )
+    .expect("a one-word due date comes back");
+    for (request, field) in [
+        (
+            json!({ "op": "task.set", "uid": inside, "due": "2026-07-15 17:00" }),
+            "due date",
+        ),
+        (
+            json!({ "op": "task.tag", "uid": inside, "facet_value": "note=two words", "mode": "add" }),
+            "tags",
+        ),
+        (
+            json!({ "op": "task.place", "uid": inside, "ns": "has space" }),
+            "placements",
+        ),
+        (
+            json!({ "op": "task.bind", "uid": inside, "sync": "file:///Users/u/repos/in/tasks.md#Fix_Login" }),
+            "identity",
+        ),
+        (
+            json!({ "op": "task.add", "text": "\"first\n\nsecond\" +repos/in" }),
+            "section prose",
+        ),
+    ] {
+        let e = call(&host, request.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{request}: {e:?}");
+        assert!(e.message.contains(field), "{request}: {e:?}");
+    }
+    let Response::Task { task, .. } =
+        call(&host, json!({ "op": "task.show", "uid": inside })).unwrap()
+    else {
+        panic!("task")
+    };
+    assert_eq!(task.item.due.as_deref(), Some("2026-07-15"), "rolled back");
+}
+
 #[test]
 fn a_due_date_is_bounded_on_add_and_a_tag_over_the_limit_can_still_be_removed() {
     let (db, _inside, _outside, managed) = mutate_fixture();

@@ -126,6 +126,47 @@ pub fn get(conn: &Connection, namespace: NamespaceId) -> Result<Option<Mount>> {
     Ok(mount)
 }
 
+/// The `file://` mount whose directory covers `path` most closely, with its namespace path. `None` when
+/// no mount covers it. The one copy of this lookup: `binding::serializer_for` and `jkb_sync`'s
+/// `task_line_problem` both find a bound file's mount by it.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn covering(conn: &Connection, path: &std::path::Path) -> Result<Option<(String, Mount)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT n.path, m.backing_uri, m.sync_mode, m.serializer, m.include_glob, m.exclude_glob,
+                m.conflict_policy
+         FROM mounts m JOIN namespaces n ON n.id = m.namespace_id
+         WHERE m.backing_uri LIKE 'file://%'",
+    )?;
+    let mounts = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Mount {
+                    backing_uri: row.get(1)?,
+                    sync_mode: row.get(2)?,
+                    serializer: row.get(3)?,
+                    include_glob: row.get(4)?,
+                    exclude_glob: row.get(5)?,
+                    conflict_policy: row.get(6)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(mounts
+        .into_iter()
+        .filter_map(|(ns, mount)| {
+            let dir = mount
+                .backing_uri
+                .strip_prefix("file://")?
+                .trim_end_matches('/');
+            path.starts_with(dir).then_some((dir.len(), ns, mount))
+        })
+        .max_by_key(|(len, _, _)| *len)
+        .map(|(_, ns, mount)| (ns, mount)))
+}
+
 /// The namespace paths of every configured mount, ordered by path. Backs the
 /// all-mounts watcher (`jkb sync --watch` with no namespace).
 ///

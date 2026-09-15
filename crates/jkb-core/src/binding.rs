@@ -155,12 +155,12 @@ pub fn synced_uris_for_file(conn: &Connection, bare_uri: &str) -> Result<Vec<Str
         row.get::<_, String>(0)
     })?;
     let file = bare_uri.strip_prefix("file://");
+    let uris = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::new();
-    for row in rows {
-        let uri = row?;
-        // `LIKE '<uri>#%'` also matches a document whose own name continues past a `#` (`C#.md` for
-        // the file `C`); only a uri whose fragment [`file_path`] takes off belongs to this file.
-        if uri == bare_uri || file_path(&uri) == file {
+    for uri in uris {
+        // `LIKE '<uri>#%'` also matches a document whose own name continues past a `#` (`C#.md` or
+        // `C#42` for the file `C`); only a uri whose fragment [`file_of`] takes off belongs to this file.
+        if uri == bare_uri || file_of(conn, &uri)?.as_deref() == file {
             out.push(uri);
         }
     }
@@ -224,17 +224,37 @@ pub fn file_path(uri: &str) -> Option<&str> {
     })
 }
 
-/// The serializer that owns an item's file binding: the binding's own override, else the serializer
-/// the sync journal says last produced the file, else — for a file not synced yet — the serializer of
-/// the mount whose directory covers it most closely. `None` for an item bound to no file, or to a file
-/// no mount covers.
+/// The file a binding uri names, by what is stored where spelling cannot tell: a uri that is itself a
+/// sync journal key names a whole file however it is spelled — a document named `issue#42`, which
+/// [`file_path`] alone would read as the file `issue` with the local id `42` — and any other uri is
+/// parsed by [`file_path`]. The engine gathers a file's bindings ([`synced_uris_for_file`]) and walks the
+/// bound files by this; a journal row is written in the same transaction as a document's first binding,
+/// so a synced document always has one.
 ///
-/// The journal comes before the mounts because it records what the engine actually used, and the
-/// engine syncs a file with the serializer of the mount *doing the sync*: under a `document` mount
-/// over a directory with a nested `tasks` mount, `jkb sync` of the outer one imports the nested
-/// `tasks.md` as one whole-file document, which the closest mount would have misjudged as a task. The
-/// journal is keyed by the bare file uri, so a document's own uri is tried as it is before the
-/// fragment is taken off it.
+/// # Errors
+/// Returns an error if the read fails.
+pub fn file_of(conn: &Connection, uri: &str) -> Result<Option<String>> {
+    let Some(path) = file_path(uri) else {
+        return Ok(None);
+    };
+    if path.len() + "file://".len() < uri.len() && crate::sync_state::get(conn, uri)?.is_some() {
+        return Ok(uri.strip_prefix("file://").map(str::to_owned));
+    }
+    Ok(Some(path.to_owned()))
+}
+
+/// The serializer that owns an item's file binding: the binding's own override; else, for a uri that
+/// names a whole file, the serializer the sync journal says last produced it; else the serializer of
+/// the mount whose directory covers the file most closely ([`crate::mount::covering`]). `None` for an
+/// item bound to no file, or to a file no mount covers.
+///
+/// The journal is asked only of a whole-file uri because it records what the engine actually used for
+/// that file, and the engine syncs with the serializer of the mount *doing the sync*: under a
+/// `document` mount over a directory with a nested `tasks` mount, `jkb sync` of the outer one imports
+/// the nested `tasks.md` as one whole-file document, which the closest mount would misjudge as a task.
+/// A `#<local id>` binding is only ever made by a multi-item serializer, so it goes to the mount: its
+/// file's journal row can be stale (a mount re-created with another serializer keeps its rows) or
+/// written by an outer mount's refusal, and either flipped a real task out of the tasks-file rules.
 ///
 /// # Errors
 /// Returns an error if a read fails.
@@ -242,35 +262,18 @@ pub fn serializer_for(conn: &Connection, item: ItemId) -> Result<Option<String>>
     let Some(bound) = get(conn, item)? else {
         return Ok(None);
     };
-    let Some(path) = file_path(&bound.uri) else {
+    let Some(path) = file_of(conn, &bound.uri)? else {
         return Ok(None);
     };
     if let Some(own) = bound.serializer {
         return Ok(Some(own));
     }
-    for uri in [bound.uri.clone(), format!("file://{path}")] {
-        if let Some(journal) = crate::sync_state::get(conn, &uri)? {
+    if bound.uri.strip_prefix("file://") == Some(path.as_str()) {
+        if let Some(journal) = crate::sync_state::get(conn, &bound.uri)? {
             return Ok(Some(journal.serializer));
         }
     }
-    let mut stmt = conn.prepare_cached(
-        "SELECT backing_uri, serializer FROM mounts WHERE backing_uri LIKE 'file://%'",
-    )?;
-    let mounts = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let path = std::path::Path::new(path);
-    Ok(mounts
-        .into_iter()
-        .filter_map(|(uri, serializer)| {
-            let dir = uri
-                .strip_prefix("file://")?
-                .trim_end_matches('/')
-                .to_owned();
-            path.starts_with(&dir).then_some((dir.len(), serializer))
-        })
-        .max_by_key(|(len, _)| *len)
-        .map(|(_, serializer)| serializer))
+    Ok(crate::mount::covering(conn, std::path::Path::new(&path))?.map(|(_, m)| m.serializer))
 }
 
 /// # Errors
@@ -294,12 +297,8 @@ pub fn get(conn: &Connection, item: ItemId) -> Result<Option<Binding>> {
 
 #[cfg(test)]
 mod tests {
-    /// The serializer owning a binding decides whether it is a tasks file, not a `#` in its uri: a
-    /// document named `C#.md` is a whole-file note.
     #[test]
-    fn a_binding_s_serializer_is_its_override_else_its_journal_s_else_its_closest_mount_s() {
-        use crate::{mount, ns};
-        use jkb_types::{ConflictPolicy, SyncMode};
+    fn a_binding_s_fragment_is_only_text_a_local_id_can_be() {
         // A fragment is only text a local id can be, so a document's own `#` stays in its path, while
         // a minted id keeps its (lowercased, possibly non-ASCII) letters. Whether an item is in a
         // tasks file is still asked of its serializer, below, never of the spelling.
@@ -318,6 +317,14 @@ mod tests {
             Some("/n/a#b/tasks.md")
         );
         assert_eq!(super::file_path("managed:"), None);
+    }
+
+    /// The serializer owning a binding decides whether it is a tasks file, not a `#` in its uri: a
+    /// document named `C#.md` is a whole-file note.
+    #[test]
+    fn a_binding_s_serializer_is_its_override_else_its_journal_s_else_its_closest_mount_s() {
+        use crate::{mount, ns};
+        use jkb_types::{ConflictPolicy, SyncMode};
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |c, m| {
             for (path, dir, serializer) in [
@@ -387,8 +394,15 @@ mod tests {
             );
             assert_eq!(
                 super::serializer_for(c, task)?.as_deref(),
-                Some("document"),
-                "a fragment is taken off to find the file's journal row"
+                Some("tasks"),
+                "a `#<local id>` binding is a multi-item serializer's, whatever its file's journal row says"
+            );
+            // A dotless name spelled like a fragment is one whole file once the journal has a row for it.
+            assert_eq!(super::file_of(c, "file:///n/issue#42")?.as_deref(), Some("/n/issue"));
+            crate::sync_state::upsert(c, m, &journal("file:///n/issue#42", "document"))?;
+            assert_eq!(
+                super::file_of(c, "file:///n/issue#42")?.as_deref(),
+                Some("/n/issue#42")
             );
             crate::sync_state::upsert(c, m, &journal("file:///n/C#.md", "tasks"))?;
             assert_eq!(

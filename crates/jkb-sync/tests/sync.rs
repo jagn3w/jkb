@@ -2783,3 +2783,61 @@ fn a_document_named_with_a_hash_syncs_as_itself() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "edited in kb");
     assert!(!dir.path().join("C").exists());
 }
+
+/// A dotless name spelled like a fragment (`issue#42`) is one file once it is synced: the journal row
+/// written with its first binding says so, where spelling alone read it as the file `issue`.
+#[test]
+fn a_dotless_document_named_with_a_hash_syncs_as_itself() {
+    let dir = real_tempdir();
+    let file = dir.path().join("issue#42");
+    fs::write(&file, "the bug").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/notes",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Created), 1);
+    let report = sync(&db, "docs/notes").unwrap();
+    assert!(
+        report.results.iter().all(|r| r.path == file),
+        "no file `issue` is visited: {report:?}"
+    );
+    kb_edit(&db, &uri_for(&file), "edited in kb");
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Exported), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "edited in kb");
+    assert!(!dir.path().join("issue").exists(), "no stray file `issue`");
+}
+
+/// An unbound file flagged on its first sync, whose directory is then replaced by a link, is out of
+/// scope for the sweep as it is for discovery — kept in scope, its flag could never clear.
+#[cfg(unix)]
+#[test]
+fn a_flagged_unbound_file_behind_a_link_is_settled() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let file = dir.path().join("sub/tasks.md");
+    fs::write(&file, "## Backend\n- [ ] one ^dup\n- [ ] two ^dup\n").unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    assert_eq!(
+        sync(&db, "docs/plan").unwrap().count(Outcome::Quarantined),
+        1
+    );
+    assert_eq!(journal(&db, &uri).unwrap().0, "needs_attention");
+
+    fs::rename(dir.path().join("sub"), dir.path().join("sub.real")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("sub.real"), dir.path().join("sub")).unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        journal(&db, &uri).unwrap().0,
+        "ok",
+        "the row behind the link is settled"
+    );
+}

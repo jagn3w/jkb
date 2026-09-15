@@ -545,10 +545,144 @@ pub fn task_content_problem(content: &str) -> Option<String> {
         }
         format!(
             "it would be read back as {shown:?} (quotes are dropped, runs of spaces and tabs close \
-             up, and a trailing `^id` becomes the task's identity) — `task edit` with the text \
-             as it should read replaces it"
+             up, spaces are taken off the ends of the title and the start of every body line, and a \
+             trailing `^id` becomes the task's identity) — `task edit` with the text as it should \
+             read replaces it"
         )
     })
+}
+
+/// Why `item`'s line in a `tasks.md` would not come back as `item` — `None` when it would. `deps` are the
+/// `local_id`s it `needs:`. The whole line is asked, not only the text: a due date, a tag or a
+/// namespace with a space in it, a tag facet with an `=`, or a local id that is not lowercase letters,
+/// digits and dashes each rendered a line this serializer read back as something else, and the next
+/// import from the file then rewrote the title and cleared the field. The line is rendered alone (its
+/// dependencies as stub tasks), so no other line in the file decides its answer.
+#[must_use]
+pub fn task_line_problem(item: &SyncItem, deps: &[String]) -> Option<String> {
+    if let Some(problem) = task_content_problem(&item.content) {
+        return Some(problem);
+    }
+    let whole = line_difference(item, deps)?;
+    // A modifier the parser does not take as one is read back as words of the title, taking every
+    // modifier rendered before it along — so the field named is the first that fails on its own.
+    let bare = {
+        let mut bare = SyncItem::new(item.local_id.clone(), "task", item.content.clone());
+        bare.status.clone_from(&item.status);
+        bare
+    };
+    let alone = [
+        SyncItem {
+            priority: item.priority,
+            ..bare.clone()
+        },
+        SyncItem {
+            due: item.due.clone(),
+            ..bare.clone()
+        },
+        SyncItem {
+            tags: item.tags.clone(),
+            ..bare.clone()
+        },
+        SyncItem {
+            mirrors: item.mirrors.clone(),
+            ..bare.clone()
+        },
+    ];
+    alone
+        .iter()
+        .find_map(|one| line_difference(one, &[]))
+        .or_else(|| line_difference(&bare, deps))
+        .or(Some(whole))
+        .map(|(what, want, got)| {
+            format!(
+                "its {what} {want} would be read back as {got} (a modifier is one word, with no \
+                 spaces or quotes, and a local id is lowercase letters, digits and dashes)"
+            )
+        })
+}
+
+/// The first field of `item`'s rendered line (with `deps` as stub tasks) that parses back different,
+/// as `(field, rendered, read back)`; `None` when the line comes back whole.
+fn line_difference(item: &SyncItem, deps: &[String]) -> Option<(&'static str, String, String)> {
+    let mut alone = item.clone();
+    alone.parent = None;
+    alone.section = None;
+    let mut doc = SyncDoc {
+        layout: vec![SyncBlock::Item(item.local_id.clone())],
+        items: vec![alone],
+        ..SyncDoc::default()
+    };
+    for dep in deps {
+        let mut stub = SyncItem::new(dep.clone(), "task", "dependency");
+        stub.status = Some("open".to_owned());
+        doc.layout.push(SyncBlock::Item(dep.clone()));
+        doc.items.push(stub);
+        doc.edges.push(SyncEdge {
+            src: item.local_id.clone(),
+            dst: dep.clone(),
+            edge_type: EdgeType::DependsOn,
+        });
+    }
+    let Ok(bytes) = TasksSerializer.render(&doc) else {
+        return Some((
+            "line",
+            String::new(),
+            "nothing: it cannot be written".to_owned(),
+        ));
+    };
+    let back = match TasksSerializer.parse(&bytes) {
+        Ok(back) => back,
+        Err(e) => return Some(("line", String::new(), format!("a parse error: {e}"))),
+    };
+    let Some(got) = back.items.iter().find(|i| i.local_id == item.local_id) else {
+        return Some((
+            "identity",
+            format!("`^{}`", item.local_id),
+            "the title's words".to_owned(),
+        ));
+    };
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    let mut want_tags = item.tags.clone();
+    want_tags.sort();
+    let mut got_tags = got.tags.clone();
+    got_tags.sort();
+    let got_deps: Vec<String> = back
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::DependsOn && e.src == item.local_id)
+        .map(|e| e.dst.clone())
+        .collect();
+    let show = |v: &dyn std::fmt::Debug| format!("{v:?}");
+    if got.priority != item.priority {
+        Some(("priority", show(&item.priority), show(&got.priority)))
+    } else if got.due != item.due {
+        Some(("due date", show(&item.due), show(&got.due)))
+    } else if got_tags != want_tags {
+        Some(("tags", show(&want_tags), show(&got_tags)))
+    } else if sorted(&got.mirrors) != sorted(&item.mirrors) {
+        Some((
+            "placements",
+            show(&sorted(&item.mirrors)),
+            show(&sorted(&got.mirrors)),
+        ))
+    } else if sorted(&got_deps) != sorted(deps) {
+        Some((
+            "dependencies",
+            show(&sorted(deps)),
+            show(&sorted(&got_deps)),
+        ))
+    } else if got.status != item.status {
+        Some(("status", show(&item.status), show(&got.status)))
+    } else if got.content != item.content {
+        Some(("text", show(&item.content), show(&got.content)))
+    } else {
+        None
+    }
 }
 
 /// Parse the text after a task checkbox: the maximal run of well-formed [`Modifier`]s
@@ -803,6 +937,8 @@ mod tests {
             ),
             ("Fix  login", "read back as \"Fix login\""),
             ("Ping\tteam", "read back as \"Ping team\""),
+            ("Steps:\n  1. build", "start of every body line"),
+            (" Fix login", "ends of the title"),
         ] {
             let problem = task_content_problem(reshaped);
             assert!(

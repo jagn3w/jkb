@@ -136,17 +136,23 @@ Two decisions in it:
   path, so a stored path stays nameable. A quick-add line carries at most 64 `+ns`/`#tag`/`^dep`
   modifiers, a task body at most 256 KiB after an edit or append, a tag or due date at most 1024 bytes,
   a claim owner at most 512 (it is stored on every transition). `task.why` is charged to the read
-  budget like every listing. `task edit` and `jkb item edit` share one edit rule
-  (`item::edit_content`): an item in a tasks file — decided by the serializer owning its binding
-  (`binding::serializer_for`), not by a `#` in its uri — refuses a result the tasks serializer would
-  not read back as written (`jkb_sync::task_content_problem` renders it as a one-task file and parses
-  it again), so a blank or whitespace-only line, a checkbox line in the body, trailing
-  `^id`/`@due`/`#tag`/`+ns`/`!p` tokens, and a title the parser would normalize (quotes dropped,
-  runs of spaces or tabs closed up) are refused, judged on the result rather than the text sent, and
-  the refusal names which of these it is. `task.add`
-  holds a task it files into a tasks.md to the same round trip, and so does `task.bind` for a task it
-  binds into one (host-only: the daemon refuses file bindings). The size cap is checked before the
-  probe, which parses inside the writer's transaction, and the parse is linear in duplicate lines. Tags and due dates are bounded in the
+  budget like every listing. **Every task write holds the task's whole tasks.md line to the file's
+  round trip** (`jkb_sync::filed_task_problem`, run by `LocalBackend` after the op, inside its
+  transaction): the line is assembled as an export would assemble it — real local id, text, status,
+  priority, due date, tags, out-of-file placements, in-file dependencies — rendered alone and parsed
+  back, and a write whose result would come back different is refused, naming the first field that
+  fails on its own. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
+  namespace with a space, and `task bind --sync …#Fix_Login` through, and the next import from the file
+  cleared the field and rewrote the title. Whether a task is in a tasks file is decided by the
+  serializer owning its binding (`binding::serializer_for`: a `#<local id>` binding goes to its mount,
+  since only a multi-item serializer makes one; a whole-file uri to the sync journal row the engine
+  wrote for it), never by a `#` in its uri. `task edit` and `jkb item edit` also share one edit rule
+  (`item::edit_content`), which refuses a text the serializer would not read back as written
+  (`jkb_sync::task_content_problem`): a blank or whitespace-only line, a checkbox line in the body,
+  trailing `^id`/`@due`/`#tag`/`+ns`/`!p` tokens, or what the parser normalizes (quotes, runs of spaces
+  or tabs, spaces at the title's ends and a body line's start); the refusal names which. The size cap
+  is checked before that probe, which parses inside the writer's transaction, and the parse is linear
+  in duplicate lines. Tags and due dates are bounded in the
   core writers every path shares (`tag::MAX_TAG_BYTES`, `task::MAX_DUE_BYTES`), so `tag rm` can always
   remove one, and `ns mv` checks every path it would write.
   `task.add`'s global-backlog question is answered by running the whole create and rolling it back, so

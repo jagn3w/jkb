@@ -1056,6 +1056,24 @@ impl ApiError {
     }
 }
 
+/// Run a write to the task `uid` in one transaction, then hold the task's tasks.md line to the file's
+/// round trip ([`tasks::check_line`]) before it commits. Every task write op but `task.add`, which
+/// checks the task it made, goes through here, so no op can leave a line the next import misreads.
+fn task_write<T: Send + 'static>(
+    db: &Db,
+    actor: &str,
+    uid: String,
+    op: impl FnOnce(&rusqlite::Connection, &jkb_core::WriteMeta, &str) -> Result<T, ApiError>
+        + Send
+        + 'static,
+) -> Result<T, ApiError> {
+    db.write_txn_with(actor, move |c, m| {
+        let out = op(c, m, &uid)?;
+        tasks::check_line(c, &uid)?;
+        Ok(out)
+    })
+}
+
 impl From<jkb_core::Error> for ApiError {
     fn from(e: jkb_core::Error) -> Self {
         let message = e.to_string();
@@ -1473,7 +1491,9 @@ impl Backend for LocalBackend {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let roots = self.file_roots.clone();
                 match db.write_txn_with(actor, move |c, m| {
-                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
+                    let added = tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())?;
+                    tasks::check_line(c, &added.uid)?;
+                    Ok(added)
                 }) {
                     Ok(added) => Response::Added { added },
                     Err(tasks::AddFailure::NeedsGlobalBacklogAssent) => {
@@ -1489,11 +1509,11 @@ impl Backend for LocalBackend {
                 due,
             } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
+                task_write(db, actor, uid, move |c, m, uid| {
                     tasks::set(
                         c,
                         m,
-                        &uid,
+                        uid,
                         status.as_deref(),
                         priority,
                         due.as_deref(),
@@ -1505,8 +1525,8 @@ impl Backend for LocalBackend {
             Request::TaskEdit { uid, text, append } => {
                 let roots = self.file_roots.clone();
                 Response::Edited {
-                    file_backed: db.write_txn_with(actor, move |c, m| {
-                        tasks::edit(c, m, &uid, &text, append, roots.as_ref())
+                    file_backed: task_write(db, actor, uid, move |c, m, uid| {
+                        tasks::edit(c, m, uid, &text, append, roots.as_ref())
                     })?,
                 }
             }
@@ -1516,60 +1536,60 @@ impl Backend for LocalBackend {
                 mode,
             } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
-                    tasks::tag(c, m, &uid, &facet_value, mode, roots.as_ref())
+                task_write(db, actor, uid, move |c, m, uid| {
+                    tasks::tag(c, m, uid, &facet_value, mode, roots.as_ref())
                 })?;
                 Response::Applied {}
             }
             Request::TaskDepend { uid, dep } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
-                    tasks::depend(c, m, &uid, &dep, roots.as_ref())
+                task_write(db, actor, uid, move |c, m, uid| {
+                    tasks::depend(c, m, uid, &dep, roots.as_ref())
                 })?;
                 Response::Applied {}
             }
             Request::TaskUndepend { uid, dep } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
-                    tasks::undepend(c, m, &uid, &dep, roots.as_ref())
+                task_write(db, actor, uid, move |c, m, uid| {
+                    tasks::undepend(c, m, uid, &dep, roots.as_ref())
                 })?;
                 Response::Applied {}
             }
             Request::TaskPlace { uid, ns, home } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
-                    tasks::place(c, m, &uid, &ns, home, roots.as_ref())
+                task_write(db, actor, uid, move |c, m, uid| {
+                    tasks::place(c, m, uid, &ns, home, roots.as_ref())
                 })?;
                 Response::Applied {}
             }
             Request::TaskUnplace { uid, ns } => {
                 let roots = self.file_roots.clone();
                 Response::Unplaced {
-                    removed: db.write_txn_with(actor, move |c, m| {
-                        tasks::unplace(c, m, &uid, &ns, roots.as_ref())
+                    removed: task_write(db, actor, uid, move |c, m, uid| {
+                        tasks::unplace(c, m, uid, &ns, roots.as_ref())
                     })?,
                 }
             }
             Request::TaskBind { uid, sync } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
-                    tasks::bind(c, m, &uid, sync.as_deref(), roots.as_ref())
+                task_write(db, actor, uid, move |c, m, uid| {
+                    tasks::bind(c, m, uid, sync.as_deref(), roots.as_ref())
                 })?;
                 Response::Applied {}
             }
             Request::TaskClaim { uid, owner } => {
                 let roots = self.file_roots.clone();
                 Response::Claimed {
-                    claimed: db.write_txn_with(actor, move |c, m| {
-                        tasks::claim(c, m, &uid, &owner, roots.as_ref())
+                    claimed: task_write(db, actor, uid, move |c, m, uid| {
+                        tasks::claim(c, m, uid, &owner, roots.as_ref())
                     })?,
                 }
             }
             Request::TaskRelease { uid, owner } => {
                 let roots = self.file_roots.clone();
                 Response::Released {
-                    released: db.write_txn_with(actor, move |c, m| {
-                        tasks::release(c, m, &uid, &owner, roots.as_ref())
+                    released: task_write(db, actor, uid, move |c, m, uid| {
+                        tasks::release(c, m, uid, &owner, roots.as_ref())
                     })?,
                 }
             }

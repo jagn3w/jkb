@@ -300,10 +300,14 @@ fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
             // parse failure quarantines before `apply_doc` runs, so it has no bindings at
             // all). Using `accepts_bound` for it left a narrowed `--include` unable to clear
             // the very row it was narrowed to escape.
+            //
+            // And an unbound file reached through a link below the mount is out of scope, as it is
+            // for `discover`, whose walk never enters a link — kept in scope, its flag could never
+            // be reconciled or cleared. A bound one stays in scope, so its refusal stays reported.
             let in_scope = if bound.contains(&path) {
                 filter.accepts_bound(&ctx.dir, &path)
             } else {
-                filter.accepts(&ctx.dir, &path)
+                filter.accepts(&ctx.dir, &path) && !through_link(&ctx.dir, &path)
             };
             !in_scope || (!path.exists() && !bound.contains(&path))
         })
@@ -658,6 +662,58 @@ pub fn tasks_mount_file(db: &Db, home_ns: &str) -> Result<Option<String>> {
     Ok(db.read(move |conn| mount::tasks_file_for(conn, &home))?)
 }
 
+/// Why the task `item` would not come back from the tasks.md it is written into as the knowledge base
+/// now holds it — `None` when it would, or when it is in no tasks file. Its line is assembled exactly as
+/// an export would assemble it ([`assemble_kb_doc`]: its real local id, text, status, due date, tags,
+/// out-of-file placements and in-file dependencies) and asked of [`crate::task_line_problem`].
+///
+/// Asked by `jkb_api` after every task write, inside the write's transaction, so a value the file
+/// cannot carry is refused whichever field it arrived in. Checking only the text let `task set --due
+/// "2026-07-15 17:00"` through, and the next import from the file cleared the due date and rewrote the
+/// title.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn filed_task_problem(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    if binding::serializer_for(conn, item)?.as_deref() != Some("tasks") {
+        return Ok(None);
+    }
+    let Some(bound) = binding::get(conn, item)? else {
+        return Ok(None);
+    };
+    let Some(file) = binding::file_of(conn, &bound.uri)? else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(file);
+    let Some((mount_ns, mount)) = mount::covering(conn, &path)? else {
+        return Ok(None);
+    };
+    let Some(dir) = mount.backing_uri.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    let ctx = Ctx {
+        mount_ns,
+        dir: PathBuf::from(dir.trim_end_matches('/')),
+        sync_mode: mount.sync_mode,
+        conflict_policy: mount.conflict_policy,
+        serializer: "tasks".to_owned(),
+    };
+    let bare = file_uri(&path);
+    let local = local_of(&bare, &bound.uri);
+    let journal = sync_state::get(conn, &bare)?;
+    let kb = assemble_kb_doc(conn, &ctx, &path, &bare, journal.as_ref())?;
+    let Some(line) = kb.items.iter().find(|i| i.local_id == local) else {
+        return Ok(None);
+    };
+    let deps: Vec<String> = kb
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::DependsOn && e.src == local)
+        .map(|e| e.dst.clone())
+        .collect();
+    Ok(crate::task_line_problem(line, &deps))
+}
+
 /// Load the mount configuration into an owned [`Ctx`].
 fn load_ctx(db: &Db, mount_ns: &str) -> Result<Ctx> {
     let path = mount_ns.to_owned();
@@ -803,14 +859,15 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
 /// line, so a file with 262 tasks yielded 262 identical paths to whatever came next.
 fn bound_paths(db: &Db, ctx: &Ctx) -> Result<BTreeSet<PathBuf>> {
     let mount_ns = ctx.mount_ns.clone();
-    let uris = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
-    let mut out = BTreeSet::new();
-    for uri in uris {
-        if let Some(path) = binding::file_path(&uri) {
-            out.insert(PathBuf::from(path));
+    Ok(db.read(move |conn| {
+        let mut out = BTreeSet::new();
+        for uri in binding::synced_uris_under(conn, &mount_ns)? {
+            if let Some(path) = binding::file_of(conn, &uri)? {
+                out.insert(PathBuf::from(path));
+            }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })?)
 }
 
 /// The journal's explanation for `path`, when it has one — the reason a reconcile refused.

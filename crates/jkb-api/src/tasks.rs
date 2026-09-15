@@ -299,11 +299,6 @@ pub fn add(
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
-    // A quoted title can carry newlines, and `first\n\nsecond` came back from the file as a task and a
-    // paragraph of prose.
-    if synced.is_some() {
-        check_filed(&spec.title)?;
-    }
 
     let id = task::create(conn, meta, &spec)?;
     if let Some(parent) = parent {
@@ -610,29 +605,35 @@ pub fn bind(
     }
     let id = writable(conn, reference, roots)?;
     match sync {
-        Some(uri) => {
-            binding::set(conn, meta, id, uri, Some(SyncMode::Bidirectional), None)?;
-            // A managed task's body may hold what a tasks.md cannot: bound into one unchecked, a second
-            // paragraph came back from the next sync as section prose.
-            if item::in_tasks_file(conn, id)? {
-                check_filed(&item::get_content(conn, id)?.unwrap_or_default())?;
-            }
-        }
+        Some(uri) => binding::set(conn, meta, id, uri, Some(SyncMode::Bidirectional), None)?,
         None => binding::set(conn, meta, id, task::MANAGED_BINDING, None, None)?,
     }
     Ok(())
 }
 
-/// Refuse a task's text that its tasks.md would not give back as written — the edit rule's round trip
-/// (`jkb_sync::task_content_problem`), asked wherever a task *becomes* written into a tasks file: a
-/// task `task.add` files, and one `task.bind` binds. `task.edit` asks it through
-/// `item::edit_content`.
-fn check_filed(content: &str) -> Result<(), ApiError> {
-    match jkb_sync::task_content_problem(content) {
+/// Refuse a task write that leaves `reference`'s line in its tasks.md unable to come back from the file
+/// as the knowledge base now holds it (`jkb_sync::filed_task_problem`) — whatever field the write
+/// changed. Run by `LocalBackend` after **every** task write, inside that write's transaction, so a
+/// refusal rolls the write back: checked at three call sites it covered only the text, and a due date,
+/// tag or namespace with a space in it, or a bound `#Fix_Login`, reached the file as a line the next
+/// import read back as a different task. The state after the write is judged, so a write that removes
+/// the offending value passes.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] naming what would change, or a failed read.
+pub fn check_line(conn: &Connection, reference: &str) -> Result<(), ApiError> {
+    let Some(id) = task::resolve_ref(conn, reference)? else {
+        return Ok(());
+    };
+    let problem = jkb_sync::filed_task_problem(conn, id).map_err(|e| match e {
+        jkb_sync::Error::Core(e) => ApiError::from(e),
+        other => ApiError::with_code(ErrorCode::Internal, other.to_string()),
+    })?;
+    match problem {
         Some(problem) => Err(ApiError::with_code(
             ErrorCode::Invalid,
             format!(
-                "this task is filed into a tasks.md, and its text would not come back from the file \
+                "this task is written into a tasks.md, and its line would not come back from the file \
                  as written: {problem}"
             ),
         )),
