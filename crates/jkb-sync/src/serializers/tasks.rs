@@ -482,8 +482,8 @@ fn classify(token: &str) -> Option<Modifier> {
 /// `None` when it would. Asked by rendering the task as a one-task file and parsing it back with this
 /// serializer, so the answer is this serializer's own rules rather than a copy of them: a blank line
 /// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` or `#f=v`
-/// becoming an identity, a due date or a tag. Handed to `jkb_core::item::edit_content` and checked by
-/// `jkb_api::tasks::add` for a task it files.
+/// becoming an identity, a due date or a tag. Handed to `jkb_core::item::edit_content`, and asked first by
+/// [`task_line_problem`], the whole-line check `jkb_api` runs after every task write.
 #[must_use]
 pub fn task_content_problem(content: &str) -> Option<String> {
     const PROBE: &str = "jkb-content-probe";
@@ -765,11 +765,20 @@ fn split_trailing_anchor(rest: &str) -> (&str, Option<String>) {
     }
 }
 
-/// Whether `s` is a uri-safe local id: non-empty lowercase letters, digits, and dashes.
+/// Whether `s` is a local id: non-empty lowercase letters, digits and dashes — in any script, since
+/// [`mint_id`] slugs a title with the Unicode-aware [`slug`]. ASCII-only, this rejected the ids it had
+/// just minted for `Café`, `修复` or `İstanbul` (whose lowercase carries a combining dot): each sync read
+/// the stamped `^id` back as title words, minted another, and stamped that too, so the task changed
+/// identity on every pass. Anything ASCII but `[a-z0-9-]` still ends an id, as do uppercase letters and
+/// whitespace in any script.
 fn is_uri_safe(s: &str) -> bool {
     !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && s.chars().all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '-'
+                || (!c.is_ascii() && !c.is_uppercase() && !c.is_whitespace() && !c.is_control())
+        })
 }
 
 /// Parse a header line `#{1,6} text`, returning `(level, text)`. Only lines starting
@@ -945,6 +954,39 @@ mod tests {
                 problem.as_deref().is_some_and(|p| p.contains(named)),
                 "{reshaped:?} would not come back as written, and the reason names {named:?}: {problem:?}"
             );
+        }
+    }
+
+    /// An id minted from a title in any script is read back as the task's identity, so the file settles
+    /// after one stamp; a line an older version stamped again and again collapses to its first id.
+    #[test]
+    fn a_title_in_any_script_keeps_one_id_across_syncs() {
+        let text = "## A\n- [ ] Café résumé cleanup\n- [ ] 修复\n- [ ] İstanbul\n";
+        let first = TasksSerializer.parse(text.as_bytes()).unwrap();
+        let stamped = TasksSerializer.render(&first).unwrap();
+        let second = TasksSerializer.parse(&stamped).unwrap();
+        assert_eq!(
+            first.items,
+            second.items,
+            "{}",
+            String::from_utf8_lossy(&stamped)
+        );
+        assert_eq!(
+            TasksSerializer.render(&second).unwrap(),
+            stamped,
+            "byte-stable"
+        );
+
+        let churned = "- [ ] 修复 ^修复-108866 ^修复-修复-108866-85d000\n";
+        let healed = TasksSerializer.parse(churned.as_bytes()).unwrap();
+        assert_eq!(healed.items[0].local_id, "修复-108866");
+        assert_eq!(healed.items[0].content, "修复");
+        // Still not an id: uppercase in any script, ASCII punctuation.
+        for title in ["Fix ^Fix", "Fix ^fix_login", "Fix ^Über"] {
+            let doc = TasksSerializer
+                .parse(format!("- [ ] {title}\n").as_bytes())
+                .unwrap();
+            assert_eq!(doc.items[0].content, title, "{title:?}");
         }
     }
 

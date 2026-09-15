@@ -307,9 +307,11 @@ pub fn add(
     for branch in &branches {
         location::record_branch(conn, meta, id, branch, BranchWrite::Add)?;
     }
+    // A new line has no problem it already had, so any is refused — and before the question below.
+    check_line(conn, &uid, None)?;
     // Asked last, after every write this request makes has succeeded, and answered by failing the
-    // transaction so they are rolled back: a missing `^dep` or a refused placement is the answer,
-    // not a question put to the user first.
+    // transaction so they are rolled back: a missing `^dep`, a refused placement or a line the file
+    // could not carry is the answer, not a question put to the user first.
     if !assented {
         return Err(AddFailure::NeedsGlobalBacklogAssent);
     }
@@ -611,25 +613,44 @@ pub fn bind(
     Ok(())
 }
 
+/// Why `reference`'s line in its tasks.md would not come back from the file as the knowledge base holds
+/// it (`jkb_sync::filed_task_problem`); `None` when it would, or when it is in no tasks file.
+///
+/// # Errors
+/// A failed read.
+pub fn line_problem(conn: &Connection, reference: &str) -> Result<Option<String>, ApiError> {
+    let Some(id) = task::resolve_ref(conn, reference)? else {
+        return Ok(None);
+    };
+    jkb_sync::filed_task_problem(conn, id).map_err(|e| match e {
+        jkb_sync::Error::Core(e) => ApiError::from(e),
+        other => ApiError::with_code(ErrorCode::Internal, other.to_string()),
+    })
+}
+
 /// Refuse a task write that leaves `reference`'s line in its tasks.md unable to come back from the file
-/// as the knowledge base now holds it (`jkb_sync::filed_task_problem`) — whatever field the write
-/// changed. Run by `LocalBackend` after **every** task write, inside that write's transaction, so a
-/// refusal rolls the write back: checked at three call sites it covered only the text, and a due date,
-/// tag or namespace with a space in it, or a bound `#Fix_Login`, reached the file as a line the next
-/// import read back as a different task. The state after the write is judged, so a write that removes
-/// the offending value passes.
+/// as the knowledge base now holds it — whatever field the write changed. `LocalBackend` runs it after
+/// **every** task write, inside that write's transaction, so a refusal rolls the write back: checked at
+/// three call sites it covered only the text, and a due date, tag or namespace with a space in it, or a
+/// bound `#Fix_Login`, reached the file as a line the next import read back as a different task.
+///
+/// Only a write that makes a readable line unreadable is refused (`before` is the problem the line had
+/// already). Writers outside the typed operations — `jkb task start` recording `repo=My App`, the MCP
+/// server's `task_update`, `jkb ns mv` — do not ask the file, and refusing every later write to a line
+/// one of them had broken left the task unable even to be released. A write that takes the offending
+/// value away passes, like any other.
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] naming what would change, or a failed read.
-pub fn check_line(conn: &Connection, reference: &str) -> Result<(), ApiError> {
-    let Some(id) = task::resolve_ref(conn, reference)? else {
+pub fn check_line(
+    conn: &Connection,
+    reference: &str,
+    before: Option<&str>,
+) -> Result<(), ApiError> {
+    if before.is_some() {
         return Ok(());
-    };
-    let problem = jkb_sync::filed_task_problem(conn, id).map_err(|e| match e {
-        jkb_sync::Error::Core(e) => ApiError::from(e),
-        other => ApiError::with_code(ErrorCode::Internal, other.to_string()),
-    })?;
-    match problem {
+    }
+    match line_problem(conn, reference)? {
         Some(problem) => Err(ApiError::with_code(
             ErrorCode::Invalid,
             format!(

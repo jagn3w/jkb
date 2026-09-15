@@ -140,8 +140,11 @@ Two decisions in it:
   round trip** (`jkb_sync::filed_task_problem`, run by `LocalBackend` after the op, inside its
   transaction): the line is assembled as an export would assemble it — real local id, text, status,
   priority, due date, tags, out-of-file placements, in-file dependencies — rendered alone and parsed
-  back, and a write whose result would come back different is refused, naming the first field that
-  fails on its own. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
+  back, and a write that makes a readable line come back different is refused, naming the first field
+  that fails on its own. A line that was already unreadable does not block later writes: writers outside
+  the typed operations do not ask the file (`jkb task start` recording `repo=My App`, the MCP server's
+  `task_update`, `jkb ns mv`, `jkb tag rename`), and refusing every write after one of them left the task
+  unable to be released. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
   namespace with a space, and `task bind --sync …#Fix_Login` through, and the next import from the file
   cleared the field and rewrote the title. Whether a task is in a tasks file is decided by the
   serializer owning its binding (`binding::serializer_for`: a `#<local id>` binding goes to its mount,

@@ -684,6 +684,17 @@ pub fn filed_task_problem(conn: &Connection, item: ItemId) -> Result<Option<Stri
     let Some(file) = binding::file_of(conn, &bound.uri)? else {
         return Ok(None);
     };
+    // Nothing keeps a uri to one item, and the assembly below finds a line by uri: bound onto a uri
+    // another task holds, this task's line would be judged by that task's.
+    let holders: i64 = conn
+        .prepare_cached("SELECT count(*) FROM bindings WHERE uri = ?1")?
+        .query_row([&bound.uri], |r| r.get(0))?;
+    if holders > 1 {
+        return Ok(Some(format!(
+            "its binding `{}` is already another task's line",
+            bound.uri
+        )));
+    }
     let path = PathBuf::from(file);
     let Some((mount_ns, mount)) = mount::covering(conn, &path)? else {
         return Ok(None);
@@ -803,7 +814,8 @@ fn is_temp(path: &Path) -> bool {
 
 /// Whether `path` (under `dir`) is reached through a symlink below the mount directory.
 ///
-/// Asked only of a watch event's path that nothing is bound to: the watcher no longer follows links,
+/// Asked of paths nothing is bound to, by the watch filter and by the full sync's out-of-scope sweep
+/// (which settles such a row, since `discover` never yields it). The watcher no longer follows links,
 /// but an event can still name such a path, and reconciling one only to have `nofollow` refuse it
 /// wrote a `needs_attention` row per event for files outside the mount. A **bound** file reached
 /// through a link is reconciled, never skipped — `nofollow` refuses it and the journal names the link,

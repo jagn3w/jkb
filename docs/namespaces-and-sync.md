@@ -202,7 +202,10 @@ A **bound** file reached through a link is not skipped (a fourth review): it is 
 refuses it, and its journal row stays `needs_attention` naming the link. Skipping it at discovery, as
 the third review's fix did, let the full sync's out-of-scope sweep settle the row to `ok`, so the file
 stopped syncing with `jkb doctor` reporting nothing. A size or type refusal carries no link remedy, and
-names the 64 MiB limit.
+names the 64 MiB limit. An **unbound** file flagged on its first sync (a quarantine, so no bindings) whose
+directory is then replaced by a link is settled by the full sync's out-of-scope sweep (a fifth review):
+`discover` never walks into the link, so kept in scope its flag could never be reconciled or cleared.
+Pinned by `a_flagged_unbound_file_behind_a_link_is_settled`.
 
 What it costs: a synced path may not contain a link at all. `jkb mount create` stores a mount's
 directory canonical, so real mounts qualify; a test that mounts a raw temp directory must canonicalize
@@ -212,6 +215,23 @@ a child process) and, because a bound path is no longer filtered before it is re
 `sync_never_writes_through_a_symlink_planted_at_a_bound_file` and
 `a_bound_file_reached_through_a_link_stays_flagged_naming_the_link`, which fail when the engine goes
 back to following links. Not verified on macOS here — the tests ran on Linux.
+
+## A task's `^id` is lowercase letters, digits and dashes in any script
+
+**Decided (stage-6.2 review 6, 2026-09-15):** the `tasks` serializer reads `^id` as an identity when
+it is lowercase letters, digits and dashes in any script (non-ASCII characters that are not uppercase,
+whitespace or control), not only ASCII.
+
+Why: `mint_id` slugs a title with the Unicode-aware `dsl::slug`, so `Café résumé cleanup` mints
+`café-résumé-cleanup-e0b106`, `修复` mints `修复-108866`, and `İstanbul` a lowercase with a combining dot.
+The parser's ASCII-only rule read each stamped id back as title words, minted another and stamped it
+too: measured over three parse/render passes, each such task took a new id every pass and its line grew
+a `^id` per sync. Nothing noticed until the task-write line check refused every write to such a task.
+Widening the reader rather than ASCII-folding the minter keeps every id already stored, and the
+existing rule that trailing anchors collapse to the left-most heals a churned line to its first id.
+ASCII punctuation and uppercase in any script still end an id. Pinned by
+`a_title_in_any_script_keeps_one_id_across_syncs` and, through the ops,
+`a_task_titled_in_any_script_is_filed_and_written_like_any_other`.
 
 ## A file's document lives on its journal row, not in the namespace tree (D45)
 

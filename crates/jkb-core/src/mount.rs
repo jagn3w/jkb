@@ -127,12 +127,13 @@ pub fn get(conn: &Connection, namespace: NamespaceId) -> Result<Option<Mount>> {
 }
 
 /// The `file://` mount whose directory covers `path` most closely, with its namespace path. `None` when
-/// no mount covers it. The one copy of this lookup: `binding::serializer_for` and `jkb_sync`'s
-/// `task_line_problem` both find a bound file's mount by it.
+/// no mount covers it; of two mounts over one directory, the first listed. The one copy of this lookup:
+/// [`ambient_namespace`], `binding::serializer_for` and `jkb_sync::filed_task_problem` all find a path's
+/// mount by it, so cwd scoping and the tasks-file rules cannot pick different mounts.
 ///
 /// # Errors
 /// Returns an error if the query fails.
-pub fn covering(conn: &Connection, path: &std::path::Path) -> Result<Option<(String, Mount)>> {
+pub fn covering(conn: &Connection, path: &Path) -> Result<Option<(String, Mount)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT n.path, m.backing_uri, m.sync_mode, m.serializer, m.include_glob, m.exclude_glob,
                 m.conflict_policy
@@ -154,17 +155,17 @@ pub fn covering(conn: &Connection, path: &std::path::Path) -> Result<Option<(Str
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(mounts
-        .into_iter()
-        .filter_map(|(ns, mount)| {
-            let dir = mount
-                .backing_uri
-                .strip_prefix("file://")?
-                .trim_end_matches('/');
-            path.starts_with(dir).then_some((dir.len(), ns, mount))
-        })
-        .max_by_key(|(len, _, _)| *len)
-        .map(|(_, ns, mount)| (ns, mount)))
+    let mut best: Option<(usize, String, Mount)> = None;
+    for (ns, mount) in mounts {
+        let Some(dir) = mount.backing_uri.strip_prefix("file://") else {
+            continue;
+        };
+        let dir = dir.trim_end_matches('/');
+        if path.starts_with(dir) && best.as_ref().is_none_or(|(len, _, _)| dir.len() > *len) {
+            best = Some((dir.len(), ns, mount));
+        }
+    }
+    Ok(best.map(|(_, ns, mount)| (ns, mount)))
 }
 
 /// The namespace paths of every configured mount, ordered by path. Backs the
@@ -254,31 +255,7 @@ pub fn tasks_file_for(conn: &Connection, home_ns: &str) -> Result<Option<String>
 /// # Errors
 /// Returns an error if the query fails.
 pub fn ambient_namespace(conn: &Connection, fs_path: &Path) -> Result<Option<String>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT n.path, m.backing_uri FROM mounts m
-         JOIN namespaces n ON n.id = m.namespace_id
-         WHERE m.backing_uri LIKE 'file://%'",
-    )?;
-    let mounts = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    // Choose the longest backing path that is an ancestor of (or equal to) fs_path.
-    let mut best: Option<(usize, String)> = None;
-    for (ns_path, backing_uri) in mounts {
-        let Some(dir) = backing_uri.strip_prefix("file://") else {
-            continue;
-        };
-        if fs_path.starts_with(dir) {
-            let len = dir.len();
-            if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
-                best = Some((len, ns_path));
-            }
-        }
-    }
-    Ok(best.map(|(_, ns_path)| ns_path))
+    Ok(covering(conn, fs_path)?.map(|(ns_path, _)| ns_path))
 }
 
 #[cfg(test)]

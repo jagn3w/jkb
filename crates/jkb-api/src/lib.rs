@@ -1056,9 +1056,9 @@ impl ApiError {
     }
 }
 
-/// Run a write to the task `uid` in one transaction, then hold the task's tasks.md line to the file's
+/// Run a write to the task `uid` in one transaction, holding the task's tasks.md line to the file's
 /// round trip ([`tasks::check_line`]) before it commits. Every task write op but `task.add`, which
-/// checks the task it made, goes through here, so no op can leave a line the next import misreads.
+/// checks the task it makes, goes through here, so no op can leave a line the next import misreads.
 fn task_write<T: Send + 'static>(
     db: &Db,
     actor: &str,
@@ -1068,8 +1068,9 @@ fn task_write<T: Send + 'static>(
         + 'static,
 ) -> Result<T, ApiError> {
     db.write_txn_with(actor, move |c, m| {
+        let before = tasks::line_problem(c, &uid)?;
         let out = op(c, m, &uid)?;
-        tasks::check_line(c, &uid)?;
+        tasks::check_line(c, &uid, before.as_deref())?;
         Ok(out)
     })
 }
@@ -1491,9 +1492,7 @@ impl Backend for LocalBackend {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let roots = self.file_roots.clone();
                 match db.write_txn_with(actor, move |c, m| {
-                    let added = tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())?;
-                    tasks::check_line(c, &added.uid)?;
-                    Ok(added)
+                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
                 }) {
                     Ok(added) => Response::Added { added },
                     Err(tasks::AddFailure::NeedsGlobalBacklogAssent) => {

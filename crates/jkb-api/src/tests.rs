@@ -1928,10 +1928,23 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         .collect();
     task_writes.sort_unstable();
     assert_eq!(covered, task_writes);
+    // A line some other writer already broke does not block the task: only a write that breaks a
+    // readable line is refused, or a task a host command had left unreadable could not even be released.
+    let problem = db
+        .read({
+            let uid = inside.clone();
+            move |c| {
+                let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
+                Ok(jkb_sync::filed_task_problem(c, id).unwrap())
+            }
+        })
+        .unwrap();
+    assert!(
+        problem.as_deref().is_some_and(|p| p.contains("due date")),
+        "the planted line is unreadable: {problem:?}"
+    );
     for request in writes {
-        let e = call(&host, request.clone()).unwrap_err();
-        assert_eq!(e.code, ErrorCode::Invalid, "{request}: {e:?}");
-        assert!(e.message.contains("due date"), "{request}: {e:?}");
+        call(&host, request.clone()).unwrap_or_else(|e| panic!("{request}: {e:?}"));
     }
 
     // A write that takes the offending value away passes, and each field is judged on its own.
@@ -1958,6 +1971,10 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
             "identity",
         ),
         (
+            json!({ "op": "task.bind", "uid": inside, "sync": format!("file:///Users/u/repos/in/tasks.md#{}", other.trim_start_matches("task:")) }),
+            "already another task's",
+        ),
+        (
             json!({ "op": "task.add", "text": "\"first\n\nsecond\" +repos/in" }),
             "section prose",
         ),
@@ -1972,6 +1989,67 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         panic!("task")
     };
     assert_eq!(task.item.due.as_deref(), Some("2026-07-15"), "rolled back");
+}
+
+/// A title in any script files and round-trips: its minted id keeps the title's letters, and the
+/// serializer reads such an id back as the task's identity.
+#[test]
+fn a_task_titled_in_any_script_is_filed_and_written_like_any_other() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    for title in ["Fix naïve parser", "修复解析器", "İstanbul ofisi"] {
+        let Response::Added { added } = call(
+            &b,
+            json!({ "op": "task.add", "text": format!("{title} +repos/in") }),
+        )
+        .unwrap_or_else(|e| panic!("{title}: {e:?}")) else {
+            panic!("added")
+        };
+        assert!(added.binding.is_some(), "{title} is filed: {added:?}");
+        call(
+            &b,
+            json!({ "op": "task.claim", "uid": added.uid, "owner": "agent:a" }),
+        )
+        .unwrap_or_else(|e| panic!("{title}: {e:?}"));
+    }
+}
+
+/// The line check is part of what `task.add` judges before it asks about the global backlog, so a line
+/// the file could not carry is refused, not asked about and then refused.
+#[test]
+fn a_backlog_add_whose_line_would_not_come_back_is_refused_before_the_question() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    db.write_txn("t", |c, m| {
+        let id = jkb_core::ns::ensure(c, "tasks/.backlog")?;
+        jkb_core::mount::create(
+            c,
+            m,
+            id,
+            "file:///Users/u/repos/backlog",
+            jkb_types::SyncMode::Bidirectional,
+            "tasks",
+            None,
+            None,
+            jkb_types::ConflictPolicy::Manual,
+        )
+    })
+    .unwrap();
+    let b = rooted(&db);
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "\"first\n\nsecond\"", "backlog": true, "cwd": "/nowhere" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" })
+        )
+        .unwrap(),
+        Response::NeedsGlobalBacklogAssent {},
+        "a line that comes back is still asked about"
+    );
 }
 
 #[test]
