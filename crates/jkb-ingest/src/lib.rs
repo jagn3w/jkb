@@ -22,7 +22,7 @@ mod fetch;
 mod pipeline;
 
 pub use error::{Error, Result};
-pub use pipeline::{Outcome, Pipeline};
+pub use pipeline::{text_address, Outcome, Pipeline};
 
 /// Read and parse a source named on the command line: an `http(s)` URL is rendered in a headless
 /// browser and its DOM parsed as HTML; anything else is a file, parsed by its extension. Returns the raw

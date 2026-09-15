@@ -674,8 +674,8 @@ impl Request {
     /// **Not "every op that does not write".** The reader serves one call at a time, and what queues
     /// there is a client's reads — a grep over the whole knowledge base among them. The queue's and the
     /// notification hook's own reads (`mq.inspect`, `mq.tail`, `notify.open_sessions`) are short and
-    /// latency-bound — a `SessionStart` sweep has 1 s — so they stay on the writer, which runs only such
-    /// ops; classing them by "does not write" put the sweep behind a container's grep (stage-6.1 review).
+    /// latency-bound — a `SessionStart` sweep has 1 s — so they stay on the writer, which otherwise runs
+    /// only writes (`ingest.text`, the longest, under the daemon's own small budget); classing them by "does not write" put the sweep behind a container's grep (stage-6.1 review).
     /// Exhaustive, so a new op must say. A write classed here fails against the daemon's `query_only`
     /// reader rather than writing somewhere unguarded (`every_op_is_served_on_the_connection_its_class_names`).
     #[must_use]

@@ -33,3 +33,9 @@ pub const CLIENT_FILE_ROOT: &str = "repos";
 
 /// The default address `jkb serve` binds and a client assumes.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7117";
+
+/// The largest request body `jkb serve` accepts ([`server::ServeConfig::max_body_bytes`]'s default, which
+/// the unit does not change). A client checks a large request against it before sending: the daemon
+/// refuses a body past it by closing the connection mid-upload, and a body many times the cap then
+/// reached the client as a failed send — "cannot reach jkb serve" — rather than the refusal.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;

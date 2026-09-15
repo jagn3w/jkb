@@ -4263,12 +4263,14 @@ fn ingest_through_the_daemon_sends_text_and_the_host_stores_it() {
         String::from_utf8_lossy(&found.stderr)
     );
 
+    // Past the cap: refused before it is sent — a body many times the cap otherwise reached the client as
+    // a daemon that could not be reached.
     let big = client_home.join("big.txt");
     std::fs::write(&big, "word ".repeat(300_000)).unwrap();
     let out = remote(&["ingest", big.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("run it on the host"),
+        String::from_utf8_lossy(&out.stderr).contains("-byte request, more than"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

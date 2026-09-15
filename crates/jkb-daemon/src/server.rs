@@ -54,6 +54,10 @@ pub struct ServeConfig {
     pub max_ops: usize,
     /// Concurrent long-polls — a separate budget, so subscribers cannot starve a hook's request.
     pub max_polls: usize,
+    /// Concurrent `ingest.text` requests — a fourth budget, in place of an op permit as a read's is: one
+    /// capture of a body at the cap holds the single writer for over 100 ms, so a burst of them on op
+    /// permits held it for seconds while the notification hook's writes, with 1 s to answer, queued.
+    pub max_ingests: usize,
     /// Concurrent read-set requests (`Request::is_agent_read`) — a third budget. The reads run one at a time
     /// on the reader connection, so a burst of them otherwise held every op permit while queued and a
     /// hook's write was refused `busy`.
@@ -87,10 +91,11 @@ impl ServeConfig {
         Self {
             addr,
             token_path,
-            max_body_bytes: 1024 * 1024,
+            max_body_bytes: crate::MAX_BODY_BYTES,
             max_ops: 64,
             max_polls: 32,
             max_reads: 16,
+            max_ingests: 2,
             read_budget_bytes: 16 * 1024 * 1024,
             max_wait: Duration::from_secs(30),
             poll_floor: Duration::from_millis(250),
@@ -184,6 +189,7 @@ struct State {
     ops: Arc<Semaphore>,
     polls: Arc<Semaphore>,
     reads: Arc<Semaphore>,
+    ingests: Arc<Semaphore>,
     read_budget_bytes: usize,
     /// The `(topic, group)` pairs with a long-poll held right now.
     polling: Mutex<HashSet<(String, String)>>,
@@ -339,6 +345,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         ops: Arc::new(Semaphore::new(cfg.max_ops)),
         polls: Arc::new(Semaphore::new(cfg.max_polls)),
         reads: Arc::new(Semaphore::new(cfg.max_reads)),
+        ingests: Arc::new(Semaphore::new(cfg.max_ingests)),
         read_budget_bytes: cfg.read_budget_bytes,
         polling: Mutex::new(HashSet::new()),
         sent: Notify::new(),
@@ -878,7 +885,8 @@ async fn handle(
 /// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with
 /// its long-poll slot and wait: a long-poll waits under the poll budget, one per group; a read
 /// (`Request::is_agent_read`) queues on the one reader connection, so it waits under the read budget rather
-/// than holding an op permit a hook's write needs; anything else keeps the op permit.
+/// than holding an op permit a hook's write needs; an `ingest.text` takes its own small budget the same
+/// way; anything else keeps the op permit.
 fn permit_for<'s>(
     state: &'s State,
     request: &Request,
@@ -915,6 +923,13 @@ fn permit_for<'s>(
             };
             drop(op_permit);
             Ok((read_permit, None, Duration::ZERO))
+        }
+        Request::IngestText(_) => {
+            let Ok(ingest_permit) = Arc::clone(&state.ingests).try_acquire_owned() else {
+                return Err(busy("the daemon is at its ingest limit; retry".to_owned()));
+            };
+            drop(op_permit);
+            Ok((ingest_permit, None, Duration::ZERO))
         }
         _ => Ok((op_permit, None, Duration::ZERO)),
     }

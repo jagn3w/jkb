@@ -2316,6 +2316,19 @@ fn ingest_text_captures_a_client_s_text_without_calling_a_model() {
         again.document, ingested.document,
         "the same text is the same document"
     );
+    assert!(again.already_ingested && !again.embedded, "{again:?}");
+    // Asked under another namespace, it answers where the document is.
+    let Response::Ingested {
+        ingested: elsewhere,
+    } = call(
+        &daemon,
+        json!({ "op": "ingest.text", "text": text, "mime": "text/markdown", "namespace": "inbox" }),
+    )
+    .unwrap()
+    else {
+        panic!("ingested")
+    };
+    assert_eq!(elsewhere.namespace, "references/notes");
     let (uid, blobs, actor) = db
         .read(move |c| {
             let uid: String = c.query_row(
@@ -2332,9 +2345,11 @@ fn ingest_text_captures_a_client_s_text_without_calling_a_model() {
             Ok((uid, blobs, actor))
         })
         .unwrap();
-    assert_eq!(
-        uid,
-        format!("b3:{}", jkb_ingest::blob::hash_bytes(text.as_bytes()))
+    assert_eq!(uid, format!("b3:{}", jkb_ingest::text_address(&text)));
+    assert_ne!(
+        jkb_ingest::text_address(&text),
+        jkb_ingest::blob::hash_bytes(text.as_bytes()),
+        "never the address of a file whose bytes are this text"
     );
     assert_eq!(blobs, 0, "no source bytes, so no blob");
     assert_eq!(actor, "serve");

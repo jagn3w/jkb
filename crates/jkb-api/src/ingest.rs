@@ -45,7 +45,8 @@ pub struct IngestAsk {
 pub struct Ingested {
     /// The document item's id.
     pub document: i64,
-    /// Where it was placed.
+    /// Where the document is: its primary namespace, which for one ingested before is where that ingest
+    /// put it, not where this request asked.
     pub namespace: String,
     /// How many chunks it was split into.
     pub chunk_count: usize,
@@ -90,9 +91,13 @@ pub fn ingest(
         .with_actor(actor)
         .ingest(db, ask.raw.as_deref(), &parsed, &ask.namespace)
         .map_err(refusal)?;
+    let document = outcome.document;
+    let namespace = db
+        .read(move |conn| jkb_core::item::primary_namespace(conn, document))?
+        .unwrap_or_default();
     Ok(Ingested {
         document: outcome.document.get(),
-        namespace: ask.namespace.clone(),
+        namespace,
         chunk_count: outcome.chunk_count,
         embedded: outcome.embedded,
         already_ingested: outcome.already_ingested,
@@ -111,10 +116,9 @@ fn refusal(e: jkb_ingest::Error) -> ApiError {
     }
 }
 
-/// The embedder of a backend that calls no model. It names the host's default model, because that name
-/// is part of an ingestion's idempotency key: where the host addresses a source as this capture did — a
-/// plain-text file, whose text is its bytes — the host's own `jkb ingest` then resumes the capture and
-/// embeds it rather than capturing it a second time.
+/// The embedder of a backend that calls no model. It names the host's default model and dimension: the
+/// model is part of an ingestion's idempotency key, so a repeat of the same text resumes this capture,
+/// and the dimension names the vector table a repeat checks for vectors `jkb index --pending` wrote.
 struct NoModel;
 
 impl Embedder for NoModel {

@@ -972,6 +972,30 @@ fn reads_have_their_own_permits_and_a_bounded_answer() {
     assert!(truncated && rows.len() < 100, "{} rows", rows.len());
 }
 
+/// Ingests run under a budget of their own too, in place of an op permit: a burst of large captures,
+/// each holding the one writer, is refused past its small limit rather than queued ahead of the hook's
+/// writes.
+#[test]
+fn ingests_have_their_own_permits() {
+    let f = Fixture::with(|cfg| cfg.max_ingests = 0);
+    let c = f.client();
+    let refused = c
+        .call(Request::IngestText(jkb_api::ingest::IngestAsk {
+            text: "t".into(),
+            mime: "text/plain".into(),
+            namespace: "inbox".into(),
+            raw: None,
+        }))
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Busy, "{refused:?}");
+    assert!(refused.message.contains("ingest limit"), "{refused:?}");
+    c.call(Request::MqTopicCreate {
+        topic: "claude/notify".into(),
+        spec: SpecInput::default(),
+    })
+    .expect("a write is served while ingests are at their limit");
+}
+
 /// A response body keeps its request's permit until it is written, and a client that never reads it
 /// keeps that permit only until the write deadline closes the connection — not until the daemon
 /// restarts, which is what a body holding a permit meant before there was a deadline.

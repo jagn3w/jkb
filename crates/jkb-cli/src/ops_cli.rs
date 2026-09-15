@@ -215,12 +215,23 @@ impl<'a> Ops<'a> {
             None => self.ambient()?.unwrap_or_else(|| "inbox".to_owned()),
         };
         let (raw, parsed) = jkb_ingest::read_source(source)?;
-        let ingested = match self.call(Request::IngestText(jkb_api::ingest::IngestAsk {
+        let request = Request::IngestText(jkb_api::ingest::IngestAsk {
             text: parsed.text,
             mime: parsed.mime,
             namespace,
             raw: (!self.remote).then_some(raw),
-        }))? {
+        });
+        if self.remote {
+            let size = serde_json::to_vec(&request)?.len();
+            if size > jkb_daemon::MAX_BODY_BYTES {
+                bail!(
+                    "{source}'s text makes a {size}-byte request, more than the {} bytes the daemon \
+                     accepts in one request; run it on the host",
+                    jkb_daemon::MAX_BODY_BYTES
+                );
+            }
+        }
+        let ingested = match self.call(request)? {
             Response::Ingested { ingested } => ingested,
             other => return unexpected("ingest.text", &other),
         };

@@ -1553,7 +1553,7 @@ fn local_ops(db: &Db, command: Command, global: bool, json: bool) -> Result<()> 
 
 /// The ambient repo key: the full namespace path of the `file://` mount covering the
 /// current directory (design D26.2), or `None` outside any mount. Tasks home under
-/// `tasks/<repo>/…` using this key. Unlike [`ambient`], `--global` does not apply — homing
+/// `tasks/<repo>/…` using this key. Unlike `ops_cli::Ops::ambient`, `--global` does not apply — homing
 /// always reflects where the task was captured.
 fn ambient_repo(db: &Db) -> Result<Option<String>> {
     let cwd = std::env::current_dir()?;

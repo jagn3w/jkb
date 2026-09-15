@@ -453,3 +453,60 @@ fn a_documents_vector_is_the_centroid_of_its_chunks() {
         );
     }
 }
+
+/// A capture no model embedded, whose vectors `index_pending` wrote later, is complete: a repeat run
+/// answers already ingested and embedded, and marks the ingestion so, rather than resuming it forever.
+/// Text with no source bytes is addressed apart from any file's bytes, and a run that has the bytes
+/// keeps them as the blob even when it only resumes.
+#[test]
+fn a_capture_embedded_later_completes_and_text_is_addressed_apart_from_bytes() {
+    let db = open_db();
+    let text = "no model saw this text when it was captured, but the index did later";
+    let first = pipeline(false)
+        .ingest(&db, None, &doc(text), "docs")
+        .unwrap();
+    assert!(!first.embedded && !first.already_ingested);
+    let again = pipeline(false)
+        .ingest(&db, None, &doc(text), "docs")
+        .unwrap();
+    assert!(
+        again.already_ingested && !again.embedded,
+        "a resume with no model wrote nothing: {again:?}"
+    );
+    pipeline(true).index_pending(&db).unwrap();
+    let complete = pipeline(false)
+        .ingest(&db, None, &doc(text), "docs")
+        .unwrap();
+    assert!(
+        complete.already_ingested && complete.embedded,
+        "{complete:?}"
+    );
+    let status: String = db
+        .read(|c| Ok(c.query_row("SELECT status FROM ingestions", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(status, "complete");
+
+    // The same characters as a file's bytes are another document, and that ingest stores its blob.
+    let before = item_count(&db);
+    let from_file = pipeline(false)
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
+        .unwrap();
+    assert_ne!(from_file.document, first.document);
+    assert!(item_count(&db) > before);
+    let resumed = pipeline(false)
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
+        .unwrap();
+    assert_eq!(resumed.document, from_file.document);
+    db.write_txn("t", |c, _| {
+        c.execute("DELETE FROM blobs", [])?;
+        Ok(())
+    })
+    .unwrap();
+    pipeline(false)
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
+        .unwrap();
+    let blobs: i64 = db
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(blobs, 1, "a resume with the bytes keeps them");
+}

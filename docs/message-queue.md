@@ -180,17 +180,24 @@ the ingestion's idempotency key, and captures it through the same `Pipeline::ing
 - **Addressed by what the host saw.** From the host's own process the raw bytes travel with the request
   (`IngestAsk::raw`, `#[serde(skip)]`, so never on the wire): the document is `b3:<hash of the bytes>`
   and the bytes are its blob, exactly as a host ingest always was, so re-ingesting a file ingested
-  before this op is still a no-op. Through the daemon there are no bytes, so the document is
-  `b3:<hash of the text>` and no blob is stored — a hash the client named for bytes the host never saw
-  would let it choose which document's uid its text is filed under. The same file ingested from the
-  container and from the host is therefore two documents when its text differs from its bytes.
+  before this op is still a no-op. Through the daemon there are no bytes, so the document is addressed
+  by `jkb_ingest::text_address` — the blake3 of the text behind a domain prefix — and no blob is stored.
+  Not by a hash the client names, which would let it choose the uid its text is filed under; and not by
+  the text's plain hash either (review 1): a UTF-8 file's text is its bytes, so a container sending a
+  host file's bytes as text took the uid and ingestion row the host's own ingest of that file resumes
+  into, leaving the host's document unparsed, under the container's namespace and mime, and `already
+  ingested` for good. The same file ingested from the container and from the host is two documents.
 - **No model call for a client.** `jkb serve` has no embedder (as for search), so a container's ingest
   is captured, keyword-searchable at once, and answered `embedded: false` with a warning; it gains vectors
-  when the host runs `jkb index --pending`. The capture is keyed by the host's default model, so where
-  the two address it alike — a plain-text file, whose text is its bytes — the host's own `jkb ingest`
-  resumes it and embeds rather than capturing it again.
-- **Size.** The request is bounded by the daemon's body cap (1 MiB); past it the CLI says to run it on
-  the host.
+  when the host runs `jkb index --pending`. A repeat of the same text answers `already_ingested`; once
+  the vectors exist (written by `index --pending`, which keys no ingestion) a repeat marks the ingestion
+  complete and answers `embedded: true`. Nothing runs `index --pending` on its own yet (tasks F5).
+- **Size and load.** The request is bounded by the daemon's body cap (`jkb_daemon::MAX_BODY_BYTES`, 1 MiB),
+  which the CLI checks before sending — a body many times the cap was otherwise cut off mid-upload and
+  reported as a daemon that could not be reached. A capture at the cap holds the single writer for
+  over 100 ms, so ingests run under a budget of their own (`max_ingests`, 2) in place of an op permit,
+  refused `busy` past it, rather than queue ahead of the notification hook's writes.
+- **Answer.** `namespace` is where the document is — for one ingested before, where that ingest put it.
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
 effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
@@ -492,6 +499,8 @@ migration's lock),
 - The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
   task-mutate set (S6.2) and ingest (S6.3) are done; `stat`, `item show`/`edit`/`rm`, `related`, `inv`, `view`, `ns`, `tag`, `undo`,
   `history`, `blob`, and the session verbs (`task start`/`work`/`land`/…) are still refused remotely.
+- Embedding what the container ingests (tasks F5): captured and keyword-searchable, it stays unembedded
+  until `jkb index --pending` runs on the host, and nothing runs it on a schedule.
 - The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than
   through `jkb-api` (design H4 says they should become its callers).
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.
