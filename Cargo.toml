@@ -42,6 +42,9 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # for URL fetching. Kept TLS-free here (embed only hits http://localhost); crates
 # that need https opt into a TLS feature (see tasks.md 7.3).
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json"] }
+# `float_roundtrip`: typed operations cross a process boundary as JSON, and without it a parsed f64
+# can land one ulp off (measured — a search score printed differently through the daemon than on the
+# host; `jkb-api` `a_search_score_crosses_the_wire_exactly`).
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # dev-only
-serde_json = "1"
 proptest = "1"

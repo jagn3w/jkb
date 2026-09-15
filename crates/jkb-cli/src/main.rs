@@ -16,6 +16,7 @@ mod output;
 mod owner;
 mod pr;
 mod presence;
+mod read_cli;
 mod remote;
 mod repo;
 mod review;
@@ -24,16 +25,15 @@ mod session;
 mod staging;
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use jkb_api::kb::SearchRoute;
 
 use jkb_core::lifecycle;
-use jkb_core::query::{Query, Scope};
 use jkb_core::transition::{self, Reclaimed};
 use jkb_core::{
     binding, blob, claim, edge, investigation, item, mount, ns, nstype, placement, tag, task, undo,
@@ -42,7 +42,6 @@ use jkb_core::{
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_fsm::Fact;
 use jkb_ingest::Pipeline;
-use jkb_search::{Route, Searcher};
 use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, PlacementRole, Resolution, SyncMode};
 
 /// A local-first, agent-native knowledge base.
@@ -104,9 +103,10 @@ enum Command {
         /// Query DSL terms; `~"…"` is the vector term, bare words are FTS.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
-        /// Which route to use.
-        #[arg(long, value_enum, default_value_t = RouteArg::Hybrid)]
-        route: RouteArg,
+        /// Which route to use (default: hybrid; fts with `JKB_REMOTE` set, since the daemon embeds
+        /// no query text).
+        #[arg(long, value_enum)]
+        route: Option<RouteArg>,
         /// Maximum number of hits.
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -1100,12 +1100,12 @@ enum RouteArg {
     Hybrid,
 }
 
-impl From<RouteArg> for Route {
+impl From<RouteArg> for SearchRoute {
     fn from(r: RouteArg) -> Self {
         match r {
-            RouteArg::Vector => Route::Vector,
-            RouteArg::Fts => Route::Fts,
-            RouteArg::Hybrid => Route::Hybrid,
+            RouteArg::Vector => Self::Vector,
+            RouteArg::Fts => Self::Fts,
+            RouteArg::Hybrid => Self::Hybrid,
         }
     }
 }
@@ -1274,25 +1274,14 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
-        Command::Query {
-            terms,
-            limit,
-            count,
-        } => cmd_query(&db, &terms.join(" "), limit, count, global, json),
-        Command::Search {
-            terms,
-            route,
-            limit,
-            context,
-        } => cmd_search(
-            &db,
-            &terms.join(" "),
-            route.into(),
-            limit,
-            context,
-            global,
-            json,
-        ),
+        cmd @ (Command::Query { .. }
+        | Command::Search { .. }
+        | Command::Find { .. }
+        | Command::Recent { .. }
+        | Command::Ls { .. }
+        | Command::Tree { .. }
+        | Command::Grep { .. }
+        | Command::Cat { .. }) => local_reads(&db, cmd, global, json),
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
         Command::Mount { cmd } => cmd_mount(&db, cmd, json),
@@ -1324,60 +1313,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Serve { .. } | Command::Service { .. } => {
             unreachable!("dispatched before the database is opened")
         }
-        Command::Ls {
-            path,
-            all,
-            long,
-            recursive,
-            time,
-        } => cmd_ls(
-            &db,
-            path.as_deref(),
-            LsOpts {
-                all,
-                long,
-                recursive,
-                time,
-            },
-            json,
-        ),
-        Command::Grep {
-            pattern,
-            path,
-            ignore_case,
-            names_only,
-            count,
-        } => cmd_grep(
-            &db,
-            &pattern,
-            path.as_deref(),
-            GrepOpts {
-                ignore_case,
-                names_only,
-                count,
-            },
-            global,
-            json,
-        ),
-        Command::Cat { uid } => cmd_cat(&db, &uid),
-        Command::Tree { path, all, depth } => cmd_tree(&db, path.as_deref(), all, depth, json),
-        Command::Find {
-            path,
-            kind,
-            tags,
-            status,
-            limit,
-        } => cmd_find(
-            &db,
-            path.as_deref(),
-            kind.as_deref(),
-            &tags,
-            status.as_deref(),
-            limit,
-            global,
-            json,
-        ),
-        Command::Recent { path, limit } => cmd_recent(&db, path.as_deref(), limit, global, json),
         Command::Stat { uid } => cmd_stat(&db, &uid, json),
         Command::Guide => {
             cmd_guide();
@@ -1597,6 +1532,17 @@ fn embedder() -> Result<Arc<dyn Embedder + Send + Sync>> {
     Ok(Arc::new(e))
 }
 
+/// The agent read set on this host (`read_cli`): through a `LocalBackend` over `db`, the same op
+/// `jkb serve` answers the dev container with, so the two cannot list different things.
+fn local_reads(db: &Db, command: Command, global: bool, json: bool) -> Result<()> {
+    let mut backend = jkb_api::LocalBackend::new(db.clone());
+    // Only a search embeds; building the embedder is not a cost `ls` should pay.
+    if matches!(command, Command::Search { .. }) {
+        backend = backend.with_embedder(embedder()?);
+    }
+    read_cli::Reads::new(&backend, global, json, SearchRoute::Hybrid).run(command)
+}
+
 /// The ambient namespace for the current directory, unless `--global`.
 fn ambient(db: &Db, global: bool) -> Result<Option<String>> {
     if global {
@@ -1606,16 +1552,6 @@ fn ambient(db: &Db, global: bool) -> Result<Option<String>> {
     Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
 }
 
-/// If a query has no explicit scope, default it to the ambient namespace subtree.
-fn apply_ambient(query: &mut Query, db: &Db, global: bool) -> Result<()> {
-    if query.scope == Scope::All {
-        if let Some(path) = ambient(db, global)? {
-            query.scope = Scope::Subtree(path);
-        }
-    }
-    Ok(())
-}
-
 /// The ambient repo key: the full namespace path of the `file://` mount covering the
 /// current directory (design D26.2), or `None` outside any mount. Tasks home under
 /// `tasks/<repo>/…` using this key. Unlike [`ambient`], `--global` does not apply — homing
@@ -1623,25 +1559,6 @@ fn apply_ambient(query: &mut Query, db: &Db, global: bool) -> Result<()> {
 fn ambient_repo(db: &Db) -> Result<Option<String>> {
     let cwd = std::env::current_dir()?;
     Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
-}
-
-/// Default an unscoped task query to the ambient repo's task tree (`tasks/<repo>/**`) when
-/// inside a repo, else the global `tasks/**` tree (design D26, open-question 4). `--global`
-/// forces the global tree.
-fn apply_ambient_tasks(query: &mut Query, db: &Db, global: bool) -> Result<()> {
-    if query.scope == Scope::All {
-        let root = task::DEFAULT_ROOT;
-        let base = if global {
-            root.to_owned()
-        } else {
-            match ambient_repo(db)? {
-                Some(repo) => format!("{root}/{repo}"),
-                None => root.to_owned(),
-            }
-        };
-        query.scope = Scope::Subtree(base);
-    }
-    Ok(())
 }
 
 /// Confirm a global `tasks/.backlog` fallback when `--backlog` is used outside any repo
@@ -1703,688 +1620,6 @@ fn cmd_ingest(db: &Db, path: &str, ns: Option<&str>, global: bool, json: bool) -
     Ok(())
 }
 
-fn cmd_query(
-    db: &Db,
-    dsl: &str,
-    limit: Option<usize>,
-    count: bool,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    let mut query = jkb_core::query::parse(dsl)?;
-    apply_ambient(&mut query, db, global)?;
-    // `--count` reports the total; `--limit` only caps a listing.
-    if !count {
-        if let Some(limit) = limit {
-            query.limit = Some(limit);
-        }
-    }
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-    if count {
-        if json {
-            println!("{}", serde_json::json!({ "count": ids.len() }));
-        } else {
-            println!("{}", ids.len());
-        }
-        return Ok(());
-    }
-    let items = output::fetch_items(db, &ids)?;
-    output::print_items(&items, json);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_search(
-    db: &Db,
-    dsl: &str,
-    route: Route,
-    limit: usize,
-    context: Option<usize>,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    let mut query = jkb_core::query::parse(dsl)?;
-    apply_ambient(&mut query, db, global)?;
-    let searcher = Searcher::new(embedder()?);
-    let hits = searcher.search(db, &query, route, limit)?;
-
-    if json {
-        // Resolve every hit (and every `source_document`) to a real item before emitting.
-        // A search result identified only by a row id is not interpretable by the agent that
-        // asked for it: `jkb query --json` returns uid/kind/snippet, and search — the
-        // flagship read — must not be the one surface that answers in opaque integers.
-        let mut ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
-        ids.extend(hits.iter().filter_map(|h| h.source_document));
-        ids.sort_unstable_by_key(|i| i.get());
-        ids.dedup_by_key(|i| i.get());
-        let resolved: std::collections::HashMap<i64, output::DisplayItem> =
-            output::fetch_items(db, &ids)?
-                .into_iter()
-                .map(|i| (i.id, i))
-                .collect();
-
-        let mut arr = Vec::new();
-        for hit in &hits {
-            let ctx: Vec<serde_json::Value> = match context {
-                Some(n) => searcher
-                    .get_context(db, hit.item, n)?
-                    .into_iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "item": c.item.get(),
-                            "position": c.position,
-                            "is_hit": c.is_hit,
-                            "content": c.content,
-                        })
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
-            let item = resolved.get(&hit.item.get());
-            let source = hit
-                .source_document
-                .and_then(|d| resolved.get(&d.get()))
-                .map(|d| serde_json::json!({ "id": d.id, "uid": d.uid, "kind": d.kind }));
-            arr.push(serde_json::json!({
-                "item": hit.item.get(),
-                "uid": item.map(|i| i.uid.clone()),
-                "kind": item.map(|i| i.kind.clone()),
-                "status": item.and_then(|i| i.status.clone()),
-                "snippet": item.and_then(|i| i.snippet.clone()),
-                "route": hit.route.as_str(),
-                "score": hit.score,
-                "distance": hit.distance,
-                "namespace": hit.namespace_path,
-                "source_document": source,
-                "context": ctx,
-            }));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
-        );
-        return Ok(());
-    }
-
-    if hits.is_empty() {
-        println!("(no results)");
-        return Ok(());
-    }
-    // Resolved BY ID, never by position — the JSON branch above already does this. `fetch_items`
-    // drops rows it cannot find, so zipping made one missing item print nothing at all (and exit
-    // 0), and a gap mid-list mislabelled every hit after it (design D42.4). Never pair two lists
-    // by index when one of them can be shorter.
-    let ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
-    let by_id: std::collections::HashMap<i64, output::DisplayItem> = output::fetch_items(db, &ids)?
-        .into_iter()
-        .map(|i| (i.id, i))
-        .collect();
-    for hit in &hits {
-        let Some(item) = by_id.get(&hit.item.get()) else {
-            // A hit whose item is gone should be unreachable now that `knn_live` filters them,
-            // so say so rather than skipping silently — a search that quietly drops results is
-            // the failure this fix exists to remove.
-            eprintln!(
-                "warning: search hit {} has no item row; run `jkb index --sweep`",
-                hit.item.get()
-            );
-            continue;
-        };
-        println!(
-            "[{} {:.3}] {}",
-            hit.route.as_str(),
-            hit.score,
-            output_line(item)
-        );
-        if let Some(n) = context {
-            for c in searcher.get_context(db, hit.item, n)? {
-                let marker = if c.is_hit { "»" } else { " " };
-                println!("    {marker} {}: {}", c.position, first_line(&c.content));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A direct child of a namespace in the tree: a sub-namespace, or an item homed there.
-struct Child {
-    kind: String,
-    reference: String,
-    label: String,
-    has_children: bool,
-    status: Option<String>,
-    priority: Option<i64>,
-    /// For namespaces: count of visible item leaves anywhere in the subtree (respecting the
-    /// terminal-status toggle). `None` for item children. Lets the pane flag which folders
-    /// lead to real content. This is the sum of [`Child::leaf_kinds`].
-    leaf_count: Option<i64>,
-    /// For namespaces: the same leaves broken down by item `kind`, ordered by kind name.
-    /// A folder holding 8 tasks and 4 documents is not described by "12", and calling that
-    /// 12 tasks is simply wrong — so the breakdown, not the total, is what a tree renders.
-    leaf_kinds: Option<BTreeMap<String, i64>>,
-    /// For namespaces: the type recorded on **this** namespace, if any. Deliberately its
-    /// *own* type rather than the inherited one — a label on every namespace under a typed
-    /// root would be noise, and the interesting fact is where the type was applied.
-    ns_type: Option<String>,
-    /// The one-line description of [`Child::ns_type`], for a tooltip.
-    ns_type_about: Option<String>,
-    /// For a task with subtasks: `(total, open)`. A parent with open subtasks is held off
-    /// the ready frontier, so the tree must be able to show it as a container rather than
-    /// as one more pickable task sitting beside its own children.
-    subtasks: Option<(i64, i64)>,
-    /// For an item that others were derived from: how many `chunk` items came out of it.
-    /// Chunks are index units, not content — the tree hides them and shows their count here,
-    /// against the document they belong to. `None` when there are none.
-    chunk_count: Option<i64>,
-    /// The item's `updated_at` (for `ls -t`); `None` for namespaces.
-    updated: Option<String>,
-}
-
-/// The item kind ingest produces per document fragment. Chunks are derived index units:
-/// they are rebuildable from the VFS, nothing links *to* them, and listing them buries each
-/// ingested document under its own pieces. The tree hides them unless `--all` and surfaces
-/// their count against the document they came from.
-const KIND_CHUNK: &str = "chunk";
-
-/// Render a per-kind leaf breakdown as `8 task · 4 document`, ordered by kind name.
-///
-/// Kinds are **not** pluralized: they are `items.kind` values verbatim, and English
-/// pluralization of an open vocabulary goes wrong fast (`hypothesis` → `hypothesiss`). The
-/// count in front makes the reading unambiguous without it.
-fn format_leaf_kinds(kinds: &BTreeMap<String, i64>) -> String {
-    kinds
-        .iter()
-        .filter(|(_, n)| **n > 0)
-        .map(|(kind, n)| format!("{n} {kind}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-impl Child {
-    /// The item's hidden chunk count as a suffix, e.g. ` (3 chunks)`, or empty. Shows where
-    /// the fragments went for a document the tree no longer expands into.
-    fn chunk_label(&self) -> String {
-        self.chunk_count
-            .filter(|n| *n > 0)
-            .map(|n| format!(" ({n} chunk{})", if n == 1 { "" } else { "s" }))
-            .unwrap_or_default()
-    }
-
-    /// The namespace's own type as a bracketed label, e.g. ` [tasks]`, or empty.
-    fn type_label(&self) -> String {
-        self.ns_type
-            .as_deref()
-            .map(|t| format!(" [{t}]"))
-            .unwrap_or_default()
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "kind": self.kind,
-            "ref": self.reference,
-            "label": self.label,
-            "has_children": self.has_children,
-            "status": self.status,
-            "priority": self.priority,
-            "leaf_count": self.leaf_count,
-            "leaf_kinds": self.leaf_kinds,
-            "type": self.ns_type,
-            "type_about": self.ns_type_about,
-            "chunk_count": self.chunk_count,
-            "subtask_count": self.subtasks.map(|(total, _)| total),
-            "open_subtask_count": self.subtasks.map(|(_, open)| open),
-            "updated": self.updated,
-        })
-    }
-
-    /// Ordering key: namespaces first, then tasks (most important — lowest priority
-    /// number — first), then other items; ties broken by label. Nulls sort last.
-    fn sort_key(&self) -> (u8, i64, String) {
-        let group = match self.kind.as_str() {
-            "namespace" => 0,
-            "task" => 1,
-            _ => 2,
-        };
-        (
-            group,
-            self.priority.unwrap_or(i64::MAX),
-            self.label.to_lowercase(),
-        )
-    }
-}
-
-/// A short label for an item: its first non-empty content line (≤80 chars), else its uid.
-fn item_label(meta: &item::ItemMeta) -> String {
-    // The derivation is `output::title_of` — the one copy. Only the width is this function's
-    // own, which is the split that helper's doc describes: a tree row, a staging row and a
-    // gate refusal have different widths but must agree on what the task is *called*. This
-    // was the fourth surviving copy, and the one that names tasks in the explorer tree.
-    let title = output::title_of(meta);
-    truncate(&title, 80)
-}
-
-/// The children of any item that contains others — the container behaviour a node takes on
-/// (design D35).
-///
-/// One read for every container. A task's subtasks and a document's chunks are the same
-/// query because containment is recorded the same way for both: on the placement. Nothing
-/// here branches on what kind of node it is.
-fn contained_children(
-    conn: &rusqlite::Connection,
-    parent: jkb_types::ItemId,
-    all: bool,
-) -> jkb_core::Result<Vec<Child>> {
-    let ids = jkb_core::containment::children(conn, parent)?;
-    let subtask_counts = jkb_core::containment::child_counts(conn, &ids)?;
-    let chunk_counts = item::derived_kind_counts(conn, &ids, KIND_CHUNK)?;
-    let mut out = Vec::new();
-    for id in ids {
-        let Some(meta) = item::get(conn, id)? else {
-            continue;
-        };
-        if !all && jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref()) {
-            continue;
-        }
-        let subtasks = subtask_counts.get(&id).copied();
-        let chunks = chunk_counts.get(&id).copied().unwrap_or(0);
-        out.push(Child {
-            label: item_label(&meta),
-            kind: meta.kind,
-            reference: meta.uid,
-            // Containment nests: a child that contains in turn expands in turn.
-            has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
-            status: meta.status,
-            priority: meta.priority,
-            leaf_count: None,
-            leaf_kinds: None,
-            ns_type: None,
-            ns_type_about: None,
-            chunk_count: (chunks > 0).then_some(chunks),
-            subtasks,
-            updated: Some(meta.updated_at),
-        });
-    }
-    Ok(out)
-}
-
-/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
-/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
-/// tasks are hidden unless `all`.
-fn list_children(
-    conn: &rusqlite::Connection,
-    path: Option<&str>,
-    all: bool,
-) -> jkb_core::Result<Vec<Child>> {
-    // "Container" is a behaviour, not a node kind. A pure namespace is a node that ONLY
-    // contains; a parent task both is a task and contains its subtasks. So `ls` resolves a
-    // namespace first (the common case, and the historical meaning) and falls back to an
-    // item uid — one command lists the children of anything that has any.
-    if let Some(p) = path {
-        if ns::get(conn, p)?.is_none() {
-            if let Some(id) = item::id_for_uid(conn, p)? {
-                return contained_children(conn, id, all);
-            }
-        }
-    }
-    let mut out = Vec::new();
-
-    let ns_children = match path {
-        None => ns::roots(conn)?,
-        Some(p) => ns::children(conn, p)?,
-    };
-    // All children's subtree leaf counts in one grouped recursive query, rather than a
-    // separate descendant walk per child (an N+1 the tree hit on every expand).
-    let leaf_counts = ns::subtree_leaf_counts(conn, path, all)?;
-    for (ns_id, ns_path) in ns_children {
-        let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
-        let has_sub = !ns::children(conn, &ns_path)?.is_empty();
-        let mut leaf_kinds = leaf_counts.get(&ns_id).cloned().unwrap_or_default();
-        if !all {
-            // Chunks are hidden below, so they must not be counted here either — a folder
-            // reporting "1 chunk" that shows nothing when opened is worse than no count.
-            leaf_kinds.remove(KIND_CHUNK);
-        }
-        let leaf_count: i64 = leaf_kinds.values().sum();
-        // The namespace's OWN type, not `effective_type`: labelling every namespace under a
-        // typed root would be noise, and where the type was *applied* is the useful fact.
-        let ns_type = ns::get_type_by_id(conn, ns_id)?;
-        let ns_type_about = ns_type
-            .as_deref()
-            .and_then(|name| nstype::resolve(name).ok())
-            .map(|t| t.about().to_owned());
-        out.push(Child {
-            kind: "namespace".to_owned(),
-            reference: ns_path,
-            label,
-            has_children: has_sub || leaf_count > 0,
-            status: None,
-            priority: None,
-            leaf_count: Some(leaf_count),
-            leaf_kinds: Some(leaf_kinds),
-            ns_type,
-            ns_type_about,
-            chunk_count: None,
-            subtasks: None,
-            updated: None,
-        });
-    }
-
-    if let Some(p) = path {
-        if let Some(ns_id) = ns::get(conn, p)? {
-            // Any placement role: a `tasks/…` mirror surfaces the task even though its
-            // primary home is elsewhere (the symbolic-link view).
-            // Directly placed only: a contained node is listed under its container, not
-            // beside it. It is still IN this namespace — `ns:` scoping finds it — which is
-            // exactly why the placement keeps both the namespace and the parent.
-            let placed = placement::items_directly_in(conn, ns_id)?;
-            // One grouped query for every document's chunk count, not one per document.
-            let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
-            let subtask_counts = jkb_core::containment::child_counts(conn, &placed)?;
-            for item_id in placed {
-                let Some(meta) = item::get(conn, item_id)? else {
-                    continue;
-                };
-                // Hide any terminal-status item (done/cancelled) unless `all` — like
-                // ignored files, revealed only on explicit toggle.
-                let terminal = jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref());
-                if !all && terminal {
-                    continue;
-                }
-                let subtasks = subtask_counts.get(&item_id).copied();
-                let chunks = chunk_counts.get(&item_id).copied().unwrap_or(0);
-                out.push(Child {
-                    label: item_label(&meta),
-                    kind: meta.kind,
-                    reference: meta.uid,
-                    // Anything that contains expands: a task into its subtasks, a document
-                    // into its chunks.
-                    has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
-                    status: meta.status,
-                    priority: meta.priority,
-                    leaf_count: None,
-                    leaf_kinds: None,
-                    ns_type: None,
-                    ns_type_about: None,
-                    chunk_count: chunk_counts.get(&item_id).copied(),
-                    subtasks,
-                    updated: Some(meta.updated_at.clone()),
-                });
-            }
-        }
-    }
-    out.sort_by_key(Child::sort_key);
-    Ok(out)
-}
-
-/// Flags for `jkb ls` (the ergonomic listing verb).
-#[derive(Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)] // a CLI flags bag, not state
-#[derive(Default)]
-struct LsOpts {
-    all: bool,
-    long: bool,
-    recursive: bool,
-    time: bool,
-}
-
-/// `jkb ls [path]` — namespaces + items under a namespace (the lazy tree primitive plus
-/// familiar `-l`/`-R`/`-t` ergonomics). `-R` walks the subtree depth-first; without it,
-/// just the direct children.
-fn cmd_ls(db: &Db, path: Option<&str>, opts: LsOpts, json: bool) -> Result<()> {
-    let owned = path.map(str::to_owned);
-    let all = opts.all;
-    let recursive = opts.recursive;
-    // (namespace shown as the row's "parent", child) pairs — the parent gives `-l`/`-R`
-    // rows a stable location column even when descending.
-    let rows: Vec<(Option<String>, Child)> = db.read(move |conn| {
-        let mut acc = Vec::new();
-        collect_ls(conn, owned.as_deref(), all, recursive, &mut acc)?;
-        Ok(acc)
-    })?;
-
-    let mut rows = rows;
-    if opts.time {
-        // Most-recently-updated first; rows without an `updated` (namespaces) sort last.
-        rows.sort_by(|a, b| b.1.updated.cmp(&a.1.updated));
-    }
-
-    if json {
-        let children: Vec<_> = rows.iter().map(|(_, c)| c.to_json()).collect();
-        let v = serde_json::json!({ "path": path, "children": children });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else if rows.is_empty() {
-        println!("(empty)");
-    } else {
-        for (parent, c) in &rows {
-            print_ls_row(parent.as_deref(), c, opts);
-        }
-    }
-    Ok(())
-}
-
-/// Accumulate `ls` rows, optionally recursing into sub-namespaces depth-first. Each row is
-/// `(parent namespace path, child)`.
-fn collect_ls(
-    conn: &rusqlite::Connection,
-    path: Option<&str>,
-    all: bool,
-    recursive: bool,
-    acc: &mut Vec<(Option<String>, Child)>,
-) -> jkb_core::Result<()> {
-    let children = list_children(conn, path, all)?;
-    for c in children {
-        let is_ns = c.kind == "namespace";
-        let ns_path = c.reference.clone();
-        acc.push((path.map(str::to_owned), c));
-        if recursive && is_ns {
-            collect_ls(conn, Some(&ns_path), all, recursive, acc)?;
-        }
-    }
-    Ok(())
-}
-
-/// One human-readable `ls` row. `-l` adds kind/status and the location (namespace path for a
-/// sub-namespace, or `parent → uid` for an item); the default is the compact tree row.
-fn print_ls_row(parent: Option<&str>, c: &Child, opts: LsOpts) {
-    let status = c
-        .status
-        .as_deref()
-        .map(|s| format!(" ({s})"))
-        .unwrap_or_default();
-    if opts.long {
-        let loc = if c.kind == "namespace" {
-            c.reference.clone()
-        } else {
-            match parent {
-                Some(p) => format!("{p} → {}", c.reference),
-                None => c.reference.clone(),
-            }
-        };
-        let updated = c.updated.as_deref().unwrap_or("");
-        println!(
-            "{:<10} {:<12} {:<24} {}{}{status}",
-            c.kind,
-            updated,
-            loc,
-            c.label,
-            c.type_label()
-        );
-    } else {
-        let arrow = if c.has_children { "▸" } else { " " };
-        // When recursing, prefix items with their namespace so the flattened list stays legible.
-        let loc = match (opts.recursive, parent, c.kind.as_str()) {
-            (true, Some(p), k) if k != "namespace" => format!("{p}/"),
-            _ => String::new(),
-        };
-        println!(
-            "{arrow} {:<10} {loc}{}{}{}{status}",
-            c.kind,
-            c.label,
-            c.type_label(),
-            c.chunk_label()
-        );
-    }
-}
-
-/// Flags for `jkb grep`.
-#[derive(Clone, Copy)]
-struct GrepOpts {
-    ignore_case: bool,
-    names_only: bool,
-    count: bool,
-}
-
-/// `jkb grep <pattern> [path]` — literal-substring content search over a namespace subtree.
-/// Prints `uid:line` per matching line (or just uids with `-l`, or a count with `-c`), and
-/// **exits 1 when nothing matched** so it composes in scripts like real grep.
-fn cmd_grep(
-    db: &Db,
-    pattern: &str,
-    path: Option<&str>,
-    opts: GrepOpts,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    // Explicit path wins; otherwise scope to the ambient namespace (nothing = search all).
-    let scope = match path {
-        Some(p) => Some(p.to_owned()),
-        None => ambient(db, global)?,
-    };
-    let (pat, scope2) = (pattern.to_owned(), scope.clone());
-    let hits = db.read(move |conn| item::grep(conn, &pat, scope2.as_deref(), opts.ignore_case))?;
-
-    // Extract the matching lines per item (the SQL already confirmed a match exists).
-    let needle = if opts.ignore_case {
-        pattern.to_lowercase()
-    } else {
-        pattern.to_owned()
-    };
-    let matches_line = |line: &str| {
-        if opts.ignore_case {
-            line.to_lowercase().contains(&needle)
-        } else {
-            line.contains(&needle)
-        }
-    };
-
-    if opts.count {
-        let n = hits.len();
-        if json {
-            println!("{}", serde_json::json!({ "count": n }));
-        } else {
-            println!("{n}");
-        }
-        if n == 0 {
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
-    if json {
-        let arr: Vec<_> = hits
-            .iter()
-            .map(|h| {
-                let lines: Vec<_> = h
-                    .content
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, l)| matches_line(l))
-                    .map(|(i, l)| serde_json::json!({ "line": i + 1, "text": l }))
-                    .collect();
-                serde_json::json!({ "uid": h.uid, "kind": h.kind, "matches": lines })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if opts.names_only {
-        for h in &hits {
-            println!("{}", h.uid);
-        }
-    } else {
-        for h in &hits {
-            for (i, line) in h.content.lines().enumerate() {
-                if matches_line(line) {
-                    println!("{}:{}:{}", h.uid, i + 1, line.trim_end());
-                }
-            }
-        }
-    }
-
-    if hits.is_empty() {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-/// `jkb cat <uid>` — print an item's full content to stdout (no metadata, no truncation),
-/// so a task/note/document body pipes cleanly into another tool or an agent's context.
-fn cmd_cat(db: &Db, uid: &str) -> Result<()> {
-    let u = uid.to_owned();
-    let content = db.read(move |conn| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        item::get_content(conn, id).map(Some)
-    })?;
-    match content {
-        None => anyhow::bail!("no item with uid `{uid}`"),
-        Some(c) => print!("{}", c.unwrap_or_default()),
-    }
-    Ok(())
-}
-
-/// `jkb find [path] --kind --tag --status` — structured item search: familiar flags that
-/// compile to the query DSL (the typed complement to `grep`). Empty filters = list the
-/// scope (like `find .`); scope defaults to the ambient namespace.
-#[allow(clippy::too_many_arguments)]
-fn cmd_find(
-    db: &Db,
-    path: Option<&str>,
-    kind: Option<&str>,
-    tags: &[String],
-    status: Option<&str>,
-    limit: Option<usize>,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    // Refuse the one footgun: no filter, no path, no ambient scope, no limit would list the
-    // entire KB. Any filter / path / --limit (or being inside a mounted repo) makes it fine.
-    let unfiltered = kind.is_none() && tags.is_empty() && status.is_none() && path.is_none();
-    if unfiltered && limit.is_none() && ambient(db, global)?.is_none() {
-        anyhow::bail!(
-            "`find` with no filters would list the entire KB — add --kind/--tag/--status, a path, or --limit"
-        );
-    }
-
-    let mut terms: Vec<String> = Vec::new();
-    if let Some(k) = kind {
-        terms.push(format!("kind:{k}"));
-    }
-    for t in tags {
-        terms.push(format!("tag:{t}"));
-    }
-    if let Some(s) = status {
-        terms.push(format!("status:{s}"));
-    }
-    if let Some(p) = path {
-        terms.push(format!("ns:{p}/**"));
-    }
-    cmd_query(db, &terms.join(" "), limit, false, global, json)
-}
-
-/// `jkb recent [path]` — the most-recently-updated items in a subtree, newest first.
-fn cmd_recent(db: &Db, path: Option<&str>, limit: usize, global: bool, json: bool) -> Result<()> {
-    let dsl = path.map(|p| format!("ns:{p}/**")).unwrap_or_default();
-    let mut query = jkb_core::query::parse(&dsl)?;
-    apply_ambient(&mut query, db, global)?;
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-    let mut items = output::fetch_items(db, &ids)?;
-    // Newest first; missing timestamps (shouldn't happen) sort last.
-    items.sort_by(|a, b| b.updated.cmp(&a.updated));
-    items.truncate(limit);
-    output::print_items(&items, json);
-    Ok(())
-}
-
 /// `jkb stat <uid>` — compact metadata for one item (no body).
 fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
     let u = uid.to_owned();
@@ -2419,116 +1654,6 @@ fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
     } else {
         print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
         println!("content:   {chars} chars");
-    }
-    Ok(())
-}
-
-/// One node in the `jkb tree` output: a listed child plus its recursively-listed children.
-struct TreeNode {
-    child: Child,
-    children: Vec<TreeNode>,
-}
-
-fn tree_nodes(
-    conn: &rusqlite::Connection,
-    path: Option<&str>,
-    all: bool,
-    depth_left: Option<usize>,
-) -> jkb_core::Result<Vec<TreeNode>> {
-    let mut out = Vec::new();
-    for child in list_children(conn, path, all)? {
-        // Descend into any container, not just namespaces — otherwise de-duplicating a
-        // subtask out of its namespace listing would make it unreachable in `tree`.
-        let descend = child.has_children && depth_left != Some(0);
-        let children = if descend {
-            tree_nodes(conn, Some(&child.reference), all, depth_left.map(|d| d - 1))?
-        } else {
-            Vec::new()
-        };
-        out.push(TreeNode { child, children });
-    }
-    Ok(out)
-}
-
-fn tree_to_json(node: &TreeNode) -> serde_json::Value {
-    let mut v = node.child.to_json();
-    if !node.children.is_empty() {
-        v["children"] = node.children.iter().map(tree_to_json).collect();
-    }
-    v
-}
-
-/// Depth `jkb tree` descends by default before eliding deeper folders with `…` — deep
-/// enough to map any real subtree, shallow enough to bound the output and the per-namespace
-/// query fan-out (each level lists its children). `--depth` overrides.
-const DEFAULT_TREE_DEPTH: usize = 4;
-
-/// Render one tree level with box-drawing prefixes (`├─`/`└─`); a namespace elided by the
-/// depth cap (it has children we didn't descend into) gets a trailing `…`.
-fn print_tree(nodes: &[TreeNode], prefix: &str) {
-    for (i, node) in nodes.iter().enumerate() {
-        let last = i + 1 == nodes.len();
-        let (branch, cont) = if last {
-            ("└─ ", "   ")
-        } else {
-            ("├─ ", "│  ")
-        };
-        // Show WHAT is in the subtree, not just how much: a bare number invites reading
-        // every leaf as a task, which is what this display used to claim.
-        let leaves = node
-            .child
-            .leaf_kinds
-            .as_ref()
-            .filter(|_| node.child.kind == "namespace")
-            .map(|kinds| match format_leaf_kinds(kinds) {
-                s if s.is_empty() => String::new(),
-                s => format!(" ({s})"),
-            })
-            .unwrap_or_default();
-        let ns_type = node.child.type_label();
-        let status = node
-            .child
-            .status
-            .as_deref()
-            .map(|s| format!(" [{s}]"))
-            .unwrap_or_default();
-        let elided = if node.children.is_empty()
-            && node.child.has_children
-            && node.child.kind == "namespace"
-        {
-            " …"
-        } else {
-            ""
-        };
-        println!(
-            "{prefix}{branch}{}{ns_type}{leaves}{}{status}{elided}",
-            node.child.label,
-            node.child.chunk_label()
-        );
-        print_tree(&node.children, &format!("{prefix}{cont}"));
-    }
-}
-
-/// `jkb tree [path]` — a recursive map of the namespace subtree with per-folder counts.
-fn cmd_tree(
-    db: &Db,
-    path: Option<&str>,
-    all: bool,
-    depth: Option<usize>,
-    json: bool,
-) -> Result<()> {
-    let owned = path.map(str::to_owned);
-    let depth = Some(depth.unwrap_or(DEFAULT_TREE_DEPTH));
-    let nodes = db.read(move |conn| tree_nodes(conn, owned.as_deref(), all, depth))?;
-    if json {
-        let v = serde_json::json!({
-            "path": path,
-            "tree": nodes.iter().map(tree_to_json).collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        println!("{}", path.unwrap_or("."));
-        print_tree(&nodes, "");
     }
     Ok(())
 }
@@ -4349,43 +3474,9 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> 
             under.as_deref(),
             json,
         )?,
-        TaskCmd::Next { terms, limit } => {
-            let mut query = jkb_core::query::parse(&terms.join(" "))?;
-            apply_ambient_tasks(&mut query, db, global)?;
-            let (scope, tags) = (query.scope.clone(), query.tags.clone());
-            let mut rows = db.read(move |conn| task::ready(conn, scope, &tags))?;
-            if let Some(limit) = limit {
-                rows.truncate(limit);
-            }
-            let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
-            let items = output::fetch_items(db, &ids)?;
-            output::print_items(&items, json);
+        cmd @ (TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. }) => {
+            local_reads(db, Command::Task { cmd }, global, json)?;
         }
-        TaskCmd::Show { uid } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let extra = task_branch_extra(db, id)?;
-            output::print_item_full(db, id, json, &extra)?;
-            // Subtasks are shown after the body: a parent is off the ready frontier until
-            // they are all terminal, so "why isn't this actionable?" must be answerable
-            // from the same command that shows the task.
-            let subs = db.read(move |conn| task::subtasks(conn, id))?;
-            if !subs.is_empty() && !json {
-                let open = subs
-                    .iter()
-                    .filter(|t| !jkb_types::TaskStatus::is_terminal_str(t.status.as_deref()))
-                    .count();
-                println!("\nsubtasks ({open} open of {}):", subs.len());
-                for t in &subs {
-                    let status = t.status.as_deref().unwrap_or("?");
-                    let title = t.title.as_deref().unwrap_or("");
-                    println!("  [{status:^12}] {} — {}", t.uid, first_line(title));
-                }
-                if open > 0 {
-                    println!("this task is held off the ready frontier until they are done");
-                }
-            }
-        }
-        TaskCmd::Subtasks { uid, all } => cmd_task_subtasks(db, &uid, all, json)?,
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         TaskCmd::Why { uid } => cmd_task_why(db, &uid, json)?,
         TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
@@ -4414,62 +3505,6 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> 
         other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
-}
-
-/// What this task's branches record — the cut point, the land target, and any landing jkb itself
-/// performed — for `jkb task show`.
-///
-/// Read for **every** branch the task names, keyed by branch: that is what the record is keyed by,
-/// and a task legitimately carries two. The old shape — a `base=<branch>:<sha>` tag among the
-/// task's tags — showed the same thing by accident of the encoding, and is what a dozen call sites
-/// then had to take apart.
-///
-/// The repository is the task's own `repo=`, so this reads correctly from anywhere; the database
-/// is global across repos (D32) and a namesake branch elsewhere is a different branch.
-fn task_branch_extra(db: &Db, id: ItemId) -> Result<output::Extra> {
-    let rows = db.read(move |conn| jkb_core::transition::history(conn, id))?;
-    let mut extra = output::Extra::default();
-    let mut json_rows = Vec::new();
-    // The task's history, not a per-branch record: what is worth showing here is what happened
-    // to this task, and every entry is a statement about a moment rather than a projection that
-    // has to be kept in agreement with git.
-    for r in rows
-        .iter()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let mut line = format!("  {} {} -> {}", r.at, r.event, r.to_status);
-        if let Some(b) = &r.labels.branch {
-            let _ = write!(line, " on {b}");
-        }
-        if let Some(o) = &r.labels.onto {
-            let _ = write!(line, " onto {o}");
-        }
-        if let Some(n) = r.labels.pr_number {
-            let _ = write!(line, " #{n}");
-        }
-        extra.lines.push(line);
-        json_rows.push(serde_json::json!({
-            "at": r.at,
-            "event": r.event,
-            "to": r.to_status,
-            "branch": r.labels.branch,
-            "onto": r.labels.onto,
-            "pr": r.labels.pr_number,
-        }));
-    }
-    if !extra.lines.is_empty() {
-        extra
-            .lines
-            .insert(0, "recent transitions (`jkb task why` for all):".to_owned());
-    }
-    extra
-        .json
-        .insert("transitions".to_owned(), json_rows.into());
-    Ok(extra)
 }
 
 /// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
@@ -4826,31 +3861,6 @@ fn record_pr(db: &Db, id: ItemId, number: i64) -> Result<()> {
         jkb_core::transition::note(conn, meta, id, &facts, &labels)?;
         Ok(())
     })
-}
-
-/// `task subtasks <uid>` — a parent's children, shaped exactly like `jkb ls` output.
-///
-/// Sharing the shape is the point: the tree expands a namespace and a parent task with one
-/// parser, so nesting subtasks costs the UI a different *command*, not a different model.
-fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
-    // A thin alias over the container read: `jkb ls <task-uid>` is the same call. It exists
-    // for discoverability from the task surface, not as a second implementation.
-    let id = resolve_task_uid(db, uid)?;
-    let children = db.read(move |conn| contained_children(conn, id, all))?;
-    if json {
-        let arr: Vec<_> = children.iter().map(Child::to_json).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "path": uid, "children": arr }))?
-        );
-    } else if children.is_empty() {
-        println!("(no subtasks)");
-    } else {
-        for c in &children {
-            print_ls_row(None, c, LsOpts::default());
-        }
-    }
-    Ok(())
 }
 
 /// Where `task start` is being told the work is happening. Grouped so the signature stays under
@@ -8242,11 +7252,7 @@ fn orphaned_claims(held: Vec<claim::ClaimInfo>, keep: &[String]) -> Reclaimed {
 
 /// Canonicalize a task uid: leave a `:`-bearing uid alone, else prefix `task:`.
 fn canonical_task_uid(uid: &str) -> String {
-    if uid.contains(':') {
-        uid.to_owned()
-    } else {
-        format!("task:{uid}")
-    }
+    task::canonical_uid(uid)
 }
 
 /// Resolve a task reference (full `task:<slug>` uid or bare slug) to its item id.
@@ -8254,20 +7260,8 @@ fn canonical_task_uid(uid: &str) -> String {
 /// # Errors
 /// Errors if no item matches either the given uid or `task:<uid>`.
 fn resolve_task_uid(db: &Db, uid: &str) -> Result<ItemId> {
-    // Accept either the full `task:<slug>` uid or the bare slug.
-    let candidates = if uid.contains(':') {
-        vec![uid.to_owned()]
-    } else {
-        vec![format!("task:{uid}"), uid.to_owned()]
-    };
-    let id = db.read(move |conn| {
-        for cand in &candidates {
-            if let Some(id) = jkb_core::item::id_for_uid(conn, cand)? {
-                return Ok(Some(id));
-            }
-        }
-        Ok(None)
-    })?;
+    let reference = uid.to_owned();
+    let id = db.read(move |conn| task::resolve_ref(conn, &reference))?;
     id.ok_or_else(|| anyhow::anyhow!("no item with uid {uid}"))
 }
 

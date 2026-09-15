@@ -63,18 +63,52 @@ routinely built from different checkouts.
 | `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
 | `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
 | `notify.gone` | `session`, `owner`, `instance` (as `notify.open_sessions` reported them) | `notified` {…} |
+| `kb.ambient` | `cwd`, `home?` | `ambient` {`namespace`} |
+| `kb.query` | `dsl`, `default_scope?`, `limit?`, `count?` | `items` {`items`}, or with `count` `count` {`count`} |
+| `kb.ls` | `path?`, `all?`, `recursive?` | `listing` {`rows`: [{`parent`, `child`}]} |
+| `kb.tree` | `path?`, `all?`, `depth?` | `tree` {`nodes`: [{`child`, `children`}]} |
+| `kb.cat` | `uid` | `content` {`content`} |
+| `kb.grep` | `pattern`, `scope?`, `ignore_case?` | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}]} |
+| `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` | `search_hits` {`hits`} |
+| `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
+| `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
+| `task.subtasks` | `uid`, `all?` | `children` {`children`} |
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
 effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
 12 h) and `notify.withdraw` (`id`, `session`; no TTL), keyed `session/<id>` — and only while the topic
 has a consumer group. [notifications.md](notifications.md) is their record.
 
+**The agent read set** (`kb.*`, `task.ready`/`show`/`subtasks`; tasks S6.1) is in
+`crates/jkb-api/src/kb.rs`, and each read has **one implementation there**: the host CLI serves `jkb
+query`, `find`, `recent`, `search`, `ls`, `tree`, `grep`, `cat` and `jkb task next`/`show`/`subtasks`
+through a `LocalBackend` too (`crates/jkb-cli/src/read_cli.rs`), so the daemon cannot answer one of
+them differently from the host — pinned byte-for-byte by `tests/cli.rs`
+`the_read_set_answers_through_the_daemon_exactly_as_on_the_host`. The CLI only renders, and its
+`--json` shapes are unchanged (the UI parses them, D31). Three decisions in it:
+
+- **An unscoped read's scope comes from the client's directory, re-rooted.** `kb.ambient` takes the
+  client's `cwd` and `$HOME`; a `cwd` under that home is looked up under the serving process's home,
+  which is what makes the container's `/home/vscode/repos/jkb` find the mount the host recorded as
+  `/Users/<u>/repos/jkb` (the container binds `~/repos` at `~/repos`). In one process the homes are
+  equal and nothing changes. The path is compared against the mounts table and never opened.
+  Residual: a container directory under its home that is *not* bound from the host re-roots onto a
+  host path that may be a mount, and scopes to that namespace — wrong scoping, no content moved.
+  Verified by disabling the re-rooting: the daemon's answers then differ from the host's.
+- **The daemon serves only the FTS search route.** Vector and hybrid embed the query text, which would
+  have the host call a model for the container, so a backend with no embedder — what `jkb serve`
+  builds — refuses them with `unsupported`, and remote mode's `jkb search` defaults to `--route fts`
+  (the host keeps `hybrid`).
+- **`kb.search`'s limit is capped at 1000**, because the hybrid route fuses from twice the limit and an
+  unbounded client value is an overflow in the daemon, not a long answer.
+
 `after` is the consumer's **fetch position**, separate from its committed one as in Kafka: a consumer
 that has handed messages on but not yet acked them polls with `after` set to the last seq it handed
 on. Without it, a batch of unacked messages comes back from every poll and nothing past it is read.
 
 Errors carry a stable `code`: `no_such_topic`, `topic_conflict`, `no_such_group`, `queue_full`,
-`too_large`, `invalid`, `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
+`too_large`, `invalid`, `not_found` (an item a read names does not exist), `unsupported` (a search
+route this backend does not serve), `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
 it), `bad_request`, `busy` (transient — retry: another writer held the database lock past the busy
 timeout, or, over HTTP, the daemon is at a concurrency limit or the group already has a long-poll in
 progress), `internal`, and `schema_newer` — a newer `jkb` migrated the database, so this build must
@@ -239,7 +273,7 @@ host.
 **Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
 `~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
-- runs `jkb mq …` through the daemon;
+- runs `jkb mq …` and the agent read set (above) through the daemon;
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
 - **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
   `mount`, `ingest`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
@@ -250,7 +284,7 @@ host.
 
 The table is an exhaustive `match` (`crates/jkb-cli/src/remote.rs`), so a new subcommand does not
 compile until it says which it is. A daemon that cannot be reached is remembered for 5 seconds
-(`~/.cache/jkb/remote-unreachable`), so a burst of short-lived `jkb` processes pays one connect
+(`~/.cache/jkb/remote-unreachable-<port>`), so a burst of short-lived `jkb` processes pays one connect
 timeout, not one each.
 
 `setup.sh` activates every unit `jkb service units` lists (label, installed path, role) — restarting
@@ -283,7 +317,11 @@ migration's lock),
 - `JKB_REMOTE` set in the container — at the cutover (tasks S6), not before: remote mode refuses
   `JKB_DB` and every unported command, and the container's agents still need both. The network path
   it will take already exists; see `.container/README.md`, "The one opening to the host".
-- Porting the agent read and task-mutate command sets to operations — stage S6.
+- Porting the task-mutate command set to operations, and client-side ingest — stages S6.2/S6.3. The
+  read set is done (S6.1); `stat`, `item show`, `related`, `inv`, `view`, `ns`, `tag`, `history` and
+  `blob` are still refused remotely.
+- The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than
+  through `jkb-api` (design H4 says they should become its callers).
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.
 - A native, non-subprocess client (Swift) — it would speak the HTTP protocol above. `jkb-notifier
   serve`, the first consumer, runs `jkb mq subscribe` as a child for now (design N2).

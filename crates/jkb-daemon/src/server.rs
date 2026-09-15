@@ -388,7 +388,10 @@ pub const fn status_for(code: ErrorCode) -> StatusCode {
     match code {
         ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
         ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
-        ErrorCode::NoSuchTopic | ErrorCode::NoSuchGroup => StatusCode::NOT_FOUND,
+        ErrorCode::NoSuchTopic | ErrorCode::NoSuchGroup | ErrorCode::NotFound => {
+            StatusCode::NOT_FOUND
+        }
+        ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
         ErrorCode::TopicConflict => StatusCode::CONFLICT,
         ErrorCode::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorCode::Invalid | ErrorCode::AckBeyondEnd | ErrorCode::CorruptPayload => {

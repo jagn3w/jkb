@@ -15,14 +15,20 @@
 //! or an unknown request field is refused (`deny_unknown_fields`), response fields are only ever
 //! added, and an op never changes meaning — a changed meaning is a new op name.
 //!
-//! Stage 2 shipped the message-queue ops (`mq.*`), stage 5 the notification ops (`notify.*`); the
-//! agent read/write sets follow.
+//! Stage 2 shipped the message-queue ops (`mq.*`), stage 5 the notification ops (`notify.*`), stage
+//! 6.1 the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`, in [`kb`]); the task-mutate set
+//! follows.
+
+use std::sync::Arc;
 
 use jkb_core::mq::{self, Created, Draft, QueueError, Start, TopicSpec};
 use jkb_core::notify::{self, NotifEvent, Observation};
 use jkb_core::Db;
+use jkb_types::Embedder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod kb;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +154,118 @@ pub enum Request {
         owner: String,
         /// The record's instance, as the producer read it.
         instance: String,
+    },
+    /// The namespace of the mount holding a working directory — what an unscoped read defaults to.
+    #[serde(rename = "kb.ambient")]
+    KbAmbient {
+        /// The client's working directory, absolute, in its own filesystem.
+        cwd: String,
+        /// The client's `$HOME`, so a directory under it is looked up under the server's
+        /// ([`kb::ambient`]). Empty for none.
+        #[serde(default)]
+        home: String,
+    },
+    /// The items a query DSL matches.
+    #[serde(rename = "kb.query")]
+    KbQuery {
+        /// The query DSL.
+        dsl: String,
+        /// The scope when the DSL names none.
+        #[serde(default)]
+        default_scope: Option<String>,
+        /// At most this many (ignored with `count`).
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Answer how many instead of which.
+        #[serde(default)]
+        count: bool,
+    },
+    /// The children of a namespace or container.
+    #[serde(rename = "kb.ls")]
+    KbLs {
+        /// The namespace path or item uid; top level when absent.
+        #[serde(default)]
+        path: Option<String>,
+        /// Include terminal items and chunks.
+        #[serde(default)]
+        all: bool,
+        /// Descend into every namespace below.
+        #[serde(default)]
+        recursive: bool,
+    },
+    /// A subtree.
+    #[serde(rename = "kb.tree")]
+    KbTree {
+        /// The namespace path or item uid; top level when absent.
+        #[serde(default)]
+        path: Option<String>,
+        /// Include terminal items and chunks.
+        #[serde(default)]
+        all: bool,
+        /// Levels to descend; at most [`kb::MAX_TREE_DEPTH`], which is also what absent asks for.
+        #[serde(default)]
+        depth: Option<usize>,
+    },
+    /// An item's full content.
+    #[serde(rename = "kb.cat")]
+    KbCat {
+        /// The item.
+        uid: String,
+    },
+    /// Items whose content holds a literal pattern, with the matching lines.
+    #[serde(rename = "kb.grep")]
+    KbGrep {
+        /// The literal pattern.
+        pattern: String,
+        /// The namespace subtree to search; everywhere when absent.
+        #[serde(default)]
+        scope: Option<String>,
+        /// Fold case (Unicode).
+        #[serde(default)]
+        ignore_case: bool,
+    },
+    /// Ranked search.
+    #[serde(rename = "kb.search")]
+    KbSearch {
+        /// The query DSL.
+        dsl: String,
+        /// The scope when the DSL names none.
+        #[serde(default)]
+        default_scope: Option<String>,
+        /// The route; a backend without an embedder serves only `fts`.
+        route: kb::SearchRoute,
+        /// At most this many hits.
+        limit: usize,
+        /// ±N neighbour chunks per hit.
+        #[serde(default)]
+        context: Option<usize>,
+    },
+    /// The ready frontier.
+    #[serde(rename = "task.ready")]
+    TaskReady {
+        /// Query DSL: its scope and tags narrow the frontier.
+        dsl: String,
+        /// The scope when the DSL names none.
+        #[serde(default)]
+        default_scope: Option<String>,
+        /// At most this many.
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// A task in full.
+    #[serde(rename = "task.show")]
+    TaskShow {
+        /// A task uid or bare slug.
+        uid: String,
+    },
+    /// A task's subtasks.
+    #[serde(rename = "task.subtasks")]
+    TaskSubtasks {
+        /// A task uid or bare slug.
+        uid: String,
+        /// Include terminal subtasks.
+        #[serde(default)]
+        all: bool,
     },
 }
 
@@ -365,6 +483,16 @@ impl Request {
         "notify.event",
         "notify.open_sessions",
         "notify.gone",
+        "kb.ambient",
+        "kb.query",
+        "kb.ls",
+        "kb.tree",
+        "kb.cat",
+        "kb.grep",
+        "kb.search",
+        "task.ready",
+        "task.show",
+        "task.subtasks",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -384,6 +512,16 @@ impl Request {
             Self::NotifyEvent { .. } => "notify.event",
             Self::NotifyOpenSessions {} => "notify.open_sessions",
             Self::NotifyGone { .. } => "notify.gone",
+            Self::KbAmbient { .. } => "kb.ambient",
+            Self::KbQuery { .. } => "kb.query",
+            Self::KbLs { .. } => "kb.ls",
+            Self::KbTree { .. } => "kb.tree",
+            Self::KbCat { .. } => "kb.cat",
+            Self::KbGrep { .. } => "kb.grep",
+            Self::KbSearch { .. } => "kb.search",
+            Self::TaskReady { .. } => "task.ready",
+            Self::TaskShow { .. } => "task.show",
+            Self::TaskSubtasks { .. } => "task.subtasks",
         }
     }
 }
@@ -447,6 +585,56 @@ pub enum Response {
         /// By session.
         sessions: Vec<NotifySession>,
     },
+    /// A `kb.ambient`.
+    Ambient {
+        /// The mount's namespace, or `None` outside every mount.
+        namespace: Option<String>,
+    },
+    /// A `kb.query` or `task.ready` listing.
+    Items {
+        /// In the query's order.
+        items: Vec<kb::ItemRow>,
+    },
+    /// A `kb.query` with `count`.
+    Count {
+        /// How many matched.
+        count: usize,
+    },
+    /// A `kb.ls`.
+    Listing {
+        /// Depth-first.
+        rows: Vec<kb::ListRow>,
+    },
+    /// A `kb.tree`.
+    Tree {
+        /// The top level.
+        nodes: Vec<kb::TreeNode>,
+    },
+    /// A `task.subtasks`.
+    Children {
+        /// In containment order.
+        children: Vec<kb::Child>,
+    },
+    /// A `kb.cat`.
+    Content {
+        /// The text; empty when the item has none.
+        content: String,
+    },
+    /// A `kb.grep`.
+    GrepHits {
+        /// By uid.
+        hits: Vec<kb::GrepHit>,
+    },
+    /// A `kb.search`.
+    SearchHits {
+        /// Best first.
+        hits: Vec<kb::SearchHit>,
+    },
+    /// A `task.show`.
+    Task {
+        /// The task.
+        task: Box<kb::TaskDetail>,
+    },
 }
 
 impl Response {
@@ -466,7 +654,17 @@ impl Response {
             | Self::Position { .. }
             | Self::Compacted { .. }
             | Self::Topics { .. }
-            | Self::Sessions { .. } => false,
+            | Self::Sessions { .. }
+            | Self::Ambient { .. }
+            | Self::Items { .. }
+            | Self::Count { .. }
+            | Self::Listing { .. }
+            | Self::Tree { .. }
+            | Self::Children { .. }
+            | Self::Content { .. }
+            | Self::GrepHits { .. }
+            | Self::SearchHits { .. }
+            | Self::Task { .. } => false,
         }
     }
 }
@@ -516,6 +714,11 @@ pub enum ErrorCode {
     SchemaNewer,
     /// The daemon could not be reached (client-side: refused, timed out, or recently unreachable).
     Unavailable,
+    /// The thing a read names does not exist (an item uid, say).
+    NotFound,
+    /// A request this backend does not serve in this form (a search route that embeds text, on a
+    /// backend with no embedder).
+    Unsupported,
     /// Anything else: a database or internal failure.
     Internal,
     /// A code this build does not know, from a newer peer. Clients treat it like `internal`.
@@ -582,6 +785,8 @@ impl From<jkb_core::Error> for ApiError {
                 }
             },
             jkb_core::Error::SchemaNewer { .. } => ErrorCode::SchemaNewer,
+            jkb_core::Error::Types(jkb_types::Error::Validation(_)) => ErrorCode::Invalid,
+            jkb_core::Error::Types(jkb_types::Error::NotFound(_)) => ErrorCode::NotFound,
             jkb_core::Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
                 if matches!(
                     f.code,
@@ -617,13 +822,22 @@ pub trait Backend {
 #[derive(Clone)]
 pub struct LocalBackend {
     db: Db,
+    embedder: Option<Arc<dyn Embedder + Send + Sync>>,
 }
 
 impl LocalBackend {
-    /// A backend over `db`.
+    /// A backend over `db`, with no embedder: `kb.search` serves only the FTS route. What `jkb serve`
+    /// runs, so a client's search never makes the host call a model.
     #[must_use]
     pub const fn new(db: Db) -> Self {
-        Self { db }
+        Self { db, embedder: None }
+    }
+
+    /// The same backend, embedding search text with `embedder` for the vector and hybrid routes.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder + Send + Sync>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 }
 
@@ -784,6 +998,94 @@ impl Backend for LocalBackend {
                     notify::gone(c, m, &session, &owner, &instance, now)
                 })?
                 .into(),
+            Request::KbAmbient { cwd, home } => {
+                let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                Response::Ambient {
+                    namespace: self
+                        .db
+                        .read(move |c| kb::ambient(c, &cwd, &home, server_home.as_deref()))?,
+                }
+            }
+            Request::KbQuery {
+                dsl,
+                default_scope,
+                limit,
+                count,
+            } => {
+                if count {
+                    Response::Count {
+                        count: self
+                            .db
+                            .read(move |c| kb::query_count(c, &dsl, default_scope.as_deref()))?,
+                    }
+                } else {
+                    Response::Items {
+                        items: self.db.read(move |c| {
+                            kb::query_items(c, &dsl, default_scope.as_deref(), limit)
+                        })?,
+                    }
+                }
+            }
+            Request::KbLs {
+                path,
+                all,
+                recursive,
+            } => Response::Listing {
+                rows: self
+                    .db
+                    .read(move |c| kb::ls(c, path.as_deref(), all, recursive))?,
+            },
+            Request::KbTree { path, all, depth } => Response::Tree {
+                nodes: self
+                    .db
+                    .read(move |c| kb::tree(c, path.as_deref(), all, depth))?,
+            },
+            Request::KbCat { uid } => Response::Content {
+                content: self.db.read_with(move |c| kb::cat(c, &uid))?,
+            },
+            Request::KbGrep {
+                pattern,
+                scope,
+                ignore_case,
+            } => Response::GrepHits {
+                hits: self
+                    .db
+                    .read(move |c| kb::grep(c, &pattern, scope.as_deref(), ignore_case))?,
+            },
+            Request::KbSearch {
+                dsl,
+                default_scope,
+                route,
+                limit,
+                context,
+            } => Response::SearchHits {
+                hits: kb::search(
+                    &self.db,
+                    self.embedder.as_ref(),
+                    &kb::SearchAsk {
+                        dsl,
+                        default_scope,
+                        route,
+                        limit,
+                        context,
+                    },
+                )?,
+            },
+            Request::TaskReady {
+                dsl,
+                default_scope,
+                limit,
+            } => Response::Items {
+                items: self
+                    .db
+                    .read(move |c| kb::ready(c, &dsl, default_scope.as_deref(), limit))?,
+            },
+            Request::TaskShow { uid } => Response::Task {
+                task: Box::new(self.db.read_with(move |c| kb::task_show(c, &uid))?),
+            },
+            Request::TaskSubtasks { uid, all } => Response::Children {
+                children: self.db.read_with(move |c| kb::subtasks(c, &uid, all))?,
+            },
         })
     }
 }

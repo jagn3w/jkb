@@ -51,6 +51,7 @@ fn an_unknown_op_or_field_is_refused_rather_than_ignored() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one sample per op
 fn every_op_names_its_own_wire_tag_and_is_advertised() {
     let samples = [
         Request::MqTopicCreate {
@@ -101,6 +102,49 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
             session: "s".into(),
             owner: "1".into(),
             instance: "h".into(),
+        },
+        Request::KbAmbient {
+            cwd: "/".into(),
+            home: String::new(),
+        },
+        Request::KbQuery {
+            dsl: String::new(),
+            default_scope: None,
+            limit: None,
+            count: false,
+        },
+        Request::KbLs {
+            path: None,
+            all: false,
+            recursive: false,
+        },
+        Request::KbTree {
+            path: None,
+            all: false,
+            depth: None,
+        },
+        Request::KbCat { uid: "u".into() },
+        Request::KbGrep {
+            pattern: "p".into(),
+            scope: None,
+            ignore_case: false,
+        },
+        Request::KbSearch {
+            dsl: "x".into(),
+            default_scope: None,
+            route: super::kb::SearchRoute::Fts,
+            limit: 1,
+            context: None,
+        },
+        Request::TaskReady {
+            dsl: String::new(),
+            default_scope: None,
+            limit: None,
+        },
+        Request::TaskShow { uid: "u".into() },
+        Request::TaskSubtasks {
+            uid: "u".into(),
+            all: false,
         },
     ];
     // OPS against the tags serde actually accepts — read from its unknown-variant error, which lists
@@ -444,4 +488,341 @@ fn only_an_answer_that_sent_something_wakes_subscribers() {
     assert!(!call(&b, json!({ "op": "mq.inspect" }))
         .unwrap()
         .announces_a_send());
+}
+
+// ---- the agent read set (tasks S6.1) ----
+
+/// A database with a mount at `/Users/u/repos/jkb` → `repos/jkb`, a document under it holding two
+/// lines that say "needle", and a task `task:parent` under `tasks/repos/jkb` with one open subtask.
+fn read_fixture() -> LocalBackend {
+    use jkb_core::{item, mount, ns, placement, task};
+    use jkb_types::{ConflictPolicy, PlacementRole, SyncMode};
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let repo = ns::ensure(c, "repos/jkb")?;
+        mount::create(
+            c,
+            m,
+            repo,
+            "file:///Users/u/repos/jkb",
+            SyncMode::Bidirectional,
+            "document",
+            None,
+            None,
+            ConflictPolicy::Manual,
+        )?;
+        let doc = item::upsert(
+            c,
+            m,
+            &item::NewItem {
+                uid: "doc:a".into(),
+                kind: "document".into(),
+                content: Some("title\nthe needle here\nnothing\nNEEDLE again".into()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        placement::place(c, m, doc, repo, PlacementRole::Primary, 0)?;
+        let mut parent = task::NewTask::new("task:parent", "Parent task\nbody");
+        parent.home = "tasks/repos/jkb".into();
+        let parent = task::create(c, m, &parent)?;
+        let mut child = task::NewTask::new("task:child", "Child task");
+        child.home = "tasks/repos/jkb".into();
+        let child = task::create(c, m, &child)?;
+        task::add_subtask(c, m, parent, child)
+    })
+    .unwrap();
+    LocalBackend::new(db)
+}
+
+#[test]
+fn a_container_directory_finds_the_mount_the_host_recorded() {
+    let b = read_fixture();
+    let found =
+        b.db.read(|c| {
+            super::kb::ambient(
+                c,
+                "/home/vscode/repos/jkb/crates",
+                "/home/vscode",
+                Some(std::path::Path::new("/Users/u")),
+            )
+        })
+        .unwrap();
+    assert_eq!(found.as_deref(), Some("repos/jkb"));
+    // Through the op, in one process: the client's home is this process's, so nothing is re-rooted
+    // and the host's own path is what matches.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let r = call(
+        &b,
+        json!({ "op": "kb.ambient", "cwd": "/Users/u/repos/jkb", "home": home }),
+    )
+    .unwrap();
+    assert_eq!(
+        r,
+        Response::Ambient {
+            namespace: Some("repos/jkb".into())
+        }
+    );
+}
+
+#[test]
+fn a_search_that_would_embed_is_refused_by_a_backend_with_no_embedder() {
+    let b = read_fixture();
+    for route in ["vector", "hybrid"] {
+        let e = call(
+            &b,
+            json!({ "op": "kb.search", "dsl": "needle", "route": route, "limit": 5 }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Unsupported, "{route}: {e:?}");
+    }
+    let e = call(
+        &b,
+        json!({ "op": "kb.search", "dsl": "needle", "route": "hybrid", "limit": usize::MAX }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "a limit the fusion would overflow on: {e:?}"
+    );
+    let Response::SearchHits { hits } = call(
+        &b,
+        json!({ "op": "kb.search", "dsl": "needle", "route": "fts", "limit": 5 }),
+    )
+    .unwrap() else {
+        panic!("a search answers with hits")
+    };
+    assert_eq!(
+        hits.iter()
+            .filter_map(|h| h.row.as_ref().map(|r| r.uid.as_str()))
+            .collect::<Vec<_>>(),
+        ["doc:a"],
+        "FTS needs no embedder"
+    );
+}
+
+#[test]
+fn grep_answers_with_the_matching_lines_and_cat_with_the_body() {
+    let b = read_fixture();
+    let Response::GrepHits { hits } = call(
+        &b,
+        json!({ "op": "kb.grep", "pattern": "needle", "scope": "repos/jkb", "ignore_case": true }),
+    )
+    .unwrap() else {
+        panic!("grep answers with hits")
+    };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0]
+            .lines
+            .iter()
+            .map(|l| (l.line, l.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, "the needle here"), (4, "NEEDLE again")]
+    );
+    let Response::GrepHits { hits } = call(
+        &b,
+        json!({ "op": "kb.grep", "pattern": "needle", "scope": "tasks" }),
+    )
+    .unwrap() else {
+        panic!("grep answers with hits")
+    };
+    assert!(hits.is_empty(), "the scope is honoured");
+
+    assert_eq!(
+        call(&b, json!({ "op": "kb.cat", "uid": "doc:a" })).unwrap(),
+        Response::Content {
+            content: "title\nthe needle here\nnothing\nNEEDLE again".into()
+        }
+    );
+    let e = call(&b, json!({ "op": "kb.cat", "uid": "doc:nope" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert!(e.message.contains("no item with uid `doc:nope`"), "{e:?}");
+}
+
+#[test]
+fn a_query_scopes_by_default_only_when_it_names_no_scope_and_counts_past_its_limit() {
+    let b = read_fixture();
+    let uids = |r: Response| match r {
+        Response::Items { items } => items.into_iter().map(|i| i.uid).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        uids(
+            call(
+                &b,
+                json!({ "op": "kb.query", "dsl": "", "default_scope": "repos/jkb" })
+            )
+            .unwrap()
+        ),
+        ["doc:a"]
+    );
+    let mut named = uids(
+        call(
+            &b,
+            json!({ "op": "kb.query", "dsl": "ns:tasks/**", "default_scope": "repos/jkb" }),
+        )
+        .unwrap(),
+    );
+    named.sort();
+    assert_eq!(named, ["task:child", "task:parent"], "a named scope wins");
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "kb.query", "dsl": "kind:task", "limit": 1, "count": true }),
+        )
+        .unwrap(),
+        Response::Count { count: 2 }
+    );
+    let e = call(&b, json!({ "op": "kb.query", "dsl": "ns:" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "a malformed query: {e:?}");
+}
+
+#[test]
+fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
+    let b = read_fixture();
+    let Response::Task { task } = call(&b, json!({ "op": "task.show", "uid": "parent" })).unwrap()
+    else {
+        panic!("task.show answers with a task")
+    };
+    assert_eq!(task.item.uid, "task:parent", "a bare slug resolves");
+    assert_eq!(task.item.namespace.as_deref(), Some("tasks/repos/jkb"));
+    assert_eq!(
+        task.subtasks
+            .iter()
+            .map(|s| s.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["task:child"]
+    );
+    let e = call(&b, json!({ "op": "task.show", "uid": "nope" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+
+    let Response::Items { items } = call(
+        &b,
+        json!({ "op": "task.ready", "dsl": "", "default_scope": "tasks/repos/jkb" }),
+    )
+    .unwrap() else {
+        panic!("task.ready answers with items")
+    };
+    assert_eq!(
+        items.iter().map(|i| i.uid.as_str()).collect::<Vec<_>>(),
+        ["task:child"]
+    );
+
+    let Response::Children { children } =
+        call(&b, json!({ "op": "task.subtasks", "uid": "parent" })).unwrap()
+    else {
+        panic!("task.subtasks answers with children")
+    };
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].reference, "task:child");
+}
+
+#[test]
+fn ls_and_tree_list_the_same_children() {
+    let b = read_fixture();
+    let Response::Listing { rows } = call(
+        &b,
+        json!({ "op": "kb.ls", "path": "repos", "recursive": true }),
+    )
+    .unwrap() else {
+        panic!("kb.ls answers with a listing")
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.parent.as_deref(), r.child.reference.as_str()))
+            .collect::<Vec<_>>(),
+        [(Some("repos"), "repos/jkb"), (Some("repos/jkb"), "doc:a")]
+    );
+    let Response::Tree { nodes } = call(
+        &b,
+        json!({ "op": "kb.tree", "path": "tasks/repos", "depth": 4 }),
+    )
+    .unwrap() else {
+        panic!("kb.tree answers with nodes")
+    };
+    let jkb = &nodes[0];
+    assert_eq!(jkb.child.reference, "tasks/repos/jkb");
+    let parent = &jkb.children[0];
+    assert_eq!(
+        (parent.child.subtask_count, parent.child.open_subtask_count),
+        (Some(1), Some(1))
+    );
+    assert_eq!(
+        parent.children[0].child.reference, "task:child",
+        "a tree descends into a container, not only a namespace"
+    );
+    assert!(
+        serde_json::from_value::<Request>(json!({ "op": "kb.ls", "path": "x", "depth": 1 }))
+            .is_err(),
+        "an unknown field on a read is refused like any other"
+    );
+}
+
+#[test]
+fn a_search_score_crosses_the_wire_exactly() {
+    // Measured: without serde_json's `float_roundtrip`, 59,200 of 400,000 random finite f64s parsed
+    // back one ulp off — this one among them — so a score the daemon sent printed differently from
+    // the host's. The workspace enables the feature; this pins that it stays enabled.
+    let score = 1.071_566_039_146_582_6e-75_f64;
+    let hit = super::kb::SearchHit {
+        item: 1,
+        row: None,
+        route: "fts".to_owned(),
+        score,
+        distance: Some(0.123_456_79),
+        namespace: None,
+        source_document: None,
+        context: Vec::new(),
+    };
+    let wire = serde_json::to_string(&Response::SearchHits {
+        hits: vec![hit.clone()],
+    })
+    .unwrap();
+    let Response::SearchHits { hits } = serde_json::from_str(&wire).unwrap() else {
+        panic!("round-trips as search hits")
+    };
+    assert_eq!(hits[0].score.to_bits(), score.to_bits(), "{wire}");
+    assert_eq!(hits[0], hit);
+}
+
+#[test]
+fn a_tree_over_a_self_listing_node_stops_at_the_cap() {
+    use jkb_core::{item, ns, placement};
+    use jkb_types::PlacementRole;
+    // A document whose uid is the path of the namespace it is placed in, with a chunk so it expands:
+    // listing it by reference lists that namespace again.
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let loop_ns = ns::ensure(c, "loop")?;
+        let new = |uid: &str, kind: &str| item::NewItem {
+            uid: uid.into(),
+            kind: kind.into(),
+            content: Some(uid.into()),
+            content_hash: None,
+            mime: None,
+        };
+        let doc = item::upsert(c, m, &new("loop", "document"))?;
+        placement::place(c, m, doc, loop_ns, PlacementRole::Primary, 0)?;
+        let chunk = item::upsert(c, m, &new("loop#0", "chunk"))?;
+        jkb_core::edge::link(c, m, chunk, doc, jkb_types::EdgeType::DerivedFrom, None)
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let Response::Tree { nodes } = call(&b, json!({ "op": "kb.tree", "path": "loop" })).unwrap()
+    else {
+        panic!("kb.tree answers with nodes")
+    };
+    let mut depth = 0;
+    let mut level = &nodes;
+    while let Some(first) = level.first() {
+        depth += 1;
+        level = &first.children;
+    }
+    assert_eq!(
+        depth,
+        super::kb::MAX_TREE_DEPTH + 1,
+        "the cap, not the stack, ends it"
+    );
 }

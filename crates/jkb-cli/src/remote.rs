@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
-use super::{Cli, Command, CommandsCmd};
+use super::{Cli, Command, CommandsCmd, TaskCmd};
 
 /// How a command behaves with `JKB_REMOTE` set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,6 @@ const NOT_YET: &str = "not ported to the daemon yet; run it on the host";
 #[must_use]
 pub const fn support(command: &Command) -> Support {
     match command {
-        Command::Mq { .. } => Support::Ported,
         Command::Notify { .. } | Command::Guide | Command::Commands { .. } => Support::NoDatabase,
         Command::Serve { .. } => {
             Support::Refused("the daemon runs on the host, next to the database")
@@ -45,9 +44,21 @@ pub const fn support(command: &Command) -> Support {
         | Command::Mount { .. }
         | Command::Sync { .. }
         | Command::Service { .. } => Support::Refused(HOST_ONLY),
-        Command::Query { .. }
+        // The queue, and the agent read set (tasks S6.1). `read_cli::handles` names the same reads for
+        // dispatch; `the_ported_reads_are_the_ones_read_cli_handles` holds the two together.
+        Command::Mq { .. }
+        | Command::Query { .. }
         | Command::Search { .. }
-        | Command::Ns { .. }
+        | Command::Find { .. }
+        | Command::Recent { .. }
+        | Command::Ls { .. }
+        | Command::Tree { .. }
+        | Command::Grep { .. }
+        | Command::Cat { .. }
+        | Command::Task {
+            cmd: TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. },
+        } => Support::Ported,
+        Command::Ns { .. }
         | Command::Tag { .. }
         | Command::Staging { .. }
         | Command::Task { .. }
@@ -56,12 +67,6 @@ pub const fn support(command: &Command) -> Support {
         | Command::Index { .. }
         | Command::Doctor { .. }
         | Command::Mcp
-        | Command::Ls { .. }
-        | Command::Grep { .. }
-        | Command::Cat { .. }
-        | Command::Tree { .. }
-        | Command::Find { .. }
-        | Command::Recent { .. }
         | Command::Stat { .. }
         | Command::Item { .. }
         | Command::Related { .. }
@@ -208,25 +213,31 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             },
             _ => bail!("internal: a NoDatabase command with no remote dispatch"),
         },
-        Support::Ported => match cli.command {
-            Command::Mq { cmd } => {
-                let backend =
-                    match jkb_daemon::client::RemoteBackend::new(remote, token_file(remote)) {
-                        Ok(backend) => backend,
-                        Err(e) => {
-                            let err = super::mq_cli::refused(e.code, e.message);
-                            // The same `--json` rule `mq_cli::run` applies once it has a backend.
-                            if cli.json {
-                                super::mq_cli::print_failure(&cmd, &err);
-                            }
-                            return Err(err);
-                        }
+        Support::Ported => {
+            let backend = match jkb_daemon::client::RemoteBackend::new(remote, token_file(remote)) {
+                Ok(backend) => backend.with_down_marker(down_marker(remote)),
+                Err(e) => {
+                    let err = super::mq_cli::refused(e.code, e.message);
+                    // The same `--json` rule `mq_cli::run` applies once it has a backend.
+                    if let (true, Command::Mq { cmd }) = (cli.json, &cli.command) {
+                        super::mq_cli::print_failure(cmd, &err);
                     }
-                    .with_down_marker(down_marker(remote));
-                super::mq_cli::run(&backend, cmd, cli.json)
+                    return Err(err);
+                }
+            };
+            match cli.command {
+                Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
+                // FTS by default: the daemon embeds no query text (`jkb_api::kb::search`).
+                command if super::read_cli::handles(&command) => super::read_cli::Reads::new(
+                    &backend,
+                    cli.global,
+                    cli.json,
+                    jkb_api::kb::SearchRoute::Fts,
+                )
+                .run(command),
+                _ => bail!("internal: a Ported command with no remote dispatch"),
             }
-            _ => bail!("internal: a Ported command with no remote dispatch"),
-        },
+        }
     }
 }
 
@@ -301,8 +312,41 @@ mod tests {
             );
         }
         assert!(matches!(
-            support(&parse(&["task", "next"]).command),
+            support(&parse(&["task", "add", "x"]).command),
             Support::Refused(_)
         ));
+    }
+
+    #[test]
+    fn the_ported_reads_are_the_ones_read_cli_handles() {
+        for args in [
+            vec!["query", "kind:task"],
+            vec!["search", "x"],
+            vec!["find", "--kind", "task"],
+            vec!["recent"],
+            vec!["ls"],
+            vec!["tree"],
+            vec!["grep", "x"],
+            vec!["cat", "u"],
+            vec!["task", "next"],
+            vec!["task", "show", "u"],
+            vec!["task", "subtasks", "u"],
+            vec!["task", "add", "x"],
+            vec!["task", "set", "u", "--priority", "1"],
+            vec!["task", "why", "u"],
+            vec!["stat", "u"],
+            vec!["ns", "ls"],
+            vec!["item", "show", "u"],
+            vec!["mq", "topic", "ls"],
+            vec!["guide"],
+        ] {
+            let command = parse(&args).command;
+            let is_mq = matches!(command, crate::Command::Mq { .. });
+            assert_eq!(
+                support(&command) == Support::Ported,
+                is_mq || crate::read_cli::handles(&command),
+                "{args:?}: remote mode serves exactly the commands something dispatches"
+            );
+        }
     }
 }

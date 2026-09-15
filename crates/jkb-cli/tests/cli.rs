@@ -3642,6 +3642,151 @@ fn serve_answers_schema_newer_rather_than_exiting_on_a_newer_database() {
     serve.stop();
 }
 
+/// The agent read set (tasks S6.1) answers through `jkb serve` byte-for-byte as it does on the host —
+/// from a client whose home and working directory are the container's, not the host's. Equal output
+/// is the claim, because both sides run the same op; the ambient checks are what show the scope was
+/// actually applied on each side rather than dropped on both.
+#[test]
+#[allow(clippy::too_many_lines)] // one walk: fixture, then every read on both sides
+fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let host_home = root.join("host-home");
+    let client_home = root.join("container-home");
+    let host_repo = host_home.join("repos/proj");
+    let client_repo = client_home.join("repos/proj");
+    std::fs::create_dir_all(&host_repo).unwrap();
+    std::fs::create_dir_all(&client_repo).unwrap();
+    let db = root.join("host.db");
+    let token = root.join("daemon/token");
+
+    let host = |args: &[&str], cwd: &Path| {
+        jkb(&db)
+            .args(args)
+            .env("HOME", &host_home)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+    let host_ok = |args: &[&str], cwd: &Path| {
+        let out = host(args, cwd);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    host_ok(
+        &["mount", "create", "repos/proj", host_repo.to_str().unwrap()],
+        &root,
+    );
+    let parent: serde_json::Value = serde_json::from_str(&host_ok(
+        &["--json", "task", "add", "parent with a needle !p1"],
+        &host_repo,
+    ))
+    .unwrap();
+    let parent = parent["uid"].as_str().unwrap().to_owned();
+    host_ok(&["task", "add", "child", "--under", &parent], &host_repo);
+    host_ok(&["task", "add", "sibling needle !p2"], &host_repo);
+    host_ok(&["task", "add", "outside the repo"], &root);
+
+    let (mut serve, url) = Daemon::spawn({
+        let mut cmd = jkb(&db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(&token)
+            .env("HOME", &host_home);
+        cmd
+    });
+    let remote = |args: &[&str], cwd: &Path| {
+        jkb_bare()
+            .args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB")
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+
+    let reads: Vec<Vec<&str>> = vec![
+        vec!["--json", "ls"],
+        vec!["ls", "tasks", "-R", "-l"],
+        vec!["--json", "tree", "tasks"],
+        vec!["tree"],
+        vec!["--json", "query", "kind:task"],
+        vec!["query", "kind:task", "--count"],
+        vec!["--json", "find", "--kind", "task"],
+        vec!["--json", "--global", "recent"],
+        vec!["--json", "--global", "grep", "needle"],
+        vec!["grep", "-i", "NEEDLE", "tasks"],
+        vec!["cat", &parent],
+        vec!["--json", "--global", "search", "needle", "--route", "fts"],
+        vec!["--json", "task", "next"],
+        vec!["task", "next"],
+        vec!["--json", "task", "show", &parent],
+        vec!["task", "show", &parent],
+        vec!["--json", "task", "subtasks", &parent],
+    ];
+    for args in &reads {
+        let (h, r) = (host(args, &host_repo), remote(args, &client_repo));
+        assert!(
+            h.status.success() && r.status.success(),
+            "{args:?}: host {}; remote {}",
+            String::from_utf8_lossy(&h.stderr),
+            String::from_utf8_lossy(&r.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout),
+            String::from_utf8_lossy(&h.stdout),
+            "{args:?}: the daemon answered differently from the host"
+        );
+    }
+
+    // The ambient scope was applied through the daemon, not dropped: inside the repo `task next`
+    // lists the repo's tasks and not the one captured outside it; `--global` lists that one too.
+    let next = String::from_utf8(remote(&["task", "next"], &client_repo).stdout).unwrap();
+    assert!(next.contains("sibling needle"), "{next}");
+    assert!(!next.contains("outside the repo"), "{next}");
+    let global =
+        String::from_utf8(remote(&["--global", "task", "next"], &client_repo).stdout).unwrap();
+    assert!(global.contains("outside the repo"), "{global}");
+    let grep = remote(&["grep", "needle"], &client_repo);
+    assert!(
+        grep.stdout.is_empty() && grep.status.code() == Some(1),
+        "grep's ambient scope is the repo's namespace, which holds no items — exit 1, like grep: {}",
+        String::from_utf8_lossy(&grep.stdout)
+    );
+
+    // Search defaults to FTS through the daemon, which embeds nothing; asking for more is refused.
+    let out = remote(&["search", "needle"], &client_repo);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["search", "needle", "--route", "hybrid"], &client_repo);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only --route fts"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["cat", "task:nope"], &client_repo);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no item with uid `task:nope`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !client_home.join(".jkb/jkb.db").exists(),
+        "no read opened a database of its own"
+    );
+    serve.stop();
+}
+
 /// The dev container's path to the knowledge base, end to end through real binaries: `jkb serve` on
 /// one side, `jkb` with `JKB_REMOTE` on the other. Ported commands work through the daemon; every
 /// other command, `--db` and `JKB_DB`, is refused before it does anything — no database is created.
@@ -3690,7 +3835,7 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
     assert_eq!(tail[0]["seq"].to_string(), seq.trim());
 
     for refused in [
-        &["task", "next"][..],
+        &["task", "add", "x"][..],
         &["sync"],
         &["ingest", "/etc/hostname"],
         &["serve"],

@@ -1,0 +1,937 @@
+//! The agent read set (tasks S6.1): the knowledge-base reads a container agent needs, as ops.
+//!
+//! **Each function here is the one implementation of its read.** [`crate::LocalBackend`] serves it
+//! in-process for the host CLI and behind `jkb serve` for the dev container, and the CLI only renders
+//! what comes back — so `jkb ls` cannot list one thing on the host and another in the container.
+//!
+//! All pure database reads (design r3.2 H4). Two requests carry something from the client's world,
+//! and neither reaches the host's: a working directory ([`ambient`]) is only compared, as a string,
+//! against the mounts table; a search route that would embed text ([`search`]) is refused unless the
+//! backend was given an embedder, which the daemon never is.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use jkb_core::query::{self, Scope};
+use jkb_core::{containment, item, mount, ns, nstype, placement, tag, task, transition, Db};
+use jkb_search::{Route, Searcher};
+use jkb_types::{Embedder, ItemId, TaskStatus};
+use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use crate::{ApiError, ErrorCode};
+
+/// The most hits one `kb.search` may ask for. The hybrid route fuses from twice the limit, so an
+/// unbounded client value is an overflow in the daemon rather than a long answer.
+pub const MAX_SEARCH_LIMIT: usize = 1000;
+
+/// The deepest `kb.tree` descends, whatever it is asked. A node is listed by its reference, and a
+/// reference is looked up as a namespace before an item — so an item whose uid is the path of a
+/// namespace holding it lists that namespace again, forever. The CLI asks for 4 by default; without a
+/// cap a request asking for no limit over such data overflowed the daemon's stack.
+pub const MAX_TREE_DEPTH: usize = 64;
+
+/// How many of a task's transitions `task.show` carries — the recent ones; `jkb task why` has all.
+pub const RECENT_TRANSITIONS: usize = 5;
+
+/// The item kind ingest produces per document fragment. Chunks are derived index units: they are
+/// rebuildable from the VFS, nothing links *to* them, and listing them buries each ingested document
+/// under its own pieces. Listings hide them unless `all` and surface their count against the
+/// document they came from.
+pub const KIND_CHUNK: &str = "chunk";
+
+/// A search route on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchRoute {
+    /// Nearest neighbours of the embedded query text.
+    Vector,
+    /// Keyword (FTS5).
+    Fts,
+    /// Both, fused.
+    Hybrid,
+}
+
+impl From<SearchRoute> for Route {
+    fn from(r: SearchRoute) -> Self {
+        match r {
+            SearchRoute::Vector => Self::Vector,
+            SearchRoute::Fts => Self::Fts,
+            SearchRoute::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+/// A denormalized item row for listings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemRow {
+    /// Row id.
+    pub id: i64,
+    /// Stable uid.
+    pub uid: String,
+    /// Item kind.
+    pub kind: String,
+    /// Status (tasks).
+    pub status: Option<String>,
+    /// Resolution — how a unit ended (investigation units); `None` = unresolved.
+    pub resolution: Option<String>,
+    /// Priority (tasks).
+    pub priority: Option<i64>,
+    /// Due date (tasks).
+    pub due: Option<String>,
+    /// A one-line content snippet.
+    pub snippet: Option<String>,
+    /// The namespace the item is placed under (primary preferred).
+    pub namespace: Option<String>,
+    /// Last-update timestamp (ISO).
+    pub updated: Option<String>,
+}
+
+/// A direct child of a namespace or container: a sub-namespace, or an item placed there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Child {
+    /// `namespace`, or the item's kind.
+    pub kind: String,
+    /// The namespace path, or the item's uid.
+    pub reference: String,
+    /// A short label: the last path segment, or the item's title (≤ 80 chars).
+    pub label: String,
+    /// Whether it expands.
+    pub has_children: bool,
+    /// The item's status.
+    pub status: Option<String>,
+    /// The item's priority.
+    pub priority: Option<i64>,
+    /// For namespaces: visible item leaves anywhere in the subtree — the sum of `leaf_kinds`.
+    pub leaf_count: Option<i64>,
+    /// For namespaces: those leaves by item kind. A folder holding 8 tasks and 4 documents is not
+    /// described by "12", so the breakdown is what a tree renders.
+    pub leaf_kinds: Option<BTreeMap<String, i64>>,
+    /// For namespaces: the type recorded on THIS namespace, not the inherited one — where a type was
+    /// applied is the useful fact, and a label on every namespace under a typed root is noise.
+    pub ns_type: Option<String>,
+    /// The one-line description of `ns_type`.
+    pub ns_type_about: Option<String>,
+    /// For an item with subtasks: how many. A parent with open subtasks is held off the ready
+    /// frontier, so a tree must be able to show it as a container.
+    pub subtask_count: Option<i64>,
+    /// For an item with subtasks: how many are open.
+    pub open_subtask_count: Option<i64>,
+    /// For an item other items were derived from: its hidden `chunk` count.
+    pub chunk_count: Option<i64>,
+    /// The item's `updated_at`; `None` for namespaces.
+    pub updated: Option<String>,
+}
+
+impl Child {
+    /// Ordering key: namespaces first, then tasks (lowest priority number first), then other items;
+    /// ties by label. Nulls sort last.
+    fn sort_key(&self) -> (u8, i64, String) {
+        let group = match self.kind.as_str() {
+            "namespace" => 0,
+            "task" => 1,
+            _ => 2,
+        };
+        (
+            group,
+            self.priority.unwrap_or(i64::MAX),
+            self.label.to_lowercase(),
+        )
+    }
+}
+
+/// One `kb.ls` row: the namespace it was listed under, and the child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRow {
+    /// The namespace listed (`None` for the top level).
+    pub parent: Option<String>,
+    /// What was found there.
+    pub child: Child,
+}
+
+/// One `kb.tree` node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeNode {
+    /// The node.
+    pub child: Child,
+    /// What it contains, down to the requested depth.
+    pub children: Vec<TreeNode>,
+}
+
+/// One matching line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepLine {
+    /// 1-based line number.
+    pub line: usize,
+    /// The line, as stored.
+    pub text: String,
+}
+
+/// One item `kb.grep` matched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepHit {
+    /// Its uid.
+    pub uid: String,
+    /// Its kind.
+    pub kind: String,
+    /// The lines holding the pattern. Can be empty: a pattern spanning a line break matches the
+    /// item but no single line.
+    pub lines: Vec<GrepLine>,
+}
+
+/// One chunk of a hit's context window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextLine {
+    /// The chunk's item id.
+    pub item: i64,
+    /// Its position among its document's chunks.
+    pub position: i64,
+    /// Whether it is the hit itself.
+    pub is_hit: bool,
+    /// Its text.
+    pub content: String,
+}
+
+/// One `kb.search` hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// The matched item's id.
+    pub item: i64,
+    /// The matched item, or `None` if its row is gone.
+    pub row: Option<ItemRow>,
+    /// The route that produced it.
+    pub route: String,
+    /// Score, higher is better.
+    pub score: f64,
+    /// Cosine distance, when a vector match contributed.
+    pub distance: Option<f32>,
+    /// The namespace the hit is placed under.
+    pub namespace: Option<String>,
+    /// For a chunk: the document it came from.
+    pub source_document: Option<ItemRow>,
+    /// The ±N chunks around it, when asked for.
+    pub context: Vec<ContextLine>,
+}
+
+/// A tag application.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagPair {
+    /// The facet.
+    pub facet: String,
+    /// The value.
+    pub value: String,
+}
+
+/// An item in full, for `task.show`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemDetail {
+    /// Row id.
+    pub id: i64,
+    /// Uid.
+    pub uid: String,
+    /// Kind.
+    pub kind: String,
+    /// Status.
+    pub status: Option<String>,
+    /// Priority.
+    pub priority: Option<i64>,
+    /// Due date.
+    pub due: Option<String>,
+    /// Primary namespace (else the first placement).
+    pub namespace: Option<String>,
+    /// Full content.
+    pub content: Option<String>,
+    /// Tags, by facet then value.
+    pub tags: Vec<TagPair>,
+}
+
+/// One task transition, as `task.show` summarizes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionSummary {
+    /// When.
+    pub at: String,
+    /// The event.
+    pub event: String,
+    /// The status it moved to.
+    pub to: String,
+    /// The branch the work is on.
+    pub branch: Option<String>,
+    /// The branch it lands on.
+    pub onto: Option<String>,
+    /// The pull request that proved a landing.
+    pub pr: Option<i64>,
+}
+
+/// A subtask, as `task.show` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtaskSummary {
+    /// Its uid.
+    pub uid: String,
+    /// Its content (the title is its first non-blank line).
+    pub title: Option<String>,
+    /// Its status.
+    pub status: Option<String>,
+}
+
+/// `task.show`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDetail {
+    /// The task.
+    pub item: ItemDetail,
+    /// Its last [`RECENT_TRANSITIONS`] transitions, oldest first.
+    pub transitions: Vec<TransitionSummary>,
+    /// Its subtasks, in containment order.
+    pub subtasks: Vec<SubtaskSummary>,
+}
+
+fn not_found(what: impl Into<String>) -> ApiError {
+    ApiError::with_code(ErrorCode::NotFound, what)
+}
+
+/// The ambient namespace for a client's working directory: the mount whose directory holds it.
+///
+/// `cwd` is a path in the CLIENT's filesystem and `client_home` its `$HOME`; a `cwd` under that home
+/// is re-rooted at `server_home` before the lookup. That is what makes the dev container's
+/// `/home/vscode/repos/jkb` find the mount the host recorded as `/Users/<u>/repos/jkb` — the
+/// container binds the host's `~/repos` at its own `~/repos` (`.container/container.json`). In one
+/// process the two homes are the same and the path is unchanged. The path is only compared against
+/// the mounts table; nothing opens it.
+///
+/// Residual, stated: a container path under its home that is NOT bound from the host (its own
+/// `~/scratch`, say) re-roots onto a host path that may be a mount, and so scopes to a namespace that
+/// is not the directory the agent is in. Scoping only; no content moves.
+///
+/// # Errors
+/// Returns an error if the read fails.
+pub fn ambient(
+    conn: &Connection,
+    cwd: &str,
+    client_home: &str,
+    server_home: Option<&Path>,
+) -> jkb_core::Result<Option<String>> {
+    let cwd = rerooted(Path::new(cwd), client_home, server_home);
+    mount::ambient_namespace(conn, &cwd)
+}
+
+fn rerooted(cwd: &Path, client_home: &str, server_home: Option<&Path>) -> PathBuf {
+    match (client_home, server_home) {
+        ("", _) | (_, None) => cwd.to_path_buf(),
+        (client, Some(server)) => cwd
+            .strip_prefix(client)
+            .map_or_else(|_| cwd.to_path_buf(), |rest| server.join(rest)),
+    }
+}
+
+/// Apply a default scope to a parsed query that names none.
+fn scoped(dsl: &str, default_scope: Option<&str>) -> jkb_core::Result<query::Query> {
+    let mut q = query::parse(dsl)?;
+    if q.scope == Scope::All {
+        if let Some(path) = default_scope {
+            q.scope = Scope::Subtree(path.to_owned());
+        }
+    }
+    Ok(q)
+}
+
+/// `kb.query`: the items a DSL query matches, as listing rows; `default_scope` applies when the
+/// query names no scope.
+///
+/// # Errors
+/// A malformed query, or a failed read.
+pub fn query_items(
+    conn: &Connection,
+    dsl: &str,
+    default_scope: Option<&str>,
+    limit: Option<usize>,
+) -> jkb_core::Result<Vec<ItemRow>> {
+    let mut q = scoped(dsl, default_scope)?;
+    if let Some(limit) = limit {
+        q.limit = Some(limit);
+    }
+    let ids = q.evaluate(conn)?;
+    item_rows(conn, &ids)
+}
+
+/// `kb.query` with `count`: how many items it matches, ignoring any limit.
+///
+/// # Errors
+/// A malformed query, or a failed read.
+pub fn query_count(
+    conn: &Connection,
+    dsl: &str,
+    default_scope: Option<&str>,
+) -> jkb_core::Result<usize> {
+    Ok(scoped(dsl, default_scope)?.evaluate(conn)?.len())
+}
+
+/// `task.ready`: the ready frontier for a DSL's scope and tags, by priority then due.
+///
+/// # Errors
+/// A malformed query, or a failed read.
+pub fn ready(
+    conn: &Connection,
+    dsl: &str,
+    default_scope: Option<&str>,
+    limit: Option<usize>,
+) -> jkb_core::Result<Vec<ItemRow>> {
+    let q = scoped(dsl, default_scope)?;
+    let mut rows = task::ready(conn, q.scope, &q.tags)?;
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
+    item_rows(conn, &ids)
+}
+
+/// A one-line snippet: the first non-blank line, trimmed to 80 chars.
+fn snippet(content: &str) -> String {
+    let line = item::first_nonblank(content);
+    let mut out: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        out.push('…');
+    }
+    out
+}
+
+fn truncated(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(n.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+fn primary_namespace(conn: &Connection, id: i64) -> jkb_core::Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+             WHERE p.item_id = ?1
+             ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1",
+        )?
+        .query_row([id], |r| r.get::<_, String>(0))
+        .optional()?)
+}
+
+/// Listing rows for `ids`, in their order, skipping any that no longer exist.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn item_rows(conn: &Connection, ids: &[ItemId]) -> jkb_core::Result<Vec<ItemRow>> {
+    let mut out = Vec::new();
+    for id in ids {
+        let row = conn
+            .prepare_cached(
+                "SELECT id, uid, kind, status, resolution, priority, due, content, updated_at
+                 FROM items WHERE id = ?1",
+            )?
+            .query_row([id.get()], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            })
+            .optional()?;
+        let Some((id, uid, kind, status, resolution, priority, due, content, updated)) = row else {
+            continue;
+        };
+        out.push(ItemRow {
+            namespace: primary_namespace(conn, id)?,
+            id,
+            uid,
+            kind,
+            status,
+            resolution,
+            priority,
+            due,
+            snippet: content.as_deref().map(snippet),
+            updated: Some(updated),
+        });
+    }
+    Ok(out)
+}
+
+fn item_child(meta: item::ItemMeta, subtasks: Option<(i64, i64)>, chunks: Option<i64>) -> Child {
+    let chunks = chunks.filter(|n| *n > 0);
+    Child {
+        label: truncated(&item::title_of(&meta), 80),
+        kind: meta.kind,
+        reference: meta.uid,
+        // Anything that contains expands: a task into its subtasks, a document into its chunks.
+        has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks.is_some(),
+        status: meta.status,
+        priority: meta.priority,
+        leaf_count: None,
+        leaf_kinds: None,
+        ns_type: None,
+        ns_type_about: None,
+        subtask_count: subtasks.map(|(total, _)| total),
+        open_subtask_count: subtasks.map(|(_, open)| open),
+        chunk_count: chunks,
+        updated: Some(meta.updated_at),
+    }
+}
+
+/// The children of an item that contains others — a task's subtasks, a document's chunks. One read
+/// for every container, because containment is recorded the same way for both (design D35).
+/// Terminal items are hidden unless `all`.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn contained_children(
+    conn: &Connection,
+    parent: ItemId,
+    all: bool,
+) -> jkb_core::Result<Vec<Child>> {
+    let ids = containment::children(conn, parent)?;
+    let subtask_counts = containment::child_counts(conn, &ids)?;
+    let chunk_counts = item::derived_kind_counts(conn, &ids, KIND_CHUNK)?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(meta) = item::get(conn, id)? else {
+            continue;
+        };
+        if !all && TaskStatus::is_terminal_str(meta.status.as_deref()) {
+            continue;
+        }
+        out.push(item_child(
+            meta,
+            subtask_counts.get(&id).copied(),
+            chunk_counts.get(&id).copied(),
+        ));
+    }
+    Ok(out)
+}
+
+/// The direct children of `path` (top-level namespaces when `None`): sub-namespaces, then items
+/// placed directly there. A path that names no namespace but an item uid lists that item's contained
+/// children — "container" is a behaviour, not a node kind. Terminal items are hidden unless `all`.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn children(conn: &Connection, path: Option<&str>, all: bool) -> jkb_core::Result<Vec<Child>> {
+    if let Some(p) = path {
+        if ns::get(conn, p)?.is_none() {
+            if let Some(id) = item::id_for_uid(conn, p)? {
+                return contained_children(conn, id, all);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let ns_children = match path {
+        None => ns::roots(conn)?,
+        Some(p) => ns::children(conn, p)?,
+    };
+    // Every child's subtree leaf counts in one grouped query, not a walk per child.
+    let leaf_counts = ns::subtree_leaf_counts(conn, path, all)?;
+    for (ns_id, ns_path) in ns_children {
+        let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
+        let has_sub = !ns::children(conn, &ns_path)?.is_empty();
+        let mut leaf_kinds = leaf_counts.get(&ns_id).cloned().unwrap_or_default();
+        if !all {
+            // Chunks are hidden, so they must not be counted either — a folder reporting "1 chunk"
+            // that shows nothing when opened is worse than no count.
+            leaf_kinds.remove(KIND_CHUNK);
+        }
+        let leaf_count: i64 = leaf_kinds.values().sum();
+        let ns_type = ns::get_type_by_id(conn, ns_id)?;
+        let ns_type_about = ns_type
+            .as_deref()
+            .and_then(|name| nstype::resolve(name).ok())
+            .map(|t| t.about().to_owned());
+        out.push(Child {
+            kind: "namespace".to_owned(),
+            reference: ns_path,
+            label,
+            has_children: has_sub || leaf_count > 0,
+            status: None,
+            priority: None,
+            leaf_count: Some(leaf_count),
+            leaf_kinds: Some(leaf_kinds),
+            ns_type,
+            ns_type_about,
+            subtask_count: None,
+            open_subtask_count: None,
+            chunk_count: None,
+            updated: None,
+        });
+    }
+    if let Some(p) = path {
+        if let Some(ns_id) = ns::get(conn, p)? {
+            // Any placement role — a `tasks/…` mirror surfaces the task — but directly placed only:
+            // a contained node is listed under its container, not beside it.
+            let placed = placement::items_directly_in(conn, ns_id)?;
+            let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
+            let subtask_counts = containment::child_counts(conn, &placed)?;
+            for item_id in placed {
+                let Some(meta) = item::get(conn, item_id)? else {
+                    continue;
+                };
+                if !all && TaskStatus::is_terminal_str(meta.status.as_deref()) {
+                    continue;
+                }
+                out.push(item_child(
+                    meta,
+                    subtask_counts.get(&item_id).copied(),
+                    chunk_counts.get(&item_id).copied(),
+                ));
+            }
+        }
+    }
+    out.sort_by_key(Child::sort_key);
+    Ok(out)
+}
+
+/// `kb.ls`: the children of `path`, and with `recursive` every namespace below it depth-first, each
+/// row naming the namespace it was listed under.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn ls(
+    conn: &Connection,
+    path: Option<&str>,
+    all: bool,
+    recursive: bool,
+) -> jkb_core::Result<Vec<ListRow>> {
+    fn walk(
+        conn: &Connection,
+        path: Option<&str>,
+        all: bool,
+        recursive: bool,
+        acc: &mut Vec<ListRow>,
+    ) -> jkb_core::Result<()> {
+        for child in children(conn, path, all)? {
+            let descend = (recursive && child.kind == "namespace").then(|| child.reference.clone());
+            acc.push(ListRow {
+                parent: path.map(str::to_owned),
+                child,
+            });
+            if let Some(ns_path) = descend {
+                walk(conn, Some(&ns_path), all, recursive, acc)?;
+            }
+        }
+        Ok(())
+    }
+    let mut acc = Vec::new();
+    walk(conn, path, all, recursive, &mut acc)?;
+    Ok(acc)
+}
+
+/// `kb.tree`: the subtree under `path`, descending into any container — not only namespaces, or a
+/// subtask de-duplicated out of its namespace listing would be unreachable — to `depth` levels,
+/// never more than [`MAX_TREE_DEPTH`] (`None` asks for that).
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn tree(
+    conn: &Connection,
+    path: Option<&str>,
+    all: bool,
+    depth: Option<usize>,
+) -> jkb_core::Result<Vec<TreeNode>> {
+    walk_tree(
+        conn,
+        path,
+        all,
+        depth.map_or(MAX_TREE_DEPTH, |d| d.min(MAX_TREE_DEPTH)),
+    )
+}
+
+fn walk_tree(
+    conn: &Connection,
+    path: Option<&str>,
+    all: bool,
+    depth: usize,
+) -> jkb_core::Result<Vec<TreeNode>> {
+    let mut out = Vec::new();
+    for child in children(conn, path, all)? {
+        let nested = if child.has_children && depth > 0 {
+            walk_tree(conn, Some(&child.reference), all, depth - 1)?
+        } else {
+            Vec::new()
+        };
+        out.push(TreeNode {
+            child,
+            children: nested,
+        });
+    }
+    Ok(out)
+}
+
+/// `kb.cat`: an item's full content (empty when it has none).
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] when no item has `uid`; else a failed read.
+pub fn cat(conn: &Connection, uid: &str) -> Result<String, ApiError> {
+    let Some(id) = item::id_for_uid(conn, uid)? else {
+        return Err(not_found(format!("no item with uid `{uid}`")));
+    };
+    Ok(item::get_content(conn, id)?.unwrap_or_default())
+}
+
+/// `kb.grep`: items under `scope` whose content holds `pattern` literally, with the lines that do.
+/// Case folding, when asked, is Unicode — the same fold `item::grep` filters with, so an item is
+/// never matched with no line agreeing.
+///
+/// # Errors
+/// Returns an error if the read fails.
+pub fn grep(
+    conn: &Connection,
+    pattern: &str,
+    scope: Option<&str>,
+    ignore_case: bool,
+) -> jkb_core::Result<Vec<GrepHit>> {
+    let needle = if ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_owned()
+    };
+    let matches = |line: &str| {
+        if ignore_case {
+            line.to_lowercase().contains(&needle)
+        } else {
+            line.contains(&needle)
+        }
+    };
+    Ok(item::grep(conn, pattern, scope, ignore_case)?
+        .into_iter()
+        .map(|h| GrepHit {
+            lines: h
+                .content
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| matches(l))
+                .map(|(i, l)| GrepLine {
+                    line: i + 1,
+                    text: l.to_owned(),
+                })
+                .collect(),
+            uid: h.uid,
+            kind: h.kind,
+        })
+        .collect())
+}
+
+/// What `kb.search` was asked.
+#[derive(Debug, Clone)]
+pub struct SearchAsk {
+    /// The DSL: `~"…"` is the vector term, bare words FTS.
+    pub dsl: String,
+    /// The scope when the DSL names none.
+    pub default_scope: Option<String>,
+    /// The route.
+    pub route: SearchRoute,
+    /// At most this many hits (≤ [`MAX_SEARCH_LIMIT`]).
+    pub limit: usize,
+    /// ±N neighbour chunks per hit.
+    pub context: Option<usize>,
+}
+
+/// `kb.search`: hits best-first, each resolved to its item.
+///
+/// # Errors
+/// [`ErrorCode::Unsupported`] for a route that embeds text with no `embedder`; [`ErrorCode::Invalid`]
+/// for a limit over [`MAX_SEARCH_LIMIT`] or a malformed query; else a failed read.
+pub fn search(
+    db: &Db,
+    embedder: Option<&Arc<dyn Embedder + Send + Sync>>,
+    ask: &SearchAsk,
+) -> Result<Vec<SearchHit>, ApiError> {
+    if ask.limit > MAX_SEARCH_LIMIT {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("a search limit of at most {MAX_SEARCH_LIMIT}"),
+        ));
+    }
+    let query = scoped(&ask.dsl, ask.default_scope.as_deref())?;
+    let searcher = match (ask.route, embedder) {
+        (_, Some(e)) => Searcher::new(e.clone()),
+        (SearchRoute::Fts, None) => Searcher::new(Arc::new(NoEmbedder)),
+        (SearchRoute::Vector | SearchRoute::Hybrid, None) => {
+            return Err(ApiError::with_code(
+                ErrorCode::Unsupported,
+                "this backend has no embedder, so it serves only --route fts: the vector and \
+                 hybrid routes embed the query text, which the daemon does not do for a client",
+            ))
+        }
+    };
+    let hits = searcher
+        .search(db, &query, ask.route.into(), ask.limit)
+        .map_err(search_error)?;
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let context = match ask.context {
+            Some(n) => searcher
+                .get_context(db, hit.item, n)
+                .map_err(search_error)?
+                .into_iter()
+                .map(|c| ContextLine {
+                    item: c.item.get(),
+                    position: c.position,
+                    is_hit: c.is_hit,
+                    content: c.content,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let (item, source) = (hit.item, hit.source_document);
+        let (row, source_document) = db.read(move |conn| {
+            let one = |id: ItemId| -> jkb_core::Result<Option<ItemRow>> {
+                Ok(item_rows(conn, &[id])?.into_iter().next())
+            };
+            Ok((one(item)?, source.map(one).transpose()?.flatten()))
+        })?;
+        out.push(SearchHit {
+            item: hit.item.get(),
+            row,
+            route: hit.route.as_str().to_owned(),
+            score: hit.score,
+            distance: hit.distance,
+            namespace: hit.namespace_path,
+            source_document,
+            context,
+        });
+    }
+    Ok(out)
+}
+
+fn search_error(e: jkb_search::Error) -> ApiError {
+    match e {
+        jkb_search::Error::Core(core) => core.into(),
+        jkb_search::Error::Types(t) => jkb_core::Error::Types(t).into(),
+        jkb_search::Error::Sqlite(s) => jkb_core::Error::Sqlite(s).into(),
+        other => ApiError::with_code(ErrorCode::Internal, other.to_string()),
+    }
+}
+
+/// The embedder an FTS-only search is built with. `Searcher` embeds only for the vector and hybrid
+/// routes, which [`search`] refuses before constructing one of these; if that ever changes this
+/// refuses rather than returning a vector.
+struct NoEmbedder;
+
+impl Embedder for NoEmbedder {
+    fn model(&self) -> &'static str {
+        "none"
+    }
+    fn dim(&self) -> usize {
+        0
+    }
+    fn embed(&self, _text: &str) -> jkb_types::Result<Vec<f32>> {
+        Err(jkb_types::Error::EmbedderUnavailable(
+            "no embedder: this backend serves only the fts route".to_owned(),
+        ))
+    }
+    fn health_check(&self) -> jkb_types::Result<()> {
+        self.embed("").map(|_| ())
+    }
+}
+
+/// `task.show`: a task (or any item a task reference names) in full, with its recent transitions and
+/// its subtasks.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] when the reference names no item; else a failed read.
+pub fn task_show(conn: &Connection, reference: &str) -> Result<TaskDetail, ApiError> {
+    let Some(id) = task::resolve_ref(conn, reference)? else {
+        return Err(not_found(format!("no item with uid {reference}")));
+    };
+    let Some(meta) = item::get(conn, id)? else {
+        return Err(not_found(format!("no item with uid {reference}")));
+    };
+    let history = transition::history(conn, id)?;
+    let skip = history.len().saturating_sub(RECENT_TRANSITIONS);
+    Ok(TaskDetail {
+        item: ItemDetail {
+            id: id.get(),
+            namespace: primary_namespace(conn, id.get())?,
+            uid: meta.uid,
+            kind: meta.kind,
+            status: meta.status,
+            priority: meta.priority,
+            due: meta.due,
+            content: meta.content,
+            tags: tag::applications(conn, id)?
+                .into_iter()
+                .map(|(facet, value)| TagPair { facet, value })
+                .collect(),
+        },
+        transitions: history
+            .into_iter()
+            .skip(skip)
+            .map(|r| TransitionSummary {
+                at: r.at,
+                event: r.event,
+                to: r.to_status,
+                branch: r.labels.branch,
+                onto: r.labels.onto,
+                pr: r.labels.pr_number,
+            })
+            .collect(),
+        subtasks: task::subtasks(conn, id)?
+            .into_iter()
+            .map(|t| SubtaskSummary {
+                uid: t.uid,
+                title: t.title,
+                status: t.status,
+            })
+            .collect(),
+    })
+}
+
+/// `task.subtasks`: a task's contained children, shaped like `kb.ls` children.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] when the reference names no item; else a failed read.
+pub fn subtasks(conn: &Connection, reference: &str, all: bool) -> Result<Vec<Child>, ApiError> {
+    let Some(id) = task::resolve_ref(conn, reference)? else {
+        return Err(not_found(format!("no item with uid {reference}")));
+    };
+    Ok(contained_children(conn, id, all)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::rerooted;
+
+    #[test]
+    fn a_client_path_under_its_home_is_looked_up_under_the_server_s() {
+        let server = Some(Path::new("/Users/u"));
+        assert_eq!(
+            rerooted(Path::new("/home/vscode/repos/jkb"), "/home/vscode", server),
+            Path::new("/Users/u/repos/jkb")
+        );
+        assert_eq!(
+            rerooted(Path::new("/home/vscode"), "/home/vscode", server),
+            Path::new("/Users/u")
+        );
+        assert_eq!(
+            rerooted(Path::new("/home/vscodex/repos"), "/home/vscode", server),
+            Path::new("/home/vscodex/repos"),
+            "a prefix of the home's NAME is not under it"
+        );
+        assert_eq!(
+            rerooted(Path::new("/tmp/w"), "/home/vscode", server),
+            Path::new("/tmp/w"),
+            "outside the home: as given"
+        );
+        assert_eq!(
+            rerooted(Path::new("/home/vscode/r"), "", server),
+            Path::new("/home/vscode/r"),
+            "no client home: as given"
+        );
+        assert_eq!(
+            rerooted(Path::new("/home/vscode/r"), "/home/vscode", None),
+            Path::new("/home/vscode/r"),
+            "no server home: as given"
+        );
+    }
+}

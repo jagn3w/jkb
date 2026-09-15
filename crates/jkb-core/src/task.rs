@@ -671,6 +671,32 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
     Ok(hit.is_some())
 }
 
+/// A task reference as a user types it, made a uid: a `:`-bearing reference is a uid already, a
+/// bare slug gets `task:` in front.
+#[must_use]
+pub fn canonical_uid(reference: &str) -> String {
+    if reference.contains(':') {
+        reference.to_owned()
+    } else {
+        format!("task:{reference}")
+    }
+}
+
+/// The item a task reference names: a full uid, or a bare slug tried as `task:<slug>` first and
+/// then as itself. `None` when neither exists.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Option<ItemId>> {
+    if reference.contains(':') {
+        return item::id_for_uid(conn, reference);
+    }
+    match item::id_for_uid(conn, &canonical_uid(reference))? {
+        Some(id) => Ok(Some(id)),
+        None => item::id_for_uid(conn, reference),
+    }
+}
+
 /// The **ready frontier**: tasks (`kind = 'task'`) whose status is non-terminal and
 /// which have no `depends_on` edge to a non-terminal task, optionally narrowed to a
 /// `scope` and `tags`. Ordered by priority (ascending, nulls last) then due date

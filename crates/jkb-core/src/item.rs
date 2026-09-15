@@ -204,6 +204,35 @@ pub struct ItemMeta {
     pub updated_at: String,
 }
 
+/// The first non-blank line of `content`, trimmed and untruncated.
+///
+/// The **one** copy of this derivation. There were four, at three different truncation
+/// lengths, over content that carries checkbox and quick-add syntax (`- [ ] … !p1 ^id`) for
+/// every finding and every serializer-imported task — so the first change to it, such as
+/// stripping the trailing `^id`, had to be made in four places with nothing forcing the
+/// fourth, after which a staging row, a gate refusal and `jkb task show` would disagree
+/// about one task's name. Truncation is deliberately left to each caller: a listing, a
+/// staging row and a refusal message have genuinely different widths. It lives here rather
+/// than in the CLI because the typed operations (`jkb-api`) name items too.
+#[must_use]
+pub fn first_nonblank(content: &str) -> &str {
+    content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+/// An item's display title: its first non-blank line, falling back to the uid for an item
+/// with no body. Untruncated — see [`first_nonblank`].
+#[must_use]
+pub fn title_of(meta: &ItemMeta) -> String {
+    match meta.content.as_deref().map(first_nonblank) {
+        Some(line) if !line.is_empty() => line.to_owned(),
+        _ => meta.uid.clone(),
+    }
+}
+
 /// Fetch an item's full row by id, or `None` if it does not exist.
 ///
 /// # Errors
